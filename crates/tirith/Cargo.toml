@@ -1,0 +1,35 @@
+[package]
+name = "tirith"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI tool for URL security analysis in shell environments"
+repository = "https://github.com/sheeki03/tirith"
+homepage = "https://github.com/sheeki03/tirith"
+readme = "../../README.md"
+keywords = ["security", "url", "shell", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tirith"
+path = "src/main.rs"
+
+[dependencies]
+tirith-core = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+is-terminal = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[package.metadata.deb]
+section = "utils"
+assets = [
+    ["target/release/tirith", "usr/bin/", "755"],
+    ["assets/shell/tirith.sh", "usr/share/tirith/shell/", "644"],
+    ["assets/shell/lib/*", "usr/share/tirith/shell/lib/", "644"],
+]
