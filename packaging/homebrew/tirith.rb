@@ -1,5 +1,5 @@
 class Tirith < Formula
-  desc "URL security analysis for shell environments"
+  desc "Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection"
   homepage "https://github.com/sheeki03/tirith"
   license "Apache-2.0"
   version "0.1.0"
@@ -40,8 +40,15 @@ class Tirith < Formula
 
   def caveats
     <<~EOS
-      Add to your shell profile:
-        eval "$(tirith init)"
+      Activate tirith by adding to your shell profile:
+
+        zsh  (~/.zshrc):                        eval "$(tirith init)"
+        bash (~/.bashrc):                       eval "$(tirith init)"
+        fish (~/.config/fish/config.fish):      tirith init | source
+
+      Then restart your terminal or run: source ~/.zshrc
+
+      Verify: tirith doctor
     EOS
   end
 

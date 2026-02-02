@@ -71,7 +71,7 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
     }
 
     if verdict.action == Action::Block {
-        writeln!(w, "  Set TIRITH=0 to bypass (use with caution)")?;
+        writeln!(w, "  Bypass: prefix your command with TIRITH=0 (applies to that command only)")?;
     }
 
     Ok(())
@@ -114,7 +114,7 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
     }
 
     if verdict.action == Action::Block {
-        writeln!(w, "  Set TIRITH=0 to bypass (use with caution)")?;
+        writeln!(w, "  Bypass: prefix your command with TIRITH=0 (applies to that command only)")?;
     }
 
     Ok(())

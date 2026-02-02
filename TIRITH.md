@@ -804,7 +804,7 @@ If not a TTY (scripts, CI, piped input, cron):
 TIRITH=0 curl -L https://something.xyz | bash
 ```
 
-Disables tirith for a single command. For local dev use when you know what you're doing.
+This is a standard shell per-command prefix — the variable only exists for that single command and does not persist in your session. For local dev use when you know what you're doing.
 
 **Org policy can disable this:**
 

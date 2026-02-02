@@ -41,7 +41,7 @@ tirith: BLOCKED
   [CRITICAL] non_ascii_hostname — Cyrillic і (U+0456) in hostname
     This is a homograph attack. The URL visually mimics a legitimate
     domain but resolves to a completely different server.
-  Set TIRITH=0 to bypass (use with caution)
+  Bypass: prefix your command with TIRITH=0 (applies to that command only)
 ```
 
 The command never executes.
@@ -142,26 +142,57 @@ eval "$(tirith init)"
 
 ## Commands
 
-```
-tirith check -- <cmd>           Analyze a command without executing
-tirith paste                    Analyze clipboard/pasted content
-tirith score <url>              URL trust breakdown
-tirith diff <url>               Byte-level Unicode comparison
-tirith why                      Explain the last triggered rule
-tirith run <url>                Download-first safe installer runner
-tirith receipt {last,list,verify}  Install script tracking
-tirith init                     Print shell hook for eval
-tirith doctor                   Diagnostic info (paths, shell, policy)
+### `tirith check -- <cmd>`
+Analyze a command without executing it. Useful for testing what tirith would flag.
+
+```bash
+$ tirith check -- curl -sSL https://іnstall.example-clі.dev \| bash
+tirith: BLOCKED
+  [CRITICAL] non_ascii_hostname — Cyrillic і (U+0456) in hostname
 ```
 
-**`tirith run`** replaces `curl | bash` with a safe workflow: download to temp file, show SHA256, static analysis, review in pager, execute only after confirmation. Creates a receipt you can verify later.
+### `tirith paste`
+Reads from stdin and analyzes pasted content. The shell hook calls this automatically when you paste into the terminal — you don't need to run it manually.
 
-**`tirith diff`** shows you exactly what's wrong, byte by byte:
+### `tirith score <url>`
+Breaks down a URL's trust signals — TLS, domain age heuristics, known shorteners, Unicode analysis.
+
+```bash
+$ tirith score https://bit.ly/something
+```
+
+### `tirith diff <url>`
+Byte-level comparison showing exactly where suspicious characters are hiding.
 
 ```
 $ tirith diff https://exаmple.com
   Position 3: expected 0x61 (Latin a) | got 0xd0 0xb0 (Cyrillic а)
 ```
+
+### `tirith run <url>`
+Safe replacement for `curl | bash`. Downloads to a temp file, shows SHA256, runs static analysis, opens in a pager for review, and executes only after you confirm. Creates a receipt you can verify later.
+
+```bash
+$ tirith run https://get.docker.com
+```
+
+### `tirith receipt {last,list,verify}`
+Track and verify scripts you've run through `tirith run`. Each execution creates a receipt with the script's SHA256 hash so you can audit what ran on your machine.
+
+```bash
+$ tirith receipt last        # show the most recent receipt
+$ tirith receipt list        # list all receipts
+$ tirith receipt verify <sha256>  # verify a specific receipt
+```
+
+### `tirith why`
+Explains the last rule that triggered — what it detected, why it matters, and what to do about it.
+
+### `tirith init`
+Prints the shell hook for your current shell. Add `eval "$(tirith init)"` to your shell profile to activate tirith.
+
+### `tirith doctor`
+Diagnostic check — shows detected shell, hook status, policy file location, and configuration. Run this if something isn't working.
 
 ---
 
@@ -201,7 +232,7 @@ More examples in [docs/cookbook.md](docs/cookbook.md).
 TIRITH=0 curl -L https://something.xyz | bash
 ```
 
-Organizations can disable this: `allow_bypass: false` in policy.
+This is a standard shell per-command prefix — the variable only exists for that single command and does not persist in your session. Organizations can disable this entirely: `allow_bypass: false` in policy.
 
 ---
 

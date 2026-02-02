@@ -2,7 +2,7 @@
 pkgname=tirith
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='URL security analysis for shell environments'
+pkgdesc='Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection'
 arch=('x86_64' 'aarch64')
 url='https://github.com/sheeki03/tirith'
 license=('Apache-2.0')
@@ -47,4 +47,16 @@ package() {
   # License
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
+
+post_install() {
+  echo ""
+  echo "Activate tirith by adding to your shell profile:"
+  echo ""
+  echo "  zsh  (~/.zshrc):                        eval \"\$(tirith init)\""
+  echo "  bash (~/.bashrc):                       eval \"\$(tirith init)\""
+  echo "  fish (~/.config/fish/config.fish):      tirith init | source"
+  echo ""
+  echo "Then restart your terminal. Verify: tirith doctor"
+  echo ""
 }

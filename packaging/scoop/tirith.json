@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "description": "URL security analysis for shell environments",
+  "description": "Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection",
   "homepage": "https://github.com/sheeki03/tirith",
   "license": "Apache-2.0",
   "architecture": {
@@ -10,7 +10,7 @@
     }
   },
   "bin": "tirith.exe",
-  "notes": "Add to your PowerShell profile: Invoke-Expression (& tirith init)",
+  "notes": "Activate tirith by adding to your PowerShell profile ($PROFILE):\n\n  Invoke-Expression (& tirith init)\n\nThen restart your terminal. Verify: tirith doctor",
   "checkver": "github",
   "autoupdate": {
     "architecture": {
