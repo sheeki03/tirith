@@ -1,8 +1,8 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+version = 2
 
 [licenses]
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -14,8 +14,8 @@ allow = [
     "OpenSSL",
     "Zlib",
     "CC0-1.0",
+    "Unicode-DFS-2016",
 ]
-copyleft = "deny"
 
 [bans]
 multiple-versions = "warn"
