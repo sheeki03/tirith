@@ -9,7 +9,7 @@ license = "Apache-2.0"
 rust-version = "1.75"
 
 [workspace.dependencies]
-tirith-core = { path = "crates/tirith-core" }
+tirith-core = { version = "0.1.0", path = "crates/tirith-core" }
 clap = { version = "4", features = ["derive"] }
 url = "2"
 regex = "1"
