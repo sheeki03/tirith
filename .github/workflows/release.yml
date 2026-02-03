@@ -613,4 +613,7 @@ jobs:
           choco pack tirith.nuspec --out ${{ github.workspace }}
 
       - name: Push to Chocolatey
-        run: choco push tirith.*.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+        shell: pwsh
+        run: |
+          $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
+          choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
