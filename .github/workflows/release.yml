@@ -265,12 +265,14 @@ jobs:
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XL}\"/}" homebrew-tap/Formula/tirith.rb
 
       - name: Push formula
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/tirith.rb
-          git commit -m "tirith ${{ github.ref_name }}"
+          git commit -m "tirith $VERSION"
           git push
 
   publish-npm:
@@ -406,12 +408,14 @@ jobs:
           sed -i "s/\"hash\": \"PLACEHOLDER\"/\"hash\": \"${HASH}\"/" scoop-tirith/bucket/tirith.json
 
       - name: Push manifest
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           cd scoop-tirith
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add bucket/tirith.json
-          git commit -m "tirith ${{ github.ref_name }}"
+          git commit -m "tirith $VERSION"
           git push
 
   publish-docker:
@@ -523,7 +527,7 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace rockylinux:9 bash -c '
+          docker run --rm -e VERSION -v ${{ github.workspace }}:/workspace -w /workspace rockylinux:9 bash -c '
             set -e
             VER="${VERSION#v}"
 
@@ -588,8 +592,10 @@ jobs:
 
       - name: Template and pack
         shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = $env:VERSION.TrimStart("v")
           # Artifact extracts directly to artifacts/
           $hash = (Get-FileHash artifacts/tirith-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
 
