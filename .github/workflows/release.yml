@@ -525,8 +525,7 @@ jobs:
         run: |
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace rockylinux:9 bash -c '
             set -e
-            VER="${{ github.ref_name }}"
-            VER="${VER#v}"
+            VER="${VERSION#v}"
 
             # Install build tools
             dnf install -y gcc rpm-build curl ca-certificates git
