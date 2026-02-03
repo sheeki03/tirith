@@ -25,6 +25,8 @@ struct DoctorInfo {
     interactive: bool,
     hook_dir: Option<String>,
     hooks_materialized: bool,
+    shell_profile: Option<String>,
+    hook_configured: bool,
     policy_paths: Vec<String>,
     policy_root_env: Option<String>,
     data_dir: Option<String>,
@@ -52,6 +54,9 @@ fn gather_info() -> DoctorInfo {
             }
         })
         .unwrap_or(false);
+
+    // Check if shell profile has tirith init configured
+    let (shell_profile, hook_configured) = check_shell_profile(&detected_shell);
 
     let data_dir = tirith_core::policy::data_dir();
     let log_path = data_dir.as_ref().map(|d| d.join("log.jsonl"));
@@ -88,6 +93,8 @@ fn gather_info() -> DoctorInfo {
         interactive,
         hook_dir: hook_dir.map(|d| d.display().to_string()),
         hooks_materialized,
+        shell_profile: shell_profile.map(|p| p.display().to_string()),
+        hook_configured,
         policy_paths,
         policy_root_env,
         data_dir: data_dir.map(|d| d.display().to_string()),
@@ -106,6 +113,37 @@ fn print_human(info: &DoctorInfo) {
         info.hook_dir.as_deref().unwrap_or("not found")
     );
     eprintln!("  materialized: {}", info.hooks_materialized);
+    eprintln!(
+        "  profile:      {}",
+        info.shell_profile.as_deref().unwrap_or("not found")
+    );
+    if info.hook_configured {
+        eprintln!("  hook status:  configured");
+    } else {
+        eprintln!("  hook status:  NOT CONFIGURED");
+        eprintln!();
+        eprintln!("  WARNING: tirith shell hook is not configured!");
+        eprintln!("  Commands will NOT be intercepted until you add to your shell profile:");
+        eprintln!();
+        match info.detected_shell.as_str() {
+            "zsh" => {
+                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.zshrc");
+                eprintln!("    source ~/.zshrc");
+            }
+            "bash" => {
+                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.bashrc");
+                eprintln!("    source ~/.bashrc");
+            }
+            "fish" => {
+                eprintln!("    echo 'tirith init | source' >> ~/.config/fish/config.fish");
+                eprintln!("    source ~/.config/fish/config.fish");
+            }
+            _ => {
+                eprintln!("    eval \"$(tirith init)\"");
+            }
+        }
+        eprintln!();
+    }
     if info.policy_paths.is_empty() {
         eprintln!("  policies:     (none found)");
     } else {
@@ -132,6 +170,57 @@ fn print_human(info: &DoctorInfo) {
         "  last trigger: {}",
         info.last_trigger_path.as_deref().unwrap_or("not found")
     );
+}
+
+/// Check if the user's shell profile contains tirith init configuration.
+/// Returns (profile_path, is_configured).
+fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
+    let home = match home::home_dir() {
+        Some(h) => h,
+        None => return (None, false),
+    };
+
+    // Determine which profile files to check based on shell
+    let profile_candidates: Vec<PathBuf> = match shell {
+        "zsh" => vec![
+            home.join(".zshrc"),
+            home.join(".zshenv"),
+            home.join(".zprofile"),
+        ],
+        "bash" => vec![
+            home.join(".bashrc"),
+            home.join(".bash_profile"),
+            home.join(".profile"),
+        ],
+        "fish" => vec![home.join(".config/fish/config.fish")],
+        "powershell" | "pwsh" => {
+            // PowerShell profile locations vary; check common ones
+            let docs = home.join("Documents");
+            vec![
+                docs.join("PowerShell/Microsoft.PowerShell_profile.ps1"),
+                docs.join("WindowsPowerShell/Microsoft.PowerShell_profile.ps1"),
+                home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
+            ]
+        }
+        _ => return (None, false),
+    };
+
+    // Find the first existing profile and check if it contains tirith init
+    for profile in &profile_candidates {
+        if profile.exists() {
+            if let Ok(contents) = std::fs::read_to_string(profile) {
+                // Check for various forms of tirith init
+                let configured = contents.contains("tirith init")
+                    || contents.contains("tirith-hook")
+                    || contents.contains("_tirith_");
+                return (Some(profile.clone()), configured);
+            }
+        }
+    }
+
+    // Return the primary profile path even if it doesn't exist
+    let primary = profile_candidates.into_iter().next();
+    (primary, false)
 }
 
 fn detect_shell() -> &'static str {

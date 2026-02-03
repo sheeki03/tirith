@@ -48,7 +48,7 @@
           meta = with pkgs.lib; {
             description = "Terminal security tool";
             homepage = "https://github.com/sheeki03/tirith";
-            license = licenses.asl20;
+            license = licenses.agpl3Only;
             maintainers = [];
           };
         };

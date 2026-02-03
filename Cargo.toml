@@ -3,13 +3,13 @@ members = ["crates/tirith-core", "crates/tirith"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 rust-version = "1.83"
 
 [workspace.dependencies]
-tirith-core = { version = "0.1.2", path = "crates/tirith-core" }
+tirith-core = { version = "0.1.3", path = "crates/tirith-core" }
 clap = { version = "4", features = ["derive"] }
 url = "2"
 regex = "1"

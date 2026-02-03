@@ -2,7 +2,7 @@
 # tirith install script
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh
-#   TIRITH_VERSION=0.1.0 curl -fsSL ... | sh
+#   TIRITH_VERSION=0.1.3 curl -fsSL ... | sh
 set -eu
 
 REPO="sheeki03/tirith"

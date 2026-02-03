@@ -20,6 +20,13 @@ fuzz/corpus/
 # Claude Code context
 CLAUDE.md
 
+# Generated assets (CI-only for cargo-deb)
+crates/tirith/assets/completions/
+crates/tirith/assets/man/
+
+# External repo templates (for ohmyzsh-tirith, asdf-tirith)
+external-repos/
+
 # Non-project files
 charts/
 chart_urls*.json

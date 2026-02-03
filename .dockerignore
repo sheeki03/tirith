@@ -1,0 +1,5 @@
+target/
+openclaw/
+.git/
+*.md
+!README.md

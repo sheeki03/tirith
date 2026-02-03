@@ -1,11 +1,11 @@
 # Maintainer: tirith contributors
 pkgname=tirith
-pkgver=0.1.0
+pkgver=0.1.3
 pkgrel=1
 pkgdesc='Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection'
 arch=('x86_64' 'aarch64')
 url='https://github.com/sheeki03/tirith'
-license=('Apache-2.0')
+license=('AGPL3')
 depends=('gcc-libs')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
@@ -45,7 +45,7 @@ package() {
   install -Dm644 <(target/release/tirith manpage) "$pkgdir/usr/share/man/man1/tirith.1"
 
   # License
-  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 LICENSE-AGPL "$pkgdir/usr/share/licenses/$pkgname/LICENSE-AGPL"
 }
 
 post_install() {
