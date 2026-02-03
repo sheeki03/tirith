@@ -7,11 +7,6 @@ if set -q _TIRITH_FISH_LOADED
 end
 set -g _TIRITH_FISH_LOADED 1
 
-# Save original key bindings function BEFORE defining our new one
-if functions -q fish_user_key_bindings; and not functions -q _tirith_original_fish_user_key_bindings
-    functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
-end
-
 function _tirith_check_command
     set -l cmd (commandline)
 
@@ -64,4 +59,9 @@ function fish_user_key_bindings
     # Override Enter
     bind \r _tirith_check_command
     bind \n _tirith_check_command
+end
+
+# Save original key bindings function if it exists
+if functions -q fish_user_key_bindings
+    functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
 end
