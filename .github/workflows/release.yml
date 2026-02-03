@@ -13,10 +13,36 @@ on:
 permissions:
   contents: write
   id-token: write # For sigstore signing
+  packages: write # For GHCR Docker images
 
 jobs:
+  completions:
+    name: Generate Completions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native binary for completions
+        run: cargo build --release --locked -p tirith
+
+      - name: Generate completions and man page
+        run: |
+          mkdir -p staging/completions staging/man
+          ./target/release/tirith completions bash > staging/completions/tirith.bash
+          ./target/release/tirith completions zsh > staging/completions/_tirith
+          ./target/release/tirith completions fish > staging/completions/tirith.fish
+          ./target/release/tirith manpage > staging/man/tirith.1
+
+      - name: Upload completions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: completions-man
+          path: staging/
+
   build:
     name: Build (${{ matrix.target }})
+    needs: completions
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,42 +70,34 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p tirith
 
-      - name: Generate completions and man page (Unix)
-        if: runner.os != 'Windows' && matrix.target != 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p staging/completions staging/man
-          ./target/${{ matrix.target }}/release/tirith completions bash > staging/completions/tirith.bash
-          ./target/${{ matrix.target }}/release/tirith completions zsh > staging/completions/_tirith
-          ./target/${{ matrix.target }}/release/tirith completions fish > staging/completions/tirith.fish
-          ./target/${{ matrix.target }}/release/tirith manpage > staging/man/tirith.1
-          cp target/${{ matrix.target }}/release/tirith staging/
+      - name: Download completions (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: completions-man
+          path: staging/
 
-      - name: Stage binary only (cross-compiled Unix)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/tirith staging/
+      - name: Stage binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/tirith staging/
 
-      - name: Generate completions and man page (Windows)
+      - name: Download completions (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: completions-man
+          path: staging/
+
+      - name: Stage binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path staging\completions, staging\man
-          .\target\${{ matrix.target }}\release\tirith.exe completions bash > staging\completions\tirith.bash
-          .\target\${{ matrix.target }}\release\tirith.exe completions zsh > staging\completions\_tirith
-          .\target\${{ matrix.target }}\release\tirith.exe completions fish > staging\completions\tirith.fish
-          .\target\${{ matrix.target }}\release\tirith.exe manpage > staging\man\tirith.1
-          Copy-Item target\${{ matrix.target }}\release\tirith.exe staging\
+        run: Copy-Item target\${{ matrix.target }}\release\tirith.exe staging\
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd staging
-          if [ -d completions ]; then
-            tar czf ../tirith-${{ matrix.target }}.tar.gz tirith completions man
-          else
-            tar czf ../tirith-${{ matrix.target }}.tar.gz tirith
-          fi
+          tar czf ../tirith-${{ matrix.target }}.tar.gz tirith completions man
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -150,6 +168,9 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Remove completions-man directories (not for release)
+        run: rm -rf artifacts/completions artifacts/man
 
       - name: Generate checksums
         run: |
@@ -236,8 +257,8 @@ jobs:
           SHA_AL=$(sha256sum tirith-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           SHA_XL=$(sha256sum tirith-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           cd ..
-          sed -i "s/version \"0.1.0\"/version \"${VER}\"/" homebrew-tap/Formula/tirith.rb
-          sed -i "s|releases/download/v0.1.0/|releases/download/${VERSION}/|g" homebrew-tap/Formula/tirith.rb
+          sed -i "s/version \"[0-9.]*\"/version \"${VER}\"/" homebrew-tap/Formula/tirith.rb
+          sed -i "s|releases/download/v[0-9.]*|releases/download/${VERSION}|g" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AL}\"/}" homebrew-tap/Formula/tirith.rb
@@ -380,8 +401,8 @@ jobs:
           HASH=$(sha256sum artifacts/tirith-x86_64-pc-windows-msvc.zip | cut -d' ' -f1)
           mkdir -p scoop-tirith/bucket
           cp source/packaging/scoop/tirith.json scoop-tirith/bucket/tirith.json
-          sed -i "s/\"version\": \"0.1.0\"/\"version\": \"${VER}\"/" scoop-tirith/bucket/tirith.json
-          sed -i "s|releases/download/v0.1.0/|releases/download/${VERSION}/|" scoop-tirith/bucket/tirith.json
+          sed -i "s/\"version\": \"[0-9.]*\"/\"version\": \"${VER}\"/" scoop-tirith/bucket/tirith.json
+          sed -i "s|releases/download/v[0-9.]*|releases/download/${VERSION}|" scoop-tirith/bucket/tirith.json
           sed -i "s/\"hash\": \"PLACEHOLDER\"/\"hash\": \"${HASH}\"/" scoop-tirith/bucket/tirith.json
 
       - name: Push manifest
@@ -392,3 +413,199 @@ jobs:
           git add bucket/tirith.json
           git commit -m "tirith ${{ github.ref_name }}"
           git push
+
+  publish-docker:
+    name: Publish Docker Image
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/sheeki03/tirith:latest
+            ghcr.io/sheeki03/tirith:${{ steps.version.outputs.VERSION }}
+
+  publish-deb:
+    name: Build Debian Package
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo-deb
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deb
+          key: cargo-deb-${{ runner.os }}
+
+      - name: Install cargo-deb
+        run: command -v cargo-deb || cargo install cargo-deb --locked
+
+      # cargo-deb requires assets relative to crates/tirith/, but shell hooks
+      # live at repo root. This directory is gitignored and only exists in CI.
+      - name: Copy shell hooks to assets
+        run: |
+          mkdir -p crates/tirith/assets/shell/lib
+          cp shell/tirith.sh crates/tirith/assets/shell/
+          cp shell/lib/*.zsh crates/tirith/assets/shell/lib/
+          cp shell/lib/*.bash crates/tirith/assets/shell/lib/
+          cp shell/lib/*.fish crates/tirith/assets/shell/lib/
+          cp shell/lib/*.ps1 crates/tirith/assets/shell/lib/
+
+      - name: Build release binary into crate-local target
+        run: |
+          cd crates/tirith
+          CARGO_TARGET_DIR=target cargo build --release --locked
+
+      - name: Generate completions and manpage for .deb
+        run: |
+          mkdir -p crates/tirith/assets/completions crates/tirith/assets/man
+          ./crates/tirith/target/release/tirith completions bash > crates/tirith/assets/completions/tirith.bash
+          ./crates/tirith/target/release/tirith completions zsh > crates/tirith/assets/completions/_tirith
+          ./crates/tirith/target/release/tirith completions fish > crates/tirith/assets/completions/tirith.fish
+          ./crates/tirith/target/release/tirith manpage > crates/tirith/assets/man/tirith.1
+
+      - name: Build .deb with cargo-deb
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd crates/tirith
+          CARGO_TARGET_DIR=target cargo deb --no-build
+          mv target/debian/*.deb ../../tirith_${VERSION}_amd64.deb
+
+      - name: Generate .deb checksum
+        run: |
+          sha256sum tirith_*.deb > tirith_deb_checksum.txt
+          cat tirith_deb_checksum.txt
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tirith_*.deb
+            tirith_deb_checksum.txt
+
+  publish-rpm:
+    name: Build RPM package
+    needs: smoke-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build RPM in Rocky Linux container
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace rockylinux:9 bash -c '
+            set -e
+            VER="${{ github.ref_name }}"
+            VER="${VER#v}"
+
+            # Install build tools
+            dnf install -y gcc rpm-build curl ca-certificates git
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source $HOME/.cargo/env
+
+            # Build release binary
+            cargo build --release --locked -p tirith
+
+            # Generate completions and manpage
+            mkdir -p build/{completions,man,shell/lib}
+            ./target/release/tirith completions bash > build/completions/tirith.bash
+            ./target/release/tirith completions zsh > build/completions/_tirith
+            ./target/release/tirith completions fish > build/completions/tirith.fish
+            ./target/release/tirith manpage > build/man/tirith.1
+            cp shell/tirith.sh build/shell/
+            cp shell/lib/* build/shell/lib/
+
+            # Prepare RPM build
+            mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS}
+            mkdir -p ~/rpmbuild/SOURCES/shell/lib
+            mkdir -p ~/rpmbuild/SOURCES/completions
+            mkdir -p ~/rpmbuild/SOURCES/man
+
+            cp target/release/tirith ~/rpmbuild/SOURCES/
+            cp build/shell/tirith.sh ~/rpmbuild/SOURCES/shell/
+            cp build/shell/lib/* ~/rpmbuild/SOURCES/shell/lib/
+            cp build/completions/* ~/rpmbuild/SOURCES/completions/
+            cp build/man/* ~/rpmbuild/SOURCES/man/
+            cp LICENSE-AGPL ~/rpmbuild/SOURCES/
+            cp LICENSE-COMMERCIAL ~/rpmbuild/SOURCES/
+
+            # Update spec version and build
+            sed "s/^Version:.*/Version:        ${VER}/" packaging/rpm/tirith.spec > ~/rpmbuild/SPECS/tirith.spec
+            rpmbuild -bb ~/rpmbuild/SPECS/tirith.spec --define "_topdir $HOME/rpmbuild"
+
+            # Copy RPM to workspace
+            cp ~/rpmbuild/RPMS/x86_64/tirith-*.rpm /workspace/
+          '
+
+      - name: Upload RPM to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tirith-*.rpm
+
+  publish-chocolatey:
+    name: Publish to Chocolatey
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tirith-x86_64-pc-windows-msvc
+          path: artifacts
+          merge-multiple: true
+
+      - name: Template and pack
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          # Artifact extracts directly to artifacts/
+          $hash = (Get-FileHash artifacts/tirith-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+
+          # Update nuspec
+          (Get-Content packaging/chocolatey/tirith.nuspec) -replace '<version>[0-9.]+</version>', "<version>$version</version>" | Set-Content packaging/chocolatey/tirith.nuspec
+
+          # Update install script
+          $install = Get-Content packaging/chocolatey/tools/chocolateyinstall.ps1
+          $install = $install -replace "\`$version = '[0-9.]+'", "`$version = '$version'"
+          $install = $install -replace "\`$checksum = 'PLACEHOLDER'", "`$checksum = '$hash'"
+          $install | Set-Content packaging/chocolatey/tools/chocolateyinstall.ps1
+
+          # Pack (cd to chocolatey dir so tools/** paths resolve correctly)
+          cd packaging/chocolatey
+          choco pack tirith.nuspec --out ${{ github.workspace }}
+
+      - name: Push to Chocolatey
+        run: choco push tirith.*.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}

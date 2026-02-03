@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>tirith</id>
+    <version>0.1.3</version>
+    <title>tirith</title>
+    <authors>sheeki03</authors>
+    <owners>sheeki03</owners>
+    <license type="expression">AGPL-3.0-only</license>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectUrl>https://github.com/sheeki03/tirith</projectUrl>
+    <description>Terminal security tool that catches homograph attacks, pipe-to-shell patterns, and ANSI injection before they execute.</description>
+    <summary>Your terminal's security guard</summary>
+    <tags>security terminal cli rust shell</tags>
+    <packageSourceUrl>https://github.com/sheeki03/tirith/tree/main/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://github.com/sheeki03/tirith#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/sheeki03/tirith/issues</bugTrackerUrl>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

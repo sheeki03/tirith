@@ -1,0 +1,7 @@
+VERIFICATION
+
+The binary is downloaded from:
+https://github.com/sheeki03/tirith/releases/download/v{VERSION}/tirith-x86_64-pc-windows-msvc.zip
+
+Checksum verification is performed during install via Install-ChocolateyZipPackage.
+To verify manually: compare SHA256 hash with checksums.txt in the release.

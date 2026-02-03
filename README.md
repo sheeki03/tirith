@@ -3,7 +3,7 @@
 **Your browser would catch this. Your terminal won't.**
 
 [![CI](https://github.com/sheeki03/tirith/actions/workflows/ci.yml/badge.svg)](https://github.com/sheeki03/tirith/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE-APACHE)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE-AGPL)
 
 ---
 
@@ -26,7 +26,7 @@ brew install sheeki03/tap/tirith && eval "$(tirith init)"
 
 That's it. Every command you run is now guarded. Zero friction on clean input. Sub-millisecond overhead. You forget it's there until it saves you.
 
-Also available via `npm install -g tirith`, `cargo install tirith`, `scoop`, and [more](#install).
+Also available via [npm](#npm), [cargo](#cargo), [apt/dnf](#linux-packages), and [more](#install).
 
 ---
 
@@ -88,17 +88,62 @@ Nothing. Zero output. You forget tirith is running.
 
 ## Install
 
-**macOS:**
+### macOS
+
+**Homebrew:**
 
 ```bash
 brew install sheeki03/tap/tirith
 ```
 
-**Linux / macOS (shell script):**
+### Linux Packages
+
+**Debian / Ubuntu (.deb):**
+
+Download from [GitHub Releases](https://github.com/sheeki03/tirith/releases/latest), then:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh
+sudo dpkg -i tirith_*_amd64.deb
 ```
+
+**Fedora / RHEL / CentOS 9+ (.rpm):**
+
+Download from [GitHub Releases](https://github.com/sheeki03/tirith/releases/latest), then:
+
+```bash
+sudo dnf install ./tirith-*.rpm
+```
+
+**Arch Linux (AUR):**
+
+```bash
+yay -S tirith
+# or: paru -S tirith
+```
+
+**Nix:**
+
+```bash
+nix profile install github:sheeki03/tirith
+# or try without installing: nix run github:sheeki03/tirith -- --version
+```
+
+### Windows
+
+**Scoop:**
+
+```powershell
+scoop bucket add tirith https://github.com/sheeki03/scoop-tirith
+scoop install tirith
+```
+
+**Chocolatey:**
+
+```powershell
+choco install tirith
+```
+
+### Cross-Platform
 
 **npm:**
 
@@ -112,21 +157,23 @@ npm install -g tirith
 cargo install tirith
 ```
 
-**Windows:**
-
-```powershell
-scoop bucket add tirith https://github.com/sheeki03/scoop-tirith
-scoop install tirith
-```
-
-**Arch Linux (AUR):**
+**asdf:**
 
 ```bash
-yay -S tirith
-# or: paru -S tirith
+asdf plugin add tirith https://github.com/sheeki03/asdf-tirith.git
+asdf install tirith latest
+asdf global tirith latest
 ```
 
-Then activate — add to your `.zshrc`, `.bashrc`, or `config.fish`:
+**Docker:**
+
+```bash
+docker run --rm ghcr.io/sheeki03/tirith check -- "curl https://example.com | bash"
+```
+
+### Activate
+
+Add to your shell profile (`.zshrc`, `.bashrc`, or `config.fish`):
 
 ```bash
 eval "$(tirith init)"
@@ -138,6 +185,18 @@ eval "$(tirith init)"
 | bash | preexec (two modes) | 5.0+ |
 | fish | fish_preexec event | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
+
+### Shell Integrations
+
+**Oh-My-Zsh:**
+
+```bash
+git clone https://github.com/sheeki03/ohmyzsh-tirith \
+  ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/tirith
+
+# Add tirith to plugins in ~/.zshrc:
+plugins=(... tirith)
+```
 
 ---
 
@@ -258,6 +317,13 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE) for details.
+tirith is dual-licensed:
+
+- **AGPL-3.0-only**: [LICENSE-AGPL](LICENSE-AGPL) — free under copyleft terms
+- **Commercial**: [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) — alternative licensing available
+
+This software is free under AGPL-3.0-only with copyleft obligations. If your intended
+use would trigger AGPL requirements and you prefer not to comply, contact
+sheeki003@gmail.com for commercial licensing options.
 
 Third-party data attributions in [NOTICE](NOTICE).
