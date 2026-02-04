@@ -45,6 +45,17 @@ tirith searches for policy in this order:
 
 Use `tirith doctor` to see which policy files are active.
 
+## Warp terminal: silent blocking
+
+Warp terminal handles `/dev/tty` output differently than traditional terminals. tirith auto-detects Warp and uses stderr instead, but if block/warn messages aren't showing:
+
+```bash
+# Add to your ~/.zshrc or ~/.bashrc
+export TIRITH_OUTPUT=stderr
+```
+
+This forces tirith to output to stderr instead of `/dev/tty`, which Warp displays correctly.
+
 ## Audit log location
 
 Default: `~/.local/share/tirith/log.jsonl` (XDG-compliant)
