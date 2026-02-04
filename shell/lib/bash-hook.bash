@@ -8,6 +8,17 @@
 [[ -n "$_TIRITH_BASH_LOADED" ]] && return
 _TIRITH_BASH_LOADED=1
 
+# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
+# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
+# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+_tirith_output() {
+  if [[ "${TIRITH_OUTPUT:-}" == "stderr" ]] || [[ "$TERM_PROGRAM" == "WarpTerminal" ]]; then
+    printf '%s\n' "$1" >&2
+  else
+    printf '%s\n' "$1" >/dev/tty
+  fi
+}
+
 _TIRITH_BASH_MODE="${TIRITH_BASH_MODE:-enter}"
 
 # Check if a command is unsafe to eval (heredocs, multiline, etc.)
@@ -52,6 +63,13 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
   # Mode: enter — bind -x Enter override with full block+warn capability
 
   _tirith_enter() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+
+    # Ensure terminal state is restored on exit
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Empty input: just return (shows new prompt)
     if [[ -z "$READLINE_LINE" ]]; then
       READLINE_LINE=""
@@ -79,12 +97,16 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
     if [[ $rc -eq 1 ]]; then
       # Block: show the command that was blocked, print warning, clear line
-      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
+      _tirith_output ""
+      _tirith_output "command> $READLINE_LINE"
+      [[ -n "$output" ]] && _tirith_output "$output"
       READLINE_LINE=""
       READLINE_POINT=0
     elif [[ $rc -eq 2 ]]; then
       # Warn: print warning then execute
-      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
+      _tirith_output ""
+      _tirith_output "command> $READLINE_LINE"
+      [[ -n "$output" ]] && _tirith_output "$output"
       # Fall through to execute
     fi
 
@@ -123,6 +145,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
   # Bracketed paste interception
   _tirith_paste() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Read pasted content until bracketed paste end sequence (\e[201~)
     local pasted=""
     local char
@@ -146,11 +173,13 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
       if [[ $rc -eq 1 ]]; then
         # Block: show what was pasted, then warning, discard paste
-        printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
+        _tirith_output ""
+        _tirith_output "paste> $pasted"
+        [[ -n "$output" ]] && _tirith_output "$output"
         return
       elif [[ $rc -eq 2 ]]; then
         # Warn: show warning, keep paste
-        [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
+        [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
       fi
     fi
 

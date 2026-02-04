@@ -7,6 +7,17 @@
 [[ -n "$_TIRITH_ZSH_LOADED" ]] && return
 _TIRITH_ZSH_LOADED=1
 
+# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
+# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
+# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+_tirith_output() {
+  if [[ "${TIRITH_OUTPUT:-}" == "stderr" ]] || [[ "$TERM_PROGRAM" == "WarpTerminal" ]]; then
+    printf '%s\n' "$1" >&2
+  else
+    printf '%s\n' "$1" >/dev/tty
+  fi
+}
+
 # Save original accept-line widget if it exists
 if zle -la | grep -q '^accept-line$'; then
   zle -A accept-line _tirith_original_accept_line
@@ -31,11 +42,15 @@ _tirith_accept_line() {
   if [[ $rc -eq 1 ]]; then
     # Block: show command and output
     BUFFER=""
-    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
+    _tirith_output ""
+    _tirith_output "command> $buf"
+    [[ -n "$output" ]] && _tirith_output "$output"
     zle send-break
   elif [[ $rc -eq 2 ]]; then
     # Warn: show command and output, then execute
-    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
+    _tirith_output ""
+    _tirith_output "command> $buf"
+    [[ -n "$output" ]] && _tirith_output "$output"
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   else
     # Allow: execute normally
@@ -72,11 +87,13 @@ _tirith_bracketed_paste() {
       # Block: show paste content and output
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
-      printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
+      _tirith_output ""
+      _tirith_output "paste> $pasted"
+      [[ -n "$output" ]] && _tirith_output "$output"
       zle send-break
     elif [[ $rc -eq 2 ]]; then
       # Warn: show warning, keep paste
-      [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
+      [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
     fi
     # Allow (0): keep the paste silently
   fi

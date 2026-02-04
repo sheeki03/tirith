@@ -13,7 +13,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
             title: "ANSI escape sequences in pasted content".to_string(),
             description: "Pasted content contains ANSI escape sequences that could hide malicious commands or manipulate terminal display".to_string(),
             evidence: scan.details.iter()
-                .filter(|d| d.description.contains("ANSI"))
+                .filter(|d| d.description.contains("escape"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
                     hex: format!("0x{:02x}", d.byte),
@@ -122,9 +122,10 @@ fn looks_like_hidden_command(line: &str) -> bool {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
+    let prefix = crate::util::truncate_bytes(s, max);
+    if prefix.len() == s.len() {
+        prefix
     } else {
-        format!("{}...", &s[..max])
+        format!("{prefix}...")
     }
 }

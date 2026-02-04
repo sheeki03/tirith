@@ -332,7 +332,57 @@ pub struct ExtractedUrl {
 }
 
 /// Common value-taking flags across docker subcommands.
-const DOCKER_VALUE_FLAGS: &[&str] = &["--platform", "--format", "--filter", "-f", "--label", "-l"];
+const DOCKER_VALUE_FLAGS: &[&str] = &[
+    "--platform",
+    "--format",
+    "--filter",
+    "-f",
+    "--label",
+    "-l",
+    "--name",
+    "--hostname",
+    "--user",
+    "-u",
+    "--workdir",
+    "-w",
+    "--network",
+    "--net",
+    "--env",
+    "-e",
+    "--env-file",
+    "--publish",
+    "-p",
+    "--expose",
+    "--volume",
+    "-v",
+    "--mount",
+    "--add-host",
+    "--device",
+    "--entrypoint",
+    "--log-driver",
+    "--log-opt",
+    "--restart",
+    "--runtime",
+    "--cpus",
+    "--cpu-shares",
+    "--cpu-quota",
+    "--memory",
+    "--memory-reservation",
+    "--memory-swap",
+    "--shm-size",
+    "--ulimit",
+    "--security-opt",
+    "--sysctl",
+    "--tmpfs",
+    "--gpus",
+    "--ipc",
+    "--pid",
+    "--userns",
+    "--cgroupns",
+];
+
+/// Short flags that may embed their value inline (e.g., -p8080:80).
+const DOCKER_VALUE_PREFIXES: &[&str] = &["-p", "-e", "-v", "-l", "-u", "-w"];
 
 /// Extract the first non-flag argument as a Docker image reference.
 fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec<ExtractedUrl>) {
@@ -352,6 +402,12 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
         if clean.starts_with('-') {
             if DOCKER_VALUE_FLAGS.iter().any(|f| clean == *f) {
                 skip_next = true;
+            }
+            if DOCKER_VALUE_PREFIXES
+                .iter()
+                .any(|p| clean.starts_with(p) && clean.len() > p.len())
+            {
+                continue;
             }
             continue;
         }

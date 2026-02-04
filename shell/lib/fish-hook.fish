@@ -7,6 +7,17 @@ if set -q _TIRITH_FISH_LOADED
 end
 set -g _TIRITH_FISH_LOADED 1
 
+# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
+# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
+# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+function _tirith_output
+    if test "$TIRITH_OUTPUT" = "stderr"; or test "$TERM_PROGRAM" = "WarpTerminal"
+        printf '%s\n' "$argv[1]" >&2
+    else
+        printf '%s\n' "$argv[1]" >/dev/tty
+    end
+end
+
 # Save original key bindings function BEFORE defining our new one
 if functions -q fish_user_key_bindings; and not functions -q _tirith_original_fish_user_key_bindings
     functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
@@ -30,12 +41,17 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         rm -f $tmpfile
 
         if test $rc -eq 1
-            printf '\npaste> %s\n%s\n' "$content" "$output" >/dev/tty
+            _tirith_output ""
+            _tirith_output "paste> $content"
+            if test -n "$output"
+                _tirith_output "$output"
+            end
             commandline -f repaint
             return
         else if test $rc -eq 2
             if test -n "$output"
-                printf '\n%s\n' "$output" >/dev/tty
+                _tirith_output ""
+                _tirith_output "$output"
                 commandline -f repaint
             end
         end
@@ -62,11 +78,19 @@ function _tirith_check_command
 
     if test $rc -eq 1
         # Block: show warning, clear line (no execute)
-        printf '\ncommand> %s\n%s\n' "$cmd" "$output" >/dev/tty
+        _tirith_output ""
+        _tirith_output "command> $cmd"
+        if test -n "$output"
+            _tirith_output "$output"
+        end
         commandline -r ""
     else if test $rc -eq 2
         # Warn: show warning then execute
-        printf '\ncommand> %s\n%s\n' "$cmd" "$output" >/dev/tty
+        _tirith_output ""
+        _tirith_output "command> $cmd"
+        if test -n "$output"
+            _tirith_output "$output"
+        end
         commandline -f execute
     else
         # Allow: execute normally

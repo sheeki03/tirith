@@ -65,10 +65,11 @@ pub fn check(env: &dyn EnvSnapshot) -> Vec<Finding> {
 }
 
 fn redact_value(val: &str) -> String {
-    if val.len() <= 20 {
+    let prefix = crate::util::truncate_bytes(val, 20);
+    if prefix.len() == val.len() {
         val.to_string()
     } else {
-        format!("{}...", &val[..20])
+        format!("{prefix}...")
     }
 }
 
