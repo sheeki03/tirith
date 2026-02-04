@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-02-04
+
+### Fixed
+
+- Shell hooks now reliably display block/warn messages in all terminal contexts (zsh, bash, fish, PowerShell).
+- Blocked commands show with `command>` prefix, blocked pastes show with `paste>` prefix.
+- Fish hook now works with vi keybindings (`fish_vi_key_bindings`). Binds Enter in insert, default, and replace modes.
+- Fish vi mode: Enter from normal mode now correctly returns to insert mode after execution.
+
 ## [0.1.4] - 2026-02-04
 
 ### Fixed

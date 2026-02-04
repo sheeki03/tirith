@@ -25,17 +25,25 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         return
     }
 
-    # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    # No output capture: binary writes to stderr which is the terminal.
-    & tirith check --shell powershell -- $line
+    # Run tirith check, use temp file to prevent output leakage
+    $tmpfile = [System.IO.Path]::GetTempFileName()
+    & tirith check --non-interactive --shell powershell -- $line > $tmpfile 2>&1
     $rc = $LASTEXITCODE
+    $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
 
     if ($rc -eq 1) {
-        # Block: revert the line
+        # Block: show what was blocked, then warning, revert line
+        Write-Host "command> $line"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+    } elseif ($rc -eq 2) {
+        # Warn: show warning then execute
+        Write-Host "command> $line"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     } else {
-        # Allow (0) or Warn (2): execute normally
-        # Warn message already printed to stderr by the binary
+        # Allow: execute normally
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     }
 }
@@ -49,13 +57,21 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         return
     }
 
-    # Check with tirith paste
-    $pasted | & tirith paste --shell powershell
+    # Check with tirith paste, use temp file to prevent output leakage
+    $tmpfile = [System.IO.Path]::GetTempFileName()
+    $pasted | & tirith paste --shell powershell > $tmpfile 2>&1
     $rc = $LASTEXITCODE
+    $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
 
     if ($rc -eq 1) {
-        # Block: discard paste, warning already printed by binary
+        # Block: show what was pasted, then warning, discard paste
+        Write-Host "paste> $pasted"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
         return
+    } elseif ($rc -eq 2) {
+        # Warn: show warning, keep paste
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
     }
 
     # Allow (0) or Warn (2): insert pasted content

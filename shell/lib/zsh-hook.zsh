@@ -21,22 +21,21 @@ _tirith_accept_line() {
     return
   fi
 
-  # Run tirith check and capture output.
-  # In zle context, stderr doesn't display directly - we must capture and print.
-  local output
-  output=$(tirith check --shell posix -- "$buf" 2>&1)
+  # Run tirith check, redirect to temp file to prevent tty leakage
+  local tmpfile=$(mktemp)
+  tirith check --non-interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
   local rc=$?
+  local output=$(<"$tmpfile")
+  rm -f "$tmpfile"
 
   if [[ $rc -eq 1 ]]; then
-    # Block: show the command that was blocked, print warning, clear line
-    print -r -- "$buf"
-    [[ -n "$output" ]] && print -r -- "$output"
+    # Block: show command and output
     BUFFER=""
-    zle reset-prompt
+    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
+    zle send-break
   elif [[ $rc -eq 2 ]]; then
-    # Warn: print warning then execute
-    print -r -- "$buf"
-    [[ -n "$output" ]] && print -r -- "$output"
+    # Warn: show command and output, then execute
+    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   else
     # Allow: execute normally
@@ -62,21 +61,22 @@ _tirith_bracketed_paste() {
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
 
   if [[ -n "$pasted" ]]; then
-    # Pipe pasted content to tirith paste and capture output
-    local output
-    output=$(echo -n "$pasted" | tirith paste --shell posix 2>&1)
+    # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
+    local tmpfile=$(mktemp)
+    echo -n "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
     local rc=$?
+    local output=$(<"$tmpfile")
+    rm -f "$tmpfile"
 
     if [[ $rc -eq 1 ]]; then
-      # Block: revert the paste, show what was pasted, then warning
+      # Block: show paste content and output
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
-      print -r -- "paste> $pasted"
-      [[ -n "$output" ]] && print -r -- "$output"
-      zle reset-prompt
+      printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
+      zle send-break
     elif [[ $rc -eq 2 ]]; then
-      # Warn: keep the paste but show warning
-      [[ -n "$output" ]] && print -r -- "$output"
+      # Warn: show warning, keep paste
+      [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
     fi
     # Allow (0): keep the paste silently
   fi

@@ -70,22 +70,21 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
       return
     fi
 
-    # Run tirith check and capture output.
-    # In bind -x context, stderr may not display properly.
-    local output
-    output=$(tirith check --shell posix -- "$READLINE_LINE" 2>&1)
+    # Run tirith check, use temp file to prevent tty leakage in bind -x context
+    local tmpfile=$(mktemp)
+    tirith check --non-interactive --shell posix -- "$READLINE_LINE" >"$tmpfile" 2>&1
     local rc=$?
+    local output=$(<"$tmpfile")
+    rm -f "$tmpfile"
 
     if [[ $rc -eq 1 ]]; then
       # Block: show the command that was blocked, print warning, clear line
-      printf '%s\n' "$READLINE_LINE"
-      [[ -n "$output" ]] && printf '%s\n' "$output"
+      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
       READLINE_LINE=""
       READLINE_POINT=0
     elif [[ $rc -eq 2 ]]; then
       # Warn: print warning then execute
-      printf '%s\n' "$READLINE_LINE"
-      [[ -n "$output" ]] && printf '%s\n' "$output"
+      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
       # Fall through to execute
     fi
 
@@ -138,19 +137,20 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     done
 
     if [[ -n "$pasted" ]]; then
-      # Check with tirith paste and capture output
-      local output
-      output=$(printf '%s' "$pasted" | tirith paste --shell posix 2>&1)
+      # Check with tirith paste, use temp file to prevent tty leakage
+      local tmpfile=$(mktemp)
+      printf '%s' "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
       local rc=$?
+      local output=$(<"$tmpfile")
+      rm -f "$tmpfile"
 
       if [[ $rc -eq 1 ]]; then
         # Block: show what was pasted, then warning, discard paste
-        printf 'paste> %s\n' "$pasted"
-        [[ -n "$output" ]] && printf '%s\n' "$output"
+        printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
         return
       elif [[ $rc -eq 2 ]]; then
         # Warn: show warning, keep paste
-        [[ -n "$output" ]] && printf '%s\n' "$output"
+        [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
       fi
     fi
 

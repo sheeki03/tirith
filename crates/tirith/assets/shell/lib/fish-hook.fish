@@ -14,6 +14,46 @@ if functions -q fish_user_key_bindings; and not functions -q _tirith_original_fi
     functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
 end
 
+# Wrap fish_clipboard_paste to intercept all clipboard paste operations
+# Covers: Ctrl+V, Ctrl+Y, and any custom bindings using fish_clipboard_paste
+# NOTE: Terminal-level paste (right-click, middle-click) uses fish's internal
+# __fish_paste and is NOT intercepted to avoid breakage on fish updates.
+if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish_clipboard_paste
+    functions -c fish_clipboard_paste _tirith_original_fish_clipboard_paste
+
+    # Only define wrapper if we successfully copied the original
+    function fish_clipboard_paste
+        # Get clipboard content via original function
+        # Use string collect to preserve newlines (set -l splits on newlines)
+        set -l content (_tirith_original_fish_clipboard_paste | string collect)
+
+        if test -z "$content"
+            return
+        end
+
+        # Check with tirith paste, use temp file to prevent tty leakage
+        set -l tmpfile (mktemp)
+        echo -n "$content" | tirith paste --shell fish >$tmpfile 2>&1
+        set -l rc $status
+        set -l output (cat $tmpfile | string collect)
+        rm -f $tmpfile
+
+        if test $rc -eq 1
+            # Blocked - show what was pasted, then warning
+        printf '\npaste> %s\n%s\n' "$content" "$output" >/dev/tty
+            return
+        else if test $rc -eq 2
+            # Warn - show warning, continue with paste
+            if test -n "$output"
+                printf '\n%s\n' "$output" >/dev/tty
+            end
+        end
+
+        # Allowed - output the content for insertion
+        echo -n "$content"
+    end
+end
+
 function _tirith_check_command
     set -l cmd (commandline)
 
@@ -23,52 +63,55 @@ function _tirith_check_command
         return
     end
 
-    # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    tirith check --shell fish -- "$cmd"
+    # Run tirith check, use temp file to prevent tty leakage
+    set -l tmpfile (mktemp)
+    tirith check --non-interactive --shell fish -- "$cmd" >$tmpfile 2>&1
     set -l rc $status
+    set -l output (cat $tmpfile | string collect)
+    rm -f $tmpfile
 
     if test $rc -eq 1
-        # Block: clear the line
+        # Block: show what was blocked, then warning, clear line
+        printf '\ncommand> %s\n%s\n' "$cmd" "$output" >/dev/tty
         commandline -r ""
         commandline -f repaint
+    else if test $rc -eq 2
+        # Warn: show warning then execute
+        printf '\ncommand> %s\n%s\n' "$cmd" "$output" >/dev/tty
+        commandline -f execute
     else
-        # Allow (0) or Warn (2): execute normally
-        # Warn message already printed to stderr by the binary
+        # Allow: execute normally
         commandline -f execute
     end
 end
 
-# NOTE: Only intercepts Ctrl+V paste. Right-click and middle-click paste
-# bypass this check — fish does not expose a hookable paste event.
-function _tirith_check_paste
-    # Read clipboard content
-    set -l pasted (fish_clipboard_paste 2>/dev/null)
-
-    if test -n "$pasted"
-        # Check with tirith paste
-        echo -n "$pasted" | tirith paste --shell fish
-        set -l rc $status
-
-        if test $rc -eq 1
-            # Block: discard paste
-            return
-        end
-    end
-
-    # Allow: insert pasted content
-    commandline -i -- "$pasted"
+# Bind Enter for command check in modes that execute commands (supports vi keybindings)
+# This is done immediately when sourced, not waiting for fish_user_key_bindings
+function _tirith_bind_enter
+    # Default/emacs mode
+    bind \r _tirith_check_command
+    bind \n _tirith_check_command
+    # Vi insert mode
+    bind -M insert \r _tirith_check_command 2>/dev/null
+    bind -M insert \n _tirith_check_command 2>/dev/null
+    # Vi default/normal mode - use -m insert to return to insert after execution
+    bind -M default -m insert \r _tirith_check_command 2>/dev/null
+    bind -M default -m insert \n _tirith_check_command 2>/dev/null
+    # Vi replace mode - also executes commands (return to insert after execute)
+    bind -M replace -m insert \r _tirith_check_command 2>/dev/null
+    bind -M replace -m insert \n _tirith_check_command 2>/dev/null
 end
 
+# Bind immediately
+_tirith_bind_enter
+
+# Also hook into fish_user_key_bindings for any future rebinds
 function fish_user_key_bindings
     # Call original user key bindings if they existed
     if functions -q _tirith_original_fish_user_key_bindings
         _tirith_original_fish_user_key_bindings
     end
 
-    # Override Enter
-    bind \r _tirith_check_command
-    bind \n _tirith_check_command
-
-    # Paste interception (Ctrl+V only)
-    bind \cv _tirith_check_paste
+    # Re-bind Enter after user's bindings
+    _tirith_bind_enter
 end

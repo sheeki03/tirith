@@ -70,15 +70,25 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
       return
     fi
 
-    # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    tirith check --shell posix -- "$READLINE_LINE"
+    # Run tirith check, use temp file to prevent tty leakage in bind -x context
+    local tmpfile=$(mktemp)
+    tirith check --non-interactive --shell posix -- "$READLINE_LINE" >"$tmpfile" 2>&1
     local rc=$?
+    local output=$(<"$tmpfile")
+    rm -f "$tmpfile"
 
     if [[ $rc -eq 1 ]]; then
-      # Block: clear the line
+      # Block: show the command that was blocked, print warning, clear line
+      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
       READLINE_LINE=""
       READLINE_POINT=0
-    else
+    elif [[ $rc -eq 2 ]]; then
+      # Warn: print warning then execute
+      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
+      # Fall through to execute
+    fi
+
+    if [[ $rc -ne 1 ]]; then
       # Allow (0) or Warn (2): execute the command
       local cmd="$READLINE_LINE"
       READLINE_LINE=""
@@ -127,13 +137,20 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     done
 
     if [[ -n "$pasted" ]]; then
-      # Check with tirith paste
-      printf '%s' "$pasted" | tirith paste --shell posix
+      # Check with tirith paste, use temp file to prevent tty leakage
+      local tmpfile=$(mktemp)
+      printf '%s' "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
       local rc=$?
+      local output=$(<"$tmpfile")
+      rm -f "$tmpfile"
 
       if [[ $rc -eq 1 ]]; then
-        # Block: discard paste
+        # Block: show what was pasted, then warning, discard paste
+        printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
         return
+      elif [[ $rc -eq 2 ]]; then
+        # Warn: show warning, keep paste
+        [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
       fi
     fi
 

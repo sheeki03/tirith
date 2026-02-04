@@ -21,17 +21,24 @@ _tirith_accept_line() {
     return
   fi
 
-  # Run tirith check. Binary prints warnings/blocks directly to stderr.
-  tirith check --shell posix -- "$buf"
+  # Run tirith check, redirect to temp file to prevent tty leakage
+  local tmpfile=$(mktemp)
+  tirith check --non-interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
   local rc=$?
+  local output=$(<"$tmpfile")
+  rm -f "$tmpfile"
 
   if [[ $rc -eq 1 ]]; then
-    # Block: clear the line
-    zle kill-whole-line
-    zle reset-prompt
+    # Block: show command and output
+    BUFFER=""
+    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
+    zle send-break
+  elif [[ $rc -eq 2 ]]; then
+    # Warn: show command and output, then execute
+    printf '\ncommand> %s\n%s\n' "$buf" "$output" >/dev/tty
+    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   else
-    # Allow (0) or Warn (2): execute normally
-    # Warn message already printed to stderr by the binary
+    # Allow: execute normally
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   fi
 }
@@ -54,17 +61,24 @@ _tirith_bracketed_paste() {
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
 
   if [[ -n "$pasted" ]]; then
-    # Pipe pasted content to tirith paste
-    echo -n "$pasted" | tirith paste --shell posix
+    # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
+    local tmpfile=$(mktemp)
+    echo -n "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
     local rc=$?
+    local output=$(<"$tmpfile")
+    rm -f "$tmpfile"
 
     if [[ $rc -eq 1 ]]; then
-      # Block: revert the paste
+      # Block: show paste content and output
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
-      zle reset-prompt
+      printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
+      zle send-break
+    elif [[ $rc -eq 2 ]]; then
+      # Warn: show warning, keep paste
+      [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
     fi
-    # Allow (0) or Warn (2): keep the paste, warning already printed
+    # Allow (0): keep the paste silently
   fi
 }
 
