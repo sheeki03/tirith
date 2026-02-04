@@ -52,6 +52,13 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
   # Mode: enter — bind -x Enter override with full block+warn capability
 
   _tirith_enter() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+
+    # Ensure terminal state is restored on exit
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Empty input: just return (shows new prompt)
     if [[ -z "$READLINE_LINE" ]]; then
       READLINE_LINE=""
@@ -123,6 +130,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
   # Bracketed paste interception
   _tirith_paste() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Read pasted content until bracketed paste end sequence (\e[201~)
     local pasted=""
     local char

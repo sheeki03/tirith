@@ -92,11 +92,12 @@ fn default_log_path() -> Option<PathBuf> {
 }
 
 fn redact_command(cmd: &str) -> String {
-    // Redact: keep first 80 chars, replace the rest
-    if cmd.len() <= 80 {
+    // Redact: keep first 80 bytes (UTF-8 safe), replace the rest
+    let prefix = crate::util::truncate_bytes(cmd, 80);
+    if prefix.len() == cmd.len() {
         cmd.to_string()
     } else {
-        format!("{}[...redacted {} chars]", &cmd[..80], cmd.len() - 80)
+        format!("{}[...redacted {} chars]", prefix, cmd.len() - prefix.len())
     }
 }
 

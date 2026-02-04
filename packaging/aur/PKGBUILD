@@ -7,7 +7,7 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/sheeki03/tirith'
 license=('AGPL3')
 depends=('gcc-libs')
-makedepends=('cargo')
+makedepends=('cargo' 'base-devel')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

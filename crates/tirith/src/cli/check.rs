@@ -1,3 +1,4 @@
+use crate::cli::last_trigger;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
@@ -14,7 +15,13 @@ pub fn run(
         return 0;
     }
 
-    let shell_type = shell.parse::<ShellType>().unwrap_or(ShellType::Posix);
+    let shell_type = match shell.parse::<ShellType>() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("tirith: warning: unknown shell '{shell}', falling back to posix");
+            ShellType::Posix
+        }
+    };
 
     let interactive = if interactive_flag {
         true
@@ -41,7 +48,7 @@ pub fn run(
 
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
-        write_last_trigger(&verdict, cmd);
+        last_trigger::write_last_trigger(&verdict, cmd);
     }
 
     // Log to audit
@@ -56,48 +63,4 @@ pub fn run(
     }
 
     verdict.action.exit_code()
-}
-
-fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
-    if let Some(dir) = tirith_core::policy::data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("last_trigger.json");
-        let tmp = dir.join(".last_trigger.json.tmp");
-
-        #[derive(serde::Serialize)]
-        struct LastTrigger<'a> {
-            rule_ids: Vec<String>,
-            severity: String,
-            command_redacted: String,
-            findings: &'a [tirith_core::verdict::Finding],
-            timestamp: String,
-        }
-
-        let trigger = LastTrigger {
-            rule_ids: verdict
-                .findings
-                .iter()
-                .map(|f| f.rule_id.to_string())
-                .collect(),
-            severity: verdict
-                .findings
-                .iter()
-                .map(|f| f.severity)
-                .max()
-                .map(|s| format!("{s}"))
-                .unwrap_or_default(),
-            command_redacted: if cmd.len() > 80 {
-                format!("{}...", &cmd[..80])
-            } else {
-                cmd.to_string()
-            },
-            findings: &verdict.findings,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-
-        if let Ok(json) = serde_json::to_string_pretty(&trigger) {
-            let _ = std::fs::write(&tmp, &json);
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
 }

@@ -3,6 +3,7 @@ pub mod completions;
 pub mod diff;
 pub mod doctor;
 pub mod init;
+pub mod last_trigger;
 pub mod manpage;
 pub mod paste;
 pub mod receipt;
