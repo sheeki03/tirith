@@ -268,34 +268,6 @@ fn domain_matches(host: &str, pattern: &str) -> bool {
     host == pattern || host.ends_with(&format!(".{pattern}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_allowlist_domain_matches_subdomain() {
-        let mut p = Policy::default();
-        p.allowlist = vec!["github.com".to_string()];
-        assert!(p.is_allowlisted("https://api.github.com/repos"));
-        assert!(p.is_allowlisted("git@github.com:owner/repo.git"));
-        assert!(!p.is_allowlisted("https://evil-github.com"));
-    }
-
-    #[test]
-    fn test_allowlist_schemeless_host() {
-        let mut p = Policy::default();
-        p.allowlist = vec!["raw.githubusercontent.com".to_string()];
-        assert!(p.is_allowlisted("raw.githubusercontent.com/path/to/file"));
-    }
-
-    #[test]
-    fn test_allowlist_schemeless_host_with_port() {
-        let mut p = Policy::default();
-        p.allowlist = vec!["example.com".to_string()];
-        assert!(p.is_allowlisted("example.com:8080/path"));
-    }
-}
-
 /// Discover policy path by walking up from cwd to .git boundary.
 fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
     let start = cwd
@@ -360,4 +332,38 @@ pub fn data_dir() -> Option<PathBuf> {
 pub fn config_dir() -> Option<PathBuf> {
     let base = etcetera::choose_base_strategy().ok()?;
     Some(base.config_dir().join("tirith"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowlist_domain_matches_subdomain() {
+        let p = Policy {
+            allowlist: vec!["github.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("https://api.github.com/repos"));
+        assert!(p.is_allowlisted("git@github.com:owner/repo.git"));
+        assert!(!p.is_allowlisted("https://evil-github.com"));
+    }
+
+    #[test]
+    fn test_allowlist_schemeless_host() {
+        let p = Policy {
+            allowlist: vec!["raw.githubusercontent.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("raw.githubusercontent.com/path/to/file"));
+    }
+
+    #[test]
+    fn test_allowlist_schemeless_host_with_port() {
+        let p = Policy {
+            allowlist: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("example.com:8080/path"));
+    }
 }
