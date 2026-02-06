@@ -9,6 +9,23 @@ If hooks are not found:
 2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)
 3. Set `TIRITH_SHELL_DIR` to point to your shell hooks directory explicitly
 
+## Brew upgrade applied but behavior did not change
+
+If `brew` reports a newer version but `tirith --version` is older, or shell behavior looks unchanged:
+
+```bash
+which -a tirith
+brew info tirith
+hash -r
+```
+
+Then refresh materialized hooks and restart shell:
+
+```bash
+rm -rf ~/.local/share/tirith/shell
+exec zsh   # or exec bash / restart terminal
+```
+
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:
