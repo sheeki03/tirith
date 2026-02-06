@@ -170,6 +170,12 @@ npm install -g tirith
 cargo install tirith
 ```
 
+**Mise:**
+
+```bash
+mise use -g tirith
+```
+
 **asdf:**
 
 ```bash
