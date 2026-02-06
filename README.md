@@ -210,6 +210,16 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 
 In bash, enter mode is used by default, but SSH sessions automatically fall back to preexec mode for PTY compatibility.
 
+**Nix / Home-Manager:** tirith must be in your `$PATH` — the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
+
+```nix
+home.packages = [ pkgs.tirith ];
+
+programs.zsh.initContent = ''
+  eval "$(tirith init --shell zsh)"
+'';
+```
+
 ### Shell Integrations
 
 **Oh-My-Zsh:**
