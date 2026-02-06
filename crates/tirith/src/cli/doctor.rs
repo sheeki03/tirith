@@ -39,7 +39,7 @@ fn gather_info() -> DoctorInfo {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let detected_shell = detect_shell().to_string();
+    let detected_shell = crate::cli::init::detect_shell().to_string();
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
     let hook_dir = crate::cli::init::find_hook_dir_readonly();
@@ -127,15 +127,17 @@ fn print_human(info: &DoctorInfo) {
         eprintln!();
         match info.detected_shell.as_str() {
             "zsh" => {
-                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.zshrc");
+                eprintln!("    echo 'eval \"$(tirith init --shell zsh)\"' >> ~/.zshrc");
                 eprintln!("    source ~/.zshrc");
             }
             "bash" => {
-                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.bashrc");
+                eprintln!("    echo 'eval \"$(tirith init --shell bash)\"' >> ~/.bashrc");
                 eprintln!("    source ~/.bashrc");
             }
             "fish" => {
-                eprintln!("    echo 'tirith init | source' >> ~/.config/fish/config.fish");
+                eprintln!(
+                    "    echo 'tirith init --shell fish | source' >> ~/.config/fish/config.fish"
+                );
                 eprintln!("    source ~/.config/fish/config.fish");
             }
             _ => {
@@ -221,22 +223,4 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
     // Return the primary profile path even if it doesn't exist
     let primary = profile_candidates.into_iter().next();
     (primary, false)
-}
-
-fn detect_shell() -> &'static str {
-    if let Ok(shell) = std::env::var("SHELL") {
-        if shell.contains("zsh") {
-            return "zsh";
-        }
-        if shell.contains("bash") {
-            return "bash";
-        }
-        if shell.contains("fish") {
-            return "fish";
-        }
-    }
-    #[cfg(windows)]
-    return "powershell";
-    #[cfg(not(windows))]
-    "bash"
 }

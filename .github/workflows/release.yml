@@ -580,8 +580,6 @@ jobs:
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
-    # Chocolatey moderation can block new versions while previous is pending
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -618,4 +616,36 @@ jobs:
         shell: pwsh
         run: |
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
-          choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — package may be under moderation or API key issue"
+            exit 0
+          }
+
+  publish-aur:
+    name: Update AUR Package
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update PKGBUILD version
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${VERSION#v}"
+          sed -i "s/^pkgver=.*/pkgver=${VER}/" packaging/aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: tirith
+          pkgbuild: packaging/aur/PKGBUILD
+          assets: packaging/aur/tirith.install
+          commit_username: sheeki03
+          commit_email: shivomsharma03@gmail.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          updpkgsums: true

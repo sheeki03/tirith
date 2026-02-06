@@ -26,6 +26,7 @@ is-terminal = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 home = { workspace = true }
+libc = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
