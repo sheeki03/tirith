@@ -3,6 +3,7 @@
 **Your browser would catch this. Your terminal won't.**
 
 [![CI](https://github.com/sheeki03/tirith/actions/workflows/ci.yml/badge.svg)](https://github.com/sheeki03/tirith/actions/workflows/ci.yml)
+[![GitHub Stars](https://img.shields.io/github/stars/sheeki03/tirith?style=flat&logo=github)](https://github.com/sheeki03/tirith/stargazers)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE-AGPL)
 
 ---
@@ -350,3 +351,7 @@ use would trigger AGPL requirements and you prefer not to comply, contact
 sheeki003@gmail.com for commercial licensing options.
 
 Third-party data attributions in [NOTICE](NOTICE).
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=sheeki03/tirith&type=Date)](https://star-history.com/#sheeki03/tirith&Date)
