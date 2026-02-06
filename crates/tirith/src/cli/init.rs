@@ -254,9 +254,22 @@ fn materialize_hooks() -> Option<PathBuf> {
     let data_dir = tirith_core::policy::data_dir()?;
     let shell_dir = data_dir.join("shell");
     let lib_dir = shell_dir.join("lib");
+    let version_path = shell_dir.join(".hooks-version");
+    let current_version = env!("CARGO_PKG_VERSION");
 
-    // Check if we need to materialize (files missing or binary newer)
-    let needs_write = !lib_dir.join("zsh-hook.zsh").exists() || binary_newer_than(&lib_dir);
+    // Re-materialize if required files are missing or embedded hook version changed.
+    let required_files = [
+        shell_dir.join("tirith.sh"),
+        lib_dir.join("zsh-hook.zsh"),
+        lib_dir.join("bash-hook.bash"),
+        lib_dir.join("fish-hook.fish"),
+        lib_dir.join("powershell-hook.ps1"),
+    ];
+    let version_matches = fs::read_to_string(&version_path)
+        .ok()
+        .map(|v| v.trim() == current_version)
+        .unwrap_or(false);
+    let needs_write = !required_files.iter().all(|p| p.exists()) || !version_matches;
 
     if needs_write {
         fs::create_dir_all(&lib_dir).ok()?;
@@ -266,6 +279,7 @@ fn materialize_hooks() -> Option<PathBuf> {
         fs::write(lib_dir.join("bash-hook.bash"), assets::BASH_HOOK).ok()?;
         fs::write(lib_dir.join("fish-hook.fish"), assets::FISH_HOOK).ok()?;
         fs::write(lib_dir.join("powershell-hook.ps1"), assets::POWERSHELL_HOOK).ok()?;
+        fs::write(&version_path, format!("{current_version}\n")).ok()?;
 
         eprintln!(
             "tirith: materialized shell hooks to {}",
@@ -274,23 +288,6 @@ fn materialize_hooks() -> Option<PathBuf> {
     }
 
     Some(shell_dir)
-}
-
-/// Check if the binary is newer than existing hook files.
-fn binary_newer_than(lib_dir: &std::path::Path) -> bool {
-    let exe_mtime = std::env::current_exe()
-        .ok()
-        .and_then(|p| fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok());
-
-    let hook_mtime = fs::metadata(lib_dir.join("zsh-hook.zsh"))
-        .ok()
-        .and_then(|m| m.modified().ok());
-
-    match (exe_mtime, hook_mtime) {
-        (Some(exe), Some(hook)) => exe > hook,
-        _ => true, // If we can't compare, re-materialize
-    }
 }
 
 #[cfg(test)]

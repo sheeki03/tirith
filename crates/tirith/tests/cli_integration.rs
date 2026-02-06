@@ -1,6 +1,8 @@
 //! Integration tests for the tirith CLI binary.
 //! Tests exercise subcommands via process invocation.
 
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn tirith() -> Command {
@@ -312,6 +314,34 @@ fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
         stdout, "enter",
         "explicit TIRITH_BASH_MODE should take precedence"
     );
+}
+
+#[test]
+fn embedded_shell_hooks_match_repo_hooks() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let embedded_dir = manifest_dir.join("assets/shell/lib");
+    let repo_dir = manifest_dir.join("../../shell/lib");
+
+    if !repo_dir.exists() {
+        // Skip outside workspace layout (e.g. crate-only package test).
+        return;
+    }
+
+    for hook in [
+        "zsh-hook.zsh",
+        "bash-hook.bash",
+        "fish-hook.fish",
+        "powershell-hook.ps1",
+    ] {
+        let embedded = fs::read_to_string(embedded_dir.join(hook))
+            .unwrap_or_else(|e| panic!("failed reading embedded hook {hook}: {e}"));
+        let repo = fs::read_to_string(repo_dir.join(hook))
+            .unwrap_or_else(|e| panic!("failed reading repo hook {hook}: {e}"));
+        assert_eq!(
+            embedded, repo,
+            "embedded hook {hook} must stay in sync with shell/lib/{hook}"
+        );
+    }
 }
 
 // ─── Tier 1 early exit (no I/O) ───
