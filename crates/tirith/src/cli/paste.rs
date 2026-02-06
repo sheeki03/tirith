@@ -7,10 +7,19 @@ use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
 pub fn run(shell: &str, json: bool) -> i32 {
-    // Read raw bytes from stdin
+    // Read raw bytes from stdin with 1 MiB cap
+    const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
+
     let mut raw_bytes = Vec::new();
-    if let Err(e) = std::io::stdin().read_to_end(&mut raw_bytes) {
+    if let Err(e) = std::io::stdin()
+        .take(MAX_PASTE + 1)
+        .read_to_end(&mut raw_bytes)
+    {
         eprintln!("tirith: failed to read stdin: {e}");
+        return 1;
+    }
+    if raw_bytes.len() as u64 > MAX_PASTE {
+        eprintln!("tirith: paste input exceeds 1 MiB limit");
         return 1;
     }
 

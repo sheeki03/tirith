@@ -35,7 +35,7 @@ pub fn list(json: bool) -> i32 {
                 for r in &receipts {
                     eprintln!(
                         "  {} {} ({} bytes) {}",
-                        &r.sha256[..12],
+                        tirith_core::receipt::short_hash(&r.sha256),
                         r.url,
                         r.size,
                         r.timestamp
@@ -64,9 +64,15 @@ pub fn verify(sha256: &str, json: bool) -> i32 {
                     let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
                     println!();
                 } else if valid {
-                    eprintln!("tirith: receipt {} verified OK", &sha256[..12]);
+                    eprintln!(
+                        "tirith: receipt {} verified OK",
+                        tirith_core::receipt::short_hash(sha256)
+                    );
                 } else {
-                    eprintln!("tirith: receipt {} FAILED verification", &sha256[..12]);
+                    eprintln!(
+                        "tirith: receipt {} FAILED verification",
+                        tirith_core::receipt::short_hash(sha256)
+                    );
                 }
                 if valid {
                     0

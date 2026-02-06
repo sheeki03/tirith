@@ -334,6 +334,15 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(base.config_dir().join("tirith"))
 }
 
+/// Get tirith state directory.
+/// Must match bash-hook.bash path: ${XDG_STATE_HOME:-$HOME/.local/state}/tirith
+pub fn state_dir() -> Option<PathBuf> {
+    match std::env::var("XDG_STATE_HOME") {
+        Ok(val) if !val.trim().is_empty() => Some(PathBuf::from(val.trim()).join("tirith")),
+        _ => home::home_dir().map(|h| h.join(".local/state/tirith")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
