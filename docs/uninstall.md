@@ -2,7 +2,7 @@
 
 ## Remove shell hook
 
-Remove the `eval "$(tirith init)"` line from your shell config:
+Remove the `tirith init` hook line from your shell config:
 
 | Shell | Config file |
 |-------|-------------|

@@ -1,0 +1,15 @@
+post_install() {
+  echo ""
+  echo "Activate tirith by adding to your shell profile:"
+  echo ""
+  echo "  zsh  (~/.zshrc):                        eval \"\$(tirith init --shell zsh)\""
+  echo "  bash (~/.bashrc):                       eval \"\$(tirith init --shell bash)\""
+  echo "  fish (~/.config/fish/config.fish):      tirith init --shell fish | source"
+  echo ""
+  echo "Then restart your terminal. Verify: tirith doctor"
+  echo ""
+}
+
+post_upgrade() {
+  post_install
+}

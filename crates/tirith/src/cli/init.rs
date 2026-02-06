@@ -1,5 +1,9 @@
+#[cfg(unix)]
+use libc;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Command;
 
 use crate::assets;
 
@@ -20,7 +24,6 @@ pub fn run(shell: Option<&str>) -> i32 {
         }
         "bash" => {
             if let Some(dir) = &hook_dir {
-                println!(r#"export TIRITH_BASH_MODE=enter"#);
                 println!(r#"source "{}/lib/bash-hook.bash""#, dir.display());
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
@@ -54,16 +57,14 @@ pub fn run(shell: Option<&str>) -> i32 {
     }
 }
 
-fn detect_shell() -> &'static str {
+pub(crate) fn detect_shell() -> &'static str {
+    if let Some(shell) = detect_shell_from_parent() {
+        return shell;
+    }
+
     if let Ok(shell) = std::env::var("SHELL") {
-        if shell.contains("zsh") {
-            return "zsh";
-        }
-        if shell.contains("bash") {
-            return "bash";
-        }
-        if shell.contains("fish") {
-            return "fish";
+        if let Some(shell) = normalize_shell_name(&shell) {
+            return shell;
         }
     }
 
@@ -72,6 +73,76 @@ fn detect_shell() -> &'static str {
 
     #[cfg(not(windows))]
     "bash"
+}
+
+fn normalize_shell_name(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let base = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+
+    if base.contains("zsh") {
+        Some("zsh")
+    } else if base.contains("bash") {
+        Some("bash")
+    } else if base.contains("fish") {
+        Some("fish")
+    } else if base.contains("pwsh") || base.contains("powershell") {
+        Some("powershell")
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn detect_shell_from_parent() -> Option<&'static str> {
+    let mut pid = unsafe { libc::getppid() };
+
+    // Walk ancestors because the immediate parent may be a wrapper process
+    // (e.g., timeout/env) or a shell that exec'd into another program.
+    for _ in 0..8 {
+        if pid <= 1 {
+            return None;
+        }
+        let (name, parent_pid) = read_process(pid)?;
+        if let Some(shell) = normalize_shell_name(&name) {
+            return Some(shell);
+        }
+        if parent_pid == pid {
+            break;
+        }
+        pid = parent_pid;
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm=", "-o", "ppid="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let mut parts = line.split_whitespace();
+    let name = parts.next()?.to_string();
+    let ppid = parts.next()?.parse::<libc::pid_t>().ok()?;
+    Some((name, ppid))
+}
+
+#[cfg(not(unix))]
+fn detect_shell_from_parent() -> Option<&'static str> {
+    None
 }
 
 /// Find the shell hooks directory using the following search order:
@@ -219,5 +290,30 @@ fn binary_newer_than(lib_dir: &std::path::Path) -> bool {
     match (exe_mtime, hook_mtime) {
         (Some(exe), Some(hook)) => exe > hook,
         _ => true, // If we can't compare, re-materialize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_shell_name;
+
+    #[test]
+    fn normalize_shell_name_from_paths_and_login_shells() {
+        assert_eq!(normalize_shell_name("/bin/bash"), Some("bash"));
+        assert_eq!(normalize_shell_name("/opt/homebrew/bin/fish"), Some("fish"));
+        assert_eq!(normalize_shell_name("-zsh"), Some("zsh"));
+    }
+
+    #[test]
+    fn normalize_shell_name_supports_case_insensitive_names() {
+        assert_eq!(normalize_shell_name("BASH"), Some("bash"));
+        assert_eq!(normalize_shell_name("PwSh"), Some("powershell"));
+        assert_eq!(normalize_shell_name("PowerShell"), Some("powershell"));
+    }
+
+    #[test]
+    fn normalize_shell_name_rejects_unknown_values() {
+        assert_eq!(normalize_shell_name(""), None);
+        assert_eq!(normalize_shell_name("python"), None);
     }
 }

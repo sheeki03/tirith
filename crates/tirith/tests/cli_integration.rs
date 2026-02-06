@@ -248,6 +248,15 @@ fn init_bash_output() {
         .output()
         .expect("failed to run tirith");
     assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("bash-hook.bash"),
+        "init --shell bash should reference bash hook"
+    );
+    assert!(
+        !stdout.contains("export TIRITH_BASH_MODE=enter"),
+        "init --shell bash should not override user-provided TIRITH_BASH_MODE"
+    );
 }
 
 #[test]
@@ -257,6 +266,52 @@ fn init_unsupported_shell() {
         .output()
         .expect("failed to run tirith");
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_hook_defaults_to_preexec_in_ssh_sessions() {
+    let hook = format!(
+        "{}/assets/shell/lib/bash-hook.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let script = format!(
+        "unset TIRITH_BASH_MODE; export SSH_CONNECTION=1; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
+        hook
+    );
+    let out = Command::new("bash")
+        .args(["-lc", &script])
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout, "preexec",
+        "SSH sessions should default to preexec mode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
+    let hook = format!(
+        "{}/assets/shell/lib/bash-hook.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let script = format!(
+        "export TIRITH_BASH_MODE=enter; export SSH_CONNECTION=1; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
+        hook
+    );
+    let out = Command::new("bash")
+        .args(["-lc", &script])
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout, "enter",
+        "explicit TIRITH_BASH_MODE should take precedence"
+    );
 }
 
 // ─── Tier 1 early exit (no I/O) ───

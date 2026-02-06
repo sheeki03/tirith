@@ -1,14 +1,60 @@
 #!/usr/bin/env bash
 # tirith bash hook
 # Two modes controlled by TIRITH_BASH_MODE:
-#   enter (default): bind -x Enter override. Can block execution.
+#   enter (default outside SSH): bind -x Enter override. Can block execution.
 #   preexec: DEBUG trap warn-only. Cannot block.
 
 # Guard against double-loading
 [[ -n "$_TIRITH_BASH_LOADED" ]] && return
 _TIRITH_BASH_LOADED=1
 
-_TIRITH_BASH_MODE="${TIRITH_BASH_MODE:-enter}"
+# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
+# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
+# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+_tirith_output() {
+  if [[ "${TIRITH_OUTPUT:-}" == "stderr" ]] || [[ "$TERM_PROGRAM" == "WarpTerminal" ]]; then
+    printf '%s\n' "$1" >&2
+  else
+    printf '%s\n' "$1" >/dev/tty
+  fi
+}
+
+if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
+  _TIRITH_BASH_MODE="$TIRITH_BASH_MODE"
+elif [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" ]]; then
+  # SSH PTY environments are more reliable with DEBUG-trap preexec mode.
+  _TIRITH_BASH_MODE="preexec"
+else
+  _TIRITH_BASH_MODE="enter"
+fi
+
+# Queue command execution into PROMPT_COMMAND so interactive commands
+# (ssh, gcloud compute ssh, etc.) run outside the bind -x callback.
+_tirith_register_prompt_hook() {
+  [[ -n "${_TIRITH_PROMPT_HOOKED:-}" ]] && return
+  _TIRITH_PROMPT_HOOKED=1
+
+  _tirith_prompt_hook() {
+    local pending_eval="${_TIRITH_PENDING_EVAL:-}"
+    local pending_source="${_TIRITH_PENDING_SOURCE:-}"
+    unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_SOURCE
+
+    if [[ -n "$pending_source" ]]; then
+      source "$pending_source"
+      rm -f "$pending_source"
+    elif [[ -n "$pending_eval" ]]; then
+      eval -- "$pending_eval"
+    fi
+  }
+
+  if declare -p PROMPT_COMMAND >/dev/null 2>&1 && [[ "$(declare -p PROMPT_COMMAND)" == "declare -a"* ]]; then
+    PROMPT_COMMAND=(_tirith_prompt_hook "${PROMPT_COMMAND[@]}")
+  elif [[ -n "${PROMPT_COMMAND:-}" ]]; then
+    PROMPT_COMMAND="_tirith_prompt_hook;${PROMPT_COMMAND}"
+  else
+    PROMPT_COMMAND="_tirith_prompt_hook"
+  fi
+}
 
 # Check if a command is unsafe to eval (heredocs, multiline, etc.)
 _tirith_unsafe_to_eval() {
@@ -51,7 +97,16 @@ _tirith_unsafe_to_eval() {
 if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
   # Mode: enter — bind -x Enter override with full block+warn capability
 
+  _tirith_register_prompt_hook
+
   _tirith_enter() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+
+    # Ensure terminal state is restored on exit
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Empty input: just return (shows new prompt)
     if [[ -z "$READLINE_LINE" ]]; then
       READLINE_LINE=""
@@ -79,12 +134,16 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
     if [[ $rc -eq 1 ]]; then
       # Block: show the command that was blocked, print warning, clear line
-      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
+      _tirith_output ""
+      _tirith_output "command> $READLINE_LINE"
+      [[ -n "$output" ]] && _tirith_output "$output"
       READLINE_LINE=""
       READLINE_POINT=0
     elif [[ $rc -eq 2 ]]; then
       # Warn: print warning then execute
-      printf '\ncommand> %s\n%s\n' "$READLINE_LINE" "$output" >/dev/tty
+      _tirith_output ""
+      _tirith_output "command> $READLINE_LINE"
+      [[ -n "$output" ]] && _tirith_output "$output"
       # Fall through to execute
     fi
 
@@ -103,18 +162,17 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
         # Write to a temp file and source it to avoid eval pitfalls
         local tmpf
         tmpf=$(mktemp "${TMPDIR:-/tmp}/tirith.XXXXXX") || {
-          # If mktemp fails, just execute directly — fail-open
-          eval -- "$cmd"
+          # If mktemp fails, defer direct eval — fail-open
+          _TIRITH_PENDING_EVAL="$cmd"
           return
         }
         printf '%s\n' "$cmd" > "$tmpf"
-        source "$tmpf"
-        rm -f "$tmpf"
+        _TIRITH_PENDING_SOURCE="$tmpf"
         return
       fi
 
       history -s -- "$cmd"
-      eval -- "$cmd"
+      _TIRITH_PENDING_EVAL="$cmd"
     fi
   }
 
@@ -123,6 +181,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
   # Bracketed paste interception
   _tirith_paste() {
+    # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null) || true
+    trap 'stty "$_saved_stty" 2>/dev/null || true' RETURN
+
     # Read pasted content until bracketed paste end sequence (\e[201~)
     local pasted=""
     local char
@@ -146,11 +209,13 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
 
       if [[ $rc -eq 1 ]]; then
         # Block: show what was pasted, then warning, discard paste
-        printf '\npaste> %s\n%s\n' "$pasted" "$output" >/dev/tty
+        _tirith_output ""
+        _tirith_output "paste> $pasted"
+        [[ -n "$output" ]] && _tirith_output "$output"
         return
       elif [[ $rc -eq 2 ]]; then
         # Warn: show warning, keep paste
-        [[ -n "$output" ]] && printf '\n%s\n' "$output" >/dev/tty
+        [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
       fi
     fi
 

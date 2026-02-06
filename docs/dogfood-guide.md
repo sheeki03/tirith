@@ -10,7 +10,9 @@
 2. Activate in your shell:
    ```sh
    # Add to your shell config (~/.zshrc, ~/.bashrc, etc.)
-   eval "$(tirith init)"
+   eval "$(tirith init --shell zsh)"   # zsh
+   eval "$(tirith init --shell bash)"  # bash
+   tirith init --shell fish | source   # fish
    ```
 
 3. Restart your shell or source the config.

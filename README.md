@@ -21,7 +21,20 @@ Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, an
 **Tirith stands at the gate.**
 
 ```bash
-brew install sheeki03/tap/tirith && eval "$(tirith init)"
+brew install sheeki03/tap/tirith
+```
+
+Then activate in your shell profile:
+
+```bash
+# zsh
+eval "$(tirith init --shell zsh)"
+
+# bash
+eval "$(tirith init --shell bash)"
+
+# fish
+tirith init --shell fish | source
 ```
 
 That's it. Every command you run is now guarded. Zero friction on clean input. Sub-millisecond overhead. You forget it's there until it saves you.
@@ -176,7 +189,9 @@ docker run --rm ghcr.io/sheeki03/tirith check -- "curl https://example.com | bas
 Add to your shell profile (`.zshrc`, `.bashrc`, or `config.fish`):
 
 ```bash
-eval "$(tirith init)"
+eval "$(tirith init --shell zsh)"   # in ~/.zshrc
+eval "$(tirith init --shell bash)"  # in ~/.bashrc
+tirith init --shell fish | source   # in ~/.config/fish/config.fish
 ```
 
 | Shell | Hook type | Tested on |
@@ -185,6 +200,8 @@ eval "$(tirith init)"
 | bash | preexec (two modes) | 5.0+ |
 | fish | fish_preexec event | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
+
+In bash, enter mode is used by default, but SSH sessions automatically fall back to preexec mode for PTY compatibility.
 
 ### Shell Integrations
 
@@ -249,7 +266,7 @@ $ tirith receipt verify <sha256>  # verify a specific receipt
 Explains the last rule that triggered — what it detected, why it matters, and what to do about it.
 
 ### `tirith init`
-Prints the shell hook for your current shell. Add `eval "$(tirith init)"` to your shell profile to activate tirith.
+Prints the shell hook for your current shell. Add `eval "$(tirith init)"` to your shell profile to activate tirith. If you use multiple shells, you can force a specific one with `tirith init --shell bash|zsh|fish`.
 
 ### `tirith doctor`
 Diagnostic check — shows detected shell, hook status, policy file location, and configuration. Run this if something isn't working.

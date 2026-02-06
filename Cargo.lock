@@ -1535,6 +1535,7 @@ dependencies = [
  "clap_mangen",
  "home",
  "is-terminal",
+ "libc",
  "serde",
  "serde_json",
  "tirith-core",

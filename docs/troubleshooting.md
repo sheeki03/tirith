@@ -6,16 +6,27 @@ Run `tirith doctor` to see the hook directory being used and whether hooks were 
 
 If hooks are not found:
 1. Ensure `tirith` is in your PATH
-2. Run `eval "$(tirith init)"` and check for error messages
+2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)
 3. Set `TIRITH_SHELL_DIR` to point to your shell hooks directory explicitly
 
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:
-- **enter mode** (default): Binds to Enter key via `bind -x`. Intercepts commands before execution.
+- **enter mode** (default outside SSH): Binds to Enter key via `bind -x`. Intercepts commands before execution.
 - **preexec mode**: Uses `DEBUG` trap. Compatible with more environments but slightly different behavior.
 
-Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec`
+Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec` (set before `tirith init` in your shell rc)
+
+## Bash: no visible input after `ssh` / `gcloud compute ssh`
+
+tirith automatically defaults to preexec mode when `SSH_CONNECTION`, `SSH_TTY`, or `SSH_CLIENT` is set. If you still see input issues, force preexec explicitly:
+
+```bash
+export TIRITH_BASH_MODE=preexec
+eval "$(tirith init --shell bash)"
+```
+
+This avoids `bind -x` enter interception in environments where PTY handling is fragile.
 
 ## PowerShell: PSReadLine conflicts
 
