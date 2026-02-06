@@ -34,7 +34,19 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
         };
 
         if let Ok(json) = serde_json::to_string_pretty(&trigger) {
-            let _ = std::fs::write(&tmp, &json);
+            {
+                use std::io::Write;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                if let Ok(mut f) = opts.open(&tmp) {
+                    let _ = f.write_all(json.as_bytes());
+                }
+            }
             let _ = std::fs::rename(&tmp, &path);
         }
     }

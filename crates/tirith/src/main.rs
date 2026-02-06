@@ -110,6 +110,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Remove persistent bash safe-mode flag (re-enables enter mode)
+        #[arg(long, conflicts_with = "json")]
+        reset_bash_safe_mode: bool,
     },
 
     /// Generate shell completions
@@ -176,7 +179,10 @@ fn main() {
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),
 
-        Commands::Doctor { json } => cli::doctor::run(json),
+        Commands::Doctor {
+            json,
+            reset_bash_safe_mode,
+        } => cli::doctor::run(json, reset_bash_safe_mode),
 
         Commands::Completions { shell } => cli::completions::run(shell),
 

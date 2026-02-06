@@ -28,6 +28,9 @@ uuid = { workspace = true }
 home = { workspace = true }
 libc = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
