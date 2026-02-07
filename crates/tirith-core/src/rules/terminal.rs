@@ -115,7 +115,7 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
 
 fn looks_like_hidden_command(line: &str) -> bool {
     let suspicious = [
-        "curl ", "wget ", "bash", "/bin/", "sudo ", "rm ", "chmod ", "eval ", "exec ", "> /",
+        "curl ", "wget ", "http ", "https ", "xh ", "bash", "/bin/", "sudo ", "rm ", "chmod ", "eval ", "exec ", "> /",
         ">> /", "| sh",
     ];
     suspicious.iter().any(|p| line.contains(p))
