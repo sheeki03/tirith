@@ -467,6 +467,9 @@ fn is_source_command(cmd: &str) -> bool {
         cmd,
         "curl"
             | "wget"
+            | "http"
+            | "https"
+            | "xh"
             | "fetch"
             | "scp"
             | "rsync"

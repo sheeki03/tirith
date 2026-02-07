@@ -249,6 +249,18 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "wget download command",
     },
     PatternEntry {
+        id: "httpie",
+        tier1_exec_fragments: &[r"(?:^|\s)https?\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "HTTPie CLI download command (http/https)",
+    },
+    PatternEntry {
+        id: "xh",
+        tier1_exec_fragments: &[r"(?:^|\s)xh\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "xh CLI download command (HTTPie-compatible)",
+    },
+    PatternEntry {
         id: "scp",
         tier1_exec_fragments: &[r"scp\s"],
         tier1_paste_only_fragments: &[],

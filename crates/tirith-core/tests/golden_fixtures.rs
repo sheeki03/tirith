@@ -586,7 +586,7 @@ fn test_extractor_ids_cover_rule_triggers() {
         ("path rules", &["standard_url"]),
         (
             "transport rules",
-            &["standard_url", "curl", "wget", "scp", "rsync"],
+            &["standard_url", "curl", "wget", "httpie", "xh", "scp", "rsync"],
         ),
         ("ecosystem rules", &["standard_url", "docker_command"]),
         // Command shape rules need their own patterns

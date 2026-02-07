@@ -39,6 +39,8 @@ pub enum RuleId {
     PipeToInterpreter,
     CurlPipeShell,
     WgetPipeShell,
+    HttpiePipeShell,
+    XhPipeShell,
     DotfileOverwrite,
     ArchiveExtract,
 
