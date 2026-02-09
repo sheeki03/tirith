@@ -304,26 +304,35 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       READLINE_LINE=""
       READLINE_POINT=0
 
+      history -s -- "$cmd"
+
+      # Execute directly with full terminal I/O.  bind -x disconnects
+      # stdin from the terminal, so we must restore it from /dev/tty.
+      # We also save/restore terminal (stty) state since bind -x may
+      # alter it, and child processes (pacman, etc.) need canonical mode
+      # to read interactive input.
+      local _pre_stty
+      _pre_stty=$(stty -g </dev/tty 2>/dev/null) || true
+      stty sane </dev/tty 2>/dev/null || true
+
       # Check if safe to eval
       if _tirith_unsafe_to_eval "$cmd"; then
-        # Unsafe for eval: fall back to preexec-style warn-only
-        # Add to history and print warning that blocking is limited
-        history -s -- "$cmd"
-        >&2 printf 'tirith: complex command — executing without block capability\n'
-        # Write to a temp file and source it to avoid eval pitfalls
+        # Unsafe for eval: write to temp file and source it
         local tmpf
         tmpf=$(mktemp "${TMPDIR:-/tmp}/tirith.XXXXXX") || {
-          # If mktemp fails, defer direct eval — fail-open
-          _TIRITH_PENDING_EVAL="$cmd"
+          eval -- "$cmd" </dev/tty
+          [[ -n "$_pre_stty" ]] && stty "$_pre_stty" </dev/tty 2>/dev/null || true
           return
         }
         printf '%s\n' "$cmd" > "$tmpf"
-        _TIRITH_PENDING_SOURCE="$tmpf"
+        source "$tmpf" </dev/tty
+        rm -f "$tmpf"
+        [[ -n "$_pre_stty" ]] && stty "$_pre_stty" </dev/tty 2>/dev/null || true
         return
       fi
 
-      history -s -- "$cmd"
-      _TIRITH_PENDING_EVAL="$cmd"
+      eval -- "$cmd" </dev/tty
+      [[ -n "$_pre_stty" ]] && stty "$_pre_stty" </dev/tty 2>/dev/null || true
     }
 
     # Bracketed paste interception
