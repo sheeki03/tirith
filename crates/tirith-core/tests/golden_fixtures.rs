@@ -371,6 +371,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "pipe_to_interpreter",
     "curl_pipe_shell",
     "wget_pipe_shell",
+    "httpie_pipe_shell",
+    "xh_pipe_shell",
     "dotfile_overwrite",
     "archive_extract",
     // Environment
@@ -479,6 +481,8 @@ fn test_rule_id_list_is_complete() {
         RuleId::PipeToInterpreter,
         RuleId::CurlPipeShell,
         RuleId::WgetPipeShell,
+        RuleId::HttpiePipeShell,
+        RuleId::XhPipeShell,
         RuleId::DotfileOverwrite,
         RuleId::ArchiveExtract,
         RuleId::ProxyEnvSet,
@@ -586,7 +590,15 @@ fn test_extractor_ids_cover_rule_triggers() {
         ("path rules", &["standard_url"]),
         (
             "transport rules",
-            &["standard_url", "curl", "wget", "scp", "rsync"],
+            &[
+                "standard_url",
+                "curl",
+                "wget",
+                "httpie",
+                "xh",
+                "scp",
+                "rsync",
+            ],
         ),
         ("ecosystem rules", &["standard_url", "docker_command"]),
         // Command shape rules need their own patterns

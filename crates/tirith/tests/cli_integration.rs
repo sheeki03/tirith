@@ -91,7 +91,7 @@ fn check_json_output() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).expect("output should be valid JSON");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["action"], "block");
     assert!(!json["findings"].as_array().unwrap().is_empty());
 }
@@ -106,7 +106,7 @@ fn check_json_clean_output() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).expect("output should be valid JSON");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["action"], "allow");
 }
 

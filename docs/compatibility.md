@@ -33,7 +33,8 @@ Exit codes are stable:
 
 ## JSON Output
 
-- `schema_version` is emitted in all JSON output (currently version 2)
+- `schema_version` is emitted in all JSON output (currently version 3)
+- Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version
 - The `findings` array structure is stable

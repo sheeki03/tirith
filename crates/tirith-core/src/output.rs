@@ -2,7 +2,7 @@ use std::io::Write;
 
 use crate::verdict::{Action, Evidence, Finding, Severity, Verdict};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// JSON output wrapper with schema version.
 #[derive(serde::Serialize)]
@@ -59,6 +59,7 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
             Severity::High => "\x1b[31m",     // red
             Severity::Medium => "\x1b[33m",   // yellow
             Severity::Low => "\x1b[36m",      // cyan
+            Severity::Info => "\x1b[90m",     // dim/gray
         };
         let reset = "\x1b[0m";
 

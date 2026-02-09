@@ -67,6 +67,7 @@ fn severity_to_score(max: Severity, count: usize) -> (u32, &'static str) {
         Severity::High => 70,
         Severity::Medium => 40,
         Severity::Low => 15,
+        Severity::Info => 0,
     };
     let bonus = (count.saturating_sub(1) as u32) * 5;
     let score = (base + bonus).min(100);
