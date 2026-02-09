@@ -289,7 +289,11 @@ fn test_tier1_coverage() {
                     || byte_scan.has_control_chars
                     || byte_scan.has_bidi_controls
                     || byte_scan.has_zero_width
-                    || byte_scan.has_invalid_utf8;
+                    || byte_scan.has_invalid_utf8
+                    || byte_scan.has_unicode_tags
+                    || byte_scan.has_variation_selectors
+                    || byte_scan.has_invisible_math_operators
+                    || byte_scan.has_invisible_whitespace;
 
                 if byte_triggered {
                     continue; // Byte scan catches it
@@ -299,7 +303,13 @@ fn test_tier1_coverage() {
             // Exec context: bidi/zero-width check bypasses tier 1 regex (M4 fix)
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
-                if byte_scan.has_bidi_controls || byte_scan.has_zero_width {
+                if byte_scan.has_bidi_controls
+                    || byte_scan.has_zero_width
+                    || byte_scan.has_unicode_tags
+                    || byte_scan.has_variation_selectors
+                    || byte_scan.has_invisible_math_operators
+                    || byte_scan.has_invisible_whitespace
+                {
                     continue;
                 }
             }
@@ -367,6 +377,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "bidi_controls",
     "zero_width_chars",
     "hidden_multiline",
+    "unicode_tags",
+    "invisible_math_operator",
+    "variation_selector",
+    "invisible_whitespace",
     // Command shape
     "pipe_to_interpreter",
     "curl_pipe_shell",
@@ -478,6 +492,10 @@ fn test_rule_id_list_is_complete() {
         RuleId::BidiControls,
         RuleId::ZeroWidthChars,
         RuleId::HiddenMultiline,
+        RuleId::UnicodeTags,
+        RuleId::InvisibleMathOperator,
+        RuleId::VariationSelector,
+        RuleId::InvisibleWhitespace,
         RuleId::PipeToInterpreter,
         RuleId::CurlPipeShell,
         RuleId::WgetPipeShell,
@@ -527,9 +545,12 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter", // cat script | bash
-        "bidi_controls",       // exec context, no URL needed
-        "zero_width_chars",    // exec context, no URL needed
+        "pipe_to_interpreter",     // cat script | bash
+        "bidi_controls",           // exec context, no URL needed
+        "zero_width_chars",        // exec context, no URL needed
+        "unicode_tags",            // byte-level, no URL needed
+        "invisible_math_operator", // byte-level, no URL needed
+        "invisible_whitespace",    // byte-level, no URL needed
     ]
     .into_iter()
     .collect();

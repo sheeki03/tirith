@@ -223,3 +223,76 @@ input = "echo \u2066text"
 context = "paste"
 expected_action = "block"
 expected_rules = ["bidi_controls"]
+
+# ─── Part 2: Invisible character hardening ───
+
+[[fixture]]
+name = "unicode_tags_paste"
+min_milestone = 2
+input = "echo hidden"
+context = "paste"
+expected_action = "block"
+expected_rules = ["unicode_tags"]
+raw_bytes = [101, 99, 104, 111, 32, 243, 160, 129, 136, 243, 160, 129, 169]
+
+[[fixture]]
+name = "unicode_tags_exec"
+min_milestone = 2
+input = "echo \U000E0048\U000E0065\U000E006C\U000E006C\U000E006F"
+context = "exec"
+expected_action = "block"
+expected_rules = ["unicode_tags"]
+
+[[fixture]]
+name = "variation_selector_paste"
+min_milestone = 2
+input = "A"
+context = "paste"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+raw_bytes = [65, 239, 184, 143]
+
+[[fixture]]
+name = "invisible_whitespace_paste"
+min_milestone = 2
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+raw_bytes = [101, 99, 104, 111, 226, 128, 138, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "invisible_math_operator_paste"
+min_milestone = 2
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_math_operator"]
+raw_bytes = [101, 99, 104, 111, 226, 129, 161, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "cgj_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 205, 143, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "soft_hyphen_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 194, 173, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "word_joiner_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 226, 129, 160, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]

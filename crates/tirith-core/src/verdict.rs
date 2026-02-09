@@ -34,6 +34,10 @@ pub enum RuleId {
     BidiControls,
     ZeroWidthChars,
     HiddenMultiline,
+    UnicodeTags,
+    InvisibleMathOperator,
+    VariationSelector,
+    InvisibleWhitespace,
 
     // Command shape rules
     PipeToInterpreter,

@@ -74,7 +74,94 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
         });
     }
 
+    if scan.has_invisible_math_operators {
+        findings.push(Finding {
+            rule_id: RuleId::InvisibleMathOperator,
+            severity: Severity::Medium,
+            title: "Invisible math operator characters detected".to_string(),
+            description: "Content contains invisible Unicode math operators (U+2061–U+2064) that could be used to obfuscate content".to_string(),
+            evidence: scan.details.iter()
+                .filter(|d| d.description.contains("invisible math operator"))
+                .map(|d| Evidence::ByteSequence {
+                    offset: d.offset,
+                    hex: format!("0x{:02x}", d.byte),
+                    description: d.description.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    if scan.has_unicode_tags {
+        let decoded = decode_unicode_tags(input);
+        findings.push(Finding {
+            rule_id: RuleId::UnicodeTags,
+            severity: Severity::Critical,
+            title: "Unicode Tags (hidden ASCII) detected".to_string(),
+            description: "Content contains Unicode Tag characters (U+E0000–U+E007F) that encode hidden ASCII text invisible to the user".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: if decoded.is_empty() {
+                    "Hidden text could not be decoded".to_string()
+                } else {
+                    format!("Hidden text: \"{}\"", truncate(&decoded, 200))
+                },
+            }],
+        });
+    }
+
+    if scan.has_variation_selectors {
+        findings.push(Finding {
+            rule_id: RuleId::VariationSelector,
+            severity: Severity::Info,
+            title: "Variation selector characters detected".to_string(),
+            description: "Content contains Unicode variation selectors (VS1-256). These are commonly used in emoji sequences but may indicate obfuscation in command contexts".to_string(),
+            evidence: scan.details.iter()
+                .filter(|d| d.description.contains("variation selector"))
+                .map(|d| Evidence::ByteSequence {
+                    offset: d.offset,
+                    hex: format!("0x{:02x}", d.byte),
+                    description: d.description.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    if scan.has_invisible_whitespace {
+        findings.push(Finding {
+            rule_id: RuleId::InvisibleWhitespace,
+            severity: Severity::Medium,
+            title: "Invisible whitespace characters detected".to_string(),
+            description: "Content contains unusual invisible whitespace (hair space, thin space, narrow no-break space) that could be used to obfuscate commands or URLs".to_string(),
+            evidence: scan.details.iter()
+                .filter(|d| d.description.contains("invisible whitespace"))
+                .map(|d| Evidence::ByteSequence {
+                    offset: d.offset,
+                    hex: format!("0x{:02x}", d.byte),
+                    description: d.description.clone(),
+                })
+                .collect(),
+        });
+    }
+
     findings
+}
+
+/// Decode Unicode Tag characters (U+E0000–U+E007F) to their hidden ASCII message.
+/// Each tag character encodes one ASCII byte: codepoint - 0xE0000 = ASCII value.
+fn decode_unicode_tags(input: &[u8]) -> String {
+    let Ok(s) = std::str::from_utf8(input) else {
+        return String::new();
+    };
+    let mut decoded = String::new();
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if (0xE0001..=0xE007F).contains(&cp) {
+            let ascii = (cp - 0xE0000) as u8;
+            if ascii.is_ascii_graphic() || ascii == b' ' {
+                decoded.push(ascii as char);
+            }
+        }
+    }
+    decoded
 }
 
 /// Check for hidden multiline content in string input.

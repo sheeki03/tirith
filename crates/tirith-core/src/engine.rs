@@ -51,6 +51,10 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_bidi_controls
                 || scan.has_zero_width
                 || scan.has_invalid_utf8
+                || scan.has_unicode_tags
+                || scan.has_variation_selectors
+                || scan.has_invisible_math_operators
+                || scan.has_invisible_whitespace
         } else {
             false
         }
@@ -61,10 +65,15 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     // Step 2: URL-like regex scan
     let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
 
-    // Step 3 (exec only): check for bidi/zero-width chars even without URLs
+    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs
     let exec_bidi_triggered = if ctx.scan_context == ScanContext::Exec {
         let scan = extract::scan_bytes(ctx.input.as_bytes());
-        scan.has_bidi_controls || scan.has_zero_width
+        scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
     } else {
         false
     };
@@ -141,18 +150,28 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(multiline_findings);
     }
 
-    // Bidi and zero-width checks apply to both exec and paste contexts
-    // (exec context: bidi in URLs/commands is always dangerous)
+    // Invisible character checks apply to both exec and paste contexts
     if ctx.scan_context == ScanContext::Exec {
         let byte_input = ctx.input.as_bytes();
         let scan = extract::scan_bytes(byte_input);
-        if scan.has_bidi_controls || scan.has_zero_width {
+        if scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
+        {
             let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-            // Only keep bidi and zero-width findings for exec context
+            // Only keep invisible-char findings for exec context
             findings.extend(byte_findings.into_iter().filter(|f| {
                 matches!(
                     f.rule_id,
-                    crate::verdict::RuleId::BidiControls | crate::verdict::RuleId::ZeroWidthChars
+                    crate::verdict::RuleId::BidiControls
+                        | crate::verdict::RuleId::ZeroWidthChars
+                        | crate::verdict::RuleId::UnicodeTags
+                        | crate::verdict::RuleId::InvisibleMathOperator
+                        | crate::verdict::RuleId::VariationSelector
+                        | crate::verdict::RuleId::InvisibleWhitespace
                 )
             }));
         }

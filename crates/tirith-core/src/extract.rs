@@ -49,6 +49,10 @@ pub struct ByteScanResult {
     pub has_bidi_controls: bool,
     pub has_zero_width: bool,
     pub has_invalid_utf8: bool,
+    pub has_unicode_tags: bool,
+    pub has_variation_selectors: bool,
+    pub has_invisible_math_operators: bool,
+    pub has_invisible_whitespace: bool,
     pub details: Vec<ByteFinding>,
 }
 
@@ -74,6 +78,10 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         has_bidi_controls: false,
         has_zero_width: false,
         has_invalid_utf8: false,
+        has_unicode_tags: false,
+        has_variation_selectors: false,
+        has_invisible_math_operators: false,
+        has_invisible_whitespace: false,
         details: Vec::new(),
     };
 
@@ -169,13 +177,49 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("bidi control U+{:04X}", ch as u32),
                     });
                 }
-                // Zero-width characters
+                // Zero-width characters (ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner)
                 if is_zero_width(ch) {
                     result.has_zero_width = true;
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
                         description: format!("zero-width character U+{:04X}", ch as u32),
+                    });
+                }
+                // Unicode Tags (hidden ASCII encoding) U+E0000–U+E007F
+                if is_unicode_tag(ch) {
+                    result.has_unicode_tags = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        description: format!("unicode tag U+{:04X}", ch as u32),
+                    });
+                }
+                // Variation selectors: U+FE00–U+FE0F and U+E0100–U+E01EF
+                if is_variation_selector(ch) {
+                    result.has_variation_selectors = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        description: format!("variation selector U+{:04X}", ch as u32),
+                    });
+                }
+                // Invisible math operators U+2061–U+2064
+                if is_invisible_math_operator(ch) {
+                    result.has_invisible_math_operators = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        description: format!("invisible math operator U+{:04X}", ch as u32),
+                    });
+                }
+                // Invisible whitespace: Hair Space, Thin Space, Narrow No-Break Space
+                if is_invisible_whitespace(ch) {
+                    result.has_invisible_whitespace = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        description: format!("invisible whitespace U+{:04X}", ch as u32),
                     });
                 }
                 i += ch.len_utf8();
@@ -215,6 +259,38 @@ fn is_zero_width(ch: char) -> bool {
         | '\u{200C}' // ZWNJ
         | '\u{200D}' // ZWJ
         | '\u{FEFF}' // BOM / ZWNBSP
+        | '\u{034F}' // Combining Grapheme Joiner
+        | '\u{00AD}' // Soft Hyphen
+        | '\u{2060}' // Word Joiner
+    )
+}
+
+/// Check if a character is a Unicode Tag (hidden ASCII encoding).
+fn is_unicode_tag(ch: char) -> bool {
+    ('\u{E0000}'..='\u{E007F}').contains(&ch)
+}
+
+/// Check if a character is a variation selector.
+fn is_variation_selector(ch: char) -> bool {
+    // VS1-16
+    ('\u{FE00}'..='\u{FE0F}').contains(&ch)
+    // VS17-256 (Supplementary)
+    || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
+}
+
+/// Check if a character is an invisible math operator.
+fn is_invisible_math_operator(ch: char) -> bool {
+    // Function Application, Invisible Times, Invisible Separator, Invisible Plus
+    ('\u{2061}'..='\u{2064}').contains(&ch)
+}
+
+/// Check if a character is an invisible whitespace variant.
+fn is_invisible_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200A}' // Hair Space
+        | '\u{2009}' // Thin Space
+        | '\u{202F}' // Narrow No-Break Space
     )
 }
 
