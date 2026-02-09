@@ -391,6 +391,14 @@ const ALL_RULE_IDS: &[&str] = &[
     "archive_extract",
     // Environment
     "proxy_env_set",
+    "sensitive_env_export",
+    "code_injection_env",
+    "interpreter_hijack_env",
+    "shell_injection_env",
+    // Network destination
+    "metadata_endpoint",
+    "private_network_access",
+    "command_network_deny",
     // Ecosystem
     "git_typosquat",
     "docker_untrusted_registry",
@@ -437,7 +445,11 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
-const EXTERNALLY_TRIGGERED_RULES: &[&str] = &["proxy_env_set", "policy_blocklisted"];
+const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
+    "proxy_env_set",
+    "policy_blocklisted",
+    "command_network_deny",
+];
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
@@ -504,6 +516,13 @@ fn test_rule_id_list_is_complete() {
         RuleId::DotfileOverwrite,
         RuleId::ArchiveExtract,
         RuleId::ProxyEnvSet,
+        RuleId::SensitiveEnvExport,
+        RuleId::CodeInjectionEnv,
+        RuleId::InterpreterHijackEnv,
+        RuleId::ShellInjectionEnv,
+        RuleId::MetadataEndpoint,
+        RuleId::PrivateNetworkAccess,
+        RuleId::CommandNetworkDeny,
         RuleId::GitTyposquat,
         RuleId::DockerUntrustedRegistry,
         RuleId::PipUrlInstall,
@@ -551,6 +570,10 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "unicode_tags",            // byte-level, no URL needed
         "invisible_math_operator", // byte-level, no URL needed
         "invisible_whitespace",    // byte-level, no URL needed
+        "code_injection_env",      // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",     // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",  // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",    // export OPENAI_API_KEY=, no URL needed
     ]
     .into_iter()
     .collect();
@@ -637,6 +660,13 @@ fn test_extractor_ids_cover_rule_triggers() {
                 "powershell_invoke_expression",
             ],
         ),
+        // Environment variable detection
+        (
+            "env var detection",
+            &["env_var_dangerous", "env_var_hijack", "env_var_sensitive"],
+        ),
+        // Network destination detection
+        ("metadata endpoint", &["metadata_endpoint"]),
         // Deception triggers
         ("punycode detection", &["punycode_domain"]),
         ("lookalike TLD", &["lookalike_tld"]),

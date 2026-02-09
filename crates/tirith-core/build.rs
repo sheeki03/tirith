@@ -357,6 +357,41 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Archive extraction commands that may target sensitive paths",
     },
     PatternEntry {
+        id: "env_var_dangerous",
+        tier1_exec_fragments: &[
+            r"LD_PRELOAD",
+            r"LD_LIBRARY_PATH",
+            r"LD_AUDIT",
+            r"DYLD_INSERT_LIBRARIES",
+            r"DYLD_LIBRARY_PATH",
+            r"BASH_ENV\s*=",
+            r"\bENV\s*=",
+            r"PROMPT_COMMAND\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Code injection and shell injection environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_hijack",
+        tier1_exec_fragments: &[r"(?:PYTHONPATH|NODE_OPTIONS|RUBYLIB|PERL5LIB)\s*="],
+        tier1_paste_only_fragments: &[],
+        notes: "Interpreter hijacking environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_sensitive",
+        tier1_exec_fragments: &[
+            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Sensitive API key environment variable exports",
+    },
+    PatternEntry {
+        id: "metadata_endpoint",
+        tier1_exec_fragments: &[r"169\.254\.169\.254", r"100\.100\.100\.200"],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud metadata endpoint IP addresses (AWS, Alibaba Cloud)",
+    },
+    PatternEntry {
         id: "non_ascii_paste",
         tier1_exec_fragments: &[],
         tier1_paste_only_fragments: &[r"[^\x00-\x7F]"],

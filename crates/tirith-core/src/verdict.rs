@@ -50,6 +50,15 @@ pub enum RuleId {
 
     // Environment rules
     ProxyEnvSet,
+    SensitiveEnvExport,
+    CodeInjectionEnv,
+    InterpreterHijackEnv,
+    ShellInjectionEnv,
+
+    // Network destination rules
+    MetadataEndpoint,
+    PrivateNetworkAccess,
+    CommandNetworkDeny,
 
     // Ecosystem rules
     GitTyposquat,
