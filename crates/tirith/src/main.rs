@@ -135,6 +135,10 @@ enum Commands {
         ignore: Vec<String>,
     },
 
+    /// Run as MCP server (JSON-RPC over stdio)
+    #[command(name = "mcp-server")]
+    McpServer,
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -218,6 +222,8 @@ fn main() {
             json,
             &ignore,
         ),
+
+        Commands::McpServer => cli::mcp_server::run(),
 
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),

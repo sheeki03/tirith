@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod init;
 pub mod last_trigger;
 pub mod manpage;
+pub mod mcp_server;
 pub mod paste;
 pub mod receipt;
 pub mod scan;

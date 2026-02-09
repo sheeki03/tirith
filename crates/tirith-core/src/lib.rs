@@ -4,6 +4,7 @@ pub mod data;
 pub mod engine;
 pub mod extract;
 pub mod homoglyph;
+pub mod mcp;
 pub mod normalize;
 pub mod output;
 pub mod parse;
