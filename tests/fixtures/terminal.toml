@@ -296,3 +296,36 @@ context = "paste"
 expected_action = "block"
 expected_rules = ["zero_width_chars"]
 raw_bytes = [99, 117, 114, 226, 129, 160, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "invisible_whitespace_exec"
+min_milestone = 2
+input = "echo\u2009hello"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+
+[[fixture]]
+name = "invisible_math_operator_exec"
+min_milestone = 2
+input = "echo\u2061hello"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["invisible_math_operator"]
+
+[[fixture]]
+name = "variation_selector_exec"
+min_milestone = 2
+input = "A\uFE01"
+context = "exec"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+
+[[fixture]]
+name = "variation_selector_supplementary_paste"
+min_milestone = 2
+input = "A"
+context = "paste"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+raw_bytes = [65, 243, 160, 132, 128]
