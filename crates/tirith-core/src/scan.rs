@@ -67,6 +67,9 @@ const PRIORITY_PARENT_DIRS: &[&str] = &[
 ];
 
 /// Run a file scan operation.
+///
+/// Detection is always free (ADR-13). `max_files` is a caller-provided safety
+/// cap (e.g. for resource-constrained CI), not a license gate.
 pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut files = collect_files(&config.path, config.recursive, &config.ignore_patterns);
 
@@ -85,7 +88,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut truncation_reason = None;
     let mut skipped_count = 0;
 
-    // Apply max_files cap
+    // Apply caller-provided safety cap (not a license gate)
     if let Some(max) = config.max_files {
         if files.len() > max {
             skipped_count = files.len() - max;
@@ -132,44 +135,58 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
 
     let is_config = is_priority_file(file_path);
 
+    let cwd = file_path.parent().map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes),
         interactive: false,
-        cwd: file_path.parent().map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: Some(file_path.to_path_buf()),
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     Some(FileScanResult {
         path: file_path.to_path_buf(),
-        findings: verdict.findings,
+        findings,
         is_config_file: is_config,
     })
 }
 
 /// Scan content from stdin (no file path).
 pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: content.to_string(),
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes.to_vec()),
         interactive: false,
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: None,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     FileScanResult {
         path: PathBuf::from("<stdin>"),
-        findings: verdict.findings,
+        findings,
         is_config_file: false,
     }
 }

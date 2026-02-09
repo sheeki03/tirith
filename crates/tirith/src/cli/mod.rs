@@ -1,4 +1,5 @@
 pub mod check;
+pub mod checkpoint;
 pub mod completions;
 pub mod diff;
 pub mod doctor;
@@ -12,5 +13,7 @@ pub mod scan;
 pub mod score;
 pub mod why;
 
+#[cfg(unix)]
+pub mod fetch;
 #[cfg(unix)]
 pub mod run;

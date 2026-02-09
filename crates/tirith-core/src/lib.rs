@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod checkpoint;
 pub mod confusables;
 pub mod data;
 pub mod engine;

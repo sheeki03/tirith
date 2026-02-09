@@ -43,9 +43,27 @@ pub fn run(
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        clipboard_html: None,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let mut verdict = engine::analyze(&ctx);
+
+    // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
+    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+
+    // Auto-checkpoint before destructive commands (Pro feature, non-blocking)
+    if verdict.action != tirith_core::verdict::Action::Block
+        && tirith_core::license::current_tier() >= tirith_core::license::Tier::Pro
+        && tirith_core::checkpoint::should_auto_checkpoint(cmd)
+    {
+        if let Some(cwd) = &ctx.cwd {
+            let cwd_str = cwd.as_str();
+            if let Err(e) = tirith_core::checkpoint::create(&[cwd_str], Some(cmd)) {
+                eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
+            }
+        }
+    }
 
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {

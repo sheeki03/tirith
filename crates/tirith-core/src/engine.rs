@@ -30,6 +30,9 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
     /// File path being scanned (only populated for ScanContext::FileScan).
     pub file_path: Option<std::path::PathBuf>,
+    /// Clipboard HTML content for rich-text paste analysis.
+    /// Only populated when `tirith paste --html <path>` is used.
+    pub clipboard_html: Option<String>,
 }
 
 /// Run the tiered analysis pipeline.
@@ -160,6 +163,28 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             &ctx.input,
             ctx.file_path.as_deref(),
         ));
+
+        // Rendered content rules (file-type gated)
+        if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
+            // PDF files get their own parser
+            let is_pdf = ctx
+                .file_path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+
+            if is_pdf {
+                let pdf_bytes = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
+                findings.extend(crate::rules::rendered::check_pdf(pdf_bytes));
+            } else {
+                findings.extend(crate::rules::rendered::check(
+                    &ctx.input,
+                    ctx.file_path.as_deref(),
+                ));
+            }
+        }
     } else {
         // Exec/Paste: standard pipeline
 
@@ -172,6 +197,13 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             // Check for hidden multiline content in pasted text
             let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
             findings.extend(multiline_findings);
+
+            // Check clipboard HTML for hidden content (rich-text paste analysis)
+            if let Some(ref html) = ctx.clipboard_html {
+                let clipboard_findings =
+                    crate::rules::terminal::check_clipboard_html(html, &ctx.input);
+                findings.extend(clipboard_findings);
+            }
         }
 
         // Invisible character checks apply to both exec and paste contexts
@@ -328,18 +360,137 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 }
 
 // ---------------------------------------------------------------------------
+// Paranoia tier filtering (Phase 15)
+// ---------------------------------------------------------------------------
+
+/// Filter a verdict's findings by paranoia level and license tier.
+///
+/// This is an output-layer filter — the engine always detects everything (ADR-13).
+/// CLI/MCP call this after `analyze()` to reduce noise at lower paranoia levels.
+///
+/// - Paranoia 1-2 (any tier): Medium+ findings only
+/// - Paranoia 3 (Pro required): also show Low findings
+/// - Paranoia 4 (Pro required): also show Info findings
+///
+/// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
+pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
+    let tier = crate::license::current_tier();
+    let effective = if tier >= crate::license::Tier::Pro {
+        paranoia.min(4)
+    } else {
+        paranoia.min(2) // Free users capped at 2
+    };
+
+    verdict.findings.retain(|f| match f.severity {
+        crate::verdict::Severity::Info => effective >= 4,
+        crate::verdict::Severity::Low => effective >= 3,
+        _ => true, // Medium/High/Critical always shown
+    });
+}
+
+/// Filter a Vec<Finding> by paranoia level and license tier.
+/// Same logic as `filter_findings_by_paranoia` but operates on raw findings
+/// (for scan results that don't use the Verdict wrapper).
+pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
+    let tier = crate::license::current_tier();
+    let effective = if tier >= crate::license::Tier::Pro {
+        paranoia.min(4)
+    } else {
+        paranoia.min(2)
+    };
+
+    findings.retain(|f| match f.severity {
+        crate::verdict::Severity::Info => effective >= 4,
+        crate::verdict::Severity::Low => effective >= 3,
+        _ => true,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tier-gated enrichment (ADR-13: detect free, enrich paid)
 // ---------------------------------------------------------------------------
 
 /// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.
-/// Populated in Part 8 when rendered/cloaking rules ship.
-#[allow(unused_variables)]
 fn enrich_pro(findings: &mut [Finding]) {
-    // Part 8 will populate:
-    // - finding.human_view / finding.agent_view for rendered content findings
-    // - decoded hidden text in evidence detail
-    // - cloaking diff text in evidence
-    // - line numbers in evidence for file scan findings
+    for finding in findings.iter_mut() {
+        match finding.rule_id {
+            // Rendered content findings: show what human sees vs what agent processes
+            crate::verdict::RuleId::HiddenCssContent => {
+                finding.human_view =
+                    Some("Content hidden via CSS — invisible in rendered view".into());
+                finding.agent_view = Some(format!(
+                    "AI agent sees full text including CSS-hidden content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HiddenColorContent => {
+                finding.human_view =
+                    Some("Text blends with background — invisible to human eye".into());
+                finding.agent_view = Some(format!(
+                    "AI agent reads text regardless of color contrast. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HiddenHtmlAttribute => {
+                finding.human_view =
+                    Some("Elements marked hidden/aria-hidden — not displayed".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes hidden element content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HtmlComment => {
+                finding.human_view = Some("HTML comments not rendered in browser".into());
+                finding.agent_view = Some(format!(
+                    "AI agent reads comment content as context. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::MarkdownComment => {
+                finding.human_view = Some("Markdown comments not rendered in preview".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes markdown comment content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::PdfHiddenText => {
+                finding.human_view = Some("Sub-pixel text invisible in PDF viewer".into());
+                finding.agent_view = Some(format!(
+                    "AI agent extracts all text including sub-pixel content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::ClipboardHidden => {
+                finding.human_view =
+                    Some("Hidden content in clipboard HTML not visible in paste preview".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes full clipboard including hidden HTML. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Summarize evidence entries for enrichment text.
+fn evidence_summary(evidence: &[crate::verdict::Evidence]) -> String {
+    let details: Vec<&str> = evidence
+        .iter()
+        .filter_map(|e| {
+            if let crate::verdict::Evidence::Text { detail } = e {
+                Some(detail.as_str())
+            } else {
+                None
+            }
+        })
+        .take(3)
+        .collect();
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("Details: {}", details.join("; "))
+    }
 }
 
 /// Team enrichment: MITRE ATT&CK classification, custom rule metadata.
@@ -365,6 +516,7 @@ mod tests {
             interactive: true,
             cwd: None,
             file_path: None,
+            clipboard_html: None,
         };
         let verdict = analyze(&ctx);
         // Should reach tier 3 (not fast-exit at tier 1)
@@ -380,6 +532,68 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, crate::verdict::RuleId::BidiControls)),
             "should detect bidi controls in exec context"
+        );
+    }
+
+    #[test]
+    fn test_paranoia_filter_suppresses_info_low() {
+        use crate::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::VariationSelector,
+                severity: Severity::Info,
+                title: "info finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+            },
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::High,
+                title: "high finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Default paranoia (1): only Medium+ shown
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 1 should keep only High+"
+        );
+        assert_eq!(verdict.findings[0].severity, Severity::High);
+
+        // Paranoia 2: still only Medium+ (free tier cap)
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 2);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 2 should keep only Medium+"
         );
     }
 }

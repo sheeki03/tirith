@@ -15,6 +15,7 @@ pub fn run(url: &str, json: bool) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);

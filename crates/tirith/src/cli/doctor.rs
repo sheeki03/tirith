@@ -37,6 +37,10 @@ struct DoctorInfo {
     data_dir: Option<String>,
     log_path: Option<String>,
     last_trigger_path: Option<String>,
+    /// Whether cloaking detection is available on this platform (Unix-only, ADR-8).
+    cloaking_available: bool,
+    /// Whether webhook dispatch is available on this platform (Unix-only, ADR-8).
+    webhooks_available: bool,
 }
 
 fn gather_info() -> DoctorInfo {
@@ -111,6 +115,8 @@ fn gather_info() -> DoctorInfo {
         data_dir: data_dir.map(|d| d.display().to_string()),
         log_path: log_path.map(|p| p.display().to_string()),
         last_trigger_path: last_trigger_path.map(|p| p.display().to_string()),
+        cloaking_available: cfg!(unix),
+        webhooks_available: cfg!(unix),
     }
 }
 
@@ -188,6 +194,22 @@ fn print_human(info: &DoctorInfo) {
     eprintln!(
         "  last trigger: {}",
         info.last_trigger_path.as_deref().unwrap_or("not found")
+    );
+    eprintln!(
+        "  cloaking:     {}",
+        if info.cloaking_available {
+            "available"
+        } else {
+            "not available (Unix-only)"
+        }
+    );
+    eprintln!(
+        "  webhooks:     {}",
+        if info.webhooks_available {
+            "available"
+        } else {
+            "not available (Unix-only)"
+        }
     );
 }
 

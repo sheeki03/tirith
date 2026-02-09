@@ -178,19 +178,23 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         _ => ShellType::Posix,
     };
 
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: command.to_string(),
         shell,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
         interactive: false,
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: None,
+        clipboard_html: None,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let mut verdict = engine::analyze(&ctx);
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -220,9 +224,12 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        clipboard_html: None,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let mut verdict = engine::analyze(&ctx);
+    let policy = crate::policy::Policy::discover(None);
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -251,9 +258,12 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        clipboard_html: None,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let mut verdict = engine::analyze(&ctx);
+    let policy = crate::policy::Policy::discover(None);
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -415,16 +425,68 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
 }
 
 #[cfg(unix)]
-fn call_fetch_cloaking(_args: &Value) -> ToolCallResult {
-    // Stub — actual detection added in Part 8
-    ToolCallResult {
-        content: vec![ContentItem {
-            content_type: "text".into(),
-            text: "Not yet implemented — cloaking detection will be available in a future release."
-                .into(),
-        }],
-        is_error: false,
-        structured_content: None,
+fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
+    let url = match args.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return tool_error("Missing required parameter: url"),
+    };
+
+    let is_pro = crate::license::current_tier() >= crate::license::Tier::Pro;
+
+    match crate::rules::cloaking::check(url) {
+        Ok(result) => {
+            let text = if result.cloaking_detected {
+                let differing: Vec<&str> = result
+                    .diff_pairs
+                    .iter()
+                    .map(|d| d.agent_b.as_str())
+                    .collect();
+                format!(
+                    "Cloaking detected for {}. Differing agents: {}",
+                    url,
+                    differing.join(", ")
+                )
+            } else {
+                format!("No cloaking detected for {url}")
+            };
+
+            let structured = serde_json::json!({
+                "url": result.url,
+                "cloaking_detected": result.cloaking_detected,
+                "agents": result.agent_responses.iter().map(|a| {
+                    serde_json::json!({
+                        "agent": a.agent_name,
+                        "status_code": a.status_code,
+                        "content_length": a.content_length,
+                    })
+                }).collect::<Vec<_>>(),
+                "diffs": result.diff_pairs.iter().map(|d| {
+                    let mut entry = serde_json::json!({
+                        "agent_a": d.agent_a,
+                        "agent_b": d.agent_b,
+                        "diff_chars": d.diff_chars,
+                    });
+                    // Pro enrichment: include diff text
+                    if is_pro {
+                        if let Some(ref text) = d.diff_text {
+                            entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(text));
+                        }
+                    }
+                    entry
+                }).collect::<Vec<_>>(),
+                "findings": result.findings,
+            });
+
+            ToolCallResult {
+                content: vec![ContentItem {
+                    content_type: "text".into(),
+                    text,
+                }],
+                is_error: false,
+                structured_content: Some(structured),
+            }
+        }
+        Err(e) => tool_error(&format!("Cloaking check failed: {e}")),
     }
 }
 

@@ -78,6 +78,22 @@ pub enum RuleId {
     Web3RpcEndpoint,
     Web3AddressInUrl,
 
+    // Rendered content rules
+    HiddenCssContent,
+    HiddenColorContent,
+    HiddenHtmlAttribute,
+    MarkdownComment,
+    HtmlComment,
+
+    // Cloaking rules
+    ServerCloaking,
+
+    // Clipboard rules
+    ClipboardHidden,
+
+    // PDF rules
+    PdfHiddenText,
+
     // Policy rules
     PolicyBlocklisted,
 
