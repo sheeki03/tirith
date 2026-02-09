@@ -27,9 +27,14 @@ impl std::fmt::Display for Tier {
 /// 2. `~/.config/tirith/license.key` file
 /// 3. Fallback: `Tier::Community`
 ///
-/// The key is a JWT with `tier` and `exp` claims, verified offline against an
-/// embedded Ed25519 public key. Invalid, expired, or missing keys silently
-/// fall back to Community (no panic, no error exit).
+/// **TEMPORARY / NOT A SECURITY BOUNDARY:** The current key format is unsigned
+/// base64-encoded JSON (see `decode_tier`). Anyone can self-issue any tier.
+/// This is intentional bootstrap behavior — signature verification (Ed25519-
+/// signed JWT) will be added before the first paid release. Until then, tiers
+/// gate enrichment depth, not security-critical detection (ADR-13).
+///
+/// Invalid, expired, or missing keys silently fall back to Community
+/// (no panic, no error exit).
 pub fn current_tier() -> Tier {
     let key = read_license_key();
     match key {
@@ -66,8 +71,12 @@ fn license_key_path() -> Option<PathBuf> {
 
 /// Decode tier from a license key.
 ///
-/// Currently supports a simple base64-encoded JSON payload for bootstrapping.
-/// Will be upgraded to Ed25519-signed JWT before first paid release.
+/// **Bootstrap format (unsigned, not a security boundary):** Accepts
+/// base64-encoded JSON with `tier` and optional `exp` fields. This format
+/// is trivially forgeable — anyone can self-issue any tier by encoding
+/// `{"tier":"pro"}`. Signature verification will be added before the first
+/// paid release; until then, tier gating only controls enrichment depth
+/// (ADR-13), not detection coverage.
 ///
 /// Accepted format (base64 of JSON):
 /// ```json

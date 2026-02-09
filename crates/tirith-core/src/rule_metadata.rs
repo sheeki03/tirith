@@ -71,9 +71,19 @@ pub fn filter_early_access(findings: &mut Vec<Finding>, tier: Tier) {
 
 /// Testable version of `filter_early_access` with explicit date.
 pub fn filter_early_access_at(findings: &mut Vec<Finding>, tier: Tier, now: chrono::NaiveDate) {
+    filter_early_access_with(findings, tier, now, RULE_META);
+}
+
+/// Core filter logic, parameterized over the metadata table for testing.
+pub fn filter_early_access_with(
+    findings: &mut Vec<Finding>,
+    tier: Tier,
+    now: chrono::NaiveDate,
+    rule_meta: &[RuleMeta],
+) {
     findings.retain(|finding| {
         // Look up rule in metadata table
-        let meta = RULE_META.iter().find(|m| m.rule_id == finding.rule_id);
+        let meta = rule_meta.iter().find(|m| m.rule_id == finding.rule_id);
         let meta = match meta {
             Some(m) => m,
             None => return true, // No metadata → always pass through
@@ -175,30 +185,73 @@ mod tests {
 
     #[test]
     fn test_critical_finding_bypasses_gate() {
-        // Manually test the filter logic with a simulated RULE_META entry.
-        // Since we can't mutate the const, test the retain logic directly.
-        let finding = make_finding(TEST_RULE, Severity::Critical);
-
-        // Simulate: gate is active, tier is Community (below Pro min_tier)
-        let meta = test_meta(Some("2099-12-31"));
+        // Gate is active and tier is below minimum, but finding is Critical
+        // — must pass through the actual filter logic.
+        let custom_meta = &[RuleMeta {
+            rule_id: TEST_RULE,
+            min_tier: Some(Tier::Pro),
+            early_access_until: Some("2099-12-31"),
+        }];
         let now = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
 
-        // Critical finding should pass through even with active gate
-        assert!(is_early_access_active(&meta, now));
-
-        // Direct retain logic test
-        let should_keep = finding.severity == Severity::Critical;
-        assert!(should_keep);
+        let mut findings = vec![make_finding(TEST_RULE, Severity::Critical)];
+        filter_early_access_with(&mut findings, Tier::Community, now, custom_meta);
+        assert_eq!(
+            findings.len(),
+            1,
+            "Critical finding must bypass active early-access gate"
+        );
     }
 
     #[test]
-    fn test_filter_suppresses_for_free_tier() {
-        // Integration test: since RULE_META is empty in prod, this verifies
-        // that findings with no metadata entry always pass through.
+    fn test_filter_suppresses_medium_for_free_tier() {
+        // Gate is active, tier is Community (below Pro min), finding is Medium
+        // — must be suppressed by the actual filter.
+        let custom_meta = &[RuleMeta {
+            rule_id: TEST_RULE,
+            min_tier: Some(Tier::Pro),
+            early_access_until: Some("2099-12-31"),
+        }];
+        let now = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        let mut findings = vec![make_finding(TEST_RULE, Severity::Medium)];
+        filter_early_access_with(&mut findings, Tier::Community, now, custom_meta);
+        assert_eq!(
+            findings.len(),
+            0,
+            "Medium finding must be suppressed for Community tier"
+        );
+    }
+
+    #[test]
+    fn test_filter_passes_medium_for_pro_tier() {
+        // Gate is active but tier meets minimum — finding must pass through.
+        let custom_meta = &[RuleMeta {
+            rule_id: TEST_RULE,
+            min_tier: Some(Tier::Pro),
+            early_access_until: Some("2099-12-31"),
+        }];
+        let now = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        let mut findings = vec![make_finding(TEST_RULE, Severity::Medium)];
+        filter_early_access_with(&mut findings, Tier::Pro, now, custom_meta);
+        assert_eq!(
+            findings.len(),
+            1,
+            "Medium finding must pass for Pro tier when gate requires Pro"
+        );
+    }
+
+    #[test]
+    fn test_filter_no_metadata_passes_through() {
+        // Finding with no entry in metadata table always passes through.
         let mut findings = vec![make_finding(TEST_RULE, Severity::Medium)];
         let now = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        filter_early_access_at(&mut findings, Tier::Community, now);
-        // No RULE_META entry for TEST_RULE → passes through
-        assert_eq!(findings.len(), 1);
+        filter_early_access_with(&mut findings, Tier::Community, now, &[]);
+        assert_eq!(
+            findings.len(),
+            1,
+            "Finding with no metadata must always pass through"
+        );
     }
 }
