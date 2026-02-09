@@ -321,7 +321,7 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         recursive,
         fail_on: crate::verdict::Severity::Critical,
         ignore_patterns: vec![],
-        max_files: Some(50), // Community tier
+        max_files: None,
     };
 
     let result = scan::scan(&config);

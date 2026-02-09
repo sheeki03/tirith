@@ -291,6 +291,20 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         });
     }
 
+    // Enrichment pass (ADR-13): detection is free, enrichment is paid.
+    // All detection rules have already run above. Now add tier-gated enrichment.
+    let tier = crate::license::current_tier();
+    if tier >= crate::license::Tier::Pro {
+        enrich_pro(&mut findings);
+    }
+    if tier >= crate::license::Tier::Team {
+        enrich_team(&mut findings);
+    }
+
+    // Early access filter (ADR-14): suppress non-critical findings for rules
+    // in time-boxed early access windows when tier is below the minimum.
+    crate::rule_metadata::filter_early_access(&mut findings, tier);
+
     let tier3_ms = tier3_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -311,6 +325,29 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     verdict.urls_extracted_count = Some(extracted.len());
 
     verdict
+}
+
+// ---------------------------------------------------------------------------
+// Tier-gated enrichment (ADR-13: detect free, enrich paid)
+// ---------------------------------------------------------------------------
+
+/// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.
+/// Populated in Part 8 when rendered/cloaking rules ship.
+#[allow(unused_variables)]
+fn enrich_pro(findings: &mut [Finding]) {
+    // Part 8 will populate:
+    // - finding.human_view / finding.agent_view for rendered content findings
+    // - decoded hidden text in evidence detail
+    // - cloaking diff text in evidence
+    // - line numbers in evidence for file scan findings
+}
+
+/// Team enrichment: MITRE ATT&CK classification, custom rule metadata.
+/// Populated in Part 9 when Team features ship.
+#[allow(unused_variables)]
+fn enrich_team(findings: &mut [Finding]) {
+    // Part 9 will populate:
+    // - finding MITRE ATT&CK ids
 }
 
 #[cfg(test)]

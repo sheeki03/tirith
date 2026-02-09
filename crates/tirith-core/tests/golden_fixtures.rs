@@ -439,6 +439,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "web3_address_in_url",
     // Policy
     "policy_blocklisted",
+    // License/infrastructure
+    "license_required",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -476,10 +478,12 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
+/// - license_required: emitted by license infrastructure, not detection rules
 const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "proxy_env_set",
     "policy_blocklisted",
     "command_network_deny",
+    "license_required",
 ];
 
 #[test]
@@ -569,6 +573,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
         RuleId::PolicyBlocklisted,
+        RuleId::LicenseRequired,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

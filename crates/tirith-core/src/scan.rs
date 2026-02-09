@@ -92,8 +92,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
             files.truncate(max);
             truncated = true;
             truncation_reason = Some(format!(
-                "Scan capped at {max} files ({skipped_count} skipped). \
-                 Upgrade to Pro for unlimited scanning."
+                "Scan capped at {max} files ({skipped_count} skipped)."
             ));
         }
     }

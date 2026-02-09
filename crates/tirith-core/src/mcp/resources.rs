@@ -45,7 +45,7 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 recursive: true,
                 fail_on: crate::verdict::Severity::Critical,
                 ignore_patterns: vec![],
-                max_files: Some(50),
+                max_files: None,
             };
 
             let result = scan::scan(&config);

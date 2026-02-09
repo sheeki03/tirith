@@ -80,6 +80,9 @@ pub enum RuleId {
 
     // Policy rules
     PolicyBlocklisted,
+
+    // License/infrastructure rules
+    LicenseRequired,
 }
 
 impl fmt::Display for RuleId {

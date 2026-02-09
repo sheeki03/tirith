@@ -40,7 +40,7 @@ pub fn run(
         recursive: true,
         fail_on: fail_on_severity,
         ignore_patterns: ignore.to_vec(),
-        max_files: Some(50), // Community tier default
+        max_files: None,
     };
 
     let result = scan::scan(&config);
