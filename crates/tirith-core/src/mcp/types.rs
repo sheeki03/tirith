@@ -5,16 +5,6 @@ use serde_json::Value;
 // JSON-RPC 2.0
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub struct JsonRpcRequest {
-    #[allow(dead_code)]
-    pub jsonrpc: String,
-    pub id: Option<Value>,
-    pub method: String,
-    #[serde(default)]
-    pub params: Option<Value>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,

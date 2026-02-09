@@ -33,11 +33,11 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
             continue;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
+        // Phase 1: Parse as raw JSON — failure here is a true parse error (-32700)
+        let raw: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(log, "tirith mcp-server: invalid JSON-RPC: {e}");
-                // JSON-RPC spec: parse errors get error response with null id
+                let _ = writeln!(log, "tirith mcp-server: parse error: {e}");
                 let resp = JsonRpcResponse::err(
                     Value::Null,
                     JsonRpcError {
@@ -51,12 +51,75 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
             }
         };
 
-        // Notifications (no id) — handle silently, no response
-        if request.id.is_none() {
-            match request.method.as_str() {
+        // Phase 2: Validate JSON-RPC envelope — failure here is invalid request (-32600)
+        // Extract id first so we can include it in error responses when recoverable.
+        let raw_id = raw.get("id").cloned();
+
+        // Recover a usable id: JSON-RPC allows string, number, or null — reject
+        // object/array/bool.
+        let usable_id = match &raw_id {
+            None => None, // notification (no id field at all)
+            Some(Value::Null) | Some(Value::Number(_)) | Some(Value::String(_)) => raw_id.clone(),
+            Some(_) => {
+                // id present but wrong type — invalid request
+                let resp = JsonRpcResponse::err(
+                    Value::Null,
+                    JsonRpcError {
+                        code: -32600,
+                        message: "Invalid request: id must be string, number, or null".into(),
+                        data: None,
+                    },
+                );
+                write_response(&mut output, &resp);
+                continue;
+            }
+        };
+
+        // Validate jsonrpc field
+        match raw.get("jsonrpc").and_then(|v| v.as_str()) {
+            Some("2.0") => {}
+            _ => {
+                let resp = JsonRpcResponse::err(
+                    usable_id.unwrap_or(Value::Null),
+                    JsonRpcError {
+                        code: -32600,
+                        message: "Invalid request: jsonrpc must be \"2.0\"".into(),
+                        data: None,
+                    },
+                );
+                write_response(&mut output, &resp);
+                continue;
+            }
+        }
+
+        // Validate method field
+        let method = match raw.get("method").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                let resp = JsonRpcResponse::err(
+                    usable_id.unwrap_or(Value::Null),
+                    JsonRpcError {
+                        code: -32600,
+                        message: "Invalid request: missing or non-string method".into(),
+                        data: None,
+                    },
+                );
+                write_response(&mut output, &resp);
+                continue;
+            }
+        };
+
+        let params = raw.get("params").cloned();
+
+        // Notifications (no id field) — handle silently, no response
+        if usable_id.is_none() {
+            match method.as_str() {
                 "notifications/initialized" => {
-                    state = State::Ready;
-                    let _ = writeln!(log, "tirith mcp-server: client initialized");
+                    if matches!(state, State::Initialized) {
+                        state = State::Ready;
+                        let _ = writeln!(log, "tirith mcp-server: client initialized");
+                    }
+                    // Ignore if not yet initialized — don't transition from AwaitingInit
                 }
                 _ => {
                     // Unknown notification — ignore per spec
@@ -65,12 +128,12 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
             continue;
         }
 
-        let id = request.id.unwrap(); // safe: we checked is_none above
+        let id = usable_id.unwrap(); // safe: we checked is_none above
 
         let response = match state {
-            State::AwaitingInit => match request.method.as_str() {
+            State::AwaitingInit => match method.as_str() {
                 "initialize" => {
-                    let result = handle_initialize(&request.params);
+                    let result = handle_initialize(&params);
                     state = State::Initialized;
                     let _ = writeln!(log, "tirith mcp-server: session initialized");
                     JsonRpcResponse::ok(id, result)
@@ -85,9 +148,9 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
                     },
                 ),
             },
-            State::Initialized | State::Ready => match request.method.as_str() {
+            State::Initialized | State::Ready => match method.as_str() {
                 "initialize" => {
-                    let result = handle_initialize(&request.params);
+                    let result = handle_initialize(&params);
                     JsonRpcResponse::ok(id, result)
                 }
                 "ping" => JsonRpcResponse::ok(id, json!({})),
@@ -96,14 +159,14 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
                     JsonRpcResponse::ok(id, json!({ "tools": tools }))
                 }
                 "tools/call" => {
-                    let result = handle_tools_call(&request.params);
+                    let result = handle_tools_call(&params);
                     JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!({})))
                 }
                 "resources/list" => {
                     let resources = resources::list();
                     JsonRpcResponse::ok(id, json!({ "resources": resources }))
                 }
-                "resources/read" => handle_resources_read(id, &request.params),
+                "resources/read" => handle_resources_read(id, &params),
                 _ => JsonRpcResponse::err(
                     id,
                     JsonRpcError {
@@ -391,5 +454,116 @@ mod tests {
         let (stdout, _) = run_session(input);
         let resps = parse_responses(&stdout);
         assert_eq!(resps[0]["error"]["code"], -32700);
+        assert_eq!(resps[0]["id"], Value::Null);
+    }
+
+    #[test]
+    fn test_notification_before_init_ignored() {
+        // Sending notifications/initialized before initialize should NOT
+        // transition to Ready — tools/list must still get -32002.
+        let input = format!(
+            "{}\n{}\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+        );
+
+        let (stdout, _) = run_session(&input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps.len(), 1);
+        assert_eq!(resps[0]["error"]["code"], -32002);
+    }
+
+    #[test]
+    fn test_invalid_request_missing_method() {
+        // Valid JSON but missing "method" → -32600, not -32700
+        let input = r#"{"jsonrpc":"2.0","id":1}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        // id should be preserved
+        assert_eq!(resps[0]["id"], 1);
+    }
+
+    #[test]
+    fn test_invalid_request_wrong_jsonrpc_version() {
+        let input = r#"{"jsonrpc":"1.0","id":1,"method":"ping"}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        assert_eq!(resps[0]["id"], 1);
+    }
+
+    #[test]
+    fn test_invalid_request_object_id() {
+        // JSON-RPC id must be string/number/null — object is invalid
+        let input = r#"{"jsonrpc":"2.0","id":{"x":1},"method":"ping"}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        // Can't use the bad id, so null
+        assert_eq!(resps[0]["id"], Value::Null);
+    }
+
+    #[test]
+    fn test_invalid_request_array_id() {
+        let input = r#"{"jsonrpc":"2.0","id":[1,2],"method":"ping"}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        assert_eq!(resps[0]["id"], Value::Null);
+    }
+
+    #[test]
+    fn test_invalid_request_bool_id() {
+        let input = r#"{"jsonrpc":"2.0","id":true,"method":"ping"}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        assert_eq!(resps[0]["id"], Value::Null);
+    }
+
+    #[test]
+    fn test_invalid_request_missing_jsonrpc() {
+        let input = r#"{"id":1,"method":"ping"}
+"#;
+        let (stdout, _) = run_session(input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["error"]["code"], -32600);
+        assert_eq!(resps[0]["id"], 1);
+    }
+
+    #[test]
+    fn test_string_id_preserved() {
+        // JSON-RPC allows string ids
+        let input = format!("{}\n", r#"{"jsonrpc":"2.0","id":"abc","method":"ping"}"#,);
+        let (stdout, _) = run_session(&input);
+        let resps = parse_responses(&stdout);
+        assert_eq!(resps[0]["id"], "abc");
+        assert_eq!(resps[0]["result"], json!({}));
+    }
+
+    #[test]
+    fn test_null_id_treated_as_notification() {
+        // JSON-RPC: explicit null id is still a valid id (not a notification)
+        // but our implementation treats missing id as notification.
+        // null id should be treated as a request with null id per spec.
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        );
+        let (stdout, _) = run_session(&input);
+        let resps = parse_responses(&stdout);
+        // id=1: initialize
+        assert_eq!(resps[0]["id"], 1);
+        // id=null: ping should get a response
+        assert_eq!(resps.len(), 2);
+        assert_eq!(resps[1]["id"], Value::Null);
+        assert_eq!(resps[1]["result"], json!({}));
     }
 }
