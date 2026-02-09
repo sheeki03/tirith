@@ -7,6 +7,7 @@ pub mod last_trigger;
 pub mod manpage;
 pub mod paste;
 pub mod receipt;
+pub mod scan;
 pub mod score;
 pub mod why;
 

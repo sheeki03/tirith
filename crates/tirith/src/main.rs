@@ -105,6 +105,36 @@ enum Commands {
         shell: Option<String>,
     },
 
+    /// Scan files for hidden content and config poisoning
+    Scan {
+        /// Path to scan (directory or file)
+        path: Option<String>,
+
+        /// Scan a single file explicitly
+        #[arg(long, conflicts_with = "path", conflicts_with = "stdin")]
+        file: Option<String>,
+
+        /// Read content from stdin
+        #[arg(long, conflicts_with = "path", conflicts_with = "file")]
+        stdin: bool,
+
+        /// Exit non-zero in CI when findings meet threshold
+        #[arg(long)]
+        ci: bool,
+
+        /// Severity threshold for CI failure
+        #[arg(long, default_value = "critical")]
+        fail_on: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Patterns to ignore
+        #[arg(long)]
+        ignore: Vec<String>,
+    },
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -170,6 +200,24 @@ fn main() {
         Commands::Diff { url, json } => cli::diff::run(&url, json),
 
         Commands::Why { json } => cli::why::run(json),
+
+        Commands::Scan {
+            path,
+            file,
+            stdin,
+            ci,
+            fail_on,
+            json,
+            ignore,
+        } => cli::scan::run(
+            path.as_deref(),
+            file.as_deref(),
+            stdin,
+            ci,
+            &fail_on,
+            json,
+            &ignore,
+        ),
 
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),

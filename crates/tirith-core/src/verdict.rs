@@ -60,6 +60,16 @@ pub enum RuleId {
     PrivateNetworkAccess,
     CommandNetworkDeny,
 
+    // Config file rules
+    ConfigInjection,
+    ConfigNonAscii,
+    ConfigInvisibleUnicode,
+    McpInsecureServer,
+    McpUntrustedServer,
+    McpDuplicateServerName,
+    McpOverlyPermissive,
+    McpSuspiciousArgs,
+
     // Ecosystem rules
     GitTyposquat,
     DockerUntrustedRegistry,
@@ -167,6 +177,12 @@ pub struct Finding {
     pub title: String,
     pub description: String,
     pub evidence: Vec<Evidence>,
+    /// What a human sees (populated by Pro enrichment, Part 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_view: Option<String>,
+    /// What an AI agent processes (populated by Pro enrichment, Part 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_view: Option<String>,
 }
 
 /// The action to take based on analysis.
@@ -272,6 +288,8 @@ mod tests {
             title: "test".to_string(),
             description: "test".to_string(),
             evidence: vec![],
+            human_view: None,
+            agent_view: None,
         }];
         let verdict = Verdict::from_findings(findings, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);

@@ -20,6 +20,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -37,6 +39,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -54,6 +58,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -106,6 +112,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                         description: d.description.clone(),
                     })
                     .collect(),
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -124,6 +132,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -141,6 +151,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     format!("Hidden text: \"{}\"", truncate(&decoded, 200))
                 },
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -158,6 +170,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -175,6 +189,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -227,6 +243,8 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
                     evidence: vec![Evidence::Text {
                         detail: format!("line {}: {}", i + 1, truncate(trimmed, 100)),
                     }],
+                    human_view: None,
+                    agent_view: None,
                 });
                 break;
             }

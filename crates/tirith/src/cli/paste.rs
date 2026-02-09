@@ -49,6 +49,7 @@ pub fn run(shell: &str, json: bool) -> i32 {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
+        file_path: None,
     };
 
     let verdict = engine::analyze(&ctx);

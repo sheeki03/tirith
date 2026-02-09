@@ -26,6 +26,9 @@ struct Fixture {
     expected_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// File path for file-scan context fixtures.
+    #[serde(default)]
+    file_path: Option<String>,
 }
 
 fn default_shell() -> String {
@@ -60,16 +63,22 @@ fn run_fixture(fixture: &Fixture) {
     let scan_context = match fixture.context.as_str() {
         "exec" => ScanContext::Exec,
         "paste" => ScanContext::Paste,
+        "file" => ScanContext::FileScan,
         _ => panic!("Unknown context: {}", fixture.context),
     };
 
     let raw_bytes = if !fixture.raw_bytes.is_empty() {
         Some(fixture.raw_bytes.clone())
-    } else if scan_context == ScanContext::Paste {
+    } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
         Some(fixture.input.as_bytes().to_vec())
     } else {
         None
     };
+
+    let file_path = fixture
+        .file_path
+        .as_ref()
+        .map(|p| std::path::PathBuf::from(p));
 
     let ctx = AnalysisContext {
         input: fixture.input.clone(),
@@ -78,6 +87,7 @@ fn run_fixture(fixture: &Fixture) {
         raw_bytes,
         interactive: true,
         cwd: None,
+        file_path,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -218,6 +228,16 @@ fn test_shell_weirdness_fixtures() {
 }
 
 #[test]
+fn test_configfile_fixtures() {
+    let fixtures = load_fixtures("configfile.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} configfile fixtures");
+}
+
+#[test]
 fn test_policy_fixtures() {
     let fixtures = load_fixtures("policy.toml");
     let count = fixtures.len();
@@ -241,6 +261,7 @@ fn test_fixture_count() {
         "clean.toml",
         "shell_weirdness.toml",
         "policy.toml",
+        "configfile.toml",
     ];
 
     let total: usize = files.iter().map(|f| load_fixtures(f).len()).sum();
@@ -345,6 +366,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "clean.toml",
     "shell_weirdness.toml",
     "policy.toml",
+    "configfile.toml",
 ];
 
 /// Complete list of all RuleId variants (snake_case serialized form).
@@ -399,6 +421,15 @@ const ALL_RULE_IDS: &[&str] = &[
     "metadata_endpoint",
     "private_network_access",
     "command_network_deny",
+    // Config file
+    "config_injection",
+    "config_non_ascii",
+    "config_invisible_unicode",
+    "mcp_insecure_server",
+    "mcp_untrusted_server",
+    "mcp_duplicate_server_name",
+    "mcp_overly_permissive",
+    "mcp_suspicious_args",
     // Ecosystem
     "git_typosquat",
     "docker_untrusted_registry",
@@ -449,6 +480,9 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "proxy_env_set",
     "policy_blocklisted",
     "command_network_deny",
+    // serde_json deduplicates JSON keys, so we can't test duplicate server names
+    // through static fixtures — the parser keeps only the last value.
+    "mcp_duplicate_server_name",
 ];
 
 #[test]
@@ -523,6 +557,14 @@ fn test_rule_id_list_is_complete() {
         RuleId::MetadataEndpoint,
         RuleId::PrivateNetworkAccess,
         RuleId::CommandNetworkDeny,
+        RuleId::ConfigInjection,
+        RuleId::ConfigNonAscii,
+        RuleId::ConfigInvisibleUnicode,
+        RuleId::McpInsecureServer,
+        RuleId::McpUntrustedServer,
+        RuleId::McpDuplicateServerName,
+        RuleId::McpOverlyPermissive,
+        RuleId::McpSuspiciousArgs,
         RuleId::GitTyposquat,
         RuleId::DockerUntrustedRegistry,
         RuleId::PipUrlInstall,
@@ -564,16 +606,21 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter",     // cat script | bash
-        "bidi_controls",           // exec context, no URL needed
-        "zero_width_chars",        // exec context, no URL needed
-        "unicode_tags",            // byte-level, no URL needed
-        "invisible_math_operator", // byte-level, no URL needed
-        "invisible_whitespace",    // byte-level, no URL needed
-        "code_injection_env",      // export LD_PRELOAD=, no URL needed
-        "shell_injection_env",     // export BASH_ENV=, no URL needed
-        "interpreter_hijack_env",  // export PYTHONPATH=, no URL needed
-        "sensitive_env_export",    // export OPENAI_API_KEY=, no URL needed
+        "pipe_to_interpreter",      // cat script | bash
+        "bidi_controls",            // exec context, no URL needed
+        "zero_width_chars",         // exec context, no URL needed
+        "unicode_tags",             // byte-level, no URL needed
+        "invisible_math_operator",  // byte-level, no URL needed
+        "invisible_whitespace",     // byte-level, no URL needed
+        "code_injection_env",       // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",      // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",   // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",     // export OPENAI_API_KEY=, no URL needed
+        "config_injection",         // file context, no URL needed
+        "config_non_ascii",         // file context, no URL needed
+        "config_invisible_unicode", // file context, no URL needed
+        "mcp_suspicious_args",      // file context, no URL needed
+        "mcp_overly_permissive",    // file context, no URL needed
     ]
     .into_iter()
     .collect();
@@ -717,16 +764,22 @@ fn test_tier1_does_not_gate_findings() {
         let scan_context = match fixture.context.as_str() {
             "exec" => ScanContext::Exec,
             "paste" => ScanContext::Paste,
+            "file" => ScanContext::FileScan,
             _ => continue,
         };
 
         let raw_bytes = if !fixture.raw_bytes.is_empty() {
             Some(fixture.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste {
+        } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
             Some(fixture.input.as_bytes().to_vec())
         } else {
             None
         };
+
+        let file_path = fixture
+            .file_path
+            .as_ref()
+            .map(|p| std::path::PathBuf::from(p));
 
         let ctx = AnalysisContext {
             input: fixture.input.clone(),
@@ -735,6 +788,7 @@ fn test_tier1_does_not_gate_findings() {
             raw_bytes,
             interactive: true,
             cwd: None,
+            file_path,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -776,6 +830,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             raw_bytes: Some(raw_bytes),
             interactive: true,
             cwd: None,
+            file_path: None,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(

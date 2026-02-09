@@ -46,6 +46,8 @@ fn check_non_ascii_hostname(raw_host: &str, findings: &mut Vec<Finding>) {
                 "Hostname '{raw_host}' contains non-ASCII characters which may be a homograph attack"
             ),
             evidence: vec![homoglyph_evidence],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -64,6 +66,8 @@ fn check_punycode_domain(host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
             return;
         }
@@ -98,6 +102,8 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: raw_host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
             return;
         }
@@ -117,6 +123,8 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: url.raw_str(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -133,6 +141,8 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
         });
         return;
     }
@@ -147,6 +157,8 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -162,6 +174,8 @@ fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: format!("{host}:{port}"),
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -190,6 +204,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
             return;
         }
@@ -207,6 +223,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
             return;
         }
@@ -229,6 +247,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
             return;
         }
@@ -299,6 +319,8 @@ fn check_invalid_host_chars(raw_host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: raw_host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -313,6 +335,8 @@ fn check_trailing_dot_whitespace(raw_host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: raw_host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -331,6 +355,8 @@ fn check_lookalike_tld(host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }

@@ -11,6 +11,9 @@ pub enum ScanContext {
     Exec,
     /// Paste-time: content being pasted (paste subcommand).
     Paste,
+    /// File scan: content read from a file (scan subcommand).
+    /// Skips tier-1 fast-exit, runs byte scan + configfile rules only.
+    FileScan,
 }
 
 // Include generated Tier 1 patterns from build.rs declarative pattern table.
@@ -67,6 +70,8 @@ pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
     match context {
         ScanContext::Exec => TIER1_EXEC_REGEX.is_match(input),
         ScanContext::Paste => TIER1_PASTE_REGEX.is_match(input),
+        // FileScan always proceeds to tier-3 (no fast-exit)
+        ScanContext::FileScan => true,
     }
 }
 

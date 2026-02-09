@@ -28,6 +28,8 @@ pub struct AnalysisContext {
     pub raw_bytes: Option<Vec<u8>>,
     pub interactive: bool,
     pub cwd: Option<String>,
+    /// File path being scanned (only populated for ScanContext::FileScan).
+    pub file_path: Option<std::path::PathBuf>,
 }
 
 /// Run the tiered analysis pipeline.
@@ -139,79 +141,102 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     let tier3_start = Instant::now();
     let mut findings = Vec::new();
 
-    // Run byte-level rules for paste context
-    if ctx.scan_context == ScanContext::Paste {
-        if let Some(ref bytes) = ctx.raw_bytes {
-            let byte_findings = crate::rules::terminal::check_bytes(bytes);
-            findings.extend(byte_findings);
+    // Track extracted URLs for allowlist/blocklist (Exec/Paste only)
+    let mut extracted = Vec::new();
+
+    if ctx.scan_context == ScanContext::FileScan {
+        // FileScan: byte scan + configfile rules ONLY.
+        // Does NOT run command/env/URL-extraction rules.
+        let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
+            bytes.as_slice()
+        } else {
+            ctx.input.as_bytes()
+        };
+        let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+        findings.extend(byte_findings);
+
+        // Config file detection rules
+        findings.extend(crate::rules::configfile::check(
+            &ctx.input,
+            ctx.file_path.as_deref(),
+        ));
+    } else {
+        // Exec/Paste: standard pipeline
+
+        // Run byte-level rules for paste context
+        if ctx.scan_context == ScanContext::Paste {
+            if let Some(ref bytes) = ctx.raw_bytes {
+                let byte_findings = crate::rules::terminal::check_bytes(bytes);
+                findings.extend(byte_findings);
+            }
+            // Check for hidden multiline content in pasted text
+            let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
+            findings.extend(multiline_findings);
         }
-        // Check for hidden multiline content in pasted text
-        let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
-        findings.extend(multiline_findings);
-    }
 
-    // Invisible character checks apply to both exec and paste contexts
-    if ctx.scan_context == ScanContext::Exec {
-        let byte_input = ctx.input.as_bytes();
-        let scan = extract::scan_bytes(byte_input);
-        if scan.has_bidi_controls
-            || scan.has_zero_width
-            || scan.has_unicode_tags
-            || scan.has_variation_selectors
-            || scan.has_invisible_math_operators
-            || scan.has_invisible_whitespace
-        {
-            let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-            // Only keep invisible-char findings for exec context
-            findings.extend(byte_findings.into_iter().filter(|f| {
-                matches!(
-                    f.rule_id,
-                    crate::verdict::RuleId::BidiControls
-                        | crate::verdict::RuleId::ZeroWidthChars
-                        | crate::verdict::RuleId::UnicodeTags
-                        | crate::verdict::RuleId::InvisibleMathOperator
-                        | crate::verdict::RuleId::VariationSelector
-                        | crate::verdict::RuleId::InvisibleWhitespace
-                )
-            }));
+        // Invisible character checks apply to both exec and paste contexts
+        if ctx.scan_context == ScanContext::Exec {
+            let byte_input = ctx.input.as_bytes();
+            let scan = extract::scan_bytes(byte_input);
+            if scan.has_bidi_controls
+                || scan.has_zero_width
+                || scan.has_unicode_tags
+                || scan.has_variation_selectors
+                || scan.has_invisible_math_operators
+                || scan.has_invisible_whitespace
+            {
+                let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+                // Only keep invisible-char findings for exec context
+                findings.extend(byte_findings.into_iter().filter(|f| {
+                    matches!(
+                        f.rule_id,
+                        crate::verdict::RuleId::BidiControls
+                            | crate::verdict::RuleId::ZeroWidthChars
+                            | crate::verdict::RuleId::UnicodeTags
+                            | crate::verdict::RuleId::InvisibleMathOperator
+                            | crate::verdict::RuleId::VariationSelector
+                            | crate::verdict::RuleId::InvisibleWhitespace
+                    )
+                }));
+            }
         }
+
+        // Extract and analyze URLs
+        extracted = extract::extract_urls(&ctx.input, ctx.shell);
+
+        for url_info in &extracted {
+            // Normalize path if available — use raw extracted URL's path for non-ASCII detection
+            // since url::Url percent-encodes non-ASCII during parsing
+            let raw_path = extract_raw_path_from_url(&url_info.raw);
+            let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
+
+            // Run all rule categories
+            let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
+            findings.extend(hostname_findings);
+
+            let path_findings = crate::rules::path::check(
+                &url_info.parsed,
+                normalized_path.as_ref(),
+                raw_path.as_deref(),
+            );
+            findings.extend(path_findings);
+
+            let transport_findings =
+                crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
+            findings.extend(transport_findings);
+
+            let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
+            findings.extend(ecosystem_findings);
+        }
+
+        // Run command-shape rules on full input
+        let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
+        findings.extend(command_findings);
+
+        // Run environment rules
+        let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
+        findings.extend(env_findings);
     }
-
-    // Extract and analyze URLs
-    let extracted = extract::extract_urls(&ctx.input, ctx.shell);
-
-    for url_info in &extracted {
-        // Normalize path if available — use raw extracted URL's path for non-ASCII detection
-        // since url::Url percent-encodes non-ASCII during parsing
-        let raw_path = extract_raw_path_from_url(&url_info.raw);
-        let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
-
-        // Run all rule categories
-        let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
-        findings.extend(hostname_findings);
-
-        let path_findings = crate::rules::path::check(
-            &url_info.parsed,
-            normalized_path.as_ref(),
-            raw_path.as_deref(),
-        );
-        findings.extend(path_findings);
-
-        let transport_findings =
-            crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
-        findings.extend(transport_findings);
-
-        let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
-        findings.extend(ecosystem_findings);
-    }
-
-    // Run command-shape rules on full input
-    let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
-    findings.extend(command_findings);
-
-    // Run environment rules
-    let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
-    findings.extend(env_findings);
 
     // Apply policy severity overrides
     for finding in &mut findings {
@@ -232,6 +257,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 evidence: vec![crate::verdict::Evidence::Url {
                     raw: url_info.raw.clone(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -300,6 +327,7 @@ mod tests {
             raw_bytes: None,
             interactive: true,
             cwd: None,
+            file_path: None,
         };
         let verdict = analyze(&ctx);
         // Should reach tier 3 (not fast-exit at tier 1)

@@ -10,6 +10,7 @@ pub mod parse;
 pub mod policy;
 pub mod receipt;
 pub mod rules;
+pub mod scan;
 pub mod tokenize;
 pub mod util;
 pub mod verdict;

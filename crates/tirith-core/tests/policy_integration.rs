@@ -31,6 +31,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         raw_bytes: None,
         interactive: true,
         cwd: Some(cwd.to_string()),
+        file_path: None,
     };
     engine::analyze(&ctx)
 }

@@ -164,6 +164,8 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                                     pattern: "pipe to interpreter".to_string(),
                                     matched: format!("{} | {}", source.raw, seg.raw),
                                 }],
+                                human_view: None,
+                                agent_view: None,
                             });
                     }
                 }
@@ -191,6 +193,8 @@ fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Fi
                     pattern: "redirect to dotfile".to_string(),
                     matched: raw.clone(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -226,6 +230,8 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
                                 pattern: "archive extract".to_string(),
                                 matched: raw.clone(),
                             }],
+                            human_view: None,
+                            agent_view: None,
                         });
                         return;
                     }
@@ -355,6 +361,8 @@ fn emit_env_finding(var_name: &str, value: &str, findings: &mut Vec<Finding>) {
             name: var_name.to_string(),
             value_preview,
         }],
+        human_view: None,
+        agent_view: None,
     });
 }
 
@@ -403,6 +411,8 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         evidence: vec![Evidence::Url {
                             raw: trimmed.to_string(),
                         }],
+                        human_view: None,
+                        agent_view: None,
                     });
                     return;
                 } else if is_private_ip(&host) {
@@ -417,6 +427,8 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         evidence: vec![Evidence::Url {
                             raw: trimmed.to_string(),
                         }],
+                        human_view: None,
+                        agent_view: None,
                     });
                     return;
                 }
