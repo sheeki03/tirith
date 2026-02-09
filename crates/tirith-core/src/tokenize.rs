@@ -168,18 +168,19 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut preceding_sep = None;
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
+    // Collect (byte_offset, char) pairs so byte slicing stays valid for multi-byte UTF-8.
+    let indexed: Vec<(usize, char)> = input.char_indices().collect();
+    let len = indexed.len();
     let mut i = 0;
 
     while i < len {
-        let ch = chars[i];
+        let (byte_off, ch) = indexed[i];
 
         match ch {
             // Backtick escaping in PowerShell
             '`' if i + 1 < len => {
-                current.push(chars[i]);
-                current.push(chars[i + 1]);
+                current.push(indexed[i].1);
+                current.push(indexed[i + 1].1);
                 i += 2;
                 continue;
             }
@@ -187,12 +188,12 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             '\'' => {
                 current.push(ch);
                 i += 1;
-                while i < len && chars[i] != '\'' {
-                    current.push(chars[i]);
+                while i < len && indexed[i].1 != '\'' {
+                    current.push(indexed[i].1);
                     i += 1;
                 }
                 if i < len {
-                    current.push(chars[i]);
+                    current.push(indexed[i].1);
                     i += 1;
                 }
                 continue;
@@ -201,18 +202,18 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             '"' => {
                 current.push(ch);
                 i += 1;
-                while i < len && chars[i] != '"' {
-                    if chars[i] == '`' && i + 1 < len {
-                        current.push(chars[i]);
-                        current.push(chars[i + 1]);
+                while i < len && indexed[i].1 != '"' {
+                    if indexed[i].1 == '`' && i + 1 < len {
+                        current.push(indexed[i].1);
+                        current.push(indexed[i + 1].1);
                         i += 2;
                     } else {
-                        current.push(chars[i]);
+                        current.push(indexed[i].1);
                         i += 1;
                     }
                 }
                 if i < len {
-                    current.push(chars[i]);
+                    current.push(indexed[i].1);
                     i += 1;
                 }
                 continue;
@@ -235,7 +236,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
             }
             // Check for -and / -or operators (PowerShell logical)
             '-' if current.ends_with(char::is_whitespace) || current.is_empty() => {
-                let remaining = &input[i..];
+                let remaining = &input[byte_off..];
                 if remaining.starts_with("-and")
                     && remaining[4..]
                         .chars()
@@ -463,5 +464,13 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].command.as_deref(), Some("curl"));
         assert_eq!(segs[0].args.len(), 2);
+    }
+
+    #[test]
+    fn test_powershell_multibyte_and_operator_no_panic() {
+        // Regression test for fuzz crash: multi-byte UTF-8 before -and caused
+        // byte/char index mismatch panic in &input[i..] slicing.
+        let input = " ?]BB\u{07E7}\u{07E7} -\n-\r-and-~\0\u{c}-and-~\u{1d}";
+        let _ = tokenize(input, ShellType::PowerShell);
     }
 }
