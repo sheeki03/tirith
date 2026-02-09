@@ -417,14 +417,25 @@ fn check_mcp_duplicate_names(content: &str, path: &Path, findings: &mut Vec<Find
                 // Extract the key string (handle escaped quotes).
                 i += 1; // skip opening quote
                 let key_start = i;
+                let mut found_close = false;
                 while i < bytes.len() {
                     if bytes[i] == b'\\' {
-                        i += 2; // skip escaped char
+                        // Skip escaped char; guard against trailing backslash
+                        if i + 1 < bytes.len() {
+                            i += 2;
+                        } else {
+                            break; // malformed: trailing backslash, bail
+                        }
                     } else if bytes[i] == b'"' {
+                        found_close = true;
                         break;
                     } else {
                         i += 1;
                     }
+                }
+                if !found_close || i > bytes.len() {
+                    // Unterminated string — malformed JSON, stop scanning
+                    break;
                 }
                 let key = &content[key_start..i];
                 // After closing quote, skip whitespace and check for ':'
@@ -709,6 +720,22 @@ mod tests {
             findings.iter().any(|f| f.rule_id == RuleId::ConfigNonAscii),
             "should detect non-ASCII in .cursorrules dotfile"
         );
+    }
+
+    #[test]
+    fn test_mcp_duplicate_malformed_json_no_panic() {
+        // Malformed JSON with trailing backslash must not panic.
+        let cases = [
+            r#"{"mcpServers":{"bad\"#,         // trailing backslash
+            r#"{"mcpServers":{"unterminated"#, // unterminated string
+            r#"{"mcpServers":{""#,             // empty key, truncated
+            r#"{"mcpServers":{"#,              // open quote, no content
+            r#"{"mcpServers":{"}}"#,           // empty key closing
+        ];
+        for input in &cases {
+            // Must not panic — findings are best-effort
+            let _ = check(input, Some(Path::new("mcp.json")));
+        }
     }
 
     #[test]
