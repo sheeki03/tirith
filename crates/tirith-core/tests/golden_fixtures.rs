@@ -268,7 +268,7 @@ fn test_tier1_coverage() {
     for filename in &files {
         let fixtures = load_fixtures(filename);
         for fixture in &fixtures {
-            if fixture.expected_action == "allow" {
+            if fixture.expected_action == "allow" && fixture.expected_rules.is_empty() {
                 continue;
             }
             let scan_context = match fixture.context.as_str() {
