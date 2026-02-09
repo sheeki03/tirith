@@ -548,10 +548,9 @@ mod tests {
     }
 
     #[test]
-    fn test_null_id_treated_as_notification() {
-        // JSON-RPC: explicit null id is still a valid id (not a notification)
-        // but our implementation treats missing id as notification.
-        // null id should be treated as a request with null id per spec.
+    fn test_null_id_treated_as_request() {
+        // JSON-RPC: explicit null id is a request (not a notification).
+        // Only a missing id field makes it a notification.
         let input = format!(
             "{}\n{}\n",
             init_msg(1, "2025-11-25"),
