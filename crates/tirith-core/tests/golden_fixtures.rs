@@ -480,9 +480,6 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "proxy_env_set",
     "policy_blocklisted",
     "command_network_deny",
-    // serde_json deduplicates JSON keys, so we can't test duplicate server names
-    // through static fixtures — the parser keeps only the last value.
-    "mcp_duplicate_server_name",
 ];
 
 #[test]
@@ -606,21 +603,22 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter",      // cat script | bash
-        "bidi_controls",            // exec context, no URL needed
-        "zero_width_chars",         // exec context, no URL needed
-        "unicode_tags",             // byte-level, no URL needed
-        "invisible_math_operator",  // byte-level, no URL needed
-        "invisible_whitespace",     // byte-level, no URL needed
-        "code_injection_env",       // export LD_PRELOAD=, no URL needed
-        "shell_injection_env",      // export BASH_ENV=, no URL needed
-        "interpreter_hijack_env",   // export PYTHONPATH=, no URL needed
-        "sensitive_env_export",     // export OPENAI_API_KEY=, no URL needed
-        "config_injection",         // file context, no URL needed
-        "config_non_ascii",         // file context, no URL needed
-        "config_invisible_unicode", // file context, no URL needed
-        "mcp_suspicious_args",      // file context, no URL needed
-        "mcp_overly_permissive",    // file context, no URL needed
+        "pipe_to_interpreter",       // cat script | bash
+        "bidi_controls",             // exec context, no URL needed
+        "zero_width_chars",          // exec context, no URL needed
+        "unicode_tags",              // byte-level, no URL needed
+        "invisible_math_operator",   // byte-level, no URL needed
+        "invisible_whitespace",      // byte-level, no URL needed
+        "code_injection_env",        // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",       // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",    // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",      // export OPENAI_API_KEY=, no URL needed
+        "config_injection",          // file context, no URL needed
+        "config_non_ascii",          // file context, no URL needed
+        "config_invisible_unicode",  // file context, no URL needed
+        "mcp_suspicious_args",       // file context, no URL needed
+        "mcp_overly_permissive",     // file context, no URL needed
+        "mcp_duplicate_server_name", // file context, no URL needed
     ]
     .into_iter()
     .collect();

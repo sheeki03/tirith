@@ -36,7 +36,10 @@ pub struct FileScanResult {
 }
 
 /// Known AI config file basenames (scanned first for priority ordering).
-const PRIORITY_FILES: &[&str] = &[
+/// Only includes names specific to AI tooling — generic names like settings.json
+/// are only prioritized when found inside a known config directory (handled by
+/// `is_priority_path` checking the parent directory).
+const PRIORITY_BASENAMES: &[&str] = &[
     ".cursorrules",
     ".cursorignore",
     ".clinerules",
@@ -46,12 +49,21 @@ const PRIORITY_FILES: &[&str] = &[
     "copilot-instructions.md",
     "mcp.json",
     ".mcp.json",
-    "settings.json",
     "mcp_settings.json",
-    "config.json",
-    "copilot-instructions.md",
     "devcontainer.json",
-    "rules.md",
+];
+
+/// Parent directories that make generic filenames count as priority.
+const PRIORITY_PARENT_DIRS: &[&str] = &[
+    ".claude",
+    ".vscode",
+    ".cursor",
+    ".windsurf",
+    ".cline",
+    ".continue",
+    ".github",
+    ".devcontainer",
+    ".roo",
 ];
 
 /// Run a file scan operation.
@@ -164,9 +176,24 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
 }
 
 /// Check if a path matches a priority config file.
+/// Matches either by AI-specific basename or by being inside a known config directory.
 fn is_priority_file(path: &Path) -> bool {
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    PRIORITY_FILES.contains(&basename)
+
+    // Direct AI-specific basename match
+    if PRIORITY_BASENAMES.contains(&basename) {
+        return true;
+    }
+
+    // Generic filenames are priority only inside known config dirs
+    if let Some(parent) = path.parent() {
+        let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if PRIORITY_PARENT_DIRS.contains(&parent_name) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Collect files from a path (directory or single file).
@@ -300,10 +327,18 @@ mod tests {
 
     #[test]
     fn test_priority_file_detection() {
+        // AI-specific basenames are always priority
         assert!(is_priority_file(Path::new(".cursorrules")));
         assert!(is_priority_file(Path::new("CLAUDE.md")));
         assert!(is_priority_file(Path::new("mcp.json")));
         assert!(!is_priority_file(Path::new("README.md")));
+
+        // Generic filenames are priority only inside known config dirs
+        assert!(!is_priority_file(Path::new("settings.json")));
+        assert!(!is_priority_file(Path::new("config.json")));
+        assert!(is_priority_file(Path::new(".claude/settings.json")));
+        assert!(is_priority_file(Path::new(".vscode/settings.json")));
+        assert!(is_priority_file(Path::new(".roo/rules.md")));
     }
 
     #[test]
