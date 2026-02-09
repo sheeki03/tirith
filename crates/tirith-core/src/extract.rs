@@ -178,7 +178,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     });
                 }
                 // Zero-width characters (ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner)
-                if is_zero_width(ch) {
+                // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack
+                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) {
                     result.has_zero_width = true;
                     result.details.push(ByteFinding {
                         offset: i,

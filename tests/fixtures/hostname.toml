@@ -303,3 +303,29 @@ input = "curl https://test-123.com/api"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ─── Part 3: OCR confusion fixtures ───
+
+[[fixture]]
+name = "ocr_confusable_rnicrosoft"
+min_milestone = 3
+input = "curl https://rnicrosoft.com/update.exe"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["confusable_domain"]
+
+[[fixture]]
+name = "ocr_confusable_paypa1"
+min_milestone = 3
+input = "curl https://paypa1.com/login"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["confusable_domain"]
+
+[[fixture]]
+name = "ocr_no_false_positive_normal"
+min_milestone = 3
+input = "curl https://example.com/page"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

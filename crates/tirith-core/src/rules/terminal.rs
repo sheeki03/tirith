@@ -58,20 +58,56 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     }
 
     if scan.has_zero_width {
-        findings.push(Finding {
-            rule_id: RuleId::ZeroWidthChars,
-            severity: Severity::High,
-            title: "Zero-width characters detected".to_string(),
-            description: "Content contains invisible zero-width characters that could be used to obfuscate URLs or commands".to_string(),
-            evidence: scan.details.iter()
-                .filter(|d| d.description.contains("zero-width"))
-                .map(|d| Evidence::ByteSequence {
-                    offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
-                    description: d.description.clone(),
+        // Filter zero-width details: suppress ZWJ/ZWNJ in joining-script contexts
+        let zw_evidence: Vec<_> = scan
+            .details
+            .iter()
+            .filter(|d| d.description.contains("zero-width"))
+            .filter(|d| {
+                // Suppress ZWJ (U+200D) and ZWNJ (U+200C) when surrounded by
+                // joining-script characters (Arabic, Devanagari, Thai, etc.)
+                let is_zwj_or_zwnj =
+                    d.description.contains("U+200D") || d.description.contains("U+200C");
+                if is_zwj_or_zwnj && is_joining_script_context(input, d.offset) {
+                    return false; // Suppress — legitimate use
+                }
+                true
+            })
+            .collect();
+
+        if !zw_evidence.is_empty() {
+            // Elevate to Critical when non-invisible content is ASCII-only
+            // (zero-width chars in pure ASCII text are always suspicious)
+            let ascii_only = std::str::from_utf8(input)
+                .map(|s| {
+                    s.chars()
+                        .filter(|ch| {
+                            ch.is_alphanumeric() || ch.is_ascii_punctuation() || *ch == ' '
+                        })
+                        .all(|ch| ch.is_ascii())
                 })
-                .collect(),
-        });
+                .unwrap_or(false);
+            let severity = if ascii_only {
+                Severity::Critical
+            } else {
+                Severity::High
+            };
+
+            findings.push(Finding {
+                rule_id: RuleId::ZeroWidthChars,
+                severity,
+                title: "Zero-width characters detected".to_string(),
+                description: "Content contains invisible zero-width characters that could be used to obfuscate URLs or commands".to_string(),
+                evidence: zw_evidence
+                    .into_iter()
+                    .map(|d| Evidence::ByteSequence {
+                        offset: d.offset,
+                        hex: format!("0x{:02x}", d.byte),
+                        description: d.description.clone(),
+                    })
+                    .collect(),
+            });
+        }
     }
 
     if scan.has_invisible_math_operators {
@@ -198,6 +234,89 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// Check if a byte offset in the input is surrounded by joining-script characters.
+/// ZWJ and ZWNJ are legitimate in scripts that use character joining (Arabic, Devanagari, etc.).
+/// Returns true only if BOTH immediate non-Common neighbors are in the same joining script.
+/// One-sided joining (e.g., Latin + ZWJ + Arabic) is suspicious and not suppressed.
+fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
+    use unicode_script::{Script, UnicodeScript};
+
+    let Ok(text) = std::str::from_utf8(input) else {
+        return false;
+    };
+
+    // Find the character at the offset (the ZWJ/ZWNJ itself)
+    let zw_char = text[byte_offset..].chars().next();
+    let zw_len = zw_char.map(|c| c.len_utf8()).unwrap_or(1);
+
+    // Helper: get the non-Common/Inherited script of a char
+    let significant_script = |ch: char| {
+        let s = ch.script();
+        if s == Script::Common || s == Script::Inherited {
+            None
+        } else {
+            Some(s)
+        }
+    };
+
+    // Check the character immediately BEFORE the ZWJ/ZWNJ
+    let before_script = if byte_offset > 0 {
+        let mut prev_start = byte_offset - 1;
+        while prev_start > 0 && !text.is_char_boundary(prev_start) {
+            prev_start -= 1;
+        }
+        text[prev_start..]
+            .chars()
+            .next()
+            .and_then(significant_script)
+    } else {
+        None
+    };
+
+    // Check the character immediately AFTER the ZWJ/ZWNJ
+    let after_offset = byte_offset + zw_len;
+    let after_script = if after_offset < text.len() {
+        text[after_offset..]
+            .chars()
+            .next()
+            .and_then(significant_script)
+    } else {
+        None
+    };
+
+    // Both neighbors must be present, in the same joining script.
+    // Mixed joining scripts (e.g., Arabic + Devanagari) are suspicious.
+    match (before_script, after_script) {
+        (Some(before), Some(after)) => before == after && is_joining_script(before),
+        _ => false,
+    }
+}
+
+/// Scripts that legitimately use ZWJ/ZWNJ for character joining/shaping.
+fn is_joining_script(script: unicode_script::Script) -> bool {
+    use unicode_script::Script;
+    matches!(
+        script,
+        Script::Arabic
+            | Script::Syriac
+            | Script::Mandaic
+            | Script::Mongolian
+            | Script::Devanagari
+            | Script::Bengali
+            | Script::Gurmukhi
+            | Script::Gujarati
+            | Script::Oriya
+            | Script::Tamil
+            | Script::Telugu
+            | Script::Kannada
+            | Script::Malayalam
+            | Script::Sinhala
+            | Script::Thai
+            | Script::Tibetan
+            | Script::Myanmar
+    )
 }
 
 fn looks_like_hidden_command(line: &str) -> bool {

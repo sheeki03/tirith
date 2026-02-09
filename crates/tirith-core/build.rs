@@ -13,12 +13,14 @@ fn main() {
     compile_known_domains(&data_dir, &out_dir);
     compile_popular_repos(&data_dir, &out_dir);
     compile_public_suffix_list(&data_dir, &out_dir);
+    compile_ocr_confusions(&data_dir, &out_dir);
     generate_tier1_regex(&out_dir);
 
     println!("cargo:rerun-if-changed=assets/data/confusables.txt");
     println!("cargo:rerun-if-changed=assets/data/known_domains.csv");
     println!("cargo:rerun-if-changed=assets/data/popular_repos.csv");
     println!("cargo:rerun-if-changed=assets/data/public_suffix_list.dat");
+    println!("cargo:rerun-if-changed=assets/data/ocr_confusions.tsv");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -151,6 +153,64 @@ fn compile_public_suffix_list(data_dir: &Path, out_dir: &str) {
     ));
 
     let out_path = Path::new(out_dir).join("psl_gen.rs");
+    fs::write(&out_path, code).unwrap();
+}
+
+fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
+    let path = data_dir.join("ocr_confusions.tsv");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read ocr_confusions.tsv: {e}"));
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (line_num, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() != 2 {
+            panic!(
+                "ocr_confusions.tsv:{}: expected 2 TAB-separated columns, got {}",
+                line_num + 1,
+                parts.len()
+            );
+        }
+        let canonical = parts[1];
+        // Validate: canonical values with alphabetic chars must be lowercase
+        // (comparison pipeline lowercases input, so uppercase canonicals are dead code)
+        if canonical.chars().any(|c| c.is_ascii_uppercase()) {
+            panic!(
+                "ocr_confusions.tsv:{}: canonical value {:?} contains uppercase — \
+                 all alphabetic canonicals must be lowercase (comparison pipeline lowercases input)",
+                line_num + 1,
+                canonical
+            );
+        }
+        entries.push((parts[0].to_string(), canonical.to_string()));
+    }
+
+    // Sort by confusable length descending (multi-char first for longest-match)
+    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut code = String::new();
+    code.push_str("/// Auto-generated OCR confusion table.\n");
+    code.push_str(
+        "/// Sorted by confusable length descending for longest-match-first normalization.\n",
+    );
+    code.push_str("pub const OCR_CONFUSIONS: &[(&str, &str)] = &[\n");
+    for (confusable, canonical) in &entries {
+        // Escape for Rust string literal
+        let esc_c = confusable.replace('\\', "\\\\").replace('"', "\\\"");
+        let esc_k = canonical.replace('\\', "\\\\").replace('"', "\\\"");
+        code.push_str(&format!("    (\"{esc_c}\", \"{esc_k}\"),\n"));
+    }
+    code.push_str("];\n");
+    let count = entries.len();
+    code.push_str(&format!(
+        "\npub const OCR_CONFUSION_COUNT: usize = {count};\n"
+    ));
+
+    let out_path = Path::new(out_dir).join("ocr_confusions_gen.rs");
     fs::write(&out_path, code).unwrap();
 }
 

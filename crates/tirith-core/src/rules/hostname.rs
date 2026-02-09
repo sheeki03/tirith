@@ -167,10 +167,18 @@ fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
 }
 
 fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
-    let skeleton = crate::confusables::skeleton(&raw_host.to_lowercase());
+    let host_lower = raw_host.to_lowercase();
+    let skeleton = crate::confusables::skeleton(&host_lower);
+    let ocr_normalized = ocr_normalize(&host_lower);
+
     for known in crate::data::known_domains() {
         let known_lower = known.to_lowercase();
-        if skeleton == known_lower && raw_host.to_lowercase() != known_lower {
+        if host_lower == known_lower {
+            continue; // Exact match — not confusable
+        }
+
+        // Unicode skeleton check (existing)
+        if skeleton == known_lower {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableDomain,
                 severity: Severity::High,
@@ -185,18 +193,31 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
             });
             return;
         }
-        // Also check Levenshtein distance for typosquatting.
+
+        // OCR confusion check: apply OCR normalization and compare
+        if ocr_normalized != host_lower && ocr_normalized == known_lower {
+            findings.push(Finding {
+                rule_id: RuleId::ConfusableDomain,
+                severity: Severity::Medium,
+                title: "OCR-confusable domain detected".to_string(),
+                description: format!(
+                    "Domain '{raw_host}' is visually similar to '{known}' via OCR confusion (e.g., rn→m, l→1)"
+                ),
+                evidence: vec![Evidence::HostComparison {
+                    raw_host: raw_host.to_string(),
+                    similar_to: known.to_string(),
+                }],
+            });
+            return;
+        }
+
+        // Levenshtein distance for typosquatting.
         // Only compare domains within 3 chars of the same length to avoid
         // false positives between unrelated short domains (e.g., ghcr.io vs gcr.io).
         // For short domains (< 8 chars), skip levenshtein entirely since
         // single-edit matches are too noisy.
-        let host_lower = raw_host.to_lowercase();
         let len_diff = (host_lower.len() as isize - known_lower.len() as isize).unsigned_abs();
-        if known_lower.len() >= 8
-            && len_diff <= 3
-            && levenshtein(&host_lower, &known_lower) <= 1
-            && host_lower != known_lower
-        {
+        if known_lower.len() >= 8 && len_diff <= 3 && levenshtein(&host_lower, &known_lower) <= 1 {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableDomain,
                 severity: Severity::Medium,
@@ -212,6 +233,50 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
             return;
         }
     }
+}
+
+/// Apply OCR confusion normalization to a string.
+/// Replaces visually confusable character sequences with their canonical forms
+/// (e.g., "rn" → "m", "l" → "1"). Longest match applied first.
+/// Constrained: max 3 consecutive substitutions per ADR-9.
+fn ocr_normalize(input: &str) -> String {
+    let confusions = crate::data::ocr_confusions();
+    let mut result = String::with_capacity(input.len());
+    let mut consecutive_subs = 0u32;
+    let mut i = 0;
+    let bytes = input.as_bytes();
+
+    while i < bytes.len() {
+        let mut matched = false;
+        if consecutive_subs < 3 {
+            // Try each confusion entry (already sorted by length descending)
+            for &(confusable, canonical) in confusions {
+                let conf_bytes = confusable.as_bytes();
+                if i + conf_bytes.len() <= bytes.len()
+                    && &bytes[i..i + conf_bytes.len()] == conf_bytes
+                {
+                    result.push_str(canonical);
+                    i += conf_bytes.len();
+                    consecutive_subs += 1;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            // Reset consecutive counter on non-substitution
+            consecutive_subs = 0;
+            // Advance by one UTF-8 character to preserve multi-byte chars
+            let remaining = &input[i..];
+            if let Some(ch) = remaining.chars().next() {
+                result.push(ch);
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    result
 }
 
 fn check_invalid_host_chars(raw_host: &str, findings: &mut Vec<Finding>) {
