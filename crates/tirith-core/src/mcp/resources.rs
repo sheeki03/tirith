@@ -48,7 +48,12 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 max_files: None,
             };
 
-            let result = scan::scan(&config);
+            let policy = crate::policy::Policy::discover(None);
+            let mut result = scan::scan(&config);
+            for fr in &mut result.file_results {
+                crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+            }
+
             let report = json!({
                 "scanned_count": result.scanned_count,
                 "skipped_count": result.skipped_count,
@@ -99,7 +104,12 @@ fn read_project_safety() -> ToolCallResult {
         max_files: None,
     };
 
-    let result = scan::scan(&config);
+    let policy = crate::policy::Policy::discover(None);
+    let mut result = scan::scan(&config);
+    for fr in &mut result.file_results {
+        crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+    }
+
     let total = result.total_findings();
 
     let structured = json!({

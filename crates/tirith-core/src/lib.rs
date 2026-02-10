@@ -1,4 +1,6 @@
+pub mod approval;
 pub mod audit;
+pub mod audit_aggregator;
 pub mod checkpoint;
 pub mod confusables;
 pub mod data;
@@ -12,12 +14,15 @@ pub mod output;
 pub mod parse;
 pub mod policy;
 pub mod receipt;
+pub mod redact;
 pub mod rule_metadata;
 pub mod rules;
 pub mod scan;
+pub mod session;
 pub mod tokenize;
 pub mod util;
 pub mod verdict;
+pub mod webhook;
 
 #[cfg(unix)]
 pub mod runner;

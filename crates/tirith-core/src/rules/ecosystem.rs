@@ -48,6 +48,8 @@ fn check_docker_untrusted_registry(url: &UrlLike, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -69,6 +71,8 @@ fn check_pip_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -94,6 +98,8 @@ fn check_npm_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -121,6 +127,8 @@ fn check_web3_rpc(url: &UrlLike, findings: &mut Vec<Finding>) {
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -141,6 +149,8 @@ fn check_web3_address_in_url(url: &UrlLike, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url { raw }],
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 }
@@ -185,6 +195,8 @@ fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
                             evidence: vec![Evidence::Url { raw: url.raw_str() }],
                             human_view: None,
                             agent_view: None,
+                            mitre_id: None,
+                            custom_rule_id: None,
                         });
                         return;
                     }

@@ -135,6 +135,8 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 

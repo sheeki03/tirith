@@ -13,6 +13,7 @@ use crate::verdict::Verdict;
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     pub timestamp: String,
+    pub session_id: String,
     pub action: String,
     pub rule_ids: Vec<String>,
     pub command_redacted: String,
@@ -26,11 +27,15 @@ pub struct AuditEntry {
 }
 
 /// Append an entry to the audit log. Never panics or changes verdict on failure.
+///
+/// `custom_dlp_patterns` are Team-tier regex patterns applied alongside built-in
+/// DLP redaction before the command is written to the log.
 pub fn log_verdict(
     verdict: &Verdict,
     command: &str,
     log_path: Option<PathBuf>,
     event_id: Option<String>,
+    custom_dlp_patterns: &[String],
 ) {
     // Early exit if logging disabled
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
@@ -50,13 +55,14 @@ pub fn log_verdict(
 
     let entry = AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::session::session_id().to_string(),
         action: format!("{:?}", verdict.action),
         rule_ids: verdict
             .findings
             .iter()
             .map(|f| f.rule_id.to_string())
             .collect(),
-        command_redacted: redact_command(command),
+        command_redacted: redact_command(command, custom_dlp_patterns),
         bypass_requested: verdict.bypass_requested,
         bypass_honored: verdict.bypass_honored,
         interactive: verdict.interactive_detected,
@@ -104,13 +110,19 @@ fn default_log_path() -> Option<PathBuf> {
     crate::policy::data_dir().map(|d| d.join("log.jsonl"))
 }
 
-fn redact_command(cmd: &str) -> String {
-    // Redact: keep first 80 bytes (UTF-8 safe), replace the rest
-    let prefix = crate::util::truncate_bytes(cmd, 80);
-    if prefix.len() == cmd.len() {
-        cmd.to_string()
+fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
+    // Apply DLP redaction: built-in patterns + custom policy patterns (Team)
+    let dlp_redacted = crate::redact::redact_with_custom(cmd, custom_patterns);
+    // Then truncate to 80 bytes (UTF-8 safe)
+    let prefix = crate::util::truncate_bytes(&dlp_redacted, 80);
+    if prefix.len() == dlp_redacted.len() {
+        dlp_redacted
     } else {
-        format!("{}[...redacted {} chars]", prefix, cmd.len() - prefix.len())
+        format!(
+            "{}[...redacted {} chars]",
+            prefix,
+            dlp_redacted.len() - prefix.len()
+        )
     }
 }
 
@@ -143,9 +155,14 @@ mod tests {
             interactive_detected: false,
             policy_path_used: None,
             urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
         };
 
-        log_verdict(&verdict, "test cmd", Some(log_path.clone()), None);
+        log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]);
 
         // File should not have been created
         assert!(

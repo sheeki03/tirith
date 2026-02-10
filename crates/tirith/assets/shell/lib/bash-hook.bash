@@ -24,15 +24,65 @@ unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_SOURCE
 [[ "$(declare -p _TIRITH_TEST_SKIP_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_SKIP_HEALTH
 [[ "$(declare -p _TIRITH_TEST_FAIL_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_FAIL_HEALTH
 
-# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
-# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
-# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+# Session tracking: generate ID per shell session if not inherited
+if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
+  TIRITH_SESSION_ID="$(printf '%x-%x' "$$" "$(date +%s)")"
+  export TIRITH_SESSION_ID
+fi
+
+# Output helper: write to stderr by default (ADR-7).
+# Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
-  if [[ "${TIRITH_OUTPUT:-}" == "stderr" ]] || [[ "$TERM_PROGRAM" == "WarpTerminal" ]]; then
-    printf '%s\n' "$1" >&2
-  else
+  if [[ "${TIRITH_OUTPUT:-}" == "tty" ]]; then
     printf '%s\n' "$1" >/dev/tty
+  else
+    printf '%s\n' "$1" >&2
   fi
+}
+
+# ─── Approval workflow helpers (ADR-7) ───
+
+# Parse approval temp file. On success, sets _tirith_ap_* variables.
+# On failure (missing/unreadable/corrupt), returns 1 with fail-closed defaults.
+_tirith_parse_approval() {
+  local file="$1"
+  _tirith_ap_required="no"
+  _tirith_ap_timeout=0
+  _tirith_ap_fallback="block"
+  _tirith_ap_rule=""
+  _tirith_ap_desc=""
+
+  if [[ ! -r "$file" ]]; then
+    _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
+    rm -f "$file"  # ADR-7: delete on all paths
+    _tirith_ap_required="yes"
+    _tirith_ap_fallback="block"
+    _tirith_ap_timeout=0
+    return 1
+  fi
+
+  local valid_keys=0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TIRITH_REQUIRES_APPROVAL) _tirith_ap_required="$value"; valid_keys=$((valid_keys + 1)) ;;
+      TIRITH_APPROVAL_TIMEOUT) _tirith_ap_timeout="$value" ;;
+      TIRITH_APPROVAL_FALLBACK) _tirith_ap_fallback="$value" ;;
+      TIRITH_APPROVAL_RULE) _tirith_ap_rule="$value" ;;
+      TIRITH_APPROVAL_DESCRIPTION) _tirith_ap_desc="$value" ;;
+    esac
+  done < "$file"
+
+  # Delete temp file after reading (ADR-7 lifecycle)
+  rm -f "$file"
+
+  # Corrupt file (no valid keys) → fail closed
+  if [[ $valid_keys -eq 0 ]]; then
+    _tirith_output "tirith: warning: approval file corrupt, failing closed"
+    _tirith_ap_required="yes"
+    _tirith_ap_fallback="block"
+    return 1
+  fi
+  return 0
 }
 
 # ─── Persistent safe mode infrastructure ───
@@ -266,37 +316,76 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         return
       fi
 
-      # Run tirith check, use temp file to prevent tty leakage in bind -x context
-      local tmpfile=$(mktemp)
-      tirith check --non-interactive --shell posix -- "$READLINE_LINE" >"$tmpfile" 2>&1
+      # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
+      local errfile=$(mktemp)
+      local approval_path
+      approval_path=$(tirith check --approval-check --non-interactive --shell posix -- "$READLINE_LINE" 2>"$errfile")
       local rc=$?
-      local output=$(<"$tmpfile")
-      rm -f "$tmpfile"
+      local output=$(<"$errfile")
+      rm -f "$errfile"
 
       if [[ $rc -eq 0 ]]; then
-        # Allow: execute silently (fall through to execute block)
-        :
+        :  # Allow: no output
       elif [[ $rc -eq 2 ]]; then
-        # Warn: print warning then execute (fall through to execute block)
         _tirith_output ""
         _tirith_output "command> $READLINE_LINE"
         [[ -n "$output" ]] && _tirith_output "$output"
       elif [[ $rc -eq 1 ]]; then
-        # Block: tirith intentionally blocked this command
         _tirith_output ""
         _tirith_output "command> $READLINE_LINE"
         [[ -n "$output" ]] && _tirith_output "$output"
+      else
+        # Unexpected exit code: degrade to preexec
+        _tirith_output ""
+        _tirith_output "command> $READLINE_LINE"
+        [[ -n "$output" ]] && _tirith_output "$output"
+        [[ -n "$approval_path" ]] && rm -f "$approval_path"
+        _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
+        return  # READLINE_LINE preserved for re-execution via preexec
+      fi
+
+      # Approval workflow: runs for ALL exit codes (0, 1, 2).
+      # For rc=1 (block), approval gives user a chance to override.
+      if [[ -n "$approval_path" ]]; then
+        _tirith_parse_approval "$approval_path"
+        if [[ "$_tirith_ap_required" == "yes" ]]; then
+          _tirith_output "tirith: approval required for $_tirith_ap_rule"
+          [[ -n "$_tirith_ap_desc" ]] && _tirith_output "  $_tirith_ap_desc"
+          local response=""
+          if [[ "$_tirith_ap_timeout" -gt 0 ]]; then
+            read -t "$_tirith_ap_timeout" -p "Approve? (${_tirith_ap_timeout}s timeout) [y/N] " response </dev/tty 2>/dev/null
+          else
+            read -p "Approve? [y/N] " response </dev/tty 2>/dev/null
+          fi
+          if [[ "$response" == [yY]* ]]; then
+            :  # Approved: fall through to execute
+          else
+            case "$_tirith_ap_fallback" in
+              allow)
+                _tirith_output "tirith: approval not granted — fallback: allow"
+                ;;
+              warn)
+                _tirith_output "tirith: approval not granted — fallback: warn"
+                ;;
+              *)
+                _tirith_output "tirith: approval not granted — fallback: block"
+                READLINE_LINE=""
+                READLINE_POINT=0
+                return
+                ;;
+            esac
+          fi
+        elif [[ $rc -eq 1 ]]; then
+          # Approval not required but command was blocked: honor block
+          READLINE_LINE=""
+          READLINE_POINT=0
+          return
+        fi
+      elif [[ $rc -eq 1 ]]; then
+        # No approval file: honor block
         READLINE_LINE=""
         READLINE_POINT=0
         return
-      else
-        # Unexpected exit code (crash, OOM, missing binary): degrade to preexec
-        # Block this command but don't break the terminal — use Issue #20 infrastructure
-        _tirith_output ""
-        _tirith_output "command> $READLINE_LINE"
-        [[ -n "$output" ]] && _tirith_output "$output"
-        _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
-        return  # READLINE_LINE preserved for re-execution via preexec
       fi
 
       # rc was 0 or 2: execute the command

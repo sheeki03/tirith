@@ -34,6 +34,11 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
 
+        /// Write approval metadata to a temp file and print its path to stdout.
+        /// Used by shell hooks for the approval workflow (Team feature).
+        #[arg(long)]
+        approval_check: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -160,6 +165,12 @@ enum Commands {
     #[command(name = "mcp-server")]
     McpServer,
 
+    /// Audit log management: export, stats, compliance reports (Team)
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -181,6 +192,49 @@ enum Commands {
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Export audit log records as JSON or CSV
+    Export {
+        /// Output format: json or csv
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Filter: only records since this ISO 8601 date
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter: only records until this ISO 8601 date
+        #[arg(long)]
+        until: Option<String>,
+        /// Filter: only this session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Filter: only this action (Allow, Warn, Block)
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter: only records matching these rule IDs
+        #[arg(long)]
+        rule_id: Vec<String>,
+    },
+    /// Show summary statistics from the audit log
+    Stats {
+        /// Filter to a specific session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate a compliance report from the audit log
+    Report {
+        /// Output format: markdown, json, or html
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Filter: only records since this ISO 8601 date
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,8 +304,16 @@ fn main() {
             json,
             non_interactive,
             interactive,
+            approval_check,
             cmd,
-        } => cli::check::run(&cmd.join(" "), &shell, json, non_interactive, interactive),
+        } => cli::check::run(
+            &cmd.join(" "),
+            &shell,
+            json,
+            non_interactive,
+            interactive,
+            approval_check,
+        ),
 
         Commands::Paste { shell, json, html } => cli::paste::run(&shell, json, html.as_deref()),
 
@@ -286,6 +348,26 @@ fn main() {
         Commands::Fetch { url, json } => cli::fetch::run(&url, json),
 
         Commands::McpServer => cli::mcp_server::run(),
+
+        Commands::Audit { action } => match action {
+            AuditAction::Export {
+                format,
+                since,
+                until,
+                session,
+                action,
+                rule_id,
+            } => cli::audit::export(
+                &format,
+                since.as_deref(),
+                until.as_deref(),
+                session.as_deref(),
+                action.as_deref(),
+                &rule_id,
+            ),
+            AuditAction::Stats { session, json } => cli::audit::stats(session.as_deref(), json),
+            AuditAction::Report { format, since } => cli::audit::report(&format, since.as_deref()),
+        },
 
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),

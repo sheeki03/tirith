@@ -464,6 +464,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "pdf_hidden_text",
     // Policy
     "policy_blocklisted",
+    // Custom rules
+    "custom_rule_match",
     // License/infrastructure
     "license_required",
 ];
@@ -509,9 +511,10 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "policy_blocklisted",
     "command_network_deny",
     "license_required",
-    "server_cloaking",  // requires network fetch (Unix-only)
-    "clipboard_hidden", // requires --html clipboard input
-    "pdf_hidden_text",  // requires .pdf file input
+    "custom_rule_match", // requires custom_rules in policy (Team-only)
+    "server_cloaking",   // requires network fetch (Unix-only)
+    "clipboard_hidden",  // requires --html clipboard input
+    "pdf_hidden_text",   // requires .pdf file input
 ];
 
 #[test]
@@ -608,6 +611,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::ServerCloaking,
         RuleId::ClipboardHidden,
         RuleId::PdfHiddenText,
+        RuleId::CustomRuleMatch,
         RuleId::PolicyBlocklisted,
         RuleId::LicenseRequired,
     ];

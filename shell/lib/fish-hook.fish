@@ -12,15 +12,67 @@ if set -q _TIRITH_FISH_LOADED
 end
 set -g _TIRITH_FISH_LOADED 1
 
-# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
-# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
-# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+# Session tracking: generate ID per shell session if not inherited
+if not set -q TIRITH_SESSION_ID
+    set -gx TIRITH_SESSION_ID (printf '%x-%x' %self (date +%s))
+end
+
+# Output helper: write to stderr by default (ADR-7).
+# Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 function _tirith_output
-    if test "$TIRITH_OUTPUT" = "stderr"; or test "$TERM_PROGRAM" = "WarpTerminal"
-        printf '%s\n' "$argv[1]" >&2
-    else
+    if test "$TIRITH_OUTPUT" = "tty"
         printf '%s\n' "$argv[1]" >/dev/tty
+    else
+        printf '%s\n' "$argv[1]" >&2
     end
+end
+
+# ─── Approval workflow helpers (ADR-7) ───
+
+function _tirith_parse_approval
+    set -g _tirith_ap_required "no"
+    set -g _tirith_ap_timeout 0
+    set -g _tirith_ap_fallback "block"
+    set -g _tirith_ap_rule ""
+    set -g _tirith_ap_desc ""
+
+    if not test -r "$argv[1]"
+        _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
+        command rm -f "$argv[1]"  # ADR-7: delete on all paths
+        set -g _tirith_ap_required "yes"
+        set -g _tirith_ap_fallback "block"
+        return 1
+    end
+
+    set -l valid_keys 0
+    for line in (cat "$argv[1]")
+        set -l parts (string split -m1 = "$line")
+        if test (count $parts) -ge 2
+            switch $parts[1]
+                case TIRITH_REQUIRES_APPROVAL
+                    set -g _tirith_ap_required $parts[2]
+                    set valid_keys (math $valid_keys + 1)
+                case TIRITH_APPROVAL_TIMEOUT
+                    set -g _tirith_ap_timeout $parts[2]
+                case TIRITH_APPROVAL_FALLBACK
+                    set -g _tirith_ap_fallback $parts[2]
+                case TIRITH_APPROVAL_RULE
+                    set -g _tirith_ap_rule $parts[2]
+                case TIRITH_APPROVAL_DESCRIPTION
+                    set -g _tirith_ap_desc $parts[2]
+            end
+        end
+    end
+
+    command rm -f "$argv[1]"
+
+    if test $valid_keys -eq 0
+        _tirith_output "tirith: warning: approval file corrupt, failing closed"
+        set -g _tirith_ap_required "yes"
+        set -g _tirith_ap_fallback "block"
+        return 1
+    end
+    return 0
 end
 
 # Save original key bindings function BEFORE defining our new one
@@ -81,30 +133,27 @@ function _tirith_check_command
         return
     end
 
-    # Run tirith check, use temp file to prevent tty leakage
-    set -l tmpfile (mktemp)
-    tirith check --non-interactive --shell fish -- "$cmd" >$tmpfile 2>&1
+    # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
+    set -l errfile (mktemp)
+    set -l approval_path (tirith check --approval-check --non-interactive --shell fish -- "$cmd" 2>$errfile)
     set -l rc $status
-    set -l output (cat $tmpfile | string collect)
-    rm -f $tmpfile
+    set -l output (cat $errfile | string collect)
+    rm -f $errfile
 
     if test $rc -eq 0
-        commandline -f execute
+        # Allow: no output
     else if test $rc -eq 2
         _tirith_output ""
         _tirith_output "command> $cmd"
         if test -n "$output"
             _tirith_output "$output"
         end
-        commandline -f execute
     else if test $rc -eq 1
-        # Block: tirith intentionally blocked
         _tirith_output ""
         _tirith_output "command> $cmd"
         if test -n "$output"
             _tirith_output "$output"
         end
-        commandline -r ""
     else
         # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
         _tirith_output ""
@@ -112,8 +161,59 @@ function _tirith_check_command
             _tirith_output "$output"
         end
         _tirith_output "tirith: unexpected exit code $rc — running unprotected"
+        test -n "$approval_path"; and command rm -f "$approval_path"
         commandline -f execute
+        return
     end
+
+    # Approval workflow: runs for ALL exit codes (0, 1, 2).
+    # For rc=1 (block), approval gives user a chance to override.
+    if test -n "$approval_path"
+        _tirith_parse_approval "$approval_path"
+        if test "$_tirith_ap_required" = "yes"
+            _tirith_output "tirith: approval required for $_tirith_ap_rule"
+            if test -n "$_tirith_ap_desc"
+                _tirith_output "  $_tirith_ap_desc"
+            end
+            set -l response ""
+            if test "$_tirith_ap_timeout" -gt 0
+                # Fish read has no timeout flag; delegate to bash read -t
+                set -l timeout_s $_tirith_ap_timeout
+                if command -q bash
+                    set response (bash -c 'read -t '"$timeout_s"' -p "Approve? ('"$timeout_s"'s timeout) [y/N] " r </dev/tty 2>/dev/null && echo "$r" || echo ""')
+                else
+                    # Fallback: blocking read (no timeout support without bash)
+                    read -P "Approve? [y/N] " response
+                end
+            else
+                read -P "Approve? [y/N] " response
+            end
+            if string match -qi 'y*' -- "$response"
+                # Approved: fall through to execute
+            else
+                switch $_tirith_ap_fallback
+                    case allow
+                        _tirith_output "tirith: approval not granted — fallback: allow"
+                    case warn
+                        _tirith_output "tirith: approval not granted — fallback: warn"
+                    case '*'
+                        _tirith_output "tirith: approval not granted — fallback: block"
+                        commandline -r ""
+                        return
+                end
+            end
+        else if test $rc -eq 1
+            # Approval not required but command was blocked: honor block
+            commandline -r ""
+            return
+        end
+    else if test $rc -eq 1
+        # No approval file: honor block
+        commandline -r ""
+        return
+    end
+
+    commandline -f execute
 end
 
 function _tirith_bind_enter

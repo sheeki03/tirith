@@ -130,7 +130,7 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
             // Log bypass to audit
-            crate::audit::log_verdict(&verdict, &ctx.input, None, None);
+            crate::audit::log_verdict(&verdict, &ctx.input, None, None, &[]);
             return verdict;
         }
     }
@@ -268,6 +268,28 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         // Run environment rules
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
+
+        // Policy-driven network deny/allow (Team feature)
+        if crate::license::current_tier() >= crate::license::Tier::Team
+            && !policy.network_deny.is_empty()
+        {
+            let net_findings = crate::rules::command::check_network_policy(
+                &ctx.input,
+                ctx.shell,
+                &policy.network_deny,
+                &policy.network_allow,
+            );
+            findings.extend(net_findings);
+        }
+    }
+
+    // Custom YAML detection rules (Team-only, Phase 24)
+    if crate::license::current_tier() >= crate::license::Tier::Team
+        && !policy.custom_rules.is_empty()
+    {
+        let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
+        let custom_findings = crate::rules::custom::check(&ctx.input, ctx.scan_context, &compiled);
+        findings.extend(custom_findings);
     }
 
     // Apply policy severity overrides
@@ -291,6 +313,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -493,12 +517,62 @@ fn evidence_summary(evidence: &[crate::verdict::Evidence]) -> String {
     }
 }
 
-/// Team enrichment: MITRE ATT&CK classification, custom rule metadata.
-/// Populated in Part 9 when Team features ship.
-#[allow(unused_variables)]
+/// MITRE ATT&CK technique mapping for built-in rules.
+fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
+    use crate::verdict::RuleId;
+    match rule_id {
+        // Execution
+        RuleId::PipeToInterpreter
+        | RuleId::CurlPipeShell
+        | RuleId::WgetPipeShell
+        | RuleId::HttpiePipeShell
+        | RuleId::XhPipeShell => Some("T1059.004"), // Command and Scripting Interpreter: Unix Shell
+
+        // Persistence
+        RuleId::DotfileOverwrite => Some("T1546.004"), // Event Triggered Execution: Unix Shell Config
+
+        // Defense Evasion
+        RuleId::BidiControls | RuleId::UnicodeTags | RuleId::ZeroWidthChars => {
+            Some("T1036.005") // Masquerading: Match Legitimate Name or Location
+        }
+        RuleId::HiddenMultiline | RuleId::AnsiEscapes | RuleId::ControlChars => Some("T1036.005"),
+
+        // Hijack Execution Flow
+        RuleId::CodeInjectionEnv => Some("T1574.006"), // Hijack Execution Flow: Dynamic Linker Hijacking
+        RuleId::InterpreterHijackEnv => Some("T1574.007"), // Path Interception by PATH
+        RuleId::ShellInjectionEnv => Some("T1546.004"), // Shell Config Modification
+
+        // Credential Access
+        RuleId::MetadataEndpoint => Some("T1552.005"), // Unsecured Credentials: Cloud Instance Metadata
+        RuleId::SensitiveEnvExport => Some("T1552.001"), // Credentials In Files
+
+        // Supply Chain
+        RuleId::ConfigInjection => Some("T1195.001"), // Supply Chain Compromise: Dev Tools
+        RuleId::McpInsecureServer | RuleId::McpSuspiciousArgs => Some("T1195.002"), // Compromise Software Supply Chain
+        RuleId::GitTyposquat => Some("T1195.001"),
+        RuleId::DockerUntrustedRegistry => Some("T1195.002"),
+
+        // Discovery / Lateral Movement
+        RuleId::PrivateNetworkAccess => Some("T1046"), // Network Service Discovery
+        RuleId::ServerCloaking => Some("T1036"),       // Masquerading
+
+        // Collection
+        RuleId::ArchiveExtract => Some("T1560.001"), // Archive Collected Data: Archive via Utility
+
+        // Exfiltration
+        RuleId::ProxyEnvSet => Some("T1090.001"), // Proxy: Internal Proxy
+
+        _ => None,
+    }
+}
+
+/// Team enrichment: MITRE ATT&CK classification.
 fn enrich_team(findings: &mut [Finding]) {
-    // Part 9 will populate:
-    // - finding MITRE ATT&CK ids
+    for finding in findings.iter_mut() {
+        if finding.mitre_id.is_none() {
+            finding.mitre_id = mitre_id_for_rule(finding.rule_id).map(String::from);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +622,8 @@ mod tests {
                 evidence: vec![],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             },
             Finding {
                 rule_id: RuleId::InvisibleWhitespace,
@@ -557,6 +633,8 @@ mod tests {
                 evidence: vec![],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             },
             Finding {
                 rule_id: RuleId::HiddenCssContent,
@@ -566,6 +644,8 @@ mod tests {
                 evidence: vec![],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             },
         ];
 

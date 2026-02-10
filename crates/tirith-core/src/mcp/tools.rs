@@ -195,6 +195,8 @@ fn call_check_command(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    apply_approval_if_team(&mut verdict, &policy);
+    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -230,6 +232,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    apply_approval_if_team(&mut verdict, &policy);
+    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -264,6 +268,8 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    apply_approval_if_team(&mut verdict, &policy);
+    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict).ok();
     let text = format_verdict_text(&verdict);
 
@@ -288,8 +294,11 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
         return tool_error(&format!("File not found: {path_str}"));
     }
 
+    let policy = crate::policy::Policy::discover(None);
+
     match scan::scan_single_file(&path) {
-        Some(result) => {
+        Some(mut result) => {
+            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let structured = json!({
                 "path": result.path.display().to_string(),
                 "is_config_file": result.is_config_file,
@@ -334,7 +343,12 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         max_files: None,
     };
 
-    let result = scan::scan(&config);
+    let policy = crate::policy::Policy::discover(None);
+    let mut result = scan::scan(&config);
+    for fr in &mut result.file_results {
+        crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+    }
+
     let structured = json!({
         "scanned_count": result.scanned_count,
         "skipped_count": result.skipped_count,
@@ -374,9 +388,12 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
         return tool_error(&format!("File not found: {path_str}"));
     }
 
+    let policy = crate::policy::Policy::discover(None);
+
     // Use scan_single_file — it routes through FileScan which runs configfile rules
     match scan::scan_single_file(&path) {
-        Some(result) => {
+        Some(mut result) => {
+            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let mcp_findings: Vec<_> = result
                 .findings
                 .iter()
@@ -433,66 +450,91 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
 
     let is_pro = crate::license::current_tier() >= crate::license::Tier::Pro;
 
+    let policy = crate::policy::Policy::discover(None);
+
     match crate::rules::cloaking::check(url) {
-        Ok(result) => {
-            let text = if result.cloaking_detected {
-                let differing: Vec<&str> = result
-                    .diff_pairs
-                    .iter()
-                    .map(|d| d.agent_b.as_str())
-                    .collect();
-                format!(
-                    "Cloaking detected for {}. Differing agents: {}",
-                    url,
-                    differing.join(", ")
-                )
-            } else {
-                format!("No cloaking detected for {url}")
-            };
-
-            let structured = serde_json::json!({
-                "url": result.url,
-                "cloaking_detected": result.cloaking_detected,
-                "agents": result.agent_responses.iter().map(|a| {
-                    serde_json::json!({
-                        "agent": a.agent_name,
-                        "status_code": a.status_code,
-                        "content_length": a.content_length,
-                    })
-                }).collect::<Vec<_>>(),
-                "diffs": result.diff_pairs.iter().map(|d| {
-                    let mut entry = serde_json::json!({
-                        "agent_a": d.agent_a,
-                        "agent_b": d.agent_b,
-                        "diff_chars": d.diff_chars,
-                    });
-                    // Pro enrichment: include diff text
-                    if is_pro {
-                        if let Some(ref text) = d.diff_text {
-                            entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(text));
-                        }
-                    }
-                    entry
-                }).collect::<Vec<_>>(),
-                "findings": result.findings,
-            });
-
-            ToolCallResult {
-                content: vec![ContentItem {
-                    content_type: "text".into(),
-                    text,
-                }],
-                is_error: false,
-                structured_content: Some(structured),
-            }
+        Ok(mut result) => {
+            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
+            build_cloaking_response(result, is_pro, &policy.dlp_custom_patterns)
         }
         Err(e) => tool_error(&format!("Cloaking check failed: {e}")),
+    }
+}
+
+/// Build the MCP response for a cloaking check result.
+/// Extracted for testability — diff_text is DLP-redacted before serialization.
+#[cfg(unix)]
+fn build_cloaking_response(
+    result: crate::rules::cloaking::CloakingResult,
+    is_pro: bool,
+    dlp_patterns: &[String],
+) -> ToolCallResult {
+    let text = if result.cloaking_detected {
+        let differing: Vec<&str> = result
+            .diff_pairs
+            .iter()
+            .map(|d| d.agent_b.as_str())
+            .collect();
+        format!(
+            "Cloaking detected for {}. Differing agents: {}",
+            result.url,
+            differing.join(", ")
+        )
+    } else {
+        format!("No cloaking detected for {}", result.url)
+    };
+
+    let structured = serde_json::json!({
+        "url": result.url,
+        "cloaking_detected": result.cloaking_detected,
+        "agents": result.agent_responses.iter().map(|a| {
+            serde_json::json!({
+                "agent": a.agent_name,
+                "status_code": a.status_code,
+                "content_length": a.content_length,
+            })
+        }).collect::<Vec<_>>(),
+        "diffs": result.diff_pairs.iter().map(|d| {
+            let mut entry = serde_json::json!({
+                "agent_a": d.agent_a,
+                "agent_b": d.agent_b,
+                "diff_chars": d.diff_chars,
+            });
+            // Pro enrichment: include diff text (DLP-redacted)
+            if is_pro {
+                if let Some(ref text) = d.diff_text {
+                    let redacted = crate::redact::redact_with_custom(text, dlp_patterns);
+                    entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(redacted));
+                }
+            }
+            entry
+        }).collect::<Vec<_>>(),
+        "findings": result.findings,
+    });
+
+    ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".into(),
+            text,
+        }],
+        is_error: false,
+        structured_content: Some(structured),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Apply approval metadata to a verdict if the current tier is Team+.
+/// Shared by all MCP check tools (ADR-6: gates in core, not CLI).
+fn apply_approval_if_team(verdict: &mut crate::verdict::Verdict, policy: &crate::policy::Policy) {
+    if crate::license::current_tier() >= crate::license::Tier::Team {
+        if let Some(meta) = crate::approval::check_approval(verdict, policy) {
+            crate::approval::apply_approval(verdict, &meta);
+        }
+    }
+}
 
 fn tool_error(msg: &str) -> ToolCallResult {
     ToolCallResult {
@@ -567,4 +609,125 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cloaking_diff_text_is_dlp_redacted() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
+
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz12345678";
+        let result = CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: true,
+            findings: vec![],
+            agent_responses: vec![
+                AgentResponse {
+                    agent_name: "Chrome".into(),
+                    status_code: 200,
+                    content_length: 100,
+                },
+                AgentResponse {
+                    agent_name: "ClaudeBot".into(),
+                    status_code: 200,
+                    content_length: 80,
+                },
+            ],
+            diff_pairs: vec![DiffPair {
+                agent_a: "Chrome".into(),
+                agent_b: "ClaudeBot".into(),
+                diff_chars: 50,
+                diff_text: Some(format!("Added: config key={secret}")),
+            }],
+        };
+
+        // Simulate Pro tier seeing diff_text
+        let resp = build_cloaking_response(result, true, &[]);
+        let structured = resp.structured_content.unwrap();
+        let diff_text = structured["diffs"][0]["diff_text"]
+            .as_str()
+            .expect("diff_text should be present for Pro");
+
+        // The OpenAI key pattern should be redacted
+        assert!(
+            !diff_text.contains(secret),
+            "diff_text should not contain raw secret: {diff_text}"
+        );
+        assert!(
+            diff_text.contains("[REDACTED:OpenAI API Key]"),
+            "diff_text should contain redaction marker: {diff_text}"
+        );
+    }
+
+    #[test]
+    fn test_cloaking_diff_text_absent_for_non_pro() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
+
+        let result = CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: true,
+            findings: vec![],
+            agent_responses: vec![AgentResponse {
+                agent_name: "Chrome".into(),
+                status_code: 200,
+                content_length: 100,
+            }],
+            diff_pairs: vec![DiffPair {
+                agent_a: "Chrome".into(),
+                agent_b: "ClaudeBot".into(),
+                diff_chars: 50,
+                diff_text: Some("some diff content".into()),
+            }],
+        };
+
+        // Non-Pro: diff_text should NOT appear in structured output
+        let resp = build_cloaking_response(result, false, &[]);
+        let structured = resp.structured_content.unwrap();
+        assert!(
+            structured["diffs"][0].get("diff_text").is_none(),
+            "diff_text should not be present for non-Pro"
+        );
+    }
+
+    #[test]
+    fn test_cloaking_custom_dlp_pattern_redacts_diff_text() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
+
+        let result = CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: true,
+            findings: vec![],
+            agent_responses: vec![AgentResponse {
+                agent_name: "Chrome".into(),
+                status_code: 200,
+                content_length: 100,
+            }],
+            diff_pairs: vec![DiffPair {
+                agent_a: "Chrome".into(),
+                agent_b: "ClaudeBot".into(),
+                diff_chars: 30,
+                diff_text: Some("internal ref PROJ-99999 leaked".into()),
+            }],
+        };
+
+        let custom = vec![r"PROJ-\d+".to_string()];
+        let resp = build_cloaking_response(result, true, &custom);
+        let structured = resp.structured_content.unwrap();
+        let diff_text = structured["diffs"][0]["diff_text"]
+            .as_str()
+            .expect("diff_text should be present");
+
+        assert!(
+            !diff_text.contains("PROJ-99999"),
+            "custom DLP pattern should redact: {diff_text}"
+        );
+        assert!(
+            diff_text.contains("[REDACTED:custom]"),
+            "should contain custom redaction marker: {diff_text}"
+        );
+    }
 }

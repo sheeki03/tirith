@@ -22,6 +22,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -41,6 +43,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -60,6 +64,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -114,6 +120,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     .collect(),
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -134,6 +142,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -153,6 +163,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
             }],
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -172,6 +184,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -191,6 +205,8 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 
@@ -245,6 +261,8 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
                     }],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 });
                 break;
             }
@@ -363,6 +381,8 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
                     evidence: f.evidence,
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 });
             }
             _ => {} // Ignore comment findings in clipboard context
@@ -391,6 +411,8 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 

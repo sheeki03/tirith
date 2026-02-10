@@ -1,12 +1,27 @@
 use std::path::PathBuf;
 
 /// Product tier levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Tier {
+    #[default]
     Community,
     Pro,
     Team,
     Enterprise,
+}
+
+/// Extended license information (available for Team+ tiers).
+#[derive(Debug, Clone, Default)]
+pub struct LicenseInfo {
+    pub tier: Tier,
+    /// Organization ID (Team+ SSO-provisioned keys).
+    pub org_id: Option<String>,
+    /// SSO provider used for provisioning (e.g., "okta", "azure-ad").
+    pub sso_provider: Option<String>,
+    /// Expiry date (ISO 8601).
+    pub expires: Option<String>,
+    /// Seat count for the organization (Team+).
+    pub seat_count: Option<u32>,
 }
 
 impl std::fmt::Display for Tier {
@@ -40,6 +55,14 @@ pub fn current_tier() -> Tier {
     match key {
         Some(k) => decode_tier(&k).unwrap_or(Tier::Community),
         None => Tier::Community,
+    }
+}
+
+/// Get extended license information including org_id and SSO provider.
+pub fn license_info() -> LicenseInfo {
+    match read_license_key() {
+        Some(k) => decode_license_info(&k).unwrap_or_default(),
+        None => LicenseInfo::default(),
     }
 }
 
@@ -116,6 +139,61 @@ fn decode_tier(key: &str) -> Option<Tier> {
         "community" => Some(Tier::Community),
         _ => None,
     }
+}
+
+/// Decode full license information from a key, including SSO/Team fields.
+fn decode_license_info(key: &str) -> Option<LicenseInfo> {
+    use base64::Engine;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(key.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.trim()))
+        .ok()?;
+
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+
+    // Check expiry
+    let expires = payload
+        .get("exp")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if let Some(ref exp_str) = expires {
+        let exp_date = chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d").ok()?;
+        let today = chrono::Utc::now().date_naive();
+        if today > exp_date {
+            return None;
+        }
+    }
+
+    let tier_str = payload.get("tier").and_then(|v| v.as_str())?;
+    let tier = match tier_str.to_lowercase().as_str() {
+        "pro" => Tier::Pro,
+        "team" => Tier::Team,
+        "enterprise" => Tier::Enterprise,
+        "community" => Tier::Community,
+        _ => return None,
+    };
+
+    let org_id = payload
+        .get("org_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let sso_provider = payload
+        .get("sso_provider")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let seat_count = payload
+        .get("seat_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    Some(LicenseInfo {
+        tier,
+        org_id,
+        sso_provider,
+        expires,
+        seat_count,
+    })
 }
 
 #[cfg(test)]
@@ -219,5 +297,54 @@ mod tests {
         assert_eq!(format!("{}", Tier::Pro), "Pro");
         assert_eq!(format!("{}", Tier::Team), "Team");
         assert_eq!(format!("{}", Tier::Enterprise), "Enterprise");
+    }
+
+    // --- Phase 28: SSO/org_id tests ---
+
+    fn make_team_sso_key(org_id: &str, sso_provider: &str) -> String {
+        use base64::Engine;
+        let json = format!(
+            r#"{{"tier":"team","exp":"2099-12-31","org_id":"{org_id}","sso_provider":"{sso_provider}","seat_count":50}}"#
+        );
+        base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+    }
+
+    #[test]
+    fn test_decode_license_info_team_sso() {
+        let key = make_team_sso_key("org-acme-123", "okta");
+        let info = decode_license_info(&key).unwrap();
+        assert_eq!(info.tier, Tier::Team);
+        assert_eq!(info.org_id.as_deref(), Some("org-acme-123"));
+        assert_eq!(info.sso_provider.as_deref(), Some("okta"));
+        assert_eq!(info.seat_count, Some(50));
+        assert_eq!(info.expires.as_deref(), Some("2099-12-31"));
+    }
+
+    #[test]
+    fn test_decode_license_info_pro_no_sso() {
+        let key = make_key("pro", "2099-12-31");
+        let info = decode_license_info(&key).unwrap();
+        assert_eq!(info.tier, Tier::Pro);
+        assert!(info.org_id.is_none());
+        assert!(info.sso_provider.is_none());
+        assert!(info.seat_count.is_none());
+    }
+
+    #[test]
+    fn test_decode_license_info_expired() {
+        let _key = make_team_sso_key("org-123", "azure-ad");
+        // Override with expired date
+        use base64::Engine;
+        let json =
+            r#"{"tier":"team","exp":"2020-01-01","org_id":"org-123","sso_provider":"azure-ad"}"#;
+        let expired_key = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        assert!(decode_license_info(&expired_key).is_none());
+    }
+
+    #[test]
+    fn test_license_info_default() {
+        let info = LicenseInfo::default();
+        assert_eq!(info.tier, Tier::Community);
+        assert!(info.org_id.is_none());
     }
 }

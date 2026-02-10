@@ -75,7 +75,13 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
 
     // Log to audit
     let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(&verdict, &ctx.input, None, Some(event_id));
+    tirith_core::audit::log_verdict(
+        &verdict,
+        &ctx.input,
+        None,
+        Some(event_id),
+        &policy.dlp_custom_patterns,
+    );
 
     if json {
         let _ = output::write_json(&verdict, std::io::stdout().lock());
