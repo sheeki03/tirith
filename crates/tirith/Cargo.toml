@@ -27,8 +27,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 home = { workspace = true }
 libc = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3"
 
 [package.metadata.deb]

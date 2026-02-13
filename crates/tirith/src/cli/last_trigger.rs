@@ -1,10 +1,10 @@
 use tirith_core::util::truncate_bytes;
+use std::io::Write;
 
 pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
     if let Some(dir) = tirith_core::policy::data_dir() {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("last_trigger.json");
-        let tmp = dir.join(".last_trigger.json.tmp");
 
         #[derive(serde::Serialize)]
         struct LastTrigger<'a> {
@@ -34,20 +34,10 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
         };
 
         if let Ok(json) = serde_json::to_string_pretty(&trigger) {
-            {
-                use std::io::Write;
-                let mut opts = std::fs::OpenOptions::new();
-                opts.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    opts.mode(0o600);
-                }
-                if let Ok(mut f) = opts.open(&tmp) {
-                    let _ = f.write_all(json.as_bytes());
-                }
+            if let Ok(mut tmp_file) = tempfile::NamedTempFile::new_in(&dir) {
+                let _ = tmp_file.write_all(json.as_bytes());
+                let _ = tmp_file.persist(&path);
             }
-            let _ = std::fs::rename(&tmp, &path);
         }
     }
 }

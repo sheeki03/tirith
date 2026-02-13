@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn validate_sha256(sha256: &str) -> Result<(), String> {
@@ -49,24 +50,17 @@ impl Receipt {
         fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
 
         let path = dir.join(format!("{}.json", self.sha256));
-        let tmp_path = dir.join(format!(".{}.json.tmp", self.sha256));
 
         let json = serde_json::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
 
-        {
-            use std::io::Write;
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp_path).map_err(|e| format!("write: {e}"))?;
-            f.write_all(json.as_bytes())
-                .map_err(|e| format!("write: {e}"))?;
-        }
-        fs::rename(&tmp_path, &path).map_err(|e| format!("rename: {e}"))?;
+        let mut tmp_file = tempfile::NamedTempFile::new_in(&dir)
+            .map_err(|e| format!("create temp receipt: {e}"))?;
+        tmp_file
+            .write_all(json.as_bytes())
+            .map_err(|e| format!("write: {e}"))?;
+        tmp_file
+            .persist(&path)
+            .map_err(|e| format!("rename: {}", e.error))?;
 
         Ok(path)
     }

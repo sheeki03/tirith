@@ -29,6 +29,7 @@ unicode-normalization = { workspace = true }
 unicode-script = { workspace = true }
 is-terminal = { workspace = true }
 thiserror = { workspace = true }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
@@ -36,7 +37,6 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 [dev-dependencies]
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3"
 
 [[bench]]
 name = "perf"
