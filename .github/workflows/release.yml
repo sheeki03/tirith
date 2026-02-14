@@ -16,8 +16,30 @@ permissions:
   packages: write # For GHCR Docker images
 
 jobs:
+  enforcement-check:
+    name: Verify Enforcement Mode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify enforcement mode matches release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "Not a version tag ($RELEASE_TAG), skipping enforcement check"
+            exit 0
+          fi
+          output=$(cargo test -p tirith-core --locked --lib -- license::tests::enforcement_mode_matches_release_tag --exact --ignored --nocapture 2>&1)
+          echo "$output"
+          if ! echo "$output" | grep -q "1 passed"; then
+            echo "ERROR: enforcement mode guard test did not run (renamed or removed?)"
+            exit 1
+          fi
+
   completions:
     name: Generate Completions
+    needs: enforcement-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
