@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4"] }
 home = ">=0.5, <0.5.12"
 libc = "0.2"
 lopdf = "0.34"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 
 [profile.release]
 lto = "thin"
