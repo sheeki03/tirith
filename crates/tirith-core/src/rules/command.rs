@@ -265,6 +265,8 @@ const SENSITIVE_KEY_VARS: &[&str] = &[
 ];
 
 fn classify_env_var(name: &str) -> Option<(RuleId, Severity, &'static str, &'static str)> {
+    let name_upper = name.to_ascii_uppercase();
+    let name = name_upper.as_str();
     if CODE_INJECTION_VARS.contains(&name) {
         Some((
             RuleId::CodeInjectionEnv,
@@ -325,15 +327,22 @@ fn check_env_var_in_command(segments: &[tokenize::Segment], findings: &mut Vec<F
                 }
             }
             "set" => {
-                // Fish shell: set [-gx] VAR_NAME value
+                // Fish shell: set [-gx] VAR_NAME value...
+                let mut var_name: Option<&str> = None;
+                let mut value_parts: Vec<&str> = Vec::new();
                 for arg in &segment.args {
                     let trimmed = arg.trim();
-                    if trimmed.starts_with('-') {
+                    if trimmed.starts_with('-') && var_name.is_none() {
                         continue;
                     }
-                    // First non-flag arg is the variable name
-                    emit_env_finding(trimmed, "", findings);
-                    break;
+                    if var_name.is_none() {
+                        var_name = Some(trimmed);
+                    } else {
+                        value_parts.push(trimmed);
+                    }
+                }
+                if let Some(name) = var_name {
+                    emit_env_finding(name, &value_parts.join(" "), findings);
                 }
             }
             _ => {}
@@ -404,7 +413,6 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                             raw: trimmed.to_string(),
                         }],
                     });
-                    return;
                 } else if is_private_ip(&host) {
                     findings.push(Finding {
                         rule_id: RuleId::PrivateNetworkAccess,
@@ -418,7 +426,6 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                             raw: trimmed.to_string(),
                         }],
                     });
-                    return;
                 }
             }
         }
@@ -438,7 +445,12 @@ fn extract_host_from_arg(arg: &str) -> Option<String> {
         };
         // Get host:port (before first /)
         let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
-        return Some(strip_port(host_port));
+        let host = strip_port(host_port);
+        // Reject obviously invalid hosts (malformed brackets, embedded paths)
+        if host.is_empty() || host.contains('/') || host.contains('[') {
+            return None;
+        }
+        return Some(host);
     }
 
     // Bare host/IP: "169.254.169.254/path" or just "169.254.169.254"

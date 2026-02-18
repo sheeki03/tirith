@@ -574,6 +574,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "shell_injection_env",     // export BASH_ENV=, no URL needed
         "interpreter_hijack_env",  // export PYTHONPATH=, no URL needed
         "sensitive_env_export",    // export OPENAI_API_KEY=, no URL needed
+        "metadata_endpoint",       // curl 169.254.169.254/..., no URL scheme needed
+        "private_network_access",  // curl 10.0.0.1/..., no URL scheme needed
     ]
     .into_iter()
     .collect();
