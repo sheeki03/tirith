@@ -23,7 +23,9 @@ pub fn run(url: &str, no_exec: bool, json: bool) -> i32 {
                     executed: result.executed,
                     exit_code: result.exit_code,
                 };
-                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+                if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &out) {
+                    eprintln!("tirith: failed to write JSON output: {e}");
+                }
                 println!();
             }
 
@@ -36,7 +38,9 @@ pub fn run(url: &str, no_exec: bool, json: bool) -> i32 {
         Err(e) => {
             if json {
                 let err = serde_json::json!({ "error": e });
-                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &err);
+                if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &err) {
+                    eprintln!("tirith: failed to write JSON error output: {e}");
+                }
                 println!();
             } else {
                 eprintln!("tirith: {e}");
