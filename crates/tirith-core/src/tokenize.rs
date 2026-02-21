@@ -287,11 +287,21 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
     }
 
     let words = split_words(trimmed);
-    let command = words.first().cloned();
-    let args = if words.len() > 1 {
-        words[1..].to_vec()
-    } else {
-        Vec::new()
+
+    // Skip leading environment variable assignments (VAR=VALUE)
+    let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
+
+    let (command, args) = match first_non_assign {
+        Some(idx) => {
+            let cmd = Some(words[idx].clone());
+            let args = if idx + 1 < words.len() {
+                words[idx + 1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (cmd, args)
+        }
+        None => (None, Vec::new()),
     };
 
     segments.push(Segment {
@@ -300,6 +310,38 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
         args,
         preceding_separator: preceding_sep,
     });
+}
+
+
+/// Check if a word looks like an environment variable assignment (VAR=VALUE).
+pub fn is_env_assignment(word: &str) -> bool {
+    let s = word.trim();
+    // Strip outer quotes if present
+    let s = if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with(''') && s.ends_with(''')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+
+    // Must not start with - or =
+    if s.starts_with('-') || s.starts_with('=') {
+        return false;
+    }
+
+    // Must contain = with valid identifier chars before it
+    if let Some(eq_pos) = s.find('=') {
+        if eq_pos == 0 {
+            return false;
+        }
+        let name = &s[..eq_pos];
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    } else {
+        false
+    }
 }
 
 /// Split a segment into words, respecting quotes.
