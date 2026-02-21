@@ -135,7 +135,7 @@ function _tirith_check_command
 
     # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
     set -l errfile (mktemp)
-    set -l approval_path (tirith check --approval-check --non-interactive --shell fish -- "$cmd" 2>$errfile)
+    set -l approval_path (tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" 2>$errfile)
     set -l rc $status
     set -l output (cat $errfile | string collect)
     command rm -f $errfile

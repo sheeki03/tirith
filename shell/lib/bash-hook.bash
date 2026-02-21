@@ -320,7 +320,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
       local errfile=$(mktemp)
       local approval_path
-      approval_path=$(tirith check --approval-check --non-interactive --shell posix -- "$READLINE_LINE" 2>"$errfile")
+      approval_path=$(tirith check --approval-check --non-interactive --interactive --shell posix -- "$READLINE_LINE" 2>"$errfile")
       local rc=$?
       local output=$(<"$errfile")
       command rm -f "$errfile"
