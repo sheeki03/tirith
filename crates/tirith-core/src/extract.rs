@@ -243,9 +243,11 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         if is_sink_context(segment, &segments) && !is_docker_cmd {
             for (arg_idx, arg) in segment.args.iter().enumerate() {
                 // Skip args that are values of output-file flags (e.g. curl -o file.png)
-                if segment.command.as_ref().is_some_and(|c| {
-                    is_output_flag_value(c, &segment.args, arg_idx)
-                }) {
+                if segment
+                    .command
+                    .as_ref()
+                    .is_some_and(|c| is_output_flag_value(c, &segment.args, arg_idx))
+                {
                     continue;
                 }
                 let clean = strip_quotes(arg);
@@ -522,11 +524,9 @@ fn looks_like_schemeless_host(s: &str) -> bool {
         ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so", ".log",
         ".conf", ".cfg", ".ini", ".toml",
         // Conservative non-TLD extensions (filenames not domains)
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif",
-        ".pdf", ".csv",
-        ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm",
-        ".ttf", ".otf", ".woff", ".woff2",
-        ".docx", ".xlsx", ".pptx", ".sqlite",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif", ".pdf", ".csv", ".mp3",
+        ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm", ".ttf", ".otf", ".woff",
+        ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
     ];
     let host_lower = host_part.to_lowercase();
     if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
@@ -535,10 +535,9 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     // Path-aware distinction: no / in string + non-TLD extension = likely filename
     if !s.contains('/') {
         let non_tld_exts = [
-            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif",
-            ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac",
-            ".ogg", ".webm", ".ttf", ".otf", ".woff", ".woff2", ".docx",
-            ".xlsx", ".pptx", ".sqlite",
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif", ".pdf", ".csv",
+            ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm", ".ttf", ".otf",
+            ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
         ];
         if non_tld_exts.iter().any(|ext| host_lower.ends_with(ext)) {
             return false;
