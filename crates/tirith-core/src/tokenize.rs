@@ -312,14 +312,12 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
     });
 }
 
-
 /// Check if a word looks like an environment variable assignment (VAR=VALUE).
 pub fn is_env_assignment(word: &str) -> bool {
     let s = word.trim();
     // Strip outer quotes if present
     let s = if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with(''') && s.ends_with(''')))
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         &s[1..s.len() - 1]
     } else {
@@ -337,8 +335,7 @@ pub fn is_env_assignment(word: &str) -> bool {
             return false;
         }
         let name = &s[..eq_pos];
-        name.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     } else {
         false
     }
