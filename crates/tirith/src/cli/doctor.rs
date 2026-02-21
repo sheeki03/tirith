@@ -233,7 +233,19 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
             home.join(".bash_profile"),
             home.join(".profile"),
         ],
-        "fish" => vec![home.join(".config/fish/config.fish")],
+        "fish" => {
+            let mut candidates = vec![home.join(".config/fish/config.fish")];
+            let conf_d = home.join(".config/fish/conf.d");
+            if let Ok(entries) = std::fs::read_dir(&conf_d) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("fish") {
+                        candidates.push(path);
+                    }
+                }
+            }
+            candidates
+        }
         "powershell" | "pwsh" => {
             // PowerShell profile locations vary; check common ones
             let docs = home.join("Documents");
@@ -246,21 +258,34 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
         _ => return (None, false),
     };
 
-    // Find the first existing profile and check if it contains tirith init
+    // Check ALL candidates — don't early-return on first existing profile
+    let mut first_existing = None;
     for profile in &profile_candidates {
         if profile.exists() {
-            if let Ok(contents) = std::fs::read_to_string(profile) {
-                // Check for various forms of tirith init
-                let configured = contents.contains("tirith init")
-                    || contents.contains("tirith-hook")
-                    || contents.contains("_tirith_");
-                return (Some(profile.clone()), configured);
+            if first_existing.is_none() {
+                first_existing = Some(profile.clone());
+            }
+            match std::fs::read_to_string(profile) {
+                Ok(contents) => {
+                    let configured = contents.contains("tirith init")
+                        || contents.contains("tirith-hook")
+                        || contents.contains("_tirith_");
+                    if configured {
+                        return (Some(profile.clone()), true);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tirith: doctor: cannot read profile {}: {e}",
+                        profile.display()
+                    );
+                }
             }
         }
     }
 
-    // Return the primary profile path even if it doesn't exist
-    let primary = profile_candidates.into_iter().next();
+    // Return the first existing profile (or first candidate if none exist)
+    let primary = first_existing.or_else(|| profile_candidates.into_iter().next());
     (primary, false)
 }
 
