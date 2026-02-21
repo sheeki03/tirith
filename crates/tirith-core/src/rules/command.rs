@@ -337,15 +337,22 @@ fn check_env_var_in_command(segments: &[tokenize::Segment], findings: &mut Vec<F
                 }
             }
             "set" => {
-                // Fish shell: set [-gx] VAR_NAME value
+                // Fish shell: set [-gx] VAR_NAME value...
+                let mut var_name: Option<&str> = None;
+                let mut value_parts: Vec<&str> = Vec::new();
                 for arg in &segment.args {
                     let trimmed = arg.trim();
-                    if trimmed.starts_with('-') {
+                    if trimmed.starts_with('-') && var_name.is_none() {
                         continue;
                     }
-                    // First non-flag arg is the variable name
-                    emit_env_finding(trimmed, "", findings);
-                    break;
+                    if var_name.is_none() {
+                        var_name = Some(trimmed);
+                    } else {
+                        value_parts.push(trimmed);
+                    }
+                }
+                if let Some(name) = var_name {
+                    emit_env_finding(name, &value_parts.join(" "), findings);
                 }
             }
             _ => {}
@@ -424,7 +431,6 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         mitre_id: None,
                         custom_rule_id: None,
                     });
-                    return;
                 } else if is_private_ip(&host) {
                     findings.push(Finding {
                         rule_id: RuleId::PrivateNetworkAccess,
@@ -442,7 +448,6 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         mitre_id: None,
                         custom_rule_id: None,
                     });
-                    return;
                 }
             }
         }
@@ -462,16 +467,31 @@ fn extract_host_from_arg(arg: &str) -> Option<String> {
         };
         // Get host:port (before first /)
         let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
-        return Some(strip_port(host_port));
+        let host = strip_port(host_port);
+        // Reject obviously invalid hosts (malformed brackets, embedded paths)
+        if host.is_empty() || host.contains('/') || host.contains('[') {
+            return None;
+        }
+        return Some(host);
     }
 
     // Bare host/IP: "169.254.169.254/path" or just "169.254.169.254"
     let host_part = arg.split('/').next().unwrap_or(arg);
     let host = strip_port(host_part);
 
-    // Only accept valid IPv4 addresses for bare hosts (no scheme)
+    // Accept valid IPv4 addresses for bare hosts (no scheme)
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return Some(host);
+    }
+
+    // Accept bracketed IPv6: [::1]
+    if host_part.starts_with('[') {
+        if let Some(bracket_end) = host_part.find(']') {
+            let ipv6 = &host_part[1..bracket_end];
+            if ipv6.parse::<std::net::Ipv6Addr>().is_ok() {
+                return Some(ipv6.to_string());
+            }
+        }
     }
 
     None

@@ -90,7 +90,15 @@ static INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)chmod\s+[0-7]*7", "World-writable permission"),
     ]
     .iter()
-    .filter_map(|(pattern, desc)| Regex::new(pattern).ok().map(|re| (re, *desc)))
+    .filter_map(|(pattern, desc)| match Regex::new(pattern) {
+        Ok(re) => Some((re, *desc)),
+        Err(e) => {
+            eprintln!(
+                "tirith: warning: built-in injection pattern '{desc}' failed to compile: {e}"
+            );
+            None
+        }
+    })
     .collect()
 });
 
@@ -350,11 +358,7 @@ fn check_mcp_config(content: &str, path: &Path, findings: &mut Vec<Finding>) {
         None => return,
     };
 
-    let path_str = path.display().to_string();
-
     for (name, config) in servers {
-        let _ = &path_str; // used in sub-functions via name
-
         // Check command/url fields
         if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
             check_mcp_server_url(name, url, findings);

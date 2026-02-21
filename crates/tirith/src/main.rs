@@ -296,6 +296,12 @@ enum CheckpointAction {
 }
 
 fn main() {
+    // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     let exit_code = match cli.command {

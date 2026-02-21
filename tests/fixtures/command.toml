@@ -626,6 +626,22 @@ expected_action = "block"
 expected_rules = ["private_network_access"]
 
 [[fixture]]
+name = "curl_bare_private_ip"
+min_milestone = 1
+input = "curl 10.0.0.1/internal/api"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_bare_metadata_ip"
+min_milestone = 1
+input = "curl 169.254.169.254/latest/meta-data"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
 name = "curl_public_ip_no_network_finding"
 min_milestone = 1
 input = "curl https://203.0.113.1/api"

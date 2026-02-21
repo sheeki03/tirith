@@ -54,7 +54,7 @@ _tirith_parse_approval() {
 
   if [[ ! -r "$file" ]]; then
     _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-    rm -f "$file"  # ADR-7: delete on all paths
+    command rm -f "$file"  # ADR-7: delete on all paths
     _tirith_ap_required="yes"
     _tirith_ap_fallback="block"
     _tirith_ap_timeout=0
@@ -73,13 +73,14 @@ _tirith_parse_approval() {
   done < "$file"
 
   # Delete temp file after reading (ADR-7 lifecycle)
-  rm -f "$file"
+  command rm -f "$file"
 
-  # Corrupt file (no valid keys) → fail closed
+  # Corrupt file (no valid keys) → fail closed (reset all fields)
   if [[ $valid_keys -eq 0 ]]; then
     _tirith_output "tirith: warning: approval file corrupt, failing closed"
     _tirith_ap_required="yes"
     _tirith_ap_fallback="block"
+    _tirith_ap_timeout=0
     return 1
   fi
   return 0
@@ -150,7 +151,7 @@ _tirith_prompt_hook() {
 
   if [[ -n "$pending_source" ]]; then
     source "$pending_source"
-    rm -f "$pending_source"
+    command rm -f "$pending_source"
   elif [[ -n "$pending_eval" ]]; then
     eval -- "$pending_eval"
   fi
@@ -292,7 +293,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
 
       # Detect broken delivery: if previous pending was never consumed
       if [[ -n "${_TIRITH_PENDING_EVAL:-}" || -n "${_TIRITH_PENDING_SOURCE:-}" ]]; then
-        [[ -n "${_TIRITH_PENDING_SOURCE:-}" ]] && rm -f "${_TIRITH_PENDING_SOURCE}"
+        [[ -n "${_TIRITH_PENDING_SOURCE:-}" ]] && command rm -f "${_TIRITH_PENDING_SOURCE}"
         unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_SOURCE
         _tirith_degrade_to_preexec "previous command not delivered (check shell history)"
         return  # READLINE_LINE stays intact
@@ -322,7 +323,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       approval_path=$(tirith check --approval-check --non-interactive --shell posix -- "$READLINE_LINE" 2>"$errfile")
       local rc=$?
       local output=$(<"$errfile")
-      rm -f "$errfile"
+      command rm -f "$errfile"
 
       if [[ $rc -eq 0 ]]; then
         :  # Allow: no output
@@ -339,7 +340,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         _tirith_output ""
         _tirith_output "command> $READLINE_LINE"
         [[ -n "$output" ]] && _tirith_output "$output"
-        [[ -n "$approval_path" ]] && rm -f "$approval_path"
+        [[ -n "$approval_path" ]] && command rm -f "$approval_path"
         _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
         return  # READLINE_LINE preserved for re-execution via preexec
       fi
@@ -388,7 +389,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         return
       fi
 
-      # rc was 0 or 2: execute the command
+      # Execute the command (approval workflow above handled block cases)
       local cmd="$READLINE_LINE"
       READLINE_LINE=""
       READLINE_POINT=0
@@ -441,7 +442,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         printf '%s' "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
         local rc=$?
         local output=$(<"$tmpfile")
-        rm -f "$tmpfile"
+        command rm -f "$tmpfile"
 
         if [[ $rc -eq 0 ]]; then
           # Allow: fall through to insert

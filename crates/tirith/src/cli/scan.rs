@@ -150,7 +150,10 @@ fn parse_severity(s: &str) -> Severity {
         "medium" => Severity::Medium,
         "high" => Severity::High,
         "critical" => Severity::Critical,
-        _ => Severity::Critical,
+        _ => {
+            eprintln!("tirith scan: warning: unknown severity '{s}', defaulting to critical");
+            Severity::Critical
+        }
     }
 }
 
@@ -195,7 +198,9 @@ fn print_json_result(result: &scan::ScanResult) {
         files,
     };
 
-    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &output);
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
+        eprintln!("tirith scan: failed to write JSON output");
+    }
     println!();
 }
 
@@ -215,7 +220,9 @@ fn print_json_file_result(result: &scan::FileScanResult) {
         findings: &result.findings,
     };
 
-    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &output);
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
+        eprintln!("tirith scan: failed to write JSON output");
+    }
     println!();
 }
 

@@ -129,8 +129,14 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
-            // Log bypass to audit
-            crate::audit::log_verdict(&verdict, &ctx.input, None, None, &[]);
+            // Log bypass to audit (include custom DLP patterns from partial policy)
+            crate::audit::log_verdict(
+                &verdict,
+                &ctx.input,
+                None,
+                None,
+                &policy.dlp_custom_patterns,
+            );
             return verdict;
         }
     }
@@ -398,6 +404,18 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 ///
 /// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
 pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
+    retain_by_paranoia(&mut verdict.findings, paranoia);
+}
+
+/// Filter a Vec<Finding> by paranoia level and license tier.
+/// Same logic as `filter_findings_by_paranoia` but operates on raw findings
+/// (for scan results that don't use the Verdict wrapper).
+pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
+    retain_by_paranoia(findings, paranoia);
+}
+
+/// Shared paranoia retention logic.
+fn retain_by_paranoia(findings: &mut Vec<Finding>, paranoia: u8) {
     let tier = crate::license::current_tier();
     let effective = if tier >= crate::license::Tier::Pro {
         paranoia.min(4)
@@ -405,28 +423,10 @@ pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
         paranoia.min(2) // Free users capped at 2
     };
 
-    verdict.findings.retain(|f| match f.severity {
-        crate::verdict::Severity::Info => effective >= 4,
-        crate::verdict::Severity::Low => effective >= 3,
-        _ => true, // Medium/High/Critical always shown
-    });
-}
-
-/// Filter a Vec<Finding> by paranoia level and license tier.
-/// Same logic as `filter_findings_by_paranoia` but operates on raw findings
-/// (for scan results that don't use the Verdict wrapper).
-pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
-    let tier = crate::license::current_tier();
-    let effective = if tier >= crate::license::Tier::Pro {
-        paranoia.min(4)
-    } else {
-        paranoia.min(2)
-    };
-
     findings.retain(|f| match f.severity {
         crate::verdict::Severity::Info => effective >= 4,
         crate::verdict::Severity::Low => effective >= 3,
-        _ => true,
+        _ => true, // Medium/High/Critical always shown
     });
 }
 
@@ -532,7 +532,12 @@ fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
         RuleId::DotfileOverwrite => Some("T1546.004"), // Event Triggered Execution: Unix Shell Config
 
         // Defense Evasion
-        RuleId::BidiControls | RuleId::UnicodeTags | RuleId::ZeroWidthChars => {
+        RuleId::BidiControls
+        | RuleId::UnicodeTags
+        | RuleId::ZeroWidthChars
+        | RuleId::InvisibleMathOperator
+        | RuleId::VariationSelector
+        | RuleId::InvisibleWhitespace => {
             Some("T1036.005") // Masquerading: Match Legitimate Name or Location
         }
         RuleId::HiddenMultiline | RuleId::AnsiEscapes | RuleId::ControlChars => Some("T1036.005"),

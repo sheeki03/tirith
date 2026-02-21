@@ -12,11 +12,11 @@ pub enum Tier {
     Enterprise,
 }
 
-/// Extended license information (available for Team+ tiers).
+/// Extended license information parsed from a license token.
 #[derive(Debug, Clone, Default)]
 pub struct LicenseInfo {
     pub tier: Tier,
-    /// Organization ID (Team+ SSO-provisioned keys).
+    /// Organization ID (typically present on Team+ SSO-provisioned keys).
     pub org_id: Option<String>,
     /// SSO provider used for provisioning (e.g., "okta", "azure-ad").
     pub sso_provider: Option<String>,
@@ -105,7 +105,13 @@ fn license_info_from_payload(payload: &serde_json::Value, tier: Tier) -> License
     let seat_count = payload
         .get("seat_count")
         .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok());
+        .and_then(|v| match u32::try_from(v) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!("tirith: warning: seat_count {v} exceeds u32 range, ignoring");
+                None
+            }
+        });
 
     // For legacy tokens, exp is ISO 8601 string. For signed, it's a Unix timestamp.
     // Store as string either way for display purposes.
@@ -130,19 +136,35 @@ fn license_info_from_payload(payload: &serde_json::Value, tier: Tier) -> License
 fn decode_legacy_payload(key: &str, now: DateTime<Utc>) -> Option<serde_json::Value> {
     use base64::Engine;
 
+    let trimmed = key.trim();
+
+    // Size gate (same as signed path — DoS resistance)
+    if trimmed.len() > MAX_TOKEN_LEN {
+        return None;
+    }
+
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(key.trim())
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.trim()))
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
         .ok()?;
 
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 
     // Check expiry (ISO 8601 date string, inclusive — valid on exp date)
     if let Some(exp_str) = payload.get("exp").and_then(|v| v.as_str()) {
-        let exp_date = chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d").ok()?;
-        let today = now.date_naive();
-        if today > exp_date {
-            return None;
+        match chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d") {
+            Ok(exp_date) => {
+                let today = now.date_naive();
+                if today > exp_date {
+                    return None;
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "tirith: warning: legacy license has unparseable exp date '{exp_str}', rejecting"
+                );
+                return None;
+            }
         }
     }
     // Missing exp = no expiry (perpetual — used for testing)
@@ -175,6 +197,9 @@ fn decode_signed_token(
 ) -> Option<serde_json::Value> {
     use base64::Engine;
     use ed25519_dalek::{Signature, VerifyingKey};
+
+    // Trim for parity with legacy path
+    let token = token.trim();
 
     // Size gate (before any parsing)
     if token.len() > MAX_TOKEN_LEN {
@@ -233,7 +258,7 @@ fn decode_signed_token(
 
     // Validate exp (required for signed tokens, must be i64 Unix timestamp)
     let exp = match payload.get("exp") {
-        Some(v) => v.as_i64()?, // Missing or wrong type → None
+        Some(v) => v.as_i64()?, // Wrong type (not i64) → None
         None => return None,
     };
     // Exclusive: expired when now >= exp
@@ -256,6 +281,10 @@ fn decode_signed_token(
 // ─── Dispatch (mode-aware) ──────────────────────────────────────────
 
 /// Core dispatch: try signed first (if `.` present), then legacy based on mode.
+///
+/// Note: dispatch is one-way routing — a dot means signed format. In
+/// `SignedPreferred` mode, if a dot-containing token fails signed verification,
+/// we do NOT fall back to legacy (a dot is never valid legacy base64).
 fn decode_tier_at_with_mode(
     key: &str,
     now: DateTime<Utc>,
@@ -263,7 +292,7 @@ fn decode_tier_at_with_mode(
     keyring: &[KeyEntry],
 ) -> Option<Tier> {
     if key.contains('.') {
-        // Looks like a signed token
+        // Dot present → signed format (no fallback to legacy — dot is invalid in standard base64)
         let payload = decode_signed_token(key, keyring, now)?;
         return tier_from_payload(&payload);
     }
@@ -323,9 +352,13 @@ fn decode_license_info_at(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> 
 /// Invalid, expired, or missing keys silently fall back to Community
 /// (no panic, no error exit).
 pub fn current_tier() -> Tier {
-    let key = read_license_key();
-    match key {
-        Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or(Tier::Community),
+    match read_license_key() {
+        Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or_else(|| {
+            eprintln!(
+                "tirith: warning: license key present but decode failed, falling back to Community"
+            );
+            Tier::Community
+        }),
         None => Tier::Community,
     }
 }
@@ -333,7 +366,10 @@ pub fn current_tier() -> Tier {
 /// Get extended license information including org_id and SSO provider.
 pub fn license_info() -> LicenseInfo {
     match read_license_key() {
-        Some(k) => decode_license_info_at(&k, Utc::now()).unwrap_or_default(),
+        Some(k) => decode_license_info_at(&k, Utc::now()).unwrap_or_else(|| {
+            eprintln!("tirith: warning: license key present but decode failed for license info");
+            LicenseInfo::default()
+        }),
         None => LicenseInfo::default(),
     }
 }
@@ -357,6 +393,12 @@ pub enum KeyFormatStatus {
     Malformed,
 }
 
+/// Check the structural format of the installed license key.
+///
+/// NOTE: `SignedStructural` only means the token has the right shape
+/// (two non-empty base64url segments separated by a dot). The signature,
+/// claims (iss, aud, exp), and key validity are NOT verified here.
+/// Use `current_tier()` for full verification.
 pub fn key_format_status() -> KeyFormatStatus {
     use base64::Engine;
     match read_license_key() {
@@ -417,12 +459,23 @@ fn read_license_key() -> Option<String> {
 
     // 2. Config file
     let path = license_key_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        return None;
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(trimmed)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!(
+                "tirith: warning: cannot read license key {}: {e}",
+                path.display()
+            );
+            None
+        }
     }
-    Some(trimmed)
 }
 
 /// Path to the license key file.
@@ -1010,6 +1063,10 @@ mod tests {
         );
     }
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_parser_padded_base64url_structural() {
         // Padded base64url should still be recognized as SignedStructural by key_format_status
@@ -1021,10 +1078,11 @@ mod tests {
         // Contains padding ('='), but should still parse structurally
         assert!(token.contains('='));
 
-        // Directly test key_format_status via TIRITH_LICENSE env var
-        std::env::set_var("TIRITH_LICENSE", &token);
+        // Thread-safe env-var mutation
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_LICENSE", &token) };
         let status = key_format_status();
-        std::env::remove_var("TIRITH_LICENSE");
+        unsafe { std::env::remove_var("TIRITH_LICENSE") };
         assert_eq!(
             status,
             KeyFormatStatus::SignedStructural,
@@ -1116,6 +1174,179 @@ mod tests {
                 mode == "SignedPreferred" || mode == "SignedOnly",
                 "Release {tag} (v0.2.x) requires SignedPreferred+, found {mode}"
             );
+        } else if minor <= 1 {
+            // v0.1.x: Legacy or SignedPreferred acceptable (transition period)
+            assert!(
+                mode == "Legacy" || mode == "SignedPreferred",
+                "Release {tag} (v0.1.x) should use Legacy or SignedPreferred, found {mode}"
+            );
         }
+    }
+
+    // ── Key revocation ───────────────────────────────────────────────
+
+    #[test]
+    fn test_key_revocation_after_removal() {
+        // A token signed with key "k1" must be rejected when k1 is removed from keyring
+        let (sk, pk) = test_keypair();
+        let kr_with_key = test_keyring(pk);
+        let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
+
+        // Valid with key present
+        assert_eq!(
+            decode_tier_at_with_mode(
+                &token,
+                now(),
+                EnforcementMode::SignedPreferred,
+                &kr_with_key
+            ),
+            Some(Tier::Pro)
+        );
+
+        // Revoked: empty keyring (key removed)
+        let kr_empty: Vec<KeyEntry> = vec![];
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr_empty),
+            None,
+            "Token must be rejected after signing key is removed from keyring"
+        );
+    }
+
+    // ── Multi-key keyring ────────────────────────────────────────────
+
+    #[test]
+    fn test_multi_key_kid_directed_lookup() {
+        let (sk1, pk1) = test_keypair();
+        let (sk2, pk2) = test_keypair();
+        let kr = vec![
+            KeyEntry {
+                kid: "k1",
+                key: pk1,
+            },
+            KeyEntry {
+                kid: "k2",
+                key: pk2,
+            },
+        ];
+
+        // Token signed with k2, kid="k2" → should find k2 directly
+        let payload = format!(
+            r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k2","tier":"team","exp":{}}}"#,
+            future_ts()
+        );
+        let token = make_signed_token(&payload, &sk2);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr),
+            Some(Tier::Team)
+        );
+
+        // Token signed with k1, kid="k1" → should find k1
+        let token1 = make_signed_token(&make_payload("pro", future_ts()), &sk1);
+        assert_eq!(
+            decode_tier_at_with_mode(&token1, now(), EnforcementMode::SignedPreferred, &kr),
+            Some(Tier::Pro)
+        );
+
+        // Token signed with k1 but kid="k2" → wrong key, must reject
+        let wrong_kid_payload = format!(
+            r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k2","tier":"pro","exp":{}}}"#,
+            future_ts()
+        );
+        let wrong_kid_token = make_signed_token(&wrong_kid_payload, &sk1);
+        assert_eq!(
+            decode_tier_at_with_mode(
+                &wrong_kid_token,
+                now(),
+                EnforcementMode::SignedPreferred,
+                &kr
+            ),
+            None,
+            "Token signed with k1 but kid=k2 must be rejected"
+        );
+    }
+
+    // ── Missing claims ───────────────────────────────────────────────
+
+    #[test]
+    fn test_signed_missing_iss() {
+        let (sk, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        let payload = format!(
+            r#"{{"aud":"tirith-cli","kid":"k1","tier":"pro","exp":{}}}"#,
+            future_ts()
+        );
+        let token = make_signed_token(&payload, &sk);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr),
+            None,
+            "Missing iss claim must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_signed_missing_aud() {
+        let (sk, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        let payload = format!(
+            r#"{{"iss":"tirith.dev","kid":"k1","tier":"pro","exp":{}}}"#,
+            future_ts()
+        );
+        let token = make_signed_token(&payload, &sk);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr),
+            None,
+            "Missing aud claim must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_signed_exp_as_string_rejected() {
+        let (sk, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        // exp as ISO string instead of Unix timestamp → must reject
+        let payload =
+            r#"{"iss":"tirith.dev","aud":"tirith-cli","kid":"k1","tier":"pro","exp":"2099-12-31"}"#;
+        let token = make_signed_token(payload, &sk);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr),
+            None,
+            "Signed token with exp as string must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_empty_string_token() {
+        let (_, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        assert_eq!(
+            decode_tier_at_with_mode("", now(), EnforcementMode::SignedPreferred, &kr),
+            None
+        );
+    }
+
+    // ── Enforcement mode coverage ────────────────────────────────────
+
+    #[test]
+    fn test_legacy_mode_accepts_signed() {
+        let (sk, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::Legacy, &kr),
+            Some(Tier::Pro),
+            "Legacy mode should accept valid signed tokens"
+        );
+    }
+
+    #[test]
+    fn test_signed_only_accepts_signed() {
+        let (sk, pk) = test_keypair();
+        let kr = test_keyring(pk);
+        let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
+        assert_eq!(
+            decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedOnly, &kr),
+            Some(Tier::Pro),
+            "SignedOnly mode should accept valid signed tokens"
+        );
     }
 }

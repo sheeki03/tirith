@@ -271,7 +271,13 @@ impl Policy {
                         Policy::default()
                     }
                 },
-                Err(_) => Policy::default(),
+                Err(e) => {
+                    eprintln!(
+                        "tirith: warning: cannot read policy at {}: {e}",
+                        path.display()
+                    );
+                    Policy::default()
+                }
             },
             None => Policy::default(),
         }
@@ -315,7 +321,13 @@ impl Policy {
                     Policy::default()
                 }
             },
-            Err(_) => Policy::default(),
+            Err(e) => {
+                eprintln!(
+                    "tirith: warning: cannot read policy at {}: {e}",
+                    path.display()
+                );
+                Policy::default()
+            }
         }
     }
 

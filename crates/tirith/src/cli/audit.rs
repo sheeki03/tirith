@@ -27,13 +27,20 @@ pub fn export(
         return 1;
     }
 
-    let records = match audit_aggregator::read_log(&log_path) {
+    let result = match audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("tirith: {e}");
             return 1;
         }
     };
+    if result.skipped_lines > 0 {
+        eprintln!(
+            "tirith: warning: {} malformed audit log line(s) skipped",
+            result.skipped_lines
+        );
+    }
+    let records = result.records;
 
     let filter = AuditFilter {
         since: since.map(String::from),
@@ -73,13 +80,20 @@ pub fn stats(session: Option<&str>, json: bool) -> i32 {
         return 1;
     }
 
-    let records = match audit_aggregator::read_log(&log_path) {
+    let result = match audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("tirith: {e}");
             return 1;
         }
     };
+    if result.skipped_lines > 0 {
+        eprintln!(
+            "tirith: warning: {} malformed audit log line(s) skipped",
+            result.skipped_lines
+        );
+    }
+    let records = result.records;
 
     let filtered = if let Some(sid) = session {
         let filter = AuditFilter {
@@ -96,7 +110,10 @@ pub fn stats(session: Option<&str>, json: bool) -> i32 {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&stats).unwrap_or_else(|_| "{}".into())
+            serde_json::to_string_pretty(&stats).unwrap_or_else(|e| {
+                eprintln!("tirith: audit stats: JSON serialization failed: {e}");
+                "{}".into()
+            })
         );
     } else {
         println!("Commands analyzed: {}", stats.total_commands);
@@ -137,13 +154,20 @@ pub fn report(format: &str, since: Option<&str>) -> i32 {
         return 1;
     }
 
-    let records = match audit_aggregator::read_log(&log_path) {
+    let result = match audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("tirith: {e}");
             return 1;
         }
     };
+    if result.skipped_lines > 0 {
+        eprintln!(
+            "tirith: warning: {} malformed audit log line(s) skipped",
+            result.skipped_lines
+        );
+    }
+    let records = result.records;
 
     let filtered = if let Some(since_date) = since {
         let filter = AuditFilter {
@@ -165,7 +189,10 @@ pub fn report(format: &str, since: Option<&str>) -> i32 {
             });
             println!(
                 "{}",
-                serde_json::to_string_pretty(&report_json).unwrap_or_else(|_| "{}".into())
+                serde_json::to_string_pretty(&report_json).unwrap_or_else(|e| {
+                    eprintln!("tirith: audit report: JSON serialization failed: {e}");
+                    "{}".into()
+                })
             );
         }
         "html" => {

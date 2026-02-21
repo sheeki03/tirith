@@ -84,9 +84,11 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
     );
 
     if json {
-        let _ = output::write_json(&verdict, std::io::stdout().lock());
-    } else {
-        let _ = output::write_human_auto(&verdict);
+        if output::write_json(&verdict, std::io::stdout().lock()).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+        }
+    } else if output::write_human_auto(&verdict).is_err() {
+        eprintln!("tirith: failed to write output");
     }
 
     verdict.action.exit_code()

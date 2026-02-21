@@ -73,7 +73,6 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
     for (pattern, technique) in CSS_PATTERNS.iter() {
         let matches: Vec<_> = pattern.find_iter(input).collect();
         if !matches.is_empty() {
-            let line_num = line_number_of(input, matches[0].start());
             findings.push(Finding {
                 rule_id: RuleId::HiddenCssContent,
                 severity: Severity::High,
@@ -100,7 +99,6 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
             });
 
             // Only report first CSS technique per finding (avoid flood)
-            _ = line_num;
             break;
         }
     }
@@ -471,7 +469,10 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
 
     let doc = match lopdf::Document::load_mem(raw_bytes) {
         Ok(d) => d,
-        Err(_) => return findings, // Not a valid PDF or parse error — skip silently
+        Err(e) => {
+            eprintln!("tirith: scan: PDF parse failed: {e}");
+            return findings;
+        }
     };
 
     let mut hidden_texts: Vec<(u32, String)> = Vec::new(); // (page_num, text_snippet)
@@ -639,7 +640,7 @@ fn line_number_of(input: &str, byte_offset: usize) -> usize {
         + 1
 }
 
-/// Truncate a string to max_len chars, appending "..." if truncated.
+/// Truncate a string to `max_len` chars, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {

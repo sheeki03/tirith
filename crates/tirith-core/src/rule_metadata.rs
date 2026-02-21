@@ -40,21 +40,19 @@ pub const RULE_META: &[RuleMeta] = &[
 /// The `early_access_until` date is exclusive — the gate expires at the
 /// start of that date (UTC midnight).
 pub fn is_early_access_active(meta: &RuleMeta, now: chrono::NaiveDate) -> bool {
-    match meta.early_access_until {
-        None => false, // No gate
-        Some(date_str) => {
-            match chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                Ok(expiry) => now < expiry, // Exclusive: gate expires ON this date
-                Err(_) => {
-                    // Malformed date → fail open (never silently gate forever)
-                    eprintln!(
-                        "tirith: warning: malformed early_access_until date \
-                         for {:?}: {:?}",
-                        meta.rule_id, date_str
-                    );
-                    false
-                }
-            }
+    let Some(date_str) = meta.early_access_until else {
+        return false;
+    };
+    match chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        Ok(expiry) => now < expiry, // Exclusive: gate expires ON this date
+        Err(_) => {
+            // Malformed date → fail open (never silently gate forever)
+            eprintln!(
+                "tirith: warning: malformed early_access_until date \
+                 for {:?}: {:?}",
+                meta.rule_id, date_str
+            );
+            false
         }
     }
 }
@@ -82,17 +80,12 @@ pub fn filter_early_access_with(
     rule_meta: &[RuleMeta],
 ) {
     findings.retain(|finding| {
-        // Look up rule in metadata table
-        let meta = rule_meta.iter().find(|m| m.rule_id == finding.rule_id);
-        let meta = match meta {
-            Some(m) => m,
-            None => return true, // No metadata → always pass through
+        let Some(meta) = rule_meta.iter().find(|m| m.rule_id == finding.rule_id) else {
+            return true; // No metadata → always pass through
         };
 
-        // No tier gate → pass through
-        let min_tier = match meta.min_tier {
-            Some(t) => t,
-            None => return true,
+        let Some(min_tier) = meta.min_tier else {
+            return true; // No tier gate → pass through
         };
 
         // Critical findings always bypass gating

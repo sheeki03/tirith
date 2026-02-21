@@ -160,15 +160,19 @@ pub fn run(
     // For --approval-check mode, stdout has ONLY the temp-file path.
     // Write human-readable output to stderr so hooks can display it.
     if approval_check {
-        let _ = output::write_human(&verdict, std::io::stderr().lock());
+        if output::write_human(&verdict, std::io::stderr().lock()).is_err() {
+            eprintln!("tirith: failed to write approval output");
+        }
         return verdict.action.exit_code();
     }
 
     // Output
     if json {
-        let _ = output::write_json(&verdict, std::io::stdout().lock());
-    } else {
-        let _ = output::write_human_auto(&verdict);
+        if output::write_json(&verdict, std::io::stdout().lock()).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+        }
+    } else if output::write_human_auto(&verdict).is_err() {
+        eprintln!("tirith: failed to write output");
     }
 
     verdict.action.exit_code()

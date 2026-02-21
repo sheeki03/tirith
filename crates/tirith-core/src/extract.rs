@@ -62,6 +62,8 @@ pub struct ByteScanResult {
 pub struct ByteFinding {
     pub offset: usize,
     pub byte: u8,
+    /// Full Unicode codepoint for multi-byte characters (None for single-byte findings).
+    pub codepoint: Option<u32>,
     pub description: String,
 }
 
@@ -109,6 +111,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: None,
                         description: match next {
                             b'[' => "CSI escape sequence",
                             b']' => "OSC escape sequence",
@@ -127,6 +130,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                 result.details.push(ByteFinding {
                     offset: i,
                     byte: b,
+                    codepoint: None,
                     description: "trailing escape byte".to_string(),
                 });
             }
@@ -142,6 +146,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                 result.details.push(ByteFinding {
                     offset: i,
                     byte: b,
+                    codepoint: None,
                     description: format!("control character 0x{b:02x}"),
                 });
             }
@@ -150,6 +155,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             result.details.push(ByteFinding {
                 offset: i,
                 byte: b,
+                codepoint: None,
                 description: format!("control character 0x{b:02x}"),
             });
         }
@@ -160,6 +166,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             result.details.push(ByteFinding {
                 offset: i,
                 byte: b,
+                codepoint: None,
                 description: "control character 0x7f (DEL)".to_string(),
             });
         }
@@ -179,6 +186,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("bidi control U+{:04X}", ch as u32),
                     });
                 }
@@ -189,6 +197,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("zero-width character U+{:04X}", ch as u32),
                     });
                 }
@@ -198,6 +207,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("unicode tag U+{:04X}", ch as u32),
                     });
                 }
@@ -207,6 +217,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("variation selector U+{:04X}", ch as u32),
                     });
                 }
@@ -216,6 +227,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("invisible math operator U+{:04X}", ch as u32),
                     });
                 }
@@ -225,6 +237,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("invisible whitespace U+{:04X}", ch as u32),
                     });
                 }

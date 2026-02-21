@@ -40,13 +40,49 @@ pub fn redact(input: &str) -> String {
     result
 }
 
+/// Pre-compiled set of custom DLP patterns.
+pub struct CompiledCustomPatterns {
+    patterns: Vec<Regex>,
+}
+
+impl CompiledCustomPatterns {
+    /// Compile custom DLP patterns once for reuse across multiple redaction calls.
+    pub fn new(raw_patterns: &[String]) -> Self {
+        let patterns = raw_patterns
+            .iter()
+            .filter_map(|pat_str| match Regex::new(pat_str) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
+                    None
+                }
+            })
+            .collect();
+        Self { patterns }
+    }
+}
+
 /// Redact using both built-in and custom patterns from policy.
 pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
     let mut result = redact(input);
     for pat_str in custom_patterns {
-        if let Ok(re) = Regex::new(pat_str) {
-            result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+        match Regex::new(pat_str) {
+            Ok(re) => {
+                result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+            }
+            Err(e) => {
+                eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
+            }
         }
+    }
+    result
+}
+
+/// Redact using built-in patterns and pre-compiled custom patterns (avoids per-call recompilation).
+pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
+    let mut result = redact(input);
+    for re in &compiled.patterns {
+        result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
     }
     result
 }

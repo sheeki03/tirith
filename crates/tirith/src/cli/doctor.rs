@@ -269,12 +269,20 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
     // Find the first existing profile and check if it contains tirith init
     for profile in &profile_candidates {
         if profile.exists() {
-            if let Ok(contents) = std::fs::read_to_string(profile) {
-                // Check for various forms of tirith init
-                let configured = contents.contains("tirith init")
-                    || contents.contains("tirith-hook")
-                    || contents.contains("_tirith_");
-                return (Some(profile.clone()), configured);
+            match std::fs::read_to_string(profile) {
+                Ok(contents) => {
+                    // Check for various forms of tirith init
+                    let configured = contents.contains("tirith init")
+                        || contents.contains("tirith-hook")
+                        || contents.contains("_tirith_");
+                    return (Some(profile.clone()), configured);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tirith: doctor: cannot read profile {}: {e}",
+                        profile.display()
+                    );
+                }
             }
         }
     }

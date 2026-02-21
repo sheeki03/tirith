@@ -392,6 +392,17 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Cloud metadata endpoint IP addresses (AWS, Alibaba Cloud)",
     },
     PatternEntry {
+        id: "private_network_ip",
+        tier1_exec_fragments: &[
+            r"\b10\.\d+\.\d+\.\d+",
+            r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+",
+            r"\b192\.168\.\d+\.\d+",
+            r"\b127\.\d+\.\d+\.\d+",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Private/reserved IPv4 address ranges for SSRF/lateral-movement detection",
+    },
+    PatternEntry {
         id: "non_ascii_paste",
         tier1_exec_fragments: &[],
         tier1_paste_only_fragments: &[r"[^\x00-\x7F]"],

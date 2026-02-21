@@ -95,7 +95,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         echo -n "$content" | tirith paste --shell fish >$tmpfile 2>&1
         set -l rc $status
         set -l output (cat $tmpfile | string collect)
-        rm -f $tmpfile
+        command rm -f $tmpfile
 
         if test $rc -eq 0
             # Allow: fall through to echo
@@ -138,7 +138,7 @@ function _tirith_check_command
     set -l approval_path (tirith check --approval-check --non-interactive --shell fish -- "$cmd" 2>$errfile)
     set -l rc $status
     set -l output (cat $errfile | string collect)
-    rm -f $errfile
+    command rm -f $errfile
 
     if test $rc -eq 0
         # Allow: no output

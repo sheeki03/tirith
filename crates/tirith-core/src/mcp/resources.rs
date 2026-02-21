@@ -69,7 +69,10 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                     .collect::<Vec<_>>(),
             });
 
-            let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+            let text = serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
+                eprintln!("tirith: mcp: resource serialization failed: {e}");
+                "{}".to_string()
+            });
 
             Ok(vec![ResourceContent {
                 uri: PROJECT_SAFETY_URI.into(),

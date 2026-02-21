@@ -664,6 +664,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "mcp_suspicious_args",       // file context, no URL needed
         "mcp_overly_permissive",     // file context, no URL needed
         "mcp_duplicate_server_name", // file context, no URL needed
+        "metadata_endpoint",         // bare IP: curl 169.254.169.254/path
+        "private_network_access",    // bare IP: curl 10.0.0.1/path
     ]
     .into_iter()
     .collect();

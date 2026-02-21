@@ -121,7 +121,7 @@ pub fn list() -> Vec<ToolDefinition> {
         },
     ];
 
-    // Unix-only: cloaking detection (stub until Part 8)
+    // Unix-only: cloaking detection (requires network access)
     #[cfg(unix)]
     tools.push(ToolDefinition {
         name: "tirith_fetch_cloaking".into(),
@@ -197,7 +197,9 @@ fn call_check_command(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -234,7 +236,9 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -270,7 +274,9 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -465,7 +471,7 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
 /// Extracted for testability — diff_text is DLP-redacted before serialization.
 #[cfg(unix)]
 fn build_cloaking_response(
-    result: crate::rules::cloaking::CloakingResult,
+    mut result: crate::rules::cloaking::CloakingResult,
     is_pro: bool,
     dlp_patterns: &[String],
 ) -> ToolCallResult {
@@ -484,33 +490,14 @@ fn build_cloaking_response(
         format!("No cloaking detected for {}", result.url)
     };
 
-    let structured = serde_json::json!({
-        "url": result.url,
-        "cloaking_detected": result.cloaking_detected,
-        "agents": result.agent_responses.iter().map(|a| {
-            serde_json::json!({
-                "agent": a.agent_name,
-                "status_code": a.status_code,
-                "content_length": a.content_length,
-            })
-        }).collect::<Vec<_>>(),
-        "diffs": result.diff_pairs.iter().map(|d| {
-            let mut entry = serde_json::json!({
-                "agent_a": d.agent_a,
-                "agent_b": d.agent_b,
-                "diff_chars": d.diff_chars,
-            });
-            // Pro enrichment: include diff text (DLP-redacted)
-            if is_pro {
-                if let Some(ref text) = d.diff_text {
-                    let redacted = crate::redact::redact_with_custom(text, dlp_patterns);
-                    entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(redacted));
-                }
-            }
-            entry
-        }).collect::<Vec<_>>(),
-        "findings": result.findings,
-    });
+    // DLP-redact diff text before serialization
+    for diff in &mut result.diff_pairs {
+        if let Some(ref text) = diff.diff_text {
+            diff.diff_text = Some(crate::redact::redact_with_custom(text, dlp_patterns));
+        }
+    }
+
+    let structured = result.to_json(is_pro);
 
     ToolCallResult {
         content: vec![ContentItem {

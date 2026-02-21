@@ -74,12 +74,23 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
             .max()
             .unwrap_or(Severity::Info);
 
-        template
-            .replace("{{rule_id}}", &rule_ids.join(","))
+        let result = template
+            .replace("{{rule_id}}", &sanitize_for_json(&rule_ids.join(",")))
             .replace("{{command_preview}}", &sanitize_for_json(command_preview))
-            .replace("{{action}}", &format!("{:?}", verdict.action))
-            .replace("{{severity}}", &max_severity.to_string())
-            .replace("{{finding_count}}", &verdict.findings.len().to_string())
+            .replace(
+                "{{action}}",
+                &sanitize_for_json(&format!("{:?}", verdict.action)),
+            )
+            .replace(
+                "{{severity}}",
+                &sanitize_for_json(&max_severity.to_string()),
+            )
+            .replace("{{finding_count}}", &verdict.findings.len().to_string());
+        // Warn if template expansion produced invalid JSON
+        if serde_json::from_str::<serde_json::Value>(&result).is_err() {
+            eprintln!("tirith: webhook: warning: payload template produced invalid JSON");
+        }
+        result
     } else {
         // Default JSON payload
         let rule_ids: Vec<String> = verdict
@@ -130,18 +141,30 @@ fn expand_env_value(input: &str) -> String {
         if c == '$' {
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
-                let var_name: String = chars.by_ref().take_while(|&c| c != '}').collect();
-                if let Ok(val) = std::env::var(&var_name) {
-                    result.push_str(&val);
+                let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
+                match std::env::var(&var_name) {
+                    Ok(val) => result.push_str(&val),
+                    Err(_) => {
+                        eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                    }
                 }
             } else {
-                let var_name: String = chars
-                    .by_ref()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
+                // CR-6: Use peek to avoid consuming the delimiter character
+                let mut var_name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        var_name.push(ch);
+                        chars.next();
+                    } else {
+                        break; // Don't consume the delimiter
+                    }
+                }
                 if !var_name.is_empty() {
-                    if let Ok(val) = std::env::var(&var_name) {
-                        result.push_str(&val);
+                    match std::env::var(&var_name) {
+                        Ok(val) => result.push_str(&val),
+                        Err(_) => {
+                            eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                        }
                     }
                 }
             }
@@ -180,6 +203,10 @@ fn send_with_retry(
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 let status = resp.status();
+                // SF-16: Don't retry client errors (4xx) — they will never succeed
+                if status.is_client_error() {
+                    return Err(format!("HTTP {status} (non-retriable client error)"));
+                }
                 if attempt + 1 < max_attempts {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
                     std::thread::sleep(delay);
@@ -215,6 +242,10 @@ fn sanitize_for_json(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_sanitize_for_json() {
         assert_eq!(sanitize_for_json("hello"), "hello");
@@ -232,7 +263,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value() {
-        std::env::set_var("TIRITH_TEST_WH", "secret123");
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_TEST_WH", "secret123") };
         assert_eq!(
             expand_env_value("Bearer $TIRITH_TEST_WH"),
             "Bearer secret123"
@@ -242,7 +274,18 @@ mod tests {
             "Bearer secret123"
         );
         assert_eq!(expand_env_value("no vars"), "no vars");
-        std::env::remove_var("TIRITH_TEST_WH");
+        unsafe { std::env::remove_var("TIRITH_TEST_WH") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_expand_env_value_preserves_delimiter() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // CR-6: The character after $VAR must not be swallowed
+        unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
+        assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
+        assert_eq!(expand_env_value("$TIRITH_TEST_WH2 rest"), "val rest");
+        unsafe { std::env::remove_var("TIRITH_TEST_WH2") };
     }
 
     #[cfg(unix)]

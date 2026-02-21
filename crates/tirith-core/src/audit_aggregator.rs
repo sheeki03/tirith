@@ -61,12 +61,19 @@ pub struct AuditStats {
     pub time_range: Option<(String, String)>,
 }
 
+/// Result of reading an audit log, including accounting for skipped lines.
+pub struct ReadLogResult {
+    pub records: Vec<AuditRecord>,
+    pub skipped_lines: usize,
+}
+
 /// Read and parse all records from a JSONL audit log.
-pub fn read_log(path: &Path) -> Result<Vec<AuditRecord>, String> {
+pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
     let mut records = Vec::new();
+    let mut skipped_lines = 0usize;
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -80,10 +87,19 @@ pub fn read_log(path: &Path) -> Result<Vec<AuditRecord>, String> {
                     line_num + 1,
                     path.display()
                 );
+                skipped_lines += 1;
             }
         }
     }
-    Ok(records)
+    Ok(ReadLogResult {
+        records,
+        skipped_lines,
+    })
+}
+
+/// Parse an RFC 3339 timestamp, falling back to lexicographic comparison on failure.
+fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(ts).ok()
 }
 
 /// Filter records by the given criteria.
@@ -91,14 +107,34 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
     records
         .iter()
         .filter(|r| {
+            // CR-10: Parse timestamps for proper timezone-aware comparison
             if let Some(ref since) = filter.since {
-                if r.timestamp.as_str() < since.as_str() {
-                    return false;
+                match (parse_ts(&r.timestamp), parse_ts(since)) {
+                    (Some(rt), Some(st)) => {
+                        if rt < st {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        // Fallback to lexicographic if parsing fails
+                        if r.timestamp.as_str() < since.as_str() {
+                            return false;
+                        }
+                    }
                 }
             }
             if let Some(ref until) = filter.until {
-                if r.timestamp.as_str() > until.as_str() {
-                    return false;
+                match (parse_ts(&r.timestamp), parse_ts(until)) {
+                    (Some(rt), Some(ut)) => {
+                        if rt > ut {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        if r.timestamp.as_str() > until.as_str() {
+                            return false;
+                        }
+                    }
                 }
             }
             if let Some(ref sid) = filter.session_id {
@@ -153,15 +189,28 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let time_range = if records.is_empty() {
         None
     } else {
-        let first = records
-            .first()
+        // Use min/max by parsed timestamp (not first/last which assumes order)
+        let min_ts = records
+            .iter()
+            .min_by(
+                |a, b| match (parse_ts(&a.timestamp), parse_ts(&b.timestamp)) {
+                    (Some(ta), Some(tb)) => ta.cmp(&tb),
+                    _ => a.timestamp.cmp(&b.timestamp),
+                },
+            )
             .map(|r| r.timestamp.clone())
             .unwrap_or_default();
-        let last = records
-            .last()
+        let max_ts = records
+            .iter()
+            .max_by(
+                |a, b| match (parse_ts(&a.timestamp), parse_ts(&b.timestamp)) {
+                    (Some(ta), Some(tb)) => ta.cmp(&tb),
+                    _ => a.timestamp.cmp(&b.timestamp),
+                },
+            )
             .map(|r| r.timestamp.clone())
             .unwrap_or_default();
-        Some((first, last))
+        Some((min_ts, max_ts))
     };
 
     AuditStats {
@@ -177,7 +226,10 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
 
 /// Export records as JSON array.
 pub fn export_json(records: &[AuditRecord]) -> String {
-    serde_json::to_string_pretty(records).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string_pretty(records).unwrap_or_else(|e| {
+        eprintln!("tirith: audit: JSON serialization failed: {e}");
+        "[]".to_string()
+    })
 }
 
 /// Export records as CSV (RFC 4180 compliant).

@@ -14,19 +14,9 @@ pub fn session_id() -> &'static str {
     })
 }
 
-/// Generate a new session ID (UUID v4 format without external dep).
+/// Generate a new session ID using UUID v4.
 fn generate_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    // Simple hash-based ID: not cryptographic, just unique enough for session tracking
-    let hash = timestamp
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(pid as u128);
-    format!("{:016x}-{:08x}", hash as u64, (hash >> 64) as u32)
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Generate a fresh session ID suitable for `tirith init` to export.
@@ -57,8 +47,8 @@ mod tests {
     #[test]
     fn test_generate_session_id_format() {
         let id = generate_session_id();
-        // Format: 16 hex chars, dash, 8 hex chars
-        assert_eq!(id.len(), 25);
-        assert_eq!(id.chars().nth(16), Some('-'));
+        // UUID v4 format: 8-4-4-4-12 hex chars = 36 chars
+        assert_eq!(id.len(), 36);
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
     }
 }

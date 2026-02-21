@@ -158,7 +158,13 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
     }
 
-    let content_str = String::from_utf8_lossy(&content);
+    let content_str = match String::from_utf8(content.clone()) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("tirith: warning: downloaded content contains invalid UTF-8, using lossy conversion");
+            String::from_utf8_lossy(&content).into_owned()
+        }
+    };
 
     // Analyze
     let interpreter = script_analysis::detect_interpreter(&content_str);

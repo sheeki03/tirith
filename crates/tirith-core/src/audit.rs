@@ -50,7 +50,13 @@ pub fn log_verdict(
 
     // Ensure directory exists
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "tirith: audit: cannot create log dir {}: {e}",
+                parent.display()
+            );
+            return;
+        }
     }
 
     let entry = AuditEntry {
@@ -73,7 +79,10 @@ pub fn log_verdict(
 
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: audit: failed to serialize entry: {e}");
+            return;
+        }
     };
 
     // Open, lock, append, fsync, unlock
@@ -85,7 +94,10 @@ pub fn log_verdict(
 
     let file = match file {
         Ok(f) => f,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: audit: cannot open {}: {e}", path.display());
+            return;
+        }
     };
 
     // Harden legacy files: enforce 0600 on existing files too
@@ -95,14 +107,23 @@ pub fn log_verdict(
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
-    if file.lock_exclusive().is_err() {
+    if let Err(e) = file.lock_exclusive() {
+        eprintln!("tirith: audit: cannot lock {}: {e}", path.display());
         return;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
-    let _ = writeln!(writer, "{line}");
-    let _ = writer.flush();
-    let _ = file.sync_all();
+    if let Err(e) = writeln!(writer, "{line}") {
+        eprintln!("tirith: audit: write failed: {e}");
+        let _ = fs2::FileExt::unlock(&file);
+        return;
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("tirith: audit: flush failed: {e}");
+    }
+    if let Err(e) = file.sync_all() {
+        eprintln!("tirith: audit: sync failed: {e}");
+    }
     let _ = fs2::FileExt::unlock(&file);
 }
 
@@ -131,13 +152,18 @@ mod tests {
     use super::*;
     use crate::verdict::{Action, Verdict};
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_tirith_log_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
         // Set TIRITH_LOG=0 to disable logging
-        std::env::set_var("TIRITH_LOG", "0");
+        unsafe { std::env::set_var("TIRITH_LOG", "0") };
 
         let verdict = Verdict {
             action: Action::Allow,
@@ -171,7 +197,7 @@ mod tests {
         );
 
         // Clean up env var
-        std::env::remove_var("TIRITH_LOG");
+        unsafe { std::env::remove_var("TIRITH_LOG") };
     }
 
     #[cfg(unix)]
