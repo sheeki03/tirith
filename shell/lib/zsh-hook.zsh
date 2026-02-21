@@ -22,7 +22,7 @@ _tirith_accept_line() {
   fi
 
   # Run tirith check. Binary prints warnings/blocks directly to stderr.
-  tirith check --shell posix -- "$buf"
+  tirith check --interactive --shell posix -- "$buf"
   local rc=$?
 
   if [[ $rc -eq 1 ]]; then

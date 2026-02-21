@@ -71,7 +71,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     fi
 
     # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    tirith check --shell posix -- "$READLINE_LINE"
+    tirith check --interactive --shell posix -- "$READLINE_LINE"
     local rc=$?
 
     if [[ $rc -eq 1 ]]; then
@@ -154,7 +154,7 @@ elif [[ "$_TIRITH_BASH_MODE" == "preexec" ]]; then
     _tirith_last_cmd="$BASH_COMMAND"
 
     # Warn-only: command is already committed, we can only print warnings
-    tirith check --shell posix -- "$BASH_COMMAND" || true
+    tirith check --interactive --shell posix -- "$BASH_COMMAND" || true
   }
 
   trap '_tirith_preexec' DEBUG

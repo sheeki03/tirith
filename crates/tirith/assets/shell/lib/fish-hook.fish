@@ -24,7 +24,7 @@ function _tirith_check_command
     end
 
     # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    tirith check --shell fish -- "$cmd"
+    tirith check --interactive --shell fish -- "$cmd"
     set -l rc $status
 
     if test $rc -eq 1

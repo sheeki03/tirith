@@ -27,7 +27,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
     # Run tirith check. Binary prints warnings/blocks directly to stderr.
     # No output capture: binary writes to stderr which is the terminal.
-    & tirith check --shell powershell -- $line
+    & tirith check --interactive --shell powershell -- $line
     $rc = $LASTEXITCODE
 
     if ($rc -eq 1) {
