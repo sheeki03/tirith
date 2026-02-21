@@ -14,6 +14,37 @@ if functions -q fish_user_key_bindings; and not functions -q _tirith_original_fi
     functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
 end
 
+# Wrap fish_clipboard_paste to intercept all clipboard paste operations
+# Covers: Ctrl+V, Ctrl+Y, and any custom bindings using fish_clipboard_paste
+# NOTE: Terminal-level paste (right-click, middle-click) uses fish's internal
+# __fish_paste and is NOT intercepted to avoid breakage on fish updates.
+if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish_clipboard_paste
+    functions -c fish_clipboard_paste _tirith_original_fish_clipboard_paste
+
+    # Only define wrapper if we successfully copied the original
+    function fish_clipboard_paste
+        # Get clipboard content via original function
+        # Use string collect to preserve newlines (set -l splits on newlines)
+        set -l content (_tirith_original_fish_clipboard_paste | string collect)
+
+        if test -z "$content"
+            return
+        end
+
+        # Check with tirith (stderr stays on stderr for warnings)
+        echo -n "$content" | tirith paste --shell fish
+        set -l rc $status
+
+        if test $rc -eq 1
+            # Blocked - return nothing (paste is suppressed)
+            return
+        end
+
+        # Allowed - output the content for insertion
+        echo -n "$content"
+    end
+end
+
 function _tirith_check_command
     set -l cmd (commandline)
 
@@ -38,37 +69,13 @@ function _tirith_check_command
     end
 end
 
-# NOTE: Only intercepts Ctrl+V paste. Right-click and middle-click paste
-# bypass this check — fish does not expose a hookable paste event.
-function _tirith_check_paste
-    # Read clipboard content
-    set -l pasted (fish_clipboard_paste 2>/dev/null)
-
-    if test -n "$pasted"
-        # Check with tirith paste
-        echo -n "$pasted" | tirith paste --shell fish
-        set -l rc $status
-
-        if test $rc -eq 1
-            # Block: discard paste
-            return
-        end
-    end
-
-    # Allow: insert pasted content
-    commandline -i -- "$pasted"
-end
-
 function fish_user_key_bindings
     # Call original user key bindings if they existed
     if functions -q _tirith_original_fish_user_key_bindings
         _tirith_original_fish_user_key_bindings
     end
 
-    # Override Enter
+    # Override Enter for command check
     bind \r _tirith_check_command
     bind \n _tirith_check_command
-
-    # Paste interception (Ctrl+V only)
-    bind \cv _tirith_check_paste
 end
