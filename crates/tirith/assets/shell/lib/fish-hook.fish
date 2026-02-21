@@ -71,7 +71,7 @@ function _tirith_check_command
 
     # Run tirith check, use temp file to prevent tty leakage
     set -l tmpfile (mktemp)
-    tirith check --non-interactive --shell fish -- "$cmd" >$tmpfile 2>&1
+    tirith check --non-interactive --interactive --shell fish -- "$cmd" >$tmpfile 2>&1
     set -l rc $status
     set -l output (cat $tmpfile | string collect)
     rm -f $tmpfile

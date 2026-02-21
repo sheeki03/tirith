@@ -27,7 +27,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
     # Run tirith check, use temp file to prevent output leakage
     $tmpfile = [System.IO.Path]::GetTempFileName()
-    & tirith check --non-interactive --shell powershell -- $line > $tmpfile 2>&1
+    & tirith check --non-interactive --interactive --shell powershell -- $line > $tmpfile 2>&1
     $rc = $LASTEXITCODE
     $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue

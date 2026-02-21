@@ -34,7 +34,7 @@ _tirith_accept_line() {
 
   # Run tirith check, redirect to temp file to prevent tty leakage
   local tmpfile=$(mktemp)
-  tirith check --non-interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
+  tirith check --non-interactive --interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
   local rc=$?
   local output=$(<"$tmpfile")
   rm -f "$tmpfile"
