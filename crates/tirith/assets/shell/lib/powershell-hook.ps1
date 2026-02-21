@@ -119,7 +119,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
     # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
     $errfile = [System.IO.Path]::GetTempFileName()
-    $approvalPath = & tirith check --approval-check --non-interactive --shell powershell -- $line 2>$errfile
+    $approvalPath = & tirith check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
     $rc = $LASTEXITCODE
     $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $errfile -Force -ErrorAction SilentlyContinue

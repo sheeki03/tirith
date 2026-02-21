@@ -88,7 +88,7 @@ _tirith_accept_line() {
   # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
   local errfile=$(mktemp)
   local approval_path
-  approval_path=$(tirith check --approval-check --non-interactive --shell posix -- "$buf" 2>"$errfile")
+  approval_path=$(tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
   local rc=$?
   local output=$(<"$errfile")
   rm -f "$errfile"
