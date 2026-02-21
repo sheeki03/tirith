@@ -145,30 +145,37 @@ pub fn run(
         &policy.dlp_custom_patterns,
     );
 
-    // Webhook dispatch (Team feature, non-blocking background thread)
-    if tirith_core::license::current_tier() >= tirith_core::license::Tier::Team
+    // Webhook dispatch (Team feature, background threads joined on drop)
+    let _webhook_dispatcher = if tirith_core::license::current_tier()
+        >= tirith_core::license::Tier::Team
         && !policy.webhooks.is_empty()
     {
-        tirith_core::webhook::dispatch(
+        Some(tirith_core::webhook::dispatch(
             &verdict,
             cmd,
             &policy.webhooks,
             &policy.dlp_custom_patterns,
-        );
-    }
+        ))
+    } else {
+        None
+    };
 
     // For --approval-check mode, stdout has ONLY the temp-file path.
     // Write human-readable output to stderr so hooks can display it.
     if approval_check {
-        let _ = output::write_human(&verdict, std::io::stderr().lock());
+        if let Err(e) = output::write_human(&verdict, std::io::stderr().lock()) {
+            eprintln!("tirith: failed to write output: {e}");
+        }
         return verdict.action.exit_code();
     }
 
     // Output
     if json {
-        let _ = output::write_json(&verdict, std::io::stdout().lock());
-    } else {
-        let _ = output::write_human_auto(&verdict);
+        if let Err(e) = output::write_json(&verdict, std::io::stdout().lock()) {
+            eprintln!("tirith: failed to write JSON output: {e}");
+        }
+    } else if let Err(e) = output::write_human_auto(&verdict) {
+        eprintln!("tirith: failed to write output: {e}");
     }
 
     verdict.action.exit_code()

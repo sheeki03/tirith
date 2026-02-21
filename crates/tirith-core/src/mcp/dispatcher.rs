@@ -16,17 +16,42 @@ enum State {
 /// Reads JSON-RPC messages from `input` (one per line), writes responses to
 /// `output`. Logs go to `log` (typically stderr). Returns exit code 0 on clean
 /// shutdown (EOF on input).
-pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
+pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
     let mut state = State::AwaitingInit;
 
-    for line in input.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
+    /// Maximum line size: 10 MiB. Lines exceeding this are rejected as a
+    /// parse error (-32700) to prevent memory exhaustion from malicious input.
+    const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match read_line_limited(&mut input, &mut line, MAX_LINE_BYTES) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(LineLimitError::TooLong) => {
+                let _ = writeln!(
+                    log,
+                    "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit"
+                );
+                let resp = JsonRpcResponse::err(
+                    Value::Null,
+                    JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: line exceeds {MAX_LINE_BYTES} byte limit"),
+                        data: None,
+                    },
+                );
+                write_response(&mut output, &resp);
+                // Drain the rest of the oversized line so the next read starts fresh
+                drain_until_newline(&mut input);
+                continue;
+            }
+            Err(LineLimitError::Io(e)) => {
                 let _ = writeln!(log, "tirith mcp-server: stdin read error: {e}");
                 return 1;
             }
-        };
+        }
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -282,6 +307,57 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
 // ---------------------------------------------------------------------------
 // I/O
 // ---------------------------------------------------------------------------
+
+/// Error from the bounded line reader.
+enum LineLimitError {
+    TooLong,
+    Io(std::io::Error),
+}
+
+/// Read a single line (up to `\n`) into `buf`, but fail if the line exceeds
+/// `max_bytes`. Returns the number of bytes read (0 = EOF).
+fn read_line_limited(
+    reader: &mut impl BufRead,
+    buf: &mut String,
+    max_bytes: usize,
+) -> Result<usize, LineLimitError> {
+    let mut total = 0usize;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(LineLimitError::Io(e)),
+        };
+        if available.is_empty() {
+            return Ok(total); // EOF
+        }
+        // Find newline position in the available buffer
+        let (used, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        total += used;
+        if total > max_bytes {
+            reader.consume(used);
+            return Err(LineLimitError::TooLong);
+        }
+        // Safety: we will only push valid UTF-8 (lossy replacement for non-UTF-8)
+        let chunk = String::from_utf8_lossy(&available[..used]);
+        buf.push_str(&chunk);
+        reader.consume(used);
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// After detecting an oversized line, drain remaining bytes until the next newline
+/// so subsequent reads start at a clean message boundary.
+fn drain_until_newline(reader: &mut impl BufRead) {
+    let mut discard = String::new();
+    // read_line reads until \n (inclusive) or EOF
+    let _ = reader.read_line(&mut discard);
+}
 
 fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) {
     if let Ok(json) = serde_json::to_string(resp) {
@@ -564,5 +640,28 @@ mod tests {
         assert_eq!(resps.len(), 2);
         assert_eq!(resps[1]["id"], Value::Null);
         assert_eq!(resps[1]["result"], json!({}));
+    }
+
+    #[test]
+    fn test_oversized_line_rejected() {
+        // Build a line that exceeds the internal 10 MiB limit.
+        // We use a much smaller limit by testing the helper directly,
+        // but for the integration test we craft a line > 10 MiB.
+        // Instead, test the helper function with a small limit.
+        let data = "a".repeat(200);
+        let mut buf = String::new();
+        let mut cursor = std::io::Cursor::new(format!("{data}\n"));
+        let result = read_line_limited(&mut cursor, &mut buf, 100);
+        assert!(matches!(result, Err(LineLimitError::TooLong)));
+    }
+
+    #[test]
+    fn test_normal_line_accepted() {
+        let data = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let mut buf = String::new();
+        let mut cursor = std::io::Cursor::new(format!("{data}\n"));
+        let result = read_line_limited(&mut cursor, &mut buf, 10 * 1024 * 1024);
+        assert!(result.is_ok());
+        assert!(buf.contains("ping"));
     }
 }

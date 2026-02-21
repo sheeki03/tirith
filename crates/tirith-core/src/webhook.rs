@@ -5,20 +5,46 @@
 use crate::policy::WebhookConfig;
 use crate::verdict::{Severity, Verdict};
 
+/// Tracks background webhook delivery threads and ensures they complete.
+///
+/// Call `flush()` (or let the dispatcher drop) to join all pending deliveries
+/// before process exit.
+pub struct WebhookDispatcher {
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl WebhookDispatcher {
+    /// Block until all pending webhook deliveries have completed.
+    pub fn flush(&mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WebhookDispatcher {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// Dispatch webhook notifications for a verdict, if configured.
 ///
-/// Spawns a background thread per webhook endpoint. The main thread is never
-/// blocked. If any webhook delivery fails after retries, errors are logged
-/// to stderr.
+/// Returns a `WebhookDispatcher` whose `flush()` method (or `Drop` impl) joins
+/// all background delivery threads, ensuring they complete before process exit.
 #[cfg(unix)]
 pub fn dispatch(
     verdict: &Verdict,
     command_preview: &str,
     webhooks: &[WebhookConfig],
     custom_dlp_patterns: &[String],
-) {
+) -> WebhookDispatcher {
+    let mut dispatcher = WebhookDispatcher {
+        handles: Vec::new(),
+    };
+
     if webhooks.is_empty() {
-        return;
+        return dispatcher;
     }
 
     // Apply DLP redaction: built-in patterns + custom policy patterns (Team)
@@ -40,12 +66,15 @@ pub fn dispatch(
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             if let Err(e) = send_with_retry(&url, &payload, &headers, 3) {
                 eprintln!("tirith: webhook delivery to {url} failed: {e}");
             }
         });
+        dispatcher.handles.push(handle);
     }
+
+    dispatcher
 }
 
 /// No-op on non-Unix platforms.
@@ -55,7 +84,10 @@ pub fn dispatch(
     _command_preview: &str,
     _webhooks: &[WebhookConfig],
     _custom_dlp_patterns: &[String],
-) {
+) -> WebhookDispatcher {
+    WebhookDispatcher {
+        handles: Vec::new(),
+    }
 }
 
 /// Build the webhook payload from a template or default JSON.
@@ -75,10 +107,16 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
             .unwrap_or(Severity::Info);
 
         template
-            .replace("{{rule_id}}", &rule_ids.join(","))
+            .replace("{{rule_id}}", &sanitize_for_json(&rule_ids.join(",")))
             .replace("{{command_preview}}", &sanitize_for_json(command_preview))
-            .replace("{{action}}", &format!("{:?}", verdict.action))
-            .replace("{{severity}}", &max_severity.to_string())
+            .replace(
+                "{{action}}",
+                &sanitize_for_json(&format!("{:?}", verdict.action)),
+            )
+            .replace(
+                "{{severity}}",
+                &sanitize_for_json(&max_severity.to_string()),
+            )
             .replace("{{finding_count}}", &verdict.findings.len().to_string())
     } else {
         // Default JSON payload
@@ -107,15 +145,26 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
 }
 
 /// Expand environment variables in header values (`$VAR` or `${VAR}`).
+///
+/// Headers whose expanded value is empty (e.g. because the referenced env var
+/// is unset) are dropped with a warning, preventing empty auth headers from
+/// being sent to webhook endpoints.
 #[cfg(unix)]
 fn expand_env_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<(String, String)> {
     headers
         .iter()
-        .map(|(k, v)| {
+        .filter_map(|(k, v)| {
             let expanded = expand_env_value(v);
-            (k.clone(), expanded)
+            if expanded.is_empty() {
+                eprintln!(
+                    "tirith: webhook header '{k}' expanded to empty (env var unset?), skipping"
+                );
+                None
+            } else {
+                Some((k.clone(), expanded))
+            }
         })
         .collect()
 }

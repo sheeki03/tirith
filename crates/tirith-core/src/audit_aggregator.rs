@@ -153,15 +153,17 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let time_range = if records.is_empty() {
         None
     } else {
-        let first = records
-            .first()
+        let min_ts = records
+            .iter()
+            .min_by(|a, b| a.timestamp.cmp(&b.timestamp))
             .map(|r| r.timestamp.clone())
             .unwrap_or_default();
-        let last = records
-            .last()
+        let max_ts = records
+            .iter()
+            .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
             .map(|r| r.timestamp.clone())
             .unwrap_or_default();
-        Some((first, last))
+        Some((min_ts, max_ts))
     };
 
     AuditStats {

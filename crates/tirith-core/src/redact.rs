@@ -44,8 +44,13 @@ pub fn redact(input: &str) -> String {
 pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
     let mut result = redact(input);
     for pat_str in custom_patterns {
-        if let Ok(re) = Regex::new(pat_str) {
-            result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+        match Regex::new(pat_str) {
+            Ok(re) => {
+                result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+            }
+            Err(e) => {
+                eprintln!("tirith: invalid DLP pattern '{pat_str}': {e}");
+            }
         }
     }
     result
@@ -83,8 +88,10 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, custom_patterns: &[String]
         Evidence::ByteSequence { description, .. } => {
             *description = redact_with_custom(description, custom_patterns);
         }
-        // HostComparison and HomoglyphAnalysis contain domain names / char analysis, not user content
-        _ => {}
+        // HostComparison contains domain names for similarity analysis, not user-controlled content
+        Evidence::HostComparison { .. } => {}
+        // HomoglyphAnalysis contains character-level Unicode analysis, not user-controlled content
+        Evidence::HomoglyphAnalysis { .. } => {}
     }
 }
 

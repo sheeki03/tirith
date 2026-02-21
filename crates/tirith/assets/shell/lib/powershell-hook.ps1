@@ -60,7 +60,11 @@ function _tirith_parse_approval {
             }
         }
     } catch {
-        # Read failure → fail closed
+        # Read failure → fail closed: reset validKeys so corrupt-check triggers
+        [Console]::Error.WriteLine("tirith: warning: approval file read failed: $_")
+        $script:_tirith_ap_required = "yes"
+        $script:_tirith_ap_fallback = "block"
+        $validKeys = 0
     }
 
     Remove-Item $FilePath -Force -ErrorAction SilentlyContinue

@@ -27,6 +27,24 @@ fn require_pro() -> Result<(), String> {
     }
 }
 
+/// Validate that a checkpoint ID is safe for use as a filesystem path component.
+/// Rejects empty IDs, and IDs containing `..`, `/`, `\`, or null bytes.
+fn validate_checkpoint_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("checkpoint ID must not be empty".to_string());
+    }
+    if id.contains("..") {
+        return Err("checkpoint ID must not contain '..'".to_string());
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Err("checkpoint ID must not contain path separators".to_string());
+    }
+    if id.contains('\0') {
+        return Err("checkpoint ID must not contain null bytes".to_string());
+    }
+    Ok(())
+}
+
 /// Commands that trigger automatic checkpointing.
 const AUTO_TRIGGER_PATTERNS: &[&str] = &[
     "rm -rf",
@@ -232,6 +250,7 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
 /// Restore files from a checkpoint. Requires Pro tier (ADR-6: gate in core).
 pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
     require_pro()?;
+    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -274,6 +293,7 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 /// Get diff between checkpoint and current filesystem state. Requires Pro tier (ADR-6: gate in core).
 pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     require_pro()?;
+    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -594,6 +614,23 @@ mod tests {
 
         let result = backup_file(Path::new("/nonexistent/file.txt"), &files_dir);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_checkpoint_id_rejects_traversal() {
+        assert!(validate_checkpoint_id("").is_err(), "empty");
+        assert!(validate_checkpoint_id("..").is_err(), "bare ..");
+        assert!(validate_checkpoint_id("foo/../bar").is_err(), "embedded ..");
+        assert!(validate_checkpoint_id("foo/bar").is_err(), "forward slash");
+        assert!(validate_checkpoint_id("foo\\bar").is_err(), "backslash");
+        assert!(validate_checkpoint_id("foo\0bar").is_err(), "null byte");
+    }
+
+    #[test]
+    fn test_validate_checkpoint_id_accepts_valid() {
+        assert!(validate_checkpoint_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_checkpoint_id("my-checkpoint-123").is_ok());
+        assert!(validate_checkpoint_id("a").is_ok());
     }
 
     #[test]
