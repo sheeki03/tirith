@@ -288,11 +288,22 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
     }
 
     let words = split_words(trimmed);
-    let command = words.first().cloned();
-    let args = if words.len() > 1 {
-        words[1..].to_vec()
-    } else {
-        Vec::new()
+    // Skip leading environment variable assignments (VAR=VALUE)
+    let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
+    let (command, args) = match first_non_assign {
+        Some(idx) => {
+            let cmd = Some(words[idx].clone());
+            let args = if idx + 1 < words.len() {
+                words[idx + 1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (cmd, args)
+        }
+        None => {
+            // All words are assignments, no command
+            (None, Vec::new())
+        }
     };
 
     segments.push(Segment {
@@ -301,6 +312,32 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
         args,
         preceding_separator: preceding_sep,
     });
+}
+
+/// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
+/// Must have at least one char before `=`, and the name must be alphanumeric/underscore.
+pub fn is_env_assignment(word: &str) -> bool {
+    // Strip quotes first
+    let s = word.trim();
+    let s = if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    if s.starts_with('-') || s.starts_with('=') {
+        return false;
+    }
+    if let Some(eq_pos) = s.find('=') {
+        if eq_pos == 0 {
+            return false;
+        }
+        let name = &s[..eq_pos];
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    } else {
+        false
+    }
 }
 
 /// Split a segment into words, respecting quotes.
@@ -464,6 +501,42 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].command.as_deref(), Some("curl"));
         assert_eq!(segs[0].args.len(), 2);
+    }
+
+    #[test]
+    fn test_env_prefix_skipped() {
+        let segs = tokenize("TIRITH=0 curl evil.com", ShellType::Posix);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].command.as_deref(), Some("curl"));
+        assert_eq!(segs[0].args, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_multiple_env_prefixes() {
+        let segs = tokenize("FOO=bar BAZ=1 python script.py", ShellType::Posix);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].command.as_deref(), Some("python"));
+        assert_eq!(segs[0].args, vec!["script.py"]);
+    }
+
+    #[test]
+    fn test_env_only_no_command() {
+        let segs = tokenize("TIRITH=0", ShellType::Posix);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].command, None);
+        assert!(segs[0].args.is_empty());
+    }
+
+    #[test]
+    fn test_is_env_assignment() {
+        assert!(is_env_assignment("FOO=bar"));
+        assert!(is_env_assignment("TIRITH=0"));
+        assert!(is_env_assignment("PATH=/usr/bin"));
+        assert!(is_env_assignment("A="));
+        assert!(!is_env_assignment("-o"));
+        assert!(!is_env_assignment("curl"));
+        assert!(!is_env_assignment("=value"));
+        assert!(!is_env_assignment("--flag=value"));
     }
 
     #[test]
