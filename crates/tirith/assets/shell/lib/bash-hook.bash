@@ -268,7 +268,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
 
       # Run tirith check, use temp file to prevent tty leakage in bind -x context
       local tmpfile=$(mktemp)
-      tirith check --non-interactive --shell posix -- "$READLINE_LINE" >"$tmpfile" 2>&1
+      tirith check --non-interactive --interactive --shell posix -- "$READLINE_LINE" >"$tmpfile" 2>&1
       local rc=$?
       local output=$(<"$tmpfile")
       rm -f "$tmpfile"
