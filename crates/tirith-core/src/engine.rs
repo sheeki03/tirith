@@ -30,8 +30,6 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
 }
 
-/// Run the tiered analysis pipeline.
-
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
 fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
@@ -295,6 +293,7 @@ fn is_tirith_command(cmd: &str) -> bool {
     false
 }
 
+/// Run the tiered analysis pipeline.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     let start = Instant::now();
 
@@ -351,7 +350,6 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             },
         );
     }
-
 
     // Self-invocation guard: allow tirith's own commands (single-segment only)
     if ctx.scan_context == ScanContext::Exec && is_self_invocation(&ctx.input, ctx.shell) {
