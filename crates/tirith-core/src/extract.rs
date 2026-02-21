@@ -301,16 +301,27 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let mut results = Vec::new();
 
     for (seg_idx, segment) in segments.iter().enumerate() {
-        // Extract standard URLs from raw text
-        for mat in URL_REGEX.find_iter(&segment.raw) {
-            let raw = mat.as_str().to_string();
-            let url = parse::parse_url(&raw);
-            results.push(ExtractedUrl {
-                raw,
-                parsed: url,
-                segment_index: seg_idx,
-                in_sink_context: is_sink_context(segment, &segments),
-            });
+        // Extract standard URLs from command + args (not raw text, to skip env-prefix values).
+        // Since URL_REGEX stops at whitespace, scanning individual words is equivalent to
+        // scanning the non-env-prefix portion of the raw text.
+        let mut url_sources: Vec<&str> = Vec::new();
+        if let Some(ref cmd) = segment.command {
+            url_sources.push(cmd.as_str());
+        }
+        for arg in &segment.args {
+            url_sources.push(arg.as_str());
+        }
+        for source in &url_sources {
+            for mat in URL_REGEX.find_iter(source) {
+                let raw = mat.as_str().to_string();
+                let url = parse::parse_url(&raw);
+                results.push(ExtractedUrl {
+                    raw,
+                    parsed: url,
+                    segment_index: seg_idx,
+                    in_sink_context: is_sink_context(segment, &segments),
+                });
+            }
         }
 
         // Check for schemeless URLs in sink contexts
@@ -320,7 +331,13 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
             matches!(cmd_lower.as_str(), "docker" | "podman" | "nerdctl")
         });
         if is_sink_context(segment, &segments) && !is_docker_cmd {
-            for arg in &segment.args {
+            for (arg_idx, arg) in segment.args.iter().enumerate() {
+                // Skip args that are output-file flag values
+                if let Some(cmd) = &segment.command {
+                    if is_output_flag_value(cmd, &segment.args, arg_idx) {
+                        continue;
+                    }
+                }
                 let clean = strip_quotes(arg);
                 if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
                     results.push(ExtractedUrl {
@@ -587,6 +604,55 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
+/// Check if an arg at the given index is the value of an output-file flag for the given command.
+/// Returns true if this arg should be skipped during schemeless URL detection.
+fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
+
+    match cmd_base {
+        "curl" => {
+            // Check if previous arg is -o or --output
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-o" || prev == "--output" {
+                    return true;
+                }
+            }
+            // Check if current arg starts with -o (combined: -oFILE)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-o") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output=FILE
+            if current.starts_with("--output=") {
+                return true;
+            }
+            false
+        }
+        "wget" => {
+            // Check if previous arg is -O or --output-document
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-O" || prev == "--output-document" {
+                    return true;
+                }
+            }
+            // Check -OFILE (combined short form)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-O") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output-document=FILE
+            if current.starts_with("--output-document=") {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2
@@ -614,7 +680,9 @@ fn looks_like_schemeless_host(s: &str) -> bool {
         ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
         ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip",
         ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so", ".log",
-        ".conf", ".cfg", ".ini", ".toml",
+        ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff",
+        ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm",
+        ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
     ];
     let host_lower = host_part.to_lowercase();
     if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
@@ -995,5 +1063,76 @@ mod tests {
             !result.has_control_chars,
             "lone trailing \\r should not be flagged"
         );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_flag() {
+        let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
+        // Should NOT have schemeless URL for lenna.png
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "lenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_combined() {
+        let urls = extract_urls("curl -olenna.png https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-olenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_output_flag() {
+        let urls = extract_urls("wget -O output.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "output.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_combined() {
+        let urls = extract_urls("wget -Ooutput.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-Ooutput.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_real_domain_still_detected() {
+        let urls = extract_urls("curl evil.com/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.com/payload should be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_png_no_slash_is_file() {
+        assert!(!looks_like_schemeless_host("lenna.png"));
     }
 }
