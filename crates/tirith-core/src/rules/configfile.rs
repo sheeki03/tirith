@@ -162,23 +162,7 @@ fn is_known_config_file(path: &Path) -> bool {
 /// Check if a file is an MCP configuration file.
 fn is_mcp_config_file(path: &Path) -> bool {
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    if basename == "mcp.json" || basename == ".mcp.json" || basename == "mcp_settings.json" {
-        return true;
-    }
-
-    // Parent dir patterns for MCP configs
-    if let Some(parent) = path.parent() {
-        let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let mcp_dirs = [".vscode", ".cursor", ".windsurf", ".cline"];
-        if mcp_dirs.contains(&parent_name)
-            && (basename == "mcp.json" || basename == "mcp_settings.json")
-        {
-            return true;
-        }
-    }
-
-    false
+    basename == "mcp.json" || basename == ".mcp.json" || basename == "mcp_settings.json"
 }
 
 /// Detect invisible Unicode characters with elevated severity for config files.
@@ -344,7 +328,25 @@ fn check_mcp_config(content: &str, path: &Path, findings: &mut Vec<Finding>) {
     // Parse as JSON
     let json: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
-        Err(_) => return, // Not valid JSON, skip MCP checks
+        Err(e) => {
+            findings.push(Finding {
+                rule_id: RuleId::ConfigMalformed,
+                severity: Severity::Medium,
+                title: "MCP config file is not valid JSON".into(),
+                description: format!(
+                    "MCP configuration file could not be parsed as JSON: {e}. \
+                     Structural security checks (server URLs, args, tools) were skipped."
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!("Parse error: {e}"),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return;
+        }
     };
 
     // Look for mcpServers or servers key

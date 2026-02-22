@@ -48,7 +48,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+        if words[idx] == "TIRITH=0" {
             return true;
         }
         idx += 1;
@@ -67,7 +67,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w.starts_with("TIRITH=0") || w == "TIRITH=0" {
+                    if w == "TIRITH=0" {
                         return true;
                     }
                     idx += 1;
@@ -87,7 +87,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+                if words[idx] == "TIRITH=0" {
                     return true;
                 }
                 idx += 1;

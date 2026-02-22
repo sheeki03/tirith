@@ -436,6 +436,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "command_network_deny",
     // Config file
     "config_injection",
+    "config_malformed",
     "config_non_ascii",
     "config_invisible_unicode",
     "mcp_insecure_server",
@@ -515,6 +516,7 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "server_cloaking",   // requires network fetch (Unix-only)
     "clipboard_hidden",  // requires --html clipboard input
     "pdf_hidden_text",   // requires .pdf file input
+    "config_malformed",  // requires MCP config filename context in file scan
 ];
 
 #[test]
@@ -590,6 +592,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::PrivateNetworkAccess,
         RuleId::CommandNetworkDeny,
         RuleId::ConfigInjection,
+        RuleId::ConfigMalformed,
         RuleId::ConfigNonAscii,
         RuleId::ConfigInvisibleUnicode,
         RuleId::McpInsecureServer,

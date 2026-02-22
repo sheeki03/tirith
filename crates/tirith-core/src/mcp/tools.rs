@@ -9,6 +9,28 @@ use crate::tokenize::ShellType;
 
 use super::types::{ContentItem, ToolCallResult, ToolDefinition};
 
+/// Validate that a path is within the current working directory (path traversal protection).
+fn validate_path_scope(path: &std::path::Path) -> Result<PathBuf, String> {
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("Cannot determine working directory: {e}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("Cannot canonicalize working directory: {e}"))?;
+    let canonical_path = path.canonicalize().map_err(|_| {
+        format!(
+            "Path does not exist or is not accessible: {}",
+            path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(format!(
+            "Access denied: path '{}' is outside the working directory",
+            path.display()
+        ));
+    }
+    Ok(canonical_path)
+}
+
 /// Return the list of available tools.
 pub fn list() -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -218,8 +240,9 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: url"),
     };
 
-    // Wrap URL in a minimal curl command so the full pipeline runs
-    let input = format!("curl {url}");
+    // Wrap URL in a minimal curl command so the full pipeline runs.
+    // Shell-quote the URL to prevent metacharacters from being tokenized as separate commands.
+    let input = format!("curl '{}'", url.replace('\'', "'\\''"));
     let ctx = AnalysisContext {
         input,
         shell: ShellType::Posix,
@@ -296,9 +319,10 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
-    }
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
 
     let policy = crate::policy::Policy::discover(None);
 
@@ -337,6 +361,10 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         .unwrap_or(true);
 
     let path = PathBuf::from(path_str);
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
     if !path.is_dir() {
         return tool_error(&format!("Not a directory: {path_str}"));
     }
@@ -390,9 +418,10 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
-    }
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
 
     let policy = crate::policy::Policy::discover(None);
 
