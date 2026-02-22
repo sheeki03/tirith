@@ -52,7 +52,7 @@ enum EnforcementMode {
     SignedOnly,
 }
 
-const ENFORCEMENT_MODE: EnforcementMode = EnforcementMode::SignedPreferred;
+const ENFORCEMENT_MODE: EnforcementMode = EnforcementMode::SignedOnly;
 
 // ─── Keyring (Ed25519 public keys) ─────────────────────────────────
 
@@ -64,13 +64,22 @@ struct KeyEntry {
 // To rotate keys: generate a new Ed25519 keypair offline, add the public key
 // here as a new KeyEntry with the next kid ("k2", etc.), and store the private
 // key in your secret manager. See docs/threat-model.md for details.
-const KEYRING: &[KeyEntry] = &[KeyEntry {
-    kid: "k1",
-    key: [
-        111, 227, 28, 151, 67, 117, 194, 85, 167, 179, 224, 109, 45, 172, 183, 106, 78, 3, 55, 72,
-        57, 216, 160, 134, 78, 190, 54, 236, 190, 16, 22, 9,
-    ],
-}];
+const KEYRING: &[KeyEntry] = &[
+    KeyEntry {
+        kid: "k1",
+        key: [
+            111, 227, 28, 151, 67, 117, 194, 85, 167, 179, 224, 109, 45, 172, 183, 106, 78, 3, 55,
+            72, 57, 216, 160, 134, 78, 190, 54, 236, 190, 16, 22, 9,
+        ],
+    },
+    KeyEntry {
+        kid: "k2",
+        key: [
+            141, 30, 243, 157, 5, 88, 251, 150, 7, 123, 244, 84, 164, 1, 186, 200, 23, 1, 149, 246,
+            53, 6, 251, 131, 104, 197, 106, 24, 188, 149, 137, 237,
+        ],
+    },
+];
 
 // Compile-time: keyring must never be empty.
 const _: () = assert!(!KEYRING.is_empty());
@@ -647,65 +656,95 @@ mod tests {
     #[test]
     fn test_decode_pro() {
         let key = make_key("pro", "2099-12-31");
-        assert_eq!(decode_tier_at(&key, now()), Some(Tier::Pro));
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            Some(Tier::Pro)
+        );
     }
 
     #[test]
     fn test_decode_team() {
         // Legacy unsigned tokens capped at Pro (M1 fix)
         let key = make_key("team", "2099-12-31");
-        assert_eq!(decode_tier_at(&key, now()), Some(Tier::Pro));
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            Some(Tier::Pro)
+        );
     }
 
     #[test]
     fn test_decode_enterprise() {
         // Legacy unsigned tokens capped at Pro (M1 fix)
         let key = make_key("enterprise", "2099-12-31");
-        assert_eq!(decode_tier_at(&key, now()), Some(Tier::Pro));
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            Some(Tier::Pro)
+        );
     }
 
     #[test]
     fn test_decode_expired() {
         let key = make_key("pro", "2020-01-01");
-        assert_eq!(decode_tier_at(&key, now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_no_expiry() {
         // Legacy tokens without exp are now rejected (L4 fix)
         let key = make_key_no_exp("pro");
-        assert_eq!(decode_tier_at(&key, now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_invalid_base64() {
-        assert_eq!(decode_tier_at("not-valid!!!", now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode("not-valid!!!", now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_invalid_json() {
         use base64::Engine;
         let key = base64::engine::general_purpose::STANDARD.encode(b"not json");
-        assert_eq!(decode_tier_at(&key, now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_missing_tier() {
         use base64::Engine;
         let key = base64::engine::general_purpose::STANDARD.encode(br#"{"exp":"2099-12-31"}"#);
-        assert_eq!(decode_tier_at(&key, now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_unknown_tier() {
         let key = make_key("platinum", "2099-12-31");
-        assert_eq!(decode_tier_at(&key, now()), None);
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            None
+        );
     }
 
     #[test]
     fn test_decode_case_insensitive() {
         let key = make_key("PRO", "2099-12-31");
-        assert_eq!(decode_tier_at(&key, now()), Some(Tier::Pro));
+        assert_eq!(
+            decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
+            Some(Tier::Pro)
+        );
     }
 
     #[test]
@@ -736,7 +775,8 @@ mod tests {
     fn test_decode_license_info_team_sso() {
         // Legacy unsigned tokens capped at Pro (M1 fix)
         let key = make_team_sso_key("org-acme-123", "okta");
-        let info = decode_license_info_at(&key, now()).unwrap();
+        let info = decode_license_info_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING)
+            .unwrap();
         assert_eq!(info.tier, Tier::Pro);
         assert_eq!(info.org_id.as_deref(), Some("org-acme-123"));
         assert_eq!(info.sso_provider.as_deref(), Some("okta"));
@@ -747,7 +787,8 @@ mod tests {
     #[test]
     fn test_decode_license_info_pro_no_sso() {
         let key = make_key("pro", "2099-12-31");
-        let info = decode_license_info_at(&key, now()).unwrap();
+        let info = decode_license_info_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING)
+            .unwrap();
         assert_eq!(info.tier, Tier::Pro);
         assert!(info.org_id.is_none());
         assert!(info.sso_provider.is_none());
@@ -760,7 +801,13 @@ mod tests {
         let json =
             r#"{"tier":"team","exp":"2020-01-01","org_id":"org-123","sso_provider":"azure-ad"}"#;
         let expired_key = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
-        assert!(decode_license_info_at(&expired_key, now()).is_none());
+        assert!(decode_license_info_at_with_mode(
+            &expired_key,
+            now(),
+            EnforcementMode::Legacy,
+            KEYRING
+        )
+        .is_none());
     }
 
     #[test]

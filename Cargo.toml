@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tirith-core", "crates/tirith"]
+members = ["crates/tirith-core", "crates/tirith", "tools/sign-license", "tools/license-server"]
 resolver = "2"
 
 [workspace.package]
