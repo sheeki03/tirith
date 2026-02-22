@@ -195,7 +195,9 @@ fn print_json_result(result: &scan::ScanResult) {
         files,
     };
 
-    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &output);
+    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
+        eprintln!("tirith: write output: {e}");
+    }
     println!();
 }
 
@@ -215,7 +217,9 @@ fn print_json_file_result(result: &scan::FileScanResult) {
         findings: &result.findings,
     };
 
-    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &output);
+    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
+        eprintln!("tirith: write output: {e}");
+    }
     println!();
 }
 

@@ -109,12 +109,31 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// Validate that a checkpoint ID is safe to use in filesystem paths.
+/// Rejects path traversal attempts (`..`, `/`, `\`) and empty strings.
+fn validate_checkpoint_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.contains("..")
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+    {
+        return Err(format!("Invalid checkpoint ID: {id}"));
+    }
+    Ok(())
+}
+
 /// Get the checkpoints directory.
 pub fn checkpoints_dir() -> PathBuf {
     crate::policy::state_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp/tirith"))
         .join("checkpoints")
 }
+
+/// Maximum number of files allowed in a single checkpoint.
+const CHECKPOINT_MAX_FILES: usize = 1_000;
+/// Maximum total size (bytes) allowed in a single checkpoint (50 MiB).
+const CHECKPOINT_MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Create a checkpoint of the given paths. Requires Pro tier (ADR-6: gate in core).
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
@@ -128,17 +147,36 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
 
     let mut manifest: Vec<ManifestEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut limit_exceeded = false;
 
     for path_str in paths {
+        if limit_exceeded {
+            break;
+        }
         let path = Path::new(path_str);
         if !path.exists() {
             continue;
         }
 
         if path.is_file() {
+            if manifest.len() >= CHECKPOINT_MAX_FILES {
+                eprintln!(
+                    "tirith: checkpoint: file limit ({CHECKPOINT_MAX_FILES}) exceeded, skipping checkpoint"
+                );
+                limit_exceeded = true;
+                break;
+            }
             match backup_file(path, &files_dir) {
                 Ok(entry) => {
                     total_bytes += entry.size;
+                    if total_bytes > CHECKPOINT_MAX_TOTAL_BYTES {
+                        eprintln!(
+                            "tirith: checkpoint: size limit ({} MiB) exceeded, skipping checkpoint",
+                            CHECKPOINT_MAX_TOTAL_BYTES / (1024 * 1024)
+                        );
+                        limit_exceeded = true;
+                        break;
+                    }
                     manifest.push(entry);
                 }
                 Err(e) => {
@@ -149,7 +187,22 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
             match backup_dir(path, &files_dir) {
                 Ok(entries) => {
                     for entry in entries {
+                        if manifest.len() >= CHECKPOINT_MAX_FILES {
+                            eprintln!(
+                                "tirith: checkpoint: file limit ({CHECKPOINT_MAX_FILES}) exceeded, skipping checkpoint"
+                            );
+                            limit_exceeded = true;
+                            break;
+                        }
                         total_bytes += entry.size;
+                        if total_bytes > CHECKPOINT_MAX_TOTAL_BYTES {
+                            eprintln!(
+                                "tirith: checkpoint: size limit ({} MiB) exceeded, skipping checkpoint",
+                                CHECKPOINT_MAX_TOTAL_BYTES / (1024 * 1024)
+                            );
+                            limit_exceeded = true;
+                            break;
+                        }
                         manifest.push(entry);
                     }
                 }
@@ -158,6 +211,12 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
                 }
             }
         }
+    }
+
+    // If limits were exceeded, clean up and abort the checkpoint
+    if limit_exceeded {
+        let _ = fs::remove_dir_all(&cp_dir);
+        return Err("checkpoint skipped: file count or total size limit exceeded".to_string());
     }
 
     if manifest.is_empty() {
@@ -232,6 +291,7 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
 /// Restore files from a checkpoint. Requires Pro tier (ADR-6: gate in core).
 pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
     require_pro()?;
+    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -274,6 +334,7 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 /// Get diff between checkpoint and current filesystem state. Requires Pro tier (ADR-6: gate in core).
 pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     require_pro()?;
+    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -286,6 +347,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
 
     for entry in &manifest {
         if entry.is_dir {
@@ -293,6 +355,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
         }
         let current_path = Path::new(&entry.original_path);
         if !current_path.exists() {
+            seen_paths.insert(entry.original_path.clone());
             diffs.push(DiffEntry {
                 path: entry.original_path.clone(),
                 status: DiffStatus::Deleted,
@@ -304,6 +367,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 
         let current_sha = sha256_file(current_path).unwrap_or_default();
         if current_sha != entry.sha256 {
+            seen_paths.insert(entry.original_path.clone());
             diffs.push(DiffEntry {
                 path: entry.original_path.clone(),
                 status: DiffStatus::Modified,
@@ -314,9 +378,13 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
         // If SHA matches, file unchanged — skip
     }
 
-    // Check if checkpoint backup files still exist
+    // Check if checkpoint backup files still exist, but skip paths
+    // already categorized in the first pass (e.g. Deleted or Modified).
     for entry in &manifest {
         if entry.is_dir {
+            continue;
+        }
+        if seen_paths.contains(&entry.original_path) {
             continue;
         }
         let backup = files_dir.join(&entry.sha256);
@@ -594,6 +662,23 @@ mod tests {
 
         let result = backup_file(Path::new("/nonexistent/file.txt"), &files_dir);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_checkpoint_id_rejects_traversal() {
+        assert!(validate_checkpoint_id("../../etc/passwd").is_err());
+        assert!(validate_checkpoint_id("..").is_err());
+        assert!(validate_checkpoint_id("foo/bar").is_err());
+        assert!(validate_checkpoint_id("foo\\bar").is_err());
+        assert!(validate_checkpoint_id("").is_err());
+        assert!(validate_checkpoint_id("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_checkpoint_id_accepts_valid() {
+        assert!(validate_checkpoint_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890").is_ok());
+        assert!(validate_checkpoint_id("simple-id").is_ok());
+        assert!(validate_checkpoint_id("checkpoint_123").is_ok());
     }
 
     #[test]

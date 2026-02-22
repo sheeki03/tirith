@@ -44,9 +44,80 @@ pub struct DiffPair {
     pub diff_text: Option<String>,
 }
 
+/// Validate that a URL is safe to fetch (anti-SSRF).
+///
+/// Rejects non-HTTP(S) schemes, private/loopback/link-local IPs,
+/// and cloud metadata endpoints.
+#[cfg(unix)]
+fn validate_url_for_fetch(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // Only allow http and https schemes
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("Disallowed URL scheme: {other}")),
+    }
+
+    let host_str = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
+    // Resolve hostname to IP addresses and reject private ranges
+    use std::net::ToSocketAddrs;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = format!("{host_str}:{port}")
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for {host_str}: {e}"))?;
+
+    for addr in addrs {
+        let ip = addr.ip();
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_loopback()           // 127.0.0.0/8
+                    || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                    || v4.is_link_local()      // 169.254.0.0/16
+                    || v4.is_unspecified()     // 0.0.0.0
+                    || v4.is_broadcast()
+                // 255.255.255.255
+                {
+                    return Err(format!("URL resolves to private/reserved IP: {v4}"));
+                }
+                // Explicitly block cloud metadata endpoint
+                if v4 == std::net::Ipv4Addr::new(169, 254, 169, 254) {
+                    return Err(
+                        "URL resolves to cloud metadata endpoint (169.254.169.254)".to_string()
+                    );
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback()        // ::1
+                    || v6.is_unspecified()
+                // ::
+                {
+                    return Err(format!("URL resolves to private/reserved IP: {v6}"));
+                }
+                // fc00::/7 (unique local addresses)
+                let segments = v6.segments();
+                if segments[0] & 0xfe00 == 0xfc00 {
+                    return Err(format!("URL resolves to private/reserved IP: {v6}"));
+                }
+                // fe80::/10 (link-local)
+                if segments[0] & 0xffc0 == 0xfe80 {
+                    return Err(format!("URL resolves to link-local IP: {v6}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Check a URL for server-side cloaking.
 #[cfg(unix)]
 pub fn check(url: &str) -> Result<CloakingResult, String> {
+    // Validate URL before fetching to prevent SSRF
+    validate_url_for_fetch(url)?;
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(10))
