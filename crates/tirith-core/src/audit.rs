@@ -67,7 +67,10 @@ pub fn log_verdict(
 
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: audit: failed to serialize entry: {e}");
+            return;
+        }
     };
 
     // Open, lock, append, fsync, unlock
@@ -79,25 +82,42 @@ pub fn log_verdict(
 
     let file = match file {
         Ok(f) => f,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: audit: failed to open {}: {e}", path.display());
+            return;
+        }
     };
 
     // Harden legacy files: enforce 0600 on existing files too
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "tirith: audit: failed to set permissions on {}: {e}",
+                path.display()
+            );
+        }
     }
 
-    if file.lock_exclusive().is_err() {
+    if let Err(e) = file.lock_exclusive() {
+        eprintln!("tirith: audit: failed to lock {}: {e}", path.display());
         return;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
-    let _ = writeln!(writer, "{line}");
-    let _ = writer.flush();
-    let _ = file.sync_all();
-    let _ = fs2::FileExt::unlock(&file);
+    if let Err(e) = writeln!(writer, "{line}") {
+        eprintln!("tirith: audit: failed to write to {}: {e}", path.display());
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("tirith: audit: failed to flush {}: {e}", path.display());
+    }
+    if let Err(e) = file.sync_all() {
+        eprintln!("tirith: audit: failed to sync {}: {e}", path.display());
+    }
+    if let Err(e) = fs2::FileExt::unlock(&file) {
+        eprintln!("tirith: audit: failed to unlock {}: {e}", path.display());
+    }
 }
 
 fn default_log_path() -> Option<PathBuf> {

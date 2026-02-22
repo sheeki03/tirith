@@ -47,8 +47,9 @@ _TIRITH_SAFE_MODE_FLAG="$_TIRITH_STATE_DIR/bash-safe-mode"
 _tirith_check_safe_mode() { [[ -f "$_TIRITH_SAFE_MODE_FLAG" ]]; }
 
 _tirith_persist_safe_mode() {
-  mkdir -p "$_TIRITH_STATE_DIR" 2>/dev/null || return
-  printf '1\n' > "$_TIRITH_SAFE_MODE_FLAG" 2>/dev/null || return
+  if ! mkdir -p "$_TIRITH_STATE_DIR" 2>/dev/null || ! printf '1\n' > "$_TIRITH_SAFE_MODE_FLAG" 2>/dev/null; then
+    echo "tirith: warning: could not persist safe-mode flag" >&2
+  fi
 }
 
 # ─── Preexec function (used by both preexec mode and degrade fallback) ───

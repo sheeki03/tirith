@@ -34,7 +34,7 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
         };
 
         if let Ok(json) = serde_json::to_string_pretty(&trigger) {
-            {
+            let write_ok = {
                 use std::io::Write;
                 let mut opts = std::fs::OpenOptions::new();
                 opts.write(true).create(true).truncate(true);
@@ -43,11 +43,26 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
                     use std::os::unix::fs::OpenOptionsExt;
                     opts.mode(0o600);
                 }
-                if let Ok(mut f) = opts.open(&tmp) {
-                    let _ = f.write_all(json.as_bytes());
+                match opts.open(&tmp) {
+                    Ok(mut f) => {
+                        if let Err(e) = f.write_all(json.as_bytes()) {
+                            eprintln!("tirith: failed to write last_trigger temp file: {e}");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("tirith: failed to open last_trigger temp file: {e}");
+                        false
+                    }
+                }
+            };
+            if write_ok {
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    eprintln!("tirith: failed to rename last_trigger file: {e}");
                 }
             }
-            let _ = std::fs::rename(&tmp, &path);
         }
     }
 }

@@ -154,7 +154,12 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "tirith: failed to set permissions on {}: {e}",
+                    cached_path.display()
+                );
+            }
         }
     }
 
