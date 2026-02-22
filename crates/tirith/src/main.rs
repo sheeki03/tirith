@@ -139,6 +139,38 @@ enum Commands {
     #[command(name = "mcp-server")]
     McpServer,
 
+    /// MCP gateway proxy — intercepts shell tool calls for security analysis
+    Gateway {
+        #[command(subcommand)]
+        action: GatewayAction,
+    },
+
+    /// Configure tirith protection for an AI coding tool
+    Setup {
+        /// Tool to configure: claude-code, codex, cursor, vscode, windsurf
+        tool: String,
+
+        /// Scope: project (default for most tools) or user
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Also register tirith MCP server (Claude Code only)
+        #[arg(long)]
+        with_mcp: bool,
+
+        /// Append zshenv guard to ~/.zshenv (default: print snippet only)
+        #[arg(long)]
+        install_zshenv: bool,
+
+        /// Show what would be written without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing files and update stale entries
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -160,6 +192,30 @@ enum Commands {
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+}
+
+#[derive(Subcommand)]
+enum GatewayAction {
+    /// Run the gateway proxy
+    Run {
+        /// Path to upstream MCP server binary
+        #[arg(long)]
+        upstream_bin: String,
+
+        /// Arguments to pass to upstream binary
+        #[arg(long)]
+        upstream_arg: Vec<String>,
+
+        /// Path to gateway config YAML
+        #[arg(long)]
+        config: String,
+    },
+    /// Validate gateway config file
+    ValidateConfig {
+        /// Path to gateway config YAML
+        #[arg(long)]
+        config: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -225,6 +281,15 @@ fn main() {
 
         Commands::McpServer => cli::mcp_server::run(),
 
+        Commands::Gateway { action } => match action {
+            GatewayAction::Run {
+                upstream_bin,
+                upstream_arg,
+                config,
+            } => cli::gateway::run_gateway(&upstream_bin, &upstream_arg, &config),
+            GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),
+        },
+
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),
             ReceiptAction::List { json } => cli::receipt::list(json),
@@ -232,6 +297,22 @@ fn main() {
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),
+
+        Commands::Setup {
+            tool,
+            scope,
+            with_mcp,
+            install_zshenv,
+            dry_run,
+            force,
+        } => cli::setup::run(
+            &tool,
+            scope.as_deref(),
+            with_mcp,
+            install_zshenv,
+            dry_run,
+            force,
+        ),
 
         Commands::Doctor {
             json,

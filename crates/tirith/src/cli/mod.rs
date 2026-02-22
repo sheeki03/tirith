@@ -2,6 +2,7 @@ pub mod check;
 pub mod completions;
 pub mod diff;
 pub mod doctor;
+pub mod gateway;
 pub mod init;
 pub mod last_trigger;
 pub mod manpage;
@@ -14,3 +15,4 @@ pub mod why;
 
 #[cfg(unix)]
 pub mod run;
+pub mod setup;

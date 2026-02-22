@@ -27,6 +27,10 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 home = { workspace = true }
 libc = { workspace = true }
+regex = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+etcetera = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
