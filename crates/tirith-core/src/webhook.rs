@@ -36,6 +36,12 @@ pub fn dispatch(
             continue;
         }
 
+        // SSRF protection: validate webhook URL
+        if let Err(reason) = crate::url_validate::validate_server_url(&wh.url) {
+            eprintln!("tirith: webhook: skipping {}: {reason}", wh.url);
+            continue;
+        }
+
         let payload = build_payload(verdict, &redacted_preview, wh);
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
@@ -86,35 +92,37 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
                 &sanitize_for_json(&max_severity.to_string()),
             )
             .replace("{{finding_count}}", &verdict.findings.len().to_string());
-        // Warn if template expansion produced invalid JSON
-        if serde_json::from_str::<serde_json::Value>(&result).is_err() {
-            eprintln!("tirith: webhook: warning: payload template produced invalid JSON");
+        // Only use template result if it's valid JSON
+        if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
+            return result;
         }
-        result
-    } else {
-        // Default JSON payload
-        let rule_ids: Vec<String> = verdict
-            .findings
-            .iter()
-            .map(|f| f.rule_id.to_string())
-            .collect();
-        let max_severity = verdict
-            .findings
-            .iter()
-            .map(|f| f.severity)
-            .max()
-            .unwrap_or(Severity::Info);
-
-        serde_json::json!({
-            "event": "tirith_finding",
-            "action": format!("{:?}", verdict.action),
-            "severity": max_severity.to_string(),
-            "rule_ids": rule_ids,
-            "finding_count": verdict.findings.len(),
-            "command_preview": sanitize_for_json(command_preview),
-        })
-        .to_string()
+        eprintln!(
+            "tirith: webhook: warning: payload template produced invalid JSON, using default payload"
+        );
     }
+
+    // Default JSON payload (also used as fallback when template produces invalid JSON)
+    let rule_ids: Vec<String> = verdict
+        .findings
+        .iter()
+        .map(|f| f.rule_id.to_string())
+        .collect();
+    let max_severity = verdict
+        .findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Info);
+
+    serde_json::json!({
+        "event": "tirith_finding",
+        "action": format!("{:?}", verdict.action),
+        "severity": max_severity.to_string(),
+        "rule_ids": rule_ids,
+        "finding_count": verdict.findings.len(),
+        "command_preview": sanitize_for_json(command_preview),
+    })
+    .to_string()
 }
 
 /// Expand environment variables in header values (`$VAR` or `${VAR}`).
@@ -142,10 +150,14 @@ fn expand_env_value(input: &str) -> String {
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
                 let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
-                match std::env::var(&var_name) {
-                    Ok(val) => result.push_str(&val),
-                    Err(_) => {
-                        eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                if !var_name.starts_with("TIRITH_") {
+                    eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                } else {
+                    match std::env::var(&var_name) {
+                        Ok(val) => result.push_str(&val),
+                        Err(_) => {
+                            eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                        }
                     }
                 }
             } else {
@@ -160,10 +172,16 @@ fn expand_env_value(input: &str) -> String {
                     }
                 }
                 if !var_name.is_empty() {
-                    match std::env::var(&var_name) {
-                        Ok(val) => result.push_str(&val),
-                        Err(_) => {
-                            eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                    if !var_name.starts_with("TIRITH_") {
+                        eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                    } else {
+                        match std::env::var(&var_name) {
+                            Ok(val) => result.push_str(&val),
+                            Err(_) => {
+                                eprintln!(
+                                    "tirith: webhook: warning: env var '{var_name}' is not set"
+                                );
+                            }
                         }
                     }
                 }

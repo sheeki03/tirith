@@ -125,6 +125,19 @@ pub fn log_verdict(
         eprintln!("tirith: audit: sync failed: {e}");
     }
     let _ = fs2::FileExt::unlock(&file);
+
+    // --- Remote audit upload (Phase 10) ---
+    // Check if a policy server is configured via env vars. If so, spool the
+    // redacted audit entry for background upload.
+    let server_url = std::env::var("TIRITH_SERVER_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let api_key = std::env::var("TIRITH_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let (Some(url), Some(key)) = (server_url, api_key) {
+        crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
+    }
 }
 
 fn default_log_path() -> Option<PathBuf> {

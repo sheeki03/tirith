@@ -33,6 +33,33 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
             continue;
         }
 
+        // Cap individual message size at 10 MiB to prevent DoS
+        const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+        if trimmed.len() > MAX_LINE_LEN {
+            let _ = writeln!(
+                log,
+                "tirith mcp-server: message too large ({} bytes), dropping",
+                trimmed.len()
+            );
+            let resp = JsonRpcResponse::err(
+                Value::Null,
+                JsonRpcError {
+                    code: -32700,
+                    message: format!(
+                        "Message too large: {} bytes exceeds {} byte limit",
+                        trimmed.len(),
+                        MAX_LINE_LEN
+                    ),
+                    data: None,
+                },
+            );
+            if !write_response(&mut output, &resp) {
+                let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                return 1;
+            }
+            continue;
+        }
+
         // Phase 1: Parse as raw JSON — failure here is a true parse error (-32700)
         let raw: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,

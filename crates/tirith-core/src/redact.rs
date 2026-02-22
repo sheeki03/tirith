@@ -66,6 +66,13 @@ impl CompiledCustomPatterns {
 pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
     let mut result = redact(input);
     for pat_str in custom_patterns {
+        if pat_str.len() > 1024 {
+            eprintln!(
+                "tirith: DLP pattern too long ({} chars), skipping",
+                pat_str.len()
+            );
+            continue;
+        }
         match Regex::new(pat_str) {
             Ok(re) => {
                 result = re.replace_all(&result, "[REDACTED:custom]").into_owned();

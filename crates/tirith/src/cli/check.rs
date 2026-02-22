@@ -175,5 +175,8 @@ pub fn run(
         eprintln!("tirith: failed to write output");
     }
 
+    // Warn if license is expiring soon (Pro+ only)
+    crate::cli::license_cmd::warn_if_expiring_soon();
+
     verdict.action.exit_code()
 }

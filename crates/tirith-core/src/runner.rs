@@ -19,6 +19,7 @@ pub struct RunOptions {
     pub url: String,
     pub no_exec: bool,
     pub interactive: bool,
+    pub expected_sha256: Option<String>,
 }
 
 /// Interpreters matched by exact name only.
@@ -129,6 +130,16 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     let mut hasher = Sha256::new();
     hasher.update(&content);
     let sha256 = format!("{:x}", hasher.finalize());
+
+    // Verify hash if pinned
+    if let Some(ref expected) = opts.expected_sha256 {
+        let expected_lower = expected.to_lowercase();
+        if sha256 != expected_lower {
+            return Err(format!(
+                "SHA-256 mismatch: expected {expected_lower}, got {sha256}"
+            ));
+        }
+    }
 
     // Cache
     let cache_dir = crate::policy::data_dir()

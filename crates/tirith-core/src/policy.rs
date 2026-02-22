@@ -99,6 +99,12 @@ pub struct Policy {
     /// API key for authenticating with the policy server.
     #[serde(default)]
     pub policy_server_api_key: Option<String>,
+    /// Fail mode for remote policy fetch: "open" (default), "closed", or "cached".
+    #[serde(default)]
+    pub policy_fetch_fail_mode: Option<String>,
+    /// Whether to enforce the fetch fail mode strictly (ignore local fallback on auth errors).
+    #[serde(default)]
+    pub enforce_fail_mode: Option<bool>,
 }
 
 /// Approval rule: when a command matches, require human approval before execution.
@@ -247,6 +253,8 @@ impl Default for Policy {
             dlp_custom_patterns: Vec::new(),
             policy_server_url: None,
             policy_server_api_key: None,
+            policy_fetch_fail_mode: None,
+            enforce_fail_mode: None,
         }
     }
 }
@@ -284,7 +292,101 @@ impl Policy {
     }
 
     /// Discover and load full policy.
+    ///
+    /// Resolution order:
+    /// 1. Local policy (TIRITH_POLICY_ROOT, walk-up discovery, user-level)
+    /// 2. If `TIRITH_SERVER_URL` + `TIRITH_API_KEY` are set (or policy has
+    ///    `policy_server_url`), try remote fetch. On success the remote policy
+    ///    **replaces** the local one entirely and is cached.
+    /// 3. On remote failure, apply `policy_fetch_fail_mode`:
+    ///    - `"open"` (default): warn and use local policy
+    ///    - `"closed"`: return a fail-closed default (all actions = Block)
+    ///    - `"cached"`: try cached remote policy, else fall back to local
+    /// 4. Auth errors (401/403) always fail closed regardless of mode.
     pub fn discover(cwd: Option<&str>) -> Self {
+        // --- Step 1: resolve local policy ---
+        let local = Self::discover_local(cwd);
+
+        // --- Step 2: determine remote fetch parameters ---
+        let server_url = std::env::var("TIRITH_SERVER_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| local.policy_server_url.clone());
+        let api_key = std::env::var("TIRITH_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| local.policy_server_api_key.clone());
+
+        let (server_url, api_key) = match (server_url, api_key) {
+            (Some(u), Some(k)) => (u, k),
+            _ => return local, // no remote configured
+        };
+
+        let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
+
+        // --- Step 3: attempt remote fetch ---
+        match crate::policy_client::fetch_remote_policy(&server_url, &api_key) {
+            Ok(yaml) => {
+                // Cache the fetched policy for offline use
+                let _ = cache_remote_policy(&yaml);
+                match serde_yaml::from_str::<Policy>(&yaml) {
+                    Ok(mut p) => {
+                        p.path = Some(format!("remote:{server_url}"));
+                        // Carry over server connection info so audit upload can use it
+                        if p.policy_server_url.is_none() {
+                            p.policy_server_url = Some(server_url);
+                        }
+                        if p.policy_server_api_key.is_none() {
+                            p.policy_server_api_key = Some(api_key);
+                        }
+                        p
+                    }
+                    Err(e) => {
+                        eprintln!("tirith: warning: remote policy parse error: {e}");
+                        local
+                    }
+                }
+            }
+            Err(crate::policy_client::PolicyFetchError::AuthError(code)) => {
+                // Auth errors always fail closed
+                eprintln!("tirith: error: policy server auth failed (HTTP {code}), failing closed");
+                Self::fail_closed_policy()
+            }
+            Err(e) => {
+                // Apply fail mode
+                match fail_mode {
+                    "closed" => {
+                        eprintln!(
+                            "tirith: error: remote policy fetch failed ({e}), failing closed"
+                        );
+                        Self::fail_closed_policy()
+                    }
+                    "cached" => {
+                        eprintln!(
+                            "tirith: warning: remote policy fetch failed ({e}), trying cache"
+                        );
+                        match load_cached_remote_policy() {
+                            Some(p) => p,
+                            None => {
+                                eprintln!("tirith: warning: no cached remote policy, using local");
+                                local
+                            }
+                        }
+                    }
+                    _ => {
+                        // "open" (default): warn and use local
+                        eprintln!(
+                            "tirith: warning: remote policy fetch failed ({e}), using local policy"
+                        );
+                        local
+                    }
+                }
+            }
+        }
+    }
+
+    /// Discover local policy only (no remote fetch).
+    fn discover_local(cwd: Option<&str>) -> Self {
         // Check env override first
         if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
             if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
@@ -303,6 +405,17 @@ impl Policy {
                 }
                 Policy::default()
             }
+        }
+    }
+
+    /// Return a fail-closed policy that blocks everything.
+    fn fail_closed_policy() -> Self {
+        Policy {
+            fail_mode: FailMode::Closed,
+            allow_bypass_env: false,
+            allow_bypass_env_noninteractive: false,
+            path: Some("fail-closed".into()),
+            ..Default::default()
         }
     }
 
@@ -523,6 +636,53 @@ pub fn state_dir() -> Option<PathBuf> {
     match std::env::var("XDG_STATE_HOME") {
         Ok(val) if !val.trim().is_empty() => Some(PathBuf::from(val.trim()).join("tirith")),
         _ => home::home_dir().map(|h| h.join(".local/state/tirith")),
+    }
+}
+
+/// Get the path for caching remote policy: ~/.cache/tirith/remote-policy.yaml
+fn remote_policy_cache_path() -> Option<PathBuf> {
+    let cache_dir = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home::home_dir().unwrap_or_default().join(".cache"));
+    Some(cache_dir.join("tirith").join("remote-policy.yaml"))
+}
+
+/// Cache the raw YAML from a remote policy fetch.
+fn cache_remote_policy(yaml: &str) -> std::io::Result<()> {
+    if let Some(path) = remote_policy_cache_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Write with restricted permissions (owner-only)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
+        use std::io::Write;
+        f.write_all(yaml.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Load a previously cached remote policy.
+fn load_cached_remote_policy() -> Option<Policy> {
+    let path = remote_policy_cache_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_yaml::from_str::<Policy>(&content) {
+        Ok(mut p) => {
+            p.path = Some(format!("cached:{}", path.display()));
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("tirith: warning: cached remote policy parse error: {e}");
+            None
+        }
     }
 }
 
