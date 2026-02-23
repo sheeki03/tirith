@@ -289,12 +289,13 @@ fn check_vet_not_configured(
 ) {
     let is_cargo_install = segments.iter().any(|s| {
         if let Some(ref cmd) = s.command {
-            let base = cmd.rsplit(['/', '\\']).next().unwrap_or(cmd);
-            let base = base
-                .strip_suffix(".exe")
-                .or_else(|| base.strip_suffix(".EXE"))
-                .unwrap_or(base);
-            if base.eq_ignore_ascii_case("cargo") {
+            let base = cmd
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(cmd)
+                .to_ascii_lowercase();
+            let base = base.strip_suffix(".exe").unwrap_or(&base);
+            if base == "cargo" {
                 return is_cargo_install_or_add(&s.args);
             }
         }
