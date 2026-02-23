@@ -156,7 +156,9 @@ fn print_human(info: &DoctorInfo) {
                 eprintln!("    tirith init --shell nushell");
                 eprintln!("    # Then add to ~/.config/nushell/config.nu:");
                 if let Some(ref dir) = info.hook_dir {
-                    eprintln!("    source '{dir}/lib/nushell-hook.nu'");
+                    // Escape for Nushell double-quoted string: \ → \\, " → \"
+                    let escaped = dir.replace('\\', r"\\").replace('"', r#"\""#);
+                    eprintln!(r#"    source "{escaped}/lib/nushell-hook.nu""#);
                 } else {
                     eprintln!("    source <hook-dir>/lib/nushell-hook.nu");
                     eprintln!(
