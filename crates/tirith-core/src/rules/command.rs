@@ -290,8 +290,11 @@ fn check_vet_not_configured(
     let is_cargo_install = segments.iter().any(|s| {
         if let Some(ref cmd) = s.command {
             let base = cmd.rsplit(['/', '\\']).next().unwrap_or(cmd);
-            let base = base.strip_suffix(".exe").unwrap_or(base);
-            if base == "cargo" {
+            let base = base
+                .strip_suffix(".exe")
+                .or_else(|| base.strip_suffix(".EXE"))
+                .unwrap_or(base);
+            if base.eq_ignore_ascii_case("cargo") {
                 return is_cargo_install_or_add(&s.args);
             }
         }
@@ -596,8 +599,7 @@ mod tests {
     fn test_vet_detects_cargo_exe_windows_path() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        // Simulate Windows-style paths — the tokenizer produces the command as-is,
-        // so the vet check must handle backslashes and .exe suffix.
+        // Lowercase cargo.exe with backslashes
         let f1 = check(
             r"C:\Users\dev\.cargo\bin\cargo.exe install serde",
             ShellType::PowerShell,
@@ -607,6 +609,17 @@ mod tests {
         assert!(
             f1.iter().any(|f| f.rule_id == RuleId::VetNotConfigured),
             "should detect cargo.exe with Windows backslash path"
+        );
+        // Uppercase CARGO.EXE (Windows is case-insensitive)
+        let f2 = check(
+            r"C:\Users\dev\.cargo\bin\CARGO.EXE install serde",
+            ShellType::PowerShell,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(
+            f2.iter().any(|f| f.rule_id == RuleId::VetNotConfigured),
+            "should detect CARGO.EXE case-insensitively"
         );
     }
 }

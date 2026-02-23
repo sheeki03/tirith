@@ -93,6 +93,14 @@ pub fn log_verdict(
         open_opts.mode(0o600);
         open_opts.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x00200000) prevents the kernel from
+        // following symlinks/junctions, closing the TOCTOU race window between
+        // symlink_metadata() and open().
+        open_opts.custom_flags(0x00200000);
+    }
     let file = open_opts.open(&path);
 
     let file = match file {
