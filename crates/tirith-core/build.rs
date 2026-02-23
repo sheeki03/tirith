@@ -285,6 +285,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Archive extraction commands that may target sensitive paths",
     },
     PatternEntry {
+        id: "cargo_vet",
+        tier1_exec_fragments: &[r"\bcargo\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Any cargo command — tier-1 gate for supply-chain audit check (broad match needed because cargo flags can appear between 'cargo' and 'install'/'add')",
+    },
+    PatternEntry {
         id: "non_ascii_paste",
         tier1_exec_fragments: &[],
         tier1_paste_only_fragments: &[r"[^\x00-\x7F]"],

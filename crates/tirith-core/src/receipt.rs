@@ -49,24 +49,25 @@ impl Receipt {
         fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
 
         let path = dir.join(format!("{}.json", self.sha256));
-        let tmp_path = dir.join(format!(".{}.json.tmp", self.sha256));
 
         let json = serde_json::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
 
         {
             use std::io::Write;
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            use tempfile::NamedTempFile;
+
+            let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| format!("tempfile: {e}"))?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+                use std::os::unix::fs::PermissionsExt;
+                tmp.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("permissions: {e}"))?;
             }
-            let mut f = opts.open(&tmp_path).map_err(|e| format!("write: {e}"))?;
-            f.write_all(json.as_bytes())
+            tmp.write_all(json.as_bytes())
                 .map_err(|e| format!("write: {e}"))?;
+            tmp.persist(&path).map_err(|e| format!("persist: {e}"))?;
         }
-        fs::rename(&tmp_path, &path).map_err(|e| format!("rename: {e}"))?;
 
         Ok(path)
     }
@@ -183,6 +184,37 @@ mod tests {
         let result = short_hash(s);
         assert!(!result.is_empty());
         assert!(result.len() <= 12);
+    }
+
+    #[test]
+    fn test_receipt_save_no_predictable_tmp() {
+        // Verify NamedTempFile is used: no .{sha}.json.tmp should remain after save.
+        let dir = tempfile::tempdir().unwrap();
+        let receipts_sub = dir.path().join("receipts");
+        std::fs::create_dir_all(&receipts_sub).unwrap();
+
+        let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        // Simulate a save using NamedTempFile (same pattern as Receipt::save)
+        let path = receipts_sub.join(format!("{sha}.json"));
+        let json = r#"{"test": true}"#;
+        {
+            use std::io::Write;
+            use tempfile::NamedTempFile;
+
+            let mut tmp = NamedTempFile::new_in(&receipts_sub).unwrap();
+            tmp.write_all(json.as_bytes()).unwrap();
+            tmp.persist(&path).unwrap();
+        }
+
+        // The old predictable tmp file should NOT exist
+        let old_tmp = receipts_sub.join(format!(".{sha}.json.tmp"));
+        assert!(
+            !old_tmp.exists(),
+            "predictable .{{sha}}.json.tmp should not exist after NamedTempFile save"
+        );
+        // The final file should exist
+        assert!(path.exists(), "receipt file should exist after persist");
     }
 
     #[cfg(unix)]

@@ -52,6 +52,7 @@ pub enum RuleId {
     NpmUrlInstall,
     Web3RpcEndpoint,
     Web3AddressInUrl,
+    VetNotConfigured,
 
     // Policy rules
     PolicyBlocklisted,

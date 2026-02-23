@@ -467,7 +467,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     }
 
     // Run command-shape rules on full input
-    let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
+    let command_findings =
+        crate::rules::command::check(&ctx.input, ctx.shell, ctx.cwd.as_deref(), ctx.scan_context);
     findings.extend(command_findings);
 
     // Run environment rules

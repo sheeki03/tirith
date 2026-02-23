@@ -23,3 +23,7 @@ pub const POWERSHELL_HOOK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/shell/lib/powershell-hook.ps1"
 ));
+pub const NUSHELL_HOOK: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/shell/lib/nushell-hook.nu"
+));

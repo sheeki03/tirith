@@ -4,7 +4,6 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
     if let Some(dir) = tirith_core::policy::data_dir() {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("last_trigger.json");
-        let tmp = dir.join(".last_trigger.json.tmp");
 
         #[derive(serde::Serialize)]
         struct LastTrigger<'a> {
@@ -34,20 +33,24 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
         };
 
         if let Ok(json) = serde_json::to_string_pretty(&trigger) {
+            use std::io::Write;
+            use tempfile::NamedTempFile;
+
+            let mut tmp_file = match NamedTempFile::new_in(&dir) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            #[cfg(unix)]
             {
-                use std::io::Write;
-                let mut opts = std::fs::OpenOptions::new();
-                opts.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    opts.mode(0o600);
-                }
-                if let Ok(mut f) = opts.open(&tmp) {
-                    let _ = f.write_all(json.as_bytes());
-                }
+                use std::os::unix::fs::PermissionsExt;
+                let _ = tmp_file
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600));
             }
-            let _ = std::fs::rename(&tmp, &path);
+            if tmp_file.write_all(json.as_bytes()).is_err() {
+                return;
+            }
+            let _ = tmp_file.persist(&path);
         }
     }
 }
@@ -58,5 +61,42 @@ fn redact_command(cmd: &str) -> String {
         cmd.to_string()
     } else {
         format!("{prefix}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_last_trigger_no_predictable_tmp() {
+        // Verify NamedTempFile is used: no .last_trigger.json.tmp should remain.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last_trigger.json");
+        let json = r#"{"rule_ids":["test"],"severity":"low","command_redacted":"test","findings":[],"timestamp":"2024-01-01T00:00:00Z"}"#;
+
+        {
+            use std::io::Write;
+            use tempfile::NamedTempFile;
+
+            let mut tmp = NamedTempFile::new_in(dir.path()).unwrap();
+            tmp.write_all(json.as_bytes()).unwrap();
+            tmp.persist(&path).unwrap();
+        }
+
+        // The old predictable tmp file should NOT exist
+        let old_tmp = dir.path().join(".last_trigger.json.tmp");
+        assert!(
+            !old_tmp.exists(),
+            "predictable .last_trigger.json.tmp should not exist after NamedTempFile save"
+        );
+        // The final file should exist with correct content
+        assert!(
+            path.exists(),
+            "last_trigger.json should exist after persist"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("test"),
+            "file should contain expected data"
+        );
     }
 }

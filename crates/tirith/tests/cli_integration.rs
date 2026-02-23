@@ -336,6 +336,7 @@ fn embedded_shell_hooks_match_repo_hooks() {
         "bash-hook.bash",
         "fish-hook.fish",
         "powershell-hook.ps1",
+        "nushell-hook.nu",
     ] {
         let embedded = fs::read_to_string(embedded_dir.join(hook))
             .unwrap_or_else(|e| panic!("failed reading embedded hook {hook}: {e}"));

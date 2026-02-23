@@ -1543,6 +1543,7 @@ dependencies = [
  "fs2",
  "home",
  "is-terminal",
+ "libc",
  "once_cell",
  "percent-encoding",
  "regex",

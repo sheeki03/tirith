@@ -151,6 +151,10 @@ fn print_human(info: &DoctorInfo) {
                 );
                 eprintln!("    source ~/.config/fish/config.fish");
             }
+            "nushell" => {
+                eprintln!("    # Add to ~/.config/nushell/config.nu:");
+                eprintln!("    source (tirith init --shell nushell | save -f /tmp/tirith-nu-hook.nu; \"/tmp/tirith-nu-hook.nu\")");
+            }
             _ => {
                 eprintln!("    eval \"$(tirith init)\"");
             }
@@ -232,6 +236,14 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
                 docs.join("WindowsPowerShell/Microsoft.PowerShell_profile.ps1"),
                 home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
             ]
+        }
+        "nushell" | "nu" => {
+            let xdg = std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            vec![xdg.join("nushell/config.nu")]
         }
         _ => return (None, false),
     };

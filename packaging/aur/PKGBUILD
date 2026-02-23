@@ -1,6 +1,6 @@
 # Maintainer: tirith contributors
 pkgname=tirith
-pkgver=0.1.7
+pkgver=0.1.9
 pkgrel=1
 pkgdesc='Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection'
 arch=('x86_64' 'aarch64')
@@ -8,6 +8,7 @@ url='https://github.com/sheeki03/tirith'
 license=('AGPL-3.0-only')
 depends=('gcc-libs')
 makedepends=('cargo' 'base-devel')
+options=(!lto)
 install=tirith.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -36,6 +37,7 @@ package() {
   install -Dm644 "shell/lib/bash-hook.bash" "$pkgdir/usr/share/tirith/shell/lib/bash-hook.bash"
   install -Dm644 "shell/lib/fish-hook.fish" "$pkgdir/usr/share/tirith/shell/lib/fish-hook.fish"
   install -Dm644 "shell/lib/powershell-hook.ps1" "$pkgdir/usr/share/tirith/shell/lib/powershell-hook.ps1"
+  install -Dm644 "shell/lib/nushell-hook.nu" "$pkgdir/usr/share/tirith/shell/lib/nushell-hook.nu"
 
   # Completions
   install -Dm644 <(target/release/tirith completions bash) "$pkgdir/usr/share/bash-completion/completions/tirith"

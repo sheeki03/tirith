@@ -382,6 +382,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "npm_url_install",
     "web3_rpc_endpoint",
     "web3_address_in_url",
+    "vet_not_configured",
     // Policy
     "policy_blocklisted",
 ];
@@ -421,7 +422,8 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
-const EXTERNALLY_TRIGGERED_RULES: &[&str] = &["proxy_env_set", "policy_blocklisted"];
+const EXTERNALLY_TRIGGERED_RULES: &[&str] =
+    &["proxy_env_set", "policy_blocklisted", "vet_not_configured"];
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
@@ -488,6 +490,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::NpmUrlInstall,
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
+        RuleId::VetNotConfigured,
         RuleId::PolicyBlocklisted,
     ];
 
