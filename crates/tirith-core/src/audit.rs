@@ -74,18 +74,15 @@ pub fn log_verdict(
     };
 
     // Refuse to follow symlinks (GHSA-c6rj-wmf4-6963)
-    #[cfg(unix)]
-    {
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!(
-                    "tirith: audit: refusing to follow symlink at {}",
-                    path.display()
-                );
-                return;
-            }
-            _ => {}
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            eprintln!(
+                "tirith: audit: refusing to follow symlink at {}",
+                path.display()
+            );
+            return;
         }
+        _ => {}
     }
 
     // Open, lock, append, fsync, unlock

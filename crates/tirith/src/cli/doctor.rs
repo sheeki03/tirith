@@ -152,8 +152,10 @@ fn print_human(info: &DoctorInfo) {
                 eprintln!("    source ~/.config/fish/config.fish");
             }
             "nushell" => {
-                eprintln!("    # Add to ~/.config/nushell/config.nu:");
-                eprintln!("    source (tirith init --shell nushell | save -f /tmp/tirith-nu-hook.nu; \"/tmp/tirith-nu-hook.nu\")");
+                eprintln!("    # First, materialize hooks:");
+                eprintln!("    tirith init --shell nushell");
+                eprintln!("    # Then add to ~/.config/nushell/config.nu:");
+                eprintln!("    source ~/.local/share/tirith/shell/lib/nushell-hook.nu");
             }
             _ => {
                 eprintln!("    eval \"$(tirith init)\"");

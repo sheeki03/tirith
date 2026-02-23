@@ -44,9 +44,14 @@ pub struct Receipt {
 impl Receipt {
     /// Save receipt atomically (temp file + rename).
     pub fn save(&self) -> Result<PathBuf, String> {
-        validate_sha256(&self.sha256)?;
         let dir = receipts_dir().ok_or("cannot determine receipts directory")?;
-        fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
+        self.save_to(&dir)
+    }
+
+    /// Save receipt atomically to a specific directory.
+    pub fn save_to(&self, dir: &std::path::Path) -> Result<PathBuf, String> {
+        validate_sha256(&self.sha256)?;
+        fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
 
         let path = dir.join(format!("{}.json", self.sha256));
 
@@ -56,7 +61,7 @@ impl Receipt {
             use std::io::Write;
             use tempfile::NamedTempFile;
 
-            let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| format!("tempfile: {e}"))?;
+            let mut tmp = NamedTempFile::new_in(dir).map_err(|e| format!("tempfile: {e}"))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -188,33 +193,39 @@ mod tests {
 
     #[test]
     fn test_receipt_save_no_predictable_tmp() {
-        // Verify NamedTempFile is used: no .{sha}.json.tmp should remain after save.
+        // Call the real Receipt::save_to() and verify no predictable tmp remains.
         let dir = tempfile::tempdir().unwrap();
-        let receipts_sub = dir.path().join("receipts");
-        std::fs::create_dir_all(&receipts_sub).unwrap();
 
         let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let receipt = Receipt {
+            url: "https://example.com/test.sh".into(),
+            final_url: None,
+            redirects: vec![],
+            sha256: sha.into(),
+            size: 42,
+            domains_referenced: vec![],
+            paths_referenced: vec![],
+            analysis_method: "static".into(),
+            privilege: "normal".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            cwd: None,
+            git_repo: None,
+            git_branch: None,
+        };
 
-        // Simulate a save using NamedTempFile (same pattern as Receipt::save)
-        let path = receipts_sub.join(format!("{sha}.json"));
-        let json = r#"{"test": true}"#;
-        {
-            use std::io::Write;
-            use tempfile::NamedTempFile;
-
-            let mut tmp = NamedTempFile::new_in(&receipts_sub).unwrap();
-            tmp.write_all(json.as_bytes()).unwrap();
-            tmp.persist(&path).unwrap();
-        }
+        let path = receipt.save_to(dir.path()).unwrap();
 
         // The old predictable tmp file should NOT exist
-        let old_tmp = receipts_sub.join(format!(".{sha}.json.tmp"));
+        let old_tmp = dir.path().join(format!(".{sha}.json.tmp"));
         assert!(
             !old_tmp.exists(),
-            "predictable .{{sha}}.json.tmp should not exist after NamedTempFile save"
+            "predictable .{{sha}}.json.tmp should not exist after save_to"
         );
-        // The final file should exist
-        assert!(path.exists(), "receipt file should exist after persist");
+        // The final file should exist and be valid JSON
+        assert!(path.exists(), "receipt file should exist after save_to");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let loaded: Receipt = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.sha256, sha);
     }
 
     #[cfg(unix)]
@@ -223,23 +234,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let receipts_dir = dir.path().join("receipts");
-        std::fs::create_dir_all(&receipts_dir).unwrap();
-
         let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-        // Write a receipt file with 0600 permissions using the same pattern as save()
-        let path = receipts_dir.join(format!("{sha}.json"));
-        let json = r#"{"test": true}"#;
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            opts.mode(0o600);
-            let mut f = opts.open(&path).unwrap();
-            f.write_all(json.as_bytes()).unwrap();
-        }
+        let receipt = Receipt {
+            url: "https://example.com/test.sh".into(),
+            final_url: None,
+            redirects: vec![],
+            sha256: sha.into(),
+            size: 42,
+            domains_referenced: vec![],
+            paths_referenced: vec![],
+            analysis_method: "static".into(),
+            privilege: "normal".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            cwd: None,
+            git_repo: None,
+            git_branch: None,
+        };
+
+        let path = receipt.save_to(dir.path()).unwrap();
 
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(
