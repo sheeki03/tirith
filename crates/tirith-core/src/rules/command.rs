@@ -143,6 +143,11 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                             .unwrap_or(&source_cmd)
                             .to_lowercase();
 
+                        // Skip if the source is tirith itself — its output is trusted.
+                        if source_base == "tirith" {
+                            continue;
+                        }
+
                         let rule_id = match source_base.as_str() {
                             "curl" => RuleId::CurlPipeShell,
                             "wget" => RuleId::WgetPipeShell,
@@ -514,14 +519,17 @@ fn strip_port(host_port: &str) -> String {
     host_port.to_string()
 }
 
-/// Check if an IPv4 address is in a private/reserved range.
+/// Check if an IPv4 address is in a private/reserved range (excluding loopback).
 fn is_private_ip(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let octets = ip.octets();
+        // Loopback (127.x) is excluded — local traffic has no SSRF/lateral movement risk.
+        if octets[0] == 127 {
+            return false;
+        }
         return octets[0] == 10
             || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-            || (octets[0] == 192 && octets[1] == 168)
-            || octets[0] == 127;
+            || (octets[0] == 192 && octets[1] == 168);
     }
     false
 }

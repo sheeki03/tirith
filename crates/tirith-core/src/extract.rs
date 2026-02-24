@@ -553,6 +553,10 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
     if let Some(cmd) = &segment.command {
         let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
         let cmd_lower = cmd_base.to_lowercase();
+        // git is only a sink for download subcommands (clone, fetch, pull, etc.)
+        if cmd_lower == "git" {
+            return is_git_sink(segment);
+        }
         if is_source_command(&cmd_lower) {
             return true;
         }
@@ -585,7 +589,6 @@ fn is_source_command(cmd: &str) -> bool {
             | "fetch"
             | "scp"
             | "rsync"
-            | "git"
             | "ssh"
             | "docker"
             | "podman"
@@ -603,6 +606,26 @@ fn is_source_command(cmd: &str) -> bool {
             | "invoke-webrequest"
             | "invoke-restmethod"
     )
+}
+
+/// Check if a git command is in a sink context (only subcommands that download).
+/// `git add`, `git commit`, `git status`, etc. are NOT sinks.
+fn is_git_sink(segment: &Segment) -> bool {
+    if segment.args.is_empty() {
+        return false;
+    }
+    // First non-flag arg is the subcommand
+    for arg in &segment.args {
+        let clean = strip_quotes(arg);
+        if clean.starts_with('-') {
+            continue;
+        }
+        return matches!(
+            clean.as_str(),
+            "clone" | "fetch" | "pull" | "submodule" | "remote"
+        );
+    }
+    false
 }
 
 fn is_interpreter(cmd: &str) -> bool {
@@ -688,6 +711,10 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     if s.starts_with('-') || !s.contains('.') {
         return false;
     }
+    // Dotfiles and hidden files (e.g., .gitignore, .env.example) are not URLs
+    if s.starts_with('.') {
+        return false;
+    }
     // First component before / or end should look like a domain
     let host_part = s.split('/').next().unwrap_or(s);
     if !host_part.contains('.') || host_part.contains(' ') {
@@ -700,13 +727,83 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     let host_lower = host_part.to_lowercase();
     if !s.contains('/') {
         let file_exts = [
-            ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
-            ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
-            ".zip", ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so",
-            ".log", ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
-            ".ico", ".tiff", ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv",
-            ".flac", ".ogg", ".webm", ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx",
+            ".sh",
+            ".py",
+            ".rb",
+            ".js",
+            ".ts",
+            ".go",
+            ".rs",
+            ".c",
+            ".h",
+            ".txt",
+            ".md",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".html",
+            ".css",
+            ".tar.gz",
+            ".tar.bz2",
+            ".tar.xz",
+            ".tgz",
+            ".zip",
+            ".gz",
+            ".bz2",
+            ".rpm",
+            ".deb",
+            ".pkg",
+            ".dmg",
+            ".exe",
+            ".msi",
+            ".dll",
+            ".so",
+            ".log",
+            ".conf",
+            ".cfg",
+            ".ini",
+            ".toml",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".ico",
+            ".tiff",
+            ".tif",
+            ".pdf",
+            ".csv",
+            ".mp3",
+            ".mp4",
+            ".wav",
+            ".avi",
+            ".mkv",
+            ".flac",
+            ".ogg",
+            ".webm",
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
+            ".docx",
+            ".xlsx",
+            ".pptx",
             ".sqlite",
+            ".lock",
+            ".example",
+            ".local",
+            ".bak",
+            ".tmp",
+            ".swp",
+            ".orig",
+            ".patch",
+            ".diff",
+            ".map",
+            ".env",
+            ".sample",
+            ".dist",
+            ".editorconfig",
         ];
         if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
             return false;

@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::db::{
-    CanceledData, CreatedData, CreatedOutcome, DeadLetterData, UpdatedData, UpdatedOutcome,
+    CanceledData, CreatedData, CreatedOutcome, DeadLetterData, RevokedData, UpdatedData,
+    UpdatedOutcome,
 };
 use crate::error::AppError;
-use crate::paddle::{self, PaddleSignature};
 use crate::state::AppState;
+use crate::webhook_verify;
 
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -23,51 +24,46 @@ pub async fn webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. HMAC verification
-    let sig_header = headers
-        .get("paddle-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("missing Paddle-Signature header".into()))?;
+    // 1. Standard Webhooks HMAC verification
+    let msg_id = header_str(&headers, "webhook-id")
+        .ok_or_else(|| AppError::Unauthorized("missing webhook-id header".into()))?;
+    let timestamp = header_str(&headers, "webhook-timestamp")
+        .ok_or_else(|| AppError::Unauthorized("missing webhook-timestamp header".into()))?;
+    let sig_header = header_str(&headers, "webhook-signature")
+        .ok_or_else(|| AppError::Unauthorized("missing webhook-signature header".into()))?;
 
-    let sig = PaddleSignature::parse(sig_header)
-        .ok_or_else(|| AppError::Unauthorized("malformed Paddle-Signature header".into()))?;
-
-    paddle::verify_webhook(&state.config.paddle_webhook_secret, &body, &sig, 300)
-        .map_err(|e| AppError::Unauthorized(format!("webhook verification: {e}")))?;
+    webhook_verify::verify_webhook(
+        &state.config.polar_webhook_secret,
+        msg_id,
+        timestamp,
+        &body,
+        sig_header,
+        300,
+    )
+    .map_err(|e| AppError::Unauthorized(format!("webhook verification: {e}")))?;
 
     // 2. Parse JSON
     let event: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadWebhook(format!("invalid JSON: {e}")))?;
 
-    let event_type = event
-        .get("event_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    let event_id = event
-        .get("event_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Use webhook-id header as event_id (Polar doesn't put event_id in body)
+    let event_id = msg_id.to_string();
 
-    if event_id.is_empty() {
-        return Err(AppError::BadWebhook("missing event_id".into()));
-    }
-
-    // 3. Early idempotency precheck (optimization — avoids external calls on duplicates)
+    // 3. Early idempotency precheck
     if state.db.event_exists(&event_id).await? {
         return Ok(StatusCode::OK);
     }
 
     // 4. Route by event type
     match event_type {
-        "subscription.created" => handle_created(&state, &event, &event_id).await,
-        "subscription.canceled" => handle_canceled(&state, &event, &event_id).await,
-        "subscription.updated" => handle_updated(&state, &event, &event_id).await,
-        "transaction.completed" => {
-            info!(event_id = %event_id, "transaction.completed logged");
-            Ok(StatusCode::OK)
-        }
+        "order.paid" => handle_order_paid(&state, &event, &event_id).await,
+        "subscription.active" => handle_sub_active(&state, &event, &event_id).await,
+        "subscription.canceled" => handle_sub_canceled(&state, &event, &event_id).await,
+        "subscription.revoked" => handle_sub_revoked(&state, &event, &event_id).await,
+        "subscription.past_due" => handle_sub_past_due(&state, &event, &event_id).await,
+        "subscription.uncanceled" => handle_sub_uncanceled(&state, &event, &event_id).await,
         _ => {
             info!(event_type = %event_type, event_id = %event_id, "unknown event type, ignored");
             Ok(StatusCode::OK)
@@ -75,9 +71,9 @@ pub async fn webhook(
     }
 }
 
-// ─── subscription.created ────────────────────────────────────────────
+// ─── order.paid (Pro lifetime one-time purchase) ────────────────────────
 
-async fn handle_created(
+async fn handle_order_paid(
     state: &AppState,
     event: &serde_json::Value,
     event_id: &str,
@@ -86,83 +82,595 @@ async fn handle_created(
         .get("data")
         .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
 
-    // Required fields
-    let sub_id = json_str(data, "id")
-        .ok_or_else(|| AppError::BadWebhook("missing subscription id".into()))?;
-    let checkout_id = data
-        .pointer("/checkout/id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadWebhook("missing checkout.id".into()))?;
+    // Gate: one-time orders only
+    // Reject if subscription_id is present (subscription renewal, not lifetime Pro)
+    if data
+        .get("subscription_id")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
+        info!(
+            event_id = %event_id,
+            "order.paid with subscription_id present — subscription renewal, ignoring"
+        );
+        return Ok(StatusCode::OK);
+    }
+    // Reject if product is recurring
+    if data
+        .pointer("/product/is_recurring")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        info!(
+            event_id = %event_id,
+            "order.paid for recurring product — handled via subscription events, ignoring"
+        );
+        return Ok(StatusCode::OK);
+    }
 
-    let occurred_at = event
-        .get("occurred_at")
+    let order_id =
+        json_str(data, "id").ok_or_else(|| AppError::BadWebhook("missing order id".into()))?;
+    let customer_id = json_str(data, "customer_id").unwrap_or_else(|| "unknown".to_string());
+    let email = data
+        .pointer("/customer/email")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let checkout_id = json_str(data, "checkout_id")
+        .ok_or_else(|| AppError::BadWebhook("missing checkout_id".into()))?;
+
+    let created_at = event
+        .get("created_at")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Email — try webhook payload, then Paddle API fallback
-    let email = json_str(data, "email").or_else(|| {
-        data.pointer("/customer/email")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let email = match email {
-        Some(e) => e,
+    // Product → tier resolution
+    let product_id = json_str(data, "product_id")
+        .ok_or_else(|| AppError::BadWebhook("missing product_id".into()))?;
+
+    let tier = match state.config.tier_for_product(&product_id) {
+        Some(t) => t.to_string(),
         None => {
-            // Paddle API fallback for email
-            let customer_id = json_str(data, "customer_id");
-            match customer_id {
-                Some(ref cid) => fetch_customer_email(state, cid).await.unwrap_or_else(|| {
-                    warn!(sub_id = %sub_id, "email not in webhook and Paddle API fallback failed");
-                    "unknown".to_string()
-                }),
-                None => "unknown".to_string(),
-            }
+            // Unknown product → return 500 so Polar retries the full event.
+            // No dead-letter: provisioning requires the full event, not just tier fix.
+            error!(
+                event_id = %event_id,
+                product_id = %product_id,
+                "unknown product_id on order.paid — returning 500 for Polar retry"
+            );
+            return Err(AppError::Internal(format!(
+                "unknown product_id: {product_id}"
+            )));
         }
     };
 
-    let customer_id = json_str(data, "customer_id").unwrap_or_else(|| "unknown".to_string());
+    // Provision: generate API key, token, receipt
+    let creds = provision_credentials(state, &tier)?;
 
-    // Price → tier
-    let price_id = data
-        .pointer("/items/0/price/id")
+    let created_data = CreatedData {
+        event_id: event_id.to_string(),
+        event_type: "order.paid".to_string(),
+        subscription_id: order_id.clone(),
+        customer_id,
+        email,
+        tier,
+        product_id,
+        occurred_at: created_at,
+        checkout_id,
+        key_hash: creds.key_hash,
+        token: Some(creds.token),
+        token_expires_at: creds.token_expires_at,
+        receipt_secret: creds.receipt_secret,
+        api_key_enc: creds.api_key_enc,
+        api_key_nonce: creds.api_key_nonce,
+    };
+
+    let outcome = state.db.process_subscription_created(created_data).await?;
+    log_created_outcome(&outcome, &order_id, event_id);
+
+    Ok(StatusCode::OK)
+}
+
+// ─── subscription.active (Team/Enterprise provision or reconciliation) ──
+
+async fn handle_sub_active(
+    state: &AppState,
+    event: &serde_json::Value,
+    event_id: &str,
+) -> Result<StatusCode, AppError> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+
+    let sub_id = json_str(data, "id")
+        .ok_or_else(|| AppError::BadWebhook("missing subscription id".into()))?;
+    let customer_id = json_str(data, "customer_id").unwrap_or_else(|| "unknown".to_string());
+    let email = data
+        .pointer("/customer/email")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let product_id = json_str(data, "product_id");
+    let checkout_id = json_str(data, "checkout_id");
+
+    let created_at = event
+        .get("created_at")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let tier = match &price_id {
-        Some(pid) => match state.config.tier_for_price(pid) {
-            Some(t) => t.to_string(),
+    // Tier resolution
+    let (tier, tier_unknown) = resolve_tier(
+        state,
+        &sub_id,
+        product_id.as_deref(),
+        event_id,
+        "subscription.active",
+        &created_at,
+        event,
+    )
+    .await;
+
+    // Check if API key already exists for this subscription
+    let key_exists = state.db.has_api_key(&sub_id).await?;
+
+    if key_exists {
+        // Status reconciliation + potential un-revoke
+        let updated_data = UpdatedData {
+            event_id: event_id.to_string(),
+            event_type: "subscription.active".to_string(),
+            subscription_id: sub_id.clone(),
+            new_status: "active".to_string(),
+            customer_id: Some(customer_id),
+            email: Some(email),
+            tier: tier.clone(),
+            product_id: product_id.clone(),
+            occurred_at: created_at,
+            resolved_tier: tier.clone(),
+            tier_unknown,
+        };
+
+        let outcome = state.db.process_subscription_updated(updated_data).await?;
+        match outcome {
+            UpdatedOutcome::Unrevoked => {
+                info!(sub_id = %sub_id, "subscription.active — key un-revoked");
+            }
+            UpdatedOutcome::StatusUpdated => {
+                info!(sub_id = %sub_id, "subscription.active — status reconciled");
+            }
+            UpdatedOutcome::TerminalIgnored => {
+                warn!(sub_id = %sub_id, "subscription.active absorbed by terminal revoked state");
+            }
+            UpdatedOutcome::ActiveNoKey => {
+                warn!(sub_id = %sub_id, "subscription.active — key check race, no key found in update");
+            }
+            UpdatedOutcome::Duplicate => {
+                info!(event_id = %event_id, "duplicate event, skipped");
+            }
+            other => {
+                info!(sub_id = %sub_id, outcome = ?other, "subscription.active — updated");
+            }
+        }
+    } else {
+        // New subscription — full provision
+        let tier_str = match &tier {
+            Some(t) => t.clone(),
             None => {
-                // Dead-letter: unknown price on created → 500 (Paddle retries after config fix)
+                // Unknown product → dead-letter and return 500 for retry
+                error!(
+                    event_id = %event_id,
+                    sub_id = %sub_id,
+                    "subscription.active with unknown product, cannot provision"
+                );
                 let _ = state
                     .db
                     .insert_dead_letter(DeadLetterData {
                         event_id: event_id.to_string(),
                         subscription_id: Some(sub_id.clone()),
-                        event_type: "subscription.created".to_string(),
-                        reason: "unresolvable_price".to_string(),
-                        occurred_at: occurred_at.clone(),
+                        event_type: "subscription.active".to_string(),
+                        reason: "unresolvable_product".to_string(),
+                        occurred_at: created_at.clone(),
                         payload: redact_event(event),
                     })
                     .await;
-                return Err(AppError::Internal(format!("unknown price_id: {pid}")));
+                return Err(AppError::Internal("unknown product_id".into()));
             }
-        },
+        };
+
+        let cid = checkout_id.unwrap_or_else(|| "unknown".to_string());
+
+        let creds = provision_credentials(state, &tier_str)?;
+
+        let created_data = CreatedData {
+            event_id: event_id.to_string(),
+            event_type: "subscription.active".to_string(),
+            subscription_id: sub_id.clone(),
+            customer_id,
+            email,
+            tier: tier_str,
+            product_id: product_id.unwrap_or_default(),
+            occurred_at: created_at,
+            checkout_id: cid,
+            key_hash: creds.key_hash,
+            token: Some(creds.token),
+            token_expires_at: creds.token_expires_at,
+            receipt_secret: creds.receipt_secret,
+            api_key_enc: creds.api_key_enc,
+            api_key_nonce: creds.api_key_nonce,
+        };
+
+        let outcome = state.db.process_subscription_created(created_data).await?;
+        log_created_outcome(&outcome, &sub_id, event_id);
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ─── subscription.canceled (benefits continue until period end) ─────────
+
+async fn handle_sub_canceled(
+    state: &AppState,
+    event: &serde_json::Value,
+    event_id: &str,
+) -> Result<StatusCode, AppError> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+
+    let sub_id = match json_str(data, "id") {
+        Some(id) => id,
         None => {
             let _ = state
                 .db
                 .insert_dead_letter(DeadLetterData {
                     event_id: event_id.to_string(),
-                    subscription_id: Some(sub_id.clone()),
-                    event_type: "subscription.created".to_string(),
-                    reason: "missing_price_id".to_string(),
-                    occurred_at: occurred_at.clone(),
+                    subscription_id: None,
+                    event_type: "subscription.canceled".to_string(),
+                    reason: "missing_subscription_id".to_string(),
+                    occurred_at: event
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     payload: redact_event(event),
                 })
                 .await;
-            return Err(AppError::Internal("missing price_id".into()));
+            error!(event_id = %event_id, "canceled event missing subscription_id");
+            return Ok(StatusCode::OK);
         }
     };
 
+    let created_at = event
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let customer_id = json_str(data, "customer_id");
+    let email = data
+        .pointer("/customer/email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let product_id = json_str(data, "product_id");
+    let tier = product_id
+        .as_deref()
+        .and_then(|pid| state.config.tier_for_product(pid).map(|t| t.to_string()));
+
+    let canceled_data = CanceledData {
+        event_id: event_id.to_string(),
+        subscription_id: sub_id.clone(),
+        customer_id,
+        email,
+        tier,
+        product_id,
+        occurred_at: created_at,
+    };
+
+    let processed = state
+        .db
+        .process_subscription_canceled(canceled_data)
+        .await?;
+    if processed {
+        info!(sub_id = %sub_id, "subscription canceled — key stays active (benefits continue)");
+    } else {
+        info!(event_id = %event_id, "duplicate/absorbed canceled event, skipped");
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ─── subscription.revoked (terminal — revoke key) ──────────────────────
+
+async fn handle_sub_revoked(
+    state: &AppState,
+    event: &serde_json::Value,
+    event_id: &str,
+) -> Result<StatusCode, AppError> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+
+    let sub_id = match json_str(data, "id") {
+        Some(id) => id,
+        None => {
+            let _ = state
+                .db
+                .insert_dead_letter(DeadLetterData {
+                    event_id: event_id.to_string(),
+                    subscription_id: None,
+                    event_type: "subscription.revoked".to_string(),
+                    reason: "missing_subscription_id".to_string(),
+                    occurred_at: event
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    payload: redact_event(event),
+                })
+                .await;
+            error!(event_id = %event_id, "revoked event missing subscription_id");
+            return Ok(StatusCode::OK);
+        }
+    };
+
+    let created_at = event
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let customer_id = json_str(data, "customer_id");
+    let email = data
+        .pointer("/customer/email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let product_id = json_str(data, "product_id");
+    let tier = product_id
+        .as_deref()
+        .and_then(|pid| state.config.tier_for_product(pid).map(|t| t.to_string()));
+
+    let revoked_data = RevokedData {
+        event_id: event_id.to_string(),
+        subscription_id: sub_id.clone(),
+        customer_id,
+        email,
+        tier,
+        product_id,
+        occurred_at: created_at,
+    };
+
+    let processed = state.db.process_subscription_revoked(revoked_data).await?;
+    if processed {
+        info!(sub_id = %sub_id, "subscription revoked — key revoked (terminal)");
+    } else {
+        info!(event_id = %event_id, "duplicate revoked event, skipped");
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ─── subscription.past_due (payment failed — revoke key) ───────────────
+
+async fn handle_sub_past_due(
+    state: &AppState,
+    event: &serde_json::Value,
+    event_id: &str,
+) -> Result<StatusCode, AppError> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+
+    let sub_id = match json_str(data, "id") {
+        Some(id) => id,
+        None => {
+            error!(event_id = %event_id, "past_due event missing subscription_id");
+            return Ok(StatusCode::OK);
+        }
+    };
+
+    let created_at = event
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let product_id = json_str(data, "product_id");
+    let (tier, tier_unknown) = resolve_tier(
+        state,
+        &sub_id,
+        product_id.as_deref(),
+        event_id,
+        "subscription.past_due",
+        &created_at,
+        event,
+    )
+    .await;
+
+    let updated_data = UpdatedData {
+        event_id: event_id.to_string(),
+        event_type: "subscription.past_due".to_string(),
+        subscription_id: sub_id.clone(),
+        new_status: "past_due".to_string(),
+        customer_id: json_str(data, "customer_id"),
+        email: data
+            .pointer("/customer/email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        tier: tier.clone(),
+        product_id,
+        occurred_at: created_at,
+        resolved_tier: tier,
+        tier_unknown,
+    };
+
+    let outcome = state.db.process_subscription_updated(updated_data).await?;
+    match outcome {
+        UpdatedOutcome::Revoked => {
+            info!(sub_id = %sub_id, "subscription past_due — key revoked");
+        }
+        UpdatedOutcome::TerminalIgnored => {
+            warn!(sub_id = %sub_id, "past_due absorbed by terminal revoked state");
+        }
+        UpdatedOutcome::Duplicate => {
+            info!(event_id = %event_id, "duplicate event, skipped");
+        }
+        other => {
+            info!(sub_id = %sub_id, outcome = ?other, "subscription past_due");
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ─── subscription.uncanceled (cancel reversal → back to active) ────────
+
+async fn handle_sub_uncanceled(
+    state: &AppState,
+    event: &serde_json::Value,
+    event_id: &str,
+) -> Result<StatusCode, AppError> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
+
+    let sub_id = match json_str(data, "id") {
+        Some(id) => id,
+        None => {
+            error!(event_id = %event_id, "uncanceled event missing subscription_id");
+            return Ok(StatusCode::OK);
+        }
+    };
+
+    let created_at = event
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let product_id = json_str(data, "product_id");
+    let (tier, tier_unknown) = resolve_tier(
+        state,
+        &sub_id,
+        product_id.as_deref(),
+        event_id,
+        "subscription.uncanceled",
+        &created_at,
+        event,
+    )
+    .await;
+
+    let updated_data = UpdatedData {
+        event_id: event_id.to_string(),
+        event_type: "subscription.uncanceled".to_string(),
+        subscription_id: sub_id.clone(),
+        new_status: "active".to_string(),
+        customer_id: json_str(data, "customer_id"),
+        email: data
+            .pointer("/customer/email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        tier: tier.clone(),
+        product_id,
+        occurred_at: created_at,
+        resolved_tier: tier,
+        tier_unknown,
+    };
+
+    let outcome = state.db.process_subscription_updated(updated_data).await?;
+    match outcome {
+        UpdatedOutcome::Unrevoked => {
+            info!(sub_id = %sub_id, "subscription uncanceled — back to active");
+        }
+        UpdatedOutcome::StatusUpdated => {
+            info!(sub_id = %sub_id, "subscription uncanceled — status reconciled to active");
+        }
+        UpdatedOutcome::TerminalIgnored => {
+            warn!(sub_id = %sub_id, "uncanceled absorbed by terminal revoked state");
+        }
+        UpdatedOutcome::Duplicate => {
+            info!(event_id = %event_id, "duplicate event, skipped");
+        }
+        other => {
+            info!(sub_id = %sub_id, outcome = ?other, "subscription uncanceled");
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn json_str(val: &serde_json::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Resolve product_id → tier. On unknown product, insert dead-letter and return None.
+async fn resolve_tier(
+    state: &AppState,
+    sub_id: &str,
+    product_id: Option<&str>,
+    event_id: &str,
+    event_type: &str,
+    created_at: &Option<String>,
+    event: &serde_json::Value,
+) -> (Option<String>, bool) {
+    match product_id {
+        Some(pid) => match state.config.tier_for_product(pid) {
+            Some(t) => (Some(t.to_string()), false),
+            None => {
+                error!(
+                    sub_id = %sub_id,
+                    product_id = %pid,
+                    "unresolvable product_id — setting tier to unknown"
+                );
+                let _ = state
+                    .db
+                    .insert_dead_letter(DeadLetterData {
+                        event_id: event_id.to_string(),
+                        subscription_id: Some(sub_id.to_string()),
+                        event_type: event_type.to_string(),
+                        reason: "unresolvable_product".to_string(),
+                        occurred_at: created_at.clone(),
+                        payload: redact_event(event),
+                    })
+                    .await;
+                (None, true)
+            }
+        },
+        None => {
+            warn!(
+                sub_id = %sub_id,
+                "no product_id in event — setting tier to unknown"
+            );
+            let _ = state
+                .db
+                .insert_dead_letter(DeadLetterData {
+                    event_id: event_id.to_string(),
+                    subscription_id: Some(sub_id.to_string()),
+                    event_type: event_type.to_string(),
+                    reason: "unresolvable_product".to_string(),
+                    occurred_at: created_at.clone(),
+                    payload: redact_event(event),
+                })
+                .await;
+            (None, true)
+        }
+    }
+}
+
+struct ProvisionResult {
+    key_hash: String,
+    api_key_enc: Vec<u8>,
+    api_key_nonce: Vec<u8>,
+    token: String,
+    token_expires_at: i64,
+    receipt_secret: String,
+}
+
+/// Generate API key, encrypt it, sign token, generate receipt secret.
+fn provision_credentials(state: &AppState, tier: &str) -> Result<ProvisionResult, AppError> {
     // Generate API key
     let mut api_key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut api_key_bytes);
@@ -175,9 +683,9 @@ async fn handle_created(
 
     // Sign token
     let exp_ts = chrono::Utc::now().timestamp() + (state.config.token_ttl_days * 86400);
-    let token = state.signer.sign_token(&tier, exp_ts);
+    let token = state.signer.sign_token(tier, exp_ts);
 
-    // Generate receipt secret (32 bytes)
+    // Generate receipt secret
     let mut receipt_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut receipt_bytes);
     let receipt_secret = B64URL.encode(receipt_bytes);
@@ -192,306 +700,45 @@ async fn handle_created(
         .encrypt(nonce, api_key_raw.as_bytes())
         .map_err(|e| AppError::Internal(format!("AES encrypt: {e}")))?;
 
-    let created_data = CreatedData {
-        event_id: event_id.to_string(),
-        subscription_id: sub_id.clone(),
-        customer_id,
-        email,
-        tier,
-        price_id: price_id.unwrap_or_default(),
-        occurred_at,
-        checkout_id: checkout_id.to_string(),
+    Ok(ProvisionResult {
         key_hash,
-        token: Some(token),
-        token_expires_at: exp_ts,
-        receipt_secret,
         api_key_enc,
         api_key_nonce: nonce_bytes.to_vec(),
-    };
+        token,
+        token_expires_at: exp_ts,
+        receipt_secret,
+    })
+}
 
-    let outcome = state.db.process_subscription_created(created_data).await?;
-
+fn log_created_outcome(outcome: &CreatedOutcome, id: &str, event_id: &str) {
     match outcome {
         CreatedOutcome::Provisioned => {
-            info!(sub_id = %sub_id, "subscription created — fully provisioned");
+            info!(id = %id, "provisioned — API key, token, and receipt created");
         }
         CreatedOutcome::PartialProvisioned => {
-            warn!(sub_id = %sub_id, "subscription created — partial provisioning (degraded state)");
+            warn!(id = %id, "partial provisioning (degraded state)");
         }
-        CreatedOutcome::SkippedCanceled => {
-            warn!(sub_id = %sub_id, "created event for canceled subscription, skipping provisioning");
+        CreatedOutcome::SkippedRevoked => {
+            warn!(id = %id, "provisioning skipped — subscription is revoked (terminal)");
         }
         CreatedOutcome::AlreadyProvisioned => {
-            info!(sub_id = %sub_id, "created event for already-provisioned subscription");
+            info!(id = %id, "already provisioned, skipped");
         }
         CreatedOutcome::Duplicate => {
             info!(event_id = %event_id, "duplicate event, skipped");
         }
     }
-
-    Ok(StatusCode::OK)
-}
-
-// ─── subscription.canceled ───────────────────────────────────────────
-
-async fn handle_canceled(
-    state: &AppState,
-    event: &serde_json::Value,
-    event_id: &str,
-) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
-
-    // subscription_id is REQUIRED for cancelation
-    let sub_id = match json_str(data, "id") {
-        Some(id) => id,
-        None => {
-            // Permanent parse failure — return 200 (Paddle won't fix payload on retry)
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
-                    event_id: event_id.to_string(),
-                    subscription_id: None,
-                    event_type: "subscription.canceled".to_string(),
-                    reason: "missing_subscription_id".to_string(),
-                    occurred_at: event
-                        .get("occurred_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    payload: redact_event(event),
-                })
-                .await;
-            error!(event_id = %event_id, "canceled event missing subscription_id");
-            return Ok(StatusCode::OK);
-        }
-    };
-
-    let occurred_at = event
-        .get("occurred_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // Optional metadata (best-effort)
-    let customer_id = json_str(data, "customer_id");
-    let email = json_str(data, "email").or_else(|| {
-        data.pointer("/customer/email")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let price_id = data
-        .pointer("/items/0/price/id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let tier = price_id
-        .as_deref()
-        .and_then(|pid| state.config.tier_for_price(pid).map(|t| t.to_string()));
-
-    let canceled_data = CanceledData {
-        event_id: event_id.to_string(),
-        subscription_id: sub_id.clone(),
-        customer_id,
-        email,
-        tier,
-        price_id,
-        occurred_at,
-    };
-
-    let processed = state
-        .db
-        .process_subscription_canceled(canceled_data)
-        .await?;
-    if processed {
-        info!(sub_id = %sub_id, "subscription canceled — key revoked");
-    } else {
-        info!(event_id = %event_id, "duplicate canceled event, skipped");
-    }
-
-    Ok(StatusCode::OK)
-}
-
-// ─── subscription.updated ────────────────────────────────────────────
-
-async fn handle_updated(
-    state: &AppState,
-    event: &serde_json::Value,
-    event_id: &str,
-) -> Result<StatusCode, AppError> {
-    let data = event
-        .get("data")
-        .ok_or_else(|| AppError::BadWebhook("missing data".into()))?;
-
-    // subscription_id and status are REQUIRED
-    let sub_id = match json_str(data, "id") {
-        Some(id) => id,
-        None => {
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
-                    event_id: event_id.to_string(),
-                    subscription_id: None,
-                    event_type: "subscription.updated".to_string(),
-                    reason: "missing_subscription_id".to_string(),
-                    occurred_at: event
-                        .get("occurred_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    payload: redact_event(event),
-                })
-                .await;
-            error!(event_id = %event_id, "updated event missing subscription_id");
-            return Ok(StatusCode::OK);
-        }
-    };
-
-    let new_status = match json_str(data, "status") {
-        Some(s) => s,
-        None => {
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
-                    event_id: event_id.to_string(),
-                    subscription_id: Some(sub_id.clone()),
-                    event_type: "subscription.updated".to_string(),
-                    reason: "missing_status".to_string(),
-                    occurred_at: event
-                        .get("occurred_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    payload: redact_event(event),
-                })
-                .await;
-            error!(event_id = %event_id, sub_id = %sub_id, "updated event missing status");
-            return Ok(StatusCode::OK);
-        }
-    };
-
-    let occurred_at = event
-        .get("occurred_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // Optional metadata
-    let customer_id = json_str(data, "customer_id");
-    let email = json_str(data, "email").or_else(|| {
-        data.pointer("/customer/email")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let price_id = data
-        .pointer("/items/0/price/id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // Tier resolution — fail-closed on unknown
-    let (resolved_tier, tier_unknown) = match &price_id {
-        Some(pid) => match state.config.tier_for_price(pid) {
-            Some(t) => (Some(t.to_string()), false),
-            None => {
-                error!(
-                    sub_id = %sub_id,
-                    price_id = %pid,
-                    "unresolvable price_id on updated event — setting tier to unknown"
-                );
-                let _ = state
-                    .db
-                    .insert_dead_letter(DeadLetterData {
-                        event_id: event_id.to_string(),
-                        subscription_id: Some(sub_id.clone()),
-                        event_type: "subscription.updated".to_string(),
-                        reason: "unresolvable_price".to_string(),
-                        occurred_at: occurred_at.clone(),
-                        payload: redact_event(event),
-                    })
-                    .await;
-                (None, true)
-            }
-        },
-        None => {
-            // No price_id at all — fail-closed
-            warn!(
-                sub_id = %sub_id,
-                "no price_id in updated event — setting tier to unknown"
-            );
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
-                    event_id: event_id.to_string(),
-                    subscription_id: Some(sub_id.clone()),
-                    event_type: "subscription.updated".to_string(),
-                    reason: "unresolvable_price".to_string(),
-                    occurred_at: occurred_at.clone(),
-                    payload: redact_event(event),
-                })
-                .await;
-            (None, true)
-        }
-    };
-
-    let updated_data = UpdatedData {
-        event_id: event_id.to_string(),
-        subscription_id: sub_id.clone(),
-        new_status: new_status.clone(),
-        customer_id,
-        email,
-        tier: resolved_tier.clone(),
-        price_id,
-        occurred_at,
-        resolved_tier,
-        tier_unknown,
-    };
-
-    let outcome = state.db.process_subscription_updated(updated_data).await?;
-
-    match outcome {
-        UpdatedOutcome::Unrevoked => {
-            info!(sub_id = %sub_id, status = %new_status, "subscription updated — key un-revoked");
-        }
-        UpdatedOutcome::Revoked => {
-            info!(sub_id = %sub_id, status = %new_status, "subscription updated — key revoked");
-        }
-        UpdatedOutcome::ActiveNoKey => {
-            warn!(sub_id = %sub_id, "active sub has no API key — awaiting subscription.created");
-        }
-        UpdatedOutcome::StaleActiveIgnored => {
-            warn!(
-                sub_id = %sub_id,
-                event_id = %event_id,
-                "stale updated(active) for canceled subscription, ignoring"
-            );
-        }
-        UpdatedOutcome::UnknownStatusRevoked => {
-            warn!(sub_id = %sub_id, status = %new_status, "unknown status treated as inactive");
-        }
-        UpdatedOutcome::Duplicate => {
-            info!(event_id = %event_id, "duplicate updated event, skipped");
-        }
-    }
-
-    Ok(StatusCode::OK)
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-fn json_str(val: &serde_json::Value, key: &str) -> Option<String> {
-    val.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }
 
 /// Redact event payload — keep only safe fields for dead-letter storage.
 fn redact_event(event: &serde_json::Value) -> String {
     let mut redacted = serde_json::json!({});
 
-    if let Some(eid) = event.get("event_id") {
-        redacted["event_id"] = eid.clone();
+    if let Some(t) = event.get("type") {
+        redacted["type"] = t.clone();
     }
-    if let Some(et) = event.get("event_type") {
-        redacted["event_type"] = et.clone();
-    }
-    if let Some(oa) = event.get("occurred_at") {
-        redacted["occurred_at"] = oa.clone();
+    if let Some(ca) = event.get("created_at") {
+        redacted["created_at"] = ca.clone();
     }
     if let Some(data) = event.get("data") {
         let mut rd = serde_json::json!({});
@@ -501,53 +748,17 @@ fn redact_event(event: &serde_json::Value) -> String {
         if let Some(status) = data.get("status") {
             rd["status"] = status.clone();
         }
-        if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
-            let redacted_items: Vec<serde_json::Value> = items
-                .iter()
-                .map(|item| {
-                    let mut ri = serde_json::json!({});
-                    if let Some(price) = item.get("price") {
-                        if let Some(pid) = price.get("id") {
-                            ri["price"] = serde_json::json!({"id": pid});
-                        }
-                    }
-                    ri
-                })
-                .collect();
-            rd["items"] = serde_json::json!(redacted_items);
+        if let Some(pid) = data.get("product_id") {
+            rd["product_id"] = pid.clone();
         }
-        if let Some(checkout) = data.get("checkout") {
-            if let Some(cid) = checkout.get("id") {
-                rd["checkout"] = serde_json::json!({"id": cid});
-            }
+        if let Some(cid) = data.get("checkout_id") {
+            rd["checkout_id"] = cid.clone();
+        }
+        if let Some(cust_id) = data.get("customer_id") {
+            rd["customer_id"] = cust_id.clone();
         }
         redacted["data"] = rd;
     }
 
     serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Fetch customer email from Paddle API.
-async fn fetch_customer_email(state: &AppState, customer_id: &str) -> Option<String> {
-    let url = format!("https://api.paddle.com/customers/{customer_id}");
-    let resp = state
-        .http_client
-        .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.paddle_api_key),
-        )
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.pointer("/data/email")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }

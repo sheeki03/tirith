@@ -377,11 +377,11 @@ pub fn current_tier() -> Tier {
     match read_license_key() {
         Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or_else(|| {
             eprintln!(
-                "tirith: warning: license key present but decode failed, falling back to Community"
+                "tirith: warning: license key present but decode failed, falling back to Pro"
             );
-            Tier::Community
+            Tier::Pro
         }),
-        None => Tier::Community,
+        None => Tier::Pro,
     }
 }
 

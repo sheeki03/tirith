@@ -4,10 +4,10 @@ use std::collections::HashMap;
 #[allow(dead_code)]
 pub struct Config {
     pub ed25519_seed_hex: String,
-    pub paddle_webhook_secret: String,
-    pub paddle_api_key: String,
+    pub polar_webhook_secret: String,
+    pub polar_api_key: String,
     pub receipt_encryption_key: [u8; 32],
-    pub price_tier_map: HashMap<String, String>,
+    pub product_tier_map: HashMap<String, String>,
     pub kid: String,
     pub token_ttl_days: i64,
     pub port: u16,
@@ -28,8 +28,8 @@ impl Config {
             "ED25519_PRIVATE_KEY_HEX must be 64 hex chars (32 bytes)"
         );
 
-        let paddle_webhook_secret = required_env("PADDLE_WEBHOOK_SECRET");
-        let paddle_api_key = required_env("PADDLE_API_KEY");
+        let polar_webhook_secret = required_env("POLAR_WEBHOOK_SECRET");
+        let polar_api_key = required_env("POLAR_API_KEY");
 
         let enc_key_hex = required_env("RECEIPT_ENCRYPTION_KEY");
         let enc_key_bytes = hex::decode(&enc_key_hex).expect("RECEIPT_ENCRYPTION_KEY: invalid hex");
@@ -40,17 +40,17 @@ impl Config {
         let mut receipt_encryption_key = [0u8; 32];
         receipt_encryption_key.copy_from_slice(&enc_key_bytes);
 
-        let mut price_tier_map = HashMap::new();
+        // Map Polar product UUIDs to tier names
+        let mut product_tier_map = HashMap::new();
         for (env_key, tier) in [
-            ("PADDLE_PRICE_PRO_MONTHLY", "pro"),
-            ("PADDLE_PRICE_PRO_YEARLY", "pro"),
-            ("PADDLE_PRICE_TEAM_MONTHLY", "team"),
-            ("PADDLE_PRICE_TEAM_YEARLY", "team"),
+            ("POLAR_PRODUCT_PRO", "pro"),
+            ("POLAR_PRODUCT_TEAM", "team"),
+            ("POLAR_PRODUCT_ENTERPRISE", "enterprise"),
         ] {
-            if let Ok(price_id) = std::env::var(env_key) {
-                let price_id = price_id.trim().to_string();
-                if !price_id.is_empty() {
-                    price_tier_map.insert(price_id, tier.to_string());
+            if let Ok(product_id) = std::env::var(env_key) {
+                let product_id = product_id.trim().to_string();
+                if !product_id.is_empty() {
+                    product_tier_map.insert(product_id, tier.to_string());
                 }
             }
         }
@@ -87,10 +87,10 @@ impl Config {
 
         Config {
             ed25519_seed_hex,
-            paddle_webhook_secret,
-            paddle_api_key,
+            polar_webhook_secret,
+            polar_api_key,
             receipt_encryption_key,
-            price_tier_map,
+            product_tier_map,
             kid,
             token_ttl_days,
             port,
@@ -104,8 +104,8 @@ impl Config {
         }
     }
 
-    pub fn tier_for_price(&self, price_id: &str) -> Option<&str> {
-        self.price_tier_map.get(price_id).map(|s| s.as_str())
+    pub fn tier_for_product(&self, product_id: &str) -> Option<&str> {
+        self.product_tier_map.get(product_id).map(|s| s.as_str())
     }
 }
 

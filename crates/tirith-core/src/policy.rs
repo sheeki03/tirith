@@ -295,9 +295,9 @@ impl Policy {
     ///
     /// Resolution order:
     /// 1. Local policy (TIRITH_POLICY_ROOT, walk-up discovery, user-level)
-    /// 2. If `TIRITH_SERVER_URL` + `TIRITH_API_KEY` are set (or policy has
-    ///    `policy_server_url`), try remote fetch. On success the remote policy
-    ///    **replaces** the local one entirely and is cached.
+    /// 2. Team+ only: if `TIRITH_SERVER_URL` + `TIRITH_API_KEY` are set (or
+    ///    policy has `policy_server_url`), try remote fetch. On success the
+    ///    remote policy **replaces** the local one entirely and is cached.
     /// 3. On remote failure, apply `policy_fetch_fail_mode`:
     ///    - `"open"` (default): warn and use local policy
     ///    - `"closed"`: return a fail-closed default (all actions = Block)
@@ -306,6 +306,11 @@ impl Policy {
     pub fn discover(cwd: Option<&str>) -> Self {
         // --- Step 1: resolve local policy ---
         let local = Self::discover_local(cwd);
+
+        // Centralized policy fetch is a Team+ feature.
+        if crate::license::current_tier() < crate::license::Tier::Team {
+            return local;
+        }
 
         // --- Step 2: determine remote fetch parameters ---
         let server_url = std::env::var("TIRITH_SERVER_URL")
@@ -690,6 +695,10 @@ fn load_cached_remote_policy() -> Option<Policy> {
 mod tests {
     use super::*;
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_allowlist_domain_matches_subdomain() {
         let p = Policy {
@@ -717,5 +726,38 @@ mod tests {
             ..Default::default()
         };
         assert!(p.is_allowlisted("example.com:8080/path"));
+    }
+
+    #[test]
+    fn test_discover_skips_remote_fetch_below_team_tier() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "fail_mode: open\npolicy_fetch_fail_mode: closed\nallow_bypass_env_noninteractive: true\n",
+        )
+        .unwrap();
+
+        // Force Community tier regardless of host machine config.
+        unsafe { std::env::set_var("TIRITH_LICENSE", "!") };
+        unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
+        unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
+
+        let policy = Policy::discover(Some(dir.path().to_str().unwrap()));
+        assert_ne!(policy.path.as_deref(), Some("fail-closed"));
+        assert_eq!(policy.fail_mode, FailMode::Open);
+        assert!(policy.allow_bypass_env_noninteractive);
+        assert!(policy
+            .path
+            .as_deref()
+            .unwrap_or_default()
+            .contains(".tirith"));
+
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_LICENSE") };
     }
 }

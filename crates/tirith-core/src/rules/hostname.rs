@@ -140,7 +140,11 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
 
 fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
     // Check IPv4
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        // Loopback (127.x) is benign local development — skip.
+        if ip.octets()[0] == 127 {
+            return;
+        }
         findings.push(Finding {
             rule_id: RuleId::RawIpUrl,
             severity: Severity::Medium,
@@ -158,7 +162,11 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
     }
     // Check IPv6 (strip brackets)
     let stripped = host.trim_start_matches('[').trim_end_matches(']');
-    if stripped.parse::<std::net::Ipv6Addr>().is_ok() {
+    if let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() {
+        // IPv6 loopback (::1) is benign local development — skip.
+        if ip.is_loopback() {
+            return;
+        }
         findings.push(Finding {
             rule_id: RuleId::RawIpUrl,
             severity: Severity::Medium,

@@ -1,10 +1,10 @@
 mod config;
 mod db;
 mod error;
-mod paddle;
 mod routes;
 mod sign;
 mod state;
+mod webhook_verify;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ async fn main() {
     let signer = TokenSigner::from_hex_seed(&config.ed25519_seed_hex, config.kid.clone())
         .expect("failed to init token signer");
 
-    // HTTP client for Paddle API
+    // HTTP client for Polar API
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(3))
@@ -86,7 +86,9 @@ fn spawn_cleanup_task(db: Db) {
     });
 }
 
-/// Dead-letter auto-retry: re-fetch unresolvable prices from Paddle API every 5 min.
+/// Dead-letter auto-retry: re-fetch unresolvable products from Polar API every 5 min.
+/// Only retries subscription-type dead letters (order.paid unknown-product returns 500
+/// so Polar retries the full event — those never enter the dead-letter table).
 fn spawn_dead_letter_retry_task(db: Db, config: Arc<Config>, http_client: reqwest::Client) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -104,6 +106,7 @@ async fn retry_dead_letters(
     config: &Config,
     http_client: &reqwest::Client,
 ) -> Result<(), String> {
+    // Only returns subscription-type dead letters (filtered in SQL)
     let entries = db
         .get_retryable_dead_letters()
         .await
@@ -141,11 +144,11 @@ async fn retry_dead_letters(
             }
         }
 
-        // Try to fetch subscription from Paddle API to resolve price → tier
-        let url = format!("https://api.paddle.com/subscriptions/{sub_id}");
+        // Fetch subscription from Polar API to resolve product_id → tier
+        let url = format!("https://api.polar.sh/v1/subscriptions/{sub_id}");
         let resp = http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", config.paddle_api_key))
+            .header("Authorization", format!("Bearer {}", config.polar_api_key))
             .send()
             .await;
 
@@ -156,7 +159,7 @@ async fn retry_dead_letters(
                     dead_letter_id = entry.id,
                     sub_id = %sub_id,
                     status = %r.status(),
-                    "Paddle API returned non-success for retry"
+                    "Polar API returned non-success for retry"
                 );
                 continue;
             }
@@ -164,7 +167,7 @@ async fn retry_dead_letters(
                 warn!(
                     dead_letter_id = entry.id,
                     sub_id = %sub_id,
-                    "Paddle API request failed for retry: {e}"
+                    "Polar API request failed for retry: {e}"
                 );
                 continue;
             }
@@ -175,32 +178,30 @@ async fn retry_dead_letters(
             Err(e) => {
                 warn!(
                     dead_letter_id = entry.id,
-                    "failed to parse Paddle API response: {e}"
+                    "failed to parse Polar API response: {e}"
                 );
                 continue;
             }
         };
 
-        // Extract price_id from Paddle API response
-        let price_id = body
-            .pointer("/data/items/0/price/id")
-            .and_then(|v| v.as_str());
+        // Extract product_id from Polar API response
+        let product_id = body.get("product_id").and_then(|v| v.as_str());
 
-        if let Some(pid) = price_id {
-            if let Some(tier) = config.tier_for_price(pid) {
+        if let Some(pid) = product_id {
+            if let Some(tier) = config.tier_for_product(pid) {
                 info!(
                     dead_letter_id = entry.id,
                     sub_id = %sub_id,
                     tier = %tier,
-                    "resolved price via Paddle API retry"
+                    "resolved product via Polar API retry"
                 );
                 let _ = db.apply_retry_tier_fix(entry.id, &sub_id, tier, pid).await;
             } else {
                 warn!(
                     dead_letter_id = entry.id,
                     sub_id = %sub_id,
-                    price_id = %pid,
-                    "Paddle API returned price_id but it still doesn't map to a tier"
+                    product_id = %pid,
+                    "Polar API returned product_id but it still doesn't map to a tier"
                 );
             }
         }

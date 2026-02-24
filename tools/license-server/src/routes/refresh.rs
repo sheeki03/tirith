@@ -38,8 +38,8 @@ pub async fn refresh(
         AppError::Internal("subscription not found".into())
     })?;
 
-    // Status check
-    if sub.status != "active" {
+    // Status check — canceled still gets tokens (benefits continue until period end)
+    if sub.status != "active" && sub.status != "canceled" {
         return Err(AppError::PaymentRequired(
             "Subscription inactive. Renew at https://tirith.dev/account".into(),
         ));
@@ -47,7 +47,7 @@ pub async fn refresh(
 
     // Tier validation — fail-closed on unknown/invalid tier
     match sub.tier.as_str() {
-        "pro" | "team" => {}
+        "pro" | "team" | "enterprise" => {}
         other => {
             error!(
                 sub_id = %sub.id,

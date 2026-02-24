@@ -136,7 +136,9 @@ pub fn log_verdict(
         .ok()
         .filter(|s| !s.is_empty());
     if let (Some(url), Some(key)) = (server_url, api_key) {
-        crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
+        if crate::license::current_tier() >= crate::license::Tier::Team {
+            crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
+        }
     }
 }
 
@@ -239,5 +241,57 @@ mod tests {
             0o600,
             "audit log should be 0600"
         );
+    }
+
+    #[test]
+    fn test_remote_audit_upload_requires_team_tier() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let state_home = dir.path().join("state");
+
+        // Force Community tier and set remote upload env vars.
+        unsafe { std::env::set_var("TIRITH_LICENSE", "!") };
+        unsafe { std::env::set_var("TIRITH_SERVER_URL", "https://example.com") };
+        unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::remove_var("TIRITH_LOG") };
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+        };
+
+        log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
+
+        let spool = state_home.join("tirith").join("audit-queue.jsonl");
+        assert!(
+            !spool.exists(),
+            "Community tier must not spool remote audit uploads"
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_LICENSE") };
     }
 }
