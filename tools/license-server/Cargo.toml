@@ -1,0 +1,42 @@
+[package]
+name = "tirith-license-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "License token delivery server for tirith (Polar webhook → token signing → receipt)"
+publish = false
+
+[dependencies]
+# HTTP server
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hmac = "0.12"
+aes-gcm = "0.10"
+sha2 = { workspace = true }
+hex = "0.4"
+
+# HTTP client (Polar API)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Backup (optional R2/S3)
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }

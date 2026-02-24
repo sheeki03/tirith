@@ -16,8 +16,36 @@ permissions:
   packages: write # For GHCR Docker images
 
 jobs:
+  enforcement-check:
+    name: Verify Enforcement Mode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify enforcement mode matches release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "WARNING: workflow_dispatch without version tag — enforcement check skipped"
+              echo "This is expected for dry-run builds. Production releases must use v* tags."
+            else
+              echo "Not a version tag ($RELEASE_TAG), skipping enforcement check"
+            fi
+            exit 0
+          fi
+          output=$(cargo test -p tirith-core --locked --lib -- license::tests::enforcement_mode_matches_release_tag --exact --ignored --nocapture 2>&1)
+          echo "$output"
+          if ! echo "$output" | grep -q "1 passed"; then
+            echo "ERROR: enforcement mode guard test did not run (renamed or removed?)"
+            exit 1
+          fi
+
   completions:
     name: Generate Completions
+    needs: enforcement-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -618,8 +646,8 @@ jobs:
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
           & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
           if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — package may be under moderation or API key issue"
-            exit 0
+            Write-Error "Chocolatey push failed (exit $LASTEXITCODE) — check API key and moderation status"
+            exit 1
           }
 
   publish-aur:
@@ -629,6 +657,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate AUR SSH key
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_KEY" ]; then
+            echo "::error::AUR_SSH_PRIVATE_KEY secret is not set — cannot publish to AUR"
+            exit 1
+          fi
 
       - name: Update PKGBUILD version
         env:

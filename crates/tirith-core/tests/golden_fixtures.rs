@@ -26,6 +26,9 @@ struct Fixture {
     expected_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// File path for file-scan context fixtures.
+    #[serde(default)]
+    file_path: Option<String>,
 }
 
 fn default_shell() -> String {
@@ -60,16 +63,19 @@ fn run_fixture(fixture: &Fixture) {
     let scan_context = match fixture.context.as_str() {
         "exec" => ScanContext::Exec,
         "paste" => ScanContext::Paste,
+        "file" => ScanContext::FileScan,
         _ => panic!("Unknown context: {}", fixture.context),
     };
 
     let raw_bytes = if !fixture.raw_bytes.is_empty() {
         Some(fixture.raw_bytes.clone())
-    } else if scan_context == ScanContext::Paste {
+    } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
         Some(fixture.input.as_bytes().to_vec())
     } else {
         None
     };
+
+    let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
     let ctx = AnalysisContext {
         input: fixture.input.clone(),
@@ -78,6 +84,10 @@ fn run_fixture(fixture: &Fixture) {
         raw_bytes,
         interactive: true,
         cwd: None,
+        file_path,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -218,6 +228,16 @@ fn test_shell_weirdness_fixtures() {
 }
 
 #[test]
+fn test_configfile_fixtures() {
+    let fixtures = load_fixtures("configfile.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} configfile fixtures");
+}
+
+#[test]
 fn test_policy_fixtures() {
     let fixtures = load_fixtures("policy.toml");
     let count = fixtures.len();
@@ -225,6 +245,16 @@ fn test_policy_fixtures() {
         run_fixture(fixture);
     }
     eprintln!("Passed {count} policy fixtures");
+}
+
+#[test]
+fn test_rendered_fixtures() {
+    let fixtures = load_fixtures("rendered.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} rendered fixtures");
 }
 
 /// Verify total fixture count across all files.
@@ -241,6 +271,8 @@ fn test_fixture_count() {
         "clean.toml",
         "shell_weirdness.toml",
         "policy.toml",
+        "configfile.toml",
+        "rendered.toml",
     ];
 
     let total: usize = files.iter().map(|f| load_fixtures(f).len()).sum();
@@ -268,7 +300,7 @@ fn test_tier1_coverage() {
     for filename in &files {
         let fixtures = load_fixtures(filename);
         for fixture in &fixtures {
-            if fixture.expected_action == "allow" {
+            if fixture.expected_action == "allow" && fixture.expected_rules.is_empty() {
                 continue;
             }
             let scan_context = match fixture.context.as_str() {
@@ -289,7 +321,11 @@ fn test_tier1_coverage() {
                     || byte_scan.has_control_chars
                     || byte_scan.has_bidi_controls
                     || byte_scan.has_zero_width
-                    || byte_scan.has_invalid_utf8;
+                    || byte_scan.has_invalid_utf8
+                    || byte_scan.has_unicode_tags
+                    || byte_scan.has_variation_selectors
+                    || byte_scan.has_invisible_math_operators
+                    || byte_scan.has_invisible_whitespace;
 
                 if byte_triggered {
                     continue; // Byte scan catches it
@@ -299,7 +335,13 @@ fn test_tier1_coverage() {
             // Exec context: bidi/zero-width check bypasses tier 1 regex (M4 fix)
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
-                if byte_scan.has_bidi_controls || byte_scan.has_zero_width {
+                if byte_scan.has_bidi_controls
+                    || byte_scan.has_zero_width
+                    || byte_scan.has_unicode_tags
+                    || byte_scan.has_variation_selectors
+                    || byte_scan.has_invisible_math_operators
+                    || byte_scan.has_invisible_whitespace
+                {
                     continue;
                 }
             }
@@ -335,6 +377,8 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "clean.toml",
     "shell_weirdness.toml",
     "policy.toml",
+    "configfile.toml",
+    "rendered.toml",
 ];
 
 /// Complete list of all RuleId variants (snake_case serialized form).
@@ -367,6 +411,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "bidi_controls",
     "zero_width_chars",
     "hidden_multiline",
+    "unicode_tags",
+    "invisible_math_operator",
+    "variation_selector",
+    "invisible_whitespace",
     // Command shape
     "pipe_to_interpreter",
     "curl_pipe_shell",
@@ -377,6 +425,25 @@ const ALL_RULE_IDS: &[&str] = &[
     "archive_extract",
     // Environment
     "proxy_env_set",
+    "sensitive_env_export",
+    "code_injection_env",
+    "interpreter_hijack_env",
+    "shell_injection_env",
+    // Network destination
+    "metadata_endpoint",
+    "private_network_access",
+    "command_network_deny",
+    // Config file
+    "config_injection",
+    "config_suspicious_indicator",
+    "config_malformed",
+    "config_non_ascii",
+    "config_invisible_unicode",
+    "mcp_insecure_server",
+    "mcp_untrusted_server",
+    "mcp_duplicate_server_name",
+    "mcp_overly_permissive",
+    "mcp_suspicious_args",
     // Ecosystem
     "git_typosquat",
     "docker_untrusted_registry",
@@ -384,8 +451,24 @@ const ALL_RULE_IDS: &[&str] = &[
     "npm_url_install",
     "web3_rpc_endpoint",
     "web3_address_in_url",
+    // Rendered content
+    "hidden_css_content",
+    "hidden_color_content",
+    "hidden_html_attribute",
+    "markdown_comment",
+    "html_comment",
+    // Cloaking
+    "server_cloaking",
+    // Clipboard
+    "clipboard_hidden",
+    // PDF
+    "pdf_hidden_text",
     // Policy
     "policy_blocklisted",
+    // Custom rules
+    "custom_rule_match",
+    // License/infrastructure
+    "license_required",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -423,7 +506,18 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
 /// Rules that depend on runtime state and cannot be tested via static fixtures.
 /// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
 /// - policy_blocklisted: requires a blocklist file in policy config
-const EXTERNALLY_TRIGGERED_RULES: &[&str] = &["proxy_env_set", "policy_blocklisted"];
+/// - license_required: emitted by license infrastructure, not detection rules
+const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
+    "proxy_env_set",
+    "policy_blocklisted",
+    "command_network_deny",
+    "license_required",
+    "custom_rule_match", // requires custom_rules in policy (Team-only)
+    "server_cloaking",   // requires network fetch (Unix-only)
+    "clipboard_hidden",  // requires --html clipboard input
+    "pdf_hidden_text",   // requires .pdf file input
+    "config_malformed",  // requires MCP config filename context in file scan
+];
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
@@ -478,6 +572,10 @@ fn test_rule_id_list_is_complete() {
         RuleId::BidiControls,
         RuleId::ZeroWidthChars,
         RuleId::HiddenMultiline,
+        RuleId::UnicodeTags,
+        RuleId::InvisibleMathOperator,
+        RuleId::VariationSelector,
+        RuleId::InvisibleWhitespace,
         RuleId::PipeToInterpreter,
         RuleId::CurlPipeShell,
         RuleId::WgetPipeShell,
@@ -486,13 +584,40 @@ fn test_rule_id_list_is_complete() {
         RuleId::DotfileOverwrite,
         RuleId::ArchiveExtract,
         RuleId::ProxyEnvSet,
+        RuleId::SensitiveEnvExport,
+        RuleId::CodeInjectionEnv,
+        RuleId::InterpreterHijackEnv,
+        RuleId::ShellInjectionEnv,
+        RuleId::MetadataEndpoint,
+        RuleId::PrivateNetworkAccess,
+        RuleId::CommandNetworkDeny,
+        RuleId::ConfigInjection,
+        RuleId::ConfigSuspiciousIndicator,
+        RuleId::ConfigMalformed,
+        RuleId::ConfigNonAscii,
+        RuleId::ConfigInvisibleUnicode,
+        RuleId::McpInsecureServer,
+        RuleId::McpUntrustedServer,
+        RuleId::McpDuplicateServerName,
+        RuleId::McpOverlyPermissive,
+        RuleId::McpSuspiciousArgs,
         RuleId::GitTyposquat,
         RuleId::DockerUntrustedRegistry,
         RuleId::PipUrlInstall,
         RuleId::NpmUrlInstall,
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
+        RuleId::HiddenCssContent,
+        RuleId::HiddenColorContent,
+        RuleId::HiddenHtmlAttribute,
+        RuleId::MarkdownComment,
+        RuleId::HtmlComment,
+        RuleId::ServerCloaking,
+        RuleId::ClipboardHidden,
+        RuleId::PdfHiddenText,
+        RuleId::CustomRuleMatch,
         RuleId::PolicyBlocklisted,
+        RuleId::LicenseRequired,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
@@ -527,9 +652,24 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter", // cat script | bash
-        "bidi_controls",       // exec context, no URL needed
-        "zero_width_chars",    // exec context, no URL needed
+        "pipe_to_interpreter",       // cat script | bash
+        "bidi_controls",             // exec context, no URL needed
+        "zero_width_chars",          // exec context, no URL needed
+        "unicode_tags",              // byte-level, no URL needed
+        "invisible_math_operator",   // byte-level, no URL needed
+        "invisible_whitespace",      // byte-level, no URL needed
+        "code_injection_env",        // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",       // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",    // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",      // export OPENAI_API_KEY=, no URL needed
+        "config_injection",          // file context, no URL needed
+        "config_non_ascii",          // file context, no URL needed
+        "config_invisible_unicode",  // file context, no URL needed
+        "mcp_suspicious_args",       // file context, no URL needed
+        "mcp_overly_permissive",     // file context, no URL needed
+        "mcp_duplicate_server_name", // file context, no URL needed
+        "metadata_endpoint",         // bare IP: curl 169.254.169.254/path
+        "private_network_access",    // bare IP: curl 10.0.0.1/path
     ]
     .into_iter()
     .collect();
@@ -616,6 +756,13 @@ fn test_extractor_ids_cover_rule_triggers() {
                 "powershell_invoke_expression",
             ],
         ),
+        // Environment variable detection
+        (
+            "env var detection",
+            &["env_var_dangerous", "env_var_hijack", "env_var_sensitive"],
+        ),
+        // Network destination detection
+        ("metadata endpoint", &["metadata_endpoint"]),
         // Deception triggers
         ("punycode detection", &["punycode_domain"]),
         ("lookalike TLD", &["lookalike_tld"]),
@@ -666,16 +813,19 @@ fn test_tier1_does_not_gate_findings() {
         let scan_context = match fixture.context.as_str() {
             "exec" => ScanContext::Exec,
             "paste" => ScanContext::Paste,
+            "file" => ScanContext::FileScan,
             _ => continue,
         };
 
         let raw_bytes = if !fixture.raw_bytes.is_empty() {
             Some(fixture.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste {
+        } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
             Some(fixture.input.as_bytes().to_vec())
         } else {
             None
         };
+
+        let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
         let ctx = AnalysisContext {
             input: fixture.input.clone(),
@@ -684,6 +834,10 @@ fn test_tier1_does_not_gate_findings() {
             raw_bytes,
             interactive: true,
             cwd: None,
+            file_path,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -725,6 +879,10 @@ fn test_non_ascii_paste_not_sole_warn() {
             raw_bytes: Some(raw_bytes),
             interactive: true,
             cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
