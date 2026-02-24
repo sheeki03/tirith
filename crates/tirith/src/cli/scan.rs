@@ -57,13 +57,7 @@ pub fn run(
     // before trusting any results.
     if !result.scan_complete {
         2
-    } else if (ci && result.has_findings_at_or_above(fail_on_severity))
-        || result
-            .file_results
-            .iter()
-            .flat_map(|r| &r.findings)
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    } else if result.has_findings_at_or_above(fail_on_severity) {
         1
     } else if result.total_findings() > 0 {
         2
@@ -72,7 +66,7 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_stdin(json: bool, _ci: bool, fail_on: Severity) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -100,12 +94,7 @@ fn run_stdin(json: bool, ci: bool, fail_on: Severity) -> i32 {
         print_human_file_result(&result);
     }
 
-    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
-        || result
-            .findings
-            .iter()
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
@@ -114,7 +103,7 @@ fn run_stdin(json: bool, ci: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_single_file(file_path: &str, json: bool, _ci: bool, fail_on: Severity) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
@@ -135,12 +124,7 @@ fn run_single_file(file_path: &str, json: bool, ci: bool, fail_on: Severity) -> 
         print_human_file_result(&result);
     }
 
-    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
-        || result
-            .findings
-            .iter()
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
@@ -166,6 +150,7 @@ fn print_json_result(result: &scan::ScanResult) {
         schema_version: u32,
         scanned_count: usize,
         skipped_count: usize,
+        skipped_config_paths: usize,
         truncated: bool,
         scan_complete: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,6 +181,7 @@ fn print_json_result(result: &scan::ScanResult) {
         schema_version: 3,
         scanned_count: result.scanned_count,
         skipped_count: result.skipped_count,
+        skipped_config_paths: result.skipped_config_paths,
         truncated: result.truncated,
         scan_complete: result.scan_complete,
         truncation_reason: &result.truncation_reason,

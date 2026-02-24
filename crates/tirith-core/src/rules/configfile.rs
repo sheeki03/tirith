@@ -731,11 +731,12 @@ fn is_negated(content: &str, match_start: usize, match_end: usize) -> bool {
     // "Don't hesitate to bypass" → "hesitate" is between negation and match.
     // Per plan: "negation must be the CLOSEST preceding verb modifier to the
     // matched action verb. If another verb intervenes, negation does NOT apply."
-    let has_intervening_verb = Regex::new(
-        r"(?i)\b(?:and\s+then|but\s+instead|however|then|hesitate|try|want|need|wish|plan|decide|choose|proceed|continue|start|begin|feel\s+free|go\s+ahead)\b"
-    )
-    .ok()
-    .is_some_and(|re| re.is_match(between));
+    static INTERVENING_VERB_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(?:and\s+then|but\s+instead|however|then|hesitate|try|want|need|wish|plan|decide|choose|proceed|continue|start|begin|feel\s+free|go\s+ahead)\b"
+        ).expect("intervening verb regex")
+    });
+    let has_intervening_verb = INTERVENING_VERB_RE.is_match(between);
     if has_intervening_verb {
         return false;
     }
@@ -846,6 +847,9 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
     // Try weak patterns (only if no strong/legacy match)
     for (regex, description) in WEAK_PATTERNS.iter() {
         if let Some(m) = regex.find(content) {
+            if is_negated(content, m.start(), m.end()) {
+                continue;
+            }
             let severity = if is_known {
                 Severity::Medium
             } else {
@@ -1067,9 +1071,15 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Extract host portion from a URL string.
+/// Extract host portion from a URL string, handling IPv6 brackets.
 fn extract_host_from_url(url: &str) -> Option<&str> {
     let after_scheme = url.find("://").map(|i| &url[i + 3..])?;
+    // IPv6: http://[::1]:8080/path → extract "::1"
+    if after_scheme.starts_with('[') {
+        let bracket_end = after_scheme.find(']')?;
+        return Some(&after_scheme[1..bracket_end]);
+    }
+    // IPv4 / hostname: stop at '/', ':', or '?'
     let host_end = after_scheme
         .find(['/', ':', '?'])
         .unwrap_or(after_scheme.len());

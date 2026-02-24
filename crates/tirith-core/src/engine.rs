@@ -235,8 +235,8 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" {
-                i += 2; // skip -u and its value
+            if w == "-u" || w == "-C" || w == "-S" {
+                i += 2; // skip option and its value
                 continue;
             }
             i += 1;
@@ -274,8 +274,16 @@ fn resolve_command_wrapper(args: &[String]) -> Option<String> {
 
 /// Resolve through `time` wrapper: skip -prefixed flags, take next non-flag.
 fn resolve_time_wrapper(args: &[String]) -> Option<String> {
-    for w in args {
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
         if w.starts_with('-') {
+            // GNU time flags that consume the next argument
+            if w == "-f" || w == "-o" || w == "--format" || w == "--output" {
+                i += 2;
+                continue;
+            }
+            i += 1;
             continue;
         }
         return Some(w.rsplit('/').next().unwrap_or(w).to_string());

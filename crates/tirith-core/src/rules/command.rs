@@ -394,11 +394,18 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
 
         for arg in &segment.args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
-            if trimmed.starts_with('-') {
-                continue;
-            }
+            // For --flag=value args, extract and check the value after '='
+            let value_to_check = if trimmed.starts_with('-') {
+                if let Some(pos) = trimmed.find('=') {
+                    trimmed[pos + 1..].trim_matches(|c: char| c == '\'' || c == '"')
+                } else {
+                    continue;
+                }
+            } else {
+                trimmed
+            };
 
-            if let Some(host) = extract_host_from_arg(trimmed) {
+            if let Some(host) = extract_host_from_arg(value_to_check) {
                 if METADATA_ENDPOINTS.contains(&host.as_str()) {
                     findings.push(Finding {
                         rule_id: RuleId::MetadataEndpoint,
@@ -486,10 +493,14 @@ fn strip_port(host_port: &str) -> String {
 fn is_private_ip(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let octets = ip.octets();
-        return octets[0] == 10
-            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-            || (octets[0] == 192 && octets[1] == 168)
-            || octets[0] == 127;
+        return octets[0] == 10                                          // 10.0.0.0/8
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))     // 172.16.0.0/12
+            || (octets[0] == 192 && octets[1] == 168)                   // 192.168.0.0/16
+            || octets[0] == 127                                         // 127.0.0.0/8
+            || (octets[0] == 169 && octets[1] == 254)                   // 169.254.0.0/16 link-local
+            || (octets[0] == 100 && (64..=127).contains(&octets[1]))    // 100.64.0.0/10 CGNAT
+            || octets[0] == 0                                           // 0.0.0.0/8
+            || octets[0] >= 224; // 224.0.0.0/4 multicast + reserved
     }
     false
 }
