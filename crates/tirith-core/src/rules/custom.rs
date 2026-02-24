@@ -18,6 +18,14 @@ pub struct CompiledCustomRule {
 pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
     let mut compiled = Vec::new();
     for rule in rules {
+        if rule.pattern.len() > 1024 {
+            eprintln!(
+                "tirith: custom rule '{}' pattern too long ({} chars), skipping",
+                rule.id,
+                rule.pattern.len()
+            );
+            continue;
+        }
         let regex = match Regex::new(&rule.pattern) {
             Ok(r) => r,
             Err(e) => {

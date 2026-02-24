@@ -52,7 +52,14 @@ function _tirith_parse_approval {
             if ($parts.Count -ge 2) {
                 switch ($parts[0]) {
                     "TIRITH_REQUIRES_APPROVAL" { $script:_tirith_ap_required = $parts[1]; $validKeys++ }
-                    "TIRITH_APPROVAL_TIMEOUT" { $script:_tirith_ap_timeout = [int]$parts[1] }
+                    "TIRITH_APPROVAL_TIMEOUT" {
+                        $parsed = 0
+                        if ([int]::TryParse($parts[1], [ref]$parsed)) {
+                            $script:_tirith_ap_timeout = $parsed
+                        } else {
+                            [Console]::Error.WriteLine("tirith: warning: invalid approval timeout '$($parts[1])', using 0")
+                        }
+                    }
                     "TIRITH_APPROVAL_FALLBACK" { $script:_tirith_ap_fallback = $parts[1] }
                     "TIRITH_APPROVAL_RULE" { $script:_tirith_ap_rule = $parts[1] }
                     "TIRITH_APPROVAL_DESCRIPTION" { $script:_tirith_ap_desc = $parts[1] }
@@ -60,7 +67,6 @@ function _tirith_parse_approval {
             }
         }
     } catch {
-        # Read failure → fail closed: reset validKeys so corrupt-check triggers
         [Console]::Error.WriteLine("tirith: warning: approval file read failed: $_")
         $script:_tirith_ap_required = "yes"
         $script:_tirith_ap_fallback = "block"

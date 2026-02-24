@@ -85,6 +85,8 @@ fn run_fixture(fixture: &Fixture) {
         interactive: true,
         cwd: None,
         file_path,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -433,6 +435,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "command_network_deny",
     // Config file
     "config_injection",
+    "config_suspicious_indicator",
+    "config_malformed",
     "config_non_ascii",
     "config_invisible_unicode",
     "mcp_insecure_server",
@@ -512,6 +516,7 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "server_cloaking",   // requires network fetch (Unix-only)
     "clipboard_hidden",  // requires --html clipboard input
     "pdf_hidden_text",   // requires .pdf file input
+    "config_malformed",  // requires MCP config filename context in file scan
 ];
 
 #[test]
@@ -587,6 +592,8 @@ fn test_rule_id_list_is_complete() {
         RuleId::PrivateNetworkAccess,
         RuleId::CommandNetworkDeny,
         RuleId::ConfigInjection,
+        RuleId::ConfigSuspiciousIndicator,
+        RuleId::ConfigMalformed,
         RuleId::ConfigNonAscii,
         RuleId::ConfigInvisibleUnicode,
         RuleId::McpInsecureServer,
@@ -661,6 +668,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "mcp_suspicious_args",       // file context, no URL needed
         "mcp_overly_permissive",     // file context, no URL needed
         "mcp_duplicate_server_name", // file context, no URL needed
+        "metadata_endpoint",         // bare IP: curl 169.254.169.254/path
+        "private_network_access",    // bare IP: curl 10.0.0.1/path
     ]
     .into_iter()
     .collect();
@@ -826,6 +835,8 @@ fn test_tier1_does_not_gate_findings() {
             interactive: true,
             cwd: None,
             file_path,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
 
@@ -869,6 +880,8 @@ fn test_non_ascii_paste_not_sole_warn() {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
         let verdict = engine::analyze(&ctx);

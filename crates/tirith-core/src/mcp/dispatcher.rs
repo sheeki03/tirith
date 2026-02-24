@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
@@ -19,35 +19,32 @@ enum State {
 pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
     let mut state = State::AwaitingInit;
 
-    /// Maximum line size: 10 MiB. Lines exceeding this are rejected as a
-    /// parse error (-32700) to prevent memory exhaustion from malicious input.
+    /// Maximum line size: 10 MiB. Prevents a single huge JSON-RPC message
+    /// from consuming unbounded memory.
     const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 
     let mut line = String::new();
     loop {
         line.clear();
-        match read_line_limited(&mut input, &mut line, MAX_LINE_BYTES) {
+        match (&mut input)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_line(&mut line)
+        {
             Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(LineLimitError::TooLong) => {
+            Ok(n) if n > MAX_LINE_BYTES => {
                 let _ = writeln!(
                     log,
-                    "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit"
+                    "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit, dropping"
                 );
-                let resp = JsonRpcResponse::err(
-                    Value::Null,
-                    JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: line exceeds {MAX_LINE_BYTES} byte limit"),
-                        data: None,
-                    },
-                );
-                write_response(&mut output, &resp);
-                // Drain the rest of the oversized line so the next read starts fresh
-                drain_until_newline(&mut input);
+                // Drain remainder of this oversized line (up to next newline)
+                let mut discard = Vec::new();
+                if !line.ends_with('\n') {
+                    let _ = input.read_until(b'\n', &mut discard);
+                }
                 continue;
             }
-            Err(LineLimitError::Io(e)) => {
+            Ok(_) => {}
+            Err(e) => {
                 let _ = writeln!(log, "tirith mcp-server: stdin read error: {e}");
                 return 1;
             }
@@ -55,6 +52,33 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // Cap individual message size at 10 MiB to prevent DoS
+        const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+        if trimmed.len() > MAX_LINE_LEN {
+            let _ = writeln!(
+                log,
+                "tirith mcp-server: message too large ({} bytes), dropping",
+                trimmed.len()
+            );
+            let resp = JsonRpcResponse::err(
+                Value::Null,
+                JsonRpcError {
+                    code: -32700,
+                    message: format!(
+                        "Message too large: {} bytes exceeds {} byte limit",
+                        trimmed.len(),
+                        MAX_LINE_LEN
+                    ),
+                    data: None,
+                },
+            );
+            if !write_response(&mut output, &resp) {
+                let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                return 1;
+            }
             continue;
         }
 
@@ -71,7 +95,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -95,7 +122,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -112,7 +142,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         }
@@ -129,7 +162,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -185,7 +221,17 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                 }
                 "tools/call" => {
                     let result = handle_tools_call(&params);
-                    JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap_or(json!({})))
+                    match serde_json::to_value(result) {
+                        Ok(v) => JsonRpcResponse::ok(id, v),
+                        Err(e) => JsonRpcResponse::err(
+                            id,
+                            JsonRpcError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                                data: None,
+                            },
+                        ),
+                    }
                 }
                 "resources/list" => {
                     let resources = resources::list();
@@ -203,7 +249,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             },
         };
 
-        write_response(&mut output, &response);
+        if !write_response(&mut output, &response) {
+            let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+            return 1;
+        }
     }
 
     let _ = writeln!(log, "tirith mcp-server: stdin closed, exiting");
@@ -236,7 +285,10 @@ fn handle_initialize(params: &Option<Value>) -> Value {
         },
     };
 
-    serde_json::to_value(result).unwrap_or(json!({}))
+    serde_json::to_value(result).unwrap_or_else(|e| {
+        eprintln!("tirith: mcp: initialize serialization failed: {e}");
+        json!({})
+    })
 }
 
 fn handle_tools_call(params: &Option<Value>) -> ToolCallResult {
@@ -296,7 +348,7 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
         Err(msg) => JsonRpcResponse::err(
             id,
             JsonRpcError {
-                code: -32602,
+                code: -32603, // Internal error (not invalid params — uri validated above)
                 message: msg,
                 data: None,
             },
@@ -308,61 +360,23 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
 // I/O
 // ---------------------------------------------------------------------------
 
-/// Error from the bounded line reader.
-enum LineLimitError {
-    TooLong,
-    Io(std::io::Error),
-}
-
-/// Read a single line (up to `\n`) into `buf`, but fail if the line exceeds
-/// `max_bytes`. Returns the number of bytes read (0 = EOF).
-fn read_line_limited(
-    reader: &mut impl BufRead,
-    buf: &mut String,
-    max_bytes: usize,
-) -> Result<usize, LineLimitError> {
-    let mut total = 0usize;
-    loop {
-        let available = match reader.fill_buf() {
-            Ok(b) => b,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(LineLimitError::Io(e)),
-        };
-        if available.is_empty() {
-            return Ok(total); // EOF
+/// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
+fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
+    match serde_json::to_string(resp) {
+        Ok(json) => {
+            if writeln!(output, "{json}").is_err() || output.flush().is_err() {
+                return false; // Output pipe broken — caller should exit
+            }
+            true
         }
-        // Find newline position in the available buffer
-        let (used, done) = match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => (pos + 1, true),
-            None => (available.len(), false),
-        };
-        total += used;
-        if total > max_bytes {
-            reader.consume(used);
-            return Err(LineLimitError::TooLong);
+        Err(_) => {
+            // Serialization failed — should not happen with well-formed types.
+            // Attempt to send an internal error response as a fallback.
+            let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
+            let _ = writeln!(output, "{fallback}");
+            let _ = output.flush();
+            true
         }
-        // Safety: we will only push valid UTF-8 (lossy replacement for non-UTF-8)
-        let chunk = String::from_utf8_lossy(&available[..used]);
-        buf.push_str(&chunk);
-        reader.consume(used);
-        if done {
-            return Ok(total);
-        }
-    }
-}
-
-/// After detecting an oversized line, drain remaining bytes until the next newline
-/// so subsequent reads start at a clean message boundary.
-fn drain_until_newline(reader: &mut impl BufRead) {
-    let mut discard = String::new();
-    // read_line reads until \n (inclusive) or EOF
-    let _ = reader.read_line(&mut discard);
-}
-
-fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) {
-    if let Ok(json) = serde_json::to_string(resp) {
-        let _ = writeln!(output, "{json}");
-        let _ = output.flush();
     }
 }
 
@@ -640,28 +654,5 @@ mod tests {
         assert_eq!(resps.len(), 2);
         assert_eq!(resps[1]["id"], Value::Null);
         assert_eq!(resps[1]["result"], json!({}));
-    }
-
-    #[test]
-    fn test_oversized_line_rejected() {
-        // Build a line that exceeds the internal 10 MiB limit.
-        // We use a much smaller limit by testing the helper directly,
-        // but for the integration test we craft a line > 10 MiB.
-        // Instead, test the helper function with a small limit.
-        let data = "a".repeat(200);
-        let mut buf = String::new();
-        let mut cursor = std::io::Cursor::new(format!("{data}\n"));
-        let result = read_line_limited(&mut cursor, &mut buf, 100);
-        assert!(matches!(result, Err(LineLimitError::TooLong)));
-    }
-
-    #[test]
-    fn test_normal_line_accepted() {
-        let data = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
-        let mut buf = String::new();
-        let mut cursor = std::io::Cursor::new(format!("{data}\n"));
-        let result = read_line_limited(&mut cursor, &mut buf, 10 * 1024 * 1024);
-        assert!(result.is_ok());
-        assert!(buf.contains("ping"));
     }
 }

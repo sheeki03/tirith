@@ -121,21 +121,41 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
     // Read file content with size cap (10 MiB)
     const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-    let metadata = std::fs::metadata(file_path).ok()?;
+    let metadata = match std::fs::metadata(file_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "tirith: scan: cannot read metadata for {}: {e}",
+                file_path.display()
+            );
+            return None;
+        }
+    };
     if metadata.len() > MAX_FILE_SIZE {
-        return Some(FileScanResult {
-            path: file_path.to_path_buf(),
-            findings: vec![],
-            is_config_file: false,
-        });
+        eprintln!(
+            "tirith: scan: skipping {} ({}B exceeds {}B limit)",
+            file_path.display(),
+            metadata.len(),
+            MAX_FILE_SIZE
+        );
+        return None;
     }
 
-    let raw_bytes = std::fs::read(file_path).ok()?;
+    let raw_bytes = match std::fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("tirith: scan: cannot read {}: {e}", file_path.display());
+            return None;
+        }
+    };
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let is_config = is_priority_file(file_path);
 
-    let cwd = file_path.parent().map(|p| p.display().to_string());
+    let cwd = file_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,
@@ -144,6 +164,8 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
         interactive: false,
         cwd: cwd.clone(),
         file_path: Some(file_path.to_path_buf()),
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -174,6 +196,8 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         interactive: false,
         cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -219,6 +243,7 @@ fn collect_files(path: &Path, recursive: bool, ignore_patterns: &[String]) -> Ve
     }
 
     if !path.is_dir() {
+        eprintln!("tirith: scan: path does not exist: {}", path.display());
         return vec![];
     }
 
@@ -235,10 +260,23 @@ fn collect_files_recursive(
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: scan: cannot read directory {}: {e}", dir.display());
+            return;
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "tirith: scan: error reading entry in {}: {e}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 

@@ -59,6 +59,8 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html,
     };
 
@@ -66,6 +68,21 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
 
     // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    // Log to audit BEFORE paranoia filtering so the audit captures full detection
+    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Skip if bypass was honored — analyze() already logged it.
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(
+            &verdict,
+            &ctx.input,
+            None,
+            Some(event_id),
+            &policy.dlp_custom_patterns,
+        );
+    }
+
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     // Write last_trigger.json for non-allow verdicts
@@ -73,20 +90,12 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
         last_trigger::write_last_trigger(&verdict, &ctx.input);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(
-        &verdict,
-        &ctx.input,
-        None,
-        Some(event_id),
-        &policy.dlp_custom_patterns,
-    );
-
     if json {
-        let _ = output::write_json(&verdict, std::io::stdout().lock());
-    } else {
-        let _ = output::write_human_auto(&verdict);
+        if output::write_json(&verdict, std::io::stdout().lock()).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+        }
+    } else if output::write_human_auto(&verdict).is_err() {
+        eprintln!("tirith: failed to write output");
     }
 
     verdict.action.exit_code()

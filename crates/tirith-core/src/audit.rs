@@ -50,7 +50,13 @@ pub fn log_verdict(
 
     // Ensure directory exists
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "tirith: audit: cannot create log dir {}: {e}",
+                parent.display()
+            );
+            return;
+        }
     }
 
     let entry = AuditEntry {
@@ -89,7 +95,7 @@ pub fn log_verdict(
     let file = match file {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("tirith: audit: failed to open {}: {e}", path.display());
+            eprintln!("tirith: audit: cannot open {}: {e}", path.display());
             return;
         }
     };
@@ -98,31 +104,41 @@ pub fn log_verdict(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-            eprintln!(
-                "tirith: audit: failed to set permissions on {}: {e}",
-                path.display()
-            );
-        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
     if let Err(e) = file.lock_exclusive() {
-        eprintln!("tirith: audit: failed to lock {}: {e}", path.display());
+        eprintln!("tirith: audit: cannot lock {}: {e}", path.display());
         return;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
-        eprintln!("tirith: audit: failed to write to {}: {e}", path.display());
+        eprintln!("tirith: audit: write failed: {e}");
+        let _ = fs2::FileExt::unlock(&file);
+        return;
     }
     if let Err(e) = writer.flush() {
-        eprintln!("tirith: audit: failed to flush {}: {e}", path.display());
+        eprintln!("tirith: audit: flush failed: {e}");
     }
     if let Err(e) = file.sync_all() {
-        eprintln!("tirith: audit: failed to sync {}: {e}", path.display());
+        eprintln!("tirith: audit: sync failed: {e}");
     }
-    if let Err(e) = fs2::FileExt::unlock(&file) {
-        eprintln!("tirith: audit: failed to unlock {}: {e}", path.display());
+    let _ = fs2::FileExt::unlock(&file);
+
+    // --- Remote audit upload (Phase 10) ---
+    // Check if a policy server is configured via env vars. If so, spool the
+    // redacted audit entry for background upload.
+    let server_url = std::env::var("TIRITH_SERVER_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let api_key = std::env::var("TIRITH_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let (Some(url), Some(key)) = (server_url, api_key) {
+        if crate::license::current_tier() >= crate::license::Tier::Team {
+            crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
+        }
     }
 }
 
@@ -139,7 +155,7 @@ fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
         dlp_redacted
     } else {
         format!(
-            "{}[...redacted {} chars]",
+            "{}[...redacted {} bytes]",
             prefix,
             dlp_redacted.len() - prefix.len()
         )
@@ -151,13 +167,18 @@ mod tests {
     use super::*;
     use crate::verdict::{Action, Verdict};
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_tirith_log_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
         // Set TIRITH_LOG=0 to disable logging
-        std::env::set_var("TIRITH_LOG", "0");
+        unsafe { std::env::set_var("TIRITH_LOG", "0") };
 
         let verdict = Verdict {
             action: Action::Allow,
@@ -191,7 +212,7 @@ mod tests {
         );
 
         // Clean up env var
-        std::env::remove_var("TIRITH_LOG");
+        unsafe { std::env::remove_var("TIRITH_LOG") };
     }
 
     #[cfg(unix)]
@@ -220,5 +241,57 @@ mod tests {
             0o600,
             "audit log should be 0600"
         );
+    }
+
+    #[test]
+    fn test_remote_audit_upload_requires_team_tier() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let state_home = dir.path().join("state");
+
+        // Force Community tier and set remote upload env vars.
+        unsafe { std::env::set_var("TIRITH_LICENSE", "!") };
+        unsafe { std::env::set_var("TIRITH_SERVER_URL", "https://example.com") };
+        unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        unsafe { std::env::remove_var("TIRITH_LOG") };
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+        };
+
+        log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
+
+        let spool = state_home.join("tirith").join("audit-queue.jsonl");
+        assert!(
+            !spool.exists(),
+            "Community tier must not spool remote audit uploads"
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_LICENSE") };
     }
 }

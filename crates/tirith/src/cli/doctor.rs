@@ -211,6 +211,26 @@ fn print_human(info: &DoctorInfo) {
             "not available (Unix-only)"
         }
     );
+
+    // License key format diagnostics
+    use tirith_core::license::KeyFormatStatus;
+    match tirith_core::license::key_format_status() {
+        KeyFormatStatus::LegacyUnsigned => {
+            eprintln!("  license key:  WARNING: Using unsigned license key. Signed tokens will be required in a future release.");
+        }
+        KeyFormatStatus::LegacyInvalid => {
+            eprintln!("  license key:  WARNING: Invalid legacy license format. Key will not be recognized.");
+        }
+        KeyFormatStatus::Malformed => {
+            eprintln!("  license key:  WARNING: License key appears malformed (bad signed token structure).");
+        }
+        KeyFormatStatus::SignedStructural => {
+            eprintln!("  license key:  signed (structural check passed)");
+        }
+        KeyFormatStatus::NoKey => {
+            eprintln!("  license key:  not found");
+        }
+    }
 }
 
 /// Check if the user's shell profile contains tirith init configuration.
@@ -284,7 +304,6 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
         }
     }
 
-    // Return the first existing profile (or first candidate if none exist)
     let primary = first_existing.or_else(|| profile_candidates.into_iter().next());
     (primary, false)
 }

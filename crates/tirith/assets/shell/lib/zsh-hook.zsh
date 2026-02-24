@@ -42,7 +42,7 @@ _tirith_parse_approval() {
 
   if [[ ! -r "$file" ]]; then
     _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
-    rm -f "$file"  # ADR-7: delete on all paths
+    command rm -f "$file"  # ADR-7: delete on all paths
     _tirith_ap_required="yes"
     _tirith_ap_fallback="block"
     _tirith_ap_timeout=0
@@ -60,7 +60,7 @@ _tirith_parse_approval() {
     esac
   done < "$file"
 
-  rm -f "$file"
+  command rm -f "$file"
 
   if [[ $valid_keys -eq 0 ]]; then
     _tirith_output "tirith: warning: approval file corrupt, failing closed"
@@ -91,7 +91,7 @@ _tirith_accept_line() {
   approval_path=$(tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
   local rc=$?
   local output=$(<"$errfile")
-  rm -f "$errfile"
+  command rm -f "$errfile"
 
   if [[ $rc -eq 0 ]]; then
     :  # Allow: no output
@@ -108,7 +108,7 @@ _tirith_accept_line() {
     _tirith_output ""
     [[ -n "$output" ]] && _tirith_output "$output"
     _tirith_output "tirith: unexpected exit code $rc — running unprotected"
-    [[ -n "$approval_path" ]] && rm -f "$approval_path"
+    [[ -n "$approval_path" ]] && command rm -f "$approval_path"
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
     return
   fi
@@ -184,7 +184,7 @@ _tirith_bracketed_paste() {
     echo -n "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
     local rc=$?
     local output=$(<"$tmpfile")
-    rm -f "$tmpfile"
+    command rm -f "$tmpfile"
 
     if [[ $rc -eq 0 ]]; then
       # Allow: fall through to keep paste

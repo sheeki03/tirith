@@ -351,6 +351,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Redirect output to dotfiles in home directory (> ~/.bashrc, >> $HOME/.profile)",
     },
     PatternEntry {
+        id: "git_sink",
+        tier1_exec_fragments: &[r"git\s+(?:clone|fetch|pull|submodule|remote)\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "Git download subcommands that may reference schemeless URLs",
+    },
+    PatternEntry {
         id: "archive_extract_sensitive",
         tier1_exec_fragments: &[r"(?:tar|unzip|7z)\s"],
         tier1_paste_only_fragments: &[],
@@ -390,6 +396,17 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_exec_fragments: &[r"169\.254\.169\.254", r"100\.100\.100\.200"],
         tier1_paste_only_fragments: &[],
         notes: "Cloud metadata endpoint IP addresses (AWS, Alibaba Cloud)",
+    },
+    PatternEntry {
+        id: "private_network_ip",
+        tier1_exec_fragments: &[
+            r"\b10\.\d+\.\d+\.\d+",
+            r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+",
+            r"\b192\.168\.\d+\.\d+",
+            r"\b127\.\d+\.\d+\.\d+",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Private/reserved IPv4 address ranges for SSRF/lateral-movement detection",
     },
     PatternEntry {
         id: "non_ascii_paste",

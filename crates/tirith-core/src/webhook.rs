@@ -5,46 +5,20 @@
 use crate::policy::WebhookConfig;
 use crate::verdict::{Severity, Verdict};
 
-/// Tracks background webhook delivery threads and ensures they complete.
-///
-/// Call `flush()` (or let the dispatcher drop) to join all pending deliveries
-/// before process exit.
-pub struct WebhookDispatcher {
-    handles: Vec<std::thread::JoinHandle<()>>,
-}
-
-impl WebhookDispatcher {
-    /// Block until all pending webhook deliveries have completed.
-    pub fn flush(&mut self) {
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for WebhookDispatcher {
-    fn drop(&mut self) {
-        self.flush();
-    }
-}
-
 /// Dispatch webhook notifications for a verdict, if configured.
 ///
-/// Returns a `WebhookDispatcher` whose `flush()` method (or `Drop` impl) joins
-/// all background delivery threads, ensuring they complete before process exit.
+/// Spawns a background thread per webhook endpoint. The main thread is never
+/// blocked. If any webhook delivery fails after retries, errors are logged
+/// to stderr.
 #[cfg(unix)]
 pub fn dispatch(
     verdict: &Verdict,
     command_preview: &str,
     webhooks: &[WebhookConfig],
     custom_dlp_patterns: &[String],
-) -> WebhookDispatcher {
-    let mut dispatcher = WebhookDispatcher {
-        handles: Vec::new(),
-    };
-
+) {
     if webhooks.is_empty() {
-        return dispatcher;
+        return;
     }
 
     // Apply DLP redaction: built-in patterns + custom policy patterns (Team)
@@ -62,19 +36,22 @@ pub fn dispatch(
             continue;
         }
 
+        // SSRF protection: validate webhook URL
+        if let Err(reason) = crate::url_validate::validate_server_url(&wh.url) {
+            eprintln!("tirith: webhook: skipping {}: {reason}", wh.url);
+            continue;
+        }
+
         let payload = build_payload(verdict, &redacted_preview, wh);
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
 
-        let handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             if let Err(e) = send_with_retry(&url, &payload, &headers, 3) {
                 eprintln!("tirith: webhook delivery to {url} failed: {e}");
             }
         });
-        dispatcher.handles.push(handle);
     }
-
-    dispatcher
 }
 
 /// No-op on non-Unix platforms.
@@ -84,10 +61,7 @@ pub fn dispatch(
     _command_preview: &str,
     _webhooks: &[WebhookConfig],
     _custom_dlp_patterns: &[String],
-) -> WebhookDispatcher {
-    WebhookDispatcher {
-        handles: Vec::new(),
-    }
+) {
 }
 
 /// Build the webhook payload from a template or default JSON.
@@ -106,7 +80,7 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
             .max()
             .unwrap_or(Severity::Info);
 
-        template
+        let result = template
             .replace("{{rule_id}}", &sanitize_for_json(&rule_ids.join(",")))
             .replace("{{command_preview}}", &sanitize_for_json(command_preview))
             .replace(
@@ -117,54 +91,50 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
                 "{{severity}}",
                 &sanitize_for_json(&max_severity.to_string()),
             )
-            .replace("{{finding_count}}", &verdict.findings.len().to_string())
-    } else {
-        // Default JSON payload
-        let rule_ids: Vec<String> = verdict
-            .findings
-            .iter()
-            .map(|f| f.rule_id.to_string())
-            .collect();
-        let max_severity = verdict
-            .findings
-            .iter()
-            .map(|f| f.severity)
-            .max()
-            .unwrap_or(Severity::Info);
-
-        serde_json::json!({
-            "event": "tirith_finding",
-            "action": format!("{:?}", verdict.action),
-            "severity": max_severity.to_string(),
-            "rule_ids": rule_ids,
-            "finding_count": verdict.findings.len(),
-            "command_preview": sanitize_for_json(command_preview),
-        })
-        .to_string()
+            .replace("{{finding_count}}", &verdict.findings.len().to_string());
+        // Only use template result if it's valid JSON
+        if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
+            return result;
+        }
+        eprintln!(
+            "tirith: webhook: warning: payload template produced invalid JSON, using default payload"
+        );
     }
+
+    // Default JSON payload (also used as fallback when template produces invalid JSON)
+    let rule_ids: Vec<String> = verdict
+        .findings
+        .iter()
+        .map(|f| f.rule_id.to_string())
+        .collect();
+    let max_severity = verdict
+        .findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Info);
+
+    serde_json::json!({
+        "event": "tirith_finding",
+        "action": format!("{:?}", verdict.action),
+        "severity": max_severity.to_string(),
+        "rule_ids": rule_ids,
+        "finding_count": verdict.findings.len(),
+        "command_preview": sanitize_for_json(command_preview),
+    })
+    .to_string()
 }
 
 /// Expand environment variables in header values (`$VAR` or `${VAR}`).
-///
-/// Headers whose expanded value is empty (e.g. because the referenced env var
-/// is unset) are dropped with a warning, preventing empty auth headers from
-/// being sent to webhook endpoints.
 #[cfg(unix)]
 fn expand_env_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter_map(|(k, v)| {
+        .map(|(k, v)| {
             let expanded = expand_env_value(v);
-            if expanded.is_empty() {
-                eprintln!(
-                    "tirith: webhook header '{k}' expanded to empty (env var unset?), skipping"
-                );
-                None
-            } else {
-                Some((k.clone(), expanded))
-            }
+            (k.clone(), expanded)
         })
         .collect()
 }
@@ -179,18 +149,40 @@ fn expand_env_value(input: &str) -> String {
         if c == '$' {
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
-                let var_name: String = chars.by_ref().take_while(|&c| c != '}').collect();
-                if let Ok(val) = std::env::var(&var_name) {
-                    result.push_str(&val);
+                let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
+                if !var_name.starts_with("TIRITH_") {
+                    eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                } else {
+                    match std::env::var(&var_name) {
+                        Ok(val) => result.push_str(&val),
+                        Err(_) => {
+                            eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                        }
+                    }
                 }
             } else {
-                let var_name: String = chars
-                    .by_ref()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
+                // CR-6: Use peek to avoid consuming the delimiter character
+                let mut var_name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        var_name.push(ch);
+                        chars.next();
+                    } else {
+                        break; // Don't consume the delimiter
+                    }
+                }
                 if !var_name.is_empty() {
-                    if let Ok(val) = std::env::var(&var_name) {
-                        result.push_str(&val);
+                    if !var_name.starts_with("TIRITH_") {
+                        eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                    } else {
+                        match std::env::var(&var_name) {
+                            Ok(val) => result.push_str(&val),
+                            Err(_) => {
+                                eprintln!(
+                                    "tirith: webhook: warning: env var '{var_name}' is not set"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -229,6 +221,10 @@ fn send_with_retry(
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 let status = resp.status();
+                // SF-16: Don't retry client errors (4xx) — they will never succeed
+                if status.is_client_error() {
+                    return Err(format!("HTTP {status} (non-retriable client error)"));
+                }
                 if attempt + 1 < max_attempts {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
                     std::thread::sleep(delay);
@@ -264,6 +260,10 @@ fn sanitize_for_json(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Mutex to serialize tests that mutate environment variables.
+    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_sanitize_for_json() {
         assert_eq!(sanitize_for_json("hello"), "hello");
@@ -281,7 +281,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value() {
-        std::env::set_var("TIRITH_TEST_WH", "secret123");
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_TEST_WH", "secret123") };
         assert_eq!(
             expand_env_value("Bearer $TIRITH_TEST_WH"),
             "Bearer secret123"
@@ -291,7 +292,18 @@ mod tests {
             "Bearer secret123"
         );
         assert_eq!(expand_env_value("no vars"), "no vars");
-        std::env::remove_var("TIRITH_TEST_WH");
+        unsafe { std::env::remove_var("TIRITH_TEST_WH") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_expand_env_value_preserves_delimiter() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // CR-6: The character after $VAR must not be swallowed
+        unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
+        assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
+        assert_eq!(expand_env_value("$TIRITH_TEST_WH2 rest"), "val rest");
+        unsafe { std::env::remove_var("TIRITH_TEST_WH2") };
     }
 
     #[cfg(unix)]

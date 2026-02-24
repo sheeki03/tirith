@@ -72,6 +72,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Expected SHA-256 hash of the downloaded script (abort if mismatch)
+        #[arg(long)]
+        sha256: Option<String>,
     },
 
     /// Score a URL for security risk
@@ -145,6 +149,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Output as SARIF 2.1.0 JSON
+        #[arg(long)]
+        sarif: bool,
+
         /// Patterns to ignore
         #[arg(long)]
         ignore: Vec<String>,
@@ -171,6 +179,21 @@ enum Commands {
         action: AuditAction,
     },
 
+    /// Activate a license key
+    Activate {
+        /// The signed license token
+        key: String,
+    },
+
+    /// Show or manage license status
+    License {
+        #[command(subcommand)]
+        action: Option<LicenseAction>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -192,6 +215,14 @@ enum Commands {
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+}
+
+#[derive(Subcommand)]
+enum LicenseAction {
+    /// Deactivate current license
+    Deactivate,
+    /// Refresh license from server
+    Refresh,
 }
 
 #[derive(Subcommand)]
@@ -296,6 +327,12 @@ enum CheckpointAction {
 }
 
 fn main() {
+    // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     let exit_code = match cli.command {
@@ -318,7 +355,12 @@ fn main() {
         Commands::Paste { shell, json, html } => cli::paste::run(&shell, json, html.as_deref()),
 
         #[cfg(unix)]
-        Commands::Run { url, no_exec, json } => cli::run::run(&url, no_exec, json),
+        Commands::Run {
+            url,
+            no_exec,
+            json,
+            sha256,
+        } => cli::run::run(&url, no_exec, json, sha256),
 
         Commands::Score { url, json } => cli::score::run(&url, json),
 
@@ -333,6 +375,7 @@ fn main() {
             ci,
             fail_on,
             json,
+            sarif,
             ignore,
         } => cli::scan::run(
             path.as_deref(),
@@ -341,6 +384,7 @@ fn main() {
             ci,
             &fail_on,
             json,
+            sarif,
             &ignore,
         ),
 
@@ -387,6 +431,14 @@ fn main() {
             }
             CheckpointAction::Diff { id, json } => cli::checkpoint::diff_checkpoint(&id, json),
             CheckpointAction::Purge { json } => cli::checkpoint::purge_checkpoints(json),
+        },
+
+        Commands::Activate { key } => cli::license_cmd::activate(&key),
+
+        Commands::License { action, json } => match action {
+            None => cli::license_cmd::show(json),
+            Some(LicenseAction::Deactivate) => cli::license_cmd::deactivate(),
+            Some(LicenseAction::Refresh) => cli::license_cmd::refresh(),
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),

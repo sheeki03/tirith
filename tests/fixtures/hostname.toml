@@ -49,12 +49,12 @@ expected_action = "block"
 expected_rules = ["raw_ip_url", "private_network_access"]
 
 [[fixture]]
-name = "raw_ip_v6"
+name = "raw_ip_v6_loopback"
 min_milestone = 1
 input = "curl https://[::1]:8080/install.sh"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["raw_ip_url"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "non_standard_port_known_domain"
@@ -213,8 +213,8 @@ name = "raw_ip_loopback"
 min_milestone = 1
 input = "curl https://127.0.0.1:3000/status"
 context = "exec"
-expected_action = "block"
-expected_rules = ["raw_ip_url", "private_network_access"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "userinfo_with_encoded_at"

@@ -40,24 +40,63 @@ pub fn redact(input: &str) -> String {
     result
 }
 
+/// Pre-compiled set of custom DLP patterns.
+pub struct CompiledCustomPatterns {
+    patterns: Vec<Regex>,
+}
+
+impl CompiledCustomPatterns {
+    /// Compile custom DLP patterns once for reuse across multiple redaction calls.
+    pub fn new(raw_patterns: &[String]) -> Self {
+        let patterns = raw_patterns
+            .iter()
+            .filter_map(|pat_str| match Regex::new(pat_str) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
+                    None
+                }
+            })
+            .collect();
+        Self { patterns }
+    }
+}
+
 /// Redact using both built-in and custom patterns from policy.
 pub fn redact_with_custom(input: &str, custom_patterns: &[String]) -> String {
     let mut result = redact(input);
     for pat_str in custom_patterns {
+        if pat_str.len() > 1024 {
+            eprintln!(
+                "tirith: DLP pattern too long ({} chars), skipping",
+                pat_str.len()
+            );
+            continue;
+        }
         match Regex::new(pat_str) {
             Ok(re) => {
                 result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
             }
             Err(e) => {
-                eprintln!("tirith: invalid DLP pattern '{pat_str}': {e}");
+                eprintln!("tirith: warning: invalid custom DLP pattern '{pat_str}': {e}");
             }
         }
     }
     result
 }
 
+/// Redact using built-in patterns and pre-compiled custom patterns (avoids per-call recompilation).
+pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
+    let mut result = redact(input);
+    for re in &compiled.patterns {
+        result = re.replace_all(&result, "[REDACTED:custom]").into_owned();
+    }
+    result
+}
+
 /// Redact sensitive content from a Finding's string fields in-place.
 pub fn redact_finding(finding: &mut crate::verdict::Finding, custom_patterns: &[String]) {
+    finding.title = redact_with_custom(&finding.title, custom_patterns);
     finding.description = redact_with_custom(&finding.description, custom_patterns);
     if let Some(ref mut v) = finding.human_view {
         *v = redact_with_custom(v, custom_patterns);
@@ -88,10 +127,8 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, custom_patterns: &[String]
         Evidence::ByteSequence { description, .. } => {
             *description = redact_with_custom(description, custom_patterns);
         }
-        // HostComparison contains domain names for similarity analysis, not user-controlled content
-        Evidence::HostComparison { .. } => {}
-        // HomoglyphAnalysis contains character-level Unicode analysis, not user-controlled content
-        Evidence::HomoglyphAnalysis { .. } => {}
+        // HostComparison and HomoglyphAnalysis contain domain names / char analysis, not user content
+        _ => {}
     }
 }
 

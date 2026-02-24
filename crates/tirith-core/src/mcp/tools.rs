@@ -9,6 +9,28 @@ use crate::tokenize::ShellType;
 
 use super::types::{ContentItem, ToolCallResult, ToolDefinition};
 
+/// Validate that a path is within the current working directory (path traversal protection).
+fn validate_path_scope(path: &std::path::Path) -> Result<PathBuf, String> {
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("Cannot determine working directory: {e}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("Cannot canonicalize working directory: {e}"))?;
+    let canonical_path = path.canonicalize().map_err(|_| {
+        format!(
+            "Path does not exist or is not accessible: {}",
+            path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(format!(
+            "Access denied: path '{}' is outside the working directory",
+            path.display()
+        ));
+    }
+    Ok(canonical_path)
+}
+
 /// Return the list of available tools.
 pub fn list() -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -121,7 +143,7 @@ pub fn list() -> Vec<ToolDefinition> {
         },
     ];
 
-    // Unix-only: cloaking detection (stub until Part 8)
+    // Unix-only: cloaking detection (requires network access)
     #[cfg(unix)]
     tools.push(ToolDefinition {
         name: "tirith_fetch_cloaking".into(),
@@ -169,14 +191,12 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         Some(c) => c,
         None => return tool_error("Missing required parameter: command"),
     };
-    let shell = match args
+    let shell = args
         .get("shell")
         .and_then(|v| v.as_str())
         .unwrap_or("posix")
-    {
-        "powershell" => ShellType::PowerShell,
-        _ => ShellType::Posix,
-    };
+        .parse::<ShellType>()
+        .unwrap_or(ShellType::Posix);
 
     let cwd = std::env::current_dir()
         .ok()
@@ -189,6 +209,8 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -197,7 +219,9 @@ fn call_check_command(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -216,8 +240,9 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: url"),
     };
 
-    // Wrap URL in a minimal curl command so the full pipeline runs
-    let input = format!("curl {url}");
+    // Wrap URL in a minimal curl command so the full pipeline runs.
+    // Shell-quote the URL to prevent metacharacters from being tokenized as separate commands.
+    let input = format!("curl '{}'", url.replace('\'', "'\\''"));
     let ctx = AnalysisContext {
         input,
         shell: ShellType::Posix,
@@ -226,6 +251,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -234,7 +261,9 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -262,6 +291,8 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -270,7 +301,9 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     apply_approval_if_team(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    let structured = serde_json::to_value(&verdict).ok();
+    let structured = serde_json::to_value(&verdict)
+        .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
+        .ok();
     let text = format_verdict_text(&verdict);
 
     ToolCallResult {
@@ -290,9 +323,10 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
-    }
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
 
     let policy = crate::policy::Policy::discover(None);
 
@@ -331,6 +365,10 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         .unwrap_or(true);
 
     let path = PathBuf::from(path_str);
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
     if !path.is_dir() {
         return tool_error(&format!("Not a directory: {path_str}"));
     }
@@ -384,9 +422,10 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
-    }
+    let path = match validate_path_scope(&path) {
+        Ok(p) => p,
+        Err(e) => return tool_error(&e),
+    };
 
     let policy = crate::policy::Policy::discover(None);
 
@@ -465,7 +504,7 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
 /// Extracted for testability — diff_text is DLP-redacted before serialization.
 #[cfg(unix)]
 fn build_cloaking_response(
-    result: crate::rules::cloaking::CloakingResult,
+    mut result: crate::rules::cloaking::CloakingResult,
     is_pro: bool,
     dlp_patterns: &[String],
 ) -> ToolCallResult {
@@ -484,33 +523,14 @@ fn build_cloaking_response(
         format!("No cloaking detected for {}", result.url)
     };
 
-    let structured = serde_json::json!({
-        "url": result.url,
-        "cloaking_detected": result.cloaking_detected,
-        "agents": result.agent_responses.iter().map(|a| {
-            serde_json::json!({
-                "agent": a.agent_name,
-                "status_code": a.status_code,
-                "content_length": a.content_length,
-            })
-        }).collect::<Vec<_>>(),
-        "diffs": result.diff_pairs.iter().map(|d| {
-            let mut entry = serde_json::json!({
-                "agent_a": d.agent_a,
-                "agent_b": d.agent_b,
-                "diff_chars": d.diff_chars,
-            });
-            // Pro enrichment: include diff text (DLP-redacted)
-            if is_pro {
-                if let Some(ref text) = d.diff_text {
-                    let redacted = crate::redact::redact_with_custom(text, dlp_patterns);
-                    entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(redacted));
-                }
-            }
-            entry
-        }).collect::<Vec<_>>(),
-        "findings": result.findings,
-    });
+    // DLP-redact diff text before serialization
+    for diff in &mut result.diff_pairs {
+        if let Some(ref text) = diff.diff_text {
+            diff.diff_text = Some(crate::redact::redact_with_custom(text, dlp_patterns));
+        }
+    }
+
+    let structured = result.to_json(is_pro);
 
     ToolCallResult {
         content: vec![ContentItem {

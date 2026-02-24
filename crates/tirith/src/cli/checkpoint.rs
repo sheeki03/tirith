@@ -22,7 +22,10 @@ pub fn list_checkpoints(json: bool) -> i32 {
                 }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
+                        eprintln!("tirith: checkpoint: JSON serialization failed: {e}");
+                        "{}".to_string()
+                    })
                 );
             } else {
                 if entries.is_empty() {
@@ -77,7 +80,10 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                 });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
+                        eprintln!("tirith: checkpoint: JSON serialization failed: {e}");
+                        "{}".to_string()
+                    })
                 );
             } else {
                 println!("Restored {} file(s):", restored.len());
@@ -105,7 +111,10 @@ pub fn diff_checkpoint(id: &str, json: bool) -> i32 {
                 });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
+                        eprintln!("tirith: checkpoint: JSON serialization failed: {e}");
+                        "{}".to_string()
+                    })
                 );
             } else if diffs.is_empty() {
                 println!("No differences found — all files match checkpoint.");
@@ -138,7 +147,10 @@ pub fn purge_checkpoints(json: bool) -> i32 {
                 let json_val = serde_json::json!(result);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
+                        eprintln!("tirith: checkpoint: JSON serialization failed: {e}");
+                        "{}".to_string()
+                    })
                 );
             } else if result.removed_count == 0 {
                 println!("No checkpoints needed purging.");
@@ -167,7 +179,10 @@ pub fn create_checkpoint(paths: &[String], trigger: Option<&str>, json: bool) ->
                 let json_val = serde_json::json!(meta);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                    serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
+                        eprintln!("tirith: checkpoint: JSON serialization failed: {e}");
+                        "{}".to_string()
+                    })
                 );
             } else {
                 println!("Checkpoint created: {}", meta.id);
