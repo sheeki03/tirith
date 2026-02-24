@@ -48,7 +48,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+        if words[idx] == "TIRITH=0" {
             return true;
         }
         idx += 1;
@@ -67,7 +67,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w.starts_with("TIRITH=0") || w == "TIRITH=0" {
+                    if w == "TIRITH=0" {
                         return true;
                     }
                     idx += 1;
@@ -86,7 +86,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+                if words[idx] == "TIRITH=0" {
                     return true;
                 }
                 idx += 1;
@@ -249,9 +249,13 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip `--`, take next arg.
+/// Resolve through `command` wrapper: skip flags like -v, -p, -V, then `--`, take next arg.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
+    // Skip flags like -v, -p, -V
+    while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
+        i += 1;
+    }
     // Skip -- if present
     if i < args.len() && args[i] == "--" {
         i += 1;
@@ -275,25 +279,10 @@ fn resolve_time_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Check if a command name is tirith (literal or path match).
+/// Check if a command name is tirith (literal match).
+/// Note: callers already strip path prefixes via rsplit('/'), so only basename arrives here.
 fn is_tirith_command(cmd: &str) -> bool {
-    if cmd == "tirith" {
-        return true;
-    }
-    // Path form: try canonicalize and compare to current_exe
-    if cmd.contains('/') {
-        let cmd_path = std::path::Path::new(cmd);
-        if let Ok(canonical_cmd) = cmd_path.canonicalize() {
-            if let Ok(current) = std::env::current_exe() {
-                if let Ok(canonical_current) = current.canonicalize() {
-                    return canonical_cmd == canonical_current;
-                }
-            }
-        }
-        // Canonicalization failed — don't auto-allow, return false
-        return false;
-    }
-    false
+    cmd == "tirith"
 }
 
 /// Run the tiered analysis pipeline.
