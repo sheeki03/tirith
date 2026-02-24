@@ -122,7 +122,6 @@ fn receipt_not_ready_page(checkout_id: &str) -> String {
 <head>
 <meta charset="utf-8">
 <title>Tirith — Processing</title>
-<meta http-equiv="refresh" content="2">
 <style>
   body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #333; }}
   .spinner {{ display: inline-block; width: 20px; height: 20px; border: 3px solid #ddd; border-top-color: #333; border-radius: 50%; animation: spin 1s linear infinite; }}
@@ -132,15 +131,22 @@ fn receipt_not_ready_page(checkout_id: &str) -> String {
 <script>
   let retries = 0;
   const maxRetries = 30;
-  const interval = setInterval(() => {{
+  const poll = setInterval(async () => {{
     retries++;
     const el = document.getElementById('count');
     if (el) el.textContent = retries;
     if (retries >= maxRetries) {{
-      clearInterval(interval);
+      clearInterval(poll);
       document.getElementById('loading').style.display = 'none';
       document.getElementById('timeout').style.display = 'block';
+      return;
     }}
+    try {{
+      const r = await fetch(location.href);
+      if (r.ok && !(await r.text()).includes('Processing Your License')) {{
+        location.reload();
+      }}
+    }} catch(_) {{}}
   }}, 2000);
 </script>
 </head>

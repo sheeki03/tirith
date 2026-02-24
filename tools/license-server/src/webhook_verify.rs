@@ -33,7 +33,12 @@ pub fn verify_webhook(
         .parse()
         .map_err(|_| WebhookError::InvalidTimestamp)?;
     let now = chrono::Utc::now().timestamp();
-    if (now - ts).abs() > max_age_secs {
+    // Use checked_sub to prevent overflow with extreme timestamps
+    let expired = now
+        .checked_sub(ts)
+        .map(|d| d.unsigned_abs() > max_age_secs as u64)
+        .unwrap_or(true);
+    if expired {
         return Err(WebhookError::TimestampExpired);
     }
 

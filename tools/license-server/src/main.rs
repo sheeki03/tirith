@@ -253,7 +253,8 @@ fn spawn_backup_task(config: Config) {
                 move || -> Result<(), String> {
                     let src =
                         Db::open_readonly(&db_path).map_err(|e| format!("open readonly: {e}"))?;
-                    src.execute_batch(&format!("VACUUM INTO '{backup_path_str}'"))
+                    let safe_path = backup_path_str.replace('\'', "''");
+                    src.execute_batch(&format!("VACUUM INTO '{safe_path}'"))
                         .map_err(|e| format!("VACUUM INTO: {e}"))?;
                     Ok(())
                 }

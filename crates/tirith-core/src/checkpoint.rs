@@ -583,21 +583,21 @@ fn backup_dir_recursive(
         };
         let path = entry.path();
 
-        if path.is_symlink() {
+        // Use symlink_metadata to avoid TOCTOU race between is_symlink() and later reads
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        if meta.file_type().is_symlink() {
             continue; // Skip symlinks for safety
         }
 
-        if path.is_file() {
-            let size = match path.metadata() {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    eprintln!(
-                        "tirith: checkpoint: cannot read size of {}: {e}",
-                        path.display()
-                    );
-                    0
-                }
-            };
+        if meta.file_type().is_file() {
+            let size = meta.len();
             if size > max_single_file {
                 eprintln!(
                     "tirith: checkpoint: skip large file {} ({} bytes)",

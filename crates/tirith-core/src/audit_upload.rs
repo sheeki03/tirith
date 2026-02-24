@@ -59,7 +59,7 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
         // Walk from newest (end) to oldest (start), keep until over budget
         for line in result.into_iter().rev() {
             let line_bytes = line.len() as u64 + 1;
-            if running_bytes + line_bytes > max_bytes {
+            if running_bytes + line_bytes > max_bytes && !kept.is_empty() {
                 break;
             }
             running_bytes += line_bytes;
