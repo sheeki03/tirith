@@ -124,14 +124,15 @@ fn is_powershell_tirith_bypass(word: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
-        return false;
-    }
-    let after_env = &after_dollar[4..];
-    if !after_env.starts_with("TIRITH=") {
-        return false;
-    }
-    let value = &after_env["TIRITH=".len()..];
+    let prefix = "env:";
+    let after_env = match after_dollar.get(..prefix.len()) {
+        Some(s) if s.eq_ignore_ascii_case(prefix) => &after_dollar[prefix.len()..],
+        _ => return false,
+    };
+    let value = match after_env.strip_prefix("TIRITH=") {
+        Some(v) => v,
+        None => return false,
+    };
     strip_surrounding_quotes(value) == "0"
 }
 
@@ -141,10 +142,13 @@ fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
-        return false;
-    }
-    &after_dollar[4..] == var_name
+    let prefix = "env:";
+    after_dollar
+        .get(..prefix.len())
+        .map_or(false, |s| s.eq_ignore_ascii_case(prefix))
+        && after_dollar
+            .get(prefix.len()..)
+            .map_or(false, |s| s == var_name)
 }
 
 /// Strip a single layer of matching quotes (single or double) from a string.
