@@ -351,6 +351,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Redirect output to dotfiles in home directory (> ~/.bashrc, >> $HOME/.profile)",
     },
     PatternEntry {
+        id: "git_sink",
+        tier1_exec_fragments: &[r"git\s+(?:clone|fetch|pull|submodule|remote)\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "Git download subcommands that may reference schemeless URLs",
+    },
+    PatternEntry {
         id: "archive_extract_sensitive",
         tier1_exec_fragments: &[r"(?:tar|unzip|7z)\s"],
         tier1_paste_only_fragments: &[],

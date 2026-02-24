@@ -30,20 +30,29 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
     /// File path being scanned (only populated for ScanContext::FileScan).
     pub file_path: Option<std::path::PathBuf>,
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// `file_path`'s parent as implicit repo root.
+    pub repo_root: Option<String>,
+    /// True when `file_path` was explicitly provided by the user as a config file.
+    pub is_config_override: bool,
     /// Clipboard HTML content for rich-text paste analysis.
     /// Only populated when `tirith paste --html <path>` is used.
     pub clipboard_html: Option<String>,
 }
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
-/// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
-fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
+/// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
+/// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
+fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
     let words = split_raw_words(input);
     if words.is_empty() {
         return false;
     }
+
+    // POSIX / Fish: VAR=VALUE prefix or env wrapper
+    // (Fish 3.1+ and all POSIX shells support `TIRITH=0 command`)
 
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
@@ -74,9 +83,18 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     continue;
                 }
                 if w.starts_with('-') {
-                    // -u takes a value arg
-                    if w == "-u" {
-                        idx += 2; // skip -u and its value
+                    if w.starts_with("--") {
+                        // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                        if !w.contains('=') {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    // Short flags that take a separate value arg
+                    if w == "-u" || w == "-C" || w == "-S" {
+                        idx += 2;
                         continue;
                     }
                     idx += 1;
@@ -95,7 +113,77 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
         }
     }
 
+    // PowerShell: $env:TIRITH="0" or $env:TIRITH = "0" (before first ;)
+    if shell == ShellType::PowerShell {
+        for word in &words {
+            if is_powershell_tirith_bypass(word) {
+                return true;
+            }
+        }
+        // Multi-word: $env:TIRITH = "0" (space around =)
+        if words.len() >= 3 {
+            for window in words.windows(3) {
+                if is_powershell_env_ref(&window[0], "TIRITH")
+                    && window[1] == "="
+                    && strip_surrounding_quotes(&window[2]) == "0"
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Check if a word is `$env:TIRITH=0` with optional quotes around the value.
+/// The `$env:` prefix is matched case-insensitively (PowerShell convention).
+fn is_powershell_tirith_bypass(word: &str) -> bool {
+    if !word.starts_with('$') || word.len() < "$env:TIRITH=0".len() {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
+        return false;
+    }
+    let after_env = &after_dollar[4..];
+    if !after_env
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("TIRITH="))
+    {
+        return false;
+    }
+    let value = &after_env[7..];
+    strip_surrounding_quotes(value) == "0"
+}
+
+/// Check if a word is a PowerShell env var reference `$env:VARNAME` (no assignment).
+fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
+    if !word.starts_with('$') {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
+        return false;
+    }
+    after_dollar[4..].eq_ignore_ascii_case(var_name)
+}
+
+/// Strip a single layer of matching quotes (single or double) from a string.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
@@ -228,8 +316,18 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" {
-                i += 2; // skip -u and its value
+            if w.starts_with("--") {
+                // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                if !w.contains('=') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            // Short flags that take a separate value arg
+            if w == "-u" || w == "-C" || w == "-S" {
+                i += 2;
                 continue;
             }
             i += 1;
@@ -436,6 +534,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(crate::rules::configfile::check(
             &ctx.input,
             ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref().map(std::path::Path::new),
+            ctx.is_config_override,
         ));
 
         // Rendered content rules (file-type gated)
@@ -673,6 +773,7 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 /// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
 pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
     retain_by_paranoia(&mut verdict.findings, paranoia);
+    verdict.action = recalculate_action(&verdict.findings);
 }
 
 /// Filter a Vec<Finding> by paranoia level and license tier.
@@ -680,6 +781,24 @@ pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
 /// (for scan results that don't use the Verdict wrapper).
 pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
     retain_by_paranoia(findings, paranoia);
+}
+
+/// Recalculate verdict action from the current findings (same logic as `Verdict::from_findings`).
+fn recalculate_action(findings: &[Finding]) -> crate::verdict::Action {
+    use crate::verdict::{Action, Severity};
+    if findings.is_empty() {
+        return Action::Allow;
+    }
+    let max_severity = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Low);
+    match max_severity {
+        Severity::Critical | Severity::High => Action::Block,
+        Severity::Medium | Severity::Low => Action::Warn,
+        Severity::Info => Action::Allow,
+    }
 }
 
 /// Shared paranoia retention logic.
@@ -863,6 +982,8 @@ mod tests {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
         let verdict = analyze(&ctx);
@@ -1007,6 +1128,71 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_bypass_powershell_env() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_no_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_single_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH='0'; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_spaced() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH = \"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_mixed_case_env() {
+        assert!(find_inline_bypass(
+            "$Env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_wrong_value() {
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"1\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_other_var() {
+        assert!(!find_inline_bypass(
+            "$env:FOO=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_in_posix_mode() {
+        // PowerShell syntax should NOT match when shell is Posix
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
     fn test_self_invocation_simple() {
         assert!(is_self_invocation(
             "tirith diff https://example.com",
@@ -1051,6 +1237,115 @@ mod tests {
         assert!(!is_self_invocation(
             "curl https://evil.com",
             ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_c_flag() {
+        // env -C takes a directory arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -C /tmp TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_s_flag() {
+        // env -S takes a string arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -S 'some args' TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_env_c_flag() {
+        // env -C /tmp tirith should resolve through -C's value arg
+        assert!(is_self_invocation(
+            "env -C /tmp tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_env_c_misidentify() {
+        // env -C /tmp curl — should NOT be identified as self-invocation
+        assert!(!is_self_invocation(
+            "env -C /tmp curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_paranoia_filter_recalculates_action() {
+        use crate::verdict::{Action, Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::Medium,
+                title: "medium finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Before paranoia filter: action should be Warn (Medium max)
+        let mut verdict = Verdict::from_findings(findings, 3, timings);
+        assert_eq!(verdict.action, Action::Warn);
+
+        // After paranoia filter at level 1: Low is removed, only Medium remains → still Warn
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(verdict.action, Action::Warn);
+        assert_eq!(verdict.findings.len(), 1);
+    }
+
+    #[test]
+    fn test_powershell_bypass_case_insensitive_tirith() {
+        // PowerShell env vars are case-insensitive
+        assert!(find_inline_bypass(
+            "$env:tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(find_inline_bypass(
+            "$ENV:Tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_powershell_bypass_no_panic_on_multibyte() {
+        // Multi-byte UTF-8 after $ should not panic
+        assert!(!find_inline_bypass(
+            "$a\u{1F389}xyz; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(!find_inline_bypass(
+            "$\u{00E9}nv:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
         ));
     }
 }

@@ -313,7 +313,10 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
     }
 
     // Blocked commands summary
-    let blocked: Vec<_> = records.iter().filter(|r| r.action == "Block").collect();
+    let blocked: Vec<_> = records
+        .iter()
+        .filter(|r| r.action.eq_ignore_ascii_case("Block"))
+        .collect();
     if !blocked.is_empty() {
         report.push_str("## Blocked Commands\n\n");
         report.push_str(
@@ -321,7 +324,10 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
         );
         for r in blocked.iter().take(50) {
             let rules = r.rule_ids.join(", ");
-            let cmd = r.command_redacted.replace('|', "\\|");
+            let cmd = r
+                .command_redacted
+                .replace('|', "\\|")
+                .replace(['\n', '\r'], " ");
             report.push_str(&format!("| {} | {} | {} |\n", r.timestamp, rules, cmd));
         }
         if blocked.len() > 50 {
@@ -421,7 +427,10 @@ tr:nth-child(even) { background: #e9ecef; }
     }
 
     // Blocked commands
-    let blocked: Vec<_> = records.iter().filter(|r| r.action == "Block").collect();
+    let blocked: Vec<_> = records
+        .iter()
+        .filter(|r| r.action.eq_ignore_ascii_case("Block"))
+        .collect();
     if !blocked.is_empty() {
         html.push_str("<h2>Blocked Commands</h2>\n<table><tr><th>Timestamp</th><th>Rules</th><th>Command Preview</th></tr>\n");
         for r in blocked.iter().take(50) {

@@ -152,7 +152,10 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
 
     let is_config = is_priority_file(file_path);
 
-    let cwd = file_path.parent().map(|p| p.display().to_string());
+    let cwd = file_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,
@@ -161,6 +164,8 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
         interactive: false,
         cwd: cwd.clone(),
         file_path: Some(file_path.to_path_buf()),
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -191,6 +196,8 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         interactive: false,
         cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 

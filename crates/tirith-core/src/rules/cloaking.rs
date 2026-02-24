@@ -234,7 +234,7 @@ fn normalize_html(input: &str) -> String {
     static STYLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap());
     static NONCE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bnonce="[^"]*""#).unwrap());
     static CSRF: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r#"(?i)csrf[_-]?token[^"]*"[^"]*""#).unwrap());
+        Lazy::new(|| Regex::new(r#"(?i)<[^>]*csrf[_-]?token[^>]*>"#).unwrap());
     static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
     let s = SCRIPT.replace_all(input, "");

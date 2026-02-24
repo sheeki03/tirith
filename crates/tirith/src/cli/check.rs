@@ -57,6 +57,8 @@ pub fn run(
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -64,6 +66,21 @@ pub fn run(
 
     // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    // Log to audit BEFORE paranoia filtering so the audit captures full detection
+    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Skip if bypass was honored — analyze() already logged it.
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(
+            &verdict,
+            cmd,
+            None,
+            Some(event_id),
+            &policy.dlp_custom_patterns,
+        );
+    }
+
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     // Approval workflow (Team feature)
@@ -81,15 +98,6 @@ pub fn run(
                         return 1;
                     }
                 }
-                // Log to audit before returning
-                let event_id = uuid::Uuid::new_v4().to_string();
-                tirith_core::audit::log_verdict(
-                    &verdict,
-                    cmd,
-                    None,
-                    Some(event_id),
-                    &policy.dlp_custom_patterns,
-                );
                 return verdict.action.exit_code();
             }
         } else if approval_check {
@@ -135,16 +143,6 @@ pub fn run(
         last_trigger::write_last_trigger(&verdict, cmd);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(
-        &verdict,
-        cmd,
-        None,
-        Some(event_id),
-        &policy.dlp_custom_patterns,
-    );
-
     // Webhook dispatch (Team feature, non-blocking background thread)
     if tirith_core::license::current_tier() >= tirith_core::license::Tier::Team
         && !policy.webhooks.is_empty()
@@ -174,6 +172,9 @@ pub fn run(
     } else if output::write_human_auto(&verdict).is_err() {
         eprintln!("tirith: failed to write output");
     }
+
+    // Warn if license is expiring soon (Pro+ only)
+    crate::cli::license_cmd::warn_if_expiring_soon();
 
     verdict.action.exit_code()
 }

@@ -1,12 +1,13 @@
 use tirith_core::runner::{self, RunOptions};
 
-pub fn run(url: &str, no_exec: bool, json: bool) -> i32 {
+pub fn run(url: &str, no_exec: bool, json: bool, expected_sha256: Option<String>) -> i32 {
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
     let opts = RunOptions {
         url: url.to_string(),
         no_exec,
         interactive,
+        expected_sha256,
     };
 
     match runner::run(opts) {

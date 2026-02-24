@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
@@ -16,20 +16,69 @@ enum State {
 /// Reads JSON-RPC messages from `input` (one per line), writes responses to
 /// `output`. Logs go to `log` (typically stderr). Returns exit code 0 on clean
 /// shutdown (EOF on input).
-pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
+pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
     let mut state = State::AwaitingInit;
 
-    for line in input.lines() {
-        let line = match line {
-            Ok(l) => l,
+    /// Maximum line size: 10 MiB. Prevents a single huge JSON-RPC message
+    /// from consuming unbounded memory.
+    const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match (&mut input)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_line(&mut line)
+        {
+            Ok(0) => break, // EOF
+            Ok(n) if n > MAX_LINE_BYTES => {
+                let _ = writeln!(
+                    log,
+                    "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit, dropping"
+                );
+                // Drain remainder of this oversized line (up to next newline)
+                let mut discard = Vec::new();
+                if !line.ends_with('\n') {
+                    let _ = input.read_until(b'\n', &mut discard);
+                }
+                continue;
+            }
+            Ok(_) => {}
             Err(e) => {
                 let _ = writeln!(log, "tirith mcp-server: stdin read error: {e}");
                 return 1;
             }
-        };
+        }
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // Cap individual message size at 10 MiB to prevent DoS
+        const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+        if trimmed.len() > MAX_LINE_LEN {
+            let _ = writeln!(
+                log,
+                "tirith mcp-server: message too large ({} bytes), dropping",
+                trimmed.len()
+            );
+            let resp = JsonRpcResponse::err(
+                Value::Null,
+                JsonRpcError {
+                    code: -32700,
+                    message: format!(
+                        "Message too large: {} bytes exceeds {} byte limit",
+                        trimmed.len(),
+                        MAX_LINE_LEN
+                    ),
+                    data: None,
+                },
+            );
+            if !write_response(&mut output, &resp) {
+                let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                return 1;
+            }
             continue;
         }
 
@@ -172,13 +221,17 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
                 }
                 "tools/call" => {
                     let result = handle_tools_call(&params);
-                    JsonRpcResponse::ok(
-                        id,
-                        serde_json::to_value(result).unwrap_or_else(|e| {
-                            eprintln!("tirith: mcp: tools/call serialization failed: {e}");
-                            json!({})
-                        }),
-                    )
+                    match serde_json::to_value(result) {
+                        Ok(v) => JsonRpcResponse::ok(id, v),
+                        Err(e) => JsonRpcResponse::err(
+                            id,
+                            JsonRpcError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                                data: None,
+                            },
+                        ),
+                    }
                 }
                 "resources/list" => {
                     let resources = resources::list();
@@ -295,7 +348,7 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
         Err(msg) => JsonRpcResponse::err(
             id,
             JsonRpcError {
-                code: -32602,
+                code: -32603, // Internal error (not invalid params — uri validated above)
                 message: msg,
                 data: None,
             },

@@ -15,6 +15,8 @@ pub fn run(url: &str, json: bool) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -34,7 +36,7 @@ pub fn run(url: &str, json: bool) -> i32 {
             .iter()
             .map(|f| f.severity)
             .max()
-            .unwrap_or(Severity::Low);
+            .unwrap_or(Severity::Info);
 
         let (score, level) = severity_to_score(max_severity, verdict.findings.len());
 
@@ -56,7 +58,7 @@ pub fn run(url: &str, json: bool) -> i32 {
             .iter()
             .map(|f| f.severity)
             .max()
-            .unwrap_or(Severity::Low);
+            .unwrap_or(Severity::Info);
         let (score, level) = severity_to_score(max_severity, verdict.findings.len());
         eprintln!("tirith: {url} — risk score: {score}/100 ({level})");
         if output::write_human_auto(&verdict).is_err() {

@@ -27,9 +27,23 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
     findings
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    ) || host.starts_with("127.")
+        || host.ends_with(".localhost")
+}
+
 fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Finding>) {
     if let Some(scheme) = url.scheme() {
         if scheme == "http" && in_sink {
+            // Loopback traffic never leaves the machine — no MITM risk.
+            if let Some(host) = url.host() {
+                if is_loopback_host(host) {
+                    return;
+                }
+            }
             findings.push(Finding {
                 rule_id: RuleId::PlainHttpToSink,
                 severity: Severity::High,
