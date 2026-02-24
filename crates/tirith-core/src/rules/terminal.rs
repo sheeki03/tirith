@@ -402,11 +402,14 @@ fn strip_html_tags(html: &str) -> String {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
+    static SCRIPT_STYLE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<(?:script|style)[^>]*>.*?</(?:script|style)>").unwrap());
     static TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]*>").unwrap());
     static ENTITIES: Lazy<Regex> = Lazy::new(|| Regex::new(r"&[a-zA-Z]+;|&#\d+;").unwrap());
     static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
-    let s = TAGS.replace_all(html, " ");
+    let s = SCRIPT_STYLE.replace_all(html, " ");
+    let s = TAGS.replace_all(&s, " ");
     let s = ENTITIES.replace_all(&s, " ");
     let s = WHITESPACE.replace_all(&s, " ");
     s.trim().to_string()
@@ -456,8 +459,7 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.rule_id == RuleId::ClipboardHidden && f.title.contains("more text")),
-            "should detect length discrepancy: {:?}",
-            findings
+            "should detect length discrepancy: {findings:?}"
         );
     }
 
@@ -468,8 +470,7 @@ mod tests {
         let findings = check_clipboard_html(html, plain_text);
         assert!(
             findings.is_empty(),
-            "clean clipboard HTML should not trigger: {:?}",
-            findings
+            "clean clipboard HTML should not trigger: {findings:?}"
         );
     }
 

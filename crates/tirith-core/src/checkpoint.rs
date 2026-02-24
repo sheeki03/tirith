@@ -113,6 +113,7 @@ impl Default for CheckpointConfig {
 /// Rejects path traversal attempts (`..`, `/`, `\`) and empty strings.
 fn validate_checkpoint_id(id: &str) -> Result<(), String> {
     if id.is_empty()
+        || id == "."
         || id.contains("..")
         || id.contains('/')
         || id.contains('\\')
@@ -318,10 +319,19 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
             continue;
         }
 
+        // Reject path traversal attempts in manifest entries
+        if entry.original_path.contains("..")
+            || entry.original_path.starts_with('/')
+            || entry.original_path.starts_with('\\')
+        {
+            return Err(format!("unsafe path in manifest: {}", entry.original_path));
+        }
+
         let dst = Path::new(&entry.original_path);
         // Create parent directories
         if let Some(parent) = dst.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("restore mkdir {}: {e}", entry.original_path))?;
         }
 
         fs::copy(&src, dst).map_err(|e| format!("restore {}: {e}", entry.original_path))?;
@@ -365,7 +375,8 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
-        let current_sha = sha256_file(current_path).unwrap_or_default();
+        let current_sha = sha256_file(current_path)
+            .map_err(|e| format!("diff hash {}: {e}", entry.original_path))?;
         if current_sha != entry.sha256 {
             seen_paths.insert(entry.original_path.clone());
             diffs.push(DiffEntry {
@@ -651,7 +662,7 @@ mod tests {
         fs::create_dir_all(&files_dir).unwrap();
 
         let entries = backup_dir(&dir, &files_dir).unwrap();
-        assert_eq!(entries.len(), 2, "should backup 2 files: {:?}", entries);
+        assert_eq!(entries.len(), 2, "should backup 2 files: {entries:?}");
     }
 
     #[test]

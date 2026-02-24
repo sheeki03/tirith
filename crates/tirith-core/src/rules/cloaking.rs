@@ -158,6 +158,17 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         })
         .collect();
 
+    // If baseline fetch failed, we can't reliably detect cloaking
+    if baseline_body.is_empty() {
+        return Ok(CloakingResult {
+            url: url.to_string(),
+            cloaking_detected: false,
+            findings: Vec::new(),
+            agent_responses,
+            diff_pairs: Vec::new(),
+        });
+    }
+
     // Compare each non-baseline response against chrome baseline
     for (i, (name, _status, body)) in responses.iter().enumerate() {
         if i == baseline_idx {

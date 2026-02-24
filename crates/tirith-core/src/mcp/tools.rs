@@ -215,7 +215,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     };
 
     // Wrap URL in a minimal curl command so the full pipeline runs
-    let input = format!("curl {url}");
+    let escaped = url.replace('\'', "'\\''");
+    let input = format!("curl '{escaped}'");
     let ctx = AnalysisContext {
         input,
         shell: ShellType::Posix,
@@ -284,8 +285,8 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
+    if !path.is_file() {
+        return tool_error(&format!("File not found or is a directory: {path_str}"));
     }
 
     match scan::scan_single_file(&path) {
@@ -370,8 +371,8 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
     };
 
     let path = PathBuf::from(path_str);
-    if !path.exists() {
-        return tool_error(&format!("File not found: {path_str}"));
+    if !path.is_file() {
+        return tool_error(&format!("File not found or is a directory: {path_str}"));
     }
 
     // Use scan_single_file — it routes through FileScan which runs configfile rules

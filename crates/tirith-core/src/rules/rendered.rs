@@ -196,8 +196,11 @@ fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
         _ => {}
     }
 
-    // Hex: #rgb or #rrggbb
+    // Hex: #rgb or #rrggbb (validate ASCII hex to avoid panics on non-ASCII)
     if let Some(hex) = s.strip_prefix('#') {
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
@@ -220,9 +223,9 @@ fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
         let inner = &s[4..s.len() - 1];
         let parts: Vec<&str> = inner.split(',').collect();
         if parts.len() == 3 {
-            let r: f64 = parts[0].trim().parse().ok()?;
-            let g: f64 = parts[1].trim().parse().ok()?;
-            let b: f64 = parts[2].trim().parse().ok()?;
+            let r: f64 = parts[0].trim().parse::<f64>().ok()?.clamp(0.0, 255.0);
+            let g: f64 = parts[1].trim().parse::<f64>().ok()?.clamp(0.0, 255.0);
+            let b: f64 = parts[2].trim().parse::<f64>().ok()?.clamp(0.0, 255.0);
             return Some((r / 255.0, g / 255.0, b / 255.0));
         }
     }
@@ -905,8 +908,8 @@ mod tests {
     fn test_pdf_operand_to_f64() {
         assert_eq!(pdf_operand_to_f64(&lopdf::Object::Integer(42)), Ok(42.0));
         // Real stores f32 internally, so compare with tolerance
-        let real_val = pdf_operand_to_f64(&lopdf::Object::Real(3.14)).unwrap();
-        assert!((real_val - 3.14).abs() < 0.001, "got {real_val}");
+        let real_val = pdf_operand_to_f64(&lopdf::Object::Real(3.25)).unwrap();
+        assert!((real_val - 3.25).abs() < 0.001, "got {real_val}");
         assert!(pdf_operand_to_f64(&lopdf::Object::Boolean(true)).is_err());
     }
 

@@ -74,9 +74,8 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     continue;
                 }
                 if w.starts_with('-') {
-                    // -u takes a value arg
-                    if w == "-u" {
-                        idx += 2; // skip -u and its value
+                    if w == "-u" || w == "-C" || w == "-S" {
+                        idx += 2; // skip option and its value arg
                         continue;
                     }
                     idx += 1;
@@ -229,8 +228,8 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" {
-                i += 2; // skip -u and its value
+            if w == "-u" || w == "-C" || w == "-S" {
+                i += 2; // skip option and its value arg
                 continue;
             }
             i += 1;
@@ -666,6 +665,21 @@ pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
         crate::verdict::Severity::Low => effective >= 3,
         _ => true, // Medium/High/Critical always shown
     });
+
+    // Recalculate action after filtering
+    if verdict.findings.is_empty() {
+        verdict.action = crate::verdict::Action::Allow;
+    } else if let Some(max_sev) = verdict.findings.iter().map(|f| f.severity).max() {
+        verdict.action = match max_sev {
+            crate::verdict::Severity::Critical | crate::verdict::Severity::High => {
+                crate::verdict::Action::Block
+            }
+            crate::verdict::Severity::Medium | crate::verdict::Severity::Low => {
+                crate::verdict::Action::Warn
+            }
+            crate::verdict::Severity::Info => crate::verdict::Action::Allow,
+        };
+    }
 }
 
 /// Filter a Vec<Finding> by paranoia level and license tier.
@@ -1350,8 +1364,7 @@ mod tests {
         assert!(result.len() < 600, "should be truncated");
         assert!(
             result.contains("[truncated, 600 bytes]"),
-            "should have truncation marker, got: {}",
-            result
+            "should have truncation marker, got: {result}"
         );
     }
 
@@ -1491,24 +1504,18 @@ mod tests {
             let hv = f
                 .human_view
                 .as_ref()
-                .unwrap_or_else(|| panic!("missing human_view for {:?}", rule_id));
+                .unwrap_or_else(|| panic!("missing human_view for {rule_id:?}"));
             let av = f
                 .agent_view
                 .as_ref()
-                .unwrap_or_else(|| panic!("missing agent_view for {:?}", rule_id));
+                .unwrap_or_else(|| panic!("missing agent_view for {rule_id:?}"));
             assert!(
                 hv.contains(human_sub),
-                "{:?} human_view '{}' should contain '{}'",
-                rule_id,
-                hv,
-                human_sub
+                "{rule_id:?} human_view '{hv}' should contain '{human_sub}'"
             );
             assert!(
                 av.contains(agent_sub),
-                "{:?} agent_view '{}' should contain '{}'",
-                rule_id,
-                av,
-                agent_sub
+                "{rule_id:?} agent_view '{av}' should contain '{agent_sub}'"
             );
         }
 

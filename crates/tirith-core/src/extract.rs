@@ -685,7 +685,7 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     // the host part is likely a real domain even if its TLD overlaps a file extension
     // (e.g., evil.zip/payload is a real domain, not a filename).
     let host_lower = host_part.to_lowercase();
-    if !s.contains('/') {
+    if s.split('/').nth(1).is_none_or(|p| p.is_empty()) {
         let file_exts = [
             ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
             ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
