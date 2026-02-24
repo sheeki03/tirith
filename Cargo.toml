@@ -30,8 +30,10 @@ thiserror = "2"
 clap_complete = "4"
 clap_mangen = "0.2"
 uuid = { version = "1", features = ["v4"] }
-# Pin home <0.5.12 — v0.5.12 requires edition 2024 (Rust 1.85+), breaks MSRV 1.75
+# Pin home <0.5.12 — v0.5.12 requires edition 2024 (Rust 1.85+), breaks MSRV 1.83
 home = ">=0.5, <0.5.12"
+# Pin time <0.3.47 — v0.3.47 requires edition 2024 (Rust 1.85+), breaks MSRV 1.83
+time = ">=0.3, <0.3.47"
 libc = "0.2"
 lopdf = "0.34"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
