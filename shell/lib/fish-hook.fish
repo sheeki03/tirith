@@ -1,9 +1,14 @@
 # tirith fish hook
 # Binds Enter to check commands before execution.
 
-# Guard against double-loading
+# Guard against double-loading (session-local only).
+# If inherited from environment (exported by attacker/parent), ignore it.
 if set -q _TIRITH_FISH_LOADED
-    return
+    if set -q -x _TIRITH_FISH_LOADED
+        set -e _TIRITH_FISH_LOADED  # Inherited from env — ignore and load fresh
+    else
+        return  # Set in this session — genuine double-source guard
+    end
 end
 set -g _TIRITH_FISH_LOADED 1
 
@@ -40,20 +45,27 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         set -l output (cat $tmpfile | string collect)
         rm -f $tmpfile
 
-        if test $rc -eq 1
-            _tirith_output ""
-            _tirith_output "paste> $content"
-            if test -n "$output"
-                _tirith_output "$output"
-            end
-            commandline -f repaint
-            return
+        if test $rc -eq 0
+            # Allow: fall through to echo
         else if test $rc -eq 2
             if test -n "$output"
                 _tirith_output ""
                 _tirith_output "$output"
                 commandline -f repaint
             end
+            # Warn: fall through to echo
+        else
+            # Block or unexpected: discard
+            _tirith_output ""
+            _tirith_output "paste> $content"
+            if test -n "$output"
+                _tirith_output "$output"
+            end
+            if test $rc -ne 1
+                _tirith_output "tirith: unexpected exit code $rc — paste blocked for safety"
+            end
+            commandline -f repaint
+            return
         end
 
         echo -n "$content"
@@ -76,24 +88,30 @@ function _tirith_check_command
     set -l output (cat $tmpfile | string collect)
     rm -f $tmpfile
 
-    if test $rc -eq 1
-        # Block: show warning, clear line (no execute)
-        _tirith_output ""
-        _tirith_output "command> $cmd"
-        if test -n "$output"
-            _tirith_output "$output"
-        end
-        commandline -r ""
+    if test $rc -eq 0
+        commandline -f execute
     else if test $rc -eq 2
-        # Warn: show warning then execute
         _tirith_output ""
         _tirith_output "command> $cmd"
         if test -n "$output"
             _tirith_output "$output"
         end
         commandline -f execute
+    else if test $rc -eq 1
+        # Block: tirith intentionally blocked
+        _tirith_output ""
+        _tirith_output "command> $cmd"
+        if test -n "$output"
+            _tirith_output "$output"
+        end
+        commandline -r ""
     else
-        # Allow: execute normally
+        # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
+        _tirith_output ""
+        if test -n "$output"
+            _tirith_output "$output"
+        end
+        _tirith_output "tirith: unexpected exit code $rc — running unprotected"
         commandline -f execute
     end
 end

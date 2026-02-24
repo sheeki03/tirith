@@ -3,6 +3,7 @@
 **Your browser would catch this. Your terminal won't.**
 
 [![CI](https://github.com/sheeki03/tirith/actions/workflows/ci.yml/badge.svg)](https://github.com/sheeki03/tirith/actions/workflows/ci.yml)
+[![GitHub Stars](https://img.shields.io/github/stars/sheeki03/tirith?style=flat&logo=github)](https://github.com/sheeki03/tirith/stargazers)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE-AGPL)
 
 ---
@@ -39,7 +40,7 @@ tirith init --shell fish | source
 
 That's it. Every command you run is now guarded. Zero friction on clean input. Sub-millisecond overhead. You forget it's there until it saves you.
 
-Also available via [npm](#npm), [cargo](#cargo), [apt/dnf](#linux-packages), and [more](#install).
+Also available via [npm](#cross-platform), [cargo](#cross-platform), [mise](#cross-platform), [apt/dnf](#linux-packages), and [more](#install).
 
 ---
 
@@ -170,7 +171,7 @@ npm install -g tirith
 cargo install tirith
 ```
 
-**Mise:**
+**[Mise](https://mise.jdx.dev/)** (official registry):
 
 ```bash
 mise use -g tirith
@@ -207,7 +208,17 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 | fish | fish_preexec event | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
-In bash, enter mode is used by default, but SSH sessions automatically fall back to preexec mode for PTY compatibility.
+In bash, enter mode is used by default with a startup health gate and runtime self-healing. SSH sessions automatically fall back to preexec mode for PTY compatibility. If enter mode detects a failure, it auto-degrades to preexec and persists the decision across shells. Unexpected tirith errors (crashes, OOM-kills) trigger a mixed fail-safe policy: bash degrades to preexec, other shells warn and execute, paste paths always discard. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details.
+
+**Nix / Home-Manager:** tirith must be in your `$PATH` — the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
+
+```nix
+home.packages = [ pkgs.tirith ];
+
+programs.zsh.initContent = ''
+  eval "$(tirith init --shell zsh)"
+'';
+```
 
 ### Shell Integrations
 
@@ -350,3 +361,7 @@ use would trigger AGPL requirements and you prefer not to comply, contact
 sheeki003@gmail.com for commercial licensing options.
 
 Third-party data attributions in [NOTICE](NOTICE).
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=sheeki03/tirith&type=Date)](https://star-history.com/#sheeki03/tirith&Date)

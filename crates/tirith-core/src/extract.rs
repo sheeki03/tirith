@@ -120,7 +120,19 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         }
 
         // Control characters (< 0x20, excluding common whitespace and ESC)
-        if b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
+        // For \r: only flag when followed by non-\n (display-overwriting attack).
+        // Trailing \r and \r\n (Windows line endings) are benign clipboard artifacts.
+        if b == b'\r' {
+            let is_attack_cr = i + 1 < len && input[i + 1] != b'\n';
+            if is_attack_cr {
+                result.has_control_chars = true;
+                result.details.push(ByteFinding {
+                    offset: i,
+                    byte: b,
+                    description: format!("control character 0x{b:02x}"),
+                });
+            }
+        } else if b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
             result.has_control_chars = true;
             result.details.push(ByteFinding {
                 offset: i,
@@ -938,4 +950,59 @@ mod tests {
         );
     }
 
+    // ─── CR normalization tests ───
+
+    #[test]
+    fn test_scan_bytes_trailing_cr_not_flagged() {
+        let result = scan_bytes(b"/path\r");
+        assert!(
+            !result.has_control_chars,
+            "trailing \\r should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_scan_bytes_trailing_crlf_not_flagged() {
+        let result = scan_bytes(b"/path\r\n");
+        assert!(
+            !result.has_control_chars,
+            "trailing \\r\\n should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_scan_bytes_windows_multiline_not_flagged() {
+        let result = scan_bytes(b"line1\r\nline2\r\n");
+        assert!(
+            !result.has_control_chars,
+            "Windows \\r\\n line endings should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_scan_bytes_embedded_cr_still_flagged() {
+        let result = scan_bytes(b"safe\rmalicious");
+        assert!(
+            result.has_control_chars,
+            "embedded \\r before non-\\n should be flagged"
+        );
+    }
+
+    #[test]
+    fn test_scan_bytes_mixed_crlf_and_attack_cr() {
+        let result = scan_bytes(b"line1\r\nfake\roverwrite\r\n");
+        assert!(
+            result.has_control_chars,
+            "attack \\r mixed with \\r\\n should be flagged"
+        );
+    }
+
+    #[test]
+    fn test_scan_bytes_only_cr() {
+        let result = scan_bytes(b"\r");
+        assert!(
+            !result.has_control_chars,
+            "lone trailing \\r should not be flagged"
+        );
+    }
 }

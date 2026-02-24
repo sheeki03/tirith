@@ -21,6 +21,47 @@ pub struct RunOptions {
     pub interactive: bool,
 }
 
+/// Interpreters matched by exact name only.
+const ALLOWED_EXACT: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "deno", "bun", "nodejs",
+];
+
+/// Interpreter families that may have version suffixes (python3, python3.11, ruby3.2, node18, perl5.38).
+/// Matches: exact name OR name + digits[.digits]* suffix.
+const ALLOWED_FAMILIES: &[&str] = &["python", "ruby", "perl", "node"];
+
+fn is_allowed_interpreter(interpreter: &str) -> bool {
+    let base = interpreter.rsplit('/').next().unwrap_or(interpreter);
+
+    if ALLOWED_EXACT.contains(&base) {
+        return true;
+    }
+
+    for &family in ALLOWED_FAMILIES {
+        if base == family {
+            return true;
+        }
+        if let Some(suffix) = base.strip_prefix(family) {
+            if is_valid_version_suffix(suffix) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a suffix is a valid version string: digits (.digits)*
+/// Valid: "3", "3.11", "3.2.1"
+/// Invalid: "", ".3", "3.", "3..11", "evil"
+fn is_valid_version_suffix(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     // Check TTY requirement
     if !opts.no_exec && !opts.interactive {
@@ -95,13 +136,40 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         .join("cache");
     fs::create_dir_all(&cache_dir).map_err(|e| format!("create cache: {e}"))?;
     let cached_path = cache_dir.join(&sha256);
-    fs::write(&cached_path, &content).map_err(|e| format!("write cache: {e}"))?;
+    {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&cached_path)
+            .map_err(|e| format!("write cache: {e}"))?;
+        f.write_all(&content)
+            .map_err(|e| format!("write cache: {e}"))?;
+        // Harden legacy cache files
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
 
     let content_str = String::from_utf8_lossy(&content);
 
     // Analyze
     let interpreter = script_analysis::detect_interpreter(&content_str);
     let analysis = script_analysis::analyze(&content_str, interpreter);
+
+    // Enforce interpreter policy only when we might execute.
+    if !opts.no_exec && !is_allowed_interpreter(interpreter) {
+        return Err(format!(
+            "interpreter '{interpreter}' is not in the allowed list",
+        ));
+    }
 
     // Detect git repo and branch
     let (git_repo, git_branch) = detect_git_info();
@@ -142,7 +210,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     eprintln!(
         "tirith: downloaded {} bytes (SHA256: {})",
         content.len(),
-        &sha256[..12]
+        crate::receipt::short_hash(&sha256)
     );
     eprintln!("tirith: interpreter: {interpreter}");
     if analysis.has_sudo {
@@ -216,4 +284,93 @@ fn detect_git_info() -> (Option<String>, Option<String>) {
         .map(|s| s.trim().to_string());
 
     (repo, branch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_interpreter_sh() {
+        assert!(is_allowed_interpreter("sh"));
+    }
+
+    #[test]
+    fn test_allowed_interpreter_python3() {
+        assert!(is_allowed_interpreter("python3"));
+    }
+
+    #[test]
+    fn test_allowed_interpreter_python3_11() {
+        assert!(is_allowed_interpreter("python3.11"));
+    }
+
+    #[test]
+    fn test_allowed_interpreter_nodejs() {
+        assert!(is_allowed_interpreter("nodejs"));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_vim() {
+        assert!(!is_allowed_interpreter("vim"));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_expect() {
+        assert!(!is_allowed_interpreter("expect"));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_python_evil() {
+        assert!(!is_allowed_interpreter("python.evil"));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_node_sass() {
+        assert!(!is_allowed_interpreter("node-sass"));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_python3_trailing_dot() {
+        assert!(!is_allowed_interpreter("python3."));
+    }
+
+    #[test]
+    fn test_disallowed_interpreter_python3_double_dot() {
+        assert!(!is_allowed_interpreter("python3..11"));
+    }
+
+    #[test]
+    fn test_allowed_interpreter_strips_path() {
+        assert!(is_allowed_interpreter("/usr/bin/bash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_write_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("test_cache");
+
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&cache_path).unwrap();
+            f.write_all(b"test content").unwrap();
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        let meta = std::fs::metadata(&cache_path).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "cache file should be 0600"
+        );
+    }
 }

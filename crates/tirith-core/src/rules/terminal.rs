@@ -28,7 +28,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
             rule_id: RuleId::ControlChars,
             severity: Severity::High,
             title: "Control characters in pasted content".to_string(),
-            description: "Pasted content contains control characters (carriage return, backspace) that could hide the true command being executed".to_string(),
+            description: "Pasted content contains control characters (display-overwriting carriage return, backspace, etc.) that could hide the true command being executed".to_string(),
             evidence: scan.details.iter()
                 .filter(|d| d.description.contains("control"))
                 .map(|d| Evidence::ByteSequence {

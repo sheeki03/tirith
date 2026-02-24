@@ -3,8 +3,15 @@
 # Overrides accept-line widget to check commands before execution.
 # Overrides bracketed-paste widget to check pasted content.
 
-# Guard against double-loading
-[[ -n "$_TIRITH_ZSH_LOADED" ]] && return
+# Guard against double-loading (session-local only).
+# If inherited from environment (exported by attacker/parent), ignore it.
+if [[ -n "$_TIRITH_ZSH_LOADED" ]]; then
+  if [[ "${(t)_TIRITH_ZSH_LOADED}" == *export* ]]; then
+    unset _TIRITH_ZSH_LOADED  # Inherited from env — ignore and load fresh
+  else
+    return  # Set in this session — genuine double-source guard
+  fi
+fi
 _TIRITH_ZSH_LOADED=1
 
 # Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
@@ -34,26 +41,30 @@ _tirith_accept_line() {
 
   # Run tirith check, redirect to temp file to prevent tty leakage
   local tmpfile=$(mktemp)
-  tirith check --non-interactive --interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
+  tirith check --non-interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
   local rc=$?
   local output=$(<"$tmpfile")
   rm -f "$tmpfile"
 
-  if [[ $rc -eq 1 ]]; then
-    # Block: show command and output
+  if [[ $rc -eq 0 ]]; then
+    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
+  elif [[ $rc -eq 2 ]]; then
+    _tirith_output ""
+    _tirith_output "command> $buf"
+    [[ -n "$output" ]] && _tirith_output "$output"
+    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
+  elif [[ $rc -eq 1 ]]; then
+    # Block: tirith intentionally blocked
     BUFFER=""
     _tirith_output ""
     _tirith_output "command> $buf"
     [[ -n "$output" ]] && _tirith_output "$output"
     zle send-break
-  elif [[ $rc -eq 2 ]]; then
-    # Warn: show command and output, then execute
-    _tirith_output ""
-    _tirith_output "command> $buf"
-    [[ -n "$output" ]] && _tirith_output "$output"
-    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   else
-    # Allow: execute normally
+    # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
+    _tirith_output ""
+    [[ -n "$output" ]] && _tirith_output "$output"
+    _tirith_output "tirith: unexpected exit code $rc — running unprotected"
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   fi
 }
@@ -83,19 +94,22 @@ _tirith_bracketed_paste() {
     local output=$(<"$tmpfile")
     rm -f "$tmpfile"
 
-    if [[ $rc -eq 1 ]]; then
-      # Block: show paste content and output
+    if [[ $rc -eq 0 ]]; then
+      # Allow: fall through to keep paste
+      :
+    elif [[ $rc -eq 2 ]]; then
+      [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
+    else
+      # Block or unexpected: revert paste
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
       _tirith_output ""
       _tirith_output "paste> $pasted"
       [[ -n "$output" ]] && _tirith_output "$output"
+      [[ $rc -ne 1 ]] && _tirith_output "tirith: unexpected exit code $rc — paste blocked for safety"
       zle send-break
-    elif [[ $rc -eq 2 ]]; then
-      # Warn: show warning, keep paste
-      [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
+      return
     fi
-    # Allow (0): keep the paste silently
   fi
 }
 
