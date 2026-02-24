@@ -95,6 +95,8 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
                     .collect(),
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
 
             // Only report first CSS technique per finding (avoid flood)
@@ -125,6 +127,8 @@ fn check_css_hiding(input: &str, findings: &mut Vec<Finding>) {
                 .collect(),
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 }
@@ -178,6 +182,8 @@ fn check_color_hiding(input: &str, findings: &mut Vec<Finding>) {
                     }],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 });
             }
         }
@@ -305,6 +311,8 @@ fn check_html_hidden_attributes(input: &str, findings: &mut Vec<Finding>) {
             .collect(),
         human_view: None,
         agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     });
 }
 
@@ -377,6 +385,8 @@ fn check_html_comments(
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -444,6 +454,8 @@ fn check_markdown_comments(
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -563,6 +575,8 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 

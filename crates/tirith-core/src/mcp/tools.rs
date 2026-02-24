@@ -189,6 +189,8 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -225,6 +227,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -259,6 +263,8 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -289,7 +295,7 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
         return tool_error(&format!("File not found or is a directory: {path_str}"));
     }
 
-    match scan::scan_single_file(&path) {
+    match scan::scan_single_file_standalone(&path) {
         Some(result) => {
             let structured = json!({
                 "path": result.path.display().to_string(),
@@ -376,7 +382,7 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
     }
 
     // Use scan_single_file — it routes through FileScan which runs configfile rules
-    match scan::scan_single_file(&path) {
+    match scan::scan_single_file_standalone(&path) {
         Some(result) => {
             let mcp_findings: Vec<_> = result
                 .findings

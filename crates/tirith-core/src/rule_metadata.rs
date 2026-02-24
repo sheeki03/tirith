@@ -127,6 +127,8 @@ mod tests {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         }
     }
 

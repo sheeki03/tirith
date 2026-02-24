@@ -19,6 +19,8 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
             evidence: vec![Evidence::Url { raw: url.raw_str() }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -39,6 +41,8 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -68,6 +72,8 @@ fn check_shortened_url(url: &UrlLike, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -110,6 +116,8 @@ pub fn check_insecure_flags(args: &[String], in_sink: bool) -> Vec<Finding> {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }

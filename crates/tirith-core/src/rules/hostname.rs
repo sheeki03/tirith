@@ -48,6 +48,8 @@ fn check_non_ascii_hostname(raw_host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![homoglyph_evidence],
             human_view: None,
             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 }
@@ -68,6 +70,8 @@ fn check_punycode_domain(host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -104,6 +108,8 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -125,6 +131,8 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -143,6 +151,8 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
         return;
     }
@@ -159,6 +169,8 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -176,6 +188,8 @@ fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -206,6 +220,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -225,6 +241,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -249,6 +267,8 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -321,6 +341,8 @@ fn check_invalid_host_chars(raw_host: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -337,6 +359,8 @@ fn check_trailing_dot_whitespace(raw_host: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -357,6 +381,8 @@ fn check_lookalike_tld(host: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }

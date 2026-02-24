@@ -62,6 +62,7 @@ pub enum RuleId {
 
     // Config file rules
     ConfigInjection,
+    ConfigSuspiciousIndicator,
     ConfigNonAscii,
     ConfigInvisibleUnicode,
     McpInsecureServer,
@@ -156,6 +157,7 @@ impl RuleId {
             CommandNetworkDeny,
             // Config file rules
             ConfigInjection,
+            ConfigSuspiciousIndicator,
             ConfigNonAscii,
             ConfigInvisibleUnicode,
             McpInsecureServer,
@@ -291,6 +293,12 @@ pub struct Finding {
     /// What an AI agent processes (populated by Pro enrichment, Part 8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<String>,
+    /// MITRE ATT&CK technique ID (populated by Team enrichment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_id: Option<String>,
+    /// User-defined custom rule ID (populated only for CustomRuleMatch findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_rule_id: Option<String>,
 }
 
 /// The action to take based on analysis.
@@ -398,6 +406,8 @@ mod tests {
             evidence: vec![],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         }];
         let verdict = Verdict::from_findings(findings, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);
