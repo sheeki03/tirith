@@ -122,8 +122,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | ';' | '\n' => break, // Stop at segment boundary
-            '&' if i + 1 < len && chars[i + 1] == '&' => break,
+            '|' | ';' | '&' | '\n' => break, // Stop at segment boundary
             '\'' => {
                 current.push(ch);
                 i += 1;
