@@ -129,8 +129,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | ';' | '\n' => break, // Stop at segment boundary
-            '&' if i + 1 < len && chars[i + 1] == '&' => break,
+            '|' | ';' | '\n' | '&' => break, // Stop at segment boundary
             '\'' => {
                 current.push(ch);
                 i += 1;
@@ -257,20 +256,16 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip flags (`-p`, `-v`, `-V`) and `--`, take next arg.
+/// Resolve through `command` wrapper: skip flags and `--`, take next arg.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
-    while i < args.len() {
-        let w = &args[i];
-        if w == "--" {
-            i += 1;
-            break;
-        }
-        if w == "-p" || w == "-v" || w == "-V" {
-            i += 1;
-            continue;
-        }
-        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
+    // Skip flags like -v, -p, -V
+    while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
+        i += 1;
+    }
+    // Skip -- if present
+    if i < args.len() && args[i] == "--" {
+        i += 1;
     }
     if i < args.len() {
         let w = &args[i];
@@ -299,25 +294,10 @@ fn resolve_time_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Check if a command name is tirith (literal or path match).
+/// Check if a command name is tirith (literal match).
+/// Note: callers already strip path prefixes via rsplit('/'), so only basename arrives here.
 fn is_tirith_command(cmd: &str) -> bool {
-    if cmd == "tirith" {
-        return true;
-    }
-    // Path form: try canonicalize and compare to current_exe
-    if cmd.contains('/') {
-        let cmd_path = std::path::Path::new(cmd);
-        if let Ok(canonical_cmd) = cmd_path.canonicalize() {
-            if let Ok(current) = std::env::current_exe() {
-                if let Ok(canonical_current) = current.canonicalize() {
-                    return canonical_cmd == canonical_current;
-                }
-            }
-        }
-        // Canonicalization failed — don't auto-allow, return false
-        return false;
-    }
-    false
+    cmd == "tirith"
 }
 
 /// Run the tiered analysis pipeline.
