@@ -101,6 +101,95 @@ pub enum RuleId {
     LicenseRequired,
 }
 
+impl RuleId {
+    /// Return an array of all `RuleId` variants (compile-time exhaustive).
+    pub fn all_variants() -> &'static [RuleId] {
+        use RuleId::*;
+        &[
+            // Hostname rules
+            NonAsciiHostname,
+            PunycodeDomain,
+            MixedScriptInLabel,
+            UserinfoTrick,
+            ConfusableDomain,
+            RawIpUrl,
+            NonStandardPort,
+            InvalidHostChars,
+            TrailingDotWhitespace,
+            LookalikeTld,
+            // Path rules
+            NonAsciiPath,
+            HomoglyphInPath,
+            DoubleEncoding,
+            // Transport rules
+            PlainHttpToSink,
+            SchemelessToSink,
+            InsecureTlsFlags,
+            ShortenedUrl,
+            // Terminal deception rules
+            AnsiEscapes,
+            ControlChars,
+            BidiControls,
+            ZeroWidthChars,
+            HiddenMultiline,
+            UnicodeTags,
+            InvisibleMathOperator,
+            VariationSelector,
+            InvisibleWhitespace,
+            // Command shape rules
+            PipeToInterpreter,
+            CurlPipeShell,
+            WgetPipeShell,
+            HttpiePipeShell,
+            XhPipeShell,
+            DotfileOverwrite,
+            ArchiveExtract,
+            // Environment rules
+            ProxyEnvSet,
+            SensitiveEnvExport,
+            CodeInjectionEnv,
+            InterpreterHijackEnv,
+            ShellInjectionEnv,
+            // Network destination rules
+            MetadataEndpoint,
+            PrivateNetworkAccess,
+            CommandNetworkDeny,
+            // Config file rules
+            ConfigInjection,
+            ConfigNonAscii,
+            ConfigInvisibleUnicode,
+            McpInsecureServer,
+            McpUntrustedServer,
+            McpDuplicateServerName,
+            McpOverlyPermissive,
+            McpSuspiciousArgs,
+            // Ecosystem rules
+            GitTyposquat,
+            DockerUntrustedRegistry,
+            PipUrlInstall,
+            NpmUrlInstall,
+            Web3RpcEndpoint,
+            Web3AddressInUrl,
+            // Rendered content rules
+            HiddenCssContent,
+            HiddenColorContent,
+            HiddenHtmlAttribute,
+            MarkdownComment,
+            HtmlComment,
+            // Cloaking rules
+            ServerCloaking,
+            // Clipboard rules
+            ClipboardHidden,
+            // PDF rules
+            PdfHiddenText,
+            // Policy rules
+            PolicyBlocklisted,
+            // License/infrastructure rules
+            LicenseRequired,
+        ]
+    }
+}
+
 impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = serde_json::to_value(self)

@@ -690,12 +690,180 @@ pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8
 // Tier-gated enrichment (ADR-13: detect free, enrich paid)
 // ---------------------------------------------------------------------------
 
+/// Sanitize view text by escaping control characters to bracketed notation.
+///
+/// Encoding:
+///   literal `[` → `[LBRACK]`
+///   ESC (0x1B) → `[ESC]`
+///   Bidi (U+202A..U+202E, U+2066..U+2069) → `[U+XXXX]`
+///   Zero-width (U+200B..U+200F, U+FEFF) → `[U+XXXX]`
+///   Unicode Tags (U+E0001..U+E007F) → `[U+XXXXX]`
+///   Control chars (0x00..0x1F except \n\r\t, 0x7F) → `[0xHH]`
+///   Everything else → verbatim
+///
+/// Truncates to 512 bytes with `... [truncated, {N} bytes]` marker.
+/// Trims incomplete markers (opening `[` without closing `]`) at truncation boundary.
+fn sanitize_view(s: &str) -> String {
+    // Total output cap including truncation marker. The marker itself is
+    // at most ~30 bytes ("... [truncated, 999999 bytes]"), so we reserve
+    // space for it to ensure the final output never exceeds MAX_BYTES.
+    const MAX_BYTES: usize = 512;
+    const MARKER_RESERVE: usize = 40; // enough for "... [truncated, {N} bytes]"
+    let total = s.len();
+    let full_len = sanitize_view_full_len(s);
+    let needs_truncation = full_len > MAX_BYTES;
+    let content_cap = if needs_truncation {
+        MAX_BYTES.saturating_sub(MARKER_RESERVE)
+    } else {
+        MAX_BYTES
+    };
+
+    let mut out = String::with_capacity(std::cmp::min(total, MAX_BYTES) + 64);
+
+    for ch in s.chars() {
+        let escaped = match ch {
+            '[' => "[LBRACK]".to_string(),
+            '\x1B' => "[ESC]".to_string(),
+            // Bidi controls
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+                format!("[U+{:04X}]", ch as u32)
+            }
+            // Zero-width characters
+            '\u{200B}'..='\u{200F}' | '\u{FEFF}' => format!("[U+{:04X}]", ch as u32),
+            // Unicode Tags block
+            '\u{E0001}'..='\u{E007F}' => format!("[U+{:05X}]", ch as u32),
+            // Control chars (0x00..0x1F except \n \r \t, and 0x7F)
+            c if (c as u32) < 0x20 && c != '\n' && c != '\r' && c != '\t' => {
+                format!("[0x{:02X}]", c as u32)
+            }
+            '\x7F' => "[0x7F]".to_string(),
+            c => {
+                // Verbatim — check length before appending
+                if out.len() + c.len_utf8() > content_cap {
+                    break;
+                }
+                out.push(c);
+                continue;
+            }
+        };
+
+        if out.len() + escaped.len() > content_cap {
+            break;
+        }
+        out.push_str(&escaped);
+    }
+
+    // If we truncated (didn't consume all chars), add marker
+    if needs_truncation {
+        // Trim any incomplete bracket marker at the end
+        if let Some(last_open) = out.rfind('[') {
+            if !out[last_open..].contains(']') {
+                out.truncate(last_open);
+            }
+        }
+        out.push_str(&format!("... [truncated, {total} bytes]"));
+    }
+
+    out
+}
+
+/// Calculate the full sanitized length (without truncation) to detect if truncation occurred.
+fn sanitize_view_full_len(s: &str) -> usize {
+    let mut len = 0usize;
+    for ch in s.chars() {
+        len += match ch {
+            '[' => 8,                                               // [LBRACK]
+            '\x1B' => 5,                                            // [ESC]
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => 8, // [U+XXXX]
+            '\u{200B}'..='\u{200F}' | '\u{FEFF}' => 8,
+            '\u{E0001}'..='\u{E007F}' => 9, // [U+XXXXX]
+            c if (c as u32) < 0x20 && c != '\n' && c != '\r' && c != '\t' => 6, // [0xHH]
+            '\x7F' => 6,
+            c => c.len_utf8(),
+        };
+    }
+    len
+}
+
+/// Returns `true` if the given rule is enriched with human_view/agent_view in `enrich_pro`.
+///
+/// Uses an EXHAUSTIVE match — adding a new RuleId variant without listing it
+/// here is a **compile error**, not just a test failure. Every variant must be
+/// explicitly classified as enriched or not. No wildcard (`_ =>`) allowed.
+#[cfg(test)]
+#[deny(unreachable_patterns)]
+fn classify_rule_enriched(rule_id: crate::verdict::RuleId) -> bool {
+    use crate::verdict::RuleId::*;
+    match rule_id {
+        // === ENRICHED (must have human_view/agent_view) ===
+        // Rendered content (existing 7)
+        HiddenCssContent
+        | HiddenColorContent
+        | HiddenHtmlAttribute
+        | HtmlComment
+        | MarkdownComment
+        | PdfHiddenText
+        | ClipboardHidden
+        // Terminal (7)
+        | UnicodeTags
+        | ZeroWidthChars
+        | BidiControls
+        | InvisibleMathOperator
+        | VariationSelector
+        | ControlChars
+        | AnsiEscapes
+        // Config (3)
+        | ConfigInjection
+        | ConfigInvisibleUnicode
+        | ConfigNonAscii
+        // MCP (2)
+        | McpSuspiciousArgs
+        | McpInsecureServer
+        // Cloaking (1)
+        | ServerCloaking => true,
+
+        // === NON-ENRICHED (detection-only, no view gap) ===
+        // Every non-enriched variant is listed explicitly here.
+        // Adding a new variant WITHOUT listing it is a compile error.
+        // Hostname
+        NonAsciiHostname | PunycodeDomain | MixedScriptInLabel
+        | UserinfoTrick | ConfusableDomain | RawIpUrl
+        | NonStandardPort | InvalidHostChars | TrailingDotWhitespace
+        | LookalikeTld
+        // Path
+        | NonAsciiPath | HomoglyphInPath | DoubleEncoding
+        // Transport
+        | PlainHttpToSink | SchemelessToSink | InsecureTlsFlags
+        | ShortenedUrl
+        // Terminal (non-enriched subset)
+        | HiddenMultiline | InvisibleWhitespace
+        // Command shape
+        | PipeToInterpreter | CurlPipeShell | WgetPipeShell
+        | HttpiePipeShell | XhPipeShell | DotfileOverwrite
+        | ArchiveExtract
+        // Environment
+        | ProxyEnvSet | SensitiveEnvExport | CodeInjectionEnv
+        | InterpreterHijackEnv | ShellInjectionEnv
+        // Network destination
+        | MetadataEndpoint | PrivateNetworkAccess | CommandNetworkDeny
+        // Config (non-enriched subset)
+        | McpUntrustedServer | McpDuplicateServerName | McpOverlyPermissive
+        // Ecosystem
+        | GitTyposquat | DockerUntrustedRegistry | PipUrlInstall
+        | NpmUrlInstall | Web3RpcEndpoint | Web3AddressInUrl
+        // Policy, License
+        | PolicyBlocklisted | LicenseRequired => false,
+    }
+}
+
 /// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.
 fn enrich_pro(findings: &mut [Finding]) {
+    use crate::verdict::RuleId;
+
     for finding in findings.iter_mut() {
         match finding.rule_id {
-            // Rendered content findings: show what human sees vs what agent processes
-            crate::verdict::RuleId::HiddenCssContent => {
+            // ── Rendered content (existing 7) ──────────────────────────
+            RuleId::HiddenCssContent => {
                 finding.human_view =
                     Some("Content hidden via CSS — invisible in rendered view".into());
                 finding.agent_view = Some(format!(
@@ -703,7 +871,7 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::HiddenColorContent => {
+            RuleId::HiddenColorContent => {
                 finding.human_view =
                     Some("Text blends with background — invisible to human eye".into());
                 finding.agent_view = Some(format!(
@@ -711,7 +879,7 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::HiddenHtmlAttribute => {
+            RuleId::HiddenHtmlAttribute => {
                 finding.human_view =
                     Some("Elements marked hidden/aria-hidden — not displayed".into());
                 finding.agent_view = Some(format!(
@@ -719,28 +887,28 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::HtmlComment => {
+            RuleId::HtmlComment => {
                 finding.human_view = Some("HTML comments not rendered in browser".into());
                 finding.agent_view = Some(format!(
                     "AI agent reads comment content as context. {}",
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::MarkdownComment => {
+            RuleId::MarkdownComment => {
                 finding.human_view = Some("Markdown comments not rendered in preview".into());
                 finding.agent_view = Some(format!(
                     "AI agent processes markdown comment content. {}",
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::PdfHiddenText => {
+            RuleId::PdfHiddenText => {
                 finding.human_view = Some("Sub-pixel text invisible in PDF viewer".into());
                 finding.agent_view = Some(format!(
                     "AI agent extracts all text including sub-pixel content. {}",
                     evidence_summary(&finding.evidence)
                 ));
             }
-            crate::verdict::RuleId::ClipboardHidden => {
+            RuleId::ClipboardHidden => {
                 finding.human_view =
                     Some("Hidden content in clipboard HTML not visible in paste preview".into());
                 finding.agent_view = Some(format!(
@@ -748,7 +916,167 @@ fn enrich_pro(findings: &mut [Finding]) {
                     evidence_summary(&finding.evidence)
                 ));
             }
-            _ => {}
+
+            // ── Terminal (7 new) ───────────────────────────────────────
+            RuleId::UnicodeTags => {
+                finding.human_view = Some("Invisible — tags render as zero-width".into());
+                finding.agent_view = Some(format!(
+                    "AI processes hidden tag-encoded text. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::ZeroWidthChars => {
+                finding.human_view = Some("Invisible — zero-width chars have no glyph".into());
+                finding.agent_view = Some(format!(
+                    "AI tokenizes zero-width chars as content. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::BidiControls => {
+                finding.human_view = Some(format!(
+                    "Text appears in reversed/misleading order. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+                finding.agent_view =
+                    Some("AI reads logical character order, not visual display order".into());
+            }
+            RuleId::InvisibleMathOperator => {
+                finding.human_view = Some("Invisible — math operators render as blank".into());
+                finding.agent_view = Some(format!(
+                    "AI processes invisible operators as tokens. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::VariationSelector => {
+                finding.human_view = Some("Subtle glyph alteration — hard to spot visually".into());
+                finding.agent_view = Some(format!(
+                    "AI sees variation selector codepoints. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::ControlChars => {
+                finding.human_view = Some("Control characters hidden from terminal display".into());
+                finding.agent_view = Some(format!(
+                    "AI processes raw control sequences. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::AnsiEscapes => {
+                finding.human_view =
+                    Some("ANSI escapes render as colors/formatting, hiding content".into());
+                finding.agent_view = Some(format!(
+                    "AI sees raw escape sequences as text. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+
+            // ── Config (3 new) ─────────────────────────────────────────
+            RuleId::ConfigInjection => {
+                finding.human_view = Some("Injection blends with legitimate instructions".into());
+                finding.agent_view = Some(format!(
+                    "AI follows injected instructions as if authoritative. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::ConfigInvisibleUnicode => {
+                finding.human_view = Some("Hidden chars invisible in editors/code review".into());
+                finding.agent_view = Some(format!(
+                    "AI processes hidden Unicode payload. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::ConfigNonAscii => {
+                finding.human_view =
+                    Some("Non-ASCII may look identical to ASCII in editors".into());
+                finding.agent_view = Some(format!(
+                    "AI processes different codepoints than expected. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+
+            // ── MCP (2 new) ───────────────────────────────────────────
+            RuleId::McpSuspiciousArgs => {
+                finding.human_view =
+                    Some("Shell metacharacters may be overlooked in JSON config".into());
+                finding.agent_view = Some(format!(
+                    "MCP server args contain shell injection. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+            RuleId::McpInsecureServer => {
+                finding.human_view =
+                    Some("HTTP URL looks normal but traffic is unencrypted".into());
+                finding.agent_view = Some(format!(
+                    "MCP server uses insecure HTTP transport. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+
+            // ── Cloaking (1 new) ──────────────────────────────────────
+            RuleId::ServerCloaking => {
+                finding.human_view = Some("Browser shows benign content to human visitors".into());
+                finding.agent_view = Some(format!(
+                    "AI bot receives different content via user-agent detection. {}",
+                    evidence_summary(&finding.evidence)
+                ));
+            }
+
+            // ── Non-enriched variants (explicit for compile-time safety) ──
+            RuleId::NonAsciiHostname
+            | RuleId::PunycodeDomain
+            | RuleId::MixedScriptInLabel
+            | RuleId::UserinfoTrick
+            | RuleId::ConfusableDomain
+            | RuleId::RawIpUrl
+            | RuleId::NonStandardPort
+            | RuleId::InvalidHostChars
+            | RuleId::TrailingDotWhitespace
+            | RuleId::LookalikeTld
+            | RuleId::NonAsciiPath
+            | RuleId::HomoglyphInPath
+            | RuleId::DoubleEncoding
+            | RuleId::PlainHttpToSink
+            | RuleId::SchemelessToSink
+            | RuleId::InsecureTlsFlags
+            | RuleId::ShortenedUrl
+            | RuleId::HiddenMultiline
+            | RuleId::InvisibleWhitespace
+            | RuleId::PipeToInterpreter
+            | RuleId::CurlPipeShell
+            | RuleId::WgetPipeShell
+            | RuleId::HttpiePipeShell
+            | RuleId::XhPipeShell
+            | RuleId::DotfileOverwrite
+            | RuleId::ArchiveExtract
+            | RuleId::ProxyEnvSet
+            | RuleId::SensitiveEnvExport
+            | RuleId::CodeInjectionEnv
+            | RuleId::InterpreterHijackEnv
+            | RuleId::ShellInjectionEnv
+            | RuleId::MetadataEndpoint
+            | RuleId::PrivateNetworkAccess
+            | RuleId::CommandNetworkDeny
+            | RuleId::McpUntrustedServer
+            | RuleId::McpDuplicateServerName
+            | RuleId::McpOverlyPermissive
+            | RuleId::GitTyposquat
+            | RuleId::DockerUntrustedRegistry
+            | RuleId::PipUrlInstall
+            | RuleId::NpmUrlInstall
+            | RuleId::Web3RpcEndpoint
+            | RuleId::Web3AddressInUrl
+            | RuleId::PolicyBlocklisted
+            | RuleId::LicenseRequired => {}
+        }
+    }
+
+    // Centralized sanitization of all view text
+    for finding in findings.iter_mut() {
+        if let Some(ref mut hv) = finding.human_view {
+            *hv = sanitize_view(hv);
+        }
+        if let Some(ref mut av) = finding.agent_view {
+            *av = sanitize_view(av);
         }
     }
 }
@@ -979,5 +1307,265 @@ mod tests {
             "curl https://evil.com",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_sanitize_view_basic() {
+        // Passthrough
+        assert_eq!(sanitize_view("hello"), "hello");
+
+        // Zero-width char
+        assert_eq!(sanitize_view("\u{200B}x"), "[U+200B]x");
+
+        // Bidi control
+        assert_eq!(sanitize_view("\u{202E}abc"), "[U+202E]abc");
+
+        // ANSI escape sequences
+        assert_eq!(
+            sanitize_view("\x1B[31mred\x1B[0m"),
+            "[ESC][LBRACK]31mred[ESC][LBRACK]0m"
+        );
+
+        // Literal bracket escaping preserves marker-like text
+        assert_eq!(sanitize_view("[U+202E]"), "[LBRACK]U+202E]");
+
+        // Literal bracket mid-string
+        assert_eq!(sanitize_view("a[b"), "a[LBRACK]b");
+
+        // Control chars
+        assert_eq!(sanitize_view("\x00\x01"), "[0x00][0x01]");
+
+        // Tabs, newlines, carriage returns pass through
+        assert_eq!(sanitize_view("\t\n\r"), "\t\n\r");
+
+        // DEL (0x7F)
+        assert_eq!(sanitize_view("\x7F"), "[0x7F]");
+
+        // Unicode Tags block
+        assert_eq!(sanitize_view("\u{E0001}"), "[U+E0001]");
+
+        // Truncation of long string
+        let long = "a".repeat(600);
+        let result = sanitize_view(&long);
+        assert!(result.len() < 600, "should be truncated");
+        assert!(
+            result.contains("[truncated, 600 bytes]"),
+            "should have truncation marker, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_enrich_pro_view_content() {
+        use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+        // Table of (rule_id, expected human_view substring, expected agent_view substring)
+        let cases: Vec<(RuleId, &str, &str)> = vec![
+            // Existing 7
+            (
+                RuleId::HiddenCssContent,
+                "hidden via CSS",
+                "CSS-hidden content",
+            ),
+            (
+                RuleId::HiddenColorContent,
+                "blends with background",
+                "color contrast",
+            ),
+            (
+                RuleId::HiddenHtmlAttribute,
+                "hidden/aria-hidden",
+                "hidden element content",
+            ),
+            (
+                RuleId::HtmlComment,
+                "HTML comments not rendered",
+                "comment content as context",
+            ),
+            (
+                RuleId::MarkdownComment,
+                "Markdown comments not rendered",
+                "markdown comment content",
+            ),
+            (
+                RuleId::PdfHiddenText,
+                "Sub-pixel text invisible",
+                "sub-pixel content",
+            ),
+            (
+                RuleId::ClipboardHidden,
+                "clipboard HTML not visible",
+                "full clipboard",
+            ),
+            // Terminal (7 new)
+            (
+                RuleId::UnicodeTags,
+                "tags render as zero-width",
+                "tag-encoded text",
+            ),
+            (
+                RuleId::ZeroWidthChars,
+                "zero-width chars have no glyph",
+                "zero-width chars as content",
+            ),
+            (
+                RuleId::BidiControls,
+                "reversed/misleading order",
+                "logical character order",
+            ),
+            (
+                RuleId::InvisibleMathOperator,
+                "math operators render as blank",
+                "invisible operators as tokens",
+            ),
+            (
+                RuleId::VariationSelector,
+                "glyph alteration",
+                "variation selector codepoints",
+            ),
+            (
+                RuleId::ControlChars,
+                "Control characters hidden",
+                "raw control sequences",
+            ),
+            (
+                RuleId::AnsiEscapes,
+                "ANSI escapes render as colors",
+                "raw escape sequences",
+            ),
+            // Config (3 new)
+            (
+                RuleId::ConfigInjection,
+                "Injection blends",
+                "injected instructions",
+            ),
+            (
+                RuleId::ConfigInvisibleUnicode,
+                "invisible in editors",
+                "hidden Unicode payload",
+            ),
+            (
+                RuleId::ConfigNonAscii,
+                "Non-ASCII may look identical",
+                "different codepoints",
+            ),
+            // MCP (2 new)
+            (
+                RuleId::McpSuspiciousArgs,
+                "Shell metacharacters",
+                "shell injection",
+            ),
+            (
+                RuleId::McpInsecureServer,
+                "HTTP URL looks normal",
+                "insecure HTTP transport",
+            ),
+            // Cloaking (1 new)
+            (
+                RuleId::ServerCloaking,
+                "benign content to human",
+                "user-agent detection",
+            ),
+        ];
+
+        // Build findings for each enriched rule
+        let mut findings: Vec<Finding> = cases
+            .iter()
+            .map(|(rule_id, _, _)| Finding {
+                rule_id: *rule_id,
+                severity: Severity::Medium,
+                title: "test".into(),
+                description: "test".into(),
+                evidence: vec![Evidence::Text {
+                    detail: "sample evidence".into(),
+                }],
+                human_view: None,
+                agent_view: None,
+            })
+            .collect();
+
+        enrich_pro(&mut findings);
+
+        for (i, (rule_id, human_sub, agent_sub)) in cases.iter().enumerate() {
+            let f = &findings[i];
+            let hv = f
+                .human_view
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing human_view for {:?}", rule_id));
+            let av = f
+                .agent_view
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing agent_view for {:?}", rule_id));
+            assert!(
+                hv.contains(human_sub),
+                "{:?} human_view '{}' should contain '{}'",
+                rule_id,
+                hv,
+                human_sub
+            );
+            assert!(
+                av.contains(agent_sub),
+                "{:?} agent_view '{}' should contain '{}'",
+                rule_id,
+                av,
+                agent_sub
+            );
+        }
+
+        // Verify counts match all_variants()
+        let all_variants = RuleId::all_variants();
+        let enriched_count = all_variants
+            .iter()
+            .filter(|v| classify_rule_enriched(**v))
+            .count();
+        let non_enriched_count = all_variants
+            .iter()
+            .filter(|v| !classify_rule_enriched(**v))
+            .count();
+        assert_eq!(enriched_count + non_enriched_count, all_variants.len());
+        assert_eq!(
+            cases.len(),
+            enriched_count,
+            "test cases should cover all enriched rules"
+        );
+
+        // Runtime verification: non-enriched rules must NOT get views
+        let non_enriched_variants: Vec<RuleId> = all_variants
+            .iter()
+            .copied()
+            .filter(|v| !classify_rule_enriched(*v))
+            .collect();
+        let mut non_enriched_findings: Vec<Finding> = non_enriched_variants
+            .iter()
+            .map(|rule_id| Finding {
+                rule_id: *rule_id,
+                severity: Severity::Medium,
+                title: "test".into(),
+                description: "test".into(),
+                evidence: vec![Evidence::Text {
+                    detail: "sample evidence".into(),
+                }],
+                human_view: None,
+                agent_view: None,
+            })
+            .collect();
+
+        enrich_pro(&mut non_enriched_findings);
+
+        for (i, variant) in non_enriched_variants.iter().enumerate() {
+            let f = &non_enriched_findings[i];
+            assert!(
+                f.human_view.is_none(),
+                "{:?} classified as non-enriched but got human_view: {:?}",
+                variant,
+                f.human_view
+            );
+            assert!(
+                f.agent_view.is_none(),
+                "{:?} classified as non-enriched but got agent_view: {:?}",
+                variant,
+                f.agent_view
+            );
+        }
     }
 }
