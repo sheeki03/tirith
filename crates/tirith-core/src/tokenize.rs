@@ -329,7 +329,13 @@ pub fn is_env_assignment(word: &str) -> bool {
             return false;
         }
         let name = &s[..eq_pos];
-        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        }
     } else {
         false
     }
@@ -496,6 +502,15 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].command.as_deref(), Some("curl"));
         assert_eq!(segs[0].args.len(), 2);
+    }
+
+    #[test]
+    fn test_env_assignment_rejects_digit_prefix() {
+        assert!(!is_env_assignment("1VAR=x"));
+        assert!(!is_env_assignment("9FOO=bar"));
+        assert!(is_env_assignment("VAR=x"));
+        assert!(is_env_assignment("_VAR=x"));
+        assert!(is_env_assignment("A1=hello"));
     }
 
     #[test]
