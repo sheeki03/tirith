@@ -155,7 +155,7 @@ fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
         dlp_redacted
     } else {
         format!(
-            "{}[...redacted {} chars]",
+            "{}[...redacted {} bytes]",
             prefix,
             dlp_redacted.len() - prefix.len()
         )

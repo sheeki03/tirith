@@ -199,13 +199,17 @@ pub fn run(input: impl BufRead, mut output: impl Write, mut log: impl Write) -> 
                 }
                 "tools/call" => {
                     let result = handle_tools_call(&params);
-                    JsonRpcResponse::ok(
-                        id,
-                        serde_json::to_value(result).unwrap_or_else(|e| {
-                            eprintln!("tirith: mcp: tools/call serialization failed: {e}");
-                            json!({})
-                        }),
-                    )
+                    match serde_json::to_value(result) {
+                        Ok(v) => JsonRpcResponse::ok(id, v),
+                        Err(e) => JsonRpcResponse::err(
+                            id,
+                            JsonRpcError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                                data: None,
+                            },
+                        ),
+                    }
                 }
                 "resources/list" => {
                     let resources = resources::list();
@@ -322,7 +326,7 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
         Err(msg) => JsonRpcResponse::err(
             id,
             JsonRpcError {
-                code: -32602,
+                code: -32603, // Internal error (not invalid params — uri validated above)
                 message: msg,
                 data: None,
             },

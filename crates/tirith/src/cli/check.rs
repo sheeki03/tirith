@@ -135,15 +135,17 @@ pub fn run(
         last_trigger::write_last_trigger(&verdict, cmd);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(
-        &verdict,
-        cmd,
-        None,
-        Some(event_id),
-        &policy.dlp_custom_patterns,
-    );
+    // Log to audit (skip if bypass was honored — analyze() already logged it)
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(
+            &verdict,
+            cmd,
+            None,
+            Some(event_id),
+            &policy.dlp_custom_patterns,
+        );
+    }
 
     // Webhook dispatch (Team feature, non-blocking background thread)
     if tirith_core::license::current_tier() >= tirith_core::license::Tier::Team
