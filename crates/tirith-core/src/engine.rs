@@ -78,9 +78,18 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                     continue;
                 }
                 if w.starts_with('-') {
-                    // -u takes a value arg
-                    if w == "-u" {
-                        idx += 2; // skip -u and its value
+                    if w.starts_with("--") {
+                        // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                        if !w.contains('=') {
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    // Short flags that take a separate value arg
+                    if w == "-u" || w == "-C" || w == "-S" {
+                        idx += 2;
                         continue;
                     }
                     idx += 1;
@@ -129,14 +138,20 @@ fn is_powershell_tirith_bypass(word: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
         return false;
     }
     let after_env = &after_dollar[4..];
-    if !after_env.starts_with("TIRITH=") {
+    if !after_env
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("TIRITH="))
+    {
         return false;
     }
-    let value = &after_env["TIRITH=".len()..];
+    let value = &after_env[7..];
     strip_surrounding_quotes(value) == "0"
 }
 
@@ -146,10 +161,13 @@ fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
         return false;
     }
     let after_dollar = &word[1..];
-    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
+    if !after_dollar
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("env:"))
+    {
         return false;
     }
-    &after_dollar[4..] == var_name
+    after_dollar[4..].eq_ignore_ascii_case(var_name)
 }
 
 /// Strip a single layer of matching quotes (single or double) from a string.
@@ -293,8 +311,18 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
             continue;
         }
         if w.starts_with('-') {
-            if w == "-u" {
-                i += 2; // skip -u and its value
+            if w.starts_with("--") {
+                // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
+                if !w.contains('=') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            // Short flags that take a separate value arg
+            if w == "-u" || w == "-C" || w == "-S" {
+                i += 2;
                 continue;
             }
             i += 1;
@@ -738,6 +766,7 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 /// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
 pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
     retain_by_paranoia(&mut verdict.findings, paranoia);
+    verdict.action = recalculate_action(&verdict.findings);
 }
 
 /// Filter a Vec<Finding> by paranoia level and license tier.
@@ -745,6 +774,24 @@ pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
 /// (for scan results that don't use the Verdict wrapper).
 pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
     retain_by_paranoia(findings, paranoia);
+}
+
+/// Recalculate verdict action from the current findings (same logic as `Verdict::from_findings`).
+fn recalculate_action(findings: &[Finding]) -> crate::verdict::Action {
+    use crate::verdict::{Action, Severity};
+    if findings.is_empty() {
+        return Action::Allow;
+    }
+    let max_severity = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Low);
+    match max_severity {
+        Severity::Critical | Severity::High => Action::Block,
+        Severity::Medium | Severity::Low => Action::Warn,
+        Severity::Info => Action::Allow,
+    }
 }
 
 /// Shared paranoia retention logic.
@@ -1181,6 +1228,115 @@ mod tests {
         assert!(!is_self_invocation(
             "curl https://evil.com",
             ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_c_flag() {
+        // env -C takes a directory arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -C /tmp TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_s_flag() {
+        // env -S takes a string arg; TIRITH=0 should still be found after it
+        assert!(find_inline_bypass(
+            "env -S 'some args' TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_env_c_flag() {
+        // env -C /tmp tirith should resolve through -C's value arg
+        assert!(is_self_invocation(
+            "env -C /tmp tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_env_c_misidentify() {
+        // env -C /tmp curl — should NOT be identified as self-invocation
+        assert!(!is_self_invocation(
+            "env -C /tmp curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_paranoia_filter_recalculates_action() {
+        use crate::verdict::{Action, Finding, RuleId, Severity, Timings, Verdict};
+
+        let findings = vec![
+            Finding {
+                rule_id: RuleId::InvisibleWhitespace,
+                severity: Severity::Low,
+                title: "low finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+            Finding {
+                rule_id: RuleId::HiddenCssContent,
+                severity: Severity::Medium,
+                title: "medium finding".into(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            },
+        ];
+
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+
+        // Before paranoia filter: action should be Warn (Medium max)
+        let mut verdict = Verdict::from_findings(findings, 3, timings);
+        assert_eq!(verdict.action, Action::Warn);
+
+        // After paranoia filter at level 1: Low is removed, only Medium remains → still Warn
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(verdict.action, Action::Warn);
+        assert_eq!(verdict.findings.len(), 1);
+    }
+
+    #[test]
+    fn test_powershell_bypass_case_insensitive_tirith() {
+        // PowerShell env vars are case-insensitive
+        assert!(find_inline_bypass(
+            "$env:tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(find_inline_bypass(
+            "$ENV:Tirith=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_powershell_bypass_no_panic_on_multibyte() {
+        // Multi-byte UTF-8 after $ should not panic
+        assert!(!find_inline_bypass(
+            "$a\u{1F389}xyz; curl evil.com",
+            ShellType::PowerShell
+        ));
+        assert!(!find_inline_bypass(
+            "$\u{00E9}nv:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
         ));
     }
 }

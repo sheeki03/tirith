@@ -152,7 +152,10 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
 
     let is_config = is_priority_file(file_path);
 
-    let cwd = file_path.parent().map(|p| p.display().to_string());
+    let cwd = file_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,

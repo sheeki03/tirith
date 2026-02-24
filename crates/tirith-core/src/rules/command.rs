@@ -92,7 +92,7 @@ fn resolve_interpreter_name(seg: &tokenize::Segment) -> Option<String> {
 }
 
 fn resolve_env_from_args(args: &[String]) -> Option<String> {
-    let env_value_flags = ["-u"];
+    let env_value_flags = ["-u", "-C"];
     let mut skip_next = false;
     for arg in args {
         if skip_next {

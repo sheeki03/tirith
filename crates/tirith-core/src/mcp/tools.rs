@@ -191,14 +191,12 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         Some(c) => c,
         None => return tool_error("Missing required parameter: command"),
     };
-    let shell = match args
+    let shell = args
         .get("shell")
         .and_then(|v| v.as_str())
         .unwrap_or("posix")
-    {
-        "powershell" => ShellType::PowerShell,
-        _ => ShellType::Posix,
-    };
+        .parse::<ShellType>()
+        .unwrap_or(ShellType::Posix);
 
     let cwd = std::env::current_dir()
         .ok()
