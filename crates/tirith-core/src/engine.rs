@@ -43,7 +43,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+        if words[idx] == "TIRITH=0" {
             return true;
         }
         idx += 1;
@@ -62,7 +62,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w.starts_with("TIRITH=0") || w == "TIRITH=0" {
+                    if w == "TIRITH=0" {
                         return true;
                     }
                     idx += 1;
@@ -82,7 +82,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+                if words[idx] == "TIRITH=0" {
                     return true;
                 }
                 idx += 1;
@@ -118,8 +118,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | ';' | '\n' => break, // Stop at segment boundary
-            '&' if i + 1 < len && chars[i + 1] == '&' => break,
+            '|' | ';' | '&' | '\n' => break, // Stop at segment boundary
             '\'' => {
                 current.push(ch);
                 i += 1;
@@ -278,7 +277,7 @@ fn is_tirith_command(cmd: &str) -> bool {
         return true;
     }
     // Path form: try canonicalize and compare to current_exe
-    if cmd.contains('/') {
+    if cmd.contains('/') || cmd.contains('\\') {
         let cmd_path = std::path::Path::new(cmd);
         if let Ok(canonical_cmd) = cmd_path.canonicalize() {
             if let Ok(current) = std::env::current_exe() {
