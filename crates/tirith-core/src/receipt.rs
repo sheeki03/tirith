@@ -63,10 +63,15 @@ impl Receipt {
                 opts.mode(0o600);
             }
             let mut f = opts.open(&tmp_path).map_err(|e| format!("write: {e}"))?;
-            f.write_all(json.as_bytes())
-                .map_err(|e| format!("write: {e}"))?;
+            if let Err(e) = f.write_all(json.as_bytes()) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("write: {e}"));
+            }
         }
-        fs::rename(&tmp_path, &path).map_err(|e| format!("rename: {e}"))?;
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("rename: {e}"));
+        }
 
         Ok(path)
     }

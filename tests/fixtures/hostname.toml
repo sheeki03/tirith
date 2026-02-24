@@ -45,16 +45,16 @@ name = "raw_ip_v4"
 min_milestone = 1
 input = "curl https://192.168.1.1/install.sh"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["raw_ip_url"]
+expected_action = "block"
+expected_rules = ["raw_ip_url", "private_network_access"]
 
 [[fixture]]
-name = "raw_ip_v6"
+name = "raw_ip_v6_loopback"
 min_milestone = 1
 input = "curl https://[::1]:8080/install.sh"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["raw_ip_url"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "non_standard_port_known_domain"
@@ -205,16 +205,16 @@ name = "raw_ip_private_range"
 min_milestone = 1
 input = "curl https://10.0.0.1/api/v1"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["raw_ip_url"]
+expected_action = "block"
+expected_rules = ["raw_ip_url", "private_network_access"]
 
 [[fixture]]
 name = "raw_ip_loopback"
 min_milestone = 1
 input = "curl https://127.0.0.1:3000/status"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["raw_ip_url"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "userinfo_with_encoded_at"
@@ -300,6 +300,32 @@ expected_rules = ["invalid_host_chars"]
 name = "mixed_script_label_common_only"
 min_milestone = 1
 input = "curl https://test-123.com/api"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# ─── Part 3: OCR confusion fixtures ───
+
+[[fixture]]
+name = "ocr_confusable_rnicrosoft"
+min_milestone = 3
+input = "curl https://rnicrosoft.com/update.exe"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["confusable_domain"]
+
+[[fixture]]
+name = "ocr_confusable_paypa1"
+min_milestone = 3
+input = "curl https://paypa1.com/login"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["confusable_domain"]
+
+[[fixture]]
+name = "ocr_no_false_positive_normal"
+min_milestone = 3
+input = "curl https://example.com/page"
 context = "exec"
 expected_action = "allow"
 expected_rules = []

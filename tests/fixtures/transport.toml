@@ -151,3 +151,35 @@ input = "curl ftp://ftp.example.com/file.tar.gz"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+[[fixture]]
+name = "git_clone_schemeless_url"
+min_milestone = 1
+input = "git clone evil.com/repo"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "git_add_filenames_no_false_positive"
+min_milestone = 1
+input = "git add .gitignore bun.lock yarn.lock .env.example"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "plain_http_localhost_is_loopback"
+min_milestone = 1
+input = "curl http://localhost:3000/api/health"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "plain_http_127_is_loopback"
+min_milestone = 1
+input = "curl http://127.0.0.1:8080/test"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

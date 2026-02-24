@@ -13,12 +13,14 @@ fn main() {
     compile_known_domains(&data_dir, &out_dir);
     compile_popular_repos(&data_dir, &out_dir);
     compile_public_suffix_list(&data_dir, &out_dir);
+    compile_ocr_confusions(&data_dir, &out_dir);
     generate_tier1_regex(&out_dir);
 
     println!("cargo:rerun-if-changed=assets/data/confusables.txt");
     println!("cargo:rerun-if-changed=assets/data/known_domains.csv");
     println!("cargo:rerun-if-changed=assets/data/popular_repos.csv");
     println!("cargo:rerun-if-changed=assets/data/public_suffix_list.dat");
+    println!("cargo:rerun-if-changed=assets/data/ocr_confusions.tsv");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -151,6 +153,64 @@ fn compile_public_suffix_list(data_dir: &Path, out_dir: &str) {
     ));
 
     let out_path = Path::new(out_dir).join("psl_gen.rs");
+    fs::write(&out_path, code).unwrap();
+}
+
+fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
+    let path = data_dir.join("ocr_confusions.tsv");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read ocr_confusions.tsv: {e}"));
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (line_num, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() != 2 {
+            panic!(
+                "ocr_confusions.tsv:{}: expected 2 TAB-separated columns, got {}",
+                line_num + 1,
+                parts.len()
+            );
+        }
+        let canonical = parts[1];
+        // Validate: canonical values with alphabetic chars must be lowercase
+        // (comparison pipeline lowercases input, so uppercase canonicals are dead code)
+        if canonical.chars().any(|c| c.is_ascii_uppercase()) {
+            panic!(
+                "ocr_confusions.tsv:{}: canonical value {:?} contains uppercase — \
+                 all alphabetic canonicals must be lowercase (comparison pipeline lowercases input)",
+                line_num + 1,
+                canonical
+            );
+        }
+        entries.push((parts[0].to_string(), canonical.to_string()));
+    }
+
+    // Sort by confusable length descending (multi-char first for longest-match)
+    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut code = String::new();
+    code.push_str("/// Auto-generated OCR confusion table.\n");
+    code.push_str(
+        "/// Sorted by confusable length descending for longest-match-first normalization.\n",
+    );
+    code.push_str("pub const OCR_CONFUSIONS: &[(&str, &str)] = &[\n");
+    for (confusable, canonical) in &entries {
+        // Escape for Rust string literal
+        let esc_c = confusable.replace('\\', "\\\\").replace('"', "\\\"");
+        let esc_k = canonical.replace('\\', "\\\\").replace('"', "\\\"");
+        code.push_str(&format!("    (\"{esc_c}\", \"{esc_k}\"),\n"));
+    }
+    code.push_str("];\n");
+    let count = entries.len();
+    code.push_str(&format!(
+        "\npub const OCR_CONFUSION_COUNT: usize = {count};\n"
+    ));
+
+    let out_path = Path::new(out_dir).join("ocr_confusions_gen.rs");
     fs::write(&out_path, code).unwrap();
 }
 
@@ -291,10 +351,62 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Redirect output to dotfiles in home directory (> ~/.bashrc, >> $HOME/.profile)",
     },
     PatternEntry {
+        id: "git_sink",
+        tier1_exec_fragments: &[r"git\s+(?:clone|fetch|pull|submodule|remote)\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "Git download subcommands that may reference schemeless URLs",
+    },
+    PatternEntry {
         id: "archive_extract_sensitive",
         tier1_exec_fragments: &[r"(?:tar|unzip|7z)\s"],
         tier1_paste_only_fragments: &[],
         notes: "Archive extraction commands that may target sensitive paths",
+    },
+    PatternEntry {
+        id: "env_var_dangerous",
+        tier1_exec_fragments: &[
+            r"LD_PRELOAD",
+            r"LD_LIBRARY_PATH",
+            r"LD_AUDIT",
+            r"DYLD_INSERT_LIBRARIES",
+            r"DYLD_LIBRARY_PATH",
+            r"BASH_ENV\s*=",
+            r"\bENV\s*=",
+            r"PROMPT_COMMAND\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Code injection and shell injection environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_hijack",
+        tier1_exec_fragments: &[r"(?:PYTHONPATH|NODE_OPTIONS|RUBYLIB|PERL5LIB)\s*="],
+        tier1_paste_only_fragments: &[],
+        notes: "Interpreter hijacking environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_sensitive",
+        tier1_exec_fragments: &[
+            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Sensitive API key environment variable exports",
+    },
+    PatternEntry {
+        id: "metadata_endpoint",
+        tier1_exec_fragments: &[r"169\.254\.169\.254", r"100\.100\.100\.200"],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud metadata endpoint IP addresses (AWS, Alibaba Cloud)",
+    },
+    PatternEntry {
+        id: "private_network_ip",
+        tier1_exec_fragments: &[
+            r"\b10\.\d+\.\d+\.\d+",
+            r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+",
+            r"\b192\.168\.\d+\.\d+",
+            r"\b127\.\d+\.\d+\.\d+",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Private/reserved IPv4 address ranges for SSRF/lateral-movement detection",
     },
     PatternEntry {
         id: "non_ascii_paste",
