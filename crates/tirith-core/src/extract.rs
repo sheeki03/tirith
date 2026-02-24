@@ -11,6 +11,9 @@ pub enum ScanContext {
     Exec,
     /// Paste-time: content being pasted (paste subcommand).
     Paste,
+    /// File scan: content read from a file (scan subcommand).
+    /// Skips tier-1 fast-exit, runs byte scan + configfile rules only.
+    FileScan,
 }
 
 // Include generated Tier 1 patterns from build.rs declarative pattern table.
@@ -49,12 +52,18 @@ pub struct ByteScanResult {
     pub has_bidi_controls: bool,
     pub has_zero_width: bool,
     pub has_invalid_utf8: bool,
+    pub has_unicode_tags: bool,
+    pub has_variation_selectors: bool,
+    pub has_invisible_math_operators: bool,
+    pub has_invisible_whitespace: bool,
     pub details: Vec<ByteFinding>,
 }
 
 pub struct ByteFinding {
     pub offset: usize,
     pub byte: u8,
+    /// Full Unicode codepoint for multi-byte characters (None for single-byte findings).
+    pub codepoint: Option<u32>,
     pub description: String,
 }
 
@@ -63,6 +72,8 @@ pub fn tier1_scan(input: &str, context: ScanContext) -> bool {
     match context {
         ScanContext::Exec => TIER1_EXEC_REGEX.is_match(input),
         ScanContext::Paste => TIER1_PASTE_REGEX.is_match(input),
+        // FileScan always proceeds to tier-3 (no fast-exit)
+        ScanContext::FileScan => true,
     }
 }
 
@@ -74,6 +85,10 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         has_bidi_controls: false,
         has_zero_width: false,
         has_invalid_utf8: false,
+        has_unicode_tags: false,
+        has_variation_selectors: false,
+        has_invisible_math_operators: false,
+        has_invisible_whitespace: false,
         details: Vec::new(),
     };
 
@@ -96,6 +111,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: None,
                         description: match next {
                             b'[' => "CSI escape sequence",
                             b']' => "OSC escape sequence",
@@ -114,6 +130,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                 result.details.push(ByteFinding {
                     offset: i,
                     byte: b,
+                    codepoint: None,
                     description: "trailing escape byte".to_string(),
                 });
             }
@@ -129,6 +146,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                 result.details.push(ByteFinding {
                     offset: i,
                     byte: b,
+                    codepoint: None,
                     description: format!("control character 0x{b:02x}"),
                 });
             }
@@ -137,6 +155,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             result.details.push(ByteFinding {
                 offset: i,
                 byte: b,
+                codepoint: None,
                 description: format!("control character 0x{b:02x}"),
             });
         }
@@ -147,6 +166,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
             result.details.push(ByteFinding {
                 offset: i,
                 byte: b,
+                codepoint: None,
                 description: "control character 0x7f (DEL)".to_string(),
             });
         }
@@ -166,16 +186,59 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("bidi control U+{:04X}", ch as u32),
                     });
                 }
-                // Zero-width characters
-                if is_zero_width(ch) {
+                // Zero-width characters (ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner)
+                // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack
+                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) {
                     result.has_zero_width = true;
                     result.details.push(ByteFinding {
                         offset: i,
                         byte: b,
+                        codepoint: Some(ch as u32),
                         description: format!("zero-width character U+{:04X}", ch as u32),
+                    });
+                }
+                // Unicode Tags (hidden ASCII encoding) U+E0000–U+E007F
+                if is_unicode_tag(ch) {
+                    result.has_unicode_tags = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!("unicode tag U+{:04X}", ch as u32),
+                    });
+                }
+                // Variation selectors: U+FE00–U+FE0F and U+E0100–U+E01EF
+                if is_variation_selector(ch) {
+                    result.has_variation_selectors = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!("variation selector U+{:04X}", ch as u32),
+                    });
+                }
+                // Invisible math operators U+2061–U+2064
+                if is_invisible_math_operator(ch) {
+                    result.has_invisible_math_operators = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!("invisible math operator U+{:04X}", ch as u32),
+                    });
+                }
+                // Invisible whitespace: Hair Space, Thin Space, Narrow No-Break Space
+                if is_invisible_whitespace(ch) {
+                    result.has_invisible_whitespace = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!("invisible whitespace U+{:04X}", ch as u32),
                     });
                 }
                 i += ch.len_utf8();
@@ -215,6 +278,38 @@ fn is_zero_width(ch: char) -> bool {
         | '\u{200C}' // ZWNJ
         | '\u{200D}' // ZWJ
         | '\u{FEFF}' // BOM / ZWNBSP
+        | '\u{034F}' // Combining Grapheme Joiner
+        | '\u{00AD}' // Soft Hyphen
+        | '\u{2060}' // Word Joiner
+    )
+}
+
+/// Check if a character is a Unicode Tag (hidden ASCII encoding).
+fn is_unicode_tag(ch: char) -> bool {
+    ('\u{E0000}'..='\u{E007F}').contains(&ch)
+}
+
+/// Check if a character is a variation selector.
+fn is_variation_selector(ch: char) -> bool {
+    // VS1-16
+    ('\u{FE00}'..='\u{FE0F}').contains(&ch)
+    // VS17-256 (Supplementary)
+    || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
+}
+
+/// Check if a character is an invisible math operator.
+fn is_invisible_math_operator(ch: char) -> bool {
+    // Function Application, Invisible Times, Invisible Separator, Invisible Plus
+    ('\u{2061}'..='\u{2064}').contains(&ch)
+}
+
+/// Check if a character is an invisible whitespace variant.
+fn is_invisible_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200A}' // Hair Space
+        | '\u{2009}' // Thin Space
+        | '\u{202F}' // Narrow No-Break Space
     )
 }
 
@@ -226,6 +321,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
 
     for (seg_idx, segment) in segments.iter().enumerate() {
         // Extract standard URLs from command + args (not raw text, to skip env-prefix values).
+        // Since URL_REGEX stops at whitespace, scanning individual words is equivalent to
+        // scanning the non-env-prefix portion of the raw text.
         let mut url_sources: Vec<&str> = Vec::new();
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
@@ -254,13 +351,11 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         });
         if is_sink_context(segment, &segments) && !is_docker_cmd {
             for (arg_idx, arg) in segment.args.iter().enumerate() {
-                // Skip args that are values of output-file flags (e.g. curl -o file.png)
-                if segment
-                    .command
-                    .as_ref()
-                    .is_some_and(|c| is_output_flag_value(c, &segment.args, arg_idx))
-                {
-                    continue;
+                // Skip args that are output-file flag values
+                if let Some(cmd) = &segment.command {
+                    if is_output_flag_value(cmd, &segment.args, arg_idx) {
+                        continue;
+                    }
                 }
                 let clean = strip_quotes(arg);
                 if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
@@ -458,6 +553,10 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
     if let Some(cmd) = &segment.command {
         let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
         let cmd_lower = cmd_base.to_lowercase();
+        // git is only a sink for download subcommands (clone, fetch, pull, etc.)
+        if cmd_lower == "git" {
+            return is_git_sink(segment);
+        }
         if is_source_command(&cmd_lower) {
             return true;
         }
@@ -484,10 +583,12 @@ fn is_source_command(cmd: &str) -> bool {
         cmd,
         "curl"
             | "wget"
+            | "http"
+            | "https"
+            | "xh"
             | "fetch"
             | "scp"
             | "rsync"
-            | "git"
             | "ssh"
             | "docker"
             | "podman"
@@ -505,6 +606,26 @@ fn is_source_command(cmd: &str) -> bool {
             | "invoke-webrequest"
             | "invoke-restmethod"
     )
+}
+
+/// Check if a git command is in a sink context (only subcommands that download).
+/// `git add`, `git commit`, `git status`, etc. are NOT sinks.
+fn is_git_sink(segment: &Segment) -> bool {
+    if segment.args.is_empty() {
+        return false;
+    }
+    // First non-flag arg is the subcommand
+    for arg in &segment.args {
+        let clean = strip_quotes(arg);
+        if clean.starts_with('-') {
+            continue;
+        }
+        return matches!(
+            clean.as_str(),
+            "clone" | "fetch" | "pull" | "submodule" | "remote"
+        );
+    }
+    false
 }
 
 fn is_interpreter(cmd: &str) -> bool {
@@ -525,6 +646,55 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
+/// Check if an arg at the given index is the value of an output-file flag for the given command.
+/// Returns true if this arg should be skipped during schemeless URL detection.
+fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
+
+    match cmd_base {
+        "curl" => {
+            // Check if previous arg is -o or --output
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-o" || prev == "--output" {
+                    return true;
+                }
+            }
+            // Check if current arg starts with -o (combined: -oFILE)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-o") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output=FILE
+            if current.starts_with("--output=") {
+                return true;
+            }
+            false
+        }
+        "wget" => {
+            // Check if previous arg is -O or --output-document
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-O" || prev == "--output-document" {
+                    return true;
+                }
+            }
+            // Check -OFILE (combined short form)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-O") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output-document=FILE
+            if current.starts_with("--output-document=") {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2
@@ -536,47 +706,13 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
-/// Check if an argument at `arg_index` is the value of an output-file flag.
-/// Covers curl -o/--output and wget -O/--output-document, including combined forms.
-fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
-    let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
-
-    match cmd_base.as_str() {
-        "curl" => {
-            if arg_index > 0 {
-                let prev = &args[arg_index - 1];
-                if prev == "-o" || prev == "--output" {
-                    return true;
-                }
-            }
-            // Combined form: -oFILE (starts with -o but is longer than 2 chars)
-            let arg = &args[arg_index];
-            if arg.starts_with("-o") && arg.len() > 2 && !arg.starts_with("--") {
-                return false; // This IS the flag+value combo, not a separate value
-            }
-            false
-        }
-        "wget" => {
-            if arg_index > 0 {
-                let prev = &args[arg_index - 1];
-                if prev == "-O" || prev == "--output-document" {
-                    return true;
-                }
-            }
-            // Combined form: -OFILE
-            let arg = &args[arg_index];
-            if arg.starts_with("-O") && arg.len() > 2 && !arg.starts_with("--") {
-                return false; // This IS the flag+value combo
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
 fn looks_like_schemeless_host(s: &str) -> bool {
     // Must contain a dot, not start with -, not be a flag
     if s.starts_with('-') || !s.contains('.') {
+        return false;
+    }
+    // Dotfiles and hidden files (e.g., .gitignore, .env.example) are not URLs
+    if s.starts_with('.') {
         return false;
     }
     // First component before / or end should look like a domain
@@ -591,14 +727,83 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     let host_lower = host_part.to_lowercase();
     if !s.contains('/') {
         let file_exts = [
-            ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
-            ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
-            ".zip", ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so",
-            ".log", ".conf", ".cfg", ".ini", ".toml",
-            // Conservative non-TLD extensions (filenames not domains)
-            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif", ".pdf", ".csv",
-            ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm", ".ttf", ".otf",
-            ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
+            ".sh",
+            ".py",
+            ".rb",
+            ".js",
+            ".ts",
+            ".go",
+            ".rs",
+            ".c",
+            ".h",
+            ".txt",
+            ".md",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".html",
+            ".css",
+            ".tar.gz",
+            ".tar.bz2",
+            ".tar.xz",
+            ".tgz",
+            ".zip",
+            ".gz",
+            ".bz2",
+            ".rpm",
+            ".deb",
+            ".pkg",
+            ".dmg",
+            ".exe",
+            ".msi",
+            ".dll",
+            ".so",
+            ".log",
+            ".conf",
+            ".cfg",
+            ".ini",
+            ".toml",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".ico",
+            ".tiff",
+            ".tif",
+            ".pdf",
+            ".csv",
+            ".mp3",
+            ".mp4",
+            ".wav",
+            ".avi",
+            ".mkv",
+            ".flac",
+            ".ogg",
+            ".webm",
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
+            ".docx",
+            ".xlsx",
+            ".pptx",
+            ".sqlite",
+            ".lock",
+            ".example",
+            ".local",
+            ".bak",
+            ".tmp",
+            ".swp",
+            ".orig",
+            ".patch",
+            ".diff",
+            ".map",
+            ".env",
+            ".sample",
+            ".dist",
+            ".editorconfig",
         ];
         if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
             return false;
@@ -925,31 +1130,6 @@ mod tests {
             .expect("Generated paste pattern must be valid regex");
     }
 
-    #[test]
-    fn test_schemeless_tld_overlap_with_path_is_domain() {
-        assert!(looks_like_schemeless_host("evil.zip/payload"));
-        assert!(looks_like_schemeless_host("evil.sh/payload"));
-    }
-
-    #[test]
-    fn test_schemeless_tld_overlap_without_path_is_file() {
-        assert!(!looks_like_schemeless_host("lenna.zip"));
-        assert!(!looks_like_schemeless_host("script.sh"));
-    }
-
-    #[test]
-    fn test_schemeless_tld_overlap_sink_context_detected() {
-        let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
-        let schemeless: Vec<_> = urls
-            .iter()
-            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
-            .collect();
-        assert!(
-            !schemeless.is_empty(),
-            "evil.zip/payload should be detected as schemeless URL in sink context"
-        );
-    }
-
     // ─── CR normalization tests ───
 
     #[test]
@@ -1003,6 +1183,106 @@ mod tests {
         assert!(
             !result.has_control_chars,
             "lone trailing \\r should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_flag() {
+        let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
+        // Should NOT have schemeless URL for lenna.png
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "lenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_combined() {
+        let urls = extract_urls("curl -olenna.png https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-olenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_output_flag() {
+        let urls = extract_urls("wget -O output.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "output.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_combined() {
+        let urls = extract_urls("wget -Ooutput.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-Ooutput.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_real_domain_still_detected() {
+        let urls = extract_urls("curl evil.com/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.com/payload should be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_png_no_slash_is_file() {
+        assert!(!looks_like_schemeless_host("lenna.png"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_with_path_is_domain() {
+        // evil.zip/payload has a path component, so the .zip extension heuristic
+        // should NOT suppress it — evil.zip is a real TLD and this is a domain.
+        assert!(looks_like_schemeless_host("evil.zip/payload"));
+        assert!(looks_like_schemeless_host("evil.sh/payload"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_without_path_is_file() {
+        // Without a path, lenna.zip / script.sh look like filenames, not domains.
+        assert!(!looks_like_schemeless_host("lenna.zip"));
+        assert!(!looks_like_schemeless_host("script.sh"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_sink_context_detected() {
+        // In a real sink context, evil.zip/payload should be detected as schemeless URL.
+        let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.zip/payload should be detected as schemeless URL in sink context"
         );
     }
 }

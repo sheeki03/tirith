@@ -1,9 +1,10 @@
-// Embedded data from build.rs: known domains, popular repos.
+// Embedded data from build.rs: known domains, popular repos, OCR confusions.
 
 // Include generated data
 include!(concat!(env!("OUT_DIR"), "/known_domains_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/popular_repos_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/psl_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/ocr_confusions_gen.rs"));
 
 /// Check if a domain is in the known high-value targets list.
 pub fn is_known_domain(domain: &str) -> bool {
@@ -23,6 +24,11 @@ pub fn is_popular_repo(owner: &str, name: &str) -> bool {
 /// Get all known domains for confusable checking.
 pub fn known_domains() -> &'static [&'static str] {
     KNOWN_DOMAINS
+}
+
+/// Get the OCR confusion table for confusable domain normalization.
+pub fn ocr_confusions() -> &'static [(&'static str, &'static str)] {
+    OCR_CONFUSIONS
 }
 
 /// Check if a suffix is in the public suffix list.
