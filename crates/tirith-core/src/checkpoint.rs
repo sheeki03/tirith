@@ -255,7 +255,9 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
 /// or absolute paths.
 fn validate_restore_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
-    if p.is_absolute() {
+    // Path::is_absolute() is platform-specific (Windows requires drive letter),
+    // so also reject Unix-style absolute paths explicitly on all platforms.
+    if p.is_absolute() || path.starts_with('/') {
         return Err(format!("restore path is absolute: {path}"));
     }
     for component in p.components() {
@@ -743,6 +745,7 @@ mod tests {
         assert!(validate_restore_path("../../etc/passwd").is_err());
         assert!(validate_restore_path("/tmp/../etc/evil").is_err());
         assert!(validate_restore_path("normal/path/file.txt").is_ok());
+        // Unix-style absolute paths must be rejected on all platforms
         assert!(
             validate_restore_path("/absolute/path/file.txt").is_err(),
             "absolute paths should be rejected"
