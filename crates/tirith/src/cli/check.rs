@@ -60,10 +60,8 @@ pub fn run(
         if let Err(e) = output::write_json(&verdict, std::io::stdout().lock()) {
             eprintln!("tirith: failed to write JSON output: {e}");
         }
-    } else {
-        if let Err(e) = output::write_human_auto(&verdict) {
-            eprintln!("tirith: failed to write output: {e}");
-        }
+    } else if let Err(e) = output::write_human_auto(&verdict) {
+        eprintln!("tirith: failed to write output: {e}");
     }
 
     verdict.action.exit_code()
