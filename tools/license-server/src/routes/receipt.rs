@@ -115,6 +115,7 @@ pub async fn receipt_view(
 }
 
 fn receipt_not_ready_page(checkout_id: &str) -> String {
+    let escaped_id = html_escape(checkout_id);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -152,11 +153,19 @@ fn receipt_not_ready_page(checkout_id: &str) -> String {
 <div id="timeout" style="display:none">
   <p>Your license is still being processed. Please try again in a few minutes.</p>
   <p>If the issue persists, contact <a href="mailto:support@tirith.dev">support@tirith.dev</a>
-     with reference: <code>{checkout_id}</code></p>
+     with reference: <code>{escaped_id}</code></p>
 </div>
 </body>
 </html>"#
     )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 fn receipt_full_page(token: &str, api_key: &str, server_url: &str) -> String {

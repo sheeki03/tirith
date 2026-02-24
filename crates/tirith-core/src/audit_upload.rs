@@ -108,7 +108,9 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
     let lines = enforce_retention(lines, max_events, max_bytes);
     if lines.is_empty() {
         // Everything was trimmed -- write empty spool
-        let _ = fs::write(&path, "");
+        if let Err(e) = fs::write(&path, "") {
+            eprintln!("tirith: audit-spool: failed to clear spool: {e}");
+        }
         return;
     }
 
@@ -174,11 +176,15 @@ pub fn drain_spool(_server_url: &str, _api_key: &str, _max_events: usize, _max_b
 /// Rewrite the spool file with the remaining unsent lines.
 fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
     if remaining.is_empty() {
-        let _ = fs::write(path, "");
+        if let Err(e) = fs::write(path, "") {
+            eprintln!("tirith: audit-spool: failed to clear spool: {e}");
+        }
     } else {
         let mut content = remaining.join("\n");
         content.push('\n');
-        let _ = fs::write(path, content);
+        if let Err(e) = fs::write(path, content) {
+            eprintln!("tirith: audit-spool: failed to rewrite spool: {e}");
+        }
     }
 }
 

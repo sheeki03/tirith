@@ -163,8 +163,8 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
     // Check IPv6 (strip brackets)
     let stripped = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() {
-        // IPv6 loopback (::1) is benign local development — skip.
-        if ip.is_loopback() {
+        // IPv6 loopback (::1) or IPv4-mapped loopback (::ffff:127.x) is benign — skip.
+        if ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.octets()[0] == 127) {
             return;
         }
         findings.push(Finding {

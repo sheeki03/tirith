@@ -321,7 +321,10 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
         );
         for r in blocked.iter().take(50) {
             let rules = r.rule_ids.join(", ");
-            let cmd = r.command_redacted.replace('|', "\\|");
+            let cmd = r
+                .command_redacted
+                .replace('|', "\\|")
+                .replace(['\n', '\r'], " ");
             report.push_str(&format!("| {} | {} | {} |\n", r.timestamp, rules, cmd));
         }
         if blocked.len() > 50 {

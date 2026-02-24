@@ -493,16 +493,22 @@ fn check_mcp_duplicate_names(content: &str, path: &Path, findings: &mut Vec<Find
 }
 
 /// Check MCP server URL for security issues.
-fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
+fn check_mcp_server_url(name: &str, raw_url: &str, findings: &mut Vec<Finding>) {
+    // Use url::Url for proper parsing (handles case-insensitive schemes, bracketed IPv6, etc.)
+    let parsed = match url::Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => return, // Unparseable URL — skip structural checks
+    };
+
     // HTTP scheme (not HTTPS)
-    if url.starts_with("http://") {
+    if parsed.scheme().eq_ignore_ascii_case("http") {
         findings.push(Finding {
             rule_id: RuleId::McpInsecureServer,
             severity: Severity::Critical,
             title: "MCP server uses insecure HTTP".to_string(),
-            description: format!("Server '{name}' connects over unencrypted HTTP: {url}"),
+            description: format!("Server '{name}' connects over unencrypted HTTP: {raw_url}"),
             evidence: vec![Evidence::Url {
-                raw: url.to_string(),
+                raw: raw_url.to_string(),
             }],
             human_view: None,
             agent_view: None,
@@ -512,16 +518,21 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
     }
 
     // Raw IP address in URL
-    if let Some(host) = extract_host_from_url(url) {
-        if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok()
-        {
+    if let Some(host) = parsed.host_str() {
+        let is_ip = host.parse::<std::net::Ipv4Addr>().is_ok()
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok();
+        if is_ip {
             findings.push(Finding {
                 rule_id: RuleId::McpUntrustedServer,
                 severity: Severity::High,
                 title: "MCP server uses raw IP address".to_string(),
                 description: format!("Server '{name}' connects to a raw IP address: {host}"),
                 evidence: vec![Evidence::Url {
-                    raw: url.to_string(),
+                    raw: raw_url.to_string(),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -530,15 +541,6 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
             });
         }
     }
-}
-
-/// Extract host portion from a URL string.
-fn extract_host_from_url(url: &str) -> Option<&str> {
-    let after_scheme = url.find("://").map(|i| &url[i + 3..])?;
-    let host_end = after_scheme
-        .find(['/', ':', '?'])
-        .unwrap_or(after_scheme.len());
-    Some(&after_scheme[..host_end])
 }
 
 /// Check MCP server args for shell injection patterns.

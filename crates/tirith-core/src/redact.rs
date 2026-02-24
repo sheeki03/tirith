@@ -96,6 +96,7 @@ pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> S
 
 /// Redact sensitive content from a Finding's string fields in-place.
 pub fn redact_finding(finding: &mut crate::verdict::Finding, custom_patterns: &[String]) {
+    finding.title = redact_with_custom(&finding.title, custom_patterns);
     finding.description = redact_with_custom(&finding.description, custom_patterns);
     if let Some(ref mut v) = finding.human_view {
         *v = redact_with_custom(v, custom_patterns);

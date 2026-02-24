@@ -99,7 +99,11 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
         "TIRITH_APPROVAL_RULE={}",
         sanitize_rule_id(&metadata.rule_id)
     )?;
-    writeln!(tmp, "TIRITH_APPROVAL_DESCRIPTION={}", metadata.description)?;
+    writeln!(
+        tmp,
+        "TIRITH_APPROVAL_DESCRIPTION={}",
+        sanitize_description(&metadata.description)
+    )?;
 
     tmp.flush()?;
 
