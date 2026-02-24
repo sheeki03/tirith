@@ -369,10 +369,29 @@ fn resolve_command_wrapper(args: &[String]) -> Option<String> {
 
 /// Resolve through `time` wrapper: skip -prefixed flags, take next non-flag.
 fn resolve_time_wrapper(args: &[String]) -> Option<String> {
-    for w in args {
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        if w == "--" {
+            i += 1;
+            break;
+        }
         if w.starts_with('-') {
+            // -f/--format and -o/--output consume the next argument
+            if w == "-f" || w == "--format" || w == "-o" || w == "--output" {
+                i += 2;
+            } else if w.starts_with("--") && w.contains('=') {
+                i += 1; // --format=FMT, --output=FILE — single token
+            } else {
+                i += 1;
+            }
             continue;
         }
+        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
+    }
+    // After `--`, the next arg is the command
+    if i < args.len() {
+        let w = &args[i];
         return Some(w.rsplit('/').next().unwrap_or(w).to_string());
     }
     None
