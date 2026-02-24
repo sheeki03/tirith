@@ -42,6 +42,8 @@ fn check_non_ascii_path(normalized: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: normalized.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
         });
     }
 }
@@ -57,12 +59,13 @@ fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
         if segment.is_empty() {
             continue;
         }
+        let lower = segment.to_lowercase();
+
         // Check if segment has mixed ASCII and non-ASCII suggesting homoglyphs
         let has_ascii = segment.bytes().any(|b| b.is_ascii_alphabetic());
         let has_non_ascii = segment.bytes().any(|b| b > 0x7F);
         if has_ascii && has_non_ascii {
             // Check proximity to known paths
-            let lower = segment.to_lowercase();
             for known in &known_paths {
                 if levenshtein(&lower, known) <= 2 {
                     findings.push(Finding {
@@ -73,6 +76,8 @@ fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
                             "Path segment '{segment}' looks similar to '{known}' but contains non-ASCII characters"
                         ),
                         evidence: vec![Evidence::Url { raw: segment.to_string() }],
+                        human_view: None,
+                        agent_view: None,
                     });
                     return;
                 }
@@ -88,5 +93,7 @@ fn check_double_encoding(raw_path: &str, findings: &mut Vec<Finding>) {
         title: "Double-encoded URL path detected".to_string(),
         description: "URL path contains percent-encoded percent signs (%25XX) indicating double encoding, which may be used to bypass security filters".to_string(),
         evidence: vec![Evidence::Url { raw: raw_path.to_string() }],
+        human_view: None,
+        agent_view: None,
     });
 }

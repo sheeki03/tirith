@@ -99,8 +99,17 @@ name = "bom_in_paste"
 min_milestone = 1
 input = "\ufeffecho hello"
 context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "bom_not_at_offset_zero"
+min_milestone = 3
+input = "echo hello"
+context = "paste"
 expected_action = "block"
 expected_rules = ["zero_width_chars"]
+raw_bytes = [101, 99, 104, 111, 32, 239, 187, 191, 104, 101, 108, 108, 111]
 
 [[fixture]]
 name = "clean_paste"
@@ -223,3 +232,138 @@ input = "echo \u2066text"
 context = "paste"
 expected_action = "block"
 expected_rules = ["bidi_controls"]
+
+# ─── Part 2: Invisible character hardening ───
+
+[[fixture]]
+name = "unicode_tags_paste"
+min_milestone = 2
+input = "echo hidden"
+context = "paste"
+expected_action = "block"
+expected_rules = ["unicode_tags"]
+raw_bytes = [101, 99, 104, 111, 32, 243, 160, 129, 136, 243, 160, 129, 169]
+
+[[fixture]]
+name = "unicode_tags_exec"
+min_milestone = 2
+input = "echo \U000E0048\U000E0065\U000E006C\U000E006C\U000E006F"
+context = "exec"
+expected_action = "block"
+expected_rules = ["unicode_tags"]
+
+[[fixture]]
+name = "variation_selector_paste"
+min_milestone = 2
+input = "A"
+context = "paste"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+raw_bytes = [65, 239, 184, 143]
+
+[[fixture]]
+name = "invisible_whitespace_paste"
+min_milestone = 2
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+raw_bytes = [101, 99, 104, 111, 226, 128, 138, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "invisible_math_operator_paste"
+min_milestone = 2
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_math_operator"]
+raw_bytes = [101, 99, 104, 111, 226, 129, 161, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "cgj_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 205, 143, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "soft_hyphen_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 194, 173, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "word_joiner_in_command"
+min_milestone = 2
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 226, 129, 160, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
+name = "invisible_whitespace_exec"
+min_milestone = 2
+input = "echo\u2009hello"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+
+[[fixture]]
+name = "invisible_math_operator_exec"
+min_milestone = 2
+input = "echo\u2061hello"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["invisible_math_operator"]
+
+[[fixture]]
+name = "variation_selector_exec"
+min_milestone = 2
+input = "A\uFE01"
+context = "exec"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+
+[[fixture]]
+name = "variation_selector_supplementary_paste"
+min_milestone = 2
+input = "A"
+context = "paste"
+expected_action = "allow"
+expected_rules = ["variation_selector"]
+raw_bytes = [65, 243, 160, 132, 128]
+
+# ─── Part 3: FP reduction + OCR confusion ───
+
+[[fixture]]
+name = "zwj_in_arabic_text"
+min_milestone = 3
+input = "echo test"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [101, 99, 104, 111, 32, 217, 132, 226, 128, 141, 216, 167]
+
+[[fixture]]
+name = "zwnj_in_arabic_text"
+min_milestone = 3
+input = "echo test"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [101, 99, 104, 111, 32, 217, 133, 226, 128, 140, 217, 134]
+
+[[fixture]]
+name = "zwj_in_ascii_text"
+min_milestone = 3
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 226, 128, 141, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]

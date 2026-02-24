@@ -1,0 +1,34 @@
+# OCR Confusion Table — Pure ASCII Visual Confusables
+# Format: CONFUSABLE<TAB>CANONICAL
+# Direction: Column 1 is what the attacker substitutes (the confusable),
+#            Column 2 is the legitimate character it mimics.
+# ocr_normalize() replaces column 1 → column 2, then compares against known domains.
+# All canonical values (column 2) MUST be lowercase — comparison pipeline lowercases input.
+# Confusable values with uppercase letters are dead (input is lowercased before matching).
+# Multi-char sequences come first (longer match wins during normalization).
+# Lines starting with # are comments. Empty lines ignored.
+
+# Multi-char confusions (longer match wins)
+rn	m
+cl	d
+li	h
+vv	w
+ri	n
+
+# Single-char confusions (attacker → legitimate, all lowercase canonical)
+1	l
+0	o
+8	b
+5	s
+2	z
+6	g
+
+# Smart quotes → ASCII equivalents
+‘	'
+’	'
+“	"
+”	"
+
+# Typographic dashes → ASCII hyphen
+–	-
+—	-

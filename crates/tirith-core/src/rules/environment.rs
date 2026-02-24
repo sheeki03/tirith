@@ -56,6 +56,8 @@ pub fn check(env: &dyn EnvSnapshot) -> Vec<Finding> {
                         name: var.to_string(),
                         value_preview: redact_value(&val),
                     }],
+                    human_view: None,
+                    agent_view: None,
                 });
             }
         }

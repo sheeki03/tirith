@@ -28,6 +28,17 @@ pub struct AnalysisContext {
     pub raw_bytes: Option<Vec<u8>>,
     pub interactive: bool,
     pub cwd: Option<String>,
+    /// File path being scanned (only populated for ScanContext::FileScan).
+    pub file_path: Option<std::path::PathBuf>,
+    /// Repository root for config path classification (absolute→relative normalization).
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// an empty root (suitable for already-relative paths).
+    pub repo_root: Option<std::path::PathBuf>,
+    /// Override config file classification. When true, the file is treated as a known
+    /// config file regardless of path-based matching. Used for probe-found files inside
+    /// excluded trees (vendor/, node_modules/) where the probe already verified the
+    /// directory identity but the file's repo-relative path doesn't root-anchor.
+    pub is_config_override: bool,
 }
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
@@ -429,6 +440,10 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_control_chars
                 || scan.has_bidi_controls
                 || scan.has_zero_width
+                || scan.has_unicode_tags
+                || scan.has_variation_selectors
+                || scan.has_invisible_math_operators
+                || scan.has_invisible_whitespace
                 || scan.has_invalid_utf8
         } else {
             false
@@ -440,10 +455,15 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     // Step 2: URL-like regex scan
     let regex_triggered = extract::tier1_scan(&ctx.input, ctx.scan_context);
 
-    // Step 3 (exec only): check for bidi/zero-width chars even without URLs
+    // Step 3 (exec only): check for bidi/zero-width/invisible chars even without URLs
     let exec_bidi_triggered = if ctx.scan_context == ScanContext::Exec {
         let scan = extract::scan_bytes(ctx.input.as_bytes());
-        scan.has_bidi_controls || scan.has_zero_width
+        scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
     } else {
         false
     };
@@ -524,8 +544,28 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     let tier3_start = Instant::now();
     let mut findings = Vec::new();
 
-    // Run byte-level rules for paste context
-    if ctx.scan_context == ScanContext::Paste {
+    // Track extracted URLs for allowlist/blocklist (Exec/Paste only)
+    let mut extracted = Vec::new();
+
+    if ctx.scan_context == ScanContext::FileScan {
+        // FileScan: byte scan + configfile rules ONLY.
+        // Does NOT run command/env/URL-extraction rules.
+        let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
+            bytes.as_slice()
+        } else {
+            ctx.input.as_bytes()
+        };
+        let byte_findings = crate::rules::terminal::check_bytes(byte_input);
+        findings.extend(byte_findings);
+
+        // Config file detection rules
+        findings.extend(crate::rules::configfile::check(
+            &ctx.input,
+            ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref(),
+            ctx.is_config_override,
+        ));
+    } else if ctx.scan_context == ScanContext::Paste {
         if let Some(ref bytes) = ctx.raw_bytes {
             let byte_findings = crate::rules::terminal::check_bytes(bytes);
             findings.extend(byte_findings);
@@ -535,25 +575,37 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(multiline_findings);
     }
 
-    // Bidi and zero-width checks apply to both exec and paste contexts
-    // (exec context: bidi in URLs/commands is always dangerous)
+    // Invisible character checks apply to both exec and paste contexts
     if ctx.scan_context == ScanContext::Exec {
         let byte_input = ctx.input.as_bytes();
         let scan = extract::scan_bytes(byte_input);
-        if scan.has_bidi_controls || scan.has_zero_width {
+        if scan.has_bidi_controls
+            || scan.has_zero_width
+            || scan.has_unicode_tags
+            || scan.has_variation_selectors
+            || scan.has_invisible_math_operators
+            || scan.has_invisible_whitespace
+        {
             let byte_findings = crate::rules::terminal::check_bytes(byte_input);
-            // Only keep bidi and zero-width findings for exec context
+            // Only keep invisible-char findings for exec context
             findings.extend(byte_findings.into_iter().filter(|f| {
                 matches!(
                     f.rule_id,
-                    crate::verdict::RuleId::BidiControls | crate::verdict::RuleId::ZeroWidthChars
+                    crate::verdict::RuleId::BidiControls
+                        | crate::verdict::RuleId::ZeroWidthChars
+                        | crate::verdict::RuleId::UnicodeTags
+                        | crate::verdict::RuleId::InvisibleMathOperator
+                        | crate::verdict::RuleId::VariationSelector
+                        | crate::verdict::RuleId::InvisibleWhitespace
                 )
             }));
         }
     }
 
-    // Extract and analyze URLs
-    let extracted = extract::extract_urls(&ctx.input, ctx.shell);
+    // Extract and analyze URLs (exec/paste only, not file scan)
+    if ctx.scan_context != ScanContext::FileScan {
+        extracted = extract::extract_urls(&ctx.input, ctx.shell);
+    }
 
     for url_info in &extracted {
         // Normalize path if available — use raw extracted URL's path for non-ASCII detection
@@ -580,13 +632,14 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(ecosystem_findings);
     }
 
-    // Run command-shape rules on full input
-    let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
-    findings.extend(command_findings);
+    // Run command-shape and environment rules (exec/paste only)
+    if ctx.scan_context != ScanContext::FileScan {
+        let command_findings = crate::rules::command::check(&ctx.input, ctx.shell);
+        findings.extend(command_findings);
 
-    // Run environment rules
-    let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
-    findings.extend(env_findings);
+        let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
+        findings.extend(env_findings);
+    }
 
     // Apply policy severity overrides
     for finding in &mut findings {
@@ -607,6 +660,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 evidence: vec![crate::verdict::Evidence::Url {
                     raw: url_info.raw.clone(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -675,6 +730,9 @@ mod tests {
             raw_bytes: None,
             interactive: true,
             cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
         };
         let verdict = analyze(&ctx);
         // Should reach tier 3 (not fast-exit at tier 1)

@@ -48,7 +48,11 @@ pub fn analyze(content: &str, interpreter: &str) -> ScriptAnalysis {
         has_sudo: content.contains("sudo "),
         has_eval: content.contains("eval ") || content.contains("eval("),
         has_base64: content.contains("base64"),
-        has_curl_wget: content.contains("curl ") || content.contains("wget "),
+        has_curl_wget: content.contains("curl ")
+            || content.contains("wget ")
+            || content.contains("http ")
+            || content.contains("https ")
+            || content.contains("xh "),
         interpreter: interpreter.to_string(),
     }
 }

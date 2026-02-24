@@ -34,16 +34,42 @@ pub enum RuleId {
     BidiControls,
     ZeroWidthChars,
     HiddenMultiline,
+    UnicodeTags,
+    InvisibleMathOperator,
+    VariationSelector,
+    InvisibleWhitespace,
 
     // Command shape rules
     PipeToInterpreter,
     CurlPipeShell,
     WgetPipeShell,
+    HttpiePipeShell,
+    XhPipeShell,
     DotfileOverwrite,
     ArchiveExtract,
 
     // Environment rules
     ProxyEnvSet,
+    SensitiveEnvExport,
+    CodeInjectionEnv,
+    InterpreterHijackEnv,
+    ShellInjectionEnv,
+
+    // Network destination rules
+    MetadataEndpoint,
+    PrivateNetworkAccess,
+    CommandNetworkDeny,
+
+    // Config file rules
+    ConfigInjection,
+    ConfigSuspiciousIndicator,
+    ConfigNonAscii,
+    ConfigInvisibleUnicode,
+    McpInsecureServer,
+    McpUntrustedServer,
+    McpDuplicateServerName,
+    McpOverlyPermissive,
+    McpSuspiciousArgs,
 
     // Ecosystem rules
     GitTyposquat,
@@ -71,6 +97,7 @@ impl fmt::Display for RuleId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
+    Info,
     Low,
     Medium,
     High,
@@ -80,6 +107,7 @@ pub enum Severity {
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Severity::Info => write!(f, "INFO"),
             Severity::Low => write!(f, "LOW"),
             Severity::Medium => write!(f, "MEDIUM"),
             Severity::High => write!(f, "HIGH"),
@@ -150,6 +178,12 @@ pub struct Finding {
     pub title: String,
     pub description: String,
     pub evidence: Vec<Evidence>,
+    /// What a human sees (populated by Pro enrichment, Part 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_view: Option<String>,
+    /// What an AI agent processes (populated by Pro enrichment, Part 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_view: Option<String>,
 }
 
 /// The action to take based on analysis.
@@ -225,8 +259,8 @@ impl Verdict {
                 .unwrap_or(Severity::Low);
             match max_severity {
                 Severity::Critical | Severity::High => Action::Block,
-                Severity::Medium => Action::Warn,
-                Severity::Low => Action::Warn,
+                Severity::Medium | Severity::Low => Action::Warn,
+                Severity::Info => Action::Allow,
             }
         };
         Self {
@@ -240,5 +274,36 @@ impl Verdict {
             timings_ms: timings,
             urls_extracted_count: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_info_severity_maps_to_allow() {
+        let findings = vec![Finding {
+            rule_id: RuleId::NonAsciiHostname, // arbitrary rule
+            severity: Severity::Info,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+        }];
+        let verdict = Verdict::from_findings(findings, 3, Timings::default());
+        assert_eq!(verdict.action, Action::Allow);
+    }
+
+    #[test]
+    fn test_info_severity_display() {
+        assert_eq!(format!("{}", Severity::Info), "INFO");
+    }
+
+    #[test]
+    fn test_info_severity_ordering() {
+        assert!(Severity::Info < Severity::Low);
+        assert!(Severity::Low < Severity::Medium);
     }
 }

@@ -14,6 +14,9 @@ pub fn run(url: &str, json: bool) -> i32 {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -71,6 +74,7 @@ fn severity_to_score(max: Severity, count: usize) -> (u32, &'static str) {
         Severity::High => 70,
         Severity::Medium => 40,
         Severity::Low => 15,
+        Severity::Info => 0,
     };
     let bonus = (count.saturating_sub(1) as u32) * 5;
     let score = (base + bonus).min(100);

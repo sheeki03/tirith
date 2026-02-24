@@ -17,6 +17,8 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
                 "URL without explicit scheme passed to a command that downloads/executes content"
                     .to_string(),
             evidence: vec![Evidence::Url { raw: url.raw_str() }],
+            human_view: None,
+            agent_view: None,
         });
     }
 
@@ -35,6 +37,8 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
                     url.raw_str()
                 ),
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -62,6 +66,8 @@ fn check_shortened_url(url: &UrlLike, findings: &mut Vec<Finding>) {
                     "URL uses shortener '{host}' which hides the actual destination"
                 ),
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }
@@ -102,6 +108,8 @@ pub fn check_insecure_flags(args: &[String], in_sink: bool) -> Vec<Finding> {
                     pattern: "insecure TLS flag".to_string(),
                     matched: arg.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
             });
         }
     }

