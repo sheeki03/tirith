@@ -273,7 +273,7 @@ fn resolve_time_wrapper(args: &[String]) -> Option<String> {
 
 /// Check if a command name is tirith (literal or path match).
 fn is_tirith_command(cmd: &str) -> bool {
-    if cmd == "tirith" {
+    if cmd.eq_ignore_ascii_case("tirith") || cmd.eq_ignore_ascii_case("tirith.exe") {
         return true;
     }
     // Path form: try canonicalize and compare to current_exe
