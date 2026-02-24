@@ -282,6 +282,8 @@ const SENSITIVE_KEY_VARS: &[&str] = &[
 ];
 
 fn classify_env_var(name: &str) -> Option<(RuleId, Severity, &'static str, &'static str)> {
+    let name_upper = name.to_ascii_uppercase();
+    let name = name_upper.as_str();
     if CODE_INJECTION_VARS.contains(&name) {
         Some((
             RuleId::CodeInjectionEnv,
