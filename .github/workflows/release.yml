@@ -50,8 +50,8 @@ jobs:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04, target: aarch64-unknown-linux-gnu }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +121,7 @@ jobs:
       matrix:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - name: Download artifact
@@ -457,7 +457,7 @@ jobs:
     name: Build Debian Package
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -532,7 +532,7 @@ jobs:
             VER="${VERSION#v}"
 
             # Install build tools
-            dnf install -y gcc rpm-build curl ca-certificates git
+            dnf install -y --allowerasing gcc rpm-build curl ca-certificates git
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source $HOME/.cargo/env
 
@@ -613,4 +613,39 @@ jobs:
           choco pack tirith.nuspec --out ${{ github.workspace }}
 
       - name: Push to Chocolatey
-        run: choco push tirith.*.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+        shell: pwsh
+        run: |
+          $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
+          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — package may be under moderation or API key issue"
+            exit 0
+          }
+
+  publish-aur:
+    name: Update AUR Package
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update PKGBUILD version
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${VERSION#v}"
+          sed -i "s/^pkgver=.*/pkgver=${VER}/" packaging/aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: tirith
+          pkgbuild: packaging/aur/PKGBUILD
+          assets: packaging/aur/tirith.install
+          commit_username: sheeki03
+          commit_email: shivomsharma03@gmail.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          updpkgsums: true

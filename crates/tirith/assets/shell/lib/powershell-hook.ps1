@@ -2,8 +2,17 @@
 # Overrides Enter key via PSReadLine to check commands before execution.
 # Overrides Ctrl+V to check pasted content.
 
-# Guard against double-loading
-if ($global:_TIRITH_PS_LOADED) { return }
+# Guard against double-loading (session-local only).
+# If inherited from environment (exported by attacker/parent), ignore it.
+if ($global:_TIRITH_PS_LOADED) {
+    if ([Environment]::GetEnvironmentVariable('_TIRITH_PS_LOADED')) {
+        [Environment]::SetEnvironmentVariable('_TIRITH_PS_LOADED', $null)
+        $global:_TIRITH_PS_LOADED = $false
+        # Fall through to load fresh
+    } else {
+        return  # Set in this session — genuine double-source guard
+    }
+}
 $global:_TIRITH_PS_LOADED = $true
 
 # Check for PSReadLine
@@ -25,17 +34,28 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         return
     }
 
-    # Run tirith check. Binary prints warnings/blocks directly to stderr.
-    # No output capture: binary writes to stderr which is the terminal.
-    & tirith check --interactive --shell powershell -- $line
+    # Run tirith check, use temp file to prevent output leakage
+    $tmpfile = [System.IO.Path]::GetTempFileName()
+    & tirith check --non-interactive --shell powershell -- $line > $tmpfile 2>&1
     $rc = $LASTEXITCODE
+    $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
 
-    if ($rc -eq 1) {
-        # Block: revert the line
+    if ($rc -eq 0) {
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    } elseif ($rc -eq 2) {
+        Write-Host "command> $line"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    } elseif ($rc -eq 1) {
+        # Block: tirith intentionally blocked
+        Write-Host "command> $line"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
     } else {
-        # Allow (0) or Warn (2): execute normally
-        # Warn message already printed to stderr by the binary
+        # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
+        Write-Host "tirith: unexpected exit code $rc — running unprotected"
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     }
 }
@@ -49,15 +69,25 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         return
     }
 
-    # Check with tirith paste
-    $pasted | & tirith paste --shell powershell
+    # Check with tirith paste, use temp file to prevent output leakage
+    $tmpfile = [System.IO.Path]::GetTempFileName()
+    $pasted | & tirith paste --shell powershell > $tmpfile 2>&1
     $rc = $LASTEXITCODE
+    $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
 
-    if ($rc -eq 1) {
-        # Block: discard paste, warning already printed by binary
+    if ($rc -eq 0) {
+        # Allow: fall through to insert
+    } elseif ($rc -eq 2) {
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
+        # Warn: fall through to insert
+    } else {
+        # Block or unexpected: discard paste
+        Write-Host "paste> $pasted"
+        if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
+        if ($rc -ne 1) { Write-Host "tirith: unexpected exit code $rc — paste blocked for safety" }
         return
     }
 
-    # Allow (0) or Warn (2): insert pasted content
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
 }

@@ -1,5 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use fs2::FileExt;
@@ -72,7 +74,11 @@ pub fn log_verdict(
     };
 
     // Open, lock, append, fsync, unlock
-    let file = OpenOptions::new().create(true).append(true).open(&path);
+    let mut open_opts = OpenOptions::new();
+    open_opts.create(true).append(true);
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+    let file = open_opts.open(&path);
 
     let file = match file {
         Ok(f) => f,
@@ -81,6 +87,13 @@ pub fn log_verdict(
             return;
         }
     };
+
+    // Harden legacy files: enforce 0600 on existing files too
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
 
     if let Err(e) = file.lock_exclusive() {
         eprintln!("tirith: audit: failed to lock {}: {e}", path.display());
@@ -107,11 +120,12 @@ fn default_log_path() -> Option<PathBuf> {
 }
 
 fn redact_command(cmd: &str) -> String {
-    // Redact: keep first 80 chars, replace the rest
-    if cmd.len() <= 80 {
+    // Redact: keep first 80 bytes (UTF-8 safe), replace the rest
+    let prefix = crate::util::truncate_bytes(cmd, 80);
+    if prefix.len() == cmd.len() {
         cmd.to_string()
     } else {
-        format!("{}[...redacted {} chars]", &cmd[..80], cmd.len() - 80)
+        format!("{}[...redacted {} chars]", prefix, cmd.len() - prefix.len())
     }
 }
 
@@ -156,5 +170,33 @@ mod tests {
 
         // Clean up env var
         std::env::remove_var("TIRITH_LOG");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_log_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Test the OpenOptions pattern directly — avoids env var races with
+        // test_tirith_log_disabled (which sets TIRITH_LOG=0 in the same process).
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test_perms.jsonl");
+
+        {
+            use std::io::Write;
+            let mut open_opts = OpenOptions::new();
+            open_opts.create(true).append(true);
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+            let mut f = open_opts.open(&log_path).unwrap();
+            writeln!(f, "test").unwrap();
+        }
+
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "audit log should be 0600"
+        );
     }
 }

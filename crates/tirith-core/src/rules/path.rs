@@ -1,5 +1,6 @@
 use crate::normalize::NormalizedComponent;
 use crate::parse::UrlLike;
+use crate::util::levenshtein;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run path rules against a parsed URL.
@@ -63,7 +64,7 @@ fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
             // Check proximity to known paths
             let lower = segment.to_lowercase();
             for known in &known_paths {
-                if levenshtein_distance(&lower, known) <= 2 {
+                if levenshtein(&lower, known) <= 2 {
                     findings.push(Finding {
                         rule_id: RuleId::HomoglyphInPath,
                         severity: Severity::Medium,
@@ -88,36 +89,4 @@ fn check_double_encoding(raw_path: &str, findings: &mut Vec<Finding>) {
         description: "URL path contains percent-encoded percent signs (%25XX) indicating double encoding, which may be used to bypass security filters".to_string(),
         evidence: vec![Evidence::Url { raw: raw_path.to_string() }],
     });
-}
-
-/// Simple Levenshtein distance for short strings.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let m = a_chars.len();
-    let n = b_chars.len();
-
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, val) in dp[0].iter_mut().enumerate() {
-        *val = j;
-    }
-
-    for i in 1..=m {
-        for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-        }
-    }
-
-    dp[m][n]
 }

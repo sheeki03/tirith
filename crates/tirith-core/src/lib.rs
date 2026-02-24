@@ -11,6 +11,7 @@ pub mod policy;
 pub mod receipt;
 pub mod rules;
 pub mod tokenize;
+pub mod util;
 pub mod verdict;
 
 #[cfg(unix)]

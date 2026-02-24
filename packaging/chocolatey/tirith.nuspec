@@ -6,7 +6,7 @@
     <title>tirith</title>
     <authors>sheeki03</authors>
     <owners>sheeki03</owners>
-    <license type="expression">AGPL-3.0-only</license>
+    <licenseUrl>https://github.com/sheeki03/tirith/blob/main/LICENSE-AGPL</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <projectUrl>https://github.com/sheeki03/tirith</projectUrl>
     <description>Terminal security tool that catches homograph attacks, pipe-to-shell patterns, and ANSI injection before they execute.</description>

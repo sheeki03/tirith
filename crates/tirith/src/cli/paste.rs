@@ -1,15 +1,25 @@
 use std::io::Read;
 
+use crate::cli::last_trigger;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
 pub fn run(shell: &str, json: bool) -> i32 {
-    // Read raw bytes from stdin
+    // Read raw bytes from stdin with 1 MiB cap
+    const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
+
     let mut raw_bytes = Vec::new();
-    if let Err(e) = std::io::stdin().read_to_end(&mut raw_bytes) {
+    if let Err(e) = std::io::stdin()
+        .take(MAX_PASTE + 1)
+        .read_to_end(&mut raw_bytes)
+    {
         eprintln!("tirith: failed to read stdin: {e}");
+        return 1;
+    }
+    if raw_bytes.len() as u64 > MAX_PASTE {
+        eprintln!("tirith: paste input exceeds 1 MiB limit");
         return 1;
     }
 
@@ -17,7 +27,13 @@ pub fn run(shell: &str, json: bool) -> i32 {
         return 0;
     }
 
-    let shell_type = shell.parse::<ShellType>().unwrap_or(ShellType::Posix);
+    let shell_type = match shell.parse::<ShellType>() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("tirith: warning: unknown shell '{shell}', falling back to posix");
+            ShellType::Posix
+        }
+    };
 
     // Decode to string (lossy for URL extraction)
     let input = String::from_utf8_lossy(&raw_bytes).into_owned();
@@ -39,7 +55,7 @@ pub fn run(shell: &str, json: bool) -> i32 {
 
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
-        write_last_trigger(&verdict, &ctx.input);
+        last_trigger::write_last_trigger(&verdict, &ctx.input);
     }
 
     // Log to audit
@@ -53,48 +69,4 @@ pub fn run(shell: &str, json: bool) -> i32 {
     }
 
     verdict.action.exit_code()
-}
-
-fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
-    if let Some(dir) = tirith_core::policy::data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("last_trigger.json");
-        let tmp = dir.join(".last_trigger.json.tmp");
-
-        #[derive(serde::Serialize)]
-        struct LastTrigger<'a> {
-            rule_ids: Vec<String>,
-            severity: String,
-            command_redacted: String,
-            findings: &'a [tirith_core::verdict::Finding],
-            timestamp: String,
-        }
-
-        let trigger = LastTrigger {
-            rule_ids: verdict
-                .findings
-                .iter()
-                .map(|f| f.rule_id.to_string())
-                .collect(),
-            severity: verdict
-                .findings
-                .iter()
-                .map(|f| f.severity)
-                .max()
-                .map(|s| format!("{s}"))
-                .unwrap_or_default(),
-            command_redacted: if cmd.len() > 80 {
-                format!("{}...", &cmd[..80])
-            } else {
-                cmd.to_string()
-            },
-            findings: &verdict.findings,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-
-        if let Ok(json) = serde_json::to_string_pretty(&trigger) {
-            let _ = std::fs::write(&tmp, &json);
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
 }

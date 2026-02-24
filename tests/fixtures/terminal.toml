@@ -19,6 +19,33 @@ expected_rules = ["control_chars"]
 raw_bytes = [101, 99, 104, 111, 32, 115, 97, 102, 101, 13, 109, 97, 108, 105, 99, 105, 111, 117, 115]
 
 [[fixture]]
+name = "control_char_trailing_cr_paste"
+min_milestone = 1
+input = "/some/path"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [47, 115, 111, 109, 101, 47, 112, 97, 116, 104, 13]
+
+[[fixture]]
+name = "control_char_trailing_crlf_paste"
+min_milestone = 1
+input = "/some/path"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [47, 115, 111, 109, 101, 47, 112, 97, 116, 104, 13, 10]
+
+[[fixture]]
+name = "control_char_windows_multiline_paste"
+min_milestone = 1
+input = "echo hello\r\necho world\r\n"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+raw_bytes = [101, 99, 104, 111, 32, 104, 101, 108, 108, 111, 13, 10, 101, 99, 104, 111, 32, 119, 111, 114, 108, 100, 13, 10]
+
+[[fixture]]
 name = "control_char_backspace_paste"
 min_milestone = 1
 input = "echo safe\u0008malicious"

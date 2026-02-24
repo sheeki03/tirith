@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-pub fn run(json: bool) -> i32 {
+pub fn run(json: bool, reset_bash_safe_mode: bool) -> i32 {
+    if reset_bash_safe_mode {
+        return reset_safe_mode();
+    }
+
     let info = gather_info();
 
     if json {
@@ -27,6 +31,7 @@ struct DoctorInfo {
     hooks_materialized: bool,
     shell_profile: Option<String>,
     hook_configured: bool,
+    bash_safe_mode: bool,
     policy_paths: Vec<String>,
     policy_root_env: Option<String>,
     data_dir: Option<String>,
@@ -39,7 +44,7 @@ fn gather_info() -> DoctorInfo {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let detected_shell = detect_shell().to_string();
+    let detected_shell = crate::cli::init::detect_shell().to_string();
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
     let hook_dir = crate::cli::init::find_hook_dir_readonly();
@@ -57,6 +62,11 @@ fn gather_info() -> DoctorInfo {
 
     // Check if shell profile has tirith init configured
     let (shell_profile, hook_configured) = check_shell_profile(&detected_shell);
+
+    // Check if bash safe-mode flag exists (persistent preexec fallback)
+    let bash_safe_mode = tirith_core::policy::state_dir()
+        .map(|d| d.join("bash-safe-mode").exists())
+        .unwrap_or(false);
 
     let data_dir = tirith_core::policy::data_dir();
     let log_path = data_dir.as_ref().map(|d| d.join("log.jsonl"));
@@ -95,6 +105,7 @@ fn gather_info() -> DoctorInfo {
         hooks_materialized,
         shell_profile: shell_profile.map(|p| p.display().to_string()),
         hook_configured,
+        bash_safe_mode,
         policy_paths,
         policy_root_env,
         data_dir: data_dir.map(|d| d.display().to_string()),
@@ -127,15 +138,17 @@ fn print_human(info: &DoctorInfo) {
         eprintln!();
         match info.detected_shell.as_str() {
             "zsh" => {
-                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.zshrc");
+                eprintln!("    echo 'eval \"$(tirith init --shell zsh)\"' >> ~/.zshrc");
                 eprintln!("    source ~/.zshrc");
             }
             "bash" => {
-                eprintln!("    echo 'eval \"$(tirith init)\"' >> ~/.bashrc");
+                eprintln!("    echo 'eval \"$(tirith init --shell bash)\"' >> ~/.bashrc");
                 eprintln!("    source ~/.bashrc");
             }
             "fish" => {
-                eprintln!("    echo 'tirith init | source' >> ~/.config/fish/config.fish");
+                eprintln!(
+                    "    echo 'tirith init --shell fish | source' >> ~/.config/fish/config.fish"
+                );
                 eprintln!("    source ~/.config/fish/config.fish");
             }
             _ => {
@@ -143,6 +156,12 @@ fn print_human(info: &DoctorInfo) {
             }
         }
         eprintln!();
+    }
+    if info.bash_safe_mode {
+        eprintln!("  bash mode:    SAFE MODE (preexec fallback — previous enter-mode failure)");
+        eprintln!("                Reset: tirith doctor --reset-bash-safe-mode");
+    } else {
+        eprintln!("  bash mode:    normal");
     }
     if info.policy_paths.is_empty() {
         eprintln!("  policies:     (none found)");
@@ -248,20 +267,30 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
     (primary, false)
 }
 
-fn detect_shell() -> &'static str {
-    if let Ok(shell) = std::env::var("SHELL") {
-        if shell.contains("zsh") {
-            return "zsh";
+fn reset_safe_mode() -> i32 {
+    let state_dir = match tirith_core::policy::state_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!("tirith: could not determine state directory");
+            return 1;
         }
-        if shell.contains("bash") {
-            return "bash";
+    };
+
+    let flag = state_dir.join("bash-safe-mode");
+    if flag.exists() {
+        match std::fs::remove_file(&flag) {
+            Ok(()) => {
+                eprintln!("tirith: bash safe-mode flag removed");
+                eprintln!("  Next shell will attempt enter mode again.");
+                0
+            }
+            Err(e) => {
+                eprintln!("tirith: failed to remove {}: {e}", flag.display());
+                1
+            }
         }
-        if shell.contains("fish") {
-            return "fish";
-        }
+    } else {
+        eprintln!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
+        0
     }
-    #[cfg(windows)]
-    return "powershell";
-    #[cfg(not(windows))]
-    "bash"
 }

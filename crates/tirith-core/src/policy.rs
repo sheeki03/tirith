@@ -91,7 +91,11 @@ impl Policy {
                         p.path = Some(path.display().to_string());
                         p
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!(
+                            "tirith: warning: failed to parse policy at {}: {e}",
+                            path.display()
+                        );
                         // Parse error: use fail_mode default behavior
                         Policy::default()
                     }
@@ -132,10 +136,10 @@ impl Policy {
                     p.path = Some(path.display().to_string());
                     p
                 }
-                Err(_) => {
+                Err(e) => {
                     eprintln!(
-                        "tirith: warning: failed to parse policy at {}",
-                        path.display()
+                        "tirith: warning: failed to parse policy at {}: {e}",
+                        path.display(),
                     );
                     Policy::default()
                 }
@@ -166,6 +170,15 @@ impl Policy {
         let url_lower = url.to_lowercase();
         self.allowlist.iter().any(|pattern| {
             let p = pattern.to_lowercase();
+            if p.is_empty() {
+                return false;
+            }
+            if is_domain_pattern(&p) {
+                if let Some(host) = extract_host_for_match(url) {
+                    return domain_matches(&host, &p);
+                }
+                return false;
+            }
             url_lower.contains(&p)
         })
     }
@@ -218,6 +231,41 @@ impl Policy {
             }
         }
     }
+}
+
+fn is_domain_pattern(p: &str) -> bool {
+    !p.contains("://")
+        && !p.contains('/')
+        && !p.contains('?')
+        && !p.contains('#')
+        && !p.contains(':')
+}
+
+fn extract_host_for_match(url: &str) -> Option<String> {
+    if let Some(host) = crate::parse::parse_url(url).host() {
+        return Some(host.trim_end_matches('.').to_lowercase());
+    }
+    // Fallback for schemeless host/path (e.g., example.com/path)
+    let candidate = url.split('/').next().unwrap_or(url).trim();
+    if candidate.starts_with('-') || !candidate.contains('.') || candidate.contains(' ') {
+        return None;
+    }
+    let host = if let Some((h, port)) = candidate.rsplit_once(':') {
+        if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() {
+            h
+        } else {
+            candidate
+        }
+    } else {
+        candidate
+    };
+    Some(host.trim_end_matches('.').to_lowercase())
+}
+
+fn domain_matches(host: &str, pattern: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    let pattern = pattern.trim_start_matches("*.").trim_end_matches('.');
+    host == pattern || host.ends_with(&format!(".{pattern}"))
 }
 
 /// Discover policy path by walking up from cwd to .git boundary.
@@ -284,4 +332,47 @@ pub fn data_dir() -> Option<PathBuf> {
 pub fn config_dir() -> Option<PathBuf> {
     let base = etcetera::choose_base_strategy().ok()?;
     Some(base.config_dir().join("tirith"))
+}
+
+/// Get tirith state directory.
+/// Must match bash-hook.bash path: ${XDG_STATE_HOME:-$HOME/.local/state}/tirith
+pub fn state_dir() -> Option<PathBuf> {
+    match std::env::var("XDG_STATE_HOME") {
+        Ok(val) if !val.trim().is_empty() => Some(PathBuf::from(val.trim()).join("tirith")),
+        _ => home::home_dir().map(|h| h.join(".local/state/tirith")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowlist_domain_matches_subdomain() {
+        let p = Policy {
+            allowlist: vec!["github.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("https://api.github.com/repos"));
+        assert!(p.is_allowlisted("git@github.com:owner/repo.git"));
+        assert!(!p.is_allowlisted("https://evil-github.com"));
+    }
+
+    #[test]
+    fn test_allowlist_schemeless_host() {
+        let p = Policy {
+            allowlist: vec!["raw.githubusercontent.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("raw.githubusercontent.com/path/to/file"));
+    }
+
+    #[test]
+    fn test_allowlist_schemeless_host_with_port() {
+        let p = Policy {
+            allowlist: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(p.is_allowlisted("example.com:8080/path"));
+    }
 }
