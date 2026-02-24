@@ -49,9 +49,18 @@ pub fn run(shell: Option<&str>) -> i32 {
             }
             0
         }
+        "nushell" | "nu" => {
+            if let Some(dir) = &hook_dir {
+                println!(r#"source "{}/lib/nushell-hook.nu""#, dir.display());
+            } else {
+                eprintln!("tirith: could not locate or materialize shell hooks.");
+                return 1;
+            }
+            0
+        }
         _ => {
             eprintln!("tirith: unsupported shell '{shell}'");
-            eprintln!("Supported: zsh, bash, fish, powershell");
+            eprintln!("Supported: zsh, bash, fish, powershell, nushell");
             1
         }
     }
@@ -95,6 +104,8 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
         Some("fish")
     } else if base.contains("pwsh") || base.contains("powershell") {
         Some("powershell")
+    } else if base == "nu" || base == "nushell" {
+        Some("nushell")
     } else {
         None
     }
@@ -264,6 +275,7 @@ fn materialize_hooks() -> Option<PathBuf> {
         lib_dir.join("bash-hook.bash"),
         lib_dir.join("fish-hook.fish"),
         lib_dir.join("powershell-hook.ps1"),
+        lib_dir.join("nushell-hook.nu"),
     ];
     let version_matches = fs::read_to_string(&version_path)
         .ok()
@@ -286,6 +298,7 @@ fn materialize_hooks() -> Option<PathBuf> {
             (lib_dir.join("bash-hook.bash"), assets::BASH_HOOK),
             (lib_dir.join("fish-hook.fish"), assets::FISH_HOOK),
             (lib_dir.join("powershell-hook.ps1"), assets::POWERSHELL_HOOK),
+            (lib_dir.join("nushell-hook.nu"), assets::NUSHELL_HOOK),
         ];
         for (path, content) in &hook_files {
             if let Err(e) = fs::write(path, content) {
@@ -323,6 +336,18 @@ mod tests {
         assert_eq!(normalize_shell_name("BASH"), Some("bash"));
         assert_eq!(normalize_shell_name("PwSh"), Some("powershell"));
         assert_eq!(normalize_shell_name("PowerShell"), Some("powershell"));
+    }
+
+    #[test]
+    fn normalize_shell_name_nushell() {
+        assert_eq!(normalize_shell_name("/usr/bin/nu"), Some("nushell"));
+        assert_eq!(normalize_shell_name("nushell"), Some("nushell"));
+    }
+
+    #[test]
+    fn normalize_shell_name_no_false_positive_on_gnu() {
+        // "gnu" contains "nu" but is not nushell — exact match required
+        assert_eq!(normalize_shell_name("gnu"), None);
     }
 
     #[test]
