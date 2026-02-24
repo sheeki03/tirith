@@ -92,7 +92,10 @@ pub fn run(url: &str, json: bool) -> i32 {
             host_divergence,
             warnings,
         };
-        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+            return 1;
+        }
         println!();
     } else {
         eprintln!("tirith diff: {url}");

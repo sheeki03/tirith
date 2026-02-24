@@ -91,7 +91,7 @@ expected_rules = ["non_ascii_hostname"]
 [[fixture]]
 name = "medium_severity_warns"
 min_milestone = 1
-input = "curl https://192.168.1.1/api"
+input = "curl https://203.0.113.1/api"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["raw_ip_url"]

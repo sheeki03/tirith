@@ -2,7 +2,13 @@ use tirith_core::util::truncate_bytes;
 
 pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
     if let Some(dir) = tirith_core::policy::data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!(
+                "tirith: warning: cannot create data dir {}: {e}",
+                dir.display()
+            );
+            return;
+        }
         let path = dir.join("last_trigger.json");
         let tmp = dir.join(".last_trigger.json.tmp");
 
@@ -33,19 +39,37 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
-        if let Ok(json) = serde_json::to_string_pretty(&trigger) {
+        let json = match serde_json::to_string_pretty(&trigger) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("tirith: warning: failed to serialize last trigger: {e}");
+                return;
+            }
+        };
+
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
             {
-                use std::io::Write;
-                let mut opts = std::fs::OpenOptions::new();
-                opts.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    opts.mode(0o600);
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&tmp) {
+                Ok(mut f) => {
+                    if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                        if let Err(e) = std::fs::rename(&tmp, &path) {
+                            eprintln!("tirith: warning: failed to rename last trigger file: {e}");
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                    } else {
+                        eprintln!("tirith: warning: failed to write last trigger data");
+                        let _ = std::fs::remove_file(&tmp);
+                    }
                 }
-                if let Ok(mut f) = opts.open(&tmp) {
-                    let _ = f.write_all(json.as_bytes());
-                    let _ = std::fs::rename(&tmp, &path);
+                Err(e) => {
+                    eprintln!("tirith: warning: failed to open last trigger temp file: {e}");
                 }
             }
         }
