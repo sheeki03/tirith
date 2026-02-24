@@ -317,15 +317,9 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
 /// Must have at least one char before `=`, and the name must be alphanumeric/underscore.
 pub fn is_env_assignment(word: &str) -> bool {
-    // Strip quotes first
     let s = word.trim();
-    let s = if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-    {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    };
+
+    // Must not start with - or =
     if s.starts_with('-') || s.starts_with('=') {
         return false;
     }
