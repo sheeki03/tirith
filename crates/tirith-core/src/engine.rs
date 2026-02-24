@@ -264,12 +264,32 @@ fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     }
 }
 
-/// Resolve through `time` wrapper: skip -prefixed flags, take next non-flag.
+/// Resolve through `time` wrapper: skip flags (including `-f`/`-o` which take a separate arg).
 fn resolve_time_wrapper(args: &[String]) -> Option<String> {
-    for w in args {
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        if w == "--" {
+            i += 1;
+            break;
+        }
         if w.starts_with('-') {
+            // GNU time flags that consume the next argument
+            if w == "-f" || w == "--format" || w == "-o" || w == "--output" {
+                i += 2;
+            } else if w.starts_with("--") && w.contains('=') {
+                // --format=FMT, --output=FILE — single token
+                i += 1;
+            } else {
+                i += 1;
+            }
             continue;
         }
+        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
+    }
+    // After --, first arg is the command
+    if i < args.len() {
+        let w = &args[i];
         return Some(w.rsplit('/').next().unwrap_or(w).to_string());
     }
     None
