@@ -59,6 +59,8 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html,
     };
 

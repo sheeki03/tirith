@@ -15,6 +15,8 @@ pub fn run(url: &str, json: bool) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 

@@ -209,6 +209,8 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -249,6 +251,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -287,6 +291,8 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         interactive: false,
         cwd: None,
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 

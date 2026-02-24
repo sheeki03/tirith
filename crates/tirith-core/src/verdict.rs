@@ -62,6 +62,7 @@ pub enum RuleId {
 
     // Config file rules
     ConfigInjection,
+    ConfigSuspiciousIndicator,
     ConfigMalformed,
     ConfigNonAscii,
     ConfigInvisibleUnicode,

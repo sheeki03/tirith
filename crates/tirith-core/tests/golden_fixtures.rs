@@ -85,6 +85,8 @@ fn run_fixture(fixture: &Fixture) {
         interactive: true,
         cwd: None,
         file_path,
+        repo_root: None,
+        is_config_override: false,
         clipboard_html: None,
     };
 
@@ -433,6 +435,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "command_network_deny",
     // Config file
     "config_injection",
+    "config_suspicious_indicator",
     "config_malformed",
     "config_non_ascii",
     "config_invisible_unicode",
@@ -589,6 +592,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::PrivateNetworkAccess,
         RuleId::CommandNetworkDeny,
         RuleId::ConfigInjection,
+        RuleId::ConfigSuspiciousIndicator,
         RuleId::ConfigMalformed,
         RuleId::ConfigNonAscii,
         RuleId::ConfigInvisibleUnicode,
@@ -831,6 +835,8 @@ fn test_tier1_does_not_gate_findings() {
             interactive: true,
             cwd: None,
             file_path,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
 
@@ -874,6 +880,8 @@ fn test_non_ascii_paste_not_sole_warn() {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
         let verdict = engine::analyze(&ctx);

@@ -30,6 +30,11 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
     /// File path being scanned (only populated for ScanContext::FileScan).
     pub file_path: Option<std::path::PathBuf>,
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// `file_path`'s parent as implicit repo root.
+    pub repo_root: Option<String>,
+    /// True when `file_path` was explicitly provided by the user as a config file.
+    pub is_config_override: bool,
     /// Clipboard HTML content for rich-text paste analysis.
     /// Only populated when `tirith paste --html <path>` is used.
     pub clipboard_html: Option<String>,
@@ -529,6 +534,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(crate::rules::configfile::check(
             &ctx.input,
             ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref().map(std::path::Path::new),
+            ctx.is_config_override,
         ));
 
         // Rendered content rules (file-type gated)
@@ -975,6 +982,8 @@ mod tests {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
             clipboard_html: None,
         };
         let verdict = analyze(&ctx);
