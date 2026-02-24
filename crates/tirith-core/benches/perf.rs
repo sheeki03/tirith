@@ -65,6 +65,8 @@ fn bench_full_analysis_clean(c: &mut Criterion) {
                 interactive: true,
                 cwd: None,
                 file_path: None,
+                repo_root: None,
+                is_config_override: false,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -82,6 +84,8 @@ fn bench_full_analysis_url(c: &mut Criterion) {
                 interactive: true,
                 cwd: None,
                 file_path: None,
+                repo_root: None,
+                is_config_override: false,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -99,6 +103,7 @@ fn bench_full_analysis_complex(c: &mut Criterion) {
                 interactive: true,
                 cwd: None,
                 file_path: None,
+                repo_root: None, is_config_override: false,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -119,6 +124,8 @@ fn bench_paste_analysis(c: &mut Criterion) {
                 interactive: true,
                 cwd: None,
                 file_path: None,
+                repo_root: None,
+                is_config_override: false,
             };
             black_box(engine::analyze(&ctx));
         })

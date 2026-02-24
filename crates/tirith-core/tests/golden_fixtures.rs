@@ -88,6 +88,8 @@ fn run_fixture(fixture: &Fixture) {
         interactive: true,
         cwd: None,
         file_path,
+        repo_root: None,
+        is_config_override: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -423,6 +425,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "command_network_deny",
     // Config file
     "config_injection",
+    "config_suspicious_indicator",
     "config_non_ascii",
     "config_invisible_unicode",
     "mcp_insecure_server",
@@ -555,6 +558,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::PrivateNetworkAccess,
         RuleId::CommandNetworkDeny,
         RuleId::ConfigInjection,
+        RuleId::ConfigSuspiciousIndicator,
         RuleId::ConfigNonAscii,
         RuleId::ConfigInvisibleUnicode,
         RuleId::McpInsecureServer,
@@ -603,22 +607,23 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter",       // cat script | bash
-        "bidi_controls",             // exec context, no URL needed
-        "zero_width_chars",          // exec context, no URL needed
-        "unicode_tags",              // byte-level, no URL needed
-        "invisible_math_operator",   // byte-level, no URL needed
-        "invisible_whitespace",      // byte-level, no URL needed
-        "code_injection_env",        // export LD_PRELOAD=, no URL needed
-        "shell_injection_env",       // export BASH_ENV=, no URL needed
-        "interpreter_hijack_env",    // export PYTHONPATH=, no URL needed
-        "sensitive_env_export",      // export OPENAI_API_KEY=, no URL needed
-        "config_injection",          // file context, no URL needed
-        "config_non_ascii",          // file context, no URL needed
-        "config_invisible_unicode",  // file context, no URL needed
-        "mcp_suspicious_args",       // file context, no URL needed
-        "mcp_overly_permissive",     // file context, no URL needed
-        "mcp_duplicate_server_name", // file context, no URL needed
+        "pipe_to_interpreter",         // cat script | bash
+        "bidi_controls",               // exec context, no URL needed
+        "zero_width_chars",            // exec context, no URL needed
+        "unicode_tags",                // byte-level, no URL needed
+        "invisible_math_operator",     // byte-level, no URL needed
+        "invisible_whitespace",        // byte-level, no URL needed
+        "code_injection_env",          // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",         // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",      // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",        // export OPENAI_API_KEY=, no URL needed
+        "config_injection",            // file context, no URL needed
+        "config_suspicious_indicator", // file context, no URL needed
+        "config_non_ascii",            // file context, no URL needed
+        "config_invisible_unicode",    // file context, no URL needed
+        "mcp_suspicious_args",         // file context, no URL needed
+        "mcp_overly_permissive",       // file context, no URL needed
+        "mcp_duplicate_server_name",   // file context, no URL needed
     ]
     .into_iter()
     .collect();
@@ -787,6 +792,8 @@ fn test_tier1_does_not_gate_findings() {
             interactive: true,
             cwd: None,
             file_path,
+            repo_root: None,
+            is_config_override: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -829,6 +836,8 @@ fn test_non_ascii_paste_not_sole_warn() {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(

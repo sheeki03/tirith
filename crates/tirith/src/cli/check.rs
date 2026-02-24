@@ -43,6 +43,8 @@ pub fn run(
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
     };
 
     let verdict = engine::analyze(&ctx);

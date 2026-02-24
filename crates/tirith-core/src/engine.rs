@@ -30,6 +30,15 @@ pub struct AnalysisContext {
     pub cwd: Option<String>,
     /// File path being scanned (only populated for ScanContext::FileScan).
     pub file_path: Option<std::path::PathBuf>,
+    /// Repository root for config path classification (absolute→relative normalization).
+    /// Only populated for ScanContext::FileScan. When None, configfile checks use
+    /// an empty root (suitable for already-relative paths).
+    pub repo_root: Option<std::path::PathBuf>,
+    /// Override config file classification. When true, the file is treated as a known
+    /// config file regardless of path-based matching. Used for probe-found files inside
+    /// excluded trees (vendor/, node_modules/) where the probe already verified the
+    /// directory identity but the file's repo-relative path doesn't root-anchor.
+    pub is_config_override: bool,
 }
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
@@ -439,6 +448,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         findings.extend(crate::rules::configfile::check(
             &ctx.input,
             ctx.file_path.as_deref(),
+            ctx.repo_root.as_deref(),
+            ctx.is_config_override,
         ));
     } else {
         // Exec/Paste: standard pipeline
@@ -608,6 +619,8 @@ mod tests {
             interactive: true,
             cwd: None,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
         };
         let verdict = analyze(&ctx);
         // Should reach tier 3 (not fast-exit at tier 1)

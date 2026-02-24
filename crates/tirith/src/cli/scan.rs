@@ -51,7 +51,13 @@ pub fn run(
         print_human_result(&result);
     }
 
-    if (ci && result.has_findings_at_or_above(fail_on_severity))
+    // Exit code precedence: incomplete scan (exit 2) > findings (exit 1) > clean (exit 0).
+    // An incomplete scan may be missing worse findings, so it must not report success.
+    // Incomplete always exits 2 regardless of findings — CI must address the scan gap
+    // before trusting any results.
+    if !result.scan_complete {
+        2
+    } else if (ci && result.has_findings_at_or_above(fail_on_severity))
         || result
             .file_results
             .iter()
@@ -115,7 +121,7 @@ fn run_single_file(file_path: &str, json: bool, ci: bool, fail_on: Severity) -> 
         return 1;
     }
 
-    let result = match scan::scan_single_file(&path) {
+    let result = match scan::scan_single_file_standalone(&path) {
         Some(r) => r,
         None => {
             eprintln!("tirith scan: could not read file: {file_path}");
@@ -161,6 +167,7 @@ fn print_json_result(result: &scan::ScanResult) {
         scanned_count: usize,
         skipped_count: usize,
         truncated: bool,
+        scan_complete: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         truncation_reason: &'a Option<String>,
         total_findings: usize,
@@ -190,6 +197,7 @@ fn print_json_result(result: &scan::ScanResult) {
         scanned_count: result.scanned_count,
         skipped_count: result.skipped_count,
         truncated: result.truncated,
+        scan_complete: result.scan_complete,
         truncation_reason: &result.truncation_reason,
         total_findings: result.total_findings(),
         files,
@@ -275,6 +283,15 @@ fn print_human_result(result: &scan::ScanResult) {
             eprintln!();
             eprintln!("  \x1b[33m{reason}\x1b[0m");
         }
+    }
+
+    if !result.scan_complete {
+        eprintln!();
+        eprintln!(
+            "  \x1b[33mwarning: scan incomplete ({} config path(s) skipped) — \
+             findings may not reflect full coverage\x1b[0m",
+            result.skipped_config_paths
+        );
     }
 }
 
