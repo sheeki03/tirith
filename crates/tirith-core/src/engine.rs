@@ -145,10 +145,8 @@ fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
     let prefix = "env:";
     after_dollar
         .get(..prefix.len())
-        .map_or(false, |s| s.eq_ignore_ascii_case(prefix))
-        && after_dollar
-            .get(prefix.len()..)
-            .map_or(false, |s| s == var_name)
+        .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+        && (after_dollar.get(prefix.len()..) == Some(var_name))
 }
 
 /// Strip a single layer of matching quotes (single or double) from a string.
@@ -314,12 +312,20 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip flags like -v, -p, -V, then `--`, take next arg.
+/// Resolve through `command` wrapper: skip flags, then `--`, take next arg.
+/// Returns None for `command -v` / `command -V` which only look up commands, not execute them.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
-    // Skip flags like -v, -p, -V
+    let mut is_lookup = false;
+    // Parse flags; -v and -V are lookup-only (print path/version, no execution)
     while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
+        if args[i] == "-v" || args[i] == "-V" {
+            is_lookup = true;
+        }
         i += 1;
+    }
+    if is_lookup {
+        return None;
     }
     // Skip -- if present
     if i < args.len() && args[i] == "--" {
@@ -779,6 +785,17 @@ mod tests {
             "command -- tirith diff url",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_command_v() {
+        // `command -v tirith` is a lookup, not execution
+        assert!(!is_self_invocation("command -v tirith", ShellType::Posix));
+    }
+
+    #[test]
+    fn test_not_self_invocation_command_upper_v() {
+        assert!(!is_self_invocation("command -V tirith", ShellType::Posix));
     }
 
     #[test]
