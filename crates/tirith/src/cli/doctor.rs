@@ -277,20 +277,19 @@ fn reset_safe_mode() -> i32 {
     };
 
     let flag = state_dir.join("bash-safe-mode");
-    if flag.exists() {
-        match std::fs::remove_file(&flag) {
-            Ok(()) => {
-                eprintln!("tirith: bash safe-mode flag removed");
-                eprintln!("  Next shell will attempt enter mode again.");
-                0
-            }
-            Err(e) => {
-                eprintln!("tirith: failed to remove {}: {e}", flag.display());
-                1
-            }
+    match std::fs::remove_file(&flag) {
+        Ok(()) => {
+            eprintln!("tirith: bash safe-mode flag removed");
+            eprintln!("  Next shell will attempt enter mode again.");
+            0
         }
-    } else {
-        eprintln!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
-        0
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
+            0
+        }
+        Err(e) => {
+            eprintln!("tirith: failed to remove {}: {e}", flag.display());
+            1
+        }
     }
 }

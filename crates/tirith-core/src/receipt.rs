@@ -65,6 +65,7 @@ impl Receipt {
             let mut f = opts.open(&tmp_path).map_err(|e| format!("write: {e}"))?;
             f.write_all(json.as_bytes())
                 .map_err(|e| format!("write: {e}"))?;
+            f.sync_all().map_err(|e| format!("sync: {e}"))?;
         }
         fs::rename(&tmp_path, &path).map_err(|e| format!("rename: {e}"))?;
 

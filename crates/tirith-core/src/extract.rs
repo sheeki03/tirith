@@ -602,12 +602,13 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     let host_lower = host_part.to_lowercase();
     if !s.contains('/') {
         let file_exts = [
-        ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
-        ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip",
-        ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so", ".log",
-        ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff",
-        ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm",
-        ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
+            ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
+            ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
+            ".zip", ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so",
+            ".log", ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+            ".ico", ".tiff", ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv",
+            ".flac", ".ogg", ".webm", ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx",
+            ".sqlite",
         ];
         if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
             return false;
@@ -1085,5 +1086,4 @@ mod tests {
             "evil.zip/payload should be detected as schemeless URL in sink context"
         );
     }
-
 }

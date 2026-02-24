@@ -45,9 +45,9 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
                 }
                 if let Ok(mut f) = opts.open(&tmp) {
                     let _ = f.write_all(json.as_bytes());
+                    let _ = std::fs::rename(&tmp, &path);
                 }
             }
-            let _ = std::fs::rename(&tmp, &path);
         }
     }
 }
