@@ -68,7 +68,7 @@ pub fn log_verdict(
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("tirith: audit: serialize entry: {e}");
+            eprintln!("tirith: audit: failed to serialize entry: {e}");
             return;
         }
     };
@@ -83,7 +83,7 @@ pub fn log_verdict(
     let file = match file {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("tirith: audit: open {}: {e}", path.display());
+            eprintln!("tirith: audit: failed to open {}: {e}", path.display());
             return;
         }
     };
@@ -93,27 +93,30 @@ pub fn log_verdict(
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-            eprintln!("tirith: audit: set permissions on {}: {e}", path.display());
+            eprintln!(
+                "tirith: audit: failed to set permissions on {}: {e}",
+                path.display()
+            );
         }
     }
 
     if let Err(e) = file.lock_exclusive() {
-        eprintln!("tirith: audit: lock {}: {e}", path.display());
+        eprintln!("tirith: audit: failed to lock {}: {e}", path.display());
         return;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
-        eprintln!("tirith: audit: write to {}: {e}", path.display());
+        eprintln!("tirith: audit: failed to write to {}: {e}", path.display());
     }
     if let Err(e) = writer.flush() {
-        eprintln!("tirith: audit: flush {}: {e}", path.display());
+        eprintln!("tirith: audit: failed to flush {}: {e}", path.display());
     }
     if let Err(e) = file.sync_all() {
-        eprintln!("tirith: audit: sync {}: {e}", path.display());
+        eprintln!("tirith: audit: failed to sync {}: {e}", path.display());
     }
     if let Err(e) = fs2::FileExt::unlock(&file) {
-        eprintln!("tirith: audit: unlock {}: {e}", path.display());
+        eprintln!("tirith: audit: failed to unlock {}: {e}", path.display());
     }
 }
 
