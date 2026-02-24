@@ -22,6 +22,8 @@ build() {
   cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  # Force gcc linker — ring (crypto dep) can fail with lld on some setups
+  export RUSTFLAGS="-C linker=gcc"
   cargo build --release -p tirith
 }
 

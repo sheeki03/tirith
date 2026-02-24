@@ -30,9 +30,10 @@ thiserror = "2"
 clap_complete = "4"
 clap_mangen = "0.2"
 uuid = { version = "1", features = ["v4"] }
-# Pin home <0.5.12 — v0.5.12 requires edition 2024 (Rust 1.85+), breaks MSRV 1.75
+# Pin home <0.5.12 — v0.5.12 requires Rust 1.88, breaks MSRV 1.83
 home = ">=0.5, <0.5.12"
 libc = "0.2"
+lopdf = "0.34"
 
 [profile.release]
 lto = "thin"

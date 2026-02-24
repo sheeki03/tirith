@@ -79,8 +79,117 @@ pub enum RuleId {
     Web3RpcEndpoint,
     Web3AddressInUrl,
 
+    // Rendered content rules
+    HiddenCssContent,
+    HiddenColorContent,
+    HiddenHtmlAttribute,
+    MarkdownComment,
+    HtmlComment,
+
+    // Cloaking rules
+    ServerCloaking,
+
+    // Clipboard rules
+    ClipboardHidden,
+
+    // PDF rules
+    PdfHiddenText,
+
     // Policy rules
     PolicyBlocklisted,
+
+    // License/infrastructure rules
+    LicenseRequired,
+}
+
+impl RuleId {
+    /// Return an array of all `RuleId` variants (compile-time exhaustive).
+    pub fn all_variants() -> &'static [RuleId] {
+        use RuleId::*;
+        &[
+            // Hostname rules
+            NonAsciiHostname,
+            PunycodeDomain,
+            MixedScriptInLabel,
+            UserinfoTrick,
+            ConfusableDomain,
+            RawIpUrl,
+            NonStandardPort,
+            InvalidHostChars,
+            TrailingDotWhitespace,
+            LookalikeTld,
+            // Path rules
+            NonAsciiPath,
+            HomoglyphInPath,
+            DoubleEncoding,
+            // Transport rules
+            PlainHttpToSink,
+            SchemelessToSink,
+            InsecureTlsFlags,
+            ShortenedUrl,
+            // Terminal deception rules
+            AnsiEscapes,
+            ControlChars,
+            BidiControls,
+            ZeroWidthChars,
+            HiddenMultiline,
+            UnicodeTags,
+            InvisibleMathOperator,
+            VariationSelector,
+            InvisibleWhitespace,
+            // Command shape rules
+            PipeToInterpreter,
+            CurlPipeShell,
+            WgetPipeShell,
+            HttpiePipeShell,
+            XhPipeShell,
+            DotfileOverwrite,
+            ArchiveExtract,
+            // Environment rules
+            ProxyEnvSet,
+            SensitiveEnvExport,
+            CodeInjectionEnv,
+            InterpreterHijackEnv,
+            ShellInjectionEnv,
+            // Network destination rules
+            MetadataEndpoint,
+            PrivateNetworkAccess,
+            CommandNetworkDeny,
+            // Config file rules
+            ConfigInjection,
+            ConfigSuspiciousIndicator,
+            ConfigNonAscii,
+            ConfigInvisibleUnicode,
+            McpInsecureServer,
+            McpUntrustedServer,
+            McpDuplicateServerName,
+            McpOverlyPermissive,
+            McpSuspiciousArgs,
+            // Ecosystem rules
+            GitTyposquat,
+            DockerUntrustedRegistry,
+            PipUrlInstall,
+            NpmUrlInstall,
+            Web3RpcEndpoint,
+            Web3AddressInUrl,
+            // Rendered content rules
+            HiddenCssContent,
+            HiddenColorContent,
+            HiddenHtmlAttribute,
+            MarkdownComment,
+            HtmlComment,
+            // Cloaking rules
+            ServerCloaking,
+            // Clipboard rules
+            ClipboardHidden,
+            // PDF rules
+            PdfHiddenText,
+            // Policy rules
+            PolicyBlocklisted,
+            // License/infrastructure rules
+            LicenseRequired,
+        ]
+    }
 }
 
 impl fmt::Display for RuleId {
@@ -184,6 +293,12 @@ pub struct Finding {
     /// What an AI agent processes (populated by Pro enrichment, Part 8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<String>,
+    /// MITRE ATT&CK technique ID (populated by Team enrichment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_id: Option<String>,
+    /// User-defined custom rule ID (populated only for CustomRuleMatch findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_rule_id: Option<String>,
 }
 
 /// The action to take based on analysis.
@@ -291,6 +406,8 @@ mod tests {
             evidence: vec![],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         }];
         let verdict = Verdict::from_findings(findings, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);

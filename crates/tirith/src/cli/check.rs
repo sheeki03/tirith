@@ -45,6 +45,7 @@ pub fn run(
         file_path: None,
         repo_root: None,
         is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);

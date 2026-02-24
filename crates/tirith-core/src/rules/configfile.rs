@@ -623,6 +623,8 @@ fn check_invisible_unicode(content: &str, is_known: bool, findings: &mut Vec<Fin
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -697,6 +699,8 @@ fn check_non_ascii(content: &str, file_path: Option<&Path>, findings: &mut Vec<F
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -799,6 +803,8 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             strong_found = true;
             break; // Report first non-negated match per pattern
@@ -845,6 +851,8 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             legacy_found = true;
             break; // Report first non-negated match per pattern
@@ -883,6 +891,8 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return; // Only report first non-negated weak match
         }
@@ -1035,6 +1045,8 @@ fn check_mcp_duplicate_names(content: &str, path: &Path, findings: &mut Vec<Find
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
         seen.push(key);
@@ -1055,6 +1067,8 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -1072,6 +1086,8 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -1109,6 +1125,8 @@ fn check_mcp_args(name: &str, args: &[serde_json::Value], findings: &mut Vec<Fin
                     }],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 });
                 break; // One finding per server
             }
@@ -1133,6 +1151,8 @@ fn check_mcp_tools(name: &str, tools: &[serde_json::Value], findings: &mut Vec<F
                     }],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 });
                 break;
             }

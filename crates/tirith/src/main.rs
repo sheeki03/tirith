@@ -48,6 +48,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Path to clipboard HTML for rich-text paste analysis
+        #[arg(long)]
+        html: Option<String>,
     },
 
     /// Safely download and execute a script
@@ -98,6 +102,12 @@ enum Commands {
         action: ReceiptAction,
     },
 
+    /// Manage file checkpoints for rollback (experimental)
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+
     /// Initialize tirith shell hooks
     Init {
         /// Target shell (default: auto-detect)
@@ -134,6 +144,21 @@ enum Commands {
         #[arg(long)]
         ignore: Vec<String>,
     },
+
+    /// Check a URL for server-side cloaking (different content for bots vs browsers)
+    #[cfg(unix)]
+    Fetch {
+        /// URL to check for cloaking
+        url: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run as MCP server (JSON-RPC over stdio)
+    #[command(name = "mcp-server")]
+    McpServer,
 
     /// Diagnose tirith installation and configuration
     Doctor {
@@ -178,6 +203,44 @@ enum ReceiptAction {
     },
 }
 
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Create a checkpoint of specified paths
+    Create {
+        /// Paths to checkpoint
+        paths: Vec<String>,
+        /// Command that triggered the checkpoint
+        #[arg(long)]
+        trigger: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all checkpoints
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore files from a checkpoint
+    Restore {
+        /// Checkpoint ID
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show differences between checkpoint and current state
+    Diff {
+        /// Checkpoint ID
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove old checkpoints based on age/count/size limits
+    Purge {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -190,7 +253,7 @@ fn main() {
             cmd,
         } => cli::check::run(&cmd.join(" "), &shell, json, non_interactive, interactive),
 
-        Commands::Paste { shell, json } => cli::paste::run(&shell, json),
+        Commands::Paste { shell, json, html } => cli::paste::run(&shell, json, html.as_deref()),
 
         #[cfg(unix)]
         Commands::Run { url, no_exec, json } => cli::run::run(&url, no_exec, json),
@@ -219,10 +282,29 @@ fn main() {
             &ignore,
         ),
 
+        #[cfg(unix)]
+        Commands::Fetch { url, json } => cli::fetch::run(&url, json),
+
+        Commands::McpServer => cli::mcp_server::run(),
+
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),
             ReceiptAction::List { json } => cli::receipt::list(json),
             ReceiptAction::Verify { sha256, json } => cli::receipt::verify(&sha256, json),
+        },
+
+        Commands::Checkpoint { action } => match action {
+            CheckpointAction::Create {
+                paths,
+                trigger,
+                json,
+            } => cli::checkpoint::create_checkpoint(&paths, trigger.as_deref(), json),
+            CheckpointAction::List { json } => cli::checkpoint::list_checkpoints(json),
+            CheckpointAction::Restore { id, json } => {
+                cli::checkpoint::restore_checkpoint(&id, json)
+            }
+            CheckpointAction::Diff { id, json } => cli::checkpoint::diff_checkpoint(&id, json),
+            CheckpointAction::Purge { json } => cli::checkpoint::purge_checkpoints(json),
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),

@@ -6,7 +6,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
-pub fn run(shell: &str, json: bool) -> i32 {
+pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
     // Read raw bytes from stdin with 1 MiB cap
     const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
 
@@ -40,6 +40,15 @@ pub fn run(shell: &str, json: bool) -> i32 {
 
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
+    // Read clipboard HTML if provided
+    let clipboard_html = html_path.and_then(|path| match std::fs::read_to_string(path) {
+        Ok(html) => Some(html),
+        Err(e) => {
+            eprintln!("tirith: warning: failed to read clipboard HTML from '{path}': {e}");
+            None
+        }
+    });
+
     let ctx = AnalysisContext {
         input,
         shell: shell_type,
@@ -52,6 +61,7 @@ pub fn run(shell: &str, json: bool) -> i32 {
         file_path: None,
         repo_root: None,
         is_config_override: false,
+        clipboard_html,
     };
 
     let verdict = engine::analyze(&ctx);

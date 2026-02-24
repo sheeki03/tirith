@@ -17,6 +17,7 @@ pub fn run(url: &str, json: bool) -> i32 {
         file_path: None,
         repo_root: None,
         is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);

@@ -166,6 +166,8 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                                 }],
                                 human_view: None,
                                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
                             });
                     }
                 }
@@ -195,6 +197,8 @@ fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Fi
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -232,6 +236,8 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
                             }],
                             human_view: None,
                             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
                         });
                         return;
                     }
@@ -363,6 +369,8 @@ fn emit_env_finding(var_name: &str, value: &str, findings: &mut Vec<Finding>) {
         }],
         human_view: None,
         agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     });
 }
 
@@ -420,6 +428,8 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                     return;
                 } else if is_private_ip(&host) {
@@ -436,6 +446,8 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                     return;
                 }

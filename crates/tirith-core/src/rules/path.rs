@@ -44,6 +44,8 @@ fn check_non_ascii_path(normalized: &str, findings: &mut Vec<Finding>) {
             }],
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -78,6 +80,8 @@ fn check_homoglyph_in_path(normalized: &str, findings: &mut Vec<Finding>) {
                         evidence: vec![Evidence::Url { raw: segment.to_string() }],
                         human_view: None,
                         agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
                     });
                     return;
                 }
@@ -95,5 +99,7 @@ fn check_double_encoding(raw_path: &str, findings: &mut Vec<Finding>) {
         evidence: vec![Evidence::Url { raw: raw_path.to_string() }],
         human_view: None,
         agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
     });
 }

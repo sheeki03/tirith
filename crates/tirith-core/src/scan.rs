@@ -136,6 +136,9 @@ const CONFIG_DIR_FILE_CAP: usize = 100;
 const CONFIG_DIR_MAX_DEPTH: usize = 4;
 
 /// Run a file scan operation.
+///
+/// Detection is always free (ADR-13). `max_files` is a caller-provided safety
+/// cap (e.g. for resource-constrained CI), not a license gate.
 pub fn scan(config: &ScanConfig) -> ScanResult {
     let matcher = ConfigPathMatcher::new(&config.path, vec![]);
     let mut scan_complete = true;
@@ -337,23 +340,31 @@ fn scan_single_file_impl(
     };
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
 
+    let cwd = file_path.parent().map(|p| p.display().to_string());
+
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes),
         interactive: false,
-        cwd: file_path.parent().map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: Some(file_path.to_path_buf()),
         repo_root: Some(matcher.repo_root().to_path_buf()),
         is_config_override,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     Some(FileScanResult {
         path: file_path.to_path_buf(),
-        findings: verdict.findings,
+        findings,
         is_config_file: is_config,
     })
 }
@@ -421,25 +432,32 @@ fn infer_root_from_config_path(file_path: &Path) -> Option<PathBuf> {
 
 /// Scan content from stdin (no file path).
 pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: content.to_string(),
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes.to_vec()),
         interactive: false,
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: None,
         repo_root: None,
         is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     FileScanResult {
         path: PathBuf::from("<stdin>"),
-        findings: verdict.findings,
+        findings,
         is_config_file: false,
     }
 }
