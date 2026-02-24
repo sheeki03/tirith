@@ -856,7 +856,7 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
 
     // Try weak patterns (only if no strong/legacy match)
     for (regex, description) in WEAK_PATTERNS.iter() {
-        if let Some(m) = regex.find(content) {
+        for m in regex.find_iter(content) {
             if is_negated(content, m.start(), m.end()) {
                 continue;
             }
@@ -884,7 +884,7 @@ fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Find
                 human_view: None,
                 agent_view: None,
             });
-            return; // Only report first weak match
+            return; // Only report first non-negated weak match
         }
     }
 }

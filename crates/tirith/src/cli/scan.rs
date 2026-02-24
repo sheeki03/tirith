@@ -8,7 +8,7 @@ pub fn run(
     path: Option<&str>,
     file: Option<&str>,
     stdin: bool,
-    ci: bool,
+    _ci: bool,
     fail_on: &str,
     json: bool,
     ignore: &[String],
@@ -17,12 +17,12 @@ pub fn run(
 
     // --stdin mode: read from stdin
     if stdin {
-        return run_stdin(json, ci, fail_on_severity);
+        return run_stdin(json, fail_on_severity);
     }
 
     // --file mode: scan a single file
     if let Some(file_path) = file {
-        return run_single_file(file_path, json, ci, fail_on_severity);
+        return run_single_file(file_path, json, fail_on_severity);
     }
 
     // Directory/path mode
@@ -32,7 +32,7 @@ pub fn run(
 
     // Single file passed as positional argument
     if scan_path.is_file() {
-        return run_single_file(&scan_path.display().to_string(), json, ci, fail_on_severity);
+        return run_single_file(&scan_path.display().to_string(), json, fail_on_severity);
     }
 
     let config = ScanConfig {
@@ -66,7 +66,7 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, _ci: bool, fail_on: Severity) -> i32 {
+fn run_stdin(json: bool, fail_on: Severity) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -103,7 +103,7 @@ fn run_stdin(json: bool, _ci: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, _ci: bool, fail_on: Severity) -> i32 {
+fn run_single_file(file_path: &str, json: bool, fail_on: Severity) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
