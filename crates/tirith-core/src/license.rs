@@ -96,8 +96,10 @@ fn decode_tier(key: &str) -> Option<Tier> {
 
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 
-    // Check expiry
-    if let Some(exp_str) = payload.get("exp").and_then(|v| v.as_str()) {
+    // Check expiry — reject malformed exp values (non-string exp would
+    // otherwise skip validation, treating the token as perpetual)
+    if let Some(exp_val) = payload.get("exp") {
+        let exp_str = exp_val.as_str()?;
         let exp_date = chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d").ok()?;
         let today = chrono::Utc::now().date_naive();
         if today > exp_date {
@@ -165,6 +167,15 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_numeric_exp_rejected() {
+        // A numeric exp (e.g. Unix timestamp) must not bypass expiry validation
+        use base64::Engine;
+        let json = r#"{"tier":"pro","exp":99999999999}"#;
+        let key = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        assert_eq!(decode_tier(&key), None);
+    }
+
+    #[test]
     fn test_decode_invalid_base64() {
         assert_eq!(decode_tier("not-valid!!!"), None);
     }
@@ -197,13 +208,8 @@ mod tests {
 
     #[test]
     fn test_current_tier_defaults_community() {
-        // Without TIRITH_LICENSE set, should be Community
-        // (may not hold if user has a license file, but that's fine for CI)
-        let tier = current_tier();
-        assert!(
-            tier == Tier::Community || tier >= Tier::Pro,
-            "Should be a valid tier"
-        );
+        // Verify current_tier() doesn't panic; actual value depends on environment
+        let _tier = current_tier();
     }
 
     #[test]

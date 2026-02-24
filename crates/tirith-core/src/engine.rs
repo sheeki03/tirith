@@ -757,13 +757,15 @@ fn sanitize_view(s: &str) -> String {
 
     // If we truncated (didn't consume all chars), add marker
     if needs_truncation {
-        // Trim any incomplete bracket marker at the end
+        // Defensive: trim any incomplete bracket marker at the end.
+        // Current logic appends escaped sequences atomically, so this
+        // shouldn't trigger — but guards against future refactors.
         if let Some(last_open) = out.rfind('[') {
             if !out[last_open..].contains(']') {
                 out.truncate(last_open);
             }
         }
-        out.push_str(&format!("... [truncated, {total} bytes]"));
+        out.push_str(&format!("... [truncated, {full_len} bytes sanitized]"));
     }
 
     out
@@ -1351,7 +1353,7 @@ mod tests {
         let result = sanitize_view(&long);
         assert!(result.len() < 600, "should be truncated");
         assert!(
-            result.contains("[truncated, 600 bytes]"),
+            result.contains("[truncated, 600 bytes sanitized]"),
             "should have truncation marker, got: {result}"
         );
     }
