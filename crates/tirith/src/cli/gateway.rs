@@ -557,6 +557,9 @@ fn handle_guarded_call(
             interactive: true,
             cwd,
             file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
         };
         let _ = tx.send(engine::analyze(&ctx));
     });
@@ -1657,6 +1660,8 @@ policy:
                     evidence: vec![],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 },
                 Finding {
                     rule_id: tirith_core::verdict::RuleId::CurlPipeShell,
@@ -1666,6 +1671,8 @@ policy:
                     evidence: vec![],
                     human_view: None,
                     agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
                 },
             ],
             tier_reached: 3,
@@ -1675,6 +1682,11 @@ policy:
             policy_path_used: None,
             timings_ms: Timings::default(),
             urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
         };
 
         let resp = build_deny_response(Value::from(1), &verdict, 5.0);

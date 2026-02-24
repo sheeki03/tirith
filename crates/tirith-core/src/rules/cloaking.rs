@@ -44,80 +44,45 @@ pub struct DiffPair {
     pub diff_text: Option<String>,
 }
 
-/// Validate that a URL is safe to fetch (anti-SSRF).
-///
-/// Rejects non-HTTP(S) schemes, private/loopback/link-local IPs,
-/// and cloud metadata endpoints.
 #[cfg(unix)]
-fn validate_url_for_fetch(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
-
-    // Only allow http and https schemes
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => return Err(format!("Disallowed URL scheme: {other}")),
+impl CloakingResult {
+    /// Serialize to JSON. When `include_diff_text` is true (Pro tier), diff text
+    /// is included in the output; otherwise it is omitted.
+    pub fn to_json(&self, include_diff_text: bool) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "cloaking_detected": self.cloaking_detected,
+            "agents": self.agent_responses.iter().map(|a| {
+                serde_json::json!({
+                    "agent": a.agent_name,
+                    "status_code": a.status_code,
+                    "content_length": a.content_length,
+                })
+            }).collect::<Vec<_>>(),
+            "diffs": self.diff_pairs.iter().map(|d| {
+                let mut entry = serde_json::json!({
+                    "agent_a": d.agent_a,
+                    "agent_b": d.agent_b,
+                    "diff_chars": d.diff_chars,
+                });
+                if include_diff_text {
+                    if let Some(ref text) = d.diff_text {
+                        entry.as_object_mut().unwrap().insert(
+                            "diff_text".into(),
+                            serde_json::json!(text),
+                        );
+                    }
+                }
+                entry
+            }).collect::<Vec<_>>(),
+            "findings": self.findings,
+        })
     }
-
-    let host_str = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
-
-    // Resolve hostname to IP addresses and reject private ranges
-    use std::net::ToSocketAddrs;
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = format!("{host_str}:{port}")
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for {host_str}: {e}"))?;
-
-    for addr in addrs {
-        let ip = addr.ip();
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_loopback()           // 127.0.0.0/8
-                    || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                    || v4.is_link_local()      // 169.254.0.0/16
-                    || v4.is_unspecified()     // 0.0.0.0
-                    || v4.is_broadcast()
-                // 255.255.255.255
-                {
-                    return Err(format!("URL resolves to private/reserved IP: {v4}"));
-                }
-                // Explicitly block cloud metadata endpoint
-                if v4 == std::net::Ipv4Addr::new(169, 254, 169, 254) {
-                    return Err(
-                        "URL resolves to cloud metadata endpoint (169.254.169.254)".to_string()
-                    );
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_loopback()        // ::1
-                    || v6.is_unspecified()
-                // ::
-                {
-                    return Err(format!("URL resolves to private/reserved IP: {v6}"));
-                }
-                // fc00::/7 (unique local addresses)
-                let segments = v6.segments();
-                if segments[0] & 0xfe00 == 0xfc00 {
-                    return Err(format!("URL resolves to private/reserved IP: {v6}"));
-                }
-                // fe80::/10 (link-local)
-                if segments[0] & 0xffc0 == 0xfe80 {
-                    return Err(format!("URL resolves to link-local IP: {v6}"));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Check a URL for server-side cloaking.
 #[cfg(unix)]
 pub fn check(url: &str) -> Result<CloakingResult, String> {
-    // Validate URL before fetching to prevent SSRF
-    validate_url_for_fetch(url)?;
-
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -139,6 +104,12 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
                 responses.push((name.to_string(), 0, String::new()));
             }
         }
+    }
+
+    // Check if all fetches failed
+    let successful_count = responses.iter().filter(|(_, s, _)| *s != 0).count();
+    if successful_count == 0 {
+        return Err("all user-agent fetches failed — cannot perform cloaking analysis".to_string());
     }
 
     // Use chrome as baseline
@@ -206,6 +177,8 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -261,7 +234,7 @@ fn normalize_html(input: &str) -> String {
     static STYLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap());
     static NONCE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bnonce="[^"]*""#).unwrap());
     static CSRF: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r#"(?i)csrf[_-]?token[^"]*"[^"]*""#).unwrap());
+        Lazy::new(|| Regex::new(r#"(?i)<[^>]*csrf[_-]?token[^>]*>"#).unwrap());
     static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
     let s = SCRIPT.replace_all(input, "");
@@ -272,20 +245,20 @@ fn normalize_html(input: &str) -> String {
     s.trim().to_string()
 }
 
+/// Build a word-frequency map for diff computation.
+#[cfg(unix)]
+fn word_counts(s: &str) -> std::collections::HashMap<&str, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for word in s.split_whitespace() {
+        *counts.entry(word).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// Generate a human-readable summary of word-level differences between two texts.
 /// Shows words present in one response but not the other (capped at 500 chars).
 #[cfg(unix)]
 fn generate_diff_text(baseline: &str, other: &str) -> String {
-    use std::collections::HashMap;
-
-    fn word_counts(s: &str) -> HashMap<&str, usize> {
-        let mut counts = HashMap::new();
-        for word in s.split_whitespace() {
-            *counts.entry(word).or_insert(0) += 1;
-        }
-        counts
-    }
-
     let counts_a = word_counts(baseline);
     let counts_b = word_counts(other);
 
@@ -352,16 +325,6 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
 /// detecting meaningful content differences vs. cosmetic variations.
 #[cfg(unix)]
 fn word_diff_size(a: &str, b: &str) -> usize {
-    use std::collections::HashMap;
-
-    fn word_counts(s: &str) -> HashMap<&str, usize> {
-        let mut counts = HashMap::new();
-        for word in s.split_whitespace() {
-            *counts.entry(word).or_insert(0) += 1;
-        }
-        counts
-    }
-
     let counts_a = word_counts(a);
     let counts_b = word_counts(b);
 

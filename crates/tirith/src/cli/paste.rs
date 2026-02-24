@@ -6,7 +6,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
-pub fn run(shell: &str, json: bool) -> i32 {
+pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
     // Read raw bytes from stdin with 1 MiB cap
     const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
 
@@ -40,6 +40,15 @@ pub fn run(shell: &str, json: bool) -> i32 {
 
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
+    // Read clipboard HTML if provided
+    let clipboard_html = html_path.and_then(|path| match std::fs::read_to_string(path) {
+        Ok(html) => Some(html),
+        Err(e) => {
+            eprintln!("tirith: warning: failed to read clipboard HTML from '{path}': {e}");
+            None
+        }
+    });
+
     let ctx = AnalysisContext {
         input,
         shell: shell_type,
@@ -50,23 +59,43 @@ pub fn run(shell: &str, json: bool) -> i32 {
             .ok()
             .map(|p| p.display().to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let mut verdict = engine::analyze(&ctx);
+
+    // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
+    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    // Log to audit BEFORE paranoia filtering so the audit captures full detection
+    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Skip if bypass was honored — analyze() already logged it.
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(
+            &verdict,
+            &ctx.input,
+            None,
+            Some(event_id),
+            &policy.dlp_custom_patterns,
+        );
+    }
+
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
         last_trigger::write_last_trigger(&verdict, &ctx.input);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(&verdict, &ctx.input, None, Some(event_id));
-
     if json {
-        let _ = output::write_json(&verdict, std::io::stdout().lock());
-    } else {
-        let _ = output::write_human_auto(&verdict);
+        if output::write_json(&verdict, std::io::stdout().lock()).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+        }
+    } else if output::write_human_auto(&verdict).is_err() {
+        eprintln!("tirith: failed to write output");
     }
 
     verdict.action.exit_code()

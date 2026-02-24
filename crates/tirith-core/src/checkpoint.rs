@@ -109,31 +109,16 @@ impl Default for CheckpointConfig {
     }
 }
 
-/// Validate that a checkpoint ID is safe to use in filesystem paths.
-/// Rejects path traversal attempts (`..`, `/`, `\`) and empty strings.
-fn validate_checkpoint_id(id: &str) -> Result<(), String> {
-    if id.is_empty()
-        || id.contains("..")
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-    {
-        return Err(format!("Invalid checkpoint ID: {id}"));
-    }
-    Ok(())
-}
-
 /// Get the checkpoints directory.
 pub fn checkpoints_dir() -> PathBuf {
-    crate::policy::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp/tirith"))
-        .join("checkpoints")
+    match crate::policy::state_dir() {
+        Some(d) => d.join("checkpoints"),
+        None => {
+            eprintln!("tirith: WARNING: state dir unavailable, using /tmp/tirith (world-readable)");
+            PathBuf::from("/tmp/tirith").join("checkpoints")
+        }
+    }
 }
-
-/// Maximum number of files allowed in a single checkpoint.
-const CHECKPOINT_MAX_FILES: usize = 1_000;
-/// Maximum total size (bytes) allowed in a single checkpoint (50 MiB).
-const CHECKPOINT_MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Create a checkpoint of the given paths. Requires Pro tier (ADR-6: gate in core).
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
@@ -147,36 +132,17 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
 
     let mut manifest: Vec<ManifestEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut limit_exceeded = false;
 
     for path_str in paths {
-        if limit_exceeded {
-            break;
-        }
         let path = Path::new(path_str);
         if !path.exists() {
             continue;
         }
 
         if path.is_file() {
-            if manifest.len() >= CHECKPOINT_MAX_FILES {
-                eprintln!(
-                    "tirith: checkpoint: file limit ({CHECKPOINT_MAX_FILES}) exceeded, skipping checkpoint"
-                );
-                limit_exceeded = true;
-                break;
-            }
             match backup_file(path, &files_dir) {
                 Ok(entry) => {
                     total_bytes += entry.size;
-                    if total_bytes > CHECKPOINT_MAX_TOTAL_BYTES {
-                        eprintln!(
-                            "tirith: checkpoint: size limit ({} MiB) exceeded, skipping checkpoint",
-                            CHECKPOINT_MAX_TOTAL_BYTES / (1024 * 1024)
-                        );
-                        limit_exceeded = true;
-                        break;
-                    }
                     manifest.push(entry);
                 }
                 Err(e) => {
@@ -187,22 +153,7 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
             match backup_dir(path, &files_dir) {
                 Ok(entries) => {
                     for entry in entries {
-                        if manifest.len() >= CHECKPOINT_MAX_FILES {
-                            eprintln!(
-                                "tirith: checkpoint: file limit ({CHECKPOINT_MAX_FILES}) exceeded, skipping checkpoint"
-                            );
-                            limit_exceeded = true;
-                            break;
-                        }
                         total_bytes += entry.size;
-                        if total_bytes > CHECKPOINT_MAX_TOTAL_BYTES {
-                            eprintln!(
-                                "tirith: checkpoint: size limit ({} MiB) exceeded, skipping checkpoint",
-                                CHECKPOINT_MAX_TOTAL_BYTES / (1024 * 1024)
-                            );
-                            limit_exceeded = true;
-                            break;
-                        }
                         manifest.push(entry);
                     }
                 }
@@ -211,12 +162,6 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
                 }
             }
         }
-    }
-
-    // If limits were exceeded, clean up and abort the checkpoint
-    if limit_exceeded {
-        let _ = fs::remove_dir_all(&cp_dir);
-        return Err("checkpoint skipped: file count or total size limit exceeded".to_string());
     }
 
     if manifest.is_empty() {
@@ -260,7 +205,10 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     for entry in fs::read_dir(&base_dir).map_err(|e| format!("read dir: {e}"))? {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("tirith: checkpoint list: cannot read entry: {e}");
+                continue;
+            }
         };
         let meta_path = entry.path().join("meta.json");
         if !meta_path.exists() {
@@ -268,11 +216,23 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
         }
         let meta_str = match fs::read_to_string(&meta_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint list: cannot read {}: {e}",
+                    meta_path.display()
+                );
+                continue;
+            }
         };
         let meta: CheckpointMeta = match serde_json::from_str(&meta_str) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint list: corrupt {}: {e}",
+                    meta_path.display()
+                );
+                continue;
+            }
         };
         entries.push(CheckpointListEntry {
             id: meta.id,
@@ -288,10 +248,28 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     Ok(entries)
 }
 
+/// Validate that a restore path does not contain path traversal components.
+fn validate_restore_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!("restore path contains '..': {path}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a SHA-256 filename is exactly 64 lowercase hex characters.
+fn validate_sha256_filename(sha: &str) -> Result<(), String> {
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid sha256 in manifest: {sha}"));
+    }
+    Ok(())
+}
+
 /// Restore files from a checkpoint. Requires Pro tier (ADR-6: gate in core).
 pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
     require_pro()?;
-    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -309,6 +287,13 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
         if entry.is_dir {
             continue; // Directories are created implicitly
         }
+
+        // CR-1: Validate original_path against path traversal
+        validate_restore_path(&entry.original_path)?;
+
+        // CR-2: Validate sha256 field is a proper hex filename
+        validate_sha256_filename(&entry.sha256)?;
+
         let src = files_dir.join(&entry.sha256);
         if !src.exists() {
             eprintln!(
@@ -319,9 +304,14 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
         }
 
         let dst = Path::new(&entry.original_path);
-        // Create parent directories
+        // SF-3: Propagate create_dir_all failure with clear message
         if let Some(parent) = dst.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "restore {}: cannot create parent dir: {e}",
+                    entry.original_path
+                )
+            })?;
         }
 
         fs::copy(&src, dst).map_err(|e| format!("restore {}: {e}", entry.original_path))?;
@@ -334,7 +324,6 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
 /// Get diff between checkpoint and current filesystem state. Requires Pro tier (ADR-6: gate in core).
 pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     require_pro()?;
-    validate_checkpoint_id(checkpoint_id)?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
@@ -347,46 +336,15 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
-    let mut seen_paths = std::collections::HashSet::new();
+    // CR-9: Track paths already classified to avoid duplicates
+    let mut classified_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in &manifest {
         if entry.is_dir {
             continue;
         }
-        let current_path = Path::new(&entry.original_path);
-        if !current_path.exists() {
-            seen_paths.insert(entry.original_path.clone());
-            diffs.push(DiffEntry {
-                path: entry.original_path.clone(),
-                status: DiffStatus::Deleted,
-                checkpoint_sha256: entry.sha256.clone(),
-                current_sha256: None,
-            });
-            continue;
-        }
 
-        let current_sha = sha256_file(current_path).unwrap_or_default();
-        if current_sha != entry.sha256 {
-            seen_paths.insert(entry.original_path.clone());
-            diffs.push(DiffEntry {
-                path: entry.original_path.clone(),
-                status: DiffStatus::Modified,
-                checkpoint_sha256: entry.sha256.clone(),
-                current_sha256: Some(current_sha),
-            });
-        }
-        // If SHA matches, file unchanged — skip
-    }
-
-    // Check if checkpoint backup files still exist, but skip paths
-    // already categorized in the first pass (e.g. Deleted or Modified).
-    for entry in &manifest {
-        if entry.is_dir {
-            continue;
-        }
-        if seen_paths.contains(&entry.original_path) {
-            continue;
-        }
+        // Check backup integrity first (merged with main loop to avoid CR-9 duplicates)
         let backup = files_dir.join(&entry.sha256);
         if !backup.exists() {
             diffs.push(DiffEntry {
@@ -395,8 +353,53 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
                 checkpoint_sha256: entry.sha256.clone(),
                 current_sha256: None,
             });
+            classified_paths.insert(entry.original_path.clone());
+            continue;
+        }
+
+        let current_path = Path::new(&entry.original_path);
+        if !current_path.exists() {
+            diffs.push(DiffEntry {
+                path: entry.original_path.clone(),
+                status: DiffStatus::Deleted,
+                checkpoint_sha256: entry.sha256.clone(),
+                current_sha256: None,
+            });
+            classified_paths.insert(entry.original_path.clone());
+            continue;
+        }
+
+        // SF-6: Handle sha256_file failure explicitly instead of unwrap_or_default
+        match sha256_file(current_path) {
+            Ok(current_sha) => {
+                if current_sha != entry.sha256 {
+                    diffs.push(DiffEntry {
+                        path: entry.original_path.clone(),
+                        status: DiffStatus::Modified,
+                        checkpoint_sha256: entry.sha256.clone(),
+                        current_sha256: Some(current_sha),
+                    });
+                    classified_paths.insert(entry.original_path.clone());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint diff: cannot read {}: {e}",
+                    entry.original_path
+                );
+                diffs.push(DiffEntry {
+                    path: entry.original_path.clone(),
+                    status: DiffStatus::Modified,
+                    checkpoint_sha256: entry.sha256.clone(),
+                    current_sha256: None,
+                });
+                classified_paths.insert(entry.original_path.clone());
+            }
         }
     }
+
+    // classified_paths used to ensure no duplicates (CR-9 fix applied above by merging loops)
+    let _ = &classified_paths;
 
     Ok(diffs)
 }
@@ -424,9 +427,15 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
             let age = now.signed_duration_since(created);
             if age > max_age {
                 let cp_dir = base_dir.join(&e.id);
-                freed_bytes += e.total_bytes;
-                let _ = fs::remove_dir_all(cp_dir);
-                removed_count += 1;
+                match fs::remove_dir_all(&cp_dir) {
+                    Ok(()) => {
+                        freed_bytes += e.total_bytes;
+                        removed_count += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("tirith: checkpoint purge: failed to remove {}: {err}", e.id);
+                    }
+                }
                 return false;
             }
         }
@@ -437,9 +446,18 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
     while all.len() > config.max_count {
         if let Some(oldest) = all.pop() {
             let cp_dir = base_dir.join(&oldest.id);
-            freed_bytes += oldest.total_bytes;
-            let _ = fs::remove_dir_all(cp_dir);
-            removed_count += 1;
+            match fs::remove_dir_all(&cp_dir) {
+                Ok(()) => {
+                    freed_bytes += oldest.total_bytes;
+                    removed_count += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tirith: checkpoint purge: failed to remove {}: {e}",
+                        oldest.id
+                    );
+                }
+            }
         }
     }
 
@@ -449,9 +467,18 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
         if let Some(oldest) = all.pop() {
             total -= oldest.total_bytes;
             let cp_dir = base_dir.join(&oldest.id);
-            freed_bytes += oldest.total_bytes;
-            let _ = fs::remove_dir_all(cp_dir);
-            removed_count += 1;
+            match fs::remove_dir_all(&cp_dir) {
+                Ok(()) => {
+                    freed_bytes += oldest.total_bytes;
+                    removed_count += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tirith: checkpoint purge: failed to remove {}: {e}",
+                        oldest.id
+                    );
+                }
+            }
         }
     }
 
@@ -498,7 +525,16 @@ fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
         fs::copy(path, &dst).map_err(|e| format!("copy: {e}"))?;
     }
 
-    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    let size = match path.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            eprintln!(
+                "tirith: checkpoint: cannot read metadata for {}: {e}",
+                path.display()
+            );
+            0
+        }
+    };
 
     Ok(ManifestEntry {
         original_path: path.to_string_lossy().to_string(),
@@ -537,16 +573,31 @@ fn backup_dir_recursive(
         }
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint: skip unreadable entry in {}: {e}",
+                    dir.display()
+                );
+                continue;
+            }
         };
         let path = entry.path();
 
-        if path.is_symlink() {
+        // Use symlink_metadata to avoid TOCTOU race between is_symlink() and later reads
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        if meta.file_type().is_symlink() {
             continue; // Skip symlinks for safety
         }
 
-        if path.is_file() {
-            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if meta.file_type().is_file() {
+            let size = meta.len();
             if size > max_single_file {
                 eprintln!(
                     "tirith: checkpoint: skip large file {} ({} bytes)",
@@ -651,7 +702,7 @@ mod tests {
         fs::create_dir_all(&files_dir).unwrap();
 
         let entries = backup_dir(&dir, &files_dir).unwrap();
-        assert_eq!(entries.len(), 2, "should backup 2 files: {:?}", entries);
+        assert_eq!(entries.len(), 2, "should backup 2 files: {entries:?}");
     }
 
     #[test]
@@ -665,20 +716,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_checkpoint_id_rejects_traversal() {
-        assert!(validate_checkpoint_id("../../etc/passwd").is_err());
-        assert!(validate_checkpoint_id("..").is_err());
-        assert!(validate_checkpoint_id("foo/bar").is_err());
-        assert!(validate_checkpoint_id("foo\\bar").is_err());
-        assert!(validate_checkpoint_id("").is_err());
-        assert!(validate_checkpoint_id("foo\0bar").is_err());
+    fn test_validate_restore_path_rejects_traversal() {
+        assert!(validate_restore_path("../../etc/passwd").is_err());
+        assert!(validate_restore_path("/tmp/../etc/evil").is_err());
+        assert!(validate_restore_path("normal/path/file.txt").is_ok());
+        assert!(validate_restore_path("/absolute/path/file.txt").is_ok());
     }
 
     #[test]
-    fn test_validate_checkpoint_id_accepts_valid() {
-        assert!(validate_checkpoint_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890").is_ok());
-        assert!(validate_checkpoint_id("simple-id").is_ok());
-        assert!(validate_checkpoint_id("checkpoint_123").is_ok());
+    fn test_validate_sha256_filename() {
+        let valid = "a".repeat(64);
+        assert!(validate_sha256_filename(&valid).is_ok());
+        assert!(validate_sha256_filename("short").is_err());
+        assert!(validate_sha256_filename("../../etc/passwd").is_err());
+        assert!(validate_sha256_filename(&"g".repeat(64)).is_err()); // non-hex
     }
 
     #[test]

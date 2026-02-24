@@ -1,0 +1,16 @@
+[package]
+name = "tirith-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Internal tool for signing tirith license tokens (not distributed to end users)"
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

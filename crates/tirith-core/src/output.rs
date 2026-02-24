@@ -46,7 +46,7 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
     }
 
     let action_str = match verdict.action {
-        Action::Allow => return Ok(()),
+        Action::Allow => "INFO",
         Action::Warn => "WARNING",
         Action::Block => "BLOCKED",
     };
@@ -158,7 +158,7 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
     }
 
     let action_str = match verdict.action {
-        Action::Allow => return Ok(()),
+        Action::Allow => "INFO",
         Action::Warn => "WARNING",
         Action::Block => "BLOCKED",
     };

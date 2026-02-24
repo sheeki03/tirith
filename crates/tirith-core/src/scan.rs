@@ -67,6 +67,9 @@ const PRIORITY_PARENT_DIRS: &[&str] = &[
 ];
 
 /// Run a file scan operation.
+///
+/// Detection is always free (ADR-13). `max_files` is a caller-provided safety
+/// cap (e.g. for resource-constrained CI), not a license gate.
 pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut files = collect_files(&config.path, config.recursive, &config.ignore_patterns);
 
@@ -85,15 +88,14 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut truncation_reason = None;
     let mut skipped_count = 0;
 
-    // Apply max_files cap
+    // Apply caller-provided safety cap (not a license gate)
     if let Some(max) = config.max_files {
         if files.len() > max {
             skipped_count = files.len() - max;
             files.truncate(max);
             truncated = true;
             truncation_reason = Some(format!(
-                "Scan capped at {max} files ({skipped_count} skipped). \
-                 Upgrade to Pro for unlimited scanning."
+                "Scan capped at {max} files ({skipped_count} skipped)."
             ));
         }
     }
@@ -119,58 +121,96 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
     // Read file content with size cap (10 MiB)
     const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-    let metadata = std::fs::metadata(file_path).ok()?;
+    let metadata = match std::fs::metadata(file_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "tirith: scan: cannot read metadata for {}: {e}",
+                file_path.display()
+            );
+            return None;
+        }
+    };
     if metadata.len() > MAX_FILE_SIZE {
-        return Some(FileScanResult {
-            path: file_path.to_path_buf(),
-            findings: vec![],
-            is_config_file: false,
-        });
+        eprintln!(
+            "tirith: scan: skipping {} ({}B exceeds {}B limit)",
+            file_path.display(),
+            metadata.len(),
+            MAX_FILE_SIZE
+        );
+        return None;
     }
 
-    let raw_bytes = std::fs::read(file_path).ok()?;
+    let raw_bytes = match std::fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("tirith: scan: cannot read {}: {e}", file_path.display());
+            return None;
+        }
+    };
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let is_config = is_priority_file(file_path);
 
+    let cwd = file_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
     let ctx = AnalysisContext {
         input: content,
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes),
         interactive: false,
-        cwd: file_path.parent().map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: Some(file_path.to_path_buf()),
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     Some(FileScanResult {
         path: file_path.to_path_buf(),
-        findings: verdict.findings,
+        findings,
         is_config_file: is_config,
     })
 }
 
 /// Scan content from stdin (no file path).
 pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: content.to_string(),
         shell: ShellType::Posix,
         scan_context: ScanContext::FileScan,
         raw_bytes: Some(raw_bytes.to_vec()),
         interactive: false,
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: cwd.clone(),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
 
+    // Apply paranoia filter to scan findings
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+    let mut findings = verdict.findings;
+    engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
     FileScanResult {
         path: PathBuf::from("<stdin>"),
-        findings: verdict.findings,
+        findings,
         is_config_file: false,
     }
 }
@@ -203,6 +243,7 @@ fn collect_files(path: &Path, recursive: bool, ignore_patterns: &[String]) -> Ve
     }
 
     if !path.is_dir() {
+        eprintln!("tirith: scan: path does not exist: {}", path.display());
         return vec![];
     }
 
@@ -219,10 +260,23 @@ fn collect_files_recursive(
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("tirith: scan: cannot read directory {}: {e}", dir.display());
+            return;
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "tirith: scan: error reading entry in {}: {e}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 

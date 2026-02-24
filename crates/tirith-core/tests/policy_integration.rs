@@ -32,6 +32,9 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         interactive: true,
         cwd: Some(cwd.to_string()),
         file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
     };
     engine::analyze(&ctx)
 }
