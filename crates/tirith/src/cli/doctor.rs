@@ -157,6 +157,21 @@ fn print_human(info: &DoctorInfo) {
                 );
                 eprintln!("    source ~/.config/fish/config.fish");
             }
+            "nushell" => {
+                eprintln!("    # First, materialize hooks:");
+                eprintln!("    tirith init --shell nushell");
+                eprintln!("    # Then add to ~/.config/nushell/config.nu:");
+                if let Some(ref dir) = info.hook_dir {
+                    // Escape for Nushell double-quoted string: \ → \\, " → \"
+                    let escaped = dir.replace('\\', r"\\").replace('"', r#"\""#);
+                    eprintln!(r#"    source "{escaped}/lib/nushell-hook.nu""#);
+                } else {
+                    eprintln!("    source <hook-dir>/lib/nushell-hook.nu");
+                    eprintln!(
+                        "    # (run 'tirith init --shell nushell' first to determine the path)"
+                    );
+                }
+            }
             _ => {
                 eprintln!("    eval \"$(tirith init)\"");
             }
@@ -274,6 +289,14 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
                 docs.join("WindowsPowerShell/Microsoft.PowerShell_profile.ps1"),
                 home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
             ]
+        }
+        "nushell" | "nu" => {
+            let xdg = std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            vec![xdg.join("nushell/config.nu")]
         }
         _ => return (None, false),
     };

@@ -363,6 +363,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Archive extraction commands that may target sensitive paths",
     },
     PatternEntry {
+        id: "cargo_vet",
+        tier1_exec_fragments: &[r"\bcargo\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Cargo install/add without supply-chain audit",
+    },
+    PatternEntry {
         id: "env_var_dangerous",
         tier1_exec_fragments: &[
             r"LD_PRELOAD",

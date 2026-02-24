@@ -79,6 +79,7 @@ pub enum RuleId {
     NpmUrlInstall,
     Web3RpcEndpoint,
     Web3AddressInUrl,
+    VetNotConfigured,
 
     // Rendered content rules
     HiddenCssContent,

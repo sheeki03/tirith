@@ -49,3 +49,8 @@ pub const GATEWAY_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/configs/tirith-gateway.yaml"
 ));
+#[allow(dead_code)]
+pub const NUSHELL_HOOK: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/shell/lib/nushell-hook.nu"
+));
