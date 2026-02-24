@@ -132,7 +132,7 @@ pub fn refresh() -> i32 {
         });
 
         let server_url = match server_url {
-            Some(u) if !u.trim().is_empty() => u,
+            Some(u) if !u.trim().is_empty() => u.trim().to_string(),
             _ => {
                 eprintln!("tirith: no policy server configured");
                 eprintln!("  Set TIRITH_SERVER_URL or configure policy_server_url in policy.yaml");
@@ -140,7 +140,7 @@ pub fn refresh() -> i32 {
             }
         };
         let api_key = match api_key {
-            Some(k) if !k.trim().is_empty() => k,
+            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => {
                 eprintln!("tirith: no API key configured");
                 eprintln!("  Set TIRITH_API_KEY or configure policy_server_api_key in policy.yaml");

@@ -64,6 +64,21 @@ pub fn run(
 
     // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    // Log to audit BEFORE paranoia filtering so the audit captures full detection
+    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Skip if bypass was honored — analyze() already logged it.
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(
+            &verdict,
+            cmd,
+            None,
+            Some(event_id),
+            &policy.dlp_custom_patterns,
+        );
+    }
+
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     // Approval workflow (Team feature)
@@ -81,15 +96,6 @@ pub fn run(
                         return 1;
                     }
                 }
-                // Log to audit before returning
-                let event_id = uuid::Uuid::new_v4().to_string();
-                tirith_core::audit::log_verdict(
-                    &verdict,
-                    cmd,
-                    None,
-                    Some(event_id),
-                    &policy.dlp_custom_patterns,
-                );
                 return verdict.action.exit_code();
             }
         } else if approval_check {
@@ -133,18 +139,6 @@ pub fn run(
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
         last_trigger::write_last_trigger(&verdict, cmd);
-    }
-
-    // Log to audit (skip if bypass was honored — analyze() already logged it)
-    if !verdict.bypass_honored {
-        let event_id = uuid::Uuid::new_v4().to_string();
-        tirith_core::audit::log_verdict(
-            &verdict,
-            cmd,
-            None,
-            Some(event_id),
-            &policy.dlp_custom_patterns,
-        );
     }
 
     // Webhook dispatch (Team feature, non-blocking background thread)

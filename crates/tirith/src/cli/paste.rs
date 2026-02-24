@@ -66,14 +66,10 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
 
     // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
-    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // Write last_trigger.json for non-allow verdicts
-    if verdict.action != tirith_core::verdict::Action::Allow {
-        last_trigger::write_last_trigger(&verdict, &ctx.input);
-    }
-
-    // Log to audit (skip if bypass was honored — analyze() already logged it)
+    // Log to audit BEFORE paranoia filtering so the audit captures full detection
+    // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
+    // Skip if bypass was honored — analyze() already logged it.
     if !verdict.bypass_honored {
         let event_id = uuid::Uuid::new_v4().to_string();
         tirith_core::audit::log_verdict(
@@ -83,6 +79,13 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
+    }
+
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+
+    // Write last_trigger.json for non-allow verdicts
+    if verdict.action != tirith_core::verdict::Action::Allow {
+        last_trigger::write_last_trigger(&verdict, &ctx.input);
     }
 
     if json {

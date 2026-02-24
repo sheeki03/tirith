@@ -650,7 +650,7 @@ fn remote_policy_cache_path() -> Option<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home::home_dir().unwrap_or_default().join(".cache"));
+        .or_else(|| home::home_dir().map(|h| h.join(".cache")))?;
     Some(cache_dir.join("tirith").join("remote-policy.yaml"))
 }
 
