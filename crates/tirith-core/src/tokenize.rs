@@ -318,8 +318,6 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
 /// Must have at least one char before `=`, and the name must be alphanumeric/underscore.
 pub fn is_env_assignment(word: &str) -> bool {
     let s = word.trim();
-
-    // Must not start with - or =
     if s.starts_with('-') || s.starts_with('=') {
         return false;
     }
