@@ -73,9 +73,11 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
         last_trigger::write_last_trigger(&verdict, &ctx.input);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(&verdict, &ctx.input, None, Some(event_id));
+    // Log to audit (skip if bypass was honored — analyze() already logged it)
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(&verdict, &ctx.input, None, Some(event_id));
+    }
 
     if json {
         let _ = output::write_json(&verdict, std::io::stdout().lock());

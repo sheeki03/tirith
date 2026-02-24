@@ -70,9 +70,11 @@ pub fn run(
         last_trigger::write_last_trigger(&verdict, cmd);
     }
 
-    // Log to audit
-    let event_id = uuid::Uuid::new_v4().to_string();
-    tirith_core::audit::log_verdict(&verdict, cmd, None, Some(event_id));
+    // Log to audit (skip if bypass was honored — analyze() already logged it)
+    if !verdict.bypass_honored {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        tirith_core::audit::log_verdict(&verdict, cmd, None, Some(event_id));
+    }
 
     // Output
     if json {

@@ -127,7 +127,7 @@ fn redact_command(cmd: &str) -> String {
     if prefix.len() == cmd.len() {
         cmd.to_string()
     } else {
-        format!("{}[...redacted {} chars]", prefix, cmd.len() - prefix.len())
+        format!("{}[...redacted {} bytes]", prefix, cmd.len() - prefix.len())
     }
 }
 
