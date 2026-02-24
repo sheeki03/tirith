@@ -313,16 +313,9 @@ fn push_segment(segments: &mut Vec<Segment>, raw: &str, preceding_sep: Option<St
 }
 
 /// Check if a word looks like an environment variable assignment (VAR=VALUE).
+/// Does not strip quotes — in POSIX shells, `"FOO=bar"` is a command, not an assignment.
 pub fn is_env_assignment(word: &str) -> bool {
     let s = word.trim();
-    // Strip outer quotes if present
-    let s = if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-    {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    };
 
     // Must not start with - or =
     if s.starts_with('-') || s.starts_with('=') {
