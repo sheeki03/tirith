@@ -102,6 +102,30 @@ export TIRITH_OUTPUT=stderr
 
 This forces tirith to output to stderr instead of `/dev/tty`, which Warp displays correctly.
 
+## Codex: MCP protected, but direct shell commands still run
+
+Symptom: MCP tool calls are blocked correctly, but a direct command like
+`curl ... | bash` still executes in Codex.
+
+Cause: Codex has two execution paths. MCP gateway covers MCP `tools/call`, but
+native `/bin/zsh -lc` execution does not pass through MCP.
+
+Fix: Follow `mcp/clients/codex.md` and ensure both are configured:
+1. Codex MCP gateway registration (`codex mcp add ...`)
+2. `~/.zshenv` guard for all non-interactive `zsh -lc` runs (`ZSH_EXECUTION_STRING`)
+
+The recommended Codex guard is intentionally fail-closed: if `tirith check`
+returns an unexpected non-zero code, the command is blocked for safety.
+
+Then run:
+
+```bash
+scripts/codex-upgrade-smoke.sh --config ~/.config/tirith/gateway.yaml
+```
+
+If it reports unguarded tool names, add those names to `guarded_tools.pattern`
+in your gateway YAML and rerun the script.
+
 ## Unexpected tirith exit codes
 
 Tirith uses a **mixed fail-safe policy** for unexpected exit codes (crashes, OOM-kills, missing binary). The policy balances safety against terminal usability:

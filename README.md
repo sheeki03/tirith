@@ -232,6 +232,16 @@ git clone https://github.com/sheeki03/ohmyzsh-tirith \
 plugins=(... tirith)
 ```
 
+### AI Agent Integrations
+
+For agent clients, configure Tirith on every execution path the client can use.
+
+- Codex: follow `mcp/clients/codex.md` for one-shot setup that covers both
+  native shell execution and MCP tool calls.
+  After each Codex/Tirith upgrade, run `scripts/codex-upgrade-smoke.sh`.
+- Cursor: see `mcp/clients/cursor.md`.
+- VS Code MCP extensions: see `mcp/clients/vscode.md`.
+
 ---
 
 ## Commands

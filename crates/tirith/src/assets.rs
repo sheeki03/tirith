@@ -23,3 +23,29 @@ pub const POWERSHELL_HOOK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/shell/lib/powershell-hook.ps1"
 ));
+
+// Setup hooks embedded at compile time.
+pub const TIRITH_CHECK_PY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/tirith-check.py"
+));
+pub const CURSOR_HOOK_SH: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/cursor-hook.sh"
+));
+pub const VSCODE_HOOK_SH: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/vscode-hook.sh"
+));
+pub const WINDSURF_HOOK_SH: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/windsurf-hook.sh"
+));
+pub const ZSHENV_GUARD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/zshenv-guard.zsh"
+));
+pub const GATEWAY_YAML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/configs/tirith-gateway.yaml"
+));

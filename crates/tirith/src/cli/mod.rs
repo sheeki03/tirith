@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod completions;
 pub mod diff;
 pub mod doctor;
+pub mod gateway;
 pub mod init;
 pub mod last_trigger;
 pub mod license_cmd;
@@ -19,3 +20,4 @@ pub mod why;
 pub mod fetch;
 #[cfg(unix)]
 pub mod run;
+pub mod setup;

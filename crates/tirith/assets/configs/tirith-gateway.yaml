@@ -1,0 +1,42 @@
+# Tirith MCP Gateway configuration
+#
+# Place this file alongside your MCP server config and reference it with:
+#   tirith gateway run --upstream-bin <path> --config tirith-gateway.yaml
+#
+# Each guarded_tool entry matches tool names via regex and extracts the
+# command string via JSON Pointer paths resolved against the `params` object
+# of the tools/call request.
+
+guarded_tools:
+  # Broad POSIX shell tool names used across Codex/Cursor/VS Code extensions
+  - pattern: "^(Bash|bash|shell|sh|zsh|terminal|Terminal|terminal_exec|terminalExec|run_shell|runShell|run_shell_command|runShellCommand|shell_command|shellCommand|command_shell|commandShell)$"
+    command_paths: ["/arguments/command", "/arguments/cmd", "/arguments/script", "/arguments/code", "/command", "/cmd", "/script", "/code"]
+    shell: posix
+
+  # PowerShell tools
+  - pattern: "^(pwsh|powershell|PowerShell|pwsh_command|pwshCommand|powershell_command|powershellCommand)$"
+    command_paths: ["/arguments/command", "/arguments/cmd", "/arguments/script", "/arguments/code", "/command", "/cmd", "/script", "/code"]
+    shell: powershell
+
+  # Generic execute/run naming variants
+  - pattern: "^(run_command|runCommand|execute|execute_command|executeCommand|exec|exec_command|execCommand|run_cmd|runCmd|command_exec|commandExec)$"
+    command_paths: ["/arguments/command", "/arguments/cmd", "/arguments/script", "/arguments/code", "/command", "/cmd", "/script", "/code"]
+    shell: posix
+
+policy:
+  # What to do when tirith reports a "warn" verdict:
+  #   "deny"    - treat warnings as denials (default, safer)
+  #   "forward" - forward the command unchanged, log warning only
+  warn_action: "deny"
+
+  # What to do when tirith analysis fails (timeout, crash, etc):
+  #   "open"   - forward the command (fail open, default)
+  #   "closed" - deny the command (fail closed, stricter)
+  fail_mode: "open"
+
+  # Maximum time (ms) to wait for tirith analysis before applying fail_mode
+  timeout_ms: 10000
+
+  # Maximum bytes per JSON-RPC message line (DoS protection)
+  # Oversize messages trigger immediate session termination
+  max_message_bytes: 1048576  # 1 MiB
