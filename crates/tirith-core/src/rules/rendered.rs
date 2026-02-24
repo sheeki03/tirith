@@ -919,8 +919,8 @@ mod tests {
     fn test_pdf_operand_to_f64() {
         assert_eq!(pdf_operand_to_f64(&lopdf::Object::Integer(42)), Ok(42.0));
         // Real stores f32 internally, so compare with tolerance
-        let real_val = pdf_operand_to_f64(&lopdf::Object::Real(3.14)).unwrap();
-        assert!((real_val - 3.14).abs() < 0.001, "got {real_val}");
+        let real_val = pdf_operand_to_f64(&lopdf::Object::Real(3.25)).unwrap();
+        assert!((real_val - 3.25).abs() < 0.001, "got {real_val}");
         assert!(pdf_operand_to_f64(&lopdf::Object::Boolean(true)).is_err());
     }
 

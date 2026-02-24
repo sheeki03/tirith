@@ -603,7 +603,7 @@ mod tests {
         fs::create_dir_all(&files_dir).unwrap();
 
         let entries = backup_dir(&dir, &files_dir).unwrap();
-        assert_eq!(entries.len(), 2, "should backup 2 files: {:?}", entries);
+        assert_eq!(entries.len(), 2, "should backup 2 files: {entries:?}");
     }
 
     #[test]
