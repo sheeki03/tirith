@@ -1362,8 +1362,9 @@ guarded_tools:
 
     #[test]
     fn test_recursion_depth() {
-        // Verify the depth check logic
-        assert!(1u32 >= 1); // depth=1 would trigger abort
+        // Verify the depth check logic: any depth >= 1 should trigger abort
+        let depth: u32 = 1;
+        assert!(depth >= 1);
     }
 
     // -- No-id error rule test --

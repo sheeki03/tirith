@@ -329,6 +329,13 @@ mod tests {
 
         static HOME_LOCK: Mutex<()> = Mutex::new(());
 
+        fn zsh_available() -> bool {
+            std::process::Command::new("zsh")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+
         fn with_fake_home<F: FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
             let _lock = HOME_LOCK.lock().unwrap();
             let tmp = tempfile::tempdir().unwrap();
@@ -344,6 +351,9 @@ mod tests {
 
         #[test]
         fn install_creates_zshenv_with_guard() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 let result = offer_zshenv_guard(true, false, false, "tirith");
                 assert!(result.is_ok(), "got: {result:?}");
@@ -360,6 +370,9 @@ mod tests {
 
         #[test]
         fn install_idempotent_skips_second_run() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 offer_zshenv_guard(true, false, false, "tirith").unwrap();
                 let content1 = std::fs::read_to_string(home.join(".zshenv")).unwrap();
@@ -373,6 +386,9 @@ mod tests {
 
         #[test]
         fn install_force_replaces_block() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 offer_zshenv_guard(true, false, false, "tirith").unwrap();
 
@@ -390,6 +406,9 @@ mod tests {
 
         #[test]
         fn install_preserves_existing_content() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 let zshenv = home.join(".zshenv");
                 std::fs::write(&zshenv, "export MY_VAR=hello\n").unwrap();
@@ -404,6 +423,9 @@ mod tests {
 
         #[test]
         fn multiple_blocks_error_without_force() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 let zshenv = home.join(".zshenv");
                 let double_block = format!(
@@ -420,6 +442,9 @@ mod tests {
 
         #[test]
         fn multiple_blocks_deduped_with_force() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 let zshenv = home.join(".zshenv");
                 let double_block = format!(
@@ -440,6 +465,9 @@ mod tests {
 
         #[test]
         fn dry_run_no_write() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 let result = offer_zshenv_guard(true, false, true, "tirith");
                 assert!(result.is_ok());
@@ -451,6 +479,9 @@ mod tests {
 
         #[test]
         fn tirith_bin_placeholder_replaced() {
+            if !zsh_available() {
+                return;
+            }
             with_fake_home(|home| {
                 offer_zshenv_guard(true, false, false, "/opt/custom/tirith").unwrap();
                 let content = std::fs::read_to_string(home.join(".zshenv")).unwrap();
