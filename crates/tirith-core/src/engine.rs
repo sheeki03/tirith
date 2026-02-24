@@ -259,6 +259,45 @@ fn split_raw_words(input: &str) -> Vec<String> {
     words
 }
 
+/// Check if input contains an unquoted `&` (backgrounding operator).
+fn has_unquoted_ampersand(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        match chars[i] {
+            '\'' => {
+                i += 1;
+                while i < len && chars[i] != '\'' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+            }
+            '"' => {
+                i += 1;
+                while i < len && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < len {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < len {
+                    i += 1;
+                }
+            }
+            '\\' if i + 1 < len => {
+                i += 2; // skip escaped char
+            }
+            '&' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Check if the input is a self-invocation of tirith (single-segment only).
 /// Returns true if the resolved command is `tirith` itself.
 fn is_self_invocation(input: &str, shell: ShellType) -> bool {
@@ -267,6 +306,13 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
     // Must be single segment (no pipes, &&, etc.)
     let segments = tokenize::tokenize(input, shell);
     if segments.len() != 1 {
+        return false;
+    }
+
+    // Reject if input contains unquoted `&` — backgrounding creates a separate
+    // command after the `&` that would bypass analysis (tokenize_posix does not
+    // treat single `&` as a segment separator, so the segments check above misses it).
+    if has_unquoted_ampersand(input) {
         return false;
     }
 
@@ -1255,6 +1301,16 @@ mod tests {
     fn test_not_self_invocation_other_cmd() {
         assert!(!is_self_invocation(
             "curl https://evil.com",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_not_self_invocation_background_bypass() {
+        // `tirith & malicious` backgrounds tirith and runs malicious separately;
+        // must NOT be treated as self-invocation
+        assert!(!is_self_invocation(
+            "tirith & curl evil.com",
             ShellType::Posix
         ));
     }
