@@ -122,14 +122,20 @@ pub fn refresh() -> i32 {
     #[cfg(unix)]
     {
         // Read server URL and API key from env or policy config
-        let server_url = std::env::var("TIRITH_SERVER_URL").ok().or_else(|| {
-            let policy = tirith_core::policy::Policy::discover(None);
-            policy.policy_server_url
-        });
-        let api_key = std::env::var("TIRITH_API_KEY").ok().or_else(|| {
-            let policy = tirith_core::policy::Policy::discover(None);
-            policy.policy_server_api_key
-        });
+        let server_url = std::env::var("TIRITH_SERVER_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let policy = tirith_core::policy::Policy::discover(None);
+                policy.policy_server_url
+            });
+        let api_key = std::env::var("TIRITH_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let policy = tirith_core::policy::Policy::discover(None);
+                policy.policy_server_api_key
+            });
 
         let server_url = match server_url {
             Some(u) if !u.trim().is_empty() => u.trim().to_string(),

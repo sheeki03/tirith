@@ -346,10 +346,32 @@ impl Policy {
                         }
                         p
                     }
-                    Err(e) => {
-                        eprintln!("tirith: warning: remote policy parse error: {e}");
-                        local
-                    }
+                    Err(e) => match fail_mode {
+                        "closed" => {
+                            eprintln!(
+                                "tirith: error: remote policy parse error ({e}), failing closed"
+                            );
+                            Self::fail_closed_policy()
+                        }
+                        "cached" => {
+                            eprintln!(
+                                "tirith: warning: remote policy parse error ({e}), trying cache"
+                            );
+                            match load_cached_remote_policy() {
+                                Some(p) => p,
+                                None => {
+                                    eprintln!(
+                                        "tirith: warning: no cached remote policy, using local"
+                                    );
+                                    local
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!("tirith: warning: remote policy parse error: {e}");
+                            local
+                        }
+                    },
                 }
             }
             Err(crate::policy_client::PolicyFetchError::AuthError(code)) => {
