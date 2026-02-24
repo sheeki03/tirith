@@ -92,7 +92,12 @@ pub fn log_verdict(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "tirith: audit: failed to set permissions on {}: {e}",
+                path.display()
+            );
+        }
     }
 
     if let Err(e) = file.lock_exclusive() {
