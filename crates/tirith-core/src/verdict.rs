@@ -63,6 +63,7 @@ pub enum RuleId {
     // Config file rules
     ConfigInjection,
     ConfigSuspiciousIndicator,
+    ConfigMalformed,
     ConfigNonAscii,
     ConfigInvisibleUnicode,
     McpInsecureServer,
@@ -98,98 +99,11 @@ pub enum RuleId {
     // Policy rules
     PolicyBlocklisted,
 
+    // Custom rules (Team-only, Phase 24)
+    CustomRuleMatch,
+
     // License/infrastructure rules
     LicenseRequired,
-}
-
-impl RuleId {
-    /// Return an array of all `RuleId` variants (compile-time exhaustive).
-    pub fn all_variants() -> &'static [RuleId] {
-        use RuleId::*;
-        &[
-            // Hostname rules
-            NonAsciiHostname,
-            PunycodeDomain,
-            MixedScriptInLabel,
-            UserinfoTrick,
-            ConfusableDomain,
-            RawIpUrl,
-            NonStandardPort,
-            InvalidHostChars,
-            TrailingDotWhitespace,
-            LookalikeTld,
-            // Path rules
-            NonAsciiPath,
-            HomoglyphInPath,
-            DoubleEncoding,
-            // Transport rules
-            PlainHttpToSink,
-            SchemelessToSink,
-            InsecureTlsFlags,
-            ShortenedUrl,
-            // Terminal deception rules
-            AnsiEscapes,
-            ControlChars,
-            BidiControls,
-            ZeroWidthChars,
-            HiddenMultiline,
-            UnicodeTags,
-            InvisibleMathOperator,
-            VariationSelector,
-            InvisibleWhitespace,
-            // Command shape rules
-            PipeToInterpreter,
-            CurlPipeShell,
-            WgetPipeShell,
-            HttpiePipeShell,
-            XhPipeShell,
-            DotfileOverwrite,
-            ArchiveExtract,
-            // Environment rules
-            ProxyEnvSet,
-            SensitiveEnvExport,
-            CodeInjectionEnv,
-            InterpreterHijackEnv,
-            ShellInjectionEnv,
-            // Network destination rules
-            MetadataEndpoint,
-            PrivateNetworkAccess,
-            CommandNetworkDeny,
-            // Config file rules
-            ConfigInjection,
-            ConfigSuspiciousIndicator,
-            ConfigNonAscii,
-            ConfigInvisibleUnicode,
-            McpInsecureServer,
-            McpUntrustedServer,
-            McpDuplicateServerName,
-            McpOverlyPermissive,
-            McpSuspiciousArgs,
-            // Ecosystem rules
-            GitTyposquat,
-            DockerUntrustedRegistry,
-            PipUrlInstall,
-            NpmUrlInstall,
-            Web3RpcEndpoint,
-            Web3AddressInUrl,
-            // Rendered content rules
-            HiddenCssContent,
-            HiddenColorContent,
-            HiddenHtmlAttribute,
-            MarkdownComment,
-            HtmlComment,
-            // Cloaking rules
-            ServerCloaking,
-            // Clipboard rules
-            ClipboardHidden,
-            // PDF rules
-            PdfHiddenText,
-            // Policy rules
-            PolicyBlocklisted,
-            // License/infrastructure rules
-            LicenseRequired,
-        ]
-    }
 }
 
 impl fmt::Display for RuleId {
@@ -287,10 +201,10 @@ pub struct Finding {
     pub title: String,
     pub description: String,
     pub evidence: Vec<Evidence>,
-    /// What a human sees (populated by Pro enrichment, Part 8).
+    /// What a human sees (populated by Pro enrichment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub human_view: Option<String>,
-    /// What an AI agent processes (populated by Pro enrichment, Part 8).
+    /// What an AI agent processes (populated by Pro enrichment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<String>,
     /// MITRE ATT&CK technique ID (populated by Team enrichment).
@@ -334,6 +248,23 @@ pub struct Verdict {
     /// Number of URLs extracted during Tier 3 analysis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
+
+    // --- Approval workflow metadata (Team, Phase 7) ---
+    /// Whether this verdict requires human approval before execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_approval: Option<bool>,
+    /// Timeout in seconds for approval (0 = indefinite).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
+    /// Fallback action when approval times out: "block", "warn", or "allow".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_fallback: Option<String>,
+    /// The rule_id that triggered the approval requirement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_rule: Option<String>,
+    /// Sanitized single-line description of why approval is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_description: Option<String>,
 }
 
 /// Per-tier timing information.
@@ -359,6 +290,11 @@ impl Verdict {
             policy_path_used: None,
             timings_ms: timings,
             urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
         }
     }
 
@@ -388,6 +324,11 @@ impl Verdict {
             policy_path_used: None,
             timings_ms: timings,
             urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
         }
     }
 }

@@ -1,6 +1,7 @@
 pub mod cloaking;
 pub mod command;
 pub mod configfile;
+pub mod custom;
 pub mod ecosystem;
 pub mod environment;
 pub mod hostname;

@@ -45,6 +45,15 @@
 3. **Policy files**: tirith trusts YAML policy files found on disk (user-level and org-level)
 4. **Audit log**: append-only with file locking; does not prevent deletion by a local attacker
 
+## License Tier Verification
+
+Ed25519 signatures verify tier claims in license tokens. Key rotation is supported via a `kid` (key ID) field that maps to the embedded public key ring.
+
+- The public verification key is committed to source; the private signing key is held in release infrastructure only.
+- Tier checks are honor-system for self-built binaries — users who build from source can patch out checks. Official releases enforce signed tokens.
+- v0.2.x releases accept both signed and legacy unsigned tokens (transition period). v0.3.0+ releases require signed tokens only (`SignedOnly` enforcement mode).
+- All detection rules run regardless of tier (ADR-13). Tiers gate enrichment depth (rendered scanning, cloaking detection, checkpoints, audit reports), not security detection coverage.
+
 ## Bypass Mechanism
 
 tirith supports `TIRITH_BYPASS=1` for commands that must run despite findings. Bypasses are logged to the audit trail with `bypass_requested: true`.

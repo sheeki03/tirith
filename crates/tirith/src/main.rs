@@ -34,6 +34,11 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
 
+        /// Write approval metadata to a temp file and print its path to stdout.
+        /// Used by shell hooks for the approval workflow (Team feature).
+        #[arg(long)]
+        approval_check: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -67,6 +72,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Expected SHA-256 hash of the downloaded script (abort if mismatch)
+        #[arg(long)]
+        sha256: Option<String>,
     },
 
     /// Score a URL for security risk
@@ -140,6 +149,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Output as SARIF 2.1.0 JSON
+        #[arg(long)]
+        sarif: bool,
+
         /// Patterns to ignore
         #[arg(long)]
         ignore: Vec<String>,
@@ -159,6 +172,27 @@ enum Commands {
     /// Run as MCP server (JSON-RPC over stdio)
     #[command(name = "mcp-server")]
     McpServer,
+
+    /// Audit log management: export, stats, compliance reports (Team)
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+
+    /// Activate a license key
+    Activate {
+        /// The signed license token
+        key: String,
+    },
+
+    /// Show or manage license status
+    License {
+        #[command(subcommand)]
+        action: Option<LicenseAction>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Diagnose tirith installation and configuration
     Doctor {
@@ -181,6 +215,57 @@ enum Commands {
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+}
+
+#[derive(Subcommand)]
+enum LicenseAction {
+    /// Deactivate current license
+    Deactivate,
+    /// Refresh license from server
+    Refresh,
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Export audit log records as JSON or CSV
+    Export {
+        /// Output format: json or csv
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Filter: only records since this ISO 8601 date
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter: only records until this ISO 8601 date
+        #[arg(long)]
+        until: Option<String>,
+        /// Filter: only this session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Filter: only this action (Allow, Warn, Block)
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter: only records matching these rule IDs
+        #[arg(long)]
+        rule_id: Vec<String>,
+    },
+    /// Show summary statistics from the audit log
+    Stats {
+        /// Filter to a specific session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate a compliance report from the audit log
+    Report {
+        /// Output format: markdown, json, or html
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Filter: only records since this ISO 8601 date
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -242,6 +327,12 @@ enum CheckpointAction {
 }
 
 fn main() {
+    // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     let exit_code = match cli.command {
@@ -250,13 +341,26 @@ fn main() {
             json,
             non_interactive,
             interactive,
+            approval_check,
             cmd,
-        } => cli::check::run(&cmd.join(" "), &shell, json, non_interactive, interactive),
+        } => cli::check::run(
+            &cmd.join(" "),
+            &shell,
+            json,
+            non_interactive,
+            interactive,
+            approval_check,
+        ),
 
         Commands::Paste { shell, json, html } => cli::paste::run(&shell, json, html.as_deref()),
 
         #[cfg(unix)]
-        Commands::Run { url, no_exec, json } => cli::run::run(&url, no_exec, json),
+        Commands::Run {
+            url,
+            no_exec,
+            json,
+            sha256,
+        } => cli::run::run(&url, no_exec, json, sha256),
 
         Commands::Score { url, json } => cli::score::run(&url, json),
 
@@ -271,6 +375,7 @@ fn main() {
             ci,
             fail_on,
             json,
+            sarif,
             ignore,
         } => cli::scan::run(
             path.as_deref(),
@@ -279,6 +384,7 @@ fn main() {
             ci,
             &fail_on,
             json,
+            sarif,
             &ignore,
         ),
 
@@ -286,6 +392,26 @@ fn main() {
         Commands::Fetch { url, json } => cli::fetch::run(&url, json),
 
         Commands::McpServer => cli::mcp_server::run(),
+
+        Commands::Audit { action } => match action {
+            AuditAction::Export {
+                format,
+                since,
+                until,
+                session,
+                action,
+                rule_id,
+            } => cli::audit::export(
+                &format,
+                since.as_deref(),
+                until.as_deref(),
+                session.as_deref(),
+                action.as_deref(),
+                &rule_id,
+            ),
+            AuditAction::Stats { session, json } => cli::audit::stats(session.as_deref(), json),
+            AuditAction::Report { format, since } => cli::audit::report(&format, since.as_deref()),
+        },
 
         Commands::Receipt { action } => match action {
             ReceiptAction::Last { json } => cli::receipt::last(json),
@@ -305,6 +431,14 @@ fn main() {
             }
             CheckpointAction::Diff { id, json } => cli::checkpoint::diff_checkpoint(&id, json),
             CheckpointAction::Purge { json } => cli::checkpoint::purge_checkpoints(json),
+        },
+
+        Commands::Activate { key } => cli::license_cmd::activate(&key),
+
+        Commands::License { action, json } => match action {
+            None => cli::license_cmd::show(json),
+            Some(LicenseAction::Deactivate) => cli::license_cmd::deactivate(),
+            Some(LicenseAction::Refresh) => cli::license_cmd::refresh(),
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),

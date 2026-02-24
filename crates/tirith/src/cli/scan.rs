@@ -4,25 +4,27 @@ use std::path::PathBuf;
 use tirith_core::scan::{self, ScanConfig};
 use tirith_core::verdict::Severity;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     path: Option<&str>,
     file: Option<&str>,
     stdin: bool,
-    _ci: bool,
+    ci: bool,
     fail_on: &str,
     json: bool,
+    sarif: bool,
     ignore: &[String],
 ) -> i32 {
     let fail_on_severity = parse_severity(fail_on);
 
     // --stdin mode: read from stdin
     if stdin {
-        return run_stdin(json, fail_on_severity);
+        return run_stdin(json, sarif, ci, fail_on_severity);
     }
 
     // --file mode: scan a single file
     if let Some(file_path) = file {
-        return run_single_file(file_path, json, fail_on_severity);
+        return run_single_file(file_path, json, sarif, ci, fail_on_severity);
     }
 
     // Directory/path mode
@@ -32,7 +34,13 @@ pub fn run(
 
     // Single file passed as positional argument
     if scan_path.is_file() {
-        return run_single_file(&scan_path.display().to_string(), json, fail_on_severity);
+        return run_single_file(
+            &scan_path.display().to_string(),
+            json,
+            sarif,
+            ci,
+            fail_on_severity,
+        );
     }
 
     let config = ScanConfig {
@@ -45,19 +53,21 @@ pub fn run(
 
     let result = scan::scan(&config);
 
-    if json {
+    if sarif {
+        print_sarif_result(&result);
+    } else if json {
         print_json_result(&result);
     } else {
         print_human_result(&result);
     }
 
-    // Exit code precedence: incomplete scan (exit 2) > findings (exit 1) > clean (exit 0).
-    // An incomplete scan may be missing worse findings, so it must not report success.
-    // Incomplete always exits 2 regardless of findings — CI must address the scan gap
-    // before trusting any results.
-    if !result.scan_complete {
-        2
-    } else if result.has_findings_at_or_above(fail_on_severity) {
+    if (ci && result.has_findings_at_or_above(fail_on_severity))
+        || result
+            .file_results
+            .iter()
+            .flat_map(|r| &r.findings)
+            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
+    {
         1
     } else if result.total_findings() > 0 {
         2
@@ -66,7 +76,7 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, fail_on: Severity) -> i32 {
+fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -88,13 +98,20 @@ fn run_stdin(json: bool, fail_on: Severity) -> i32 {
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
     let result = scan::scan_stdin(&content, &raw_bytes);
 
-    if json {
+    if sarif {
+        print_sarif_file_result(&result);
+    } else if json {
         print_json_file_result(&result);
     } else {
         print_human_file_result(&result);
     }
 
-    if result.findings.iter().any(|f| f.severity >= fail_on) {
+    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
+        || result
+            .findings
+            .iter()
+            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
+    {
         1
     } else if !result.findings.is_empty() {
         2
@@ -103,14 +120,14 @@ fn run_stdin(json: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, fail_on: Severity) -> i32 {
+fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
         return 1;
     }
 
-    let result = match scan::scan_single_file_standalone(&path) {
+    let result = match scan::scan_single_file(&path) {
         Some(r) => r,
         None => {
             eprintln!("tirith scan: could not read file: {file_path}");
@@ -118,13 +135,20 @@ fn run_single_file(file_path: &str, json: bool, fail_on: Severity) -> i32 {
         }
     };
 
-    if json {
+    if sarif {
+        print_sarif_file_result(&result);
+    } else if json {
         print_json_file_result(&result);
     } else {
         print_human_file_result(&result);
     }
 
-    if result.findings.iter().any(|f| f.severity >= fail_on) {
+    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
+        || result
+            .findings
+            .iter()
+            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
+    {
         1
     } else if !result.findings.is_empty() {
         2
@@ -140,7 +164,10 @@ fn parse_severity(s: &str) -> Severity {
         "medium" => Severity::Medium,
         "high" => Severity::High,
         "critical" => Severity::Critical,
-        _ => Severity::Critical,
+        _ => {
+            eprintln!("tirith scan: warning: unknown severity '{s}', defaulting to critical");
+            Severity::Critical
+        }
     }
 }
 
@@ -150,9 +177,7 @@ fn print_json_result(result: &scan::ScanResult) {
         schema_version: u32,
         scanned_count: usize,
         skipped_count: usize,
-        skipped_config_paths: usize,
         truncated: bool,
-        scan_complete: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         truncation_reason: &'a Option<String>,
         total_findings: usize,
@@ -181,16 +206,14 @@ fn print_json_result(result: &scan::ScanResult) {
         schema_version: 3,
         scanned_count: result.scanned_count,
         skipped_count: result.skipped_count,
-        skipped_config_paths: result.skipped_config_paths,
         truncated: result.truncated,
-        scan_complete: result.scan_complete,
         truncation_reason: &result.truncation_reason,
         total_findings: result.total_findings(),
         files,
     };
 
-    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
-        eprintln!("tirith: write output: {e}");
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
+        eprintln!("tirith scan: failed to write JSON output");
     }
     println!();
 }
@@ -211,8 +234,8 @@ fn print_json_file_result(result: &scan::FileScanResult) {
         findings: &result.findings,
     };
 
-    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
-        eprintln!("tirith: write output: {e}");
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
+        eprintln!("tirith scan: failed to write JSON output");
     }
     println!();
 }
@@ -270,15 +293,50 @@ fn print_human_result(result: &scan::ScanResult) {
             eprintln!("  \x1b[33m{reason}\x1b[0m");
         }
     }
+}
 
-    if !result.scan_complete {
-        eprintln!();
-        eprintln!(
-            "  \x1b[33mwarning: scan incomplete ({} config path(s) skipped) — \
-             findings may not reflect full coverage\x1b[0m",
-            result.skipped_config_paths
-        );
+fn print_sarif_result(result: &scan::ScanResult) {
+    use tirith_core::sarif::{self, SarifFinding};
+
+    let version = env!("CARGO_PKG_VERSION");
+    let findings: Vec<SarifFinding> = result
+        .file_results
+        .iter()
+        .flat_map(|fr| {
+            fr.findings.iter().map(move |f| SarifFinding {
+                finding: f,
+                file_path: Some(fr.path.display().to_string()),
+                line_number: None,
+            })
+        })
+        .collect();
+
+    let sarif_json = sarif::to_sarif(&findings, version);
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
+        eprintln!("tirith scan: failed to write SARIF output");
     }
+    println!();
+}
+
+fn print_sarif_file_result(result: &scan::FileScanResult) {
+    use tirith_core::sarif::{self, SarifFinding};
+
+    let version = env!("CARGO_PKG_VERSION");
+    let findings: Vec<SarifFinding> = result
+        .findings
+        .iter()
+        .map(|f| SarifFinding {
+            finding: f,
+            file_path: Some(result.path.display().to_string()),
+            line_number: None,
+        })
+        .collect();
+
+    let sarif_json = sarif::to_sarif(&findings, version);
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &sarif_json).is_err() {
+        eprintln!("tirith scan: failed to write SARIF output");
+    }
+    println!();
 }
 
 fn print_human_file_result(result: &scan::FileScanResult) {

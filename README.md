@@ -362,6 +362,8 @@ sheeki003@gmail.com for commercial licensing options.
 
 Third-party data attributions in [NOTICE](NOTICE).
 
+> **Note:** Tier checks gate enrichment features (detailed diffs, checkpoints, audit reports), not security detection. All detection rules run at every tier regardless of license. Self-built binaries can set any tier; official v0.3.0+ releases require Ed25519-signed license tokens.
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=sheeki03/tirith&type=Date)](https://star-history.com/#sheeki03/tirith&Date)

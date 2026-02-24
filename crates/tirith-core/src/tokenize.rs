@@ -326,13 +326,7 @@ pub fn is_env_assignment(word: &str) -> bool {
             return false;
         }
         let name = &s[..eq_pos];
-        let mut chars = name.chars();
-        match chars.next() {
-            Some(first) if first.is_ascii_alphabetic() || first == '_' => {
-                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            }
-            _ => false,
-        }
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     } else {
         false
     }

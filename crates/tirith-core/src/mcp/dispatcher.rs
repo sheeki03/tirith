@@ -55,6 +55,33 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             continue;
         }
 
+        // Cap individual message size at 10 MiB to prevent DoS
+        const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+        if trimmed.len() > MAX_LINE_LEN {
+            let _ = writeln!(
+                log,
+                "tirith mcp-server: message too large ({} bytes), dropping",
+                trimmed.len()
+            );
+            let resp = JsonRpcResponse::err(
+                Value::Null,
+                JsonRpcError {
+                    code: -32700,
+                    message: format!(
+                        "Message too large: {} bytes exceeds {} byte limit",
+                        trimmed.len(),
+                        MAX_LINE_LEN
+                    ),
+                    data: None,
+                },
+            );
+            if !write_response(&mut output, &resp) {
+                let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                return 1;
+            }
+            continue;
+        }
+
         // Phase 1: Parse as raw JSON — failure here is a true parse error (-32700)
         let raw: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
@@ -68,7 +95,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -92,7 +122,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -109,7 +142,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         }
@@ -126,7 +162,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                         data: None,
                     },
                 );
-                write_response(&mut output, &resp);
+                if !write_response(&mut output, &resp) {
+                    let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+                    return 1;
+                }
                 continue;
             }
         };
@@ -210,7 +249,10 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
             },
         };
 
-        write_response(&mut output, &response);
+        if !write_response(&mut output, &response) {
+            let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
+            return 1;
+        }
     }
 
     let _ = writeln!(log, "tirith mcp-server: stdin closed, exiting");
@@ -243,7 +285,10 @@ fn handle_initialize(params: &Option<Value>) -> Value {
         },
     };
 
-    serde_json::to_value(result).unwrap_or(json!({}))
+    serde_json::to_value(result).unwrap_or_else(|e| {
+        eprintln!("tirith: mcp: initialize serialization failed: {e}");
+        json!({})
+    })
 }
 
 fn handle_tools_call(params: &Option<Value>) -> ToolCallResult {
@@ -315,10 +360,23 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
 // I/O
 // ---------------------------------------------------------------------------
 
-fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) {
-    if let Ok(json) = serde_json::to_string(resp) {
-        let _ = writeln!(output, "{json}");
-        let _ = output.flush();
+/// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
+fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
+    match serde_json::to_string(resp) {
+        Ok(json) => {
+            if writeln!(output, "{json}").is_err() || output.flush().is_err() {
+                return false; // Output pipe broken — caller should exit
+            }
+            true
+        }
+        Err(_) => {
+            // Serialization failed — should not happen with well-formed types.
+            // Attempt to send an internal error response as a fallback.
+            let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
+            let _ = writeln!(output, "{fallback}");
+            let _ = output.flush();
+            true
+        }
     }
 }
 

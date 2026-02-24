@@ -40,15 +40,19 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
             let cwd = std::env::current_dir()
                 .map_err(|e| format!("Cannot determine working directory: {e}"))?;
 
+            let policy = crate::policy::Policy::discover(None);
             let config = scan::ScanConfig {
                 path: cwd,
                 recursive: true,
                 fail_on: crate::verdict::Severity::Critical,
-                ignore_patterns: vec![],
+                ignore_patterns: policy.scan.ignore_patterns.clone(),
                 max_files: None,
             };
+            let mut result = scan::scan(&config);
+            for fr in &mut result.file_results {
+                crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+            }
 
-            let result = scan::scan(&config);
             let report = json!({
                 "scanned_count": result.scanned_count,
                 "skipped_count": result.skipped_count,
@@ -64,7 +68,10 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                     .collect::<Vec<_>>(),
             });
 
-            let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+            let text = serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
+                eprintln!("tirith: mcp: resource serialization failed: {e}");
+                "{}".to_string()
+            });
 
             Ok(vec![ResourceContent {
                 uri: PROJECT_SAFETY_URI.into(),
@@ -91,15 +98,19 @@ fn read_project_safety() -> ToolCallResult {
         }
     };
 
+    let policy = crate::policy::Policy::discover(None);
     let config = scan::ScanConfig {
         path: cwd,
         recursive: true,
         fail_on: crate::verdict::Severity::Critical,
-        ignore_patterns: vec![],
+        ignore_patterns: policy.scan.ignore_patterns.clone(),
         max_files: None,
     };
+    let mut result = scan::scan(&config);
+    for fr in &mut result.file_results {
+        crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+    }
 
-    let result = scan::scan(&config);
     let total = result.total_findings();
 
     let structured = json!({

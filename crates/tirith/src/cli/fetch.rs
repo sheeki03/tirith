@@ -30,34 +30,13 @@ pub fn run(url: &str, json: bool) -> i32 {
 }
 
 fn print_json(result: &cloaking::CloakingResult, is_pro: bool) {
-    let json = serde_json::json!({
-        "url": result.url,
-        "cloaking_detected": result.cloaking_detected,
-        "agents": result.agent_responses.iter().map(|a| {
-            serde_json::json!({
-                "agent": a.agent_name,
-                "status_code": a.status_code,
-                "content_length": a.content_length,
-            })
-        }).collect::<Vec<_>>(),
-        "diffs": result.diff_pairs.iter().map(|d| {
-            let mut entry = serde_json::json!({
-                "agent_a": d.agent_a,
-                "agent_b": d.agent_b,
-                "diff_chars": d.diff_chars,
-            });
-            if is_pro {
-                if let Some(ref text) = d.diff_text {
-                    entry.as_object_mut().unwrap().insert("diff_text".into(), serde_json::json!(text));
-                }
-            }
-            entry
-        }).collect::<Vec<_>>(),
-        "findings": result.findings,
-    });
+    let json = result.to_json(is_pro);
     println!(
         "{}",
-        serde_json::to_string_pretty(&json).unwrap_or_default()
+        serde_json::to_string_pretty(&json).unwrap_or_else(|e| {
+            eprintln!("tirith: fetch: JSON serialization failed: {e}");
+            "{}".to_string()
+        })
     );
 }
 

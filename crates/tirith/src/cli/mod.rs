@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod check;
 pub mod checkpoint;
 pub mod completions;
@@ -5,6 +6,7 @@ pub mod diff;
 pub mod doctor;
 pub mod init;
 pub mod last_trigger;
+pub mod license_cmd;
 pub mod manpage;
 pub mod mcp_server;
 pub mod paste;

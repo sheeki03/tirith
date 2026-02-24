@@ -16,7 +16,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("escape"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -37,7 +37,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("control"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -58,7 +58,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("bidi"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -114,7 +114,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                     .into_iter()
                     .map(|d| Evidence::ByteSequence {
                         offset: d.offset,
-                        hex: format!("0x{:02x}", d.byte),
+                        hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                         description: d.description.clone(),
                     })
                     .collect(),
@@ -136,7 +136,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("invisible math operator"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -178,7 +178,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("variation selector"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -199,7 +199,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .filter(|d| d.description.contains("invisible whitespace"))
                 .map(|d| Evidence::ByteSequence {
                     offset: d.offset,
-                    hex: format!("0x{:02x}", d.byte),
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
                     description: d.description.clone(),
                 })
                 .collect(),
@@ -217,6 +217,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
 /// Each tag character encodes one ASCII byte: codepoint - 0xE0000 = ASCII value.
 fn decode_unicode_tags(input: &[u8]) -> String {
     let Ok(s) = std::str::from_utf8(input) else {
+        eprintln!("tirith: warning: unicode tag decode failed: input is not valid UTF-8");
         return String::new();
     };
     let mut decoded = String::new();

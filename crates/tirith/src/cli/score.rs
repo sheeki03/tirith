@@ -46,8 +46,8 @@ pub fn run(url: &str, json: bool) -> i32 {
             risk_level: level,
             findings: &verdict.findings,
         };
-        if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &out) {
-            eprintln!("tirith: failed to write JSON output: {e}");
+        if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+            eprintln!("tirith: failed to write JSON output");
         }
         println!();
     } else if verdict.findings.is_empty() {
@@ -61,8 +61,8 @@ pub fn run(url: &str, json: bool) -> i32 {
             .unwrap_or(Severity::Low);
         let (score, level) = severity_to_score(max_severity, verdict.findings.len());
         eprintln!("tirith: {url} — risk score: {score}/100 ({level})");
-        if let Err(e) = output::write_human_auto(&verdict) {
-            eprintln!("tirith: failed to write output: {e}");
+        if output::write_human_auto(&verdict).is_err() {
+            eprintln!("tirith: failed to write output");
         }
     }
 
