@@ -14,7 +14,6 @@ mod tools;
 mod zshenv;
 
 #[cfg(unix)]
-#[allow(unused_imports)]
 pub use self::run_impl::run;
 
 #[cfg(not(unix))]

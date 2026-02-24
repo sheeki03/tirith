@@ -4,7 +4,6 @@ pub mod checkpoint;
 pub mod completions;
 pub mod diff;
 pub mod doctor;
-#[allow(dead_code)]
 pub mod gateway;
 pub mod init;
 pub mod last_trigger;
@@ -21,5 +20,4 @@ pub mod why;
 pub mod fetch;
 #[cfg(unix)]
 pub mod run;
-#[allow(dead_code)]
 pub mod setup;
