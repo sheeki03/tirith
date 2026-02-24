@@ -1,9 +1,14 @@
 [advisories]
 version = 2
-# time 0.3.46 DoS via RFC 2822 stack exhaustion — fix (0.3.47) requires Rust 1.88,
-# but our MSRV is 1.83. Not exploitable: lopdf (our only consumer) does not parse
-# user-provided RFC 2822 date strings. Will resolve when MSRV is bumped.
-ignore = ["RUSTSEC-2026-0009"]
+ignore = [
+    # time <0.3.47 DoS via RFC 2822 stack exhaustion. Fix (0.3.47) requires
+    # Rust 1.88 which exceeds our MSRV 1.83. Transitive dep via lopdf/rust-s3;
+    # tirith never parses user-controlled RFC 2822 dates.
+    "RUSTSEC-2026-0009",
+    # rustls-pemfile unmaintained — transitive dep of rust-s3 (license server).
+    # No replacement available; rust-s3 hasn't migrated yet.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2

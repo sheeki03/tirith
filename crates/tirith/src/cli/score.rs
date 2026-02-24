@@ -14,6 +14,10 @@ pub fn run(url: &str, json: bool) -> i32 {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -32,7 +36,7 @@ pub fn run(url: &str, json: bool) -> i32 {
             .iter()
             .map(|f| f.severity)
             .max()
-            .unwrap_or(Severity::Low);
+            .unwrap_or(Severity::Info);
 
         let (score, level) = severity_to_score(max_severity, verdict.findings.len());
 
@@ -42,7 +46,9 @@ pub fn run(url: &str, json: bool) -> i32 {
             risk_level: level,
             findings: &verdict.findings,
         };
-        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+            eprintln!("tirith: failed to write JSON output");
+        }
         println!();
     } else if verdict.findings.is_empty() {
         eprintln!("tirith: {url} — no issues found (score: 0/100)");
@@ -52,10 +58,12 @@ pub fn run(url: &str, json: bool) -> i32 {
             .iter()
             .map(|f| f.severity)
             .max()
-            .unwrap_or(Severity::Low);
+            .unwrap_or(Severity::Info);
         let (score, level) = severity_to_score(max_severity, verdict.findings.len());
         eprintln!("tirith: {url} — risk score: {score}/100 ({level})");
-        let _ = output::write_human_auto(&verdict);
+        if output::write_human_auto(&verdict).is_err() {
+            eprintln!("tirith: failed to write output");
+        }
     }
 
     0

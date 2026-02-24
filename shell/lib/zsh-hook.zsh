@@ -14,15 +14,61 @@ if [[ -n "$_TIRITH_ZSH_LOADED" ]]; then
 fi
 _TIRITH_ZSH_LOADED=1
 
-# Output helper: use stderr for Warp terminal (which doesn't display /dev/tty properly),
-# otherwise use /dev/tty for proper terminal output that doesn't mix with command output.
-# Allow override via TIRITH_OUTPUT=stderr for terminals that hide /dev/tty.
+# Session tracking: generate ID per shell session if not inherited
+if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
+  TIRITH_SESSION_ID="$(printf '%x-%x' "$$" "$(date +%s)")"
+  export TIRITH_SESSION_ID
+fi
+
+# Output helper: write to stderr by default (ADR-7).
+# Override via TIRITH_OUTPUT=tty to write to /dev/tty instead.
 _tirith_output() {
-  if [[ "${TIRITH_OUTPUT:-}" == "stderr" ]] || [[ "$TERM_PROGRAM" == "WarpTerminal" ]]; then
-    printf '%s\n' "$1" >&2
-  else
+  if [[ "${TIRITH_OUTPUT:-}" == "tty" ]]; then
     printf '%s\n' "$1" >/dev/tty
+  else
+    printf '%s\n' "$1" >&2
   fi
+}
+
+# ─── Approval workflow helpers (ADR-7) ───
+
+_tirith_parse_approval() {
+  local file="$1"
+  _tirith_ap_required="no"
+  _tirith_ap_timeout=0
+  _tirith_ap_fallback="block"
+  _tirith_ap_rule=""
+  _tirith_ap_desc=""
+
+  if [[ ! -r "$file" ]]; then
+    _tirith_output "tirith: warning: approval file missing or unreadable, failing closed"
+    command rm -f "$file"  # ADR-7: delete on all paths
+    _tirith_ap_required="yes"
+    _tirith_ap_fallback="block"
+    _tirith_ap_timeout=0
+    return 1
+  fi
+
+  local valid_keys=0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TIRITH_REQUIRES_APPROVAL) _tirith_ap_required="$value"; valid_keys=$((valid_keys + 1)) ;;
+      TIRITH_APPROVAL_TIMEOUT) _tirith_ap_timeout="$value" ;;
+      TIRITH_APPROVAL_FALLBACK) _tirith_ap_fallback="$value" ;;
+      TIRITH_APPROVAL_RULE) _tirith_ap_rule="$value" ;;
+      TIRITH_APPROVAL_DESCRIPTION) _tirith_ap_desc="$value" ;;
+    esac
+  done < "$file"
+
+  command rm -f "$file"
+
+  if [[ $valid_keys -eq 0 ]]; then
+    _tirith_output "tirith: warning: approval file corrupt, failing closed"
+    _tirith_ap_required="yes"
+    _tirith_ap_fallback="block"
+    return 1
+  fi
+  return 0
 }
 
 # Save original accept-line widget if it exists
@@ -39,34 +85,80 @@ _tirith_accept_line() {
     return
   fi
 
-  # Run tirith check, redirect to temp file to prevent tty leakage
-  local tmpfile=$(mktemp)
-  tirith check --non-interactive --interactive --shell posix -- "$buf" >"$tmpfile" 2>&1
+  # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
+  local errfile=$(mktemp)
+  local approval_path
+  approval_path=$(tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
   local rc=$?
-  local output=$(<"$tmpfile")
-  rm -f "$tmpfile"
+  local output=$(<"$errfile")
+  command rm -f "$errfile"
 
   if [[ $rc -eq 0 ]]; then
-    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
+    :  # Allow: no output
   elif [[ $rc -eq 2 ]]; then
     _tirith_output ""
     _tirith_output "command> $buf"
     [[ -n "$output" ]] && _tirith_output "$output"
-    zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
   elif [[ $rc -eq 1 ]]; then
-    # Block: tirith intentionally blocked
-    BUFFER=""
     _tirith_output ""
     _tirith_output "command> $buf"
     [[ -n "$output" ]] && _tirith_output "$output"
-    zle send-break
   else
     # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
     _tirith_output ""
     [[ -n "$output" ]] && _tirith_output "$output"
     _tirith_output "tirith: unexpected exit code $rc — running unprotected"
+    [[ -n "$approval_path" ]] && command rm -f "$approval_path"
     zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
+    return
   fi
+
+  # Approval workflow: runs for ALL exit codes (0, 1, 2).
+  # For rc=1 (block), approval gives user a chance to override.
+  if [[ -n "$approval_path" ]]; then
+    _tirith_parse_approval "$approval_path"
+    if [[ "$_tirith_ap_required" == "yes" ]]; then
+      _tirith_output "tirith: approval required for $_tirith_ap_rule"
+      [[ -n "$_tirith_ap_desc" ]] && _tirith_output "  $_tirith_ap_desc"
+      local response=""
+      if [[ "$_tirith_ap_timeout" -gt 0 ]]; then
+        read -t "$_tirith_ap_timeout" "response?Approve? (${_tirith_ap_timeout}s timeout) [y/N] " </dev/tty 2>/dev/null
+      else
+        read "response?Approve? [y/N] " </dev/tty 2>/dev/null
+      fi
+      if [[ "$response" == [yY]* ]]; then
+        :  # Approved: fall through to execute
+      else
+        case "$_tirith_ap_fallback" in
+          allow)
+            _tirith_output "tirith: approval not granted — fallback: allow"
+            ;;
+          warn)
+            _tirith_output "tirith: approval not granted — fallback: warn"
+            ;;
+          *)
+            _tirith_output "tirith: approval not granted — fallback: block"
+            BUFFER=""
+            zle send-break
+            return
+            ;;
+        esac
+      fi
+    elif [[ $rc -eq 1 ]]; then
+      # Approval not required but command was blocked: honor block
+      BUFFER=""
+      zle send-break
+      return
+    fi
+  elif [[ $rc -eq 1 ]]; then
+    # No approval file: honor block
+    BUFFER=""
+    zle send-break
+    return
+  fi
+
+  # Execute (rc=0, rc=2, or approval granted)
+  zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
 }
 
 zle -N accept-line _tirith_accept_line
@@ -92,7 +184,7 @@ _tirith_bracketed_paste() {
     echo -n "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
     local rc=$?
     local output=$(<"$tmpfile")
-    rm -f "$tmpfile"
+    command rm -f "$tmpfile"
 
     if [[ $rc -eq 0 ]]; then
       # Allow: fall through to keep paste

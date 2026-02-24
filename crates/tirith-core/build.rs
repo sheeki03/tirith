@@ -351,10 +351,62 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Redirect output to dotfiles in home directory (> ~/.bashrc, >> $HOME/.profile)",
     },
     PatternEntry {
+        id: "git_sink",
+        tier1_exec_fragments: &[r"git\s+(?:clone|fetch|pull|submodule|remote)\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "Git download subcommands that may reference schemeless URLs",
+    },
+    PatternEntry {
         id: "archive_extract_sensitive",
         tier1_exec_fragments: &[r"(?:tar|unzip|7z)\s"],
         tier1_paste_only_fragments: &[],
         notes: "Archive extraction commands that may target sensitive paths",
+    },
+    PatternEntry {
+        id: "env_var_dangerous",
+        tier1_exec_fragments: &[
+            r"LD_PRELOAD",
+            r"LD_LIBRARY_PATH",
+            r"LD_AUDIT",
+            r"DYLD_INSERT_LIBRARIES",
+            r"DYLD_LIBRARY_PATH",
+            r"BASH_ENV\s*=",
+            r"\bENV\s*=",
+            r"PROMPT_COMMAND\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Code injection and shell injection environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_hijack",
+        tier1_exec_fragments: &[r"(?:PYTHONPATH|NODE_OPTIONS|RUBYLIB|PERL5LIB)\s*="],
+        tier1_paste_only_fragments: &[],
+        notes: "Interpreter hijacking environment variable names",
+    },
+    PatternEntry {
+        id: "env_var_sensitive",
+        tier1_exec_fragments: &[
+            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Sensitive API key environment variable exports",
+    },
+    PatternEntry {
+        id: "metadata_endpoint",
+        tier1_exec_fragments: &[r"169\.254\.169\.254", r"100\.100\.100\.200"],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud metadata endpoint IP addresses (AWS, Alibaba Cloud)",
+    },
+    PatternEntry {
+        id: "private_network_ip",
+        tier1_exec_fragments: &[
+            r"\b10\.\d+\.\d+\.\d+",
+            r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+",
+            r"\b192\.168\.\d+\.\d+",
+            r"\b127\.\d+\.\d+\.\d+",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Private/reserved IPv4 address ranges for SSRF/lateral-movement detection",
     },
     PatternEntry {
         id: "non_ascii_paste",
