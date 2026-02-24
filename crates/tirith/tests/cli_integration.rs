@@ -280,8 +280,7 @@ fn bash_hook_defaults_to_preexec_in_ssh_sessions() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; export SSH_CONNECTION=1; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "unset TIRITH_BASH_MODE; export SSH_CONNECTION=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -304,8 +303,7 @@ fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "export TIRITH_BASH_MODE=enter; export SSH_CONNECTION=1; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "export TIRITH_BASH_MODE=enter; export SSH_CONNECTION=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -540,8 +538,7 @@ fn bash_hook_enter_default_outside_ssh() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -570,8 +567,7 @@ fn bash_hook_honors_persistent_safe_mode() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -600,8 +596,7 @@ fn bash_hook_explicit_override_trumps_safe_mode() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "export TIRITH_BASH_MODE=enter; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "export TIRITH_BASH_MODE=enter; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -626,8 +621,7 @@ fn bash_hook_prompt_hook_reattaches() {
     );
     // Source hook, overwrite PROMPT_COMMAND, call ensure, check re-attached
     let script = format!(
-        "source '{}'; PROMPT_COMMAND='other_fn'; _tirith_ensure_prompt_hook; [[ \"$PROMPT_COMMAND\" == *_tirith_prompt_hook* ]] && printf 'reattached' || printf 'missing'",
-        hook
+        "source '{hook}'; PROMPT_COMMAND='other_fn'; _tirith_ensure_prompt_hook; [[ \"$PROMPT_COMMAND\" == *_tirith_prompt_hook* ]] && printf 'reattached' || printf 'missing'"
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -685,10 +679,8 @@ fn bash_hook_startup_gate_degrade_persists() {
     // `bash --norc --noprofile -i -c` gives interactive context so enter mode activates
     // without loading user config (which may set _TIRITH_BASH_LOADED).
     // _TIRITH_TEST_FAIL_HEALTH=1 forces the health gate to fail.
-    let script = format!(
-        "_TIRITH_TEST_FAIL_HEALTH=1; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
-    );
+    let script =
+        format!("_TIRITH_TEST_FAIL_HEALTH=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\"");
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
@@ -714,8 +706,7 @@ fn bash_hook_startup_gate_degrade_persists() {
 
     // Step 3: Source hook in new shell — should start in preexec from flag
     let script2 = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out2 = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script2])
@@ -814,8 +805,7 @@ fn bash_hook_noninteractive_no_safe_mode_flag() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'"
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -839,8 +829,7 @@ fn bash_hook_noninteractive_no_debug_trap() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'; trap -p DEBUG",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; trap -p DEBUG"
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
@@ -864,8 +853,7 @@ fn bash_hook_noninteractive_mode_is_enter() {
         env!("CARGO_MANIFEST_DIR")
     );
     let script = format!(
-        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{}'; printf '%s' \"$_TIRITH_BASH_MODE\"",
-        hook
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
     let out = Command::new("bash")
         .args(["--norc", "--noprofile", "-c", &script])
