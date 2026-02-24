@@ -51,7 +51,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
 
     // Case 2: First real word is `env` — parse env-style args
     if idx < words.len() {
-        let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
+        let cmd = strip_outer_quotes(words[idx].rsplit('/').next().unwrap_or(&words[idx]));
         if cmd == "env" {
             idx += 1;
             while idx < words.len() {
@@ -192,7 +192,7 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
     }
 
     let cmd = &words[idx];
-    let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
+    let cmd_base = strip_outer_quotes(cmd.rsplit('/').next().unwrap_or(cmd));
 
     // Try to resolve wrappers (one level)
     let resolved = match cmd_base {
@@ -295,10 +295,20 @@ fn resolve_time_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
+/// Strip one layer of surrounding quotes (single or double) from a word.
+fn strip_outer_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        return &s[1..s.len() - 1];
+    }
+    s
+}
+
 /// Check if a command name is tirith (literal match).
-/// Note: callers already strip path prefixes via rsplit('/'), so only basename arrives here.
+/// Strips surrounding quotes since split_raw_words preserves them.
 fn is_tirith_command(cmd: &str) -> bool {
-    cmd == "tirith"
+    strip_outer_quotes(cmd) == "tirith"
 }
 
 /// Run the tiered analysis pipeline.
