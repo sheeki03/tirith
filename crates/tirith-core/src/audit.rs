@@ -98,16 +98,10 @@ pub fn log_verdict(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-            eprintln!(
-                "tirith: audit: failed to set permissions on {}: {e}",
-                path.display()
-            );
-        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
-    if let Err(e) = file.lock_exclusive() {
-        eprintln!("tirith: audit: failed to lock {}: {e}", path.display());
+    if file.lock_exclusive().is_err() {
         return;
     }
 
