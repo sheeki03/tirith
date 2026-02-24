@@ -769,7 +769,7 @@ mod tests {
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
         let (payload_part, _sig_part) = token.split_once('.').unwrap();
         // Replace signature with garbage
-        let bad_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&[0u8; 64]);
+        let bad_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 64]);
         let tampered = format!("{payload_part}.{bad_sig}");
         assert_eq!(
             decode_tier_at_with_mode(&tampered, now(), EnforcementMode::SignedPreferred, &kr),
@@ -1073,7 +1073,7 @@ mod tests {
         use base64::Engine;
         let payload = r#"{"iss":"tirith.dev","aud":"tirith-cli","tier":"pro","exp":9999999999}"#;
         let payload_b64 = base64::engine::general_purpose::URL_SAFE.encode(payload.as_bytes());
-        let fake_sig_b64 = base64::engine::general_purpose::URL_SAFE.encode(&[0u8; 64]);
+        let fake_sig_b64 = base64::engine::general_purpose::URL_SAFE.encode([0u8; 64]);
         let token = format!("{payload_b64}.{fake_sig_b64}");
         // Contains padding ('='), but should still parse structurally
         assert!(token.contains('='));
@@ -1114,8 +1114,10 @@ mod tests {
 
     #[test]
     fn test_keyring_non_empty() {
-        // Also enforced at compile time, but belt-and-suspenders
-        assert!(!KEYRING.is_empty());
+        // Also enforced at compile time (line 76), but belt-and-suspenders
+        #[allow(clippy::const_is_empty)]
+        let not_empty = !KEYRING.is_empty();
+        assert!(not_empty);
     }
 
     #[test]
