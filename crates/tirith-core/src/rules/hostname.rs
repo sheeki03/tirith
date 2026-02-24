@@ -46,6 +46,10 @@ fn check_non_ascii_hostname(raw_host: &str, findings: &mut Vec<Finding>) {
                 "Hostname '{raw_host}' contains non-ASCII characters which may be a homograph attack"
             ),
             evidence: vec![homoglyph_evidence],
+            human_view: None,
+            agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 }
@@ -64,6 +68,10 @@ fn check_punycode_domain(host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -98,6 +106,10 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: raw_host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -117,6 +129,10 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: url.raw_str(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -124,7 +140,11 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
 
 fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
     // Check IPv4
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        // Loopback (127.x) is benign local development — skip.
+        if ip.octets()[0] == 127 {
+            return;
+        }
         findings.push(Finding {
             rule_id: RuleId::RawIpUrl,
             severity: Severity::Medium,
@@ -133,12 +153,20 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
         return;
     }
     // Check IPv6 (strip brackets)
     let stripped = host.trim_start_matches('[').trim_end_matches(']');
-    if stripped.parse::<std::net::Ipv6Addr>().is_ok() {
+    if let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() {
+        // IPv6 loopback (::1) or IPv4-mapped loopback (::ffff:127.x) is benign — skip.
+        if ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.octets()[0] == 127) {
+            return;
+        }
         findings.push(Finding {
             rule_id: RuleId::RawIpUrl,
             severity: Severity::Medium,
@@ -147,6 +175,10 @@ fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -162,6 +194,10 @@ fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: format!("{host}:{port}"),
             }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -190,6 +226,10 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -207,6 +247,10 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -229,6 +273,10 @@ fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
                     raw_host: raw_host.to_string(),
                     similar_to: known.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
             return;
         }
@@ -299,6 +347,10 @@ fn check_invalid_host_chars(raw_host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: raw_host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -313,6 +365,10 @@ fn check_trailing_dot_whitespace(raw_host: &str, findings: &mut Vec<Finding>) {
             evidence: vec![Evidence::Url {
                 raw: raw_host.to_string(),
             }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 }
@@ -331,6 +387,10 @@ fn check_lookalike_tld(host: &str, findings: &mut Vec<Finding>) {
                 evidence: vec![Evidence::Url {
                     raw: host.to_string(),
                 }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }

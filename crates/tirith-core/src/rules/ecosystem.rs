@@ -46,6 +46,10 @@ fn check_docker_untrusted_registry(url: &UrlLike, findings: &mut Vec<Finding>) {
                 title: "Docker image from untrusted registry".to_string(),
                 description: format!("Image '{image}' pulled from non-standard registry '{reg}'"),
                 evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -65,6 +69,10 @@ fn check_pip_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
                         title: "Python package from non-PyPI source".to_string(),
                         description: format!("Package URL points to '{host}' instead of PyPI"),
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -88,6 +96,10 @@ fn check_npm_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
                             "Package URL points to '{host}' instead of npm registry"
                         ),
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -113,6 +125,10 @@ fn check_web3_rpc(url: &UrlLike, findings: &mut Vec<Finding>) {
                         title: "Web3 RPC endpoint detected".to_string(),
                         description: format!("URL appears to be a Web3 RPC endpoint on '{host}'"),
                         evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
                 }
             }
@@ -131,6 +147,10 @@ fn check_web3_address_in_url(url: &UrlLike, findings: &mut Vec<Finding>) {
             title: "Ethereum address found in URL".to_string(),
             description: "URL contains what appears to be an Ethereum wallet address. This may indicate a cryptocurrency-related operation.".to_string(),
             evidence: vec![Evidence::Url { raw }],
+            human_view: None,
+            agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
         });
     }
 }
@@ -173,6 +193,10 @@ fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
                                 segments[0], segments[1], pop_owner, pop_repo
                             ),
                             evidence: vec![Evidence::Url { raw: url.raw_str() }],
+                            human_view: None,
+                            agent_view: None,
+                            mitre_id: None,
+                            custom_rule_id: None,
                         });
                         return;
                     }

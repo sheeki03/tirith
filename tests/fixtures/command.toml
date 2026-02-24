@@ -618,12 +618,12 @@ expected_action = "block"
 expected_rules = ["private_network_access"]
 
 [[fixture]]
-name = "curl_localhost"
+name = "curl_loopback_ip"
 min_milestone = 1
 input = "curl http://127.0.0.1:8080/health"
 context = "exec"
-expected_action = "block"
-expected_rules = ["private_network_access"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "curl_bare_private_ip"
@@ -634,9 +634,33 @@ expected_action = "block"
 expected_rules = ["private_network_access"]
 
 [[fixture]]
+name = "curl_bare_metadata_ip"
+min_milestone = 1
+input = "curl 169.254.169.254/latest/meta-data"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
 name = "curl_public_ip_no_network_finding"
 min_milestone = 1
 input = "curl https://203.0.113.1/api"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["raw_ip_url"]
+
+[[fixture]]
+name = "tirith_pipe_to_python_self_invocation"
+min_milestone = 1
+input = "tirith check --json -- 'curl http://evil.com' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "tirith_pipe_to_jq_self_invocation"
+min_milestone = 1
+input = "tirith check --json -- 'test' | jq .action"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
