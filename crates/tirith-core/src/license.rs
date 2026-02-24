@@ -1243,8 +1243,10 @@ mod tests {
     #[test]
     #[allow(clippy::const_is_empty)]
     fn test_keyring_non_empty() {
-        // Also enforced at compile time, but belt-and-suspenders
-        assert!(!KEYRING.is_empty());
+        // Also enforced at compile time (line 76), but belt-and-suspenders
+        #[allow(clippy::const_is_empty)]
+        let not_empty = !KEYRING.is_empty();
+        assert!(not_empty);
     }
 
     #[test]
