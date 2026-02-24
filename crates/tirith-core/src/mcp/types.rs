@@ -149,7 +149,12 @@ pub struct ResourceContent {
 // Supported protocol versions (newest first)
 // ---------------------------------------------------------------------------
 
-pub const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+pub const SUPPORTED_VERSIONS: &[&str] = &[
+    "2025-11-25", // Current
+    "2025-06-18", // Structured tool outputs, enhanced OAuth
+    "2025-03-26", // OAuth 2.1, Streamable HTTP
+    "2024-11-05", // Initial release (Claude Code, Codex, Cursor, etc.)
+];
 
 pub fn negotiate_version(requested: &str) -> String {
     if SUPPORTED_VERSIONS.contains(&requested) {

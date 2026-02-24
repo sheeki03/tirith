@@ -92,7 +92,7 @@ fn resolve_interpreter_name(seg: &tokenize::Segment) -> Option<String> {
 }
 
 fn resolve_env_from_args(args: &[String]) -> Option<String> {
-    let env_value_flags = ["-u"];
+    let env_value_flags = ["-u", "-C"];
     let mut skip_next = false;
     for arg in args {
         if skip_next {
@@ -143,6 +143,11 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                             .unwrap_or(&source_cmd)
                             .to_lowercase();
 
+                        // Skip if the source is tirith itself — its output is trusted.
+                        if source_base == "tirith" {
+                            continue;
+                        }
+
                         let rule_id = match source_base.as_str() {
                             "curl" => RuleId::CurlPipeShell,
                             "wget" => RuleId::WgetPipeShell,
@@ -166,6 +171,8 @@ fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<
                                 }],
                                 human_view: None,
                                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
                             });
                     }
                 }
@@ -195,6 +202,8 @@ fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Fi
                 }],
                 human_view: None,
                 agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
             });
         }
     }
@@ -232,6 +241,8 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
                             }],
                             human_view: None,
                             agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
                         });
                         return;
                     }
@@ -331,15 +342,22 @@ fn check_env_var_in_command(segments: &[tokenize::Segment], findings: &mut Vec<F
                 }
             }
             "set" => {
-                // Fish shell: set [-gx] VAR_NAME value
+                // Fish shell: set [-gx] VAR_NAME value...
+                let mut var_name: Option<&str> = None;
+                let mut value_parts: Vec<&str> = Vec::new();
                 for arg in &segment.args {
                     let trimmed = arg.trim();
-                    if trimmed.starts_with('-') {
+                    if trimmed.starts_with('-') && var_name.is_none() {
                         continue;
                     }
-                    // First non-flag arg is the variable name
-                    emit_env_finding(trimmed, "", findings);
-                    break;
+                    if var_name.is_none() {
+                        var_name = Some(trimmed);
+                    } else {
+                        value_parts.push(trimmed);
+                    }
+                }
+                if let Some(name) = var_name {
+                    emit_env_finding(name, &value_parts.join(" "), findings);
                 }
             }
             _ => {}
@@ -363,6 +381,8 @@ fn emit_env_finding(var_name: &str, value: &str, findings: &mut Vec<Finding>) {
         }],
         human_view: None,
         agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     });
 }
 
@@ -413,8 +433,9 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
-                    return;
                 } else if is_private_ip(&host) {
                     findings.push(Finding {
                         rule_id: RuleId::PrivateNetworkAccess,
@@ -429,8 +450,9 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
                         }],
                         human_view: None,
                         agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
                     });
-                    return;
                 }
             }
         }
@@ -450,16 +472,31 @@ fn extract_host_from_arg(arg: &str) -> Option<String> {
         };
         // Get host:port (before first /)
         let host_port = after_userinfo.split('/').next().unwrap_or(after_userinfo);
-        return Some(strip_port(host_port));
+        let host = strip_port(host_port);
+        // Reject obviously invalid hosts (malformed brackets, embedded paths)
+        if host.is_empty() || host.contains('/') || host.contains('[') {
+            return None;
+        }
+        return Some(host);
     }
 
     // Bare host/IP: "169.254.169.254/path" or just "169.254.169.254"
     let host_part = arg.split('/').next().unwrap_or(arg);
     let host = strip_port(host_part);
 
-    // Only accept valid IPv4 addresses for bare hosts (no scheme)
+    // Accept valid IPv4 addresses for bare hosts (no scheme)
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return Some(host);
+    }
+
+    // Accept bracketed IPv6: [::1]
+    if host_part.starts_with('[') {
+        if let Some(bracket_end) = host_part.find(']') {
+            let ipv6 = &host_part[1..bracket_end];
+            if ipv6.parse::<std::net::Ipv6Addr>().is_ok() {
+                return Some(ipv6.to_string());
+            }
+        }
     }
 
     None
@@ -482,14 +519,17 @@ fn strip_port(host_port: &str) -> String {
     host_port.to_string()
 }
 
-/// Check if an IPv4 address is in a private/reserved range.
+/// Check if an IPv4 address is in a private/reserved range (excluding loopback).
 fn is_private_ip(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let octets = ip.octets();
+        // Loopback (127.x) is excluded — local traffic has no SSRF/lateral movement risk.
+        if octets[0] == 127 {
+            return false;
+        }
         return octets[0] == 10
             || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-            || (octets[0] == 192 && octets[1] == 168)
-            || octets[0] == 127;
+            || (octets[0] == 192 && octets[1] == 168);
     }
     false
 }
@@ -528,6 +568,125 @@ fn is_interpreter(cmd: &str) -> bool {
             | "iex"
             | "invoke-expression"
     )
+}
+
+/// Check command destination hosts against policy network deny/allow lists (Team feature).
+///
+/// For each source command (curl, wget, etc.), extracts the destination host and
+/// checks against deny/allow lists. Allow takes precedence (exempts from deny).
+pub fn check_network_policy(
+    input: &str,
+    shell: ShellType,
+    deny: &[String],
+    allow: &[String],
+) -> Vec<Finding> {
+    if deny.is_empty() {
+        return Vec::new();
+    }
+
+    let segments = tokenize::tokenize(input, shell);
+    let mut findings = Vec::new();
+
+    for segment in &segments {
+        let Some(ref cmd) = segment.command else {
+            continue;
+        };
+        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+        if !is_source_command(&cmd_base) {
+            continue;
+        }
+
+        for arg in &segment.args {
+            let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
+            if trimmed.starts_with('-') {
+                continue;
+            }
+
+            if let Some(host) = extract_host_from_arg(trimmed) {
+                // Allow list exempts from deny
+                if matches_network_list(&host, allow) {
+                    continue;
+                }
+                if matches_network_list(&host, deny) {
+                    findings.push(Finding {
+                        rule_id: RuleId::CommandNetworkDeny,
+                        severity: Severity::Critical,
+                        title: format!("Network destination denied by policy: {host}"),
+                        description: format!(
+                            "Command accesses {host}, which is on the network deny list"
+                        ),
+                        evidence: vec![Evidence::Url {
+                            raw: trimmed.to_string(),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                    return findings;
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Check if a host matches any entry in a network list.
+///
+/// Supports exact hostname match, suffix match (`.example.com` matches
+/// `sub.example.com`), and CIDR match for IPv4 addresses.
+fn matches_network_list(host: &str, list: &[String]) -> bool {
+    for entry in list {
+        // CIDR match: "10.0.0.0/8"
+        if entry.contains('/') {
+            if let Some(matched) = cidr_contains(host, entry) {
+                if matched {
+                    return true;
+                }
+                continue;
+            }
+        }
+
+        // Exact match
+        if host.eq_ignore_ascii_case(entry) {
+            return true;
+        }
+
+        // Suffix match: entry "example.com" matches "sub.example.com"
+        if host.len() > entry.len()
+            && host.ends_with(entry.as_str())
+            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if an IPv4 address is within a CIDR range.
+/// Returns `Some(true/false)` if both parse, `None` if either fails.
+fn cidr_contains(host: &str, cidr: &str) -> Option<bool> {
+    let parts: Vec<&str> = cidr.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let network: std::net::Ipv4Addr = parts[0].parse().ok()?;
+    let prefix_len: u32 = parts[1].parse().ok()?;
+    if prefix_len > 32 {
+        return None;
+    }
+    let host_ip: std::net::Ipv4Addr = host.parse().ok()?;
+
+    let mask = if prefix_len == 0 {
+        0u32
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+    let net_bits = u32::from(network) & mask;
+    let host_bits = u32::from(host_ip) & mask;
+
+    Some(net_bits == host_bits)
 }
 
 #[cfg(test)]
@@ -838,5 +997,104 @@ mod tests {
         );
         assert_eq!(extract_host_from_arg("-H"), None);
         assert_eq!(extract_host_from_arg("output.txt"), None);
+    }
+
+    // --- Network policy tests ---
+
+    #[test]
+    fn test_network_policy_deny_exact() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "curl https://evil.com/data",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_deny_subdomain() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "wget https://sub.evil.com/data",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_deny_cidr() {
+        let deny = vec!["10.0.0.0/8".to_string()];
+        let allow = vec![];
+        let findings =
+            check_network_policy("curl http://10.1.2.3/api", ShellType::Posix, &deny, &allow);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_allow_exempts() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec!["safe.evil.com".to_string()];
+        let findings = check_network_policy(
+            "curl https://safe.evil.com/data",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 0, "allow list should exempt from deny");
+    }
+
+    #[test]
+    fn test_network_policy_no_match() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "curl https://example.com/data",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn test_network_policy_empty_deny() {
+        let deny = vec![];
+        let allow = vec![];
+        let findings =
+            check_network_policy("curl https://evil.com", ShellType::Posix, &deny, &allow);
+        assert_eq!(
+            findings.len(),
+            0,
+            "empty deny list should produce no findings"
+        );
+    }
+
+    #[test]
+    fn test_cidr_contains() {
+        assert_eq!(cidr_contains("10.0.0.1", "10.0.0.0/8"), Some(true));
+        assert_eq!(cidr_contains("10.255.255.255", "10.0.0.0/8"), Some(true));
+        assert_eq!(cidr_contains("11.0.0.1", "10.0.0.0/8"), Some(false));
+        assert_eq!(cidr_contains("192.168.1.1", "192.168.0.0/16"), Some(true));
+        assert_eq!(cidr_contains("192.169.1.1", "192.168.0.0/16"), Some(false));
+        assert_eq!(cidr_contains("not-an-ip", "10.0.0.0/8"), None);
+        assert_eq!(cidr_contains("10.0.0.1", "invalid"), None);
+    }
+
+    #[test]
+    fn test_matches_network_list_hostname() {
+        let list = vec!["evil.com".to_string(), "bad.org".to_string()];
+        assert!(matches_network_list("evil.com", &list));
+        assert!(matches_network_list("sub.evil.com", &list));
+        assert!(!matches_network_list("notevil.com", &list));
+        assert!(!matches_network_list("good.com", &list));
     }
 }

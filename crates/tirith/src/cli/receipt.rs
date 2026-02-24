@@ -5,7 +5,10 @@ pub fn last(json: bool) -> i32 {
         Ok(receipts) => {
             if let Some(r) = receipts.first() {
                 if json {
-                    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), r);
+                    if serde_json::to_writer_pretty(std::io::stdout().lock(), r).is_err() {
+                        eprintln!("tirith: failed to write JSON output");
+                        return 1;
+                    }
                     println!();
                 } else {
                     print_receipt(r);
@@ -27,7 +30,10 @@ pub fn list(json: bool) -> i32 {
     match Receipt::list() {
         Ok(receipts) => {
             if json {
-                let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &receipts);
+                if serde_json::to_writer_pretty(std::io::stdout().lock(), &receipts).is_err() {
+                    eprintln!("tirith: failed to write JSON output");
+                    return 1;
+                }
                 println!();
             } else if receipts.is_empty() {
                 eprintln!("tirith: no receipts found");
@@ -61,7 +67,10 @@ pub fn verify(sha256: &str, json: bool) -> i32 {
                         "valid": valid,
                         "url": r.url,
                     });
-                    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+                    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+                        eprintln!("tirith: failed to write JSON output");
+                        return 1;
+                    }
                     println!();
                 } else if valid {
                     eprintln!(
