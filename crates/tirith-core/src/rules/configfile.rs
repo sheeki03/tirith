@@ -402,7 +402,7 @@ static STRONG_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (r"(?i)you\s+(?:are\s+now|have\s+no)\s+(?:unrestricted|restrictions?|limits?)", "Identity reassignment"),
     ]
     .iter()
-    .filter_map(|(pattern, desc)| Regex::new(pattern).ok().map(|re| (re, *desc)))
+    .map(|(pattern, desc)| (Regex::new(pattern).expect("invalid STRONG_PATTERNS regex"), *desc))
     .collect()
 });
 
@@ -423,7 +423,12 @@ static WEAK_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         ),
     ]
     .iter()
-    .filter_map(|(pattern, desc)| Regex::new(pattern).ok().map(|re| (re, *desc)))
+    .map(|(pattern, desc)| {
+        (
+            Regex::new(pattern).expect("invalid WEAK_PATTERNS regex"),
+            *desc,
+        )
+    })
     .collect()
 });
 
@@ -482,7 +487,12 @@ static LEGACY_INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|
         (r"(?i)chmod\s+[0-7]*7", "World-writable permission"),
     ]
     .iter()
-    .filter_map(|(pattern, desc)| Regex::new(pattern).ok().map(|re| (re, *desc)))
+    .map(|(pattern, desc)| {
+        (
+            Regex::new(pattern).expect("invalid LEGACY_INJECTION_PATTERNS regex"),
+            *desc,
+        )
+    })
     .collect()
 });
 
@@ -901,11 +911,7 @@ fn check_mcp_config(content: &str, path: &Path, findings: &mut Vec<Finding>) {
         None => return,
     };
 
-    let path_str = path.display().to_string();
-
     for (name, config) in servers {
-        let _ = &path_str; // used in sub-functions via name
-
         // Check command/url fields
         if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
             check_mcp_server_url(name, url, findings);
@@ -1586,23 +1592,42 @@ mod tests {
 
     #[test]
     fn test_absolute_path_rules_at_root() {
-        let matcher = ConfigPathMatcher::new(Path::new("/repo"), vec![]);
-        // Absolute path: /repo/.rules → repo-relative ".rules" → root-only match
-        assert!(matcher.is_known(Path::new("/repo/.rules")).is_config());
-        // Absolute path to a deep dir
-        assert!(matcher
-            .is_known(Path::new("/repo/.claude/skills/a.md"))
-            .is_config());
+        #[cfg(not(windows))]
+        {
+            let matcher = ConfigPathMatcher::new(Path::new("/repo"), vec![]);
+            assert!(matcher.is_known(Path::new("/repo/.rules")).is_config());
+            assert!(matcher
+                .is_known(Path::new("/repo/.claude/skills/a.md"))
+                .is_config());
+        }
+        #[cfg(windows)]
+        {
+            let matcher = ConfigPathMatcher::new(Path::new("C:\\repo"), vec![]);
+            assert!(matcher.is_known(Path::new("C:\\repo\\.rules")).is_config());
+            assert!(matcher
+                .is_known(Path::new("C:\\repo\\.claude\\skills\\a.md"))
+                .is_config());
+        }
     }
 
     #[test]
     fn test_absolute_path_outside_repo_not_config() {
-        let matcher = ConfigPathMatcher::new(Path::new("/repo"), vec![]);
-        // Path not under repo root should not match
-        assert!(!matcher.is_known(Path::new("/other/.rules")).is_config());
-        assert!(!matcher
-            .is_known(Path::new("/other/.claude/skills/a.md"))
-            .is_config());
+        #[cfg(not(windows))]
+        {
+            let matcher = ConfigPathMatcher::new(Path::new("/repo"), vec![]);
+            assert!(!matcher.is_known(Path::new("/other/.rules")).is_config());
+            assert!(!matcher
+                .is_known(Path::new("/other/.claude/skills/a.md"))
+                .is_config());
+        }
+        #[cfg(windows)]
+        {
+            let matcher = ConfigPathMatcher::new(Path::new("C:\\repo"), vec![]);
+            assert!(!matcher.is_known(Path::new("C:\\other\\.rules")).is_config());
+            assert!(!matcher
+                .is_known(Path::new("C:\\other\\.claude\\skills\\a.md"))
+                .is_config());
+        }
     }
 
     // --- Deep-dir anchoring ---

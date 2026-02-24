@@ -993,8 +993,7 @@ mod tests {
         assert_eq!(
             files.len(),
             1,
-            "should find 1 config file in vendor, found: {:?}",
-            files
+            "should find 1 config file in vendor, found: {files:?}"
         );
         assert!(
             files[0].to_string_lossy().contains("evil.md"),
@@ -1016,7 +1015,7 @@ mod tests {
         let (files, skipped) = probe_excluded_tree(&root.join("node_modules"), root, &matcher);
 
         assert_eq!(skipped, 0);
-        assert_eq!(files.len(), 1, "found: {:?}", files);
+        assert_eq!(files.len(), 1, "found: {files:?}");
         assert!(files[0].to_string_lossy().contains("evil.md"));
     }
 

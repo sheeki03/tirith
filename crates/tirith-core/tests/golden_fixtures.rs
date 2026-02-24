@@ -75,10 +75,7 @@ fn run_fixture(fixture: &Fixture) {
         None
     };
 
-    let file_path = fixture
-        .file_path
-        .as_ref()
-        .map(|p| std::path::PathBuf::from(p));
+    let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
     let ctx = AnalysisContext {
         input: fixture.input.clone(),
@@ -779,10 +776,7 @@ fn test_tier1_does_not_gate_findings() {
             None
         };
 
-        let file_path = fixture
-            .file_path
-            .as_ref()
-            .map(|p| std::path::PathBuf::from(p));
+        let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
         let ctx = AnalysisContext {
             input: fixture.input.clone(),

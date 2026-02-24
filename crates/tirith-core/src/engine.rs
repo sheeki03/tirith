@@ -54,7 +54,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+        if words[idx] == "TIRITH=0" {
             return true;
         }
         idx += 1;
@@ -73,7 +73,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w.starts_with("TIRITH=0") || w == "TIRITH=0" {
+                    if w == "TIRITH=0" {
                         return true;
                     }
                     idx += 1;
@@ -93,7 +93,7 @@ fn find_inline_bypass(input: &str, _shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx].starts_with("TIRITH=0") || words[idx] == "TIRITH=0" {
+                if words[idx] == "TIRITH=0" {
                     return true;
                 }
                 idx += 1;
@@ -257,12 +257,20 @@ fn resolve_env_wrapper(args: &[String]) -> Option<String> {
     None
 }
 
-/// Resolve through `command` wrapper: skip `--`, take next arg.
+/// Resolve through `command` wrapper: skip flags (`-p`, `-v`, `-V`) and `--`, take next arg.
 fn resolve_command_wrapper(args: &[String]) -> Option<String> {
     let mut i = 0;
-    // Skip -- if present
-    if i < args.len() && args[i] == "--" {
-        i += 1;
+    while i < args.len() {
+        let w = &args[i];
+        if w == "--" {
+            i += 1;
+            break;
+        }
+        if w == "-p" || w == "-v" || w == "-V" {
+            i += 1;
+            continue;
+        }
+        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
     }
     if i < args.len() {
         let w = &args[i];
