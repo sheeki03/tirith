@@ -49,9 +49,18 @@ pub fn run(shell: Option<&str>) -> i32 {
             }
             0
         }
+        "nu" => {
+            // Nushell requires manual sourcing via `overlay use`.
+            // Print a message guiding the user.
+            eprintln!("tirith: nushell detected — nushell hooks are not yet supported.");
+            eprintln!(
+                "See https://github.com/sheeki03/tirith for nushell integration instructions."
+            );
+            1
+        }
         _ => {
             eprintln!("tirith: unsupported shell '{shell}'");
-            eprintln!("Supported: zsh, bash, fish, powershell");
+            eprintln!("Supported: zsh, bash, fish, powershell, nu");
             1
         }
     }
@@ -81,7 +90,7 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
         return None;
     }
     let base = name
-        .rsplit('/')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
         .trim_start_matches('-')
@@ -95,6 +104,8 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
         Some("fish")
     } else if base.contains("pwsh") || base.contains("powershell") {
         Some("powershell")
+    } else if base == "nu" || base == "nu.exe" || base.contains("nushell") {
+        Some("nu")
     } else {
         None
     }
@@ -323,6 +334,19 @@ mod tests {
         assert_eq!(normalize_shell_name("BASH"), Some("bash"));
         assert_eq!(normalize_shell_name("PwSh"), Some("powershell"));
         assert_eq!(normalize_shell_name("PowerShell"), Some("powershell"));
+    }
+
+    #[test]
+    fn normalize_shell_name_supports_nushell() {
+        assert_eq!(normalize_shell_name("nu"), Some("nu"));
+        assert_eq!(normalize_shell_name("nu.exe"), Some("nu"));
+        assert_eq!(normalize_shell_name("nushell"), Some("nu"));
+        assert_eq!(normalize_shell_name("nushell.exe"), Some("nu"));
+        assert_eq!(normalize_shell_name("/usr/bin/nu"), Some("nu"));
+        assert_eq!(
+            normalize_shell_name("C:\\Program Files\\nu.exe"),
+            Some("nu")
+        );
     }
 
     #[test]

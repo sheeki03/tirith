@@ -326,6 +326,10 @@ pub fn is_env_assignment(word: &str) -> bool {
             return false;
         }
         let name = &s[..eq_pos];
+        let first = name.chars().next().unwrap_or('0');
+        if first.is_ascii_digit() {
+            return false;
+        }
         name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     } else {
         false
@@ -529,6 +533,7 @@ mod tests {
         assert!(!is_env_assignment("curl"));
         assert!(!is_env_assignment("=value"));
         assert!(!is_env_assignment("--flag=value"));
+        assert!(!is_env_assignment("1FOO=bar"));
     }
 
     #[test]

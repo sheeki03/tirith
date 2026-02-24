@@ -1093,19 +1093,25 @@ fn check_mcp_server_url(name: &str, url: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Extract host portion from a URL string, handling IPv6 brackets.
+/// Extract host portion from a URL string, handling IPv6 brackets and userinfo.
 fn extract_host_from_url(url: &str) -> Option<&str> {
     let after_scheme = url.find("://").map(|i| &url[i + 3..])?;
+    // Strip userinfo (user:pass@)
+    let after_userinfo = if let Some(at_idx) = after_scheme.find('@') {
+        &after_scheme[at_idx + 1..]
+    } else {
+        after_scheme
+    };
     // IPv6: http://[::1]:8080/path → extract "::1"
-    if after_scheme.starts_with('[') {
-        let bracket_end = after_scheme.find(']')?;
-        return Some(&after_scheme[1..bracket_end]);
+    if after_userinfo.starts_with('[') {
+        let bracket_end = after_userinfo.find(']')?;
+        return Some(&after_userinfo[1..bracket_end]);
     }
     // IPv4 / hostname: stop at '/', ':', or '?'
-    let host_end = after_scheme
+    let host_end = after_userinfo
         .find(['/', ':', '?'])
-        .unwrap_or(after_scheme.len());
-    Some(&after_scheme[..host_end])
+        .unwrap_or(after_userinfo.len());
+    Some(&after_userinfo[..host_end])
 }
 
 /// Check MCP server args for shell injection patterns.
@@ -1138,7 +1144,7 @@ fn check_mcp_args(name: &str, args: &[serde_json::Value], findings: &mut Vec<Fin
 fn check_mcp_tools(name: &str, tools: &[serde_json::Value], findings: &mut Vec<Finding>) {
     for tool in tools {
         if let Some(s) = tool.as_str() {
-            if s == "*" || s == "all" {
+            if s == "*" || s.eq_ignore_ascii_case("all") {
                 findings.push(Finding {
                     rule_id: RuleId::McpOverlyPermissive,
                     severity: Severity::High,
@@ -1664,6 +1670,14 @@ mod tests {
         assert!(!is_known_config_file(Path::new(
             "vendor/pkg/.github/agents/evil.md"
         )));
+    }
+
+    #[test]
+    fn test_extract_host_from_url_with_userinfo() {
+        assert_eq!(
+            extract_host_from_url("http://user:pass@10.0.0.1:8080/"),
+            Some("10.0.0.1")
+        );
     }
 
     // --- Negated first hit + malicious second hit ---

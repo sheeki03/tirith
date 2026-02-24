@@ -44,7 +44,10 @@ pub fn should_auto_checkpoint(command: &str) -> bool {
     AUTO_TRIGGER_PATTERNS
         .iter()
         .any(|p| lower.contains(p))
-        // Also catch `mv` that overwrites (mv src dst where dst exists)
+        // Also catch `mv` — intentionally triggers on ALL mv commands, not just
+        // overwrites, because statically determining whether the destination exists
+        // is not possible. False positives are acceptable here: checkpoints are cheap
+        // and it's better to have an unnecessary snapshot than to miss a destructive move.
         || (lower.starts_with("mv ") || lower.contains(" mv "))
 }
 
@@ -248,9 +251,13 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     Ok(entries)
 }
 
-/// Validate that a restore path does not contain path traversal components.
+/// Validate that a restore path does not contain path traversal components
+/// or absolute paths.
 fn validate_restore_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(format!("restore path is absolute: {path}"));
+    }
     for component in p.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(format!("restore path contains '..': {path}"));
@@ -261,7 +268,11 @@ fn validate_restore_path(path: &str) -> Result<(), String> {
 
 /// Validate that a SHA-256 filename is exactly 64 lowercase hex characters.
 fn validate_sha256_filename(sha: &str) -> Result<(), String> {
-    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+    if sha.len() != 64
+        || !sha
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         return Err(format!("invalid sha256 in manifest: {sha}"));
     }
     Ok(())
@@ -431,12 +442,13 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                     Ok(()) => {
                         freed_bytes += e.total_bytes;
                         removed_count += 1;
+                        return false; // Successfully removed, drop from list
                     }
                     Err(err) => {
                         eprintln!("tirith: checkpoint purge: failed to remove {}: {err}", e.id);
+                        return true; // Failed to remove, keep in list
                     }
                 }
-                return false;
             }
         }
         true
@@ -456,6 +468,9 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                         "tirith: checkpoint purge: failed to remove {}: {e}",
                         oldest.id
                     );
+                    // Failed to remove — stop trying to shrink by count
+                    // to avoid infinite loop with a stuck entry.
+                    break;
                 }
             }
         }
@@ -463,12 +478,12 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
 
     // Remove by total size (keep newest)
     let mut total: u64 = all.iter().map(|e| e.total_bytes).sum();
-    while total > config.max_total_bytes && !all.is_empty() {
+    while config.max_total_bytes > 0 && total > config.max_total_bytes && !all.is_empty() {
         if let Some(oldest) = all.pop() {
-            total -= oldest.total_bytes;
             let cp_dir = base_dir.join(&oldest.id);
             match fs::remove_dir_all(&cp_dir) {
                 Ok(()) => {
+                    total -= oldest.total_bytes;
                     freed_bytes += oldest.total_bytes;
                     removed_count += 1;
                 }
@@ -477,6 +492,9 @@ pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
                         "tirith: checkpoint purge: failed to remove {}: {e}",
                         oldest.id
                     );
+                    // Failed to remove — stop trying to shrink by size
+                    // to avoid infinite loop with a stuck entry.
+                    break;
                 }
             }
         }
@@ -545,6 +563,11 @@ fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
 }
 
 /// Backup a directory recursively.
+///
+/// NOTE: Empty directories are not recorded in the manifest. Only files are backed up.
+/// This means `restore()` will not recreate empty directories that existed at checkpoint
+/// time. Parent directories of restored files are created implicitly. Tracking empty
+/// directories would require manifest format changes and corresponding restore logic.
 fn backup_dir(dir: &Path, files_dir: &Path) -> Result<Vec<ManifestEntry>, String> {
     let mut entries = Vec::new();
     const MAX_FILES: usize = 10_000;
@@ -720,7 +743,14 @@ mod tests {
         assert!(validate_restore_path("../../etc/passwd").is_err());
         assert!(validate_restore_path("/tmp/../etc/evil").is_err());
         assert!(validate_restore_path("normal/path/file.txt").is_ok());
-        assert!(validate_restore_path("/absolute/path/file.txt").is_ok());
+        assert!(
+            validate_restore_path("/absolute/path/file.txt").is_err(),
+            "absolute paths should be rejected"
+        );
+        assert!(
+            validate_restore_path("/etc/passwd").is_err(),
+            "absolute paths should be rejected"
+        );
     }
 
     #[test]

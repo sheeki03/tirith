@@ -104,6 +104,8 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     for file_path in &files {
         if let Some(result) = scan_single_file(file_path) {
             file_results.push(result);
+        } else {
+            skipped_count += 1;
         }
     }
 

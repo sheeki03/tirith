@@ -721,11 +721,16 @@ fn looks_like_schemeless_host(s: &str) -> bool {
         return false;
     }
     // Exclude args where the host part looks like a file (e.g., "install.sh")
-    // BUT only when there is no path component — if there IS a path (contains '/'),
-    // the host part is likely a real domain even if its TLD overlaps a file extension
-    // (e.g., evil.zip/payload is a real domain, not a filename).
+    // BUT only when there is no meaningful path component — if there IS a non-empty
+    // path (e.g., evil.zip/payload), the host part is likely a real domain even if its
+    // TLD overlaps a file extension. A trailing slash alone (file.sh/) does NOT count
+    // as a meaningful path — it's still a filename, not a domain.
     let host_lower = host_part.to_lowercase();
-    if !s.contains('/') {
+    let has_meaningful_path = s.find('/').is_some_and(|idx| {
+        let after_slash = &s[idx + 1..];
+        !after_slash.is_empty() && after_slash != "/"
+    });
+    if !has_meaningful_path {
         let file_exts = [
             ".sh",
             ".py",

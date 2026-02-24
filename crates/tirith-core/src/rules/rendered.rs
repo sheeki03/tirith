@@ -202,6 +202,9 @@ fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
 
     // Hex: #rgb or #rrggbb
     if let Some(hex) = s.strip_prefix('#') {
+        if !hex.is_ascii() {
+            return None;
+        }
         return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
@@ -878,6 +881,15 @@ mod tests {
     fn test_parse_color_named() {
         assert_eq!(parse_color("white"), Some((1.0, 1.0, 1.0)));
         assert_eq!(parse_color("black"), Some((0.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_parse_color_multibyte_hex_no_panic() {
+        // Multi-byte characters like 'é' (2 bytes, 1 char) could cause
+        // a panic via byte-index slicing if not guarded.
+        assert_eq!(parse_color("#é1"), None);
+        assert_eq!(parse_color("#é1é2é3"), None);
+        assert_eq!(parse_color("#\u{1F600}ab"), None);
     }
 
     #[test]

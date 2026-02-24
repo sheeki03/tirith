@@ -115,6 +115,27 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
     // Use chrome as baseline
     let baseline_idx = 0; // chrome is first
     let baseline_body = &responses[baseline_idx].2;
+
+    // If baseline fetch failed (empty body), we cannot reliably compare — return no findings
+    // rather than false-flagging every non-empty response as cloaking.
+    if baseline_body.is_empty() {
+        let agent_responses: Vec<AgentResponse> = responses
+            .iter()
+            .map(|(name, status, body)| AgentResponse {
+                agent_name: name.clone(),
+                status_code: *status,
+                content_length: body.len(),
+            })
+            .collect();
+        return Ok(CloakingResult {
+            url: url.to_string(),
+            cloaking_detected: false,
+            findings: Vec::new(),
+            agent_responses,
+            diff_pairs: Vec::new(),
+        });
+    }
+
     let baseline_normalized = normalize_html(baseline_body);
 
     let mut diff_pairs = Vec::new();
@@ -213,12 +234,18 @@ fn fetch_with_ua(
         }
     }
 
-    let bytes = response.bytes().map_err(|e| format!("read body: {e}"))?;
-    if bytes.len() > max_body {
-        return Err(format!("response too large: {} bytes", bytes.len()));
+    // Read body with size limit to prevent OOM from servers without Content-Length
+    use std::io::Read as _;
+    let mut body_bytes = Vec::with_capacity(max_body.min(1024 * 1024));
+    response
+        .take((max_body as u64) + 1)
+        .read_to_end(&mut body_bytes)
+        .map_err(|e| format!("read body: {e}"))?;
+    if body_bytes.len() > max_body {
+        return Err(format!("response too large: {} bytes", body_bytes.len()));
     }
 
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     Ok((status, body))
 }
 
@@ -372,9 +399,15 @@ mod tests {
 
     #[test]
     fn test_normalize_html_strips_nonces() {
-        let input = r#"<script nonce="abc123">alert(1)</script><p>Content</p>"#;
+        // Use a non-script element so the NONCE regex is actually exercised
+        // (the SCRIPT regex would strip the entire <script> tag before NONCE runs).
+        let input = r#"<div nonce="abc123">Content</div><p>More</p>"#;
         let normalized = normalize_html(input);
-        assert!(!normalized.contains("nonce"));
+        assert!(
+            !normalized.contains("nonce"),
+            "nonce attribute should be stripped: {normalized}"
+        );
+        assert!(normalized.contains("Content"));
     }
 
     #[test]

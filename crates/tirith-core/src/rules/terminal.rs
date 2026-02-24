@@ -392,8 +392,8 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
 
     // Check for length discrepancy: HTML visible text vs plain text
     let visible_text = strip_html_tags(html);
-    let visible_len = visible_text.trim().len();
-    let plain_len = plain_text.trim().len();
+    let visible_len = visible_text.trim().chars().count();
+    let plain_len = plain_text.trim().chars().count();
 
     if visible_len > plain_len + 50 {
         findings.push(Finding {

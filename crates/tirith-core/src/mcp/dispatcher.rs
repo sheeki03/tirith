@@ -36,10 +36,17 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                     log,
                     "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit, dropping"
                 );
-                // Drain remainder of this oversized line (up to next newline)
-                let mut discard = Vec::new();
+                // Drain remainder of this oversized line without unbounded allocation
                 if !line.ends_with('\n') {
-                    let _ = input.read_until(b'\n', &mut discard);
+                    let mut byte = [0u8; 1];
+                    loop {
+                        match input.read(&mut byte) {
+                            Ok(0) => break, // EOF
+                            Ok(_) if byte[0] == b'\n' => break,
+                            Ok(_) => continue, // discard byte
+                            Err(_) => break,
+                        }
+                    }
                 }
                 continue;
             }

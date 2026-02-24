@@ -54,6 +54,14 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             })
             .collect();
 
+        if contexts.is_empty() {
+            eprintln!(
+                "tirith: warning: custom rule '{}' has no valid contexts, skipping",
+                rule.id
+            );
+            continue;
+        }
+
         compiled.push(CompiledCustomRule {
             id: rule.id.clone(),
             regex,

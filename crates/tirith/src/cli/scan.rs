@@ -61,13 +61,7 @@ pub fn run(
         print_human_result(&result);
     }
 
-    if (ci && result.has_findings_at_or_above(fail_on_severity))
-        || result
-            .file_results
-            .iter()
-            .flat_map(|r| &r.findings)
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    if result.has_findings_at_or_above(fail_on_severity) {
         1
     } else if result.total_findings() > 0 {
         2
@@ -76,7 +70,7 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_stdin(json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -106,12 +100,7 @@ fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
         print_human_file_result(&result);
     }
 
-    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
-        || result
-            .findings
-            .iter()
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
@@ -120,7 +109,7 @@ fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
+fn run_single_file(file_path: &str, json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
@@ -143,12 +132,7 @@ fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: 
         print_human_file_result(&result);
     }
 
-    if (ci && result.findings.iter().any(|f| f.severity >= fail_on))
-        || result
-            .findings
-            .iter()
-            .any(|f| matches!(f.severity, Severity::Critical | Severity::High))
-    {
+    if result.findings.iter().any(|f| f.severity >= fail_on) {
         1
     } else if !result.findings.is_empty() {
         2
@@ -214,6 +198,7 @@ fn print_json_result(result: &scan::ScanResult) {
 
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
         eprintln!("tirith scan: failed to write JSON output");
+        return;
     }
     println!();
 }
@@ -236,6 +221,7 @@ fn print_json_file_result(result: &scan::FileScanResult) {
 
     if serde_json::to_writer_pretty(std::io::stdout().lock(), &output).is_err() {
         eprintln!("tirith scan: failed to write JSON output");
+        return;
     }
     println!();
 }

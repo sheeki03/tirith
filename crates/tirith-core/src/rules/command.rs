@@ -402,6 +402,46 @@ fn redact_env_value(val: &str) -> String {
 /// Cloud metadata endpoint IPs that expose instance credentials.
 const METADATA_ENDPOINTS: &[&str] = &["169.254.169.254", "100.100.100.200"];
 
+fn check_host_for_network_issues(arg: &str, findings: &mut Vec<Finding>) {
+    if let Some(host) = extract_host_from_arg(arg) {
+        if METADATA_ENDPOINTS.contains(&host.as_str()) {
+            findings.push(Finding {
+                rule_id: RuleId::MetadataEndpoint,
+                severity: Severity::Critical,
+                title: format!("Cloud metadata endpoint access: {host}"),
+                description: format!(
+                    "Command accesses cloud metadata endpoint {host}, \
+                     which can expose instance credentials and sensitive configuration"
+                ),
+                evidence: vec![Evidence::Url {
+                    raw: arg.to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        } else if is_private_ip(&host) {
+            findings.push(Finding {
+                rule_id: RuleId::PrivateNetworkAccess,
+                severity: Severity::High,
+                title: format!("Private network access: {host}"),
+                description: format!(
+                    "Command accesses private network address {host}, \
+                     which may indicate SSRF or lateral movement"
+                ),
+                evidence: vec![Evidence::Url {
+                    raw: arg.to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+}
+
 fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
     for segment in segments {
         let Some(ref cmd) = segment.command else {
@@ -415,46 +455,14 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
         for arg in &segment.args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
+                // Check flag=value args for embedded URLs (e.g., --url=http://evil.com)
+                if let Some((_flag, value)) = trimmed.split_once('=') {
+                    check_host_for_network_issues(value, findings);
+                }
                 continue;
             }
 
-            if let Some(host) = extract_host_from_arg(trimmed) {
-                if METADATA_ENDPOINTS.contains(&host.as_str()) {
-                    findings.push(Finding {
-                        rule_id: RuleId::MetadataEndpoint,
-                        severity: Severity::Critical,
-                        title: format!("Cloud metadata endpoint access: {host}"),
-                        description: format!(
-                            "Command accesses cloud metadata endpoint {host}, \
-                             which can expose instance credentials and sensitive configuration"
-                        ),
-                        evidence: vec![Evidence::Url {
-                            raw: trimmed.to_string(),
-                        }],
-                        human_view: None,
-                        agent_view: None,
-                        mitre_id: None,
-                        custom_rule_id: None,
-                    });
-                } else if is_private_ip(&host) {
-                    findings.push(Finding {
-                        rule_id: RuleId::PrivateNetworkAccess,
-                        severity: Severity::High,
-                        title: format!("Private network access: {host}"),
-                        description: format!(
-                            "Command accesses private network address {host}, \
-                             which may indicate SSRF or lateral movement"
-                        ),
-                        evidence: vec![Evidence::Url {
-                            raw: trimmed.to_string(),
-                        }],
-                        human_view: None,
-                        agent_view: None,
-                        mitre_id: None,
-                        custom_rule_id: None,
-                    });
-                }
-            }
+            check_host_for_network_issues(trimmed, findings);
         }
     }
 }
@@ -510,7 +518,12 @@ fn strip_port(host_port: &str) -> String {
             return host_port[1..bracket_end].to_string();
         }
     }
-    // IPv4 or hostname: strip trailing :PORT
+    // Don't strip from unbracketed IPv6 (multiple colons)
+    let colon_count = host_port.chars().filter(|&c| c == ':').count();
+    if colon_count > 1 {
+        return host_port.to_string(); // IPv6, don't strip
+    }
+    // IPv4 or hostname with single colon: strip trailing :PORT
     if let Some(colon_idx) = host_port.rfind(':') {
         if host_port[colon_idx + 1..].parse::<u16>().is_ok() {
             return host_port[..colon_idx].to_string();
@@ -599,6 +612,32 @@ pub fn check_network_policy(
         for arg in &segment.args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
+                // Check flag=value args for embedded URLs (e.g., --url=http://evil.com)
+                if let Some((_flag, value)) = trimmed.split_once('=') {
+                    if let Some(host) = extract_host_from_arg(value) {
+                        if matches_network_list(&host, allow) {
+                            continue;
+                        }
+                        if matches_network_list(&host, deny) {
+                            findings.push(Finding {
+                                rule_id: RuleId::CommandNetworkDeny,
+                                severity: Severity::Critical,
+                                title: format!("Network destination denied by policy: {host}"),
+                                description: format!(
+                                    "Command accesses {host}, which is on the network deny list"
+                                ),
+                                evidence: vec![Evidence::Url {
+                                    raw: value.to_string(),
+                                }],
+                                human_view: None,
+                                agent_view: None,
+                                mitre_id: None,
+                                custom_rule_id: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1096,5 +1135,49 @@ mod tests {
         assert!(matches_network_list("sub.evil.com", &list));
         assert!(!matches_network_list("notevil.com", &list));
         assert!(!matches_network_list("good.com", &list));
+    }
+
+    #[test]
+    fn test_flag_value_url_detected_in_network_policy() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "curl --url=http://evil.com/data",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1, "should detect denied host in --flag=URL");
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_flag_value_url_metadata_endpoint() {
+        let findings = check(
+            "curl --url=http://169.254.169.254/latest/meta-data",
+            ShellType::Posix,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::MetadataEndpoint),
+            "should detect metadata endpoint in --flag=URL"
+        );
+    }
+
+    #[test]
+    fn test_flag_value_url_private_network() {
+        let findings = check("curl --url=http://10.0.0.1/internal", ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PrivateNetworkAccess),
+            "should detect private network in --flag=URL"
+        );
+    }
+
+    #[test]
+    fn test_strip_port_unbracketed_ipv6() {
+        assert_eq!(strip_port("fe80::1"), "fe80::1");
     }
 }

@@ -748,12 +748,9 @@ mod tests {
     }
 
     #[test]
-    fn test_current_tier_defaults_community() {
+    fn test_current_tier_defaults_pro() {
         let tier = current_tier();
-        assert!(
-            tier == Tier::Community || tier >= Tier::Pro,
-            "Should be a valid tier"
-        );
+        assert_eq!(tier, Tier::Pro);
     }
 
     #[test]

