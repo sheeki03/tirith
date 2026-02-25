@@ -56,4 +56,4 @@ Ed25519 signatures verify tier claims in license tokens. Key rotation is support
 
 ## Bypass Mechanism
 
-tirith supports `TIRITH_BYPASS=1` for commands that must run despite findings. Bypasses are logged to the audit trail with `bypass_requested: true`.
+tirith supports `TIRITH=0` as a per-command prefix to bypass checks. Bypasses are logged to the audit trail with `bypass_requested: true`. Organizations can disable this with `allow_bypass_env: false` in policy.

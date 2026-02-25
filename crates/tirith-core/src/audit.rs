@@ -85,11 +85,29 @@ pub fn log_verdict(
         }
     };
 
+    // Refuse to follow symlinks (GHSA-c6rj-wmf4-6963)
+    #[cfg(unix)]
+    {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                eprintln!(
+                    "tirith: audit: refusing to follow symlink at {}",
+                    path.display()
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Open, lock, append, fsync, unlock
     let mut open_opts = OpenOptions::new();
     open_opts.create(true).append(true);
     #[cfg(unix)]
-    open_opts.mode(0o600);
+    {
+        open_opts.mode(0o600);
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
     let file = open_opts.open(&path);
 
     let file = match file {
@@ -293,5 +311,48 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
         unsafe { std::env::remove_var("TIRITH_LICENSE") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_refuses_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "original").unwrap();
+
+        let symlink_path = dir.path().join("log.jsonl");
+        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+        let verdict = Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 1,
+            timings_ms: crate::verdict::Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+        };
+
+        log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
+
+        // Target file should be untouched
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "audit should refuse to write through symlink"
+        );
     }
 }

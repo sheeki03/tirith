@@ -6,7 +6,7 @@ If you discover a security vulnerability in tirith, please report it responsibly
 
 **Preferred:** [GitHub Security Advisory](../../security/advisories/new) — creates a private channel between you and the maintainers.
 
-**Alternative:** Email security concerns to the maintainers listed in the repository.
+**Alternative:** Email security@tirith.sh
 
 ### What to include
 

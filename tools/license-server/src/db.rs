@@ -1,8 +1,25 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
+
+/// Whether we have already logged a poison recovery (log once, not every call).
+static POISON_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Acquire the DB mutex and recover from poison (prior panic) to keep serving requests.
+fn acquire_db(lock: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            if !POISON_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::error!("DB mutex poisoned by prior panic; recovering with inner state");
+            }
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -121,7 +138,7 @@ impl Db {
         let conn = self.conn.clone();
         let eid = event_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let exists: bool = conn
                 .query_row(
                     "SELECT 1 FROM webhook_events WHERE event_id=?1",
@@ -145,7 +162,7 @@ impl Db {
     ) -> Result<CreatedOutcome, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
@@ -278,7 +295,7 @@ impl Db {
     ) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
@@ -362,7 +379,7 @@ impl Db {
     pub async fn process_subscription_revoked(&self, data: RevokedData) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
@@ -431,7 +448,7 @@ impl Db {
         let conn = self.conn.clone();
         let sid = subscription_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let exists: bool = conn
                 .query_row(
                     "SELECT 1 FROM api_keys WHERE subscription_id=?1",
@@ -455,7 +472,7 @@ impl Db {
     ) -> Result<UpdatedOutcome, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let tx = conn.unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("db tx: {e}")))?;
 
@@ -604,7 +621,7 @@ impl Db {
         let conn = self.conn.clone();
         let cid = checkout_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let secret: Option<String> = conn
                 .query_row(
                     "SELECT receipt_secret FROM pending_receipts WHERE checkout_id=?1 AND expires_at > datetime('now')",
@@ -628,7 +645,7 @@ impl Db {
         let conn = self.conn.clone();
         let secret = receipt_secret.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let row: Option<ReceiptRow> = conn
                 .query_row(
                     "DELETE FROM pending_receipts WHERE receipt_secret=?1 AND expires_at > datetime('now') RETURNING subscription_id, api_key_enc, api_key_nonce, token, checkout_id",
@@ -657,7 +674,7 @@ impl Db {
         let conn = self.conn.clone();
         let kh = key_hash.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let sub_id: Option<String> = conn
                 .query_row(
                     "SELECT subscription_id FROM api_keys WHERE key_hash=?1 AND revoked=0",
@@ -676,7 +693,7 @@ impl Db {
         let conn = self.conn.clone();
         let sid = sub_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let row: Option<SubRow> = conn
                 .query_row(
                     "SELECT id, status, tier FROM subscriptions WHERE id=?1",
@@ -707,7 +724,7 @@ impl Db {
         let sid = sub_id.to_string();
         let tok = token.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             conn.execute(
                 "INSERT INTO tokens (subscription_id, token, expires_at) VALUES (?1, ?2, ?3)",
                 params![sid, tok, expires_at],
@@ -724,7 +741,7 @@ impl Db {
     pub async fn insert_dead_letter(&self, dl: DeadLetterData) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             conn.execute(
                 "INSERT OR IGNORE INTO dead_letter (event_id, subscription_id, event_type, reason, occurred_at, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![dl.event_id, dl.subscription_id, dl.event_type, dl.reason, dl.occurred_at, dl.payload],
@@ -741,7 +758,7 @@ impl Db {
     pub async fn cleanup(&self) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             conn.execute_batch(
                 "DELETE FROM pending_receipts WHERE expires_at < datetime('now');
                  DELETE FROM dead_letter WHERE created_at < datetime('now', '-90 days');
@@ -759,7 +776,7 @@ impl Db {
     pub async fn get_retryable_dead_letters(&self) -> Result<Vec<RetryableDeadLetter>, AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             let mut stmt = conn
                 .prepare(
                     "SELECT dl.id, dl.event_id, dl.subscription_id, dl.event_type, dl.occurred_at, s.tier, s.last_event_at
@@ -804,7 +821,7 @@ impl Db {
         let tier = new_tier.to_string();
         let pid = new_product_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             conn.execute(
                 "UPDATE subscriptions SET tier=?1, product_id=?2, updated_at=datetime('now') WHERE id=?3 AND tier='unknown'",
                 params![tier, pid, sid],
@@ -824,7 +841,7 @@ impl Db {
     pub async fn delete_dead_letter(&self, dead_letter_id: i64) -> Result<(), AppError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = acquire_db(&conn);
             conn.execute(
                 "DELETE FROM dead_letter WHERE id=?1",
                 params![dead_letter_id],

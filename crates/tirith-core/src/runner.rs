@@ -149,29 +149,20 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     let cached_path = cache_dir.join(&sha256);
     {
         use std::io::Write;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts
-            .open(&cached_path)
-            .map_err(|e| format!("write cache: {e}"))?;
-        f.write_all(&content)
-            .map_err(|e| format!("write cache: {e}"))?;
-        // Harden legacy cache files
+        use tempfile::NamedTempFile;
+
+        let mut tmp = NamedTempFile::new_in(&cache_dir).map_err(|e| format!("tempfile: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-                eprintln!(
-                    "tirith: failed to set permissions on {}: {e}",
-                    cached_path.display()
-                );
-            }
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("permissions: {e}"))?;
         }
+        tmp.write_all(&content)
+            .map_err(|e| format!("write cache: {e}"))?;
+        tmp.persist(&cached_path)
+            .map_err(|e| format!("persist cache: {e}"))?;
     }
 
     let content_str = match String::from_utf8(content.clone()) {
@@ -371,21 +362,20 @@ mod tests {
     #[test]
     fn test_cache_write_permissions_0600() {
         use std::os::unix::fs::PermissionsExt;
+        use tempfile::NamedTempFile;
 
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("test_cache");
 
         {
             use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&cache_path).unwrap();
-            f.write_all(b"test content").unwrap();
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+
+            let mut tmp = NamedTempFile::new_in(dir.path()).unwrap();
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            tmp.write_all(b"test content").unwrap();
+            tmp.persist(&cache_path).unwrap();
         }
 
         let meta = std::fs::metadata(&cache_path).unwrap();
@@ -393,6 +383,40 @@ mod tests {
             meta.permissions().mode() & 0o777,
             0o600,
             "cache file should be 0600"
+        );
+    }
+
+    #[test]
+    fn test_cache_write_no_predictable_tmp() {
+        use tempfile::NamedTempFile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let cached_path = dir.path().join(sha);
+
+        {
+            use std::io::Write;
+            let mut tmp = NamedTempFile::new_in(dir.path()).unwrap();
+            tmp.write_all(b"cached script").unwrap();
+            tmp.persist(&cached_path).unwrap();
+        }
+
+        // No predictable temp file should remain
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        // Should only contain the final cached file
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the cached file should exist, found: {entries:?}"
+        );
+        assert!(
+            cached_path.exists(),
+            "cached file should exist after persist"
         );
     }
 }

@@ -5,7 +5,7 @@
 ```yaml
 # .tirith/policy.yaml (repo root)
 fail_mode: closed
-allow_bypass: false
+allow_bypass_env: false
 severity_overrides:
   shortened_url: HIGH
   plain_http_to_sink: CRITICAL
@@ -18,7 +18,7 @@ All findings block execution. No bypass mechanism. Shortened URLs and plain HTTP
 ```yaml
 # ~/.config/tirith/policy.yaml
 fail_mode: open
-allow_bypass: true
+allow_bypass_env: true
 ```
 
 With allowlist at `~/.config/tirith/allowlist`:
@@ -60,7 +60,7 @@ All Docker-related findings are escalated. Other rules use default severity.
 ```yaml
 # ~/.config/tirith/policy.yaml
 fail_mode: open
-allow_bypass: true
+allow_bypass_env: true
 severity_overrides:
   curl_pipe_shell: LOW
   wget_pipe_shell: LOW
@@ -70,3 +70,23 @@ severity_overrides:
 ```
 
 Everything becomes a LOW-severity warning. Nothing blocks. Useful for onboarding.
+
+## 6. Cargo Vet Supply-Chain Audit
+
+tirith detects when `cargo install` or `cargo add` is run in a project that
+hasn't configured [cargo-vet](https://mozilla.github.io/cargo-vet/). The
+`vet_not_configured` rule fires at LOW severity by default. To escalate:
+
+```yaml
+# .tirith/policy.yaml
+severity_overrides:
+  vet_not_configured: HIGH
+```
+
+To suppress it (e.g. for non-Rust repos):
+
+```
+# ~/.config/tirith/allowlist
+# or .tirith/allowlist
+vet_not_configured
+```

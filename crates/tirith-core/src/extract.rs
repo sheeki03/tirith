@@ -819,7 +819,7 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     if labels.len() < 2 {
         return false;
     }
-    // Last label (TLD) should be 2-6 alphabetic chars
+    // Last label (TLD) should be 2-63 alphabetic chars (DNS label max)
     let tld = labels.last().unwrap();
     tld.len() >= 2 && tld.len() <= 63 && tld.chars().all(|c| c.is_ascii_alphabetic())
 }

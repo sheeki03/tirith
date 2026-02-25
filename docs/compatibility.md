@@ -17,6 +17,15 @@ The following subcommands are considered stable. Their flags, exit codes, and ou
 These subcommands may change without notice:
 
 - `run` — safe script download/execute
+- `scan` — file and directory scanning for hidden content and config poisoning
+- `fetch` — server-side cloaking detection
+- `checkpoint` — file checkpoint and rollback
+- `gateway` — MCP gateway proxy for AI agent security
+- `setup` — configure tirith for AI coding tools
+- `audit` — audit log export, stats, and compliance reports
+- `activate` — license key activation
+- `license` — license status and management
+- `mcp-server` — MCP server mode (JSON-RPC over stdio)
 - `doctor` — diagnostic output
 - `completions` — shell completion generation (hidden)
 - `manpage` — man page generation (hidden)

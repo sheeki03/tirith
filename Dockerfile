@@ -11,10 +11,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --user-group tirith
 
 COPY --from=builder /src/target/release/tirith /usr/local/bin/
 COPY --from=builder /src/shell /usr/share/tirith/shell
+
+USER tirith
 
 ENTRYPOINT ["tirith"]
 CMD ["--help"]

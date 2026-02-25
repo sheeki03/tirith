@@ -531,11 +531,19 @@ impl Policy {
     }
 
     /// Load and merge org-level lists from a repo root's .tirith/ dir.
+    ///
+    /// **Note:** Org-level policies are committed to the repository and may be
+    /// controlled by other contributors. A diagnostic is emitted so the user
+    /// knows that repo-level policy is active.
     pub fn load_org_lists(&mut self, cwd: Option<&str>) {
         if let Some(repo_root) = find_repo_root(cwd) {
             let org_dir = repo_root.join(".tirith");
             let allowlist_path = org_dir.join("allowlist");
             if let Ok(content) = std::fs::read_to_string(&allowlist_path) {
+                eprintln!(
+                    "tirith: loading org-level allowlist from {}",
+                    allowlist_path.display()
+                );
                 for line in content.lines() {
                     let line = line.trim();
                     if !line.is_empty() && !line.starts_with('#') {
@@ -545,6 +553,10 @@ impl Policy {
             }
             let blocklist_path = org_dir.join("blocklist");
             if let Ok(content) = std::fs::read_to_string(&blocklist_path) {
+                eprintln!(
+                    "tirith: loading org-level blocklist from {}",
+                    blocklist_path.display()
+                );
                 for line in content.lines() {
                     let line = line.trim();
                     if !line.is_empty() && !line.starts_with('#') {
