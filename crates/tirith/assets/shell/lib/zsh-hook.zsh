@@ -88,7 +88,7 @@ _tirith_accept_line() {
   # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
   local errfile=$(mktemp)
   local approval_path
-  approval_path=$(tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
+  approval_path=$(command tirith check --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
   local rc=$?
   local output=$(<"$errfile")
   command rm -f "$errfile"
@@ -181,7 +181,7 @@ _tirith_bracketed_paste() {
   if [[ -n "$pasted" ]]; then
     # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
     local tmpfile=$(mktemp)
-    echo -n "$pasted" | tirith paste --shell posix >"$tmpfile" 2>&1
+    echo -n "$pasted" | command tirith paste --shell posix >"$tmpfile" 2>&1
     local rc=$?
     local output=$(<"$tmpfile")
     command rm -f "$tmpfile"

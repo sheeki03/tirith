@@ -45,7 +45,7 @@ function _tirith_parse_approval
     end
 
     set -l valid_keys 0
-    for line in (cat "$argv[1]")
+    while read -l line
         set -l parts (string split -m1 = "$line")
         if test (count $parts) -ge 2
             switch $parts[1]
@@ -62,7 +62,7 @@ function _tirith_parse_approval
                     set -g _tirith_ap_desc $parts[2]
             end
         end
-    end
+    end < "$argv[1]"
 
     command rm -f "$argv[1]"
 
@@ -92,9 +92,9 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         end
 
         set -l tmpfile (mktemp)
-        echo -n "$content" | tirith paste --shell fish >$tmpfile 2>&1
+        echo -n "$content" | command tirith paste --shell fish >$tmpfile 2>&1
         set -l rc $status
-        set -l output (cat $tmpfile | string collect)
+        set -l output (string collect < $tmpfile)
         command rm -f $tmpfile
 
         if test $rc -eq 0
@@ -133,12 +133,23 @@ function _tirith_check_command
         return
     end
 
-    # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
+    # Run tirith check with approval workflow (stdout=approval file path, stderr=human output).
+    # Redirect both stdout and stderr to temp files instead of using command substitution —
+    # fish 4.0+ changed terminal mode handling for external commands in key bindings,
+    # and command substitution (set -l x (cmd)) can hang in that context.
+    set -l outfile (mktemp)
     set -l errfile (mktemp)
-    set -l approval_path (tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" 2>$errfile)
+    command tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
     set -l rc $status
-    set -l output (cat $errfile | string collect)
-    command rm -f $errfile
+    set -l approval_path ""
+    if test -s $outfile
+        read approval_path < $outfile
+    end
+    set -l output ""
+    if test -s $errfile
+        set output (string collect < $errfile)
+    end
+    command rm -f $outfile $errfile
 
     if test $rc -eq 0
         # Allow: no output
@@ -217,18 +228,24 @@ function _tirith_check_command
 end
 
 function _tirith_bind_enter
-    # Default/emacs mode
+    # Default/emacs mode — bind both the legacy escape codes (\r/\n) and
+    # the symbolic 'enter' name so the hook fires regardless of whether
+    # the terminal uses the kitty keyboard protocol (fish 4.0+).
     bind \r _tirith_check_command
     bind \n _tirith_check_command
+    bind enter _tirith_check_command 2>/dev/null  # fish 4.0+ symbolic name
     # Vi insert mode
     bind -M insert \r _tirith_check_command 2>/dev/null
     bind -M insert \n _tirith_check_command 2>/dev/null
+    bind -M insert enter _tirith_check_command 2>/dev/null
     # Vi default/normal mode (no -m insert to avoid Ghostty input freeze)
     bind -M default \r _tirith_check_command 2>/dev/null
     bind -M default \n _tirith_check_command 2>/dev/null
+    bind -M default enter _tirith_check_command 2>/dev/null
     # Vi replace mode (no -m insert to avoid Ghostty input freeze)
     bind -M replace \r _tirith_check_command 2>/dev/null
     bind -M replace \n _tirith_check_command 2>/dev/null
+    bind -M replace enter _tirith_check_command 2>/dev/null
 end
 
 # Bind immediately
