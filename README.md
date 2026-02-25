@@ -411,12 +411,6 @@ $ tirith audit stats --json
 $ tirith audit report --format html --since 2025-01-01
 ```
 
-### `tirith activate <key>`
-Activate a license key for Pro/Team/Enterprise features.
-
-### `tirith license`
-Show or manage license status. Subcommands: `deactivate`, `refresh`.
-
 ### `tirith init`
 Prints the shell hook for your current shell. Add `eval "$(tirith init)"` to your shell profile to activate tirith. If you use multiple shells, you can force a specific one with `tirith init --shell bash|zsh|fish`.
 
@@ -434,7 +428,7 @@ Run tirith as an MCP server over JSON-RPC stdio. Used by AI coding tools for int
 - **No command rewriting** — tirith never modifies what you typed
 - **No telemetry** — no analytics, no crash reporting, no phone-home behavior
 - **No background processes** — invoked per-command, exits immediately
-- **Network only when you ask** — `run`, `fetch`, `license refresh`, and `audit report --upload` reach the network, but only on explicit invocation. Core detection never does.
+- **Network only when you ask** — `run`, `fetch`, and `audit report --upload` reach the network, but only on explicit invocation. Core detection never does.
 
 ---
 
@@ -489,18 +483,14 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
+**Every feature is available to everyone — no tiers, no feature gating.** All 66 detection rules, the MCP server, config scanning, cloaking detection, and every command ship fully unlocked.
+
 tirith is dual-licensed:
 
 - **AGPL-3.0-only**: [LICENSE-AGPL](LICENSE-AGPL) — free under copyleft terms
-- **Commercial**: [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) — alternative licensing available
-
-This software is free under AGPL-3.0-only with copyleft obligations. If your intended
-use would trigger AGPL requirements and you prefer not to comply, contact
-contact@tirith.sh for commercial licensing options.
+- **Commercial**: [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) — if AGPL copyleft obligations don't work for your use case, contact contact@tirith.sh for alternative licensing
 
 Third-party data attributions in [NOTICE](NOTICE).
-
-> **Note:** Tier checks gate enrichment features (detailed diffs, checkpoints, audit reports), not security detection. All detection rules run at every tier regardless of license. Self-built binaries can set any tier; official v0.3.0+ releases require Ed25519-signed license tokens.
 
 ## Star History
 

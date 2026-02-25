@@ -121,96 +121,96 @@ fn gather_info() -> DoctorInfo {
 }
 
 fn print_human(info: &DoctorInfo) {
-    eprintln!("tirith {}", info.version);
-    eprintln!("  binary:       {}", info.binary_path);
-    eprintln!("  shell:        {}", info.detected_shell);
-    eprintln!("  interactive:  {}", info.interactive);
-    eprintln!(
+    println!("tirith {}", info.version);
+    println!("  binary:       {}", info.binary_path);
+    println!("  shell:        {}", info.detected_shell);
+    println!("  interactive:  {}", info.interactive);
+    println!(
         "  hook dir:     {}",
         info.hook_dir.as_deref().unwrap_or("not found")
     );
-    eprintln!("  materialized: {}", info.hooks_materialized);
-    eprintln!(
+    println!("  materialized: {}", info.hooks_materialized);
+    println!(
         "  profile:      {}",
         info.shell_profile.as_deref().unwrap_or("not found")
     );
     if info.hook_configured {
-        eprintln!("  hook status:  configured");
+        println!("  hook status:  configured");
     } else {
-        eprintln!("  hook status:  NOT CONFIGURED");
-        eprintln!();
-        eprintln!("  WARNING: tirith shell hook is not configured!");
-        eprintln!("  Commands will NOT be intercepted until you add to your shell profile:");
-        eprintln!();
+        println!("  hook status:  NOT CONFIGURED");
+        println!();
+        println!("  WARNING: tirith shell hook is not configured!");
+        println!("  Commands will NOT be intercepted until you add to your shell profile:");
+        println!();
         match info.detected_shell.as_str() {
             "zsh" => {
-                eprintln!("    echo 'eval \"$(tirith init --shell zsh)\"' >> ~/.zshrc");
-                eprintln!("    source ~/.zshrc");
+                println!("    echo 'eval \"$(tirith init --shell zsh)\"' >> ~/.zshrc");
+                println!("    source ~/.zshrc");
             }
             "bash" => {
-                eprintln!("    echo 'eval \"$(tirith init --shell bash)\"' >> ~/.bashrc");
-                eprintln!("    source ~/.bashrc");
+                println!("    echo 'eval \"$(tirith init --shell bash)\"' >> ~/.bashrc");
+                println!("    source ~/.bashrc");
             }
             "fish" => {
-                eprintln!(
+                println!(
                     "    echo 'tirith init --shell fish | source' >> ~/.config/fish/config.fish"
                 );
-                eprintln!("    source ~/.config/fish/config.fish");
+                println!("    source ~/.config/fish/config.fish");
             }
             "nushell" => {
-                eprintln!("    # First, materialize hooks:");
-                eprintln!("    tirith init --shell nushell");
-                eprintln!("    # Then add to ~/.config/nushell/config.nu:");
+                println!("    # First, materialize hooks:");
+                println!("    tirith init --shell nushell");
+                println!("    # Then add to ~/.config/nushell/config.nu:");
                 if let Some(ref dir) = info.hook_dir {
                     // Escape for Nushell double-quoted string: \ → \\, " → \"
                     let escaped = dir.replace('\\', r"\\").replace('"', r#"\""#);
-                    eprintln!(r#"    source "{escaped}/lib/nushell-hook.nu""#);
+                    println!(r#"    source "{escaped}/lib/nushell-hook.nu""#);
                 } else {
-                    eprintln!("    source <hook-dir>/lib/nushell-hook.nu");
-                    eprintln!(
+                    println!("    source <hook-dir>/lib/nushell-hook.nu");
+                    println!(
                         "    # (run 'tirith init --shell nushell' first to determine the path)"
                     );
                 }
             }
             _ => {
-                eprintln!("    eval \"$(tirith init)\"");
+                println!("    eval \"$(tirith init)\"");
             }
         }
-        eprintln!();
+        println!();
     }
     if info.bash_safe_mode {
-        eprintln!("  bash mode:    SAFE MODE (preexec fallback — previous enter-mode failure)");
-        eprintln!("                Reset: tirith doctor --reset-bash-safe-mode");
+        println!("  bash mode:    SAFE MODE (preexec fallback — previous enter-mode failure)");
+        println!("                Reset: tirith doctor --reset-bash-safe-mode");
     } else {
-        eprintln!("  bash mode:    normal");
+        println!("  bash mode:    normal");
     }
     if info.policy_paths.is_empty() {
-        eprintln!("  policies:     (none found)");
+        println!("  policies:     (none found)");
     } else {
         for (i, p) in info.policy_paths.iter().enumerate() {
             if i == 0 {
-                eprintln!("  policies:     {p}");
+                println!("  policies:     {p}");
             } else {
-                eprintln!("                {p}");
+                println!("                {p}");
             }
         }
     }
     if let Some(ref root) = info.policy_root_env {
-        eprintln!("  policy root:  {root} (TIRITH_POLICY_ROOT)");
+        println!("  policy root:  {root} (TIRITH_POLICY_ROOT)");
     }
-    eprintln!(
+    println!(
         "  data dir:     {}",
         info.data_dir.as_deref().unwrap_or("not found")
     );
-    eprintln!(
+    println!(
         "  log path:     {}",
         info.log_path.as_deref().unwrap_or("not found")
     );
-    eprintln!(
+    println!(
         "  last trigger: {}",
         info.last_trigger_path.as_deref().unwrap_or("not found")
     );
-    eprintln!(
+    println!(
         "  cloaking:     {}",
         if info.cloaking_available {
             "available"
@@ -218,7 +218,7 @@ fn print_human(info: &DoctorInfo) {
             "not available (Unix-only)"
         }
     );
-    eprintln!(
+    println!(
         "  webhooks:     {}",
         if info.webhooks_available {
             "available"
@@ -231,19 +231,19 @@ fn print_human(info: &DoctorInfo) {
     use tirith_core::license::KeyFormatStatus;
     match tirith_core::license::key_format_status() {
         KeyFormatStatus::LegacyUnsigned => {
-            eprintln!("  license key:  WARNING: Using unsigned license key. Signed tokens will be required in a future release.");
+            println!("  license key:  WARNING: Using unsigned license key. Signed tokens will be required in a future release.");
         }
         KeyFormatStatus::LegacyInvalid => {
-            eprintln!("  license key:  WARNING: Invalid legacy license format. Key will not be recognized.");
+            println!("  license key:  WARNING: Invalid legacy license format. Key will not be recognized.");
         }
         KeyFormatStatus::Malformed => {
-            eprintln!("  license key:  WARNING: License key appears malformed (bad signed token structure).");
+            println!("  license key:  WARNING: License key appears malformed (bad signed token structure).");
         }
         KeyFormatStatus::SignedStructural => {
-            eprintln!("  license key:  signed (structural check passed)");
+            println!("  license key:  signed (structural check passed)");
         }
         KeyFormatStatus::NoKey => {
-            eprintln!("  license key:  not found");
+            println!("  license key:  not found");
         }
     }
 }
@@ -344,8 +344,8 @@ fn reset_safe_mode() -> i32 {
     if flag.exists() {
         match std::fs::remove_file(&flag) {
             Ok(()) => {
-                eprintln!("tirith: bash safe-mode flag removed");
-                eprintln!("  Next shell will attempt enter mode again.");
+                println!("tirith: bash safe-mode flag removed");
+                println!("  Next shell will attempt enter mode again.");
                 0
             }
             Err(e) => {
@@ -354,7 +354,7 @@ fn reset_safe_mode() -> i32 {
             }
         }
     } else {
-        eprintln!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
+        println!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
         0
     }
 }
