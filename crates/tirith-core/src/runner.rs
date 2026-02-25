@@ -20,6 +20,7 @@ pub struct RunOptions {
     pub no_exec: bool,
     pub interactive: bool,
     pub expected_sha256: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Interpreters matched by exact name only.
@@ -234,6 +235,39 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     }
     if analysis.has_base64 {
         eprintln!("tirith: WARNING: script uses base64");
+    }
+
+    let policy = crate::policy::Policy::discover(opts.cwd.as_deref());
+
+    if policy.use_vet_runner {
+        if let Ok(path) = which::which("vet") {
+            eprintln!("tirith: handing over to vet...");
+            receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+
+            // Prevent TOCTOU race condition:
+            // vet expects a URL to download, but we already downloaded and audited it.
+            // If we pass the remote URL, vet might download something different.
+            // Fortunately, curl (which vet uses) natively supports file:// URIs.
+            // We can pass the local cached path as a file:// URI to force vet
+            // to analyze the exact bytes we just approved.
+
+            // Construct file:// URI from the absolute path
+            // Note: cached_path is guaranteed to be absolute because it's derived from dirs_next::data_local_dir
+            let file_uri = format!("file://{}", cached_path.display());
+
+            let status = Command::new(path)
+                .arg(&file_uri)
+                .status()
+                .map_err(|e| format!("execute vet: {e}"))?;
+
+            return Ok(RunResult {
+                receipt,
+                executed: true,
+                exit_code: status.code(),
+            });
+        } else {
+            eprintln!("tirith: warning: use_vet_runner is enabled but 'vet' is not installed or not in PATH. Falling back to default execution.");
+        }
     }
 
     // Confirm from /dev/tty

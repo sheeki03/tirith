@@ -1,4 +1,5 @@
 use std::fmt;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Errors that can occur when fetching remote policy.

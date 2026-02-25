@@ -90,3 +90,27 @@ To suppress it (e.g. for non-Rust repos):
 # or .tirith/allowlist
 vet_not_configured
 ```
+
+## 7. Safer Pipe-to-Shell with `vet`
+
+[vet](https://getvet.sh) is a command-line tool that acts as a safety net for the risky `curl | bash` pattern. It downloads the script, lints it with ShellCheck, and prompts before execution.
+
+You have two ways to use `vet` with tirith:
+
+### Option A: Automatic wrapping in `tirith run`
+
+When you use `tirith run https://example.com/install.sh`, tirith normally downloads the script, analyzes it, and prompts you to execute it. You can configure tirith to automatically hand over execution to `vet` instead.
+
+```yaml
+# ~/.config/tirith/policy.yaml
+use_vet_runner: true
+```
+
+If `vet` is installed and this is enabled, `tirith run` will download the script, perform tirith's static analysis, and then run `vet <cached_script_path>` to provide its interactive diff and execution guard.
+
+### Option B: Using `vet` directly in the pipeline
+
+tirith allows executing `curl | vet` out-of-the-box without blocking, because `vet` isn't blindly executing the script.
+```bash
+$ curl -sSL https://example.com/install.sh | vet
+```
