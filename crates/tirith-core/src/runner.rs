@@ -246,68 +246,17 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
             // Prevent TOCTOU race condition:
             // vet expects a URL to download, but we already downloaded and audited it.
-            // If we pass the URL, vet might download something different than what we checked.
-            // If we pass the file path, vet's internal `curl -fsSL -o` will fail because it's not a URL.
-            // Solution: We run `vet <URL>` but override `curl` and `wget` in the PATH
-            // just for this execution, forcing them to simply copy our cached file.
+            // If we pass the remote URL, vet might download something different.
+            // Fortunately, curl (which vet uses) natively supports file:// URIs.
+            // We can pass the local cached path as a file:// URI to force vet
+            // to analyze the exact bytes we just approved.
             
-            // Create a temporary directory for our fake curl
-            let temp_dir = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
-            let temp_path = temp_dir.path();
-            
-            // Write a fake curl script that just copies the cached file to the destination
-            let fake_curl_path = temp_path.join("curl");
-            let fake_curl_script = format!(
-                "#!/bin/sh\n\
-                # We expect vet to call: curl -fsSL -o <dest> <url>\n\
-                # Our cached file is already checked.\n\
-                # We just need to copy it to the destination.\n\
-                # Find the '-o' argument and the argument after it.\n\
-                while [ $# -gt 0 ]; do\n\
-                    if [ \"$1\" = \"-o\" ]; then\n\
-                        shift\n\
-                        cp \"{}\" \"$1\"\n\
-                        exit 0\n\
-                    fi\n\
-                    shift\n\
-                done\n\
-                cp \"{}\" \"$1\"\n\
-                ",
-                cached_path.display(),
-                cached_path.display()
-            );
-            
-            std::fs::write(&fake_curl_path, fake_curl_script)
-                .map_err(|e| format!("write fake curl: {e}"))?;
-                
-            // Make it executable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&fake_curl_path)
-                    .map_err(|e| format!("get fake curl metadata: {e}"))?
-                    .permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&fake_curl_path, perms)
-                    .map_err(|e| format!("chmod fake curl: {e}"))?;
-            }
-
-            // Also symlink wget to the same fake script just in case vet tries it instead
-            #[cfg(unix)]
-            {
-                let _ = std::os::unix::fs::symlink(&fake_curl_path, temp_path.join("wget"));
-            }
-
-            // Prepend our temp dir to PATH
-            let mut new_path = temp_path.to_path_buf().into_os_string();
-            if let Some(existing_path) = std::env::var_os("PATH") {
-                new_path.push(":");
-                new_path.push(existing_path);
-            }
+            // Construct file:// URI from the absolute path
+            // Note: cached_path is guaranteed to be absolute because it's derived from dirs_next::data_local_dir
+            let file_uri = format!("file://{}", cached_path.display());
 
             let status = Command::new(path)
-                .env("PATH", new_path)
-                .arg(&opts.url)
+                .arg(&file_uri)
                 .status()
                 .map_err(|e| format!("execute vet: {e}"))?;
 
