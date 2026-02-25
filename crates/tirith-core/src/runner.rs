@@ -250,7 +250,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
             // Fortunately, curl (which vet uses) natively supports file:// URIs.
             // We can pass the local cached path as a file:// URI to force vet
             // to analyze the exact bytes we just approved.
-            
+
             // Construct file:// URI from the absolute path
             // Note: cached_path is guaranteed to be absolute because it's derived from dirs_next::data_local_dir
             let file_uri = format!("file://{}", cached_path.display());
