@@ -642,12 +642,12 @@ jobs:
 
       - name: Push to Chocolatey
         shell: pwsh
+        continue-on-error: true  # Chocolatey moderation can block pushes; don't fail the release
         run: |
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
           & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Chocolatey push failed (exit $LASTEXITCODE) — check API key and moderation status"
-            exit 1
+            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — previous version may still be in moderation"
           }
 
   publish-aur:
@@ -667,13 +667,18 @@ jobs:
             exit 1
           fi
 
-      - name: Update PKGBUILD version
+      - name: Update PKGBUILD version and checksums
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           VER="${VERSION#v}"
           sed -i "s/^pkgver=.*/pkgver=${VER}/" packaging/aur/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+
+          # Compute source checksum without keeping the tarball (AUR has a blob size limit)
+          URL="https://github.com/sheeki03/tirith/archive/refs/tags/${VERSION}.tar.gz"
+          SHA=$(curl -sSL "$URL" | sha256sum | cut -d' ' -f1)
+          sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/aur/PKGBUILD
 
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
@@ -685,4 +690,3 @@ jobs:
           commit_email: shivomsharma03@gmail.com
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           commit_message: "Update to ${{ github.ref_name }}"
-          updpkgsums: true
