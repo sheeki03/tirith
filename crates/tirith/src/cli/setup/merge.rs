@@ -5,13 +5,35 @@ use serde_json::{json, Value};
 
 /// Merge a server entry into an MCP JSON config file.
 ///
-/// Creates `mcpServers` object if missing. Drift detection: if the server
-/// exists with different config and `!force`, returns an error. Same config
-/// is silently skipped.
+/// Creates the server object (under `server_key`) if missing. Drift detection:
+/// if the server exists with different config and `!force`, returns an error.
+/// Same config is silently skipped.
+///
+/// `server_key` is the top-level JSON key: `"mcpServers"` for Claude Code,
+/// Cursor, and Windsurf; `"servers"` for VS Code.
 pub fn merge_mcp_json(
     path: &Path,
     server_name: &str,
     server_config: Value,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_json_with_key(
+        path,
+        server_name,
+        server_config,
+        "mcpServers",
+        force,
+        dry_run,
+    )
+}
+
+/// Like `merge_mcp_json` but with a custom top-level key (e.g. `"servers"` for VS Code).
+pub fn merge_mcp_json_with_key(
+    path: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
@@ -25,12 +47,12 @@ pub fn merge_mcp_json(
     let servers = config
         .as_object_mut()
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
-        .entry("mcpServers")
+        .entry(server_key)
         .or_insert_with(|| json!({}));
 
     let servers_obj = servers
         .as_object_mut()
-        .ok_or_else(|| format!("mcpServers in {} is not an object", path.display()))?;
+        .ok_or_else(|| format!("{server_key} in {} is not an object", path.display()))?;
 
     if let Some(existing) = servers_obj.get(server_name) {
         if !force {
@@ -199,6 +221,82 @@ pub fn merge_hooks_json(
 
     super::fs_helpers::atomic_write(path, &content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
+    Ok(())
+}
+
+/// Merge a tirith MCP server into Claude Code's settings.json `mcpServers`.
+///
+/// This is used for user-scope `--with-mcp` instead of `claude mcp add`, which
+/// hangs when called from within an active Claude Code session (subprocess deadlock).
+/// Same drift-detection semantics as `merge_mcp_json`.
+pub fn merge_claude_mcp_server(
+    path: &Path,
+    server_name: &str,
+    server_config: Value,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    let mut config: Value = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+    } else {
+        json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| format!("mcpServers in {} is not an object", path.display()))?;
+
+    if let Some(existing) = servers_obj.get(server_name) {
+        if !force {
+            if existing == &server_config {
+                eprintln!(
+                    "tirith: {server_name} MCP server already in {}, up to date",
+                    path.display()
+                );
+                return Ok(());
+            }
+            if dry_run {
+                eprintln!(
+                    "[dry-run] would error: {server_name} MCP server in {} has different config — use --force to update",
+                    path.display()
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "{server_name} MCP server in {} has different config than expected — use --force to update",
+                path.display()
+            ));
+        }
+        if !dry_run {
+            super::fs_helpers::create_backup(path, true)?;
+        }
+    }
+
+    servers_obj.insert(server_name.to_string(), server_config);
+
+    let content = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+
+    if dry_run {
+        eprintln!(
+            "[dry-run] would write {} ({} bytes)",
+            path.display(),
+            content.len()
+        );
+        return Ok(());
+    }
+
+    super::fs_helpers::atomic_write(path, &content, 0o644)?;
+    eprintln!(
+        "tirith: registered {server_name} MCP server in {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -642,6 +740,54 @@ mod tests {
             })
             .count();
         assert_eq!(backup_count, 0);
+    }
+
+    // ── merge_mcp_json_with_key (VS Code "servers") ─────────────────
+
+    #[test]
+    fn mcp_json_vscode_servers_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        merge_mcp_json_with_key(
+            &path,
+            "tirith-gateway",
+            json!({"type": "stdio", "command": "tirith", "args": ["mcp-server"]}),
+            "servers",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(content["servers"]["tirith-gateway"]["type"], "stdio");
+        assert_eq!(content["servers"]["tirith-gateway"]["command"], "tirith");
+        // Must NOT have "mcpServers" key
+        assert!(content.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn mcp_json_vscode_preserves_existing_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(
+            &path,
+            r#"{"servers":{"other":{"type":"stdio","command":"other"}}}"#,
+        )
+        .unwrap();
+
+        merge_mcp_json_with_key(
+            &path,
+            "tirith-gateway",
+            json!({"type": "stdio", "command": "tirith"}),
+            "servers",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(content["servers"]["other"]["command"], "other");
+        assert_eq!(content["servers"]["tirith-gateway"]["command"], "tirith");
     }
 
     // ── merge_hooks_json ────────────────────────────────────────────

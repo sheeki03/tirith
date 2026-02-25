@@ -9,6 +9,8 @@ mod fs_helpers;
 #[cfg(unix)]
 mod merge;
 #[cfg(unix)]
+mod shell_profile;
+#[cfg(unix)]
 mod tools;
 #[cfg(unix)]
 mod zshenv;
@@ -79,9 +81,13 @@ mod run_impl {
         dry_run: bool,
         force: bool,
     ) -> Result<(), String> {
-        // --with-mcp is only valid for claude-code
+        // --with-mcp only applies to claude-code (registers via `claude mcp add`);
+        // other tools include MCP configuration automatically via merge_mcp_json.
         if with_mcp && tool != "claude-code" {
-            return Err("--with-mcp is only supported for claude-code".into());
+            return Err(
+                "--with-mcp is only needed for claude-code (other tools register MCP automatically)"
+                    .into(),
+            );
         }
 
         // Resolve and validate scope per tool
@@ -96,14 +102,9 @@ mod run_impl {
         }
 
         // Preflight: tool-specific binary checks
-        match tool {
-            "codex" => {
-                check_binary_on_path("codex", dry_run)?;
-            }
-            "claude-code" if with_mcp && scope == Scope::User => {
-                check_binary_on_path("claude", dry_run)?;
-            }
-            _ => {}
+        // (claude-code user MCP now merges settings.json directly — no `claude` CLI needed)
+        if tool == "codex" {
+            check_binary_on_path("codex", dry_run)?;
         }
 
         // Preflight: zsh check when --install-zshenv
