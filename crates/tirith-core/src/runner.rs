@@ -20,6 +20,7 @@ pub struct RunOptions {
     pub no_exec: bool,
     pub interactive: bool,
     pub expected_sha256: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Interpreters matched by exact name only.
@@ -234,6 +235,28 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     }
     if analysis.has_base64 {
         eprintln!("tirith: WARNING: script uses base64");
+    }
+
+    let policy = crate::policy::Policy::discover(opts.cwd.as_deref());
+
+    if policy.use_vet_runner {
+        if let Ok(path) = which::which("vet") {
+            eprintln!("tirith: handing over to vet...");
+            receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+
+            let status = Command::new(path)
+                .arg(&opts.url)
+                .status()
+                .map_err(|e| format!("execute vet: {e}"))?;
+
+            return Ok(RunResult {
+                receipt,
+                executed: true,
+                exit_code: status.code(),
+            });
+        } else {
+            eprintln!("tirith: warning: use_vet_runner is enabled but 'vet' is not installed or not in PATH. Falling back to default execution.");
+        }
     }
 
     // Confirm from /dev/tty

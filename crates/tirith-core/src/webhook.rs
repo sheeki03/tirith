@@ -3,7 +3,9 @@
 /// Unix-only (ADR-8): depends on reqwest. Non-blocking: fires in a background
 /// thread so it never delays the verdict exit code.
 use crate::policy::WebhookConfig;
-use crate::verdict::{Severity, Verdict};
+#[cfg(unix)]
+use crate::verdict::Severity;
+use crate::verdict::Verdict;
 
 /// Dispatch webhook notifications for a verdict, if configured.
 ///
@@ -247,6 +249,7 @@ fn send_with_retry(
 }
 
 /// Sanitize a string for safe embedding in JSON (limit length, escape special chars).
+#[allow(dead_code)]
 fn sanitize_for_json(input: &str) -> String {
     let truncated: String = input.chars().take(200).collect();
     // Use serde_json to properly escape the string
@@ -262,6 +265,7 @@ mod tests {
 
     /// Mutex to serialize tests that mutate environment variables.
     /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
+    #[allow(dead_code)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

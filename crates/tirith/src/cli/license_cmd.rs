@@ -116,7 +116,7 @@ pub fn refresh() -> i32 {
     #[cfg(not(unix))]
     {
         eprintln!("tirith: license refresh is only supported on Unix");
-        return 1;
+        1
     }
 
     #[cfg(unix)]

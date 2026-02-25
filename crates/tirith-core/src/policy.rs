@@ -42,6 +42,10 @@ pub struct Policy {
     #[serde(default)]
     pub severity_overrides: HashMap<String, Severity>,
 
+    /// Whether to automatically pipe downloaded scripts to `vet` in `tirith run`.
+    #[serde(default)]
+    pub use_vet_runner: bool,
+
     /// Additional known domains (extends built-in list).
     #[serde(default)]
     pub additional_known_domains: Vec<String>,
@@ -251,6 +255,8 @@ impl Default for Policy {
             allowlist_rules: Vec::new(),
             custom_rules: Vec::new(),
             dlp_custom_patterns: Vec::new(),
+            use_vet_runner: false,
+
             policy_server_url: None,
             policy_server_api_key: None,
             policy_fetch_fail_mode: None,

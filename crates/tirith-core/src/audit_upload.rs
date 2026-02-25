@@ -39,6 +39,7 @@ pub fn spool_event(event_json: &str) -> std::io::Result<()> {
 /// Enforce bounded retention on the spool. Drop oldest events when over limits.
 ///
 /// Returns the (possibly trimmed) list of lines to process.
+#[allow(dead_code)]
 fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> Vec<String> {
     let mut result = lines;
 
@@ -174,6 +175,7 @@ pub fn drain_spool(_server_url: &str, _api_key: &str, _max_events: usize, _max_b
 }
 
 /// Rewrite the spool file with the remaining unsent lines.
+#[allow(dead_code)]
 fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
     if remaining.is_empty() {
         if let Err(e) = fs::write(path, "") {

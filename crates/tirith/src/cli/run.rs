@@ -8,6 +8,7 @@ pub fn run(url: &str, no_exec: bool, json: bool, expected_sha256: Option<String>
         no_exec,
         interactive,
         expected_sha256,
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
     };
 
     match runner::run(opts) {

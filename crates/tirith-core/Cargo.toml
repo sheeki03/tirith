@@ -33,6 +33,7 @@ lopdf = { workspace = true }
 uuid = { workspace = true }
 tempfile = "3"
 ed25519-dalek = { workspace = true }
+which = "8.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
