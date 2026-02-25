@@ -10,7 +10,7 @@ if ($global:_TIRITH_PS_LOADED) {
         $global:_TIRITH_PS_LOADED = $false
         # Fall through to load fresh
     } else {
-        return  # Set in this session — genuine double-source guard
+        return  # Set in this session - genuine double-source guard
     }
 }
 $global:_TIRITH_PS_LOADED = $true
@@ -27,7 +27,7 @@ if (-not $psrlModule) {
     return
 }
 
-# ─── Approval workflow helpers (ADR-7) ───
+# --- Approval workflow helpers (ADR-7) ---
 
 function _tirith_parse_approval {
     param($FilePath)
@@ -141,7 +141,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     } else {
         # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
-        Write-Host "tirith: unexpected exit code $rc — running unprotected"
+        Write-Host "tirith: unexpected exit code $rc - running unprotected"
         if (-not [string]::IsNullOrWhiteSpace($approvalPath)) {
             Remove-Item $approvalPath.Trim() -Force -ErrorAction SilentlyContinue
         }
@@ -159,7 +159,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
                 Write-Host "  $($script:_tirith_ap_desc)"
             }
             if ($script:_tirith_ap_timeout -gt 0) {
-                $response = _tirith_read_with_timeout -TimeoutSecs $script:_tirith_ap_timeout -Prompt "Approve? ($($script:_tirith_ap_timeout)s timeout) [y/N] "
+                $response = _tirith_read_with_timeout -TimeoutSecs $script:_tirith_ap_timeout -Prompt "Approve? ($($script:_tirith_ap_timeout) sec timeout) [y/N] "
             } else {
                 Write-Host -NoNewline "Approve? [y/N] "
                 $response = Read-Host
@@ -169,13 +169,13 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
             } else {
                 switch ($script:_tirith_ap_fallback) {
                     "allow" {
-                        Write-Host "tirith: approval not granted — fallback: allow"
+                        Write-Host "tirith: approval not granted - fallback: allow"
                     }
                     "warn" {
-                        Write-Host "tirith: approval not granted — fallback: warn"
+                        Write-Host "tirith: approval not granted - fallback: warn"
                     }
                     default {
-                        Write-Host "tirith: approval not granted — fallback: block"
+                        Write-Host "tirith: approval not granted - fallback: block"
                         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
                         return
                     }
@@ -220,7 +220,7 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         # Block or unexpected: discard paste
         Write-Host "paste> $pasted"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
-        if ($rc -ne 1) { Write-Host "tirith: unexpected exit code $rc — paste blocked for safety" }
+        if ($rc -ne 1) { Write-Host "tirith: unexpected exit code $rc - paste blocked for safety" }
         return
     }
 
