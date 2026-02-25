@@ -125,16 +125,25 @@ pub fn run(
         }
     }
 
-    // Auto-checkpoint before destructive commands (Pro feature, non-blocking)
-    if verdict.action != tirith_core::verdict::Action::Block
+    // Auto-checkpoint before destructive commands (Pro feature).
+    // Skip in non-interactive mode: hooks and scripts need fast responses, and
+    // checkpoint::create() synchronously traverses the entire cwd which can take
+    // seconds on large directories.
+    if interactive
+        && verdict.action != tirith_core::verdict::Action::Block
         && tirith_core::license::current_tier() >= tirith_core::license::Tier::Pro
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
     {
         if let Some(cwd) = &ctx.cwd {
-            let cwd_str = cwd.as_str();
-            if let Err(e) = tirith_core::checkpoint::create(&[cwd_str], Some(cmd)) {
-                eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
-            }
+            let cwd_owned = cwd.clone();
+            let cmd_owned = cmd.to_string();
+            std::thread::spawn(move || {
+                if let Err(e) =
+                    tirith_core::checkpoint::create(&[cwd_owned.as_str()], Some(&cmd_owned))
+                {
+                    eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
+                }
+            });
         }
     }
 
