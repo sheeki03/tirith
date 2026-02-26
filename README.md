@@ -299,6 +299,8 @@ Use `tirith setup <tool>` for one-command configuration:
 tirith setup claude-code --with-mcp   # Claude Code + MCP server
 tirith setup codex                    # OpenAI Codex
 tirith setup cursor                   # Cursor
+tirith setup gemini-cli --with-mcp   # Gemini CLI + MCP server
+tirith setup pi-cli                  # Pi CLI
 tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
 ```
@@ -398,6 +400,8 @@ One-command setup for AI coding tools. Configures shell hooks, MCP server regist
 $ tirith setup claude-code --with-mcp    # Claude Code + MCP server
 $ tirith setup codex                     # OpenAI Codex
 $ tirith setup cursor                    # Cursor
+$ tirith setup gemini-cli --with-mcp    # Gemini CLI + MCP server
+$ tirith setup pi-cli                   # Pi CLI
 $ tirith setup vscode                    # VS Code
 $ tirith setup windsurf                  # Windsurf
 ```

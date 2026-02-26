@@ -45,6 +45,14 @@ pub const ZSHENV_GUARD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/zshenv-guard.zsh"
 ));
+pub const GEMINI_HOOK_PY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/tirith-security-guard-gemini.py"
+));
+pub const TIRITH_GUARD_TS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/tirith-guard.ts"
+));
 pub const GATEWAY_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/configs/tirith-gateway.yaml"

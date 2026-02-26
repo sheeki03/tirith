@@ -181,14 +181,14 @@ enum Commands {
 
     /// Configure tirith protection for an AI coding tool
     Setup {
-        /// Tool to configure: claude-code, codex, cursor, vscode, windsurf
+        /// Tool to configure: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf
         tool: String,
 
         /// Scope: project (default for most tools) or user
         #[arg(long)]
         scope: Option<String>,
 
-        /// Also register tirith MCP server (Claude Code only)
+        /// Also register tirith MCP server (Claude Code and Gemini CLI)
         #[arg(long)]
         with_mcp: bool,
 

@@ -325,9 +325,6 @@ mod tests {
     #[cfg(unix)]
     mod integration {
         use super::*;
-        use std::sync::Mutex;
-
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
 
         fn zsh_available() -> bool {
             std::process::Command::new("zsh")
@@ -336,17 +333,40 @@ mod tests {
                 .is_ok_and(|o| o.status.success())
         }
 
-        fn with_fake_home<F: FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
-            let _lock = HOME_LOCK.lock().unwrap();
-            let tmp = tempfile::tempdir().unwrap();
-            let old_home = std::env::var("HOME").ok();
-            unsafe { std::env::set_var("HOME", tmp.path()) };
-            let result = f(tmp.path());
-            match old_home {
-                Some(h) => unsafe { std::env::set_var("HOME", h) },
-                None => unsafe { std::env::remove_var("HOME") },
+        /// RAII guard that restores (or removes) an env var on Drop.
+        struct EnvGuard {
+            key: &'static str,
+            old: Option<std::ffi::OsString>,
+        }
+
+        impl EnvGuard {
+            fn set(key: &'static str, val: &std::path::Path) -> Self {
+                let old = std::env::var_os(key);
+                unsafe { std::env::set_var(key, val) };
+                Self { key, old }
             }
-            result
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.old {
+                    Some(h) => unsafe { std::env::set_var(self.key, h) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+
+        fn with_fake_home<F: std::panic::UnwindSafe + FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
+            let _lock = super::super::super::HOME_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let _home_guard = EnvGuard::set("HOME", tmp.path());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+            match result {
+                Ok(v) => v,
+                Err(e) => std::panic::resume_unwind(e),
+            }
         }
 
         #[test]

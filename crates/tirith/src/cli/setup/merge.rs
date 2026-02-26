@@ -300,14 +300,22 @@ pub fn merge_claude_mcp_server(
     Ok(())
 }
 
-/// Merge a tirith PreToolUse hook into Claude Code's settings.json.
+/// Merge a tirith hook into a settings.json with Claude Code / Gemini CLI
+/// hook structure: `hooks.{event_name}[]` array of matcher entries, each with
+/// an inner `hooks[]` array of command entries.
 ///
-/// Navigates to `hooks.PreToolUse` array, looks for an existing entry with
-/// `matcher == "Bash"` that contains "tirith" in its command. Preserves all
-/// other keys and entries.
-pub fn merge_claude_settings(
+/// Operates at the **individual hook-command level** within a matcher's hooks
+/// array — preserves other hooks in the same matcher and other matcher entries.
+///
+/// `marker` is a tool-specific filename substring used to detect the existing
+/// tirith hook entry (e.g. `"tirith-check.py"` for Claude, `"tirith-security-guard-gemini.py"`
+/// for Gemini).
+fn merge_hook_settings_inner(
     path: &Path,
+    event_name: &str,
+    matcher_name: &str,
     hook_command: &str,
+    marker: &str,
     force: bool,
     dry_run: bool,
 ) -> Result<(), String> {
@@ -322,79 +330,159 @@ pub fn merge_claude_settings(
         .as_object_mut()
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
 
-    // Ensure hooks object exists
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks
         .as_object_mut()
         .ok_or_else(|| format!("hooks in {} is not an object", path.display()))?;
 
-    // Ensure PreToolUse array exists
-    let pre_tool_use = hooks_obj.entry("PreToolUse").or_insert_with(|| json!([]));
-    let arr = pre_tool_use
+    let event_arr = hooks_obj.entry(event_name).or_insert_with(|| json!([]));
+    let arr = event_arr
         .as_array_mut()
-        .ok_or_else(|| format!("hooks.PreToolUse in {} is not an array", path.display()))?;
+        .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
 
-    let new_entry = json!({
-        "matcher": "Bash",
-        "hooks": [
-            {
-                "type": "command",
-                "command": hook_command
-            }
-        ]
+    let new_hook_entry = json!({
+        "type": "command",
+        "command": hook_command
     });
 
-    // Find existing Bash matcher with tirith in command
-    let existing_idx = arr.iter().position(|entry| {
-        let is_bash = entry
-            .get("matcher")
+    // Helper: check if a hook entry's command contains the marker
+    let has_marker = |h: &Value| -> bool {
+        h.get("command")
             .and_then(|v| v.as_str())
-            .map(|m| m == "Bash")
-            .unwrap_or(false);
-        if !is_bash {
-            return false;
-        }
-        entry
-            .get("hooks")
-            .and_then(|v| v.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|v| v.as_str())
-                        .map(|cmd| cmd.contains("tirith"))
-                        .unwrap_or(false)
-                })
-            })
+            .map(|cmd| cmd.contains(marker))
             .unwrap_or(false)
-    });
+    };
 
-    match existing_idx {
-        Some(idx) => {
-            if !force {
-                if arr[idx] == new_entry {
-                    eprintln!("tirith: PreToolUse hook in {}, up to date", path.display());
-                    return Ok(());
+    // Find all matcher indices matching matcher_name
+    let matcher_indices: Vec<usize> = arr
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry
+                .get("matcher")
+                .and_then(|v| v.as_str())
+                .map(|m| m == matcher_name)
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    match matcher_indices.len() {
+        0 => {
+            // No existing matcher — create new matcher entry with the hook
+            arr.push(json!({
+                "matcher": matcher_name,
+                "hooks": [new_hook_entry]
+            }));
+        }
+        1 => {
+            let idx = matcher_indices[0];
+
+            // Find marker-matching hook index within the matcher's inner hooks
+            let marker_hook_idx = arr[idx]
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .and_then(|inner| inner.iter().position(&has_marker));
+
+            match marker_hook_idx {
+                Some(hi) => {
+                    // Existing tirith hook found — check if identical
+                    let existing = &arr[idx]["hooks"][hi];
+                    if *existing == new_hook_entry {
+                        eprintln!(
+                            "tirith: {event_name} hook in {}, up to date",
+                            path.display()
+                        );
+                        return Ok(());
+                    }
+                    if !force {
+                        if dry_run {
+                            eprintln!(
+                                "[dry-run] would error: {event_name} hook in {} has different config — use --force to update",
+                                path.display()
+                            );
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "{event_name} hook in {} has different config than expected — use --force to update",
+                            path.display()
+                        ));
+                    }
+                    // force: replace just this hook entry
+                    if !dry_run {
+                        super::fs_helpers::create_backup(path, true)?;
+                    }
+                    arr[idx]["hooks"][hi] = new_hook_entry;
                 }
+                None => {
+                    // Matcher exists but no tirith hook — append to inner hooks[].
+                    // Replace hooks if missing or non-array (e.g. null from malformed config).
+                    let obj = arr[idx]
+                        .as_object_mut()
+                        .ok_or_else(|| "matcher entry is not an object".to_string())?;
+                    if !obj.get("hooks").is_some_and(|v| v.is_array()) {
+                        obj.insert("hooks".to_string(), json!([]));
+                    }
+                    let inner_arr = obj["hooks"]
+                        .as_array_mut()
+                        .expect("just ensured hooks is an array");
+                    inner_arr.push(new_hook_entry);
+                }
+            }
+        }
+        _ => {
+            // Multiple matcher entries with the same name
+            if !force {
                 if dry_run {
                     eprintln!(
-                        "[dry-run] would error: PreToolUse hook in {} has different config — use --force to update",
+                        "[dry-run] would error: multiple {matcher_name} matcher entries in {} — use --force to deduplicate",
                         path.display()
                     );
                     return Ok(());
                 }
                 return Err(format!(
-                    "PreToolUse hook in {} has different config than expected — use --force to update",
+                    "multiple {matcher_name} matcher entries in {} — use --force to deduplicate",
                     path.display()
                 ));
             }
-            // force: replace (backup only when not dry-run)
             if !dry_run {
                 super::fs_helpers::create_backup(path, true)?;
             }
-            arr[idx] = new_entry;
-        }
-        None => {
-            arr.push(new_entry);
+
+            // Remove marker-matching hooks from all matcher entries and
+            // collect non-marker hooks from duplicates so we can consolidate.
+            let mut orphan_hooks: Vec<Value> = Vec::new();
+            for (pos, &idx) in matcher_indices.iter().enumerate() {
+                if let Some(inner) = arr[idx]["hooks"].as_array_mut() {
+                    inner.retain(|h| !has_marker(h));
+                    // Collect remaining hooks from duplicate matchers (not first)
+                    if pos > 0 {
+                        orphan_hooks.append(inner);
+                    }
+                }
+            }
+
+            // Ensure first matcher has a valid hooks array and insert new hook.
+            // Replace hooks if missing or non-array (e.g. null from malformed config).
+            let first = arr[matcher_indices[0]]
+                .as_object_mut()
+                .ok_or_else(|| "matcher entry is not an object".to_string())?;
+            if !first.get("hooks").is_some_and(|v| v.is_array()) {
+                first.insert("hooks".to_string(), json!([]));
+            }
+            let inner_arr = first["hooks"]
+                .as_array_mut()
+                .expect("just ensured hooks is an array");
+
+            // Move orphaned hooks from duplicates into the first matcher
+            inner_arr.extend(orphan_hooks);
+            // Add the new tirith hook
+            inner_arr.push(new_hook_entry);
+
+            // Remove all duplicate matcher entries (reverse order to preserve indices)
+            for &idx in matcher_indices[1..].iter().rev() {
+                arr.remove(idx);
+            }
         }
     }
 
@@ -412,6 +500,42 @@ pub fn merge_claude_settings(
     super::fs_helpers::atomic_write(path, &content, 0o644)?;
     eprintln!("tirith: wrote {}", path.display());
     Ok(())
+}
+
+/// Merge a tirith PreToolUse hook into Claude Code's settings.json.
+pub fn merge_claude_settings(
+    path: &Path,
+    hook_command: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_hook_settings_inner(
+        path,
+        "PreToolUse",
+        "Bash",
+        hook_command,
+        "tirith-check.py",
+        force,
+        dry_run,
+    )
+}
+
+/// Merge a tirith BeforeTool hook into Gemini CLI's settings.json.
+pub fn merge_gemini_settings(
+    path: &Path,
+    hook_command: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_hook_settings_inner(
+        path,
+        "BeforeTool",
+        "run_shell_command",
+        hook_command,
+        "tirith-security-guard-gemini.py",
+        force,
+        dry_run,
+    )
 }
 
 /// Merge a tirith hook into VS Code's settings.json using JSONC comment markers.
@@ -1079,5 +1203,336 @@ mod tests {
         let result = remove_managed_block(text, "// BEGIN x", "// END x");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("END marker without BEGIN"));
+    }
+
+    // ── merge_gemini_settings ──────────────────────────────────────
+
+    #[test]
+    fn gemini_settings_creates_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matcher"], "run_shell_command");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            inner[0]["command"],
+            "python3 tirith-security-guard-gemini.py"
+        );
+    }
+
+    #[test]
+    fn gemini_settings_preserves_other_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"other_tool","hooks":[]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn gemini_settings_preserves_other_hooks_in_same_matcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Existing run_shell_command matcher with a non-tirith hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"other-hook.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "should still be one matcher entry");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2, "should have both hooks");
+        assert_eq!(inner[0]["command"], "other-hook.py");
+        assert_eq!(
+            inner[1]["command"],
+            "python3 tirith-security-guard-gemini.py"
+        );
+    }
+
+    #[test]
+    fn gemini_settings_skip_if_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let cmd = "python3 tirith-security-guard-gemini.py";
+        merge_gemini_settings(&path, cmd, false, false).unwrap();
+        // Second call should be idempotent
+        merge_gemini_settings(&path, cmd, false, false).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 1, "no duplicate hooks");
+    }
+
+    #[test]
+    fn gemini_settings_drift_error_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = merge_gemini_settings(
+            &path,
+            "python3 /new/tirith-security-guard-gemini.py",
+            false,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("different config"));
+    }
+
+    #[test]
+    fn gemini_settings_force_replaces_only_tirith_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Matcher with tirith hook + another hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"other-hook.py"},{"type":"command","command":"python3 tirith-security-guard-gemini.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 /new/path/tirith-security-guard-gemini.py",
+            true,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let inner = content["hooks"]["BeforeTool"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 2, "both hooks present");
+        assert_eq!(inner[0]["command"], "other-hook.py", "other hook preserved");
+        assert_eq!(
+            inner[1]["command"], "python3 /new/path/tirith-security-guard-gemini.py",
+            "tirith hook updated"
+        );
+    }
+
+    #[test]
+    fn gemini_settings_multiple_matchers_error_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Two run_shell_command matcher entries
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"a.py"}]},{"matcher":"run_shell_command","hooks":[{"type":"command","command":"b.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        let result = merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("multiple"));
+    }
+
+    #[test]
+    fn gemini_settings_multiple_matchers_force_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Two run_shell_command matchers, both with a tirith hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"python3 tirith-security-guard-gemini.py"}]},{"matcher":"run_shell_command","hooks":[{"type":"command","command":"python3 /old/tirith-security-guard-gemini.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 /new/tirith-security-guard-gemini.py",
+            true,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        // All duplicates removed, consolidated into one
+        assert_eq!(arr.len(), 1, "deduplicated to one matcher");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            inner[0]["command"],
+            "python3 /new/tirith-security-guard-gemini.py"
+        );
+    }
+
+    #[test]
+    fn gemini_settings_force_consolidates_mixed_hooks_from_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Two run_shell_command matchers: first has tirith + other hook, second has another hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"python3 tirith-security-guard-gemini.py"},{"type":"command","command":"other-a.py"}]},{"matcher":"run_shell_command","hooks":[{"type":"command","command":"other-b.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 /new/tirith-security-guard-gemini.py",
+            true,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "consolidated to one matcher");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        // other-a from first, other-b from second (consolidated), then new tirith hook
+        assert_eq!(inner.len(), 3, "all hooks consolidated");
+        assert_eq!(inner[0]["command"], "other-a.py");
+        assert_eq!(inner[1]["command"], "other-b.py");
+        assert_eq!(
+            inner[2]["command"],
+            "python3 /new/tirith-security-guard-gemini.py"
+        );
+
+        // Running again without --force should succeed (convergent)
+        merge_gemini_settings(
+            &path,
+            "python3 /new/tirith-security-guard-gemini.py",
+            false,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gemini_settings_force_handles_malformed_matcher_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Two matchers: first has hooks=null (malformed), second has a tirith hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":null},{"matcher":"run_shell_command","hooks":[{"type":"command","command":"python3 tirith-security-guard-gemini.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_gemini_settings(
+            &path,
+            "python3 /new/tirith-security-guard-gemini.py",
+            true,
+            false,
+        )
+        .unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "consolidated to one matcher");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            inner[0]["command"], "python3 /new/tirith-security-guard-gemini.py",
+            "tirith hook must be present after force"
+        );
+    }
+
+    #[test]
+    fn gemini_settings_dry_run_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        merge_gemini_settings(
+            &path,
+            "python3 tirith-security-guard-gemini.py",
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!path.exists());
+    }
+
+    // ── merge_hook_settings_inner (Claude refactor validation) ─────
+
+    #[test]
+    fn claude_inner_preserves_other_hooks_in_bash_matcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Bash matcher with a non-tirith hook
+        fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"other-hook.py"}]}]}}"#,
+        )
+        .unwrap();
+
+        merge_claude_settings(&path, "python3 tirith-check.py", false, false).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "single Bash matcher");
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2, "both hooks preserved");
+        assert_eq!(inner[0]["command"], "other-hook.py");
+        assert_eq!(inner[1]["command"], "python3 tirith-check.py");
+    }
+
+    #[test]
+    fn claude_inner_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let cmd = "python3 tirith-check.py";
+        merge_claude_settings(&path, cmd, false, false).unwrap();
+        merge_claude_settings(&path, cmd, false, false).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let inner = content["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1, "no duplicate");
     }
 }

@@ -15,6 +15,12 @@ mod tools;
 #[cfg(unix)]
 mod zshenv;
 
+/// Shared mutex for tests that mutate the process-global HOME env var.
+/// Both `tools::tests` and `zshenv::tests::integration` acquire this lock
+/// so they don't race when running in parallel.
+#[cfg(test)]
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(unix)]
 pub use self::run_impl::run;
 
@@ -81,11 +87,11 @@ mod run_impl {
         dry_run: bool,
         force: bool,
     ) -> Result<(), String> {
-        // --with-mcp only applies to claude-code (registers via `claude mcp add`);
-        // other tools include MCP configuration automatically via merge_mcp_json.
-        if with_mcp && tool != "claude-code" {
+        // --with-mcp only supported for claude-code and gemini-cli;
+        // other tools include MCP configuration automatically or don't support it.
+        if with_mcp && tool != "claude-code" && tool != "gemini-cli" {
             return Err(
-                "--with-mcp is only needed for claude-code (other tools register MCP automatically)"
+                "--with-mcp is only supported for claude-code and gemini-cli (other tools register MCP automatically or don't support it)"
                     .into(),
             );
         }
@@ -96,8 +102,8 @@ mod run_impl {
         // Preflight: resolve tirith binary
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Preflight: python3 check (all tools except codex)
-        if tool != "codex" {
+        // Preflight: python3 check (all tools except codex and pi-cli)
+        if tool != "codex" && tool != "pi-cli" {
             check_binary_on_path("python3", dry_run)?;
         }
 
@@ -125,10 +131,12 @@ mod run_impl {
             "claude-code" => setup_claude_code(&opts),
             "codex" => setup_codex(&opts),
             "cursor" => setup_cursor(&opts),
+            "gemini-cli" => setup_gemini_cli(&opts),
+            "pi-cli" => setup_pi_cli(&opts),
             "vscode" => setup_vscode(&opts),
             "windsurf" => setup_windsurf(&opts),
             _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, vscode, windsurf"
+                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf"
             )),
         }
     }
@@ -136,7 +144,7 @@ mod run_impl {
     /// Resolve scope for a given tool, applying defaults and validation.
     fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
         match tool {
-            "claude-code" | "cursor" => match scope {
+            "claude-code" | "cursor" | "gemini-cli" | "pi-cli" => match scope {
                 Some("project") | None => Ok(Scope::Project),
                 Some("user") => Ok(Scope::User),
                 Some(other) => Err(format!("invalid scope '{other}' — expected 'project' or 'user'")),
@@ -159,7 +167,7 @@ mod run_impl {
                 Some(other) => Err(format!("invalid scope '{other}' — expected 'user'")),
             },
             _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, vscode, windsurf"
+                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf"
             )),
         }
     }
@@ -293,6 +301,14 @@ mod run_impl {
 
     fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_vscode(opts)
+    }
+
+    fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_gemini_cli(opts)
+    }
+
+    fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_pi_cli(opts)
     }
 
     fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
