@@ -114,6 +114,23 @@ Nothing. Zero output. You forget tirith is running.
 
 Tirith protects AI coding agents at every layer — from the configs they read to the commands they execute.
 
+### Shell hooks — passive command interception
+
+When AI agents execute shell commands (Claude Code, Codex, Cursor, etc.), tirith's shell hooks intercept every command before it runs. No agent-side configuration needed — if the hook is active in the shell, all commands are guarded:
+
+- **Blocks dangerous commands** — homograph URLs, pipe-to-shell, insecure downloads
+- **Blocks malicious paste** — ANSI injection, bidi attacks, hidden multiline in pasted content
+- **Works with every agent** — any tool that spawns a shell inherits tirith protection
+- **Zero agent modification** — the agent doesn't know tirith exists until a command is blocked
+
+```bash
+tirith setup claude-code    # installs hook in Claude Code's shell
+tirith setup codex           # installs hook in Codex's shell
+tirith setup cursor          # installs hook in Cursor's shell
+tirith setup gemini-cli      # installs hook in Gemini CLI's shell
+tirith setup pi-cli          # installs hook in Pi CLI's shell
+```
+
 ### MCP server (7 tools)
 
 Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tirith as an MCP server. AI agents can call these tools before taking action:
