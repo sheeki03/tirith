@@ -870,6 +870,44 @@ fn bash_hook_noninteractive_mode_is_enter() {
     );
 }
 
+// ─── Auto-checkpoint purge wiring (#61) ───
+
+#[test]
+fn auto_checkpoint_cli_wiring_compiles_and_runs() {
+    // Smoke test: verify that `tirith check --interactive` with a destructive
+    // command invokes the auto-checkpoint path without error.  The actual
+    // create-then-purge logic is tested in tirith_core::checkpoint::tests
+    // (test_create_and_purge_removes_expired).  This test only ensures the
+    // CLI wiring compiles and the subprocess exits cleanly.
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let workdir = tmpdir.path().join("project");
+    fs::create_dir_all(&workdir).unwrap();
+    fs::write(workdir.join("important.txt"), "do not delete").unwrap();
+
+    let state_dir = tmpdir.path().join("state");
+
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--interactive",
+            "--",
+            "rm -rf tempstuff",
+        ])
+        .env("XDG_STATE_HOME", &state_dir)
+        .current_dir(&workdir)
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0), "rm -rf should be allowed");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("auto-checkpoint failed"),
+        "auto-checkpoint should not report errors, got: {stderr}"
+    );
+}
+
 // ─── Security audit fix tests ───
 
 #[cfg(unix)]

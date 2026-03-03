@@ -142,6 +142,12 @@ pub fn run(
                     tirith_core::checkpoint::create(&[cwd_owned.as_str()], Some(&cmd_owned))
                 {
                     eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
+                } else {
+                    // Purge old checkpoints to prevent unbounded disk growth (#61)
+                    let config = tirith_core::checkpoint::CheckpointConfig::default();
+                    if let Err(e) = tirith_core::checkpoint::purge(&config) {
+                        eprintln!("tirith: checkpoint purge failed (non-fatal): {e}");
+                    }
                 }
             });
         }

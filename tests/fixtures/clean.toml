@@ -239,3 +239,133 @@ input = "ssh user@192.168.1.100"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ─── Issue #60: schemeless URL false positive fixes ───
+
+[[fixture]]
+name = "ssh_git_github"
+min_milestone = 0
+input = "ssh git@github.com"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "scp_user_host_no_colon"
+min_milestone = 0
+input = "scp user@server.com file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "rsync_user_host_no_colon"
+min_milestone = 0
+input = "rsync user@server.com file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "curl_auth_flag"
+min_milestone = 0
+input = "curl -u admin@example.com https://api.example.com/data"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "curl_user_flag_cred"
+min_milestone = 0
+input = "curl --user admin:my.pass https://api.example.com/data"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "curl_proxy_user_flag"
+min_milestone = 0
+input = "curl -U admin:my.pass https://api.example.com/data"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_user_flag"
+min_milestone = 0
+input = "wget --user admin:my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_password_flag"
+min_milestone = 0
+input = "wget --password my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_http_user_flag"
+min_milestone = 0
+input = "wget --http-user admin:my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_http_password_flag"
+min_milestone = 0
+input = "wget --http-password my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_ftp_user_flag"
+min_milestone = 0
+input = "wget --ftp-user admin:my.pass ftp://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_ftp_password_flag"
+min_milestone = 0
+input = "wget --ftp-password my.pass ftp://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_proxy_user_flag"
+min_milestone = 0
+input = "wget --proxy-user admin:my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_proxy_password_flag"
+min_milestone = 0
+input = "wget --proxy-password my.pass https://example.com/file"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "httpie_auth_flag"
+min_milestone = 0
+input = "http -a admin:my.pass https://api.example.com/data"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "xh_auth_flag"
+min_milestone = 0
+input = "xh -a admin:my.pass https://api.example.com/data"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

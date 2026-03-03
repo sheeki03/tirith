@@ -531,6 +531,16 @@ pub struct PurgeResult {
     pub freed_bytes: u64,
 }
 
+/// Create a checkpoint and then purge old ones with default limits.
+/// Convenience wrapper used in tests; CLI calls `create()` then `purge()` directly
+/// for distinct error messages.
+pub fn create_and_purge(paths: &[&str], trigger_command: Option<&str>) -> Result<(), String> {
+    create(paths, trigger_command)?;
+    let config = CheckpointConfig::default();
+    purge(&config)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -776,5 +786,74 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: DiffEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, DiffStatus::Deleted);
+    }
+
+    #[test]
+    fn test_create_and_purge_removes_expired() {
+        // Verify create_and_purge() creates a new checkpoint AND purges
+        // age-expired ones in a single call.
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        fs::write(workdir.join("file.txt"), "content").unwrap();
+
+        let state_dir = tmpdir.path().join("state");
+
+        let prev = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        // Seed an ancient checkpoint (60 days old, exceeds 30-day default)
+        let cp_base = state_dir.join("tirith/checkpoints");
+        let old_cp = cp_base.join("old-expired");
+        let old_files = old_cp.join("files");
+        fs::create_dir_all(&old_files).unwrap();
+
+        let old_time = chrono::Utc::now() - chrono::Duration::days(60);
+        let meta_json = serde_json::json!({
+            "id": "old-expired",
+            "created_at": old_time.to_rfc3339(),
+            "trigger_command": "rm -rf old",
+            "paths": ["/tmp/old"],
+            "total_bytes": 8,
+            "file_count": 1
+        });
+        fs::write(old_cp.join("meta.json"), meta_json.to_string()).unwrap();
+        fs::write(old_files.join("dummy"), "old data").unwrap();
+        let manifest = serde_json::json!([{
+            "original_path": "old.txt",
+            "sha256": "dummy",
+            "size": 8,
+            "is_dir": false
+        }]);
+        fs::write(old_cp.join("manifest.json"), manifest.to_string()).unwrap();
+        assert!(old_cp.exists());
+
+        // Act
+        let work_str = workdir.to_str().unwrap();
+        let result = create_and_purge(&[work_str], Some("rm -rf tempstuff"));
+
+        // Restore env before assertions (so cleanup runs even on failure)
+        match prev {
+            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+
+        assert!(result.is_ok(), "create_and_purge failed: {result:?}");
+        assert!(
+            !old_cp.exists(),
+            "expired checkpoint should have been purged"
+        );
+        let remaining: Vec<_> = fs::read_dir(&cp_base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly one new checkpoint should remain"
+        );
     }
 }

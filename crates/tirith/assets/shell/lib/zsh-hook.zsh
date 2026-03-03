@@ -174,6 +174,9 @@ _tirith_bracketed_paste() {
   local old_cursor="$CURSOR"
   zle _tirith_original_bracketed_paste 2>/dev/null || zle .bracketed-paste
 
+  # Honor TIRITH=0 bypass (#30): skip paste scanning
+  [[ "${TIRITH:-}" == "0" ]] && return
+
   # The new content is what was added to BUFFER
   local new_buffer="$BUFFER"
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"

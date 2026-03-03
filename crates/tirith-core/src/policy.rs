@@ -729,10 +729,6 @@ fn load_cached_remote_policy() -> Option<Policy> {
 mod tests {
     use super::*;
 
-    /// Mutex to serialize tests that mutate environment variables.
-    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_allowlist_domain_matches_subdomain() {
         let p = Policy {
@@ -764,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_discover_skips_remote_fetch_below_team_tier() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".tirith");

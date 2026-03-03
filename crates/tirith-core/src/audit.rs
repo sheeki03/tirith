@@ -185,13 +185,9 @@ mod tests {
     use super::*;
     use crate::verdict::{Action, Verdict};
 
-    /// Mutex to serialize tests that mutate environment variables.
-    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_tirith_log_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
@@ -263,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_remote_audit_upload_requires_team_tier() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");

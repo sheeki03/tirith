@@ -1191,10 +1191,6 @@ mod tests {
         );
     }
 
-    /// Mutex to serialize tests that mutate environment variables.
-    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_parser_padded_base64url_structural() {
         // Padded base64url should still be recognized as SignedStructural by key_format_status
@@ -1207,7 +1203,7 @@ mod tests {
         assert!(token.contains('='));
 
         // Thread-safe env-var mutation
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("TIRITH_LICENSE", &token) };
         let status = key_format_status();
         unsafe { std::env::remove_var("TIRITH_LICENSE") };

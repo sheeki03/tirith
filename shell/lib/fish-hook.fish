@@ -85,6 +85,12 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
     functions -c fish_clipboard_paste _tirith_original_fish_clipboard_paste
 
     function fish_clipboard_paste
+        # Honor TIRITH=0 bypass (#30): skip paste scanning
+        if test "$TIRITH" = "0"
+            _tirith_original_fish_clipboard_paste
+            return
+        end
+
         set -l content (_tirith_original_fish_clipboard_paste | string collect)
 
         if test -z "$content"

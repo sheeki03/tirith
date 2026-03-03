@@ -197,6 +197,15 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
 # Override Ctrl+V for paste interception
 Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
+    # Honor TIRITH=0 bypass (#30): skip paste scanning
+    if ($env:TIRITH -eq "0") {
+        $content = Get-Clipboard -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrEmpty($content)) {
+            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($content)
+        }
+        return
+    }
+
     # Get clipboard content
     $pasted = Get-Clipboard -ErrorAction SilentlyContinue
 

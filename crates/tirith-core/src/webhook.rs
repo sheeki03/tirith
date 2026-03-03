@@ -260,10 +260,6 @@ fn sanitize_for_json(input: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Mutex to serialize tests that mutate environment variables.
-    /// `std::env::set_var` is not thread-safe — concurrent mutation causes UB.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_sanitize_for_json() {
         assert_eq!(sanitize_for_json("hello"), "hello");
@@ -281,7 +277,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("TIRITH_TEST_WH", "secret123") };
         assert_eq!(
             expand_env_value("Bearer $TIRITH_TEST_WH"),
@@ -298,7 +294,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value_preserves_delimiter() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
         // CR-6: The character after $VAR must not be swallowed
         unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");

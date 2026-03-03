@@ -589,7 +589,6 @@ fn is_source_command(cmd: &str) -> bool {
             | "fetch"
             | "scp"
             | "rsync"
-            | "ssh"
             | "docker"
             | "podman"
             | "nerdctl"
@@ -646,47 +645,83 @@ fn is_interpreter(cmd: &str) -> bool {
     )
 }
 
-/// Check if an arg at the given index is the value of an output-file flag for the given command.
-/// Returns true if this arg should be skipped during schemeless URL detection.
+/// Check if an arg at the given index is the value of an output-file or credential flag
+/// for the given command. Returns true if this arg should be skipped during schemeless
+/// URL detection (output filenames and auth credentials can look like domains).
 fn is_output_flag_value(cmd: &str, args: &[String], arg_index: usize) -> bool {
     let cmd_lower = cmd.to_lowercase();
     let cmd_base = cmd_lower.rsplit('/').next().unwrap_or(&cmd_lower);
 
     match cmd_base {
         "curl" => {
-            // Check if previous arg is -o or --output
             if arg_index > 0 {
                 let prev = strip_quotes(&args[arg_index - 1]);
-                if prev == "-o" || prev == "--output" {
+                if prev == "-o"
+                    || prev == "--output"
+                    || prev == "-u"
+                    || prev == "--user"
+                    || prev == "-U"
+                    || prev == "--proxy-user"
+                {
                     return true;
                 }
             }
-            // Check if current arg starts with -o (combined: -oFILE)
             let current = strip_quotes(&args[arg_index]);
             if current.starts_with("-o") && current.len() > 2 && !current.starts_with("--") {
                 return true;
             }
-            // Check --output=FILE
-            if current.starts_with("--output=") {
+            if current.starts_with("--output=")
+                || current.starts_with("--user=")
+                || current.starts_with("--proxy-user=")
+            {
                 return true;
             }
             false
         }
         "wget" => {
-            // Check if previous arg is -O or --output-document
             if arg_index > 0 {
                 let prev = strip_quotes(&args[arg_index - 1]);
-                if prev == "-O" || prev == "--output-document" {
+                if prev == "-O"
+                    || prev == "--output-document"
+                    || prev == "--user"
+                    || prev == "--password"
+                    || prev == "--http-user"
+                    || prev == "--http-password"
+                    || prev == "--ftp-user"
+                    || prev == "--ftp-password"
+                    || prev == "--proxy-user"
+                    || prev == "--proxy-password"
+                {
                     return true;
                 }
             }
-            // Check -OFILE (combined short form)
             let current = strip_quotes(&args[arg_index]);
             if current.starts_with("-O") && current.len() > 2 && !current.starts_with("--") {
                 return true;
             }
-            // Check --output-document=FILE
-            if current.starts_with("--output-document=") {
+            if current.starts_with("--output-document=")
+                || current.starts_with("--user=")
+                || current.starts_with("--password=")
+                || current.starts_with("--http-user=")
+                || current.starts_with("--http-password=")
+                || current.starts_with("--ftp-user=")
+                || current.starts_with("--ftp-password=")
+                || current.starts_with("--proxy-user=")
+                || current.starts_with("--proxy-password=")
+            {
+                return true;
+            }
+            false
+        }
+        "http" | "https" | "xh" => {
+            if arg_index > 0 {
+                let prev = strip_quotes(&args[arg_index - 1]);
+                if prev == "-a" || prev == "--auth" {
+                    return true;
+                }
+            }
+            let current = strip_quotes(&args[arg_index]);
+            if current.starts_with("--auth=") {
                 return true;
             }
             false
@@ -714,6 +749,15 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     // Dotfiles and hidden files (e.g., .gitignore, .env.example) are not URLs
     if s.starts_with('.') {
         return false;
+    }
+    // Reject bare user@host (SSH/SCP/email) but keep user:pass@host (credentialed URL).
+    // bare user@host has no ':' before '@' and no '/' after the host.
+    if let Some(at_pos) = s.find('@') {
+        let before_at = &s[..at_pos];
+        let after_at = &s[at_pos + 1..];
+        if !before_at.contains(':') && !after_at.contains('/') {
+            return false;
+        }
     }
     // First component before / or end should look like a domain
     let host_part = s.split('/').next().unwrap_or(s);
