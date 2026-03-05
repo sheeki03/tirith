@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           tirith
-Version:        0.1.3
+Version:        0.2.5
 Release:        1%{?dist}
 Summary:        Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection
 ExclusiveArch:  x86_64

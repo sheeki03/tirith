@@ -1,6 +1,6 @@
 {
   "name": "@sheeki03/tirith-win32-x64",
-  "version": "0.1.3",
+  "version": "0.2.5",
   "description": "tirith binary for Windows x64",
   "license": "AGPL-3.0-only",
   "repository": {
