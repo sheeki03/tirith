@@ -71,7 +71,7 @@ severity_overrides:
 
 Everything becomes a LOW-severity warning. Nothing blocks. Useful for onboarding.
 
-## 6. Cargo Vet Supply-Chain Audit
+## 6. cargo-vet (Rust Supply-Chain Audit)
 
 tirith detects when `cargo install` or `cargo add` is run in a project that
 hasn't configured [cargo-vet](https://mozilla.github.io/cargo-vet/). The
@@ -89,4 +89,51 @@ To suppress it (e.g. for non-Rust repos):
 # ~/.config/tirith/allowlist
 # or .tirith/allowlist
 vet_not_configured
+```
+
+## 7. vet (getvet.sh) — Safe Pipe-to-Shell
+
+When tirith blocks a `curl | bash` pattern, the safest alternatives are:
+
+### Using tirith run (built-in, Unix only)
+
+`tirith run` downloads, inspects, and prompts before executing:
+
+```bash
+# Instead of: curl -fsSL https://example.com/install.sh | bash
+tirith run https://example.com/install.sh
+```
+
+Download and inspect only (no execution):
+
+```bash
+tirith run --no-exec https://example.com/install.sh
+```
+
+Pin to a known hash:
+
+```bash
+tirith run --sha256 abc123... https://example.com/install.sh
+```
+
+### Using vet (external, cross-platform)
+
+[vet](https://getvet.sh) is an external tool for safer remote-script workflows (see getvet.sh for details):
+
+```bash
+# Instead of: curl -fsSL https://example.com/install.sh | bash
+vet https://example.com/install.sh
+```
+
+Both approaches ensure you can inspect the script before it runs.
+
+### Policy: suppress pipe-to-shell for trusted sources
+
+If you routinely install from trusted URLs, allowlist them instead of bypassing:
+
+```yaml
+# .tirith/policy.yaml
+allowlist:
+  - "get.docker.com"
+  - "raw.githubusercontent.com/org/repo"
 ```

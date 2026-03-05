@@ -895,3 +895,50 @@ fn test_non_ascii_paste_not_sole_warn() {
         );
     }
 }
+
+/// Constraint #7: Tier-1 regex must match all interpreters from the shared INTERPRETERS const.
+/// This prevents drift between the tier-1 gate (build.rs) and the tier-3 detection (command.rs).
+#[test]
+fn test_tier1_matches_all_interpreters() {
+    use tirith_core::extract::{tier1_scan, ScanContext};
+    use tirith_core::rules::command::INTERPRETERS;
+
+    // 1. Plain interpreter: cat /tmp/s.sh | <name>
+    for name in INTERPRETERS {
+        let input = format!("cat /tmp/s.sh | {}", name);
+        assert!(
+            tier1_scan(&input, ScanContext::Exec),
+            "Tier-1 scan does not match plain interpreter '{}' in '{}'",
+            name,
+            input
+        );
+    }
+
+    // 2. Quoted wrappers
+    assert!(
+        tier1_scan("cat /tmp/s.sh | 'sudo' bash", ScanContext::Exec),
+        "Tier-1 scan must match quoted wrapper 'sudo'"
+    );
+    assert!(
+        tier1_scan(r#"cat /tmp/s.sh | "env" bash"#, ScanContext::Exec),
+        "Tier-1 scan must match quoted wrapper \"env\""
+    );
+
+    // 3. Wrapper chains
+    assert!(
+        tier1_scan("cat /tmp/s.sh | command sudo bash", ScanContext::Exec),
+        "Tier-1 scan must match wrapper chain"
+    );
+
+    // 4. ANSI-C quoted interpreter
+    assert!(
+        tier1_scan("cat /tmp/s.sh | $'bash'", ScanContext::Exec),
+        "Tier-1 scan must match ANSI-C quoted interpreter"
+    );
+
+    // 5. Case insensitive
+    assert!(
+        tier1_scan("cat /tmp/s.sh | BASH", ScanContext::Exec),
+        "Tier-1 scan must match uppercase interpreter"
+    );
+}

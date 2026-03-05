@@ -97,8 +97,14 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
             return
         end
 
+        # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
+        if string match -qr '^\s*TIRITH=0\s' -- "$content"
+            echo -n "$content"
+            return
+        end
+
         set -l tmpfile (mktemp)
-        echo -n "$content" | command tirith paste --shell fish >$tmpfile 2>&1
+        echo -n "$content" | command tirith paste --shell fish --interactive >$tmpfile 2>&1
         set -l rc $status
         set -l output (string collect < $tmpfile)
         command rm -f $tmpfile

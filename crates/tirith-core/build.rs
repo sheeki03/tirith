@@ -261,7 +261,7 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "pipe_to_interpreter",
         tier1_exec_fragments: &[
-            r"\|[&\s]*(sudo\s+|env\s+|/\S*/?)*(sh|bash|zsh|dash|ksh|python|node|perl|ruby|php|iex|invoke-expression)\b",
+            r"(?i)\|[&\s]*(?:\S*(?:sudo|env|command|exec|nohup)\S*\s+|/\S*/?)*(?:\S+\s+)*\S*(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|mksh|python[23]?|node|deno|bun|perl|ruby|php|lua|tclsh|elixir|rscript|pwsh|iex|invoke-expression)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Pipe output to an interpreter (| bash, | sudo bash, | iex, etc.)",

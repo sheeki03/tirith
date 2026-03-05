@@ -6,7 +6,13 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
-pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
+pub fn run(
+    shell: &str,
+    json: bool,
+    non_interactive: bool,
+    interactive_flag: bool,
+    html_path: Option<&str>,
+) -> i32 {
     // Read raw bytes from stdin with 1 MiB cap
     const MAX_PASTE: u64 = 1024 * 1024; // 1 MiB
 
@@ -38,7 +44,15 @@ pub fn run(shell: &str, json: bool, html_path: Option<&str>) -> i32 {
     // Decode to string (lossy for URL extraction)
     let input = String::from_utf8_lossy(&raw_bytes).into_owned();
 
-    let interactive = is_terminal::is_terminal(std::io::stderr());
+    let interactive = if interactive_flag {
+        true
+    } else if non_interactive {
+        false
+    } else if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
+        val == "1"
+    } else {
+        is_terminal::is_terminal(std::io::stderr())
+    };
 
     // Read clipboard HTML if provided
     let clipboard_html = html_path.and_then(|path| match std::fs::read_to_string(path) {

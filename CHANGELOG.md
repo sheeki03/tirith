@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5]
+
+### Added
+
+- Pipe-to-shell findings now suggest `vet` (and `tirith run` on Unix for POSIX fetch commands) as safer alternatives when the source is a URL-fetching command.
+- Cookbook section for getvet.sh integration (section 7).
+- Interpreter detection hardening: canonical INTERPRETERS list (26 entries), `normalize_shell_token()` state machine, `resolve_interpreter_name()` with sudo/env/command/exec/nohup prefix chains.
+- Extended interpreter coverage: fish, csh, tcsh, ash, mksh, python2/3, deno, bun, lua, tclsh, elixir, rscript, pwsh.
+
+### Fixed
+
+- `sudo -iu root bash` combined short flags now correctly resolve to `bash`.
+- `--` end-of-options marker now stops flag-skipping in interpreter resolution.
+- ANSI-C quoting (`$'...'`) no longer applied to Fish shell (Fish doesn't support it).
+- Extracted URLs in remediation hints are sanitized to prevent ANSI injection.
+
 ## [0.1.5] - 2026-02-04
 
 ### Fixed

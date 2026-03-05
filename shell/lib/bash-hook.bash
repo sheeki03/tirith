@@ -437,8 +437,9 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         fi
       done
 
-      # Honor TIRITH=0 bypass (#30): skip paste scanning
-      if [[ "${TIRITH:-}" == "0" ]]; then
+      # Honor TIRITH=0 bypass (#30): skip paste scanning (env var or inline prefix)
+      local _t_trimmed="${pasted#"${pasted%%[![:space:]]*}"}"
+      if [[ "${TIRITH:-}" == "0" ]] || [[ "$_t_trimmed" == TIRITH=0[[:space:]]* ]]; then
         READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}${pasted}${READLINE_LINE:$READLINE_POINT}"
         READLINE_POINT=$((READLINE_POINT + ${#pasted}))
         return
@@ -447,7 +448,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -n "$pasted" ]]; then
         # Check with tirith paste, use temp file to prevent tty leakage
         local tmpfile=$(mktemp)
-        printf '%s' "$pasted" | command tirith paste --shell posix >"$tmpfile" 2>&1
+        printf '%s' "$pasted" | command tirith paste --shell posix --interactive >"$tmpfile" 2>&1
         local rc=$?
         local output=$(<"$tmpfile")
         command rm -f "$tmpfile"
