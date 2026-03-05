@@ -54,6 +54,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Force non-interactive mode
+        #[arg(long)]
+        non_interactive: bool,
+
+        /// Force interactive mode
+        #[arg(long)]
+        interactive: bool,
+
         /// Path to clipboard HTML for rich-text paste analysis
         #[arg(long)]
         html: Option<String>,
@@ -408,7 +416,13 @@ fn main() {
             approval_check,
         ),
 
-        Commands::Paste { shell, json, html } => cli::paste::run(&shell, json, html.as_deref()),
+        Commands::Paste {
+            shell,
+            json,
+            non_interactive,
+            interactive,
+            html,
+        } => cli::paste::run(&shell, json, non_interactive, interactive, html.as_deref()),
 
         #[cfg(unix)]
         Commands::Run {

@@ -213,9 +213,15 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         return
     }
 
+    # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
+    if ($pasted.TrimStart() -match '^TIRITH=0\s') {
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
+        return
+    }
+
     # Check with tirith paste, use temp file to prevent output leakage
     $tmpfile = [System.IO.Path]::GetTempFileName()
-    $pasted | & tirith paste --shell powershell > $tmpfile 2>&1
+    $pasted | & tirith paste --shell powershell --interactive > $tmpfile 2>&1
     $rc = $LASTEXITCODE
     $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue

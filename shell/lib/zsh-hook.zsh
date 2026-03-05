@@ -181,10 +181,14 @@ _tirith_bracketed_paste() {
   local new_buffer="$BUFFER"
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
 
+  # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
+  local _t_trimmed="${pasted#"${pasted%%[![:space:]]*}"}"
+  [[ "$_t_trimmed" == TIRITH=0[[:space:]]* ]] && return
+
   if [[ -n "$pasted" ]]; then
     # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
     local tmpfile=$(mktemp)
-    echo -n "$pasted" | command tirith paste --shell posix >"$tmpfile" 2>&1
+    echo -n "$pasted" | command tirith paste --shell posix --interactive >"$tmpfile" 2>&1
     local rc=$?
     local output=$(<"$tmpfile")
     command rm -f "$tmpfile"
