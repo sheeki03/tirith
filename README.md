@@ -129,6 +129,7 @@ tirith setup codex           # installs hook in Codex's shell
 tirith setup cursor          # installs hook in Cursor's shell
 tirith setup gemini-cli      # installs hook in Gemini CLI's shell
 tirith setup pi-cli          # installs hook in Pi CLI's shell
+tirith setup openclaw        # installs before_tool_call plugin for OpenClaw
 ```
 
 ### MCP server (7 tools)
