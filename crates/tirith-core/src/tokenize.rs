@@ -7,6 +7,7 @@ pub enum ShellType {
     Posix,
     Fish,
     PowerShell,
+    Cmd,
 }
 
 impl std::str::FromStr for ShellType {
@@ -16,6 +17,7 @@ impl std::str::FromStr for ShellType {
             "posix" | "bash" | "zsh" | "sh" => Ok(ShellType::Posix),
             "fish" => Ok(ShellType::Fish),
             "powershell" | "pwsh" => Ok(ShellType::PowerShell),
+            "cmd" | "cmd.exe" => Ok(ShellType::Cmd),
             _ => Err(format!("unknown shell type: {s}")),
         }
     }
@@ -40,6 +42,7 @@ pub fn tokenize(input: &str, shell: ShellType) -> Vec<Segment> {
         ShellType::Posix => tokenize_posix(input),
         ShellType::Fish => tokenize_fish(input),
         ShellType::PowerShell => tokenize_powershell(input),
+        ShellType::Cmd => tokenize_cmd(input),
     }
 }
 
@@ -277,6 +280,85 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
         }
     }
 
+    push_segment(&mut segments, &current, preceding_sep.take());
+    segments
+}
+
+fn tokenize_cmd(input: &str) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut preceding_sep = None;
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+        match ch {
+            // Caret escaping (cmd.exe escape character)
+            '^' if i + 1 < len => {
+                current.push(chars[i]);
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            // Double quotes (only quoting mechanism in cmd)
+            '"' => {
+                current.push(ch);
+                i += 1;
+                while i < len && chars[i] != '"' {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                if i < len {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            // Pipe
+            '|' => {
+                if i + 1 < len && chars[i + 1] == '|' {
+                    push_segment(&mut segments, &current, preceding_sep.take());
+                    current.clear();
+                    preceding_sep = Some("||".to_string());
+                    i += 2;
+                } else {
+                    push_segment(&mut segments, &current, preceding_sep.take());
+                    current.clear();
+                    preceding_sep = Some("|".to_string());
+                    i += 1;
+                }
+                continue;
+            }
+            // & and &&
+            '&' => {
+                if i + 1 < len && chars[i + 1] == '&' {
+                    push_segment(&mut segments, &current, preceding_sep.take());
+                    current.clear();
+                    preceding_sep = Some("&&".to_string());
+                    i += 2;
+                } else {
+                    push_segment(&mut segments, &current, preceding_sep.take());
+                    current.clear();
+                    preceding_sep = Some("&".to_string());
+                    i += 1;
+                }
+                continue;
+            }
+            '\n' => {
+                push_segment(&mut segments, &current, preceding_sep.take());
+                current.clear();
+                preceding_sep = Some("\n".to_string());
+                i += 1;
+                continue;
+            }
+            _ => {
+                current.push(ch);
+                i += 1;
+            }
+        }
+    }
     push_segment(&mut segments, &current, preceding_sep.take());
     segments
 }
@@ -534,6 +616,41 @@ mod tests {
         assert!(!is_env_assignment("=value"));
         assert!(!is_env_assignment("--flag=value"));
         assert!(!is_env_assignment("1FOO=bar"));
+    }
+
+    #[test]
+    fn test_cmd_pipe() {
+        let segs = tokenize("dir | findstr foo", ShellType::Cmd);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].command.as_deref(), Some("dir"));
+        assert_eq!(segs[1].command.as_deref(), Some("findstr"));
+    }
+
+    #[test]
+    fn test_cmd_ampersand_separator() {
+        let segs = tokenize("dir & echo done", ShellType::Cmd);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("&"));
+    }
+
+    #[test]
+    fn test_cmd_double_ampersand() {
+        let segs = tokenize("cmd1 && cmd2", ShellType::Cmd);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].preceding_separator.as_deref(), Some("&&"));
+    }
+
+    #[test]
+    fn test_cmd_caret_escape() {
+        let segs = tokenize("echo hello^|world | findstr x", ShellType::Cmd);
+        // ^| is escaped, not a pipe
+        assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn test_cmd_double_quotes() {
+        let segs = tokenize(r#"echo "hello | world" | findstr x"#, ShellType::Cmd);
+        assert_eq!(segs.len(), 2);
     }
 
     #[test]

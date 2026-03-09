@@ -102,8 +102,8 @@ mod run_impl {
         // Preflight: resolve tirith binary
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Preflight: python3 check (all tools except codex and pi-cli)
-        if tool != "codex" && tool != "pi-cli" {
+        // Preflight: python3 check (all tools except codex, pi-cli, openclaw)
+        if tool != "codex" && tool != "pi-cli" && tool != "openclaw" {
             check_binary_on_path("python3", dry_run)?;
         }
 
@@ -132,11 +132,12 @@ mod run_impl {
             "codex" => setup_codex(&opts),
             "cursor" => setup_cursor(&opts),
             "gemini-cli" => setup_gemini_cli(&opts),
+            "openclaw" => setup_openclaw(&opts),
             "pi-cli" => setup_pi_cli(&opts),
             "vscode" => setup_vscode(&opts),
             "windsurf" => setup_windsurf(&opts),
             _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf"
+                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf"
             )),
         }
     }
@@ -144,7 +145,7 @@ mod run_impl {
     /// Resolve scope for a given tool, applying defaults and validation.
     fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
         match tool {
-            "claude-code" | "cursor" | "gemini-cli" | "pi-cli" => match scope {
+            "claude-code" | "cursor" | "gemini-cli" | "openclaw" | "pi-cli" => match scope {
                 Some("project") | None => Ok(Scope::Project),
                 Some("user") => Ok(Scope::User),
                 Some(other) => Err(format!("invalid scope '{other}' — expected 'project' or 'user'")),
@@ -167,7 +168,7 @@ mod run_impl {
                 Some(other) => Err(format!("invalid scope '{other}' — expected 'user'")),
             },
             _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf"
+                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf"
             )),
         }
     }
@@ -305,6 +306,10 @@ mod run_impl {
 
     fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_gemini_cli(opts)
+    }
+
+    fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_openclaw(opts)
     }
 
     fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {

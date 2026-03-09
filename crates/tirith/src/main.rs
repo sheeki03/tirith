@@ -189,7 +189,7 @@ enum Commands {
 
     /// Configure tirith protection for an AI coding tool
     Setup {
-        /// Tool to configure: claude-code, codex, cursor, gemini-cli, pi-cli, vscode, windsurf
+        /// Tool to configure: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf
         tool: String,
 
         /// Scope: project (default for most tools) or user

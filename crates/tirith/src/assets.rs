@@ -53,6 +53,10 @@ pub const TIRITH_GUARD_TS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/tirith-guard.ts"
 ));
+pub const OPENCLAW_GUARD_TS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/openclaw-tirith-guard.ts"
+));
 pub const GATEWAY_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/configs/tirith-gateway.yaml"

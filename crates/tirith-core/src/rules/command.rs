@@ -31,6 +31,7 @@ pub const INTERPRETERS: &[&str] = &[
     "pwsh",
     "iex",
     "invoke-expression",
+    "cmd",
 ];
 
 /// Parse up to `max_digits` from `chars[*i..]` matching `predicate`, interpret as
@@ -81,13 +82,18 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
     let mut out = String::with_capacity(len);
     let mut i = 0;
     let is_ps = matches!(shell, ShellType::PowerShell);
+    let is_cmd = matches!(shell, ShellType::Cmd);
     let mut state = QState::Normal;
 
     while i < len {
         match state {
             QState::Normal => {
                 let ch = chars[i];
-                if !is_ps && ch == '\\' && i + 1 < len {
+                if is_cmd && ch == '^' && i + 1 < len {
+                    // Cmd caret escape: skip caret, take next char literal
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else if !is_ps && !is_cmd && ch == '\\' && i + 1 < len {
                     // POSIX backslash escape: skip backslash, take next char literal
                     out.push(chars[i + 1]);
                     i += 2;
@@ -95,7 +101,7 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     // PowerShell backtick escape
                     out.push(chars[i + 1]);
                     i += 2;
-                } else if ch == '\'' {
+                } else if ch == '\'' && !is_cmd {
                     state = QState::Single;
                     i += 1;
                 } else if ch == '"' {
@@ -272,12 +278,16 @@ fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
 /// Handles path separators, first-word extraction, lowercasing, and .exe stripping.
 fn basename_from_normalized(normalized: &str, shell: ShellType) -> String {
     let has_path_sep = match shell {
-        ShellType::PowerShell => normalized.contains('/') || normalized.contains('\\'),
+        ShellType::PowerShell | ShellType::Cmd => {
+            normalized.contains('/') || normalized.contains('\\')
+        }
         _ => normalized.contains('/'),
     };
     let after_path = if has_path_sep {
         match shell {
-            ShellType::PowerShell => normalized.rsplit(['/', '\\']).next().unwrap_or(normalized),
+            ShellType::PowerShell | ShellType::Cmd => {
+                normalized.rsplit(['/', '\\']).next().unwrap_or(normalized)
+            }
             _ => normalized.rsplit('/').next().unwrap_or(normalized),
         }
     } else {

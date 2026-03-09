@@ -1,6 +1,6 @@
 {
   "name": "tirith",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -11,10 +11,10 @@
     "tirith": "bin/tirith"
   },
   "optionalDependencies": {
-    "@sheeki03/tirith-darwin-arm64": "0.2.5",
-    "@sheeki03/tirith-darwin-x64": "0.2.5",
-    "@sheeki03/tirith-linux-x64": "0.2.5",
-    "@sheeki03/tirith-linux-arm64": "0.2.5",
-    "@sheeki03/tirith-win32-x64": "0.2.5"
+    "@sheeki03/tirith-darwin-arm64": "0.2.6",
+    "@sheeki03/tirith-darwin-x64": "0.2.6",
+    "@sheeki03/tirith-linux-x64": "0.2.6",
+    "@sheeki03/tirith-linux-arm64": "0.2.6",
+    "@sheeki03/tirith-win32-x64": "0.2.6"
   }
 }

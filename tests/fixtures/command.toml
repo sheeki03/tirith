@@ -1104,3 +1104,23 @@ input = "vet https://example.com/install.sh"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ─── Cmd shell type ───
+
+[[fixture]]
+name = "cmd_pipe_to_cmd_exe"
+min_milestone = 1
+input = "type payload.bat | cmd.exe /c"
+context = "exec"
+shell = "cmd"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "cmd_safe_ampersand"
+min_milestone = 1
+input = "dir & echo done"
+context = "exec"
+shell = "cmd"
+expected_action = "allow"
+expected_rules = []

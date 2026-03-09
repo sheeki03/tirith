@@ -500,6 +500,63 @@ pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
     Ok(())
 }
 
+pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
+    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
+
+    let (target, scope_root) = match opts.scope {
+        Scope::Project => {
+            let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+            (cwd.join(".openclaw"), Some(cwd))
+        }
+        Scope::User => {
+            if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR")
+                .or_else(|| std::env::var_os("CLAWDBOT_STATE_DIR"))
+            {
+                let mut p = std::path::PathBuf::from(&state_dir);
+                if let Some(s) = state_dir.to_str() {
+                    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+                        p = home.join(rest);
+                    } else if s == "~" {
+                        p = home.clone();
+                    }
+                }
+                if p.is_relative() {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        p = cwd.join(p);
+                    }
+                }
+                (p, None)
+            } else {
+                (home.join(".openclaw"), Some(home.clone()))
+            }
+        }
+    };
+
+    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+
+    let extensions_dir = target.join("extensions").join("tirith-security");
+    if !opts.dry_run {
+        std::fs::create_dir_all(&extensions_dir)
+            .map_err(|e| format!("create {}: {e}", extensions_dir.display()))?;
+    }
+
+    let guard_path = extensions_dir.join("index.ts");
+    let guard_content = crate::assets::OPENCLAW_GUARD_TS;
+    fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
+
+    if let Err(e) =
+        super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
+    {
+        eprintln!("tirith: WARNING: {e}");
+    }
+
+    eprintln!();
+    eprintln!("tirith: OpenClaw setup complete");
+    eprintln!("  Extension installed to: {}", extensions_dir.display());
+    eprintln!("  Run `tirith doctor` to verify your configuration.");
+    Ok(())
+}
+
 pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let target = home.join(".codeium").join("windsurf");
