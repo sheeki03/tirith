@@ -54,7 +54,12 @@ If you prefer to configure manually:
 3. Add a non-interactive zsh guard to `~/.zshenv` (agent shell path):
 
    ```zsh
-   if [[ -n "${ZSH_EXECUTION_STRING:-}" ]]; then
+   # Skips IDE shell env probes (VSCODE_RESOLVING_ENVIRONMENT) and
+   # explicit disable (TIRITH_ZSHENV_SKIP). No `return` — later
+   # .zshenv lines always load so the IDE gets the full environment.
+   if [[ -n "${ZSH_EXECUTION_STRING:-}" \
+      && "${TIRITH_ZSHENV_SKIP:-}" != "1" \
+      && -z "${VSCODE_RESOLVING_ENVIRONMENT:-}" ]]; then
      _tirith_bin="$(command -v tirith 2>/dev/null || true)"
      if [[ -n "${_tirith_bin}" ]]; then
        _tirith_tmp="$(mktemp 2>/dev/null || true)"
@@ -130,6 +135,8 @@ Expected: blocked by Tirith.
 - Cursor tool names vary by extension — check which names your MCP server
   exposes and add `guarded_tools` patterns to `gateway.yaml` accordingly.
 - The gateway forwards all non-matched tool calls transparently.
-- The zshenv guard applies to all non-interactive `zsh -lc` runs (no
-  env-variable bypass possible).
+- The zshenv guard applies to all non-interactive `zsh -lc` runs.
+  `TIRITH_ZSHENV_SKIP=1` disables it; `VSCODE_RESOLVING_ENVIRONMENT`
+  (set by VS Code/Cursor during shell env probing) skips the scan so
+  the IDE resolves the full environment.
 - Batch JSON-RPC arrays are denied in Phase 1 (fail-closed).

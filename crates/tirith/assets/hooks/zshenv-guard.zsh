@@ -1,8 +1,14 @@
-if [[ -n "${ZSH_EXECUTION_STRING:-}" ]]; then
-  # Skip guard if explicitly disabled
-  if [[ "${TIRITH_ZSHENV_SKIP:-}" = "1" ]]; then
-    return 0 2>/dev/null || true
-  fi
+# Tirith guard for non-interactive zsh command runs (`zsh -lc ...`).
+# Skipped when:
+#   - TIRITH_ZSHENV_SKIP=1 (explicit disable)
+#   - VSCODE_RESOLVING_ENVIRONMENT is set (IDE shell env probe — not a
+#     real command; the IDE strips this var from the resolved env so it
+#     cannot be abused to bypass the guard for actual commands)
+# Uses a single compound condition (no `return`) so later .zshenv lines
+# always load — the IDE resolves the full environment (PATH, etc.).
+if [[ -n "${ZSH_EXECUTION_STRING:-}" \
+   && "${TIRITH_ZSHENV_SKIP:-}" != "1" \
+   && -z "${VSCODE_RESOLVING_ENVIRONMENT:-}" ]]; then
 
   # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin()
   _tirith_bin="${TIRITH_BIN:-__TIRITH_BIN__}"

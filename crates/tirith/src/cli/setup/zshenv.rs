@@ -510,5 +510,93 @@ mod tests {
                 assert!(!content.contains("__TIRITH_BIN__"));
             });
         }
+
+        /// Helper: write a .zshenv with the guard plus a trailing export,
+        /// then run `zsh -c 'echo $POST_GUARD'` with the given extra env
+        /// vars. Returns (stdout, exit_code).
+        ///
+        /// `tirith_bin` is baked into the guard via placeholder replacement.
+        /// Use a nonexistent path to trigger the "not found" block branch.
+        fn run_guard_scenario(
+            home: &std::path::Path,
+            tirith_bin: &str,
+            extra_env: &[(&str, &str)],
+        ) -> (String, i32) {
+            offer_zshenv_guard(true, true, false, tirith_bin).unwrap();
+
+            // Append an export AFTER the guard block to verify that later
+            // .zshenv lines still execute when the guard is skipped.
+            let zshenv = home.join(".zshenv");
+            let mut content = std::fs::read_to_string(&zshenv).unwrap();
+            content.push_str("\nexport POST_GUARD=loaded\n");
+            std::fs::write(&zshenv, &content).unwrap();
+
+            // ZDOTDIR + HOME → fake home so zsh reads our .zshenv.
+            // No --no-rcs: that flag suppresses .zshenv too.
+            // Non-interactive `zsh -c` sources .zshenv but NOT .zshrc.
+            let output = std::process::Command::new("zsh")
+                .arg("-c")
+                .arg("echo \"POST_GUARD=${POST_GUARD:-unset}\"")
+                .env("ZDOTDIR", home)
+                .env("HOME", home)
+                .envs(extra_env.iter().copied())
+                .output()
+                .expect("failed to spawn zsh");
+
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let code = output.status.code().unwrap_or(-1);
+            (stdout, code)
+        }
+
+        #[test]
+        fn vscode_bypass_skips_guard_and_continues_zshenv() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                // tirith_bin is nonexistent — guard would block if it ran.
+                // With VSCODE_RESOLVING_ENVIRONMENT the compound condition
+                // is false, so the guard block is skipped entirely and the
+                // trailing export must still load.
+                let (stdout, code) = run_guard_scenario(
+                    home,
+                    "/nonexistent/tirith",
+                    &[("VSCODE_RESOLVING_ENVIRONMENT", "1")],
+                );
+                assert_eq!(code, 0, "IDE probe should exit 0");
+                assert_eq!(
+                    stdout, "POST_GUARD=loaded",
+                    "exports after guard must still load during IDE probe"
+                );
+            });
+        }
+
+        #[test]
+        fn tirith_skip_bypass_skips_guard_and_continues_zshenv() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                let (stdout, code) =
+                    run_guard_scenario(home, "/nonexistent/tirith", &[("TIRITH_ZSHENV_SKIP", "1")]);
+                assert_eq!(code, 0, "TIRITH_ZSHENV_SKIP should exit 0");
+                assert_eq!(
+                    stdout, "POST_GUARD=loaded",
+                    "exports after guard must still load when skip is set"
+                );
+            });
+        }
+
+        #[test]
+        fn guard_blocks_without_bypass_env() {
+            if !zsh_available() {
+                return;
+            }
+            with_fake_home(|home| {
+                // tirith_bin is nonexistent → guard hits "not found" → exit 1.
+                let (_stdout, code) = run_guard_scenario(home, "/nonexistent/tirith", &[]);
+                assert_eq!(code, 1, "guard should exit 1 when tirith binary not found");
+            });
+        }
     }
 }
