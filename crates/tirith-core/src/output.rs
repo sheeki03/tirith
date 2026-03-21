@@ -21,11 +21,16 @@ pub struct JsonOutput<'a> {
 }
 
 /// Write verdict as JSON to the given writer.
-pub fn write_json(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+pub fn write_json(
+    verdict: &Verdict,
+    custom_patterns: &[String],
+    mut w: impl Write,
+) -> std::io::Result<()> {
+    let redacted_findings = crate::redact::redacted_findings(&verdict.findings, custom_patterns);
     let output = JsonOutput {
         schema_version: SCHEMA_VERSION,
         action: verdict.action,
-        findings: &verdict.findings,
+        findings: &redacted_findings,
         tier_reached: verdict.tier_reached,
         bypass_requested: verdict.bypass_requested,
         bypass_honored: verdict.bypass_honored,

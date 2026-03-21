@@ -7,6 +7,14 @@ use std::process::Command;
 
 use crate::assets;
 
+fn posix_single_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+fn powershell_single_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
+}
+
 pub fn run(shell: Option<&str>) -> i32 {
     let shell = shell.unwrap_or_else(|| detect_shell());
 
@@ -15,7 +23,10 @@ pub fn run(shell: Option<&str>) -> i32 {
     match shell {
         "zsh" => {
             if let Some(dir) = &hook_dir {
-                println!(r#"source "{}/lib/zsh-hook.zsh""#, dir.display());
+                println!(
+                    "source {}",
+                    posix_single_quote(&dir.join("lib/zsh-hook.zsh").display().to_string())
+                );
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -24,7 +35,10 @@ pub fn run(shell: Option<&str>) -> i32 {
         }
         "bash" => {
             if let Some(dir) = &hook_dir {
-                println!(r#"source "{}/lib/bash-hook.bash""#, dir.display());
+                println!(
+                    "source {}",
+                    posix_single_quote(&dir.join("lib/bash-hook.bash").display().to_string())
+                );
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -33,7 +47,10 @@ pub fn run(shell: Option<&str>) -> i32 {
         }
         "fish" => {
             if let Some(dir) = &hook_dir {
-                println!(r#"source "{}/lib/fish-hook.fish""#, dir.display());
+                println!(
+                    "source {}",
+                    posix_single_quote(&dir.join("lib/fish-hook.fish").display().to_string())
+                );
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -42,7 +59,12 @@ pub fn run(shell: Option<&str>) -> i32 {
         }
         "powershell" | "pwsh" => {
             if let Some(dir) = &hook_dir {
-                println!(r#". "{}\lib\powershell-hook.ps1""#, dir.display());
+                println!(
+                    ". {}",
+                    powershell_single_quote(
+                        &dir.join("lib/powershell-hook.ps1").display().to_string()
+                    )
+                );
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -51,7 +73,10 @@ pub fn run(shell: Option<&str>) -> i32 {
         }
         "nushell" | "nu" => {
             if let Some(dir) = &hook_dir {
-                println!(r#"source "{}/lib/nushell-hook.nu""#, dir.display());
+                println!(
+                    "source {}",
+                    posix_single_quote(&dir.join("lib/nushell-hook.nu").display().to_string())
+                );
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -322,7 +347,7 @@ fn materialize_hooks() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_shell_name;
+    use super::{normalize_shell_name, posix_single_quote, powershell_single_quote};
 
     #[test]
     fn normalize_shell_name_from_paths_and_login_shells() {
@@ -361,5 +386,17 @@ mod tests {
     fn normalize_shell_name_rejects_unknown_values() {
         assert_eq!(normalize_shell_name(""), None);
         assert_eq!(normalize_shell_name("python"), None);
+    }
+
+    #[test]
+    fn quote_helpers_escape_shell_metacharacters() {
+        assert_eq!(
+            posix_single_quote("/tmp/hook' > file"),
+            "'/tmp/hook'\\'' > file'"
+        );
+        assert_eq!(
+            powershell_single_quote("C:\\temp\\it's.ps1"),
+            "'C:\\temp\\it''s.ps1'"
+        );
     }
 }

