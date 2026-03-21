@@ -1,6 +1,8 @@
 /// URL validation for outbound HTTP requests (SSRF protection).
 use std::net::{IpAddr, ToSocketAddrs};
 
+type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
+
 #[derive(Clone, Copy)]
 enum UrlValidationMode {
     Server,
@@ -26,7 +28,7 @@ pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
 fn validate_outbound_url_with_resolver(
     url: &str,
     mode: UrlValidationMode,
-    resolver: &dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>,
+    resolver: &HostResolver,
 ) -> Result<url::Url, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     validate_parsed_url_with_resolver(&parsed, mode, resolver)?;
@@ -36,7 +38,7 @@ fn validate_outbound_url_with_resolver(
 fn validate_parsed_url_with_resolver(
     parsed: &url::Url,
     mode: UrlValidationMode,
-    resolver: &dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>,
+    resolver: &HostResolver,
 ) -> Result<(), String> {
     validate_scheme(parsed, mode)?;
 
