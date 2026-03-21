@@ -8,6 +8,10 @@ ignore = [
     # rustls-pemfile unmaintained — transitive dep of rust-s3 (license server).
     # No replacement available; rust-s3 hasn't migrated yet.
     "RUSTSEC-2025-0134",
+    # rustls-webpki CRL distribution point matching — affects 0.101.7 via
+    # rust-s3 → rustls 0.21. Transitive dep pinned by rust-s3; tirith does
+    # not use CRL revocation checking. The 0.103.x copy is already updated.
+    "RUSTSEC-2026-0049",
 ]
 
 [licenses]

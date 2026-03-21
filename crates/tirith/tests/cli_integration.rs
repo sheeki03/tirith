@@ -402,7 +402,7 @@ fn check_last_trigger_redacts_assignment_values_in_findings() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = tirith()
         .env("XDG_DATA_HOME", dir.path())
-        .env("LOCALAPPDATA", dir.path())
+        .env("APPDATA", dir.path())
         .args([
             "check",
             "--shell",
