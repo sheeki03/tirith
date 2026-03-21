@@ -500,20 +500,6 @@ fn process_object(
 ) -> io::Result<()> {
     match check_guarded(obj, config) {
         GuardedResult::NotGuarded => forward(upstream, raw_line),
-        GuardedResult::GuardedNotification { tool_name } => {
-            write_audit(
-                "allow",
-                "passthrough_notification",
-                &[],
-                None,
-                &tool_name,
-                "",
-                0.0,
-                false,
-                false,
-            );
-            forward(upstream, raw_line)
-        }
         GuardedResult::Guarded {
             id,
             command,
@@ -522,8 +508,19 @@ fn process_object(
         } => handle_guarded_call(
             id, &command, &tool_name, shell, raw_line, config, upstream, output_tx,
         ),
+        GuardedResult::GuardedNotification {
+            command,
+            tool_name,
+            shell,
+        } => handle_guarded_notification(&command, &tool_name, shell, raw_line, config, upstream),
         GuardedResult::ExtractionFailed { id, tool_name } => {
             handle_extraction_failed(id, &tool_name, raw_line, config, upstream, output_tx)
+        }
+        GuardedResult::NotificationExtractionFailed { tool_name } => {
+            handle_notification_extraction_failed(&tool_name)
+        }
+        GuardedResult::InvalidRequest { tool_name } => {
+            handle_invalid_guarded_request(&tool_name, output_tx)
         }
     }
 }
@@ -702,6 +699,151 @@ fn handle_extraction_failed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_guarded_notification(
+    command: &str,
+    tool_name: &str,
+    shell: ShellType,
+    raw_line: &[u8],
+    config: &CompiledConfig,
+    upstream: &mut impl Write,
+) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let hash = cmd_hash_prefix(command);
+
+    let (tx, rx) = mpsc::channel();
+    let cmd_owned = command.to_string();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    thread::spawn(move || {
+        let ctx = AnalysisContext {
+            input: cmd_owned,
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        };
+        let _ = tx.send(engine::analyze(&ctx));
+    });
+
+    let timeout = Duration::from_millis(config.policy.timeout_ms);
+    match rx.recv_timeout(timeout) {
+        Ok(verdict) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let should_deny = match verdict.action {
+                Action::Block => true,
+                Action::Warn => config.policy.warn_action == "deny",
+                Action::Allow => false,
+            };
+
+            let rule_ids: Vec<String> = verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect();
+            let max_sev = verdict
+                .findings
+                .iter()
+                .map(|f| f.severity)
+                .max()
+                .map(|s| s.to_string());
+
+            if should_deny {
+                let decision = if verdict.action == Action::Block {
+                    "block"
+                } else {
+                    "warn"
+                };
+                write_audit(
+                    decision,
+                    "dropped_notification",
+                    &rule_ids,
+                    max_sev.as_deref(),
+                    tool_name,
+                    &hash,
+                    elapsed,
+                    false,
+                    false,
+                );
+                Ok(())
+            } else {
+                let decision = if verdict.action == Action::Warn {
+                    "warn"
+                } else {
+                    "allow"
+                };
+                write_audit(
+                    decision,
+                    "forwarded_notification",
+                    &rule_ids,
+                    max_sev.as_deref(),
+                    tool_name,
+                    &hash,
+                    elapsed,
+                    false,
+                    false,
+                );
+                forward(upstream, raw_line)
+            }
+        }
+        Err(_) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            write_audit(
+                "block",
+                "dropped_notification",
+                &[],
+                None,
+                tool_name,
+                &hash,
+                elapsed,
+                true,
+                true,
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_notification_extraction_failed(tool_name: &str) -> io::Result<()> {
+    write_audit(
+        "block",
+        "dropped_notification",
+        &[],
+        None,
+        tool_name,
+        "",
+        0.0,
+        true,
+        false,
+    );
+    Ok(())
+}
+
+fn handle_invalid_guarded_request(
+    tool_name: &str,
+    output_tx: &mpsc::Sender<Vec<u8>>,
+) -> io::Result<()> {
+    write_audit(
+        "block",
+        "invalid_request",
+        &[],
+        None,
+        tool_name,
+        "",
+        0.0,
+        false,
+        false,
+    );
+    let _ = output_tx.send(build_invalid_id_request_response().into_bytes());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Guarded check
 // ---------------------------------------------------------------------------
@@ -709,7 +851,9 @@ fn handle_extraction_failed(
 enum GuardedResult {
     NotGuarded,
     GuardedNotification {
+        command: String,
         tool_name: String,
+        shell: ShellType,
     },
     Guarded {
         id: Value,
@@ -719,6 +863,12 @@ enum GuardedResult {
     },
     ExtractionFailed {
         id: Value,
+        tool_name: String,
+    },
+    NotificationExtractionFailed {
+        tool_name: String,
+    },
+    InvalidRequest {
         tool_name: String,
     },
 }
@@ -748,33 +898,43 @@ fn check_guarded(obj: &Value, config: &CompiledConfig) -> GuardedResult {
         None => return GuardedResult::NotGuarded,
     };
 
-    let id = match obj.get("id") {
-        Some(v) => match v {
-            // Valid JSON-RPC id types: string, number, null
-            Value::String(_) | Value::Number(_) | Value::Null => v.clone(),
-            // Invalid id types (object, array, boolean) → normalize to null
-            _ => Value::Null,
-        },
-        None => return GuardedResult::GuardedNotification { tool_name },
-    };
-
     // Extract command via JSON Pointer paths (resolved against params)
-    for pointer in &guard.command_paths {
-        if let Some(val) = resolve_json_pointer(params, pointer) {
-            if let Some(s) = val.as_str() {
-                if !s.is_empty() {
-                    return GuardedResult::Guarded {
-                        id,
-                        command: s.to_string(),
-                        tool_name,
-                        shell: guard.shell,
-                    };
+    let extracted_command = || {
+        for pointer in &guard.command_paths {
+            if let Some(val) = resolve_json_pointer(params, pointer) {
+                if let Some(s) = val.as_str() {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
                 }
             }
         }
-    }
+        None
+    };
 
-    GuardedResult::ExtractionFailed { id, tool_name }
+    match obj.get("id") {
+        None => match extracted_command() {
+            Some(command) => GuardedResult::GuardedNotification {
+                command,
+                tool_name,
+                shell: guard.shell,
+            },
+            None => GuardedResult::NotificationExtractionFailed { tool_name },
+        },
+        Some(Value::String(_)) | Some(Value::Number(_)) | Some(Value::Null) => {
+            let id = obj.get("id").cloned().unwrap_or(Value::Null);
+            match extracted_command() {
+                Some(command) => GuardedResult::Guarded {
+                    id,
+                    command,
+                    tool_name,
+                    shell: guard.shell,
+                },
+                None => GuardedResult::ExtractionFailed { id, tool_name },
+            }
+        }
+        Some(_) => GuardedResult::InvalidRequest { tool_name },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1094,18 @@ fn build_fail_mode_deny(
     };
     let resp = JsonRpcResponse::ok(id, serde_json::to_value(&result).unwrap());
     serde_json::to_string(&resp).unwrap_or_default()
+}
+
+fn build_invalid_id_request_response() -> String {
+    serde_json::to_string(&JsonRpcResponse::err(
+        Value::Null,
+        JsonRpcError {
+            code: -32600,
+            message: "Invalid request: id must be string, number, or null".to_string(),
+            data: None,
+        },
+    ))
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,10 +1377,10 @@ guarded_tools:
             "method": "tools/call",
             "params": { "name": "Bash", "arguments": { "command": "ls" } }
         });
-        assert!(matches!(
-            check_guarded(&obj, &config),
-            GuardedResult::GuardedNotification { .. }
-        ));
+        match check_guarded(&obj, &config) {
+            GuardedResult::GuardedNotification { command, .. } => assert_eq!(command, "ls"),
+            _ => panic!("expected GuardedNotification"),
+        }
     }
 
     #[test]
@@ -1388,7 +1560,7 @@ guarded_tools:
     // -- Invalid id type tests (Fix #4: non-batch path) --
 
     #[test]
-    fn test_guarded_boolean_id_normalized_to_null() {
+    fn test_guarded_boolean_id_rejected() {
         let config = test_config();
         let obj: Value = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1396,14 +1568,14 @@ guarded_tools:
             "method": "tools/call",
             "params": { "name": "Bash", "arguments": { "command": "ls" } }
         });
-        match check_guarded(&obj, &config) {
-            GuardedResult::Guarded { id, .. } => assert!(id.is_null()),
-            _ => panic!("expected Guarded"),
-        }
+        assert!(matches!(
+            check_guarded(&obj, &config),
+            GuardedResult::InvalidRequest { .. }
+        ));
     }
 
     #[test]
-    fn test_guarded_object_id_normalized_to_null() {
+    fn test_guarded_object_id_rejected() {
         let config = test_config();
         let obj: Value = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1411,14 +1583,14 @@ guarded_tools:
             "method": "tools/call",
             "params": { "name": "Bash", "arguments": { "command": "ls" } }
         });
-        match check_guarded(&obj, &config) {
-            GuardedResult::Guarded { id, .. } => assert!(id.is_null()),
-            _ => panic!("expected Guarded"),
-        }
+        assert!(matches!(
+            check_guarded(&obj, &config),
+            GuardedResult::InvalidRequest { .. }
+        ));
     }
 
     #[test]
-    fn test_guarded_array_id_normalized_to_null() {
+    fn test_guarded_array_id_rejected() {
         let config = test_config();
         let obj: Value = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1426,10 +1598,10 @@ guarded_tools:
             "method": "tools/call",
             "params": { "name": "Bash", "arguments": { "command": "ls" } }
         });
-        match check_guarded(&obj, &config) {
-            GuardedResult::Guarded { id, .. } => assert!(id.is_null()),
-            _ => panic!("expected Guarded"),
-        }
+        assert!(matches!(
+            check_guarded(&obj, &config),
+            GuardedResult::InvalidRequest { .. }
+        ));
     }
 
     #[test]
@@ -1460,6 +1632,20 @@ guarded_tools:
             GuardedResult::Guarded { id, .. } => assert!(id.is_null()),
             _ => panic!("expected Guarded"),
         }
+    }
+
+    #[test]
+    fn test_guarded_notification_extraction_failed() {
+        let config = test_config();
+        let obj: Value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "Bash", "arguments": { "code": "ls" } }
+        });
+        assert!(matches!(
+            check_guarded(&obj, &config),
+            GuardedResult::NotificationExtractionFailed { .. }
+        ));
     }
 
     // -- Policy enum validation tests (Fix #5) --
@@ -1596,6 +1782,18 @@ policy:
         assert!(!text.contains("Tirith: Tirith"));
     }
 
+    #[test]
+    fn test_invalid_id_request_response_wire_format() {
+        let resp = build_invalid_id_request_response();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32600);
+        assert_eq!(
+            v["error"]["message"],
+            "Invalid request: id must be string, number, or null"
+        );
+        assert!(v["id"].is_null());
+    }
+
     // -- Upstream write-failure shutdown test --
 
     #[test]
@@ -1641,6 +1839,30 @@ policy:
         let mut writer = BrokenWriter;
         let err = process_object(&obj, &raw, &config, &mut writer, &tx).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn test_invalid_guarded_id_returns_local_error() {
+        let config = test_config();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let obj: Value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": true,
+            "method": "tools/call",
+            "params": { "name": "Bash", "arguments": { "command": "ls" } }
+        });
+        let raw = serde_json::to_vec(&obj).unwrap();
+        let mut writer = Vec::new();
+        process_object(&obj, &raw, &config, &mut writer, &tx).unwrap();
+        assert!(
+            writer.is_empty(),
+            "invalid guarded requests should not be forwarded"
+        );
+
+        let resp = rx.recv().unwrap();
+        let v: Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32600);
+        assert!(v["id"].is_null());
     }
 
     // -- Deny response wire format contract test (P1 fix) --
