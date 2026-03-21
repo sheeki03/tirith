@@ -4,7 +4,7 @@ $packageName = 'tirith'
 $toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
 
 # Version and checksum templated by CI
-$version = '0.2.7'
+$version = '0.2.8'
 $checksum = 'PLACEHOLDER'
 
 $url = "https://github.com/sheeki03/tirith/releases/download/v$version/tirith-x86_64-pc-windows-msvc.zip"
