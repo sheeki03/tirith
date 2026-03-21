@@ -1,6 +1,10 @@
 use tirith_core::util::truncate_bytes;
 
-pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
+pub fn write_last_trigger(
+    verdict: &tirith_core::verdict::Verdict,
+    cmd: &str,
+    custom_patterns: &[String],
+) {
     if let Some(dir) = tirith_core::policy::data_dir() {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
@@ -20,6 +24,9 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
             timestamp: String,
         }
 
+        let redacted_findings =
+            tirith_core::redact::redacted_findings(&verdict.findings, custom_patterns);
+
         let trigger = LastTrigger {
             rule_ids: verdict
                 .findings
@@ -33,8 +40,8 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
                 .max()
                 .map(|s| format!("{s}"))
                 .unwrap_or_default(),
-            command_redacted: redact_command(cmd),
-            findings: &verdict.findings,
+            command_redacted: redact_command(cmd, custom_patterns),
+            findings: &redacted_findings,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -69,17 +76,25 @@ pub fn write_last_trigger(verdict: &tirith_core::verdict::Verdict, cmd: &str) {
     }
 }
 
-fn redact_command(cmd: &str) -> String {
-    let prefix = truncate_bytes(cmd, 80);
-    if prefix.len() == cmd.len() {
-        cmd.to_string()
+fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
+    let scrubbed = tirith_core::redact::redact_command_text(cmd, custom_patterns);
+    let prefix = truncate_bytes(&scrubbed, 80);
+    if prefix.len() == scrubbed.len() {
+        scrubbed
     } else {
         format!("{prefix}...")
     }
 }
 
 #[cfg(test)]
+fn redact_assignment_values(cmd: &str) -> String {
+    tirith_core::redact::redact_shell_assignments(cmd)
+}
+
+#[cfg(test)]
 mod tests {
+    use super::{redact_assignment_values, redact_command};
+
     #[test]
     fn test_last_trigger_no_predictable_tmp() {
         // Verify NamedTempFile is used: no .last_trigger.json.tmp should remain.
@@ -111,5 +126,30 @@ mod tests {
             content.contains("test"),
             "file should contain expected data"
         );
+    }
+
+    #[test]
+    fn test_redact_assignment_values_scrubs_exports() {
+        let redacted =
+            redact_assignment_values("export AWS_ACCESS_KEY_ID=ABCDEFGHIJKLMNOPQRST echo done");
+        assert!(redacted.contains("AWS_ACCESS_KEY_ID=[REDACTED]"));
+        assert!(!redacted.contains("ABCDEFGHIJKLMNOPQRST"));
+    }
+
+    #[test]
+    fn test_redact_assignment_values_scrubs_quoted_values() {
+        let redacted = redact_assignment_values("TOKEN='secret with spaces' curl example.com");
+        assert!(redacted.contains("TOKEN=[REDACTED]"));
+        assert!(!redacted.contains("secret with spaces"));
+    }
+
+    #[test]
+    fn test_redact_command_truncates_after_scrubbing() {
+        let redacted = redact_command(
+            "TOKEN=verysecretvalue curl https://example.com/install.sh",
+            &[],
+        );
+        assert!(redacted.contains("TOKEN=[REDACTED]"));
+        assert!(!redacted.contains("verysecretvalue"));
     }
 }

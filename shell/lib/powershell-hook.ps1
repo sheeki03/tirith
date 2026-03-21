@@ -27,6 +27,14 @@ if (-not $psrlModule) {
     return
 }
 
+function global:_tirith_escape_preview {
+    param([string]$Text)
+    if ($null -eq $Text) {
+        return '""'
+    }
+    return (ConvertTo-Json -Compress -InputObject ([string]$Text))
+}
+
 # --- Approval workflow helpers (ADR-7) ---
 
 function global:_tirith_parse_approval {
@@ -133,10 +141,10 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     if ($rc -eq 0) {
         # Allow: no output
     } elseif ($rc -eq 2) {
-        Write-Host "command> $line"
+        Write-Host "command> $(_tirith_escape_preview $line)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
     } elseif ($rc -eq 1) {
-        Write-Host "command> $line"
+        Write-Host "command> $(_tirith_escape_preview $line)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
     } else {
         # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
@@ -213,12 +221,6 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         return
     }
 
-    # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
-    if ($pasted.TrimStart() -match '^TIRITH=0\s') {
-        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
-        return
-    }
-
     # Check with tirith paste, use temp file to prevent output leakage
     $tmpfile = [System.IO.Path]::GetTempFileName()
     $pasted | & tirith paste --shell powershell --interactive > $tmpfile 2>&1
@@ -233,7 +235,7 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         # Warn: fall through to insert
     } else {
         # Block or unexpected: discard paste
-        Write-Host "paste> $pasted"
+        Write-Host "paste> $(_tirith_escape_preview $pasted)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
         if ($rc -ne 1) { Write-Host "tirith: unexpected exit code $rc - paste blocked for safety" }
         return

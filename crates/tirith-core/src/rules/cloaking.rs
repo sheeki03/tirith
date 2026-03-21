@@ -83,9 +83,20 @@ impl CloakingResult {
 /// Check a URL for server-side cloaking.
 #[cfg(unix)]
 pub fn check(url: &str) -> Result<CloakingResult, String> {
+    let validated_url = crate::url_validate::validate_fetch_url(url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
@@ -95,7 +106,7 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
     let mut responses: Vec<(String, u16, String)> = Vec::new();
 
     for (name, ua) in USER_AGENTS {
-        match fetch_with_ua(&client, url, ua, MAX_BODY) {
+        match fetch_with_ua(&client, validated_url.as_str(), ua, MAX_BODY) {
             Ok((status, body)) => {
                 responses.push((name.to_string(), status, body));
             }
@@ -437,5 +448,13 @@ mod tests {
             diff > 10,
             "significant content difference should exceed threshold, got {diff}"
         );
+    }
+
+    #[test]
+    fn test_cloaking_rejects_localhost_target_before_fetch() {
+        match check("http://localhost/") {
+            Ok(_) => panic!("expected localhost target to be rejected"),
+            Err(err) => assert!(err.contains("localhost")),
+        }
     }
 }

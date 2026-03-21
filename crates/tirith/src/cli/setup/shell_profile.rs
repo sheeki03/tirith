@@ -21,6 +21,9 @@ fn needs_quoting(s: &str) -> bool {
             b,
             b' ' | b'\''
                 | b'"'
+                | b'\t'
+                | b'\n'
+                | b'\r'
                 | b'$'
                 | b'\\'
                 | b'`'
@@ -30,6 +33,12 @@ fn needs_quoting(s: &str) -> bool {
                 | b'&'
                 | b'|'
                 | b';'
+                | b'<'
+                | b'>'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
                 | b'{'
                 | b'}'
                 | b'~'
@@ -41,7 +50,7 @@ fn needs_quoting(s: &str) -> bool {
 ///
 /// Uses single-quote wrapping with per-shell escaping for embedded
 /// single quotes. Returns the path unchanged if no special characters.
-fn shell_quote(path: &str, shell: &str) -> String {
+pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
     if !needs_quoting(path) {
         return path.to_string();
     }
@@ -451,6 +460,14 @@ mod tests {
         assert_eq!(
             shell_quote("/home/$user/tirith", "bash"),
             "'/home/$user/tirith'"
+        );
+    }
+
+    #[test]
+    fn quote_path_with_redirection_and_glob_chars() {
+        assert_eq!(
+            shell_quote("/tmp/hook>[abc]?*", "bash"),
+            "'/tmp/hook>[abc]?*'"
         );
     }
 

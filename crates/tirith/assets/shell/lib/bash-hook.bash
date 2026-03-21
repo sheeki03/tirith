@@ -40,6 +40,10 @@ _tirith_output() {
   fi
 }
 
+_tirith_escape_preview() {
+  printf '%q' "$1"
+}
+
 # ─── Approval workflow helpers (ADR-7) ───
 
 # Parse approval temp file. On success, sets _tirith_ap_* variables.
@@ -106,12 +110,16 @@ _tirith_persist_safe_mode() {
 # ─── Preexec function (used by both preexec mode and degrade fallback) ───
 
 _tirith_preexec() {
+  [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return
   # Only run once per command (guard against DEBUG firing multiple times)
   [[ "${_tirith_last_cmd:-}" == "$BASH_COMMAND" ]] && return
   _tirith_last_cmd="$BASH_COMMAND"
 
   # Warn-only: command is already committed, we can only print warnings
+  local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
+  _TIRITH_BASH_INTERNAL=1
   command tirith check --shell posix -- "$BASH_COMMAND" || true
+  _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
 }
 
 # ─── Degrade function ───
@@ -321,25 +329,34 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
       local errfile=$(mktemp)
       local approval_path
+      local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
+      _TIRITH_BASH_INTERNAL=1
       approval_path=$(command tirith check --approval-check --non-interactive --interactive --shell posix -- "$READLINE_LINE" 2>"$errfile")
       local rc=$?
+      _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
       local output=$(<"$errfile")
       command rm -f "$errfile"
 
       if [[ $rc -eq 0 ]]; then
         :  # Allow: no output
       elif [[ $rc -eq 2 ]]; then
+        local escaped_line
+        escaped_line=$(_tirith_escape_preview "$READLINE_LINE")
         _tirith_output ""
-        _tirith_output "command> $READLINE_LINE"
+        _tirith_output "command> $escaped_line"
         [[ -n "$output" ]] && _tirith_output "$output"
       elif [[ $rc -eq 1 ]]; then
+        local escaped_line
+        escaped_line=$(_tirith_escape_preview "$READLINE_LINE")
         _tirith_output ""
-        _tirith_output "command> $READLINE_LINE"
+        _tirith_output "command> $escaped_line"
         [[ -n "$output" ]] && _tirith_output "$output"
       else
         # Unexpected exit code: degrade to preexec
+        local escaped_line
+        escaped_line=$(_tirith_escape_preview "$READLINE_LINE")
         _tirith_output ""
-        _tirith_output "command> $READLINE_LINE"
+        _tirith_output "command> $escaped_line"
         [[ -n "$output" ]] && _tirith_output "$output"
         [[ -n "$approval_path" ]] && command rm -f "$approval_path"
         _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
@@ -437,9 +454,8 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         fi
       done
 
-      # Honor TIRITH=0 bypass (#30): skip paste scanning (env var or inline prefix)
-      local _t_trimmed="${pasted#"${pasted%%[![:space:]]*}"}"
-      if [[ "${TIRITH:-}" == "0" ]] || [[ "$_t_trimmed" == TIRITH=0[[:space:]]* ]]; then
+      # Honor explicit TIRITH=0 bypass (#30): skip paste scanning
+      if [[ "${TIRITH:-}" == "0" ]]; then
         READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}${pasted}${READLINE_LINE:$READLINE_POINT}"
         READLINE_POINT=$((READLINE_POINT + ${#pasted}))
         return
@@ -448,8 +464,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -n "$pasted" ]]; then
         # Check with tirith paste, use temp file to prevent tty leakage
         local tmpfile=$(mktemp)
+        local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
+        _TIRITH_BASH_INTERNAL=1
         printf '%s' "$pasted" | command tirith paste --shell posix --interactive >"$tmpfile" 2>&1
         local rc=$?
+        _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
         local output=$(<"$tmpfile")
         command rm -f "$tmpfile"
 
@@ -461,8 +480,10 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           [[ -n "$output" ]] && { _tirith_output ""; _tirith_output "$output"; }
         else
           # Block (rc=1) or unexpected: discard paste (safe — user can re-paste)
+          local escaped_paste
+          escaped_paste=$(_tirith_escape_preview "$pasted")
           _tirith_output ""
-          _tirith_output "paste> $pasted"
+          _tirith_output "paste> $escaped_paste"
           [[ -n "$output" ]] && _tirith_output "$output"
           [[ $rc -ne 1 ]] && _tirith_output "tirith: paste check failed (exit code $rc)"
           return

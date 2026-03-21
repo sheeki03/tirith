@@ -155,7 +155,7 @@ pub fn run(
 
     // Write last_trigger.json for non-allow verdicts
     if verdict.action != tirith_core::verdict::Action::Allow {
-        last_trigger::write_last_trigger(&verdict, cmd);
+        last_trigger::write_last_trigger(&verdict, cmd, &policy.dlp_custom_patterns);
     }
 
     // Webhook dispatch (Team feature, non-blocking background thread)
@@ -181,7 +181,13 @@ pub fn run(
 
     // Output
     if json {
-        if output::write_json(&verdict, std::io::stdout().lock()).is_err() {
+        if output::write_json(
+            &verdict,
+            &policy.dlp_custom_patterns,
+            std::io::stdout().lock(),
+        )
+        .is_err()
+        {
             eprintln!("tirith: failed to write JSON output");
         }
     } else if output::write_human_auto(&verdict).is_err() {

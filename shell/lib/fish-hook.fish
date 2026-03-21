@@ -27,6 +27,10 @@ function _tirith_output
     end
 end
 
+function _tirith_escape_preview
+    string escape -- $argv[1]
+end
+
 # ─── Approval workflow helpers (ADR-7) ───
 
 function _tirith_parse_approval
@@ -97,12 +101,6 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
             return
         end
 
-        # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
-        if string match -qr '^\s*TIRITH=0\s' -- "$content"
-            echo -n "$content"
-            return
-        end
-
         set -l tmpfile (mktemp)
         echo -n "$content" | command tirith paste --shell fish --interactive >$tmpfile 2>&1
         set -l rc $status
@@ -120,8 +118,9 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
             # Warn: fall through to echo
         else
             # Block or unexpected: discard
+            set -l escaped_content (_tirith_escape_preview "$content")
             _tirith_output ""
-            _tirith_output "paste> $content"
+            _tirith_output "paste> $escaped_content"
             if test -n "$output"
                 _tirith_output "$output"
             end
@@ -166,14 +165,16 @@ function _tirith_check_command
     if test $rc -eq 0
         # Allow: no output
     else if test $rc -eq 2
+        set -l escaped_cmd (_tirith_escape_preview "$cmd")
         _tirith_output ""
-        _tirith_output "command> $cmd"
+        _tirith_output "command> $escaped_cmd"
         if test -n "$output"
             _tirith_output "$output"
         end
     else if test $rc -eq 1
+        set -l escaped_cmd (_tirith_escape_preview "$cmd")
         _tirith_output ""
-        _tirith_output "command> $cmd"
+        _tirith_output "command> $escaped_cmd"
         if test -n "$output"
             _tirith_output "$output"
         end

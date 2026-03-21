@@ -422,7 +422,10 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
         }
         Scope::User => {
             let abs = hooks_dir.join("tirith-security-guard-gemini.py");
-            format!(r#"python3 "{}""#, abs.display())
+            format!(
+                "python3 {}",
+                super::shell_profile::shell_quote(&abs.display().to_string(), "bash")
+            )
         }
     };
     merge::merge_gemini_settings(&settings_path, &hook_command, opts.force, opts.dry_run)?;

@@ -5,6 +5,7 @@ use crate::scan;
 use super::types::{ContentItem, ResourceContent, ResourceDefinition, ToolCallResult};
 
 const PROJECT_SAFETY_URI: &str = "tirith://project-safety";
+pub const MCP_SCAN_MAX_FILES: usize = 5_000;
 
 /// Return available resources.
 pub fn list() -> Vec<ResourceDefinition> {
@@ -46,7 +47,7 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 recursive: true,
                 fail_on: crate::verdict::Severity::Critical,
                 ignore_patterns: policy.scan.ignore_patterns.clone(),
-                max_files: None,
+                max_files: Some(MCP_SCAN_MAX_FILES),
             };
             let mut result = scan::scan(&config);
             for fr in &mut result.file_results {
@@ -104,7 +105,7 @@ fn read_project_safety() -> ToolCallResult {
         recursive: true,
         fail_on: crate::verdict::Severity::Critical,
         ignore_patterns: policy.scan.ignore_patterns.clone(),
-        max_files: None,
+        max_files: Some(MCP_SCAN_MAX_FILES),
     };
     let mut result = scan::scan(&config);
     for fr in &mut result.file_results {
