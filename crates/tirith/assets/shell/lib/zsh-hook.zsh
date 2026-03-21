@@ -30,6 +30,10 @@ _tirith_output() {
   fi
 }
 
+_tirith_escape_preview() {
+  printf '%q' -- "$1"
+}
+
 # ─── Approval workflow helpers (ADR-7) ───
 
 _tirith_parse_approval() {
@@ -96,12 +100,14 @@ _tirith_accept_line() {
   if [[ $rc -eq 0 ]]; then
     :  # Allow: no output
   elif [[ $rc -eq 2 ]]; then
+    local escaped_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
-    _tirith_output "command> $buf"
+    _tirith_output "command> $escaped_buf"
     [[ -n "$output" ]] && _tirith_output "$output"
   elif [[ $rc -eq 1 ]]; then
+    local escaped_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
-    _tirith_output "command> $buf"
+    _tirith_output "command> $escaped_buf"
     [[ -n "$output" ]] && _tirith_output "$output"
   else
     # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
@@ -174,16 +180,12 @@ _tirith_bracketed_paste() {
   local old_cursor="$CURSOR"
   zle _tirith_original_bracketed_paste 2>/dev/null || zle .bracketed-paste
 
-  # Honor TIRITH=0 bypass (#30): skip paste scanning
+  # Honor explicit TIRITH=0 bypass (#30): skip paste scanning
   [[ "${TIRITH:-}" == "0" ]] && return
 
   # The new content is what was added to BUFFER
   local new_buffer="$BUFFER"
   local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
-
-  # Honor inline TIRITH=0 prefix (#30): handles Warp routing typed input through paste
-  local _t_trimmed="${pasted#"${pasted%%[![:space:]]*}"}"
-  [[ "$_t_trimmed" == TIRITH=0[[:space:]]* ]] && return
 
   if [[ -n "$pasted" ]]; then
     # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
@@ -202,8 +204,9 @@ _tirith_bracketed_paste() {
       # Block or unexpected: revert paste
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
+      local escaped_paste=$(_tirith_escape_preview "$pasted")
       _tirith_output ""
-      _tirith_output "paste> $pasted"
+      _tirith_output "paste> $escaped_paste"
       [[ -n "$output" ]] && _tirith_output "$output"
       [[ $rc -ne 1 ]] && _tirith_output "tirith: unexpected exit code $rc — paste blocked for safety"
       zle send-break
