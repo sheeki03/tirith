@@ -320,9 +320,12 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let mut results = Vec::new();
 
     for (seg_idx, segment) in segments.iter().enumerate() {
-        // Extract standard URLs from command + args (not raw text, to skip env-prefix values).
-        // Since URL_REGEX stops at whitespace, scanning individual words is equivalent to
-        // scanning the non-env-prefix portion of the raw text.
+        let sink_context = is_sink_context(segment, &segments);
+        let resolved = resolve_segment_command(segment);
+
+        // Extract standard URLs from command + args plus leading env-assignment values.
+        // Keep the raw-text expansion targeted so output/auth false-positive suppression
+        // still applies to the command/arg path.
         let mut url_sources: Vec<&str> = Vec::new();
         if let Some(ref cmd) = segment.command {
             url_sources.push(cmd.as_str());
@@ -330,61 +333,62 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
         for arg in &segment.args {
             url_sources.push(arg.as_str());
         }
-        for source in &url_sources {
-            for mat in URL_REGEX.find_iter(source) {
-                let raw = mat.as_str().to_string();
-                let url = parse::parse_url(&raw);
-                results.push(ExtractedUrl {
-                    raw,
-                    parsed: url,
-                    segment_index: seg_idx,
-                    in_sink_context: is_sink_context(segment, &segments),
-                });
+        for (name, value) in tokenize::leading_env_assignments(&segment.raw) {
+            if ignores_env_assignment_url(&name) {
+                continue;
             }
+            let clean = strip_quotes(&value);
+            if !clean.is_empty() {
+                push_urls_from_source(&clean, seg_idx, sink_context, &mut results);
+            }
+        }
+        for source in &url_sources {
+            push_urls_from_source(source, seg_idx, sink_context, &mut results);
         }
 
         // Check for schemeless URLs in sink contexts
         // Skip for docker/podman/nerdctl commands since their args are handled as DockerRef
-        let is_docker_cmd = segment.command.as_ref().is_some_and(|cmd| {
-            let cmd_lower = cmd.to_lowercase();
-            matches!(cmd_lower.as_str(), "docker" | "podman" | "nerdctl")
-        });
-        if is_sink_context(segment, &segments) && !is_docker_cmd {
-            for (arg_idx, arg) in segment.args.iter().enumerate() {
-                // Skip args that are output-file flag values
-                if let Some(cmd) = &segment.command {
-                    if is_output_flag_value(cmd, &segment.args, arg_idx) {
+        let is_docker_cmd = resolved
+            .as_ref()
+            .is_some_and(|cmd| matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl"));
+        if sink_context && !is_docker_cmd {
+            if let Some(cmd) = resolved.as_ref() {
+                for (arg_idx, arg) in cmd.args.iter().enumerate() {
+                    // Skip args that are output-file flag values
+                    if is_output_flag_value(&cmd.name, cmd.args, arg_idx) {
                         continue;
                     }
-                }
-                let clean = strip_quotes(arg);
-                if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
-                    results.push(ExtractedUrl {
-                        raw: clean.clone(),
-                        parsed: UrlLike::SchemelessHostPath {
-                            host: extract_host_from_schemeless(&clean),
-                            path: extract_path_from_schemeless(&clean),
-                        },
-                        segment_index: seg_idx,
-                        in_sink_context: true,
-                    });
+                    let clean = strip_quotes(arg);
+                    if is_remote_copy_target(&cmd.name, &clean) {
+                        continue;
+                    }
+                    if looks_like_schemeless_host(&clean) && !URL_REGEX.is_match(&clean) {
+                        results.push(ExtractedUrl {
+                            raw: clean.clone(),
+                            parsed: UrlLike::SchemelessHostPath {
+                                host: extract_host_from_schemeless(&clean),
+                                path: extract_path_from_schemeless(&clean),
+                            },
+                            segment_index: seg_idx,
+                            in_sink_context: true,
+                        });
+                    }
                 }
             }
         }
 
         // Check for Docker refs in docker commands
-        if let Some(cmd) = &segment.command {
-            let cmd_lower = cmd.to_lowercase();
-            if matches!(cmd_lower.as_str(), "docker" | "podman" | "nerdctl") {
-                if let Some(docker_subcmd) = segment.args.first() {
+        if let Some(cmd) = resolved.as_ref() {
+            if matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl") {
+                if let Some(docker_subcmd) = cmd.args.first() {
                     let subcmd_lower = docker_subcmd.to_lowercase();
                     if subcmd_lower == "build" {
                         // For build, only -t/--tag values are image refs
                         let mut i = 1;
-                        while i < segment.args.len() {
-                            let arg = strip_quotes(&segment.args[i]);
-                            if (arg == "-t" || arg == "--tag") && i + 1 < segment.args.len() {
-                                let tag_val = strip_quotes(&segment.args[i + 1]);
+                        while i < cmd.args.len() {
+                            let arg = strip_quotes(&cmd.args[i]);
+                            if (arg == "-t" || arg == "--tag") && i + 1 < cmd.args.len() {
+                                let tag_val = strip_quotes(&cmd.args[i + 1]);
                                 if !tag_val.is_empty() {
                                     let docker_url = parse::parse_docker_ref(&tag_val);
                                     results.push(ExtractedUrl {
@@ -421,22 +425,18 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                         }
                     } else if subcmd_lower == "image" {
                         // docker image pull/push/inspect — actual subcmd is args[1]
-                        if let Some(image_subcmd) = segment.args.get(1) {
+                        if let Some(image_subcmd) = cmd.args.get(1) {
                             let image_subcmd_lower = image_subcmd.to_lowercase();
                             if matches!(
                                 image_subcmd_lower.as_str(),
                                 "pull" | "push" | "inspect" | "rm" | "tag"
                             ) {
-                                extract_first_docker_image(
-                                    &segment.args[2..],
-                                    seg_idx,
-                                    &mut results,
-                                );
+                                extract_first_docker_image(&cmd.args[2..], seg_idx, &mut results);
                             }
                         }
                     } else if matches!(subcmd_lower.as_str(), "pull" | "run" | "create") {
                         // First non-flag arg is image, then stop
-                        extract_first_docker_image(&segment.args[1..], seg_idx, &mut results);
+                        extract_first_docker_image(&cmd.args[1..], seg_idx, &mut results);
                     }
                 }
             }
@@ -511,6 +511,7 @@ const DOCKER_VALUE_PREFIXES: &[&str] = &["-p", "-e", "-v", "-l", "-u", "-w"];
 /// Extract the first non-flag argument as a Docker image reference.
 fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec<ExtractedUrl>) {
     let mut skip_next = false;
+    let mut end_of_options = false;
     for arg in args {
         if skip_next {
             skip_next = false;
@@ -518,12 +519,13 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
         }
         let clean = strip_quotes(arg);
         if clean == "--" {
-            break;
+            end_of_options = true;
+            continue;
         }
-        if clean.starts_with("--") && clean.contains('=') {
+        if !end_of_options && clean.starts_with("--") && clean.contains('=') {
             continue; // --flag=value, skip
         }
-        if clean.starts_with('-') {
+        if !end_of_options && clean.starts_with('-') {
             if DOCKER_VALUE_FLAGS.iter().any(|f| clean == *f) {
                 skip_next = true;
             }
@@ -548,14 +550,169 @@ fn extract_first_docker_image(args: &[String], seg_idx: usize, results: &mut Vec
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedCommand<'a> {
+    name: String,
+    args: &'a [String],
+}
+
+fn push_urls_from_source(
+    source: &str,
+    segment_index: usize,
+    in_sink_context: bool,
+    results: &mut Vec<ExtractedUrl>,
+) {
+    for mat in URL_REGEX.find_iter(source) {
+        let raw = mat.as_str().to_string();
+        let url = parse::parse_url(&raw);
+        results.push(ExtractedUrl {
+            raw,
+            parsed: url,
+            segment_index,
+            in_sink_context,
+        });
+    }
+}
+
+fn ignores_env_assignment_url(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "NO_PROXY" || upper.ends_with("_PROXY")
+}
+
+fn env_long_flag_takes_value(flag: &str) -> bool {
+    let name = flag.split_once('=').map(|(name, _)| name).unwrap_or(flag);
+    matches!(name, "--unset" | "--chdir" | "--split-string")
+}
+
+fn command_base_name(raw: &str) -> String {
+    let clean = strip_quotes(raw);
+    clean
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(clean.as_str())
+        .to_lowercase()
+}
+
+fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
+    let command = segment.command.as_ref()?;
+    resolve_named_command(command, &segment.args)
+}
+
+fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<ResolvedCommand<'a>> {
+    let name = command_base_name(command);
+    match name.as_str() {
+        "env" => resolve_env_command(args),
+        "command" => resolve_command_wrapper(args),
+        "time" => resolve_time_wrapper(args),
+        "tirith" => resolve_tirith_command(args),
+        _ => Some(ResolvedCommand { name, args }),
+    }
+}
+
+fn resolve_env_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
+    let mut i = 0;
+    while i < args.len() {
+        let clean = strip_quotes(&args[i]);
+        if clean == "--" {
+            i += 1;
+            break;
+        }
+        if tokenize::is_env_assignment(&clean) {
+            i += 1;
+            continue;
+        }
+        if clean.starts_with('-') {
+            if clean.starts_with("--") {
+                if env_long_flag_takes_value(&clean) && !clean.contains('=') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if clean == "-u" || clean == "-C" || clean == "-S" {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        return resolve_named_command(&clean, &args[i + 1..]);
+    }
+
+    while i < args.len() {
+        let clean = strip_quotes(&args[i]);
+        if tokenize::is_env_assignment(&clean) {
+            i += 1;
+            continue;
+        }
+        return resolve_named_command(&clean, &args[i + 1..]);
+    }
+
+    None
+}
+
+fn resolve_command_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+    let mut i = 0;
+    while i < args.len() {
+        let clean = strip_quotes(&args[i]);
+        if clean == "--" {
+            i += 1;
+            break;
+        }
+        if clean.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    args.get(i)
+        .and_then(|arg| resolve_named_command(arg, &args[i + 1..]))
+}
+
+fn resolve_time_wrapper(args: &[String]) -> Option<ResolvedCommand<'_>> {
+    let mut i = 0;
+    while i < args.len() {
+        let clean = strip_quotes(&args[i]);
+        if clean == "--" {
+            i += 1;
+            break;
+        }
+        if clean.starts_with('-') {
+            if clean == "-f" || clean == "--format" || clean == "-o" || clean == "--output" {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    args.get(i)
+        .and_then(|arg| resolve_named_command(arg, &args[i + 1..]))
+}
+
+fn resolve_tirith_command(args: &[String]) -> Option<ResolvedCommand<'_>> {
+    let subcommand = args.first().map(|arg| command_base_name(arg))?;
+    match subcommand.as_str() {
+        "run" => Some(ResolvedCommand {
+            name: "tirith-run".to_string(),
+            args: &args[1..],
+        }),
+        _ => Some(ResolvedCommand {
+            name: "tirith".to_string(),
+            args,
+        }),
+    }
+}
+
 /// Check if a segment is in a "sink" context (executing/downloading).
 fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
-    if let Some(cmd) = &segment.command {
-        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
-        let cmd_lower = cmd_base.to_lowercase();
+    if let Some(cmd) = resolve_segment_command(segment) {
+        let cmd_lower = cmd.name;
         // git is only a sink for download subcommands (clone, fetch, pull, etc.)
         if cmd_lower == "git" {
-            return is_git_sink(segment);
+            return is_git_sink(cmd.args);
         }
         if is_source_command(&cmd_lower) {
             return true;
@@ -566,9 +723,8 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment]) -> bool {
     if let Some(sep) = &segment.preceding_separator {
         if sep == "|" || sep == "|&" {
             // This segment receives piped input — check if it's an interpreter
-            if let Some(cmd) = &segment.command {
-                let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd);
-                if is_interpreter(cmd_base) {
+            if let Some(cmd) = resolve_segment_command(segment) {
+                if is_interpreter(&cmd.name) {
                     return true;
                 }
             }
@@ -604,17 +760,32 @@ fn is_source_command(cmd: &str) -> bool {
             | "irm"
             | "invoke-webrequest"
             | "invoke-restmethod"
+            | "tirith-run"
     )
+}
+
+fn is_remote_copy_target(cmd: &str, arg: &str) -> bool {
+    if !matches!(cmd, "scp" | "rsync") {
+        return false;
+    }
+
+    if let Some(at_pos) = arg.find('@') {
+        let before_at = &arg[..at_pos];
+        let after_at = &arg[at_pos + 1..];
+        return !before_at.contains(':') && !after_at.contains('/') && !after_at.contains(':');
+    }
+
+    false
 }
 
 /// Check if a git command is in a sink context (only subcommands that download).
 /// `git add`, `git commit`, `git status`, etc. are NOT sinks.
-fn is_git_sink(segment: &Segment) -> bool {
-    if segment.args.is_empty() {
+fn is_git_sink(args: &[String]) -> bool {
+    if args.is_empty() {
         return false;
     }
     // First non-flag arg is the subcommand
-    for arg in &segment.args {
+    for arg in args {
         let clean = strip_quotes(arg);
         if clean.starts_with('-') {
             continue;
@@ -749,15 +920,6 @@ fn looks_like_schemeless_host(s: &str) -> bool {
     // Dotfiles and hidden files (e.g., .gitignore, .env.example) are not URLs
     if s.starts_with('.') {
         return false;
-    }
-    // Reject bare user@host (SSH/SCP/email) but keep user:pass@host (credentialed URL).
-    // bare user@host has no ':' before '@' and no '/' after the host.
-    if let Some(at_pos) = s.find('@') {
-        let before_at = &s[..at_pos];
-        let after_at = &s[at_pos + 1..];
-        if !before_at.contains(':') && !after_at.contains('/') {
-            return false;
-        }
     }
     // First component before / or end should look like a domain
     let host_part = s.split('/').next().unwrap_or(s);
@@ -1028,6 +1190,44 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_urls_from_leading_env_assignment() {
+        let urls = extract_urls(
+            "PAYLOAD_URL=https://example.com/install.sh curl ok",
+            ShellType::Posix,
+        );
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "https://example.com/install.sh" && u.in_sink_context),
+            "leading env assignment URL should be extracted in sink context"
+        );
+    }
+
+    #[test]
+    fn test_extract_urls_from_quoted_leading_env_assignment() {
+        let urls = extract_urls(
+            "PAYLOAD_URL='https://example.com/install.sh' curl ok",
+            ShellType::Posix,
+        );
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "https://example.com/install.sh"),
+            "quoted leading env assignment URL should be extracted"
+        );
+    }
+
+    #[test]
+    fn test_proxy_env_assignment_url_is_not_treated_as_destination() {
+        let urls = extract_urls(
+            "HTTP_PROXY=http://proxy:8080 curl https://example.com/data",
+            ShellType::Posix,
+        );
+        assert!(
+            !urls.iter().any(|u| u.raw == "http://proxy:8080"),
+            "proxy configuration URLs should not be treated as destinations"
+        );
+    }
+
+    #[test]
     fn test_extract_urls_pipe() {
         let urls = extract_urls(
             "curl https://example.com/install.sh | bash",
@@ -1061,6 +1261,49 @@ mod tests {
             ShellType::PowerShell,
         );
         assert!(!urls.is_empty());
+    }
+
+    #[test]
+    fn test_wrapper_preserves_sink_context() {
+        let urls = extract_urls(
+            "env --ignore-environment curl http://example.com",
+            ShellType::Posix,
+        );
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "http://example.com" && u.in_sink_context),
+            "wrapped sink commands should keep sink context"
+        );
+    }
+
+    #[test]
+    fn test_env_wrapper_preserves_tirith_run_sink_context() {
+        let urls = extract_urls("env tirith run http://example.com", ShellType::Posix);
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "http://example.com" && u.in_sink_context),
+            "env wrapper should preserve tirith run sink context"
+        );
+    }
+
+    #[test]
+    fn test_command_wrapper_preserves_tirith_run_sink_context() {
+        let urls = extract_urls("command tirith run http://example.com", ShellType::Posix);
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "http://example.com" && u.in_sink_context),
+            "command wrapper should preserve tirith run sink context"
+        );
+    }
+
+    #[test]
+    fn test_time_wrapper_preserves_tirith_run_sink_context() {
+        let urls = extract_urls("time tirith run http://example.com", ShellType::Posix);
+        assert!(
+            urls.iter()
+                .any(|u| u.raw == "http://example.com" && u.in_sink_context),
+            "time wrapper should preserve tirith run sink context"
+        );
     }
 
     #[test]
@@ -1153,6 +1396,20 @@ mod tests {
             .filter(|u| matches!(u.parsed, UrlLike::DockerRef { .. }))
             .collect();
         assert_eq!(docker_urls.len(), 1);
+    }
+
+    #[test]
+    fn test_docker_run_image_after_double_dash() {
+        let urls = extract_urls(
+            "docker run --rm -- evil.registry/ns/img:1",
+            ShellType::Posix,
+        );
+        let docker_urls: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::DockerRef { .. }))
+            .collect();
+        assert_eq!(docker_urls.len(), 1);
+        assert_eq!(docker_urls[0].raw, "evil.registry/ns/img:1");
     }
 
     /// Constraint #2: Verify that EXTRACTOR_IDS is non-empty and
@@ -1299,6 +1556,27 @@ mod tests {
             !schemeless.is_empty(),
             "evil.com/payload should be detected as schemeless URL"
         );
+    }
+
+    #[test]
+    fn test_schemeless_user_at_host_detected_in_sink_context() {
+        let urls = extract_urls("curl user@bit.ly", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert_eq!(schemeless.len(), 1);
+        assert_eq!(schemeless[0].raw, "user@bit.ly");
+    }
+
+    #[test]
+    fn test_scp_user_at_host_not_treated_as_schemeless_url() {
+        let urls = extract_urls("scp user@server.com file.txt", ShellType::Posix);
+        let schemeless: Vec<_> = urls
+            .iter()
+            .filter(|u| matches!(u.parsed, UrlLike::SchemelessHostPath { .. }))
+            .collect();
+        assert!(schemeless.is_empty());
     }
 
     #[test]

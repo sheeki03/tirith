@@ -418,6 +418,30 @@ pub fn is_env_assignment(word: &str) -> bool {
     }
 }
 
+/// Return the values from leading `NAME=VALUE` tokens in a raw segment.
+/// Stops at the first non-assignment word, matching the shell prefix-assignment model.
+pub fn leading_env_assignments(segment_raw: &str) -> Vec<(String, String)> {
+    let mut assignments = Vec::new();
+    for word in split_words(segment_raw.trim()) {
+        if !is_env_assignment(&word) {
+            break;
+        }
+        if let Some((name, value)) = word.split_once('=') {
+            assignments.push((name.to_string(), value.to_string()));
+        }
+    }
+    assignments
+}
+
+/// Return the values from leading `NAME=VALUE` tokens in a raw segment.
+/// Stops at the first non-assignment word, matching the shell prefix-assignment model.
+pub fn leading_env_assignment_values(segment_raw: &str) -> Vec<String> {
+    leading_env_assignments(segment_raw)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
 /// Split a segment into words, respecting quotes.
 fn split_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
@@ -616,6 +640,26 @@ mod tests {
         assert!(!is_env_assignment("=value"));
         assert!(!is_env_assignment("--flag=value"));
         assert!(!is_env_assignment("1FOO=bar"));
+    }
+
+    #[test]
+    fn test_leading_env_assignment_values() {
+        assert_eq!(
+            leading_env_assignment_values("URL=https://example.com curl ok"),
+            vec!["https://example.com"]
+        );
+        assert_eq!(
+            leading_env_assignments("URL='https://example.com/a' FOO=bar curl ok"),
+            vec![
+                ("URL".to_string(), "'https://example.com/a'".to_string()),
+                ("FOO".to_string(), "bar".to_string())
+            ]
+        );
+        assert_eq!(
+            leading_env_assignment_values("URL='https://example.com/a' FOO=bar curl ok"),
+            vec!["'https://example.com/a'", "bar"]
+        );
+        assert!(leading_env_assignment_values("env URL=https://example.com curl ok").is_empty());
     }
 
     #[test]
