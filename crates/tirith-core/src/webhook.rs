@@ -152,6 +152,8 @@ fn expand_env_value(input: &str) -> String {
                 let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
                 if !var_name.starts_with("TIRITH_") {
                     eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                } else if is_sensitive_webhook_env_var(&var_name) {
+                    eprintln!("tirith: webhook: sensitive env var '{var_name}' blocked");
                 } else {
                     match std::env::var(&var_name) {
                         Ok(val) => result.push_str(&val),
@@ -174,6 +176,8 @@ fn expand_env_value(input: &str) -> String {
                 if !var_name.is_empty() {
                     if !var_name.starts_with("TIRITH_") {
                         eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                    } else if is_sensitive_webhook_env_var(&var_name) {
+                        eprintln!("tirith: webhook: sensitive env var '{var_name}' blocked");
                     } else {
                         match std::env::var(&var_name) {
                             Ok(val) => result.push_str(&val),
@@ -192,6 +196,11 @@ fn expand_env_value(input: &str) -> String {
     }
 
     result
+}
+
+#[cfg(unix)]
+fn is_sensitive_webhook_env_var(var_name: &str) -> bool {
+    matches!(var_name, "TIRITH_API_KEY" | "TIRITH_LICENSE")
 }
 
 /// Send a webhook with exponential backoff retry.
@@ -300,6 +309,107 @@ mod tests {
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2 rest"), "val rest");
         unsafe { std::env::remove_var("TIRITH_TEST_WH2") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_expand_env_value_blocks_sensitive_vars() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TIRITH_API_KEY", "secret-api-key");
+            std::env::set_var("TIRITH_LICENSE", "secret-license");
+        }
+        assert_eq!(expand_env_value("Bearer $TIRITH_API_KEY"), "Bearer ");
+        assert_eq!(expand_env_value("${TIRITH_LICENSE}"), "");
+        unsafe {
+            std::env::remove_var("TIRITH_API_KEY");
+            std::env::remove_var("TIRITH_LICENSE");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial bypass attempts: sensitive env var exfiltration
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_sensitive_var_both_forms() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TIRITH_API_KEY", "leaked");
+            std::env::set_var("TIRITH_LICENSE", "leaked");
+        }
+        // $VAR form
+        assert!(!expand_env_value("$TIRITH_API_KEY").contains("leaked"));
+        assert!(!expand_env_value("$TIRITH_LICENSE").contains("leaked"));
+        // ${VAR} form
+        assert!(!expand_env_value("${TIRITH_API_KEY}").contains("leaked"));
+        assert!(!expand_env_value("${TIRITH_LICENSE}").contains("leaked"));
+        // Embedded in header value
+        assert!(!expand_env_value("Bearer ${TIRITH_API_KEY}").contains("leaked"));
+        assert!(!expand_env_value("token=$TIRITH_API_KEY&extra").contains("leaked"));
+        unsafe {
+            std::env::remove_var("TIRITH_API_KEY");
+            std::env::remove_var("TIRITH_LICENSE");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_case_variation_is_different_var() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        // Unix env vars are case-sensitive: TIRITH_api_key != TIRITH_API_KEY
+        // The blocklist is exact-match, so a case variant is a DIFFERENT var.
+        // This is correct — TIRITH_api_key is not a real sensitive var.
+        unsafe { std::env::set_var("TIRITH_api_key", "not-sensitive") };
+        assert_eq!(
+            expand_env_value("$TIRITH_api_key"),
+            "not-sensitive",
+            "Case-different var name should expand (it's a different var)"
+        );
+        unsafe { std::env::remove_var("TIRITH_api_key") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_non_sensitive_tirith_var_still_expands() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_ORG_NAME", "myorg") };
+        assert_eq!(expand_env_value("$TIRITH_ORG_NAME"), "myorg");
+        assert_eq!(expand_env_value("${TIRITH_ORG_NAME}"), "myorg");
+        unsafe { std::env::remove_var("TIRITH_ORG_NAME") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_double_dollar_does_not_expand() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
+        // $$TIRITH_API_KEY: first $ sees second $ which is not '{' or alnum,
+        // so it becomes a literal '$', then the second $ starts a new expansion
+        // which hits the blocklist.
+        let result = expand_env_value("$$TIRITH_API_KEY");
+        assert!(
+            !result.contains("leaked"),
+            "Double-dollar must not leak: got {result}"
+        );
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_nested_braces_does_not_expand() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
+        // ${TIRITH_${NESTED}} — the inner ${...} is consumed as the var name
+        // "TIRITH_${NESTED" (take_while stops at '}'), which doesn't start
+        // with TIRITH_ in any meaningful way that resolves.
+        let result = expand_env_value("${TIRITH_${NESTED}}");
+        assert!(
+            !result.contains("leaked"),
+            "Nested braces must not leak: got {result}"
+        );
+        unsafe { std::env::remove_var("TIRITH_API_KEY") };
     }
 
     #[cfg(unix)]

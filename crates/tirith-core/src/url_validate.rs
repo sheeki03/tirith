@@ -1,5 +1,5 @@
 /// URL validation for outbound HTTP requests (SSRF protection).
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 type HostResolver = dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String>;
 
@@ -175,6 +175,9 @@ fn is_forbidden_ip(ip: &IpAddr) -> bool {
                 || o[0] >= 240
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = embedded_ipv4_in_v6(v6) {
+                return is_forbidden_ip(&IpAddr::V4(v4));
+            }
             let s = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -184,6 +187,30 @@ fn is_forbidden_ip(ip: &IpAddr) -> bool {
                 || (s[0] == 0x2001 && s[1] == 0x0db8)
         }
     }
+}
+
+fn embedded_ipv4_in_v6(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+
+    let octets = v6.octets();
+    if octets[..12].iter().all(|&b| b == 0) {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    const NAT64_WELL_KNOWN_PREFIX: [u8; 12] = [
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    if octets.starts_with(&NAT64_WELL_KNOWN_PREFIX) {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -338,5 +365,190 @@ mod tests {
             &|_, _| Err("resolver should not be called".to_string()),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_ipv6_literal() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:127.0.0.1]/api",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-public"));
+    }
+
+    #[test]
+    fn test_rejects_hostname_resolving_to_ipv4_mapped_ipv6() {
+        let result = validate_outbound_url_with_resolver(
+            "https://example.com/api",
+            UrlValidationMode::Fetch,
+            &resolver_with("::ffff:169.254.169.254".parse().unwrap()),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("169.254.169.254"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial bypass attempts: embedded IPv4 / translated IPv6
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bypass_mapped_cloud_metadata() {
+        // ::ffff:169.254.169.254 — AWS metadata endpoint via IPv4-mapped
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:169.254.169.254]/latest/meta-data/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped metadata must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_mapped_private_10() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:10.0.0.1]/admin",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped 10.x must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_mapped_private_192() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:192.168.1.1]/config",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped 192.168.x must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_mapped_private_172() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:172.16.0.1]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped 172.16.x must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_mapped_unspecified() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:0.0.0.0]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped 0.0.0.0 must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_mapped_broadcast() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::ffff:255.255.255.255]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "IPv4-mapped broadcast must be blocked");
+    }
+
+    #[test]
+    fn test_bypass_resolved_mapped_loopback() {
+        // DNS returns ::ffff:127.0.0.1 for a hostname
+        let result = validate_outbound_url_with_resolver(
+            "https://attacker.example.com/",
+            UrlValidationMode::Server,
+            &resolver_with("::ffff:127.0.0.1".parse().unwrap()),
+        );
+        assert!(
+            result.is_err(),
+            "Resolved IPv4-mapped loopback must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_bypass_resolved_mapped_private() {
+        // DNS returns ::ffff:10.0.0.1 for a hostname
+        let result = validate_outbound_url_with_resolver(
+            "https://attacker.example.com/api",
+            UrlValidationMode::Fetch,
+            &resolver_with("::ffff:10.0.0.1".parse().unwrap()),
+        );
+        assert!(
+            result.is_err(),
+            "Resolved IPv4-mapped private must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_rejects_nat64_encoded_loopback() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[64:ff9b::127.0.0.1]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_err(), "NAT64-encoded loopback must be blocked");
+    }
+
+    #[test]
+    fn test_rejects_resolved_nat64_encoded_metadata() {
+        let result = validate_outbound_url_with_resolver(
+            "https://example.com/api",
+            UrlValidationMode::Fetch,
+            &resolver_with("64:ff9b::169.254.169.254".parse().unwrap()),
+        );
+        assert!(
+            result.is_err(),
+            "NAT64-encoded metadata address must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_rejects_ipv4_compatible_loopback() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[::127.0.0.1]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "IPv4-compatible loopback form must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_allows_nat64_encoded_public_ipv4() {
+        let result = validate_outbound_url_with_resolver(
+            "https://[64:ff9b::0808:0808]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(
+            result.is_ok(),
+            "NAT64-encoded public IPv4 should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_legitimate_public_ipv6_still_allowed() {
+        // Google's public DNS — must NOT be blocked
+        let result = validate_outbound_url_with_resolver(
+            "https://[2607:f8b0:4004:800::200e]/",
+            UrlValidationMode::Server,
+            &|_, _| Err("resolver should not be called".to_string()),
+        );
+        assert!(result.is_ok(), "Public IPv6 must be allowed");
+    }
+
+    #[test]
+    fn test_legitimate_resolved_public_ipv6_allowed() {
+        let result = validate_outbound_url_with_resolver(
+            "https://example.com/api",
+            UrlValidationMode::Server,
+            &resolver_with("2607:f8b0:4004:800::200e".parse().unwrap()),
+        );
+        assert!(result.is_ok(), "Resolved public IPv6 must be allowed");
     }
 }

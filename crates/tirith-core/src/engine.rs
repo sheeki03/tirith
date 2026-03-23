@@ -664,29 +664,42 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 
     // Allowlist: remove findings for URLs that match allowlist
     // (blocklist takes precedence — if blocklisted, findings remain)
-    if !policy.allowlist.is_empty() {
-        let blocklisted_urls: Vec<String> = extracted
+    if !policy.allowlist.is_empty() || !policy.allowlist_rules.is_empty() {
+        let blocklisted_urls: Vec<&str> = extracted
             .iter()
             .filter(|u| policy.is_blocklisted(&u.raw))
-            .map(|u| u.raw.clone())
+            .map(|u| u.raw.as_str())
             .collect();
 
         findings.retain(|f| {
-            // Keep all findings that aren't URL-based
-            let url_in_evidence = f.evidence.iter().find_map(|e| {
-                if let crate::verdict::Evidence::Url { raw } = e {
-                    Some(raw.clone())
-                } else {
-                    None
-                }
-            });
-            match url_in_evidence {
-                Some(ref url) => {
-                    // Keep if blocklisted, otherwise drop if allowlisted
-                    blocklisted_urls.contains(url) || !policy.is_allowlisted(url)
-                }
-                None => true, // Keep non-URL findings
+            let urls_in_evidence: Vec<&str> = f
+                .evidence
+                .iter()
+                .filter_map(|e| match e {
+                    crate::verdict::Evidence::Url { raw } => Some(raw.as_str()),
+                    _ => None,
+                })
+                .collect();
+
+            if urls_in_evidence.is_empty() {
+                return true;
             }
+
+            let rule_allowlisted = |url: &str| {
+                policy.is_allowlisted_for_rule(&f.rule_id.to_string(), url)
+                    || f.custom_rule_id.as_deref().is_some_and(|custom_rule_id| {
+                        policy.is_allowlisted_for_rule(custom_rule_id, url)
+                    })
+            };
+
+            // Keep if any referenced URL is blocklisted. Otherwise only drop the
+            // finding when every referenced URL is allowlisted for this finding.
+            urls_in_evidence
+                .iter()
+                .any(|url| blocklisted_urls.contains(url))
+                || !urls_in_evidence
+                    .iter()
+                    .all(|url| policy.is_allowlisted(url) || rule_allowlisted(url))
         });
     }
 

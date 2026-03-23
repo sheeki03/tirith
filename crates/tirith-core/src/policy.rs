@@ -490,19 +490,19 @@ impl Policy {
 
     /// Check if a URL is in the allowlist.
     pub fn is_allowlisted(&self, url: &str) -> bool {
-        let url_lower = url.to_lowercase();
-        self.allowlist.iter().any(|pattern| {
-            let p = pattern.to_lowercase();
-            if p.is_empty() {
-                return false;
-            }
-            if is_domain_pattern(&p) {
-                if let Some(host) = extract_host_for_match(url) {
-                    return domain_matches(&host, &p);
-                }
-                return false;
-            }
-            url_lower.contains(&p)
+        self.allowlist
+            .iter()
+            .any(|pattern| allowlist_pattern_matches(pattern, url))
+    }
+
+    /// Check if a URL is allowlisted for a specific rule or custom rule ID.
+    pub fn is_allowlisted_for_rule(&self, rule_id: &str, url: &str) -> bool {
+        self.allowlist_rules.iter().any(|rule| {
+            rule.rule_id.eq_ignore_ascii_case(rule_id)
+                && rule
+                    .patterns
+                    .iter()
+                    .any(|pattern| allowlist_pattern_matches(pattern, url))
         })
     }
 
@@ -601,6 +601,20 @@ fn domain_matches(host: &str, pattern: &str) -> bool {
     let host = host.trim_end_matches('.');
     let pattern = pattern.trim_start_matches("*.").trim_end_matches('.');
     host == pattern || host.ends_with(&format!(".{pattern}"))
+}
+
+fn allowlist_pattern_matches(pattern: &str, url: &str) -> bool {
+    let p = pattern.to_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    if is_domain_pattern(&p) {
+        if let Some(host) = extract_host_for_match(url) {
+            return domain_matches(&host, &p);
+        }
+        return false;
+    }
+    url.to_lowercase().contains(&p)
 }
 
 /// Discover policy path by walking up from cwd to .git boundary.

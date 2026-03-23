@@ -1,11 +1,11 @@
 {
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection",
   "homepage": "https://github.com/sheeki03/tirith",
   "license": "AGPL-3.0-only",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/sheeki03/tirith/releases/download/v0.2.8/tirith-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/sheeki03/tirith/releases/download/v0.2.9/tirith-x86_64-pc-windows-msvc.zip",
       "hash": "PLACEHOLDER"
     }
   },

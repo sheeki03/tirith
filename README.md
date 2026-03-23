@@ -450,7 +450,7 @@ Run tirith as an MCP server over JSON-RPC stdio. Used by AI coding tools for int
 - **No command rewriting** — tirith never modifies what you typed
 - **No telemetry** — no analytics, no crash reporting, no phone-home behavior
 - **No background processes** — invoked per-command, exits immediately
-- **Network only when you ask** — `run`, `fetch`, and `audit report --upload` reach the network, but only on explicit invocation. Core detection never does.
+- **Network only when you ask or configure it** — `run`, `fetch`, and `audit report --upload` reach the network on explicit invocation. Optional webhook and policy-server integrations can also make outbound requests when configured. Core detection itself does not phone home.
 
 ---
 
@@ -470,6 +470,15 @@ severity_overrides:
   docker_untrusted_registry: CRITICAL
 
 fail_mode: open  # or "closed" for strict environments
+```
+
+Use `allowlist_rules` for rule-scoped suppressions when you trust a source for one rule but do not want to globally allowlist it:
+
+```yaml
+allowlist_rules:
+  - rule_id: curl_pipe_shell
+    patterns:
+      - "get.docker.com"
 ```
 
 More examples in [docs/cookbook.md](docs/cookbook.md).
@@ -505,7 +514,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-**Every feature is available to everyone — no tiers, no feature gating.** All 66 detection rules, the MCP server, config scanning, cloaking detection, and every command ship fully unlocked.
+**Core security coverage ships in the open-source tree.** All 66 detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 

