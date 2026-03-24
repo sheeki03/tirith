@@ -56,6 +56,8 @@ struct PrivateKeyDef {
     regex: String,
     #[allow(dead_code)]
     tier1_fragment: String,
+    #[allow(dead_code)]
+    severity: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +86,11 @@ static KNOWN_PATTERNS: Lazy<Vec<CompiledPattern>> = Lazy::new(|| {
 static PRIVATE_KEY_RE: Lazy<Regex> = Lazy::new(|| {
     let toml_src = include_str!("../../assets/data/credential_patterns.toml");
     let file: PatternFile = toml::from_str(toml_src).expect("credential_patterns.toml parse error");
-    let pat = &file.private_key_pattern[0].regex;
+    let pat = &file
+        .private_key_pattern
+        .first()
+        .expect("credential_patterns.toml must contain at least one [[private_key_pattern]]")
+        .regex;
     Regex::new(pat).expect("bad private key regex")
 });
 
@@ -502,6 +508,53 @@ mod tests {
                 "title must not contain the raw secret"
             );
         }
+    }
+
+    #[test]
+    fn test_a3t_variant_detected() {
+        let input = "A3T1IOSFODNN7EXAMPLE";
+        let findings = check(input, ShellType::Posix, ScanContext::Paste);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "A3T-prefixed AWS key variant should be detected"
+        );
+    }
+
+    #[test]
+    fn test_slack_token_detected() {
+        let input = concat!(
+            "xoxb-",
+            "123456789012-",
+            "123456789012-",
+            "AbCdEfGhIjKlMnOpQrStUvWx"
+        );
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "valid Slack token should be detected"
+        );
+    }
+
+    #[test]
+    fn test_slack_token_does_not_match_word_suffix() {
+        let input = concat!(
+            "xoxb-",
+            "123456789012-",
+            "123456789012-",
+            "AbCdEfGhIjKlMnOpQrStUvWx",
+            "_suffix"
+        );
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.rule_id != RuleId::CredentialInText),
+            "Slack token regex should not match when a word suffix extends the token"
+        );
     }
 
     #[test]

@@ -99,8 +99,8 @@ pub fn redact(input: &str) -> String {
             .regex
             .replace_all(&result, |caps: &regex::Captures| {
                 let matched = &caps[0];
-                let prefix_len = entry.prefix_len.min(matched.len());
-                format!("{}[REDACTED]", &matched[..prefix_len])
+                let prefix: String = matched.chars().take(entry.prefix_len).collect();
+                format!("{prefix}[REDACTED]")
             })
             .into_owned();
     }

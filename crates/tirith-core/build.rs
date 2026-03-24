@@ -33,6 +33,8 @@ struct PrivKeyPattern {
     name: String,
     #[allow(dead_code)]
     regex: String,
+    #[allow(dead_code)]
+    severity: String,
 }
 
 fn main() {
