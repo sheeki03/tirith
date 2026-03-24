@@ -1,6 +1,39 @@
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::Path;
+
+#[derive(Deserialize)]
+struct CredentialPatternsFile {
+    pattern: Option<Vec<CredPattern>>,
+    private_key_pattern: Option<Vec<PrivKeyPattern>>,
+}
+
+#[derive(Deserialize)]
+struct CredPattern {
+    tier1_fragment: String,
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    regex: String,
+    #[allow(dead_code)]
+    redact_prefix_len: Option<usize>,
+    #[allow(dead_code)]
+    severity: String,
+}
+
+#[derive(Deserialize)]
+struct PrivKeyPattern {
+    tier1_fragment: String,
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    regex: String,
+}
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -21,6 +54,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/data/popular_repos.csv");
     println!("cargo:rerun-if-changed=assets/data/public_suffix_list.dat");
     println!("cargo:rerun-if-changed=assets/data/ocr_confusions.tsv");
+    println!("cargo:rerun-if-changed=assets/data/credential_patterns.toml");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -447,6 +481,64 @@ fn generate_tier1_regex(out_dir: &str) {
                  Every extractor must have a Tier 1 trigger to maintain the superset invariant.",
             );
         }
+    }
+
+    // Load credential patterns from TOML and inject tier-1 entries
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let cred_path = Path::new(&manifest_dir)
+        .join("assets")
+        .join("data")
+        .join("credential_patterns.toml");
+    let cred_content = fs::read_to_string(&cred_path)
+        .unwrap_or_else(|e| panic!("Failed to read credential_patterns.toml: {e}"));
+    let cred_file: CredentialPatternsFile = toml::from_str(&cred_content)
+        .unwrap_or_else(|e| panic!("Failed to parse credential_patterns.toml: {e}"));
+
+    // credential_known — exec fragments from all [[pattern]] entries
+    {
+        let mut known_frags: Vec<String> = Vec::new();
+        if let Some(ref patterns) = cred_file.pattern {
+            for p in patterns {
+                known_frags.push(p.tier1_fragment.clone());
+            }
+        }
+        assert!(
+            !known_frags.is_empty(),
+            "credential_patterns.toml has no [[pattern]] entries"
+        );
+        ids.push("credential_known".to_string());
+        for frag in &known_frags {
+            exec_fragments.push(frag.clone());
+            paste_fragments.push(frag.clone());
+        }
+    }
+
+    // credential_private_key — exec fragment from [[private_key_pattern]]
+    {
+        let pk_patterns = cred_file
+            .private_key_pattern
+            .as_ref()
+            .expect("credential_patterns.toml has no [[private_key_pattern]]");
+        assert!(
+            !pk_patterns.is_empty(),
+            "credential_patterns.toml [[private_key_pattern]] is empty"
+        );
+        ids.push("credential_private_key".to_string());
+        for pk in pk_patterns {
+            exec_fragments.push(pk.tier1_fragment.clone());
+            paste_fragments.push(pk.tier1_fragment.clone());
+        }
+    }
+
+    // credential_generic — paste-only fragment for generic key=value patterns
+    {
+        // Tier-1 must be a superset of GENERIC_SECRET_RE. The runtime regex
+        // allows optional quote/bracket before the operator (["']?\]?), which
+        // cannot contain literal " in the r"..." generated output. We use
+        // .{0,2} as a permissive stand-in for the optional quote+bracket.
+        let generic_frag = r"(?i:key|token|secret|password)\w*.{0,2}\s*(?:[:=]|:=|=>|<-|>)";
+        ids.push("credential_generic".to_string());
+        paste_fragments.push(generic_frag.to_string());
     }
 
     let exec_regex = format!("(?:{})", exec_fragments.join("|"));

@@ -97,6 +97,11 @@ pub enum RuleId {
     // PDF rules
     PdfHiddenText,
 
+    // Credential rules
+    CredentialInText,
+    HighEntropySecret,
+    PrivateKeyExposed,
+
     // Policy rules
     PolicyBlocklisted,
 

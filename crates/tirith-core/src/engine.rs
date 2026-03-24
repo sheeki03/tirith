@@ -608,6 +608,11 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         );
         findings.extend(command_findings);
 
+        // Run credential leak detection rules
+        let cred_findings =
+            crate::rules::credential::check(&ctx.input, ctx.shell, ctx.scan_context);
+        findings.extend(cred_findings);
+
         // Run environment rules
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
@@ -917,6 +922,8 @@ fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
         RuleId::ShellInjectionEnv => Some("T1546.004"), // Shell Config Modification
 
         // Credential Access
+        RuleId::CredentialInText | RuleId::HighEntropySecret => Some("T1552"), // Unsecured Credentials
+        RuleId::PrivateKeyExposed => Some("T1552.004"),                        // Private Keys
         RuleId::MetadataEndpoint => Some("T1552.005"), // Unsecured Credentials: Cloud Instance Metadata
         RuleId::SensitiveEnvExport => Some("T1552.001"), // Credentials In Files
 

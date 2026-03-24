@@ -938,14 +938,7 @@ const SHELL_INJECTION_VARS: &[&str] = &["BASH_ENV", "ENV", "PROMPT_COMMAND"];
 const INTERPRETER_HIJACK_VARS: &[&str] = &["PYTHONPATH", "NODE_OPTIONS", "RUBYLIB", "PERL5LIB"];
 
 /// Sensitive credential variable names that should not be exported in commands.
-const SENSITIVE_KEY_VARS: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GITHUB_TOKEN",
-];
+use super::shared::SENSITIVE_KEY_VARS;
 
 fn classify_env_var(name: &str) -> Option<(RuleId, Severity, &'static str, &'static str)> {
     let name_upper = name.to_ascii_uppercase();

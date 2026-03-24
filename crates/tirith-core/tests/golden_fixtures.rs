@@ -257,6 +257,16 @@ fn test_rendered_fixtures() {
     eprintln!("Passed {count} rendered fixtures");
 }
 
+#[test]
+fn test_credential_fixtures() {
+    let fixtures = load_fixtures("credential.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} credential fixtures");
+}
+
 /// Verify total fixture count across all files.
 #[test]
 fn test_fixture_count() {
@@ -273,6 +283,7 @@ fn test_fixture_count() {
         "policy.toml",
         "configfile.toml",
         "rendered.toml",
+        "credential.toml",
     ];
 
     let total: usize = files.iter().map(|f| load_fixtures(f).len()).sum();
@@ -293,6 +304,7 @@ fn test_tier1_coverage() {
         "terminal.toml",
         "command.toml",
         "ecosystem.toml",
+        "credential.toml",
     ];
 
     let mut missed = Vec::new();
@@ -379,6 +391,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "policy.toml",
     "configfile.toml",
     "rendered.toml",
+    "credential.toml",
 ];
 
 /// Complete list of all RuleId variants (snake_case serialized form).
@@ -457,6 +470,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "hidden_html_attribute",
     "markdown_comment",
     "html_comment",
+    // Credential
+    "credential_in_text",
+    "high_entropy_secret",
+    "private_key_exposed",
     // Cloaking
     "server_cloaking",
     // Clipboard
@@ -612,6 +629,9 @@ fn test_rule_id_list_is_complete() {
         RuleId::HiddenHtmlAttribute,
         RuleId::MarkdownComment,
         RuleId::HtmlComment,
+        RuleId::CredentialInText,
+        RuleId::HighEntropySecret,
+        RuleId::PrivateKeyExposed,
         RuleId::ServerCloaking,
         RuleId::ClipboardHidden,
         RuleId::PdfHiddenText,
@@ -670,6 +690,9 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "mcp_duplicate_server_name", // file context, no URL needed
         "metadata_endpoint",         // bare IP: curl 169.254.169.254/path
         "private_network_access",    // bare IP: curl 10.0.0.1/path
+        "credential_in_text",        // token/key in text, no URL needed
+        "high_entropy_secret",       // high-entropy secret assignment, no URL needed
+        "private_key_exposed",       // PEM key block, no URL needed
     ]
     .into_iter()
     .collect();
@@ -767,6 +790,15 @@ fn test_extractor_ids_cover_rule_triggers() {
         ("punycode detection", &["punycode_domain"]),
         ("lookalike TLD", &["lookalike_tld"]),
         ("URL shortener", &["url_shortener"]),
+        // Credential detection
+        (
+            "credential detection",
+            &[
+                "credential_known",
+                "credential_private_key",
+                "credential_generic",
+            ],
+        ),
     ];
 
     let mut missing = Vec::new();
