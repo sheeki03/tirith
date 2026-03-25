@@ -3,7 +3,7 @@ members = ["crates/tirith-core", "crates/tirith", "tools/sign-license", "tools/l
 resolver = "2"
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.83"
