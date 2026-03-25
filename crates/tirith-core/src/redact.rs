@@ -1,6 +1,61 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+/// Credential redaction entry: (label, regex, prefix_len).
+/// prefix_len chars are kept visible, the rest is replaced with [REDACTED].
+struct CredRedactEntry {
+    regex: Regex,
+    prefix_len: usize,
+}
+
+/// Credential patterns loaded from credential_patterns.toml at compile time.
+static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
+    #[derive(serde::Deserialize)]
+    struct CredFile {
+        pattern: Option<Vec<CredPat>>,
+        private_key_pattern: Option<Vec<PkPat>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CredPat {
+        regex: String,
+        redact_prefix_len: Option<usize>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PkPat {
+        #[allow(dead_code)]
+        regex: String,
+        redact_regex: Option<String>,
+    }
+
+    let toml_str = include_str!("../assets/data/credential_patterns.toml");
+    let cred_file: CredFile = toml::from_str(toml_str).expect("invalid credential_patterns.toml");
+
+    let mut entries = Vec::new();
+    if let Some(patterns) = cred_file.pattern {
+        for p in patterns {
+            if let Ok(re) = Regex::new(&p.regex) {
+                entries.push(CredRedactEntry {
+                    regex: re,
+                    prefix_len: p.redact_prefix_len.unwrap_or(4),
+                });
+            }
+        }
+    }
+    if let Some(pk_patterns) = cred_file.private_key_pattern {
+        for pk in pk_patterns {
+            // Use redact_regex (full PEM block) if available, fall back to header-only regex
+            let redact_pattern = pk.redact_regex.as_deref().unwrap_or(&pk.regex);
+            if let Ok(re) = Regex::new(redact_pattern) {
+                entries.push(CredRedactEntry {
+                    regex: re,
+                    prefix_len: 0,
+                });
+            }
+        }
+    }
+    entries
+});
+
 /// Built-in redaction patterns: (label, regex).
 static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
     vec![
@@ -29,12 +84,24 @@ static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
     ]
 });
 
-/// Redact sensitive content from a string using built-in patterns.
+/// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
     let mut result = input.to_string();
+    // Apply built-in patterns first (existing behavior, labeled redaction)
     for (label, regex) in BUILTIN_PATTERNS.iter() {
         result = regex
             .replace_all(&result, format!("[REDACTED:{label}]"))
+            .into_owned();
+    }
+    // Apply credential patterns (prefix-preserving, catches patterns not in builtins)
+    for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
+        result = entry
+            .regex
+            .replace_all(&result, |caps: &regex::Captures| {
+                let matched = &caps[0];
+                let prefix: String = matched.chars().take(entry.prefix_len).collect();
+                format!("{prefix}[REDACTED]")
+            })
             .into_owned();
     }
     result
@@ -306,8 +373,9 @@ mod tests {
 
     #[test]
     fn test_redact_openai_key() {
-        let input = "export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz12345678";
-        let redacted = redact(input);
+        let key = concat!("sk-", "abcdefghijklmnopqrstuvwxyz12345678");
+        let input = format!("export OPENAI_API_KEY={key}");
+        let redacted = redact(&input);
         assert!(!redacted.contains("sk-abcdef"));
         assert!(redacted.contains("[REDACTED:OpenAI API Key]"));
     }
@@ -322,8 +390,9 @@ mod tests {
 
     #[test]
     fn test_redact_github_pat() {
-        let input = "GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl";
-        let redacted = redact(input);
+        let pat = concat!("gh", "p_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl");
+        let input = format!("GITHUB_TOKEN={pat}");
+        let redacted = redact(&input);
         assert!(!redacted.contains("ghp_ABCDEF"));
         assert!(redacted.contains("[REDACTED:GitHub PAT]"));
     }
@@ -354,8 +423,9 @@ mod tests {
 
     #[test]
     fn test_redact_anthropic_key() {
-        let input = "ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnop";
-        let redacted = redact(input);
+        let key = concat!("sk-ant-api03-", "abcdefghijklmnop");
+        let input = format!("ANTHROPIC_API_KEY={key}");
+        let redacted = redact(&input);
         assert!(!redacted.contains("sk-ant-api03"));
         assert!(redacted.contains("[REDACTED:Anthropic API Key]"));
     }
@@ -363,27 +433,30 @@ mod tests {
     #[test]
     fn test_redact_finding_covers_all_fields() {
         use crate::verdict::{Evidence, Finding, RuleId, Severity};
+        let openai_key = concat!("sk-", "abcdefghijklmnopqrstuvwxyz12345678");
+        let github_pat = concat!("gh", "p_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl");
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
 
         let mut finding = Finding {
             rule_id: RuleId::SensitiveEnvExport,
             severity: Severity::High,
             title: "test".into(),
-            description: "exports sk-abcdefghijklmnopqrstuvwxyz12345678".into(),
+            description: format!("exports {openai_key}"),
             evidence: vec![
                 Evidence::EnvVar {
                     name: "OPENAI_API_KEY".into(),
-                    value_preview: "sk-abcdefghijklmnopqrstuvwxyz12345678".into(),
+                    value_preview: openai_key.into(),
                 },
                 Evidence::Text {
-                    detail: "saw ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl".into(),
+                    detail: format!("saw {github_pat}"),
                 },
                 Evidence::CommandPattern {
                     pattern: "export".into(),
-                    matched: "export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz12345678".into(),
+                    matched: format!("export OPENAI_API_KEY={openai_key}"),
                 },
             ],
-            human_view: Some("key is sk-abcdefghijklmnopqrstuvwxyz12345678".into()),
-            agent_view: Some("AKIAIOSFODNN7EXAMPLE exposed".into()),
+            human_view: Some(format!("key is {openai_key}")),
+            agent_view: Some(format!("{aws_key} exposed")),
             mitre_id: None,
             custom_rule_id: None,
         };
