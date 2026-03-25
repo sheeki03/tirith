@@ -92,13 +92,15 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**66 detection rules across 11 categories.**
+**75+ detection rules across 13 categories.**
 
 | Category | What it stops |
 |----------|--------------|
 | **Homograph attacks** | Cyrillic/Greek lookalikes in hostnames, punycode domains, mixed-script labels, lookalike TLDs, confusable domains |
 | **Terminal injection** | ANSI escape sequences, bidi overrides, zero-width characters, unicode tags, invisible math operators, variation selectors |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)` — every source-to-sink pattern |
+| **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
+| **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps — inspired by the [TeamPCP attack](https://ramimac.me/teampcp/) |
 | **Command safety** | Dotfile overwrites, archive extraction to sensitive paths, cloud metadata endpoint access, private network access |
 | **Insecure transport** | Plain HTTP piped to shell, `curl -k`, disabled TLS verification, shortened URLs hiding destinations |
 | **Environment** | Proxy hijacking, sensitive env exports, code injection via env, interpreter hijack, shell injection env |
@@ -514,7 +516,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-**Core security coverage ships in the open-source tree.** All 66 detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 75+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 
