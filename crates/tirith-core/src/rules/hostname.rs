@@ -5,7 +5,7 @@ use crate::util::levenshtein;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run all hostname rules against a parsed URL.
-pub fn check(url: &UrlLike, _policy: &Policy) -> Vec<Finding> {
+pub fn check(url: &UrlLike, policy: &Policy) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     if let Some(raw_host) = url.raw_host() {
@@ -13,7 +13,7 @@ pub fn check(url: &UrlLike, _policy: &Policy) -> Vec<Finding> {
         check_mixed_script_in_label(raw_host, &mut findings);
         check_invalid_host_chars(raw_host, &mut findings);
         check_trailing_dot_whitespace(raw_host, &mut findings);
-        check_confusable_domain(raw_host, &mut findings);
+        check_confusable_domain(raw_host, &policy.additional_known_domains, &mut findings);
     }
 
     if let Some(host) = url.host() {
@@ -202,12 +202,19 @@ fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
     }
 }
 
-fn check_confusable_domain(raw_host: &str, findings: &mut Vec<Finding>) {
+fn check_confusable_domain(
+    raw_host: &str,
+    additional_domains: &[String],
+    findings: &mut Vec<Finding>,
+) {
     let host_lower = raw_host.to_lowercase();
     let skeleton = crate::confusables::skeleton(&host_lower);
     let ocr_normalized = ocr_normalize(&host_lower);
 
-    for known in crate::data::known_domains() {
+    let builtin = crate::data::known_domains().iter().copied();
+    let additional = additional_domains.iter().map(|s| s.as_str());
+
+    for known in builtin.chain(additional) {
         let known_lower = known.to_lowercase();
         if host_lower == known_lower {
             continue; // Exact match — not confusable

@@ -925,7 +925,9 @@ fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
         RuleId::CredentialInText | RuleId::HighEntropySecret => Some("T1552"), // Unsecured Credentials
         RuleId::PrivateKeyExposed => Some("T1552.004"),                        // Private Keys
         RuleId::MetadataEndpoint => Some("T1552.005"), // Unsecured Credentials: Cloud Instance Metadata
-        RuleId::SensitiveEnvExport => Some("T1552.001"), // Credentials In Files
+        RuleId::SensitiveEnvExport | RuleId::CredentialFileSweep => Some("T1552.001"), // Credentials In Files
+        RuleId::ProcMemAccess => Some("T1003.007"), // OS Credential Dumping: Proc Filesystem
+        RuleId::DockerRemotePrivEsc => Some("T1611"), // Escape to Host
 
         // Supply Chain
         RuleId::ConfigInjection => Some("T1195.001"), // Supply Chain Compromise: Dev Tools

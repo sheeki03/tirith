@@ -117,3 +117,11 @@ moralis.io,web3
 chainstack.com,web3
 getblock.io,web3
 etherscan.io,web3
+aquasec.com,security_vendor
+snyk.io,security_vendor
+sonarsource.com,security_vendor
+trivy.dev,security_vendor
+anthropic.com,ai_provider
+openai.com,ai_provider
+mistral.ai,ai_provider
+huggingface.co,ai_provider

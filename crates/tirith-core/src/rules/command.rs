@@ -1,3 +1,6 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
+
 use crate::extract::ScanContext;
 use crate::redact;
 use crate::tokenize::{self, ShellType};
@@ -348,6 +351,15 @@ pub fn check(
     // Check for archive extraction to sensitive paths
     check_archive_extract(&segments, &mut findings);
 
+    // Check for process memory access
+    check_proc_mem_access(&segments, shell, &mut findings);
+
+    // Check for Docker remote privilege escalation
+    check_docker_remote_privesc(&segments, shell, &mut findings);
+
+    // Check for credential file sweep (exec-only)
+    check_credential_file_sweep(&segments, shell, scan_context, &mut findings);
+
     // Check for cargo install/add without supply-chain audit (exec-only)
     if scan_context == ScanContext::Exec {
         check_vet_not_configured(&segments, cwd, &mut findings);
@@ -393,6 +405,263 @@ fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option
             }
             _ => {}
         }
+    }
+    None
+}
+
+/// Resolve the base command from a segment, stripping sudo/env/command/nohup/exec wrappers.
+/// Returns the normalized base command name (lowercase, .exe stripped).
+/// Unlike `resolve_interpreter_name`, this returns ANY command — not just interpreters.
+fn resolve_base_through_wrappers(seg: &tokenize::Segment, shell: ShellType) -> String {
+    let Some(ref cmd) = seg.command else {
+        return String::new();
+    };
+    let cmd_base = normalize_cmd_base(cmd, shell);
+
+    match cmd_base.as_str() {
+        "sudo" => resolve_base_sudo(&seg.args, shell).unwrap_or(cmd_base),
+        "env" => resolve_base_env(&seg.args, shell).unwrap_or(cmd_base),
+        "command" | "exec" | "nohup" => {
+            resolve_base_wrapper(&seg.args, &cmd_base, shell).unwrap_or(cmd_base)
+        }
+        _ => cmd_base,
+    }
+}
+
+/// Resolve base command through sudo wrapper.
+fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
+    let value_short_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
+    let value_long_flags = [
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--role",
+        "--type",
+        "--other-user",
+        "--host",
+        "--timeout",
+    ];
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            // Next positional after -- is the command
+            if idx + 1 < args.len() {
+                return Some(normalize_cmd_base(&args[idx + 1], shell));
+            }
+            return None;
+        }
+        if normalized.starts_with("--") {
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f)
+                || (normalized.len() > 2
+                    && value_short_flags
+                        .iter()
+                        .any(|f| normalized.ends_with(&f[1..])))
+            {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // First positional is the command — recurse for nested wrappers
+        let base = normalize_cmd_base(&args[idx], shell);
+        return match base.as_str() {
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
+            "env" => resolve_base_env(&args[idx + 1..], shell),
+            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            _ => Some(base),
+        };
+    }
+    None
+}
+
+/// Resolve base command through env wrapper.
+fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
+    let value_short_flags = ["-u", "-C"];
+    let value_long_flags = [
+        "--unset",
+        "--chdir",
+        "--split-string",
+        "--block-signal",
+        "--default-signal",
+        "--ignore-signal",
+    ];
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            if idx + 1 < args.len() {
+                return Some(normalize_cmd_base(&args[idx + 1], shell));
+            }
+            return None;
+        }
+        if normalized.starts_with("--") {
+            if normalized == "--split-string" {
+                if idx + 1 < args.len() {
+                    return resolve_base_from_command_string(&args[idx + 1], shell);
+                }
+                return None;
+            }
+            if let Some(val) = normalized.strip_prefix("--split-string=") {
+                return resolve_base_from_command_string(val, shell);
+            }
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized == "-S" {
+            if idx + 1 < args.len() {
+                return resolve_base_from_command_string(&args[idx + 1], shell);
+            }
+            return None;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // VAR=VALUE assignments
+        if normalized.contains('=') {
+            idx += 1;
+            continue;
+        }
+        // First positional is the command
+        let base = normalize_cmd_base(&args[idx], shell);
+        return match base.as_str() {
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
+            "env" => resolve_base_env(&args[idx + 1..], shell),
+            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            _ => Some(base),
+        };
+    }
+    None
+}
+
+fn resolve_base_from_command_string(command: &str, shell: ShellType) -> Option<String> {
+    let normalized = normalize_shell_token(command.trim(), shell);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let segments = tokenize::tokenize(&normalized, shell);
+    let first = segments.first()?;
+    let base = resolve_base_through_wrappers(first, shell);
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+fn unwrap_env_split_string_segment(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<tokenize::Segment> {
+    let command = seg.command.as_ref()?;
+    if normalize_cmd_base(command, shell) != "env" {
+        return None;
+    }
+
+    let value_short_flags = ["-u", "-C"];
+    let value_long_flags = [
+        "--unset",
+        "--chdir",
+        "--block-signal",
+        "--default-signal",
+        "--ignore-signal",
+    ];
+
+    let args = &seg.args;
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--split-string" || normalized == "-S" {
+            let command = args.get(idx + 1)?;
+            let normalized_command = normalize_shell_token(command.trim(), shell);
+            return tokenize::tokenize(&normalized_command, shell)
+                .into_iter()
+                .next();
+        }
+        if let Some(val) = normalized.strip_prefix("--split-string=") {
+            let normalized_command = normalize_shell_token(val.trim(), shell);
+            return tokenize::tokenize(&normalized_command, shell)
+                .into_iter()
+                .next();
+        }
+        if normalized == "--" {
+            return None;
+        }
+        if normalized.starts_with("--") {
+            if value_long_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.starts_with('-') {
+            if value_short_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.contains('=') {
+            idx += 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Resolve base command through command/exec/nohup wrappers.
+fn resolve_base_wrapper(args: &[String], wrapper: &str, shell: ShellType) -> Option<String> {
+    let value_flags: &[&str] = match wrapper {
+        "exec" => &["-a"],
+        _ => &[],
+    };
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            if idx + 1 < args.len() {
+                return Some(normalize_cmd_base(&args[idx + 1], shell));
+            }
+            return None;
+        }
+        if normalized.starts_with("--") || normalized.starts_with('-') {
+            if value_flags.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        let base = normalize_cmd_base(&args[idx], shell);
+        return match base.as_str() {
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
+            "env" => resolve_base_env(&args[idx + 1..], shell),
+            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            _ => Some(base),
+        };
     }
     None
 }
@@ -914,6 +1183,299 @@ fn check_archive_extract(segments: &[tokenize::Segment], findings: &mut Vec<Find
                     }
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process memory access detection
+// ---------------------------------------------------------------------------
+
+/// Commands that read file contents — scoped to utilities commonly used
+/// for proc memory dumping. Excludes echo/printf (not file readers).
+const PROC_MEM_READER_CMDS: &[&str] = &[
+    "cat", "dd", "strings", "head", "tail", "xxd", "od", "base64", "hexdump", "less", "more", "cp",
+    "grep",
+];
+
+static PROC_MEM_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/proc/(?:self|\d+)/mem\b").expect("PROC_MEM_RE"));
+
+fn check_proc_mem_access(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for seg in segments {
+        let effective_seg =
+            unwrap_env_split_string_segment(seg, shell).unwrap_or_else(|| seg.clone());
+        let resolved_cmd = resolve_base_through_wrappers(&effective_seg, shell);
+        if !PROC_MEM_READER_CMDS.contains(&resolved_cmd.as_str()) {
+            continue;
+        }
+
+        for arg in &effective_seg.args {
+            let normalized = normalize_shell_token(arg, shell);
+            if PROC_MEM_RE.is_match(&normalized) {
+                findings.push(Finding {
+                    rule_id: RuleId::ProcMemAccess,
+                    severity: Severity::High,
+                    title: "Process memory access detected".to_string(),
+                    description: "Command reads from /proc/*/mem, which can dump process memory \
+                                  contents including secrets and credentials"
+                        .to_string(),
+                    evidence: vec![Evidence::CommandPattern {
+                        pattern: "proc memory read".to_string(),
+                        matched: redact::redact_shell_assignments(&seg.raw),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                return;
+            }
+            // dd-style: if=/proc/self/mem
+            if let Some(val) = normalized.strip_prefix("if=") {
+                if PROC_MEM_RE.is_match(val) {
+                    findings.push(Finding {
+                        rule_id: RuleId::ProcMemAccess,
+                        severity: Severity::High,
+                        title: "Process memory access detected".to_string(),
+                        description: "Command reads from /proc/*/mem via dd, which can dump \
+                                      process memory contents including secrets and credentials"
+                            .to_string(),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "proc memory read".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docker remote privilege escalation detection
+// ---------------------------------------------------------------------------
+
+fn check_docker_remote_privesc(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for seg in segments {
+        let effective_seg =
+            unwrap_env_split_string_segment(seg, shell).unwrap_or_else(|| seg.clone());
+        let resolved_cmd = resolve_base_through_wrappers(&effective_seg, shell);
+        if resolved_cmd != "docker" && resolved_cmd != "podman" {
+            continue;
+        }
+
+        let norm_args: Vec<String> = effective_seg
+            .args
+            .iter()
+            .map(|a| normalize_shell_token(a, shell))
+            .collect();
+
+        let has_remote = detect_docker_remote_host(&norm_args, &effective_seg, shell);
+        if !has_remote {
+            continue;
+        }
+
+        let has_priv = norm_args.iter().any(|a| a == "--privileged");
+        let has_root_mount = has_docker_root_mount(&norm_args);
+
+        if has_priv || has_root_mount {
+            findings.push(Finding {
+                rule_id: RuleId::DockerRemotePrivEsc,
+                severity: Severity::Critical,
+                title: "Docker remote privileged escalation detected".to_string(),
+                description: "Command targets a remote Docker daemon with privileged access or \
+                              host root mount, enabling full host compromise"
+                    .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "docker remote privesc".to_string(),
+                    matched: redact::redact_shell_assignments(&seg.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return;
+        }
+    }
+}
+
+fn detect_docker_remote_host(
+    norm_args: &[String],
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> bool {
+    for (i, arg) in norm_args.iter().enumerate() {
+        let lower = arg.to_lowercase();
+        // -H=tcp://... or --host=tcp://... (combined form, quotes already stripped)
+        if arg.starts_with("-H=tcp://") || lower.starts_with("--host=tcp://") {
+            return true;
+        }
+        // -H tcp://... or --host tcp://... (flag + next arg)
+        if arg == "-H" || lower == "--host" {
+            if let Some(next) = norm_args.get(i + 1) {
+                if next.starts_with("tcp://") {
+                    return true;
+                }
+            }
+        }
+    }
+    // DOCKER_HOST=tcp://... as env prefix (Path A: direct leading env assignment)
+    for (name, value) in tokenize::leading_env_assignments(&seg.raw) {
+        if name.eq_ignore_ascii_case("DOCKER_HOST") {
+            let clean_val = normalize_shell_token(&value, shell);
+            if clean_val.starts_with("tcp://") {
+                return true;
+            }
+        }
+    }
+    // Path B: env wrapper form (env DOCKER_HOST=tcp://... docker ...)
+    // Skip DOCKER_HOST= args that follow -e/--env (those set container env, not client remote)
+    let args = &seg.args;
+    for (i, arg) in args.iter().enumerate() {
+        let norm = normalize_shell_token(arg, shell);
+        if let Some(val) = norm
+            .strip_prefix("DOCKER_HOST=")
+            .or_else(|| norm.strip_prefix("docker_host="))
+        {
+            // Check if this arg is a container -e/--env value (not client config)
+            if i > 0 {
+                let prev = normalize_shell_token(&args[i - 1], shell);
+                let prev_lower = prev.to_lowercase();
+                if prev_lower == "-e" || prev_lower == "--env" {
+                    continue; // container env, not client remote
+                }
+            }
+            let clean_val = normalize_shell_token(val, shell);
+            if clean_val.starts_with("tcp://") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_docker_root_mount(norm_args: &[String]) -> bool {
+    for (i, arg) in norm_args.iter().enumerate() {
+        let lower = arg.to_lowercase();
+        // -v /:/... or --volume /:/... (flag + next value)
+        if lower == "-v" || lower == "--volume" {
+            if let Some(val) = norm_args.get(i + 1) {
+                if val.starts_with("/:/") {
+                    return true;
+                }
+            }
+        }
+        // -v=/:/... or --volume=/:/...
+        if lower.starts_with("-v=/:/") || lower.starts_with("--volume=/:/") {
+            return true;
+        }
+        // --mount type=bind,src=/,dst=/...
+        let mount_val = if lower == "--mount" {
+            norm_args.get(i + 1).map(|s| s.as_str())
+        } else {
+            lower.strip_prefix("--mount=")
+        };
+        if let Some(mv) = mount_val {
+            if mv.contains("src=/,")
+                || mv.contains("source=/,")
+                || mv.ends_with("src=/")
+                || mv.ends_with("source=/")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Credential file sweep detection
+// ---------------------------------------------------------------------------
+
+const CREDENTIAL_PATHS: &[&str] = &[
+    "/.ssh/id_",
+    "/.ssh/authorized_keys",
+    "/.aws/credentials",
+    "/.aws/config",
+    "/.docker/config.json",
+    "/.kube/config",
+    "/.config/gcloud/",
+    "/.npmrc",
+    "/.pypirc",
+    "/.netrc",
+    "/.gnupg/",
+    "/.config/gh/",
+    "/.git-credentials",
+];
+
+const READ_ARCHIVE_VERBS: &[&str] = &[
+    "cat", "tar", "zip", "gzip", "strings", "head", "tail", "base64", "xxd", "dd", "cp", "find",
+    "xargs",
+];
+
+fn check_credential_file_sweep(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    context: ScanContext,
+    findings: &mut Vec<Finding>,
+) {
+    if context != ScanContext::Exec {
+        return;
+    }
+
+    for seg in segments {
+        let effective_seg =
+            unwrap_env_split_string_segment(seg, shell).unwrap_or_else(|| seg.clone());
+        let resolved_cmd = resolve_base_through_wrappers(&effective_seg, shell);
+        if !READ_ARCHIVE_VERBS.contains(&resolved_cmd.as_str()) {
+            continue;
+        }
+
+        let norm_args: Vec<String> = effective_seg
+            .args
+            .iter()
+            .map(|a| normalize_shell_token(a, shell))
+            .collect();
+        let seg_text = norm_args.join(" ");
+        let matched_count = CREDENTIAL_PATHS
+            .iter()
+            .filter(|p| seg_text.contains(**p))
+            .count();
+
+        if matched_count >= 2 {
+            findings.push(Finding {
+                rule_id: RuleId::CredentialFileSweep,
+                severity: Severity::Medium,
+                title: "Multiple credential files accessed".to_string(),
+                description: format!(
+                    "Command accesses {matched_count} known credential file paths in a single \
+                     invocation, which may indicate credential harvesting"
+                ),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "credential file sweep".to_string(),
+                    matched: redact::redact_shell_assignments(&seg.raw),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return;
         }
     }
 }

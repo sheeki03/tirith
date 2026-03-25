@@ -436,6 +436,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "xh_pipe_shell",
     "dotfile_overwrite",
     "archive_extract",
+    "proc_mem_access",
+    "docker_remote_priv_esc",
+    "credential_file_sweep",
     // Environment
     "proxy_env_set",
     "sensitive_env_export",
@@ -600,6 +603,9 @@ fn test_rule_id_list_is_complete() {
         RuleId::XhPipeShell,
         RuleId::DotfileOverwrite,
         RuleId::ArchiveExtract,
+        RuleId::ProcMemAccess,
+        RuleId::DockerRemotePrivEsc,
+        RuleId::CredentialFileSweep,
         RuleId::ProxyEnvSet,
         RuleId::SensitiveEnvExport,
         RuleId::CodeInjectionEnv,
@@ -678,6 +684,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "unicode_tags",              // byte-level, no URL needed
         "invisible_math_operator",   // byte-level, no URL needed
         "invisible_whitespace",      // byte-level, no URL needed
+        "proc_mem_access",           // /proc/*/mem access, no URL needed
+        "credential_file_sweep",     // multi-credential file access, no URL needed
         "code_injection_env",        // export LD_PRELOAD=, no URL needed
         "shell_injection_env",       // export BASH_ENV=, no URL needed
         "interpreter_hijack_env",    // export PYTHONPATH=, no URL needed
@@ -786,6 +794,9 @@ fn test_extractor_ids_cover_rule_triggers() {
         ),
         // Network destination detection
         ("metadata endpoint", &["metadata_endpoint"]),
+        ("proc_mem_access", &["proc_mem_access"]),
+        ("docker_remote_privesc", &["docker_remote_privesc"]),
+        ("credential_file_sweep", &["credential_file_sweep"]),
         // Deception triggers
         ("punycode detection", &["punycode_domain"]),
         ("lookalike TLD", &["lookalike_tld"]),

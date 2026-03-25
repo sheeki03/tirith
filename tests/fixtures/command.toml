@@ -1124,3 +1124,166 @@ context = "exec"
 shell = "cmd"
 expected_action = "allow"
 expected_rules = []
+
+# ── ProcMemAccess ──
+[[fixture]]
+name = "proc_mem_cat"
+min_milestone = 1
+input = "cat /proc/1234/mem > dump.bin"
+context = "exec"
+expected_action = "block"
+expected_rules = ["proc_mem_access"]
+
+[[fixture]]
+name = "proc_mem_self_dd"
+min_milestone = 1
+input = "dd if=/proc/self/mem of=/tmp/dump bs=4096"
+context = "exec"
+expected_action = "block"
+expected_rules = ["proc_mem_access"]
+
+[[fixture]]
+name = "proc_mem_strings"
+min_milestone = 1
+input = "strings /proc/self/mem"
+context = "exec"
+expected_action = "block"
+expected_rules = ["proc_mem_access"]
+
+[[fixture]]
+name = "proc_status_allow"
+min_milestone = 1
+input = "cat /proc/1234/status"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "proc_mem_echo_allow"
+min_milestone = 1
+input = "echo /proc/self/mem"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "proc_mem_sudo"
+min_milestone = 1
+input = "sudo cat /proc/self/mem"
+context = "exec"
+expected_action = "block"
+expected_rules = ["proc_mem_access"]
+
+# ── DockerRemotePrivEsc ──
+[[fixture]]
+name = "docker_remote_privileged"
+min_milestone = 1
+input = "docker -H tcp://10.0.0.5:2375 run --privileged alpine sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_remote_priv_esc"]
+
+[[fixture]]
+name = "docker_remote_root_mount"
+min_milestone = 1
+input = "docker --host=tcp://target:2375 run -v /:/mnt alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_remote_priv_esc"]
+
+[[fixture]]
+name = "docker_remote_no_priv_allow"
+min_milestone = 1
+input = "docker -H tcp://build-server:2375 ps"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "docker_local_privileged_allow"
+min_milestone = 1
+input = "docker run --privileged myimage"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "docker_lowercase_h_hostname_allow"
+min_milestone = 1
+input = "docker run -h tcp://somename --privileged alpine"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "docker_container_env_e_allow"
+min_milestone = 1
+input = "docker run -e DOCKER_HOST=tcp://target:2375 --privileged alpine"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "docker_container_env_flag_allow"
+min_milestone = 1
+input = "docker run --env DOCKER_HOST=tcp://target:2375 --privileged alpine"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "docker_remote_mount_src_last"
+min_milestone = 1
+input = "docker -H tcp://target:2375 run --mount type=bind,dst=/mnt,src=/ alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_remote_priv_esc"]
+
+[[fixture]]
+name = "docker_env_split_string_remote"
+min_milestone = 1
+input = "env -S 'docker -H tcp://target:2375 run --privileged alpine'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_remote_priv_esc"]
+
+[[fixture]]
+name = "docker_env_split_string_equals_remote"
+min_milestone = 1
+input = "env --split-string='docker -H tcp://target:2375 run --privileged alpine'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_remote_priv_esc"]
+
+# ── CredentialFileSweep ──
+[[fixture]]
+name = "credential_sweep_tar"
+min_milestone = 1
+input = "tar czf backup.tar.gz ~/.ssh/id_rsa ~/.aws/credentials"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["credential_file_sweep"]
+
+[[fixture]]
+name = "credential_sweep_cat"
+min_milestone = 1
+input = "cat ~/.ssh/id_rsa ~/.aws/credentials ~/.kube/config"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["credential_file_sweep"]
+
+[[fixture]]
+name = "single_credential_allow"
+min_milestone = 1
+input = "cat ~/.ssh/id_rsa"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "chmod_credential_allow"
+min_milestone = 1
+input = "chmod 600 ~/.ssh/id_rsa ~/.aws/credentials"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
