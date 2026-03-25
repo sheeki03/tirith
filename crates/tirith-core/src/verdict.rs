@@ -47,6 +47,9 @@ pub enum RuleId {
     XhPipeShell,
     DotfileOverwrite,
     ArchiveExtract,
+    ProcMemAccess,
+    DockerRemotePrivEsc,
+    CredentialFileSweep,
 
     // Environment rules
     ProxyEnvSet,
