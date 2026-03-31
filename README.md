@@ -92,13 +92,16 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**75+ detection rules across 13 categories.**
+**80+ detection rules across 15 categories.**
 
 | Category | What it stops |
 |----------|--------------|
 | **Homograph attacks** | Cyrillic/Greek lookalikes in hostnames, punycode domains, mixed-script labels, lookalike TLDs, confusable domains |
 | **Terminal injection** | ANSI escape sequences, bidi overrides, zero-width characters, unicode tags, invisible math operators, variation selectors |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)` — every source-to-sink pattern |
+| **Base64 decode-execute** | `base64 -d \| bash`, `python -c "exec(b64decode(...))"`, `powershell -EncodedCommand` — decode chains through sudo/env wrappers |
+| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
+| **Code file scanning** | Obfuscated payloads (`eval(atob(...))`), dynamic code execution (`exec(b64decode(...))`), secret exfiltration via `fetch`/`requests.post` in JS/Python files |
 | **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
 | **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps — inspired by the TeamPCP attack |
 | **Command safety** | Dotfile overwrites, archive extraction to sensitive paths, cloud metadata endpoint access, private network access |
@@ -107,7 +110,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Config file security** | Config injection, suspicious indicators, non-ASCII/invisible unicode in configs, MCP server security (insecure/untrusted/duplicate/permissive) |
 | **Ecosystem threats** | Git clone typosquats, untrusted Docker registries, pip/npm URL installs, web3 RPC endpoints, vet-not-configured |
 | **Path analysis** | Non-ASCII paths, homoglyphs in paths, double-encoding |
-| **Rendered content** | Hidden CSS/color content, hidden HTML attributes, markdown/HTML comments with instructions |
+| **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |
 
 ---
@@ -170,7 +173,7 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 
 - **CSS hiding** — `display:none`, `visibility:hidden`, `opacity:0`, `font-size:0`, off-screen positioning
 - **Color hiding** — white-on-white text, similar foreground/background (contrast ratio < 1.5:1)
-- **HTML/Markdown comments** — long comments hiding instructions for AI agents
+- **HTML/Markdown comments** — prompt injection phrases (High), destructive commands like `rm -rf` or `curl|bash` (Medium), long comments hiding instructions (Low)
 - **PDF hidden text** — sub-pixel rendered text (font-size < 1px) invisible to readers but parseable by LLMs
 
 ### Cloaking detection
@@ -516,7 +519,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-**Core security coverage ships in the open-source tree.** All 75+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 80+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 
