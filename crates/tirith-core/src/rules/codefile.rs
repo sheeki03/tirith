@@ -202,14 +202,13 @@ static PY_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
-/// Property keywords that indicate header context (suppress finding).
-static HEADER_PROPS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:headers|[Aa]uthorization|[Xx]-[Aa]pi-[Kk]ey)\s*[:=\[{]").unwrap()
-});
-
-/// Property keywords that indicate data/send context (do not suppress).
+/// Property keywords that indicate data/send context (fire the finding).
 static SEND_PROPS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)(?:body|data|json|params|payload)\s*[:=]").unwrap());
+
+/// Any property-like keyword (`word:` or `word=`) — used to detect when a
+/// secret is inside an unknown property (like `meta:`) that is NOT a send context.
+static GENERIC_PROP: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w+\s*[:=]").unwrap());
 
 /// Find the end of a call's argument list by matching the closing delimiter.
 /// `open_pos` must point to the character AFTER the opening `(`.
@@ -407,8 +406,8 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
                     0
                 }
             };
-            let is_division =
-                prev.is_ascii_alphanumeric() || matches!(prev, b')' | b']' | b'_' | b'$');
+            let is_division = prev.is_ascii_alphanumeric()
+                || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
             if !is_division {
                 i += 1; // skip opening /
                 while i < s.len() && s[i] != b'/' {
@@ -440,40 +439,39 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
     (depth, in_string.is_none())
 }
 
-/// Check if a position within a call arg span is inside a headers property
-/// by finding the nearest **shallow, non-comment** property keyword.
+/// Decide whether to suppress the exfil finding for a secret at `pos_in_span`
+/// within the HTTP call's argument span.
 ///
-/// Only keywords at the top-level call argument structure AND in actual code
-/// (not inside comments or strings) count. A nested `"headers"` key deeper
-/// than depth 1, or a `# headers:` in a comment, is ignored.
-fn is_in_header_context_within(arg_span: &str, pos_in_span: usize) -> bool {
+/// Logic: find the nearest shallow (depth ≤ 1), in-code property keyword
+/// (`word:` or `word=`) before the secret.
+/// - If it's a SEND keyword (body/data/json/params/payload) → fire (return false)
+/// - If it's anything else (headers, meta, unknown) → suppress (return true)
+/// - If NO property keyword at all → secret is in direct-argument / URL-concat
+///   context → fire (return false)
+fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
     let before = &arg_span[..pos_in_span];
     let bytes = before.as_bytes();
 
-    // Filter: shallow (depth ≤ 1) AND in actual code (not comment/string).
-    let is_shallow_code = |m: &regex::Match<'_>| -> bool {
-        let (depth, is_code) = code_context_at(bytes, m.start());
-        depth <= 1 && is_code
-    };
-
-    let last_shallow_header = HEADER_PROPS
+    // Find the nearest property-like keyword at shallow depth in actual code.
+    let nearest_prop = GENERIC_PROP
         .find_iter(before)
-        .filter(is_shallow_code)
-        .last()
-        .map(|m| m.start());
-    let last_shallow_send = SEND_PROPS
-        .find_iter(before)
-        .filter(is_shallow_code)
-        .last()
-        .map(|m| m.start());
+        .filter(|m| {
+            let (depth, is_code) = code_context_at(bytes, m.start());
+            depth <= 1 && is_code
+        })
+        .last();
 
-    match (last_shallow_header, last_shallow_send) {
-        // A send keyword is closer to the secret → not in header context
-        (Some(h), Some(s)) if s > h => false,
-        // A header keyword is closest → in header context
-        (Some(_), _) => true,
-        // No header keyword at all
-        _ => false,
+    match nearest_prop {
+        Some(m) => {
+            // If the nearest property is a recognized send keyword → fire
+            if SEND_PROPS.is_match(m.as_str()) {
+                return false;
+            }
+            // Otherwise (headers, auth, meta, token, unknown) → suppress
+            true
+        }
+        // No property keyword at all → direct argument / URL context → fire
+        None => false,
     }
 }
 
@@ -509,8 +507,8 @@ fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
         let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
 
         for sens_match in JS_SENSITIVE.find_iter(arg_span) {
-            // Suppress if inside a headers property within the call args
-            if is_in_header_context_within(arg_span, sens_match.start()) {
+            // Only fire if the secret is in a send-position context
+            if should_suppress_exfil(arg_span, sens_match.start()) {
                 continue;
             }
             let snippet = &input[http_match.start()..call_end.min(input.len())];
@@ -530,7 +528,7 @@ fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
         let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
 
         for sens_match in PY_SENSITIVE.find_iter(arg_span) {
-            if is_in_header_context_within(arg_span, sens_match.start()) {
+            if should_suppress_exfil(arg_span, sens_match.start()) {
                 continue;
             }
             let snippet = &input[http_match.start()..call_end.min(input.len())];
@@ -722,6 +720,46 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
             "internal API POST without sensitive data should not fire"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-send properties: secret in unknown kwargs must NOT fire
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exfil_js_meta_property_no_fire() {
+        let input = r#"fetch(url, {meta: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send property 'meta:' should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_python_meta_kwarg_no_fire() {
+        let input = r#"requests.post(url, meta=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let findings = check(input, Some("test.py"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send kwarg 'meta=' should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_js_token_property_no_fire() {
+        let input = r#"fetch(url, {token: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in non-send property 'token:' should NOT fire"
         );
     }
 
@@ -1083,5 +1121,33 @@ mod tests {
     fn test_find_call_end_postfix_decrement() {
         let input = b"url, {body: a-- / 2, val})";
         assert_eq!(find_call_end(input, 0), Some(26));
+    }
+
+    // -----------------------------------------------------------------------
+    // Combined: postfix division + non-send property must suppress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exfil_postfix_inc_div_then_meta_no_fire() {
+        let input = r#"fetch(url, {body: a++ / 2, meta: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in meta: after body: a++ / 2 should NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_exfil_postfix_dec_div_then_token_no_fire() {
+        let input = r#"fetch(url, {body: a-- / 2, token: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "secret in token: after body: a-- / 2 should NOT fire"
+        );
     }
 }
