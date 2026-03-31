@@ -269,8 +269,8 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
                             0
                         }
                     };
-                    let is_division =
-                        prev.is_ascii_alphanumeric() || matches!(prev, b')' | b']' | b'_' | b'$');
+                    let is_division = prev.is_ascii_alphanumeric()
+                        || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
                     if !is_division {
                         i += 1; // skip opening /
                         while i < input.len() && input[i] != b'/' {
@@ -1043,5 +1043,45 @@ mod tests {
     fn test_find_call_end_multiline_division() {
         let input = b"url, {body: 1\n/ 2, val})";
         assert_eq!(find_call_end(input, 0), Some(24));
+    }
+
+    // -----------------------------------------------------------------------
+    // Postfix ++/-- before division must not truncate call span
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exfil_postfix_increment_division_fires() {
+        let input = r#"fetch(url, {body: a++ / 2, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "a++ / 2 should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_exfil_postfix_decrement_division_fires() {
+        let input = r#"fetch(url, {body: a-- / 2, json: process.env.GITHUB_TOKEN})"#;
+        let findings = check(input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
+            "a-- / 2 should not break parser"
+        );
+    }
+
+    #[test]
+    fn test_find_call_end_postfix_increment() {
+        let input = b"url, {body: a++ / 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(26));
+    }
+
+    #[test]
+    fn test_find_call_end_postfix_decrement() {
+        let input = b"url, {body: a-- / 2, val})";
+        assert_eq!(find_call_end(input, 0), Some(26));
     }
 }
