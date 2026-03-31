@@ -223,18 +223,21 @@ function _tirith_check_command
                     case '*'
                         _tirith_output "tirith: approval not granted — fallback: block"
                         commandline -r ""
-                        return
+                        commandline -f repaint
+                        return 1
                 end
             end
         else if test $rc -eq 1
             # Approval not required but command was blocked: honor block
             commandline -r ""
-            return
+            commandline -f repaint
+            return 1
         end
     else if test $rc -eq 1
         # No approval file: honor block
         commandline -r ""
-        return
+        commandline -f repaint
+        return 1
     end
 
     commandline -f execute
