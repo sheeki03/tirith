@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "tirith-gateway": {
+      "args": [
+        "gateway",
+        "run",
+        "--upstream-bin",
+        "tirith",
+        "--upstream-arg",
+        "mcp-server",
+        "--config",
+        "~/.config/tirith/gateway.yaml"
+      ],
+      "command": "tirith"
+    }
+  }
+}
