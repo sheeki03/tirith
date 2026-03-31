@@ -81,6 +81,7 @@ if zle -la | grep -q '^accept-line$'; then
 fi
 
 _tirith_accept_line() {
+  setopt localoptions clobber   # mktemp + redirect needs clobber (#70)
   local buf="$BUFFER"
 
   # Empty input: pass through
@@ -175,6 +176,7 @@ if zle -la | grep -q '^bracketed-paste$'; then
 fi
 
 _tirith_bracketed_paste() {
+  setopt localoptions clobber   # mktemp + redirect needs clobber (#70)
   # Read the pasted content into CUTBUFFER via the original widget
   local old_buffer="$BUFFER"
   local old_cursor="$CURSOR"
