@@ -502,6 +502,17 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             ctx.is_config_override,
         ));
 
+        // Code file pattern scanning rules
+        if crate::rules::codefile::is_code_file(
+            ctx.file_path.as_deref().and_then(|p| p.to_str()),
+            &ctx.input,
+        ) {
+            findings.extend(crate::rules::codefile::check(
+                &ctx.input,
+                ctx.file_path.as_deref().and_then(|p| p.to_str()),
+            ));
+        }
+
         // Rendered content rules (file-type gated)
         if crate::rules::rendered::is_renderable_file(ctx.file_path.as_deref()) {
             // PDF files get their own parser
@@ -944,6 +955,13 @@ fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
 
         // Exfiltration
         RuleId::ProxyEnvSet => Some("T1090.001"), // Proxy: Internal Proxy
+        RuleId::DataExfiltration => Some("T1048.003"), // Exfiltration Over Unencrypted Non-C2 Protocol
+        RuleId::SuspiciousCodeExfiltration => Some("T1041"), // Exfiltration Over C2 Channel
+
+        // Command Obfuscation
+        RuleId::Base64DecodeExecute => Some("T1027.010"), // Command Obfuscation
+        RuleId::ObfuscatedPayload => Some("T1027"),       // Obfuscated Files or Information
+        RuleId::DynamicCodeExecution => Some("T1059"),    // Command and Scripting Interpreter
 
         _ => None,
     }

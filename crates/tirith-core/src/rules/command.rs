@@ -371,6 +371,12 @@ pub fn check(
     // Check for network destination access (metadata endpoints, private networks)
     check_network_destination(&segments, &mut findings);
 
+    // Check for base64 decode-execute chains
+    check_base64_decode_execute(&segments, shell, &mut findings);
+
+    // Check for data exfiltration via curl/wget uploads
+    check_data_exfiltration(&segments, shell, &mut findings);
+
     findings
 }
 
@@ -2066,6 +2072,379 @@ fn cidr_contains(host: &str, cidr: &str) -> Option<bool> {
     let host_bits = u32::from(host_ip) & mask;
 
     Some(net_bits == host_bits)
+}
+
+// ---------------------------------------------------------------------------
+// Base64 decode-execute detection
+// ---------------------------------------------------------------------------
+
+fn check_base64_decode_execute(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    // Pattern A: Pipe chain — base64 with decode flag piped to interpreter
+    for (i, seg) in segments.iter().enumerate() {
+        if let Some(ref cmd) = seg.command {
+            let cmd_base = normalize_cmd_base(cmd, shell);
+            if cmd_base == "base64" {
+                let has_decode_flag = seg.args.iter().any(|arg| {
+                    let norm = normalize_shell_token(arg, shell);
+                    matches!(norm.as_str(), "-d" | "--decode" | "-D")
+                });
+                if has_decode_flag {
+                    // Check if next piped segment is an interpreter
+                    if let Some(next_seg) = segments.get(i + 1) {
+                        if let Some(ref sep) = next_seg.preceding_separator {
+                            if (sep == "|" || sep == "|&")
+                                && resolve_interpreter_name(next_seg, shell).is_some()
+                            {
+                                findings.push(Finding {
+                                    rule_id: RuleId::Base64DecodeExecute,
+                                    severity: Severity::High,
+                                    title: "Base64 decode piped to interpreter".to_string(),
+                                    description: "Command decodes base64 content and pipes it directly to an interpreter for execution".to_string(),
+                                    evidence: vec![Evidence::CommandPattern {
+                                        pattern: "base64 decode | interpreter".to_string(),
+                                        matched: redact::redact_shell_assignments(&format!(
+                                            "{} | {}", seg.raw, next_seg.raw
+                                        )),
+                                    }],
+                                    human_view: None,
+                                    agent_view: None,
+                                    mitre_id: None,
+                                    custom_rule_id: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check: something piped to base64 -d piped to interpreter
+        // e.g. echo X | base64 -d | bash — base64 is mid-chain
+        if i >= 1 {
+            if let Some(ref sep) = seg.preceding_separator {
+                if sep == "|" || sep == "|&" {
+                    if let Some(ref cmd) = seg.command {
+                        let cmd_base = normalize_cmd_base(cmd, shell);
+                        if cmd_base == "base64" {
+                            let has_decode = seg.args.iter().any(|arg| {
+                                let norm = normalize_shell_token(arg, shell);
+                                matches!(norm.as_str(), "-d" | "--decode" | "-D")
+                            });
+                            if has_decode {
+                                if let Some(next_seg) = segments.get(i + 1) {
+                                    if let Some(ref next_sep) = next_seg.preceding_separator {
+                                        if (next_sep == "|" || next_sep == "|&")
+                                            && resolve_interpreter_name(next_seg, shell).is_some()
+                                        {
+                                            // Only fire if we didn't already fire above (when i was the base64 segment)
+                                            let already_found = findings
+                                                .iter()
+                                                .any(|f| f.rule_id == RuleId::Base64DecodeExecute);
+                                            if !already_found {
+                                                findings.push(Finding {
+                                                    rule_id: RuleId::Base64DecodeExecute,
+                                                    severity: Severity::High,
+                                                    title: "Base64 decode piped to interpreter".to_string(),
+                                                    description: "Command decodes base64 content and pipes it directly to an interpreter for execution".to_string(),
+                                                    evidence: vec![Evidence::CommandPattern {
+                                                        pattern: "base64 decode | interpreter".to_string(),
+                                                        matched: redact::redact_shell_assignments(&format!(
+                                                            "{} | {}", seg.raw, next_seg.raw
+                                                        )),
+                                                    }],
+                                                    human_view: None,
+                                                    agent_view: None,
+                                                    mitre_id: None,
+                                                    custom_rule_id: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern B: Inline decode-execute — interpreter -c/-e with decode+execute tokens
+    // Uses resolve_interpreter_name to handle wrappers (sudo, env, command, nohup, exec)
+    for seg in segments {
+        // Resolve through wrappers: sudo python → python, env node → node
+        let interpreter = if let Some(ref cmd) = seg.command {
+            let cmd_base = normalize_cmd_base(cmd, shell);
+            if is_interpreter(&cmd_base) {
+                Some(cmd_base)
+            } else {
+                resolve_interpreter_name(seg, shell)
+            }
+        } else {
+            None
+        };
+
+        if let Some(interp) = interpreter {
+            // Check ALL args (including wrapper args) for -c/-e and decode+execute tokens
+            let has_exec_flag = seg.args.iter().any(|arg| {
+                let norm = normalize_shell_token(arg, shell);
+                norm == "-c" || norm == "-e"
+            });
+            if has_exec_flag {
+                let args_joined = seg.args.join(" ");
+                let lower = args_joined.to_lowercase();
+                let has_decode_exec = (lower.contains("b64decode") && lower.contains("exec"))
+                    || (lower.contains("atob") && lower.contains("eval"))
+                    || (lower.contains("buffer.from") && lower.contains("eval"));
+                if has_decode_exec {
+                    findings.push(Finding {
+                        rule_id: RuleId::Base64DecodeExecute,
+                        severity: Severity::High,
+                        title: "Inline base64 decode-execute".to_string(),
+                        description: format!(
+                            "Interpreter '{interp}' executes code with base64 decode and eval/exec co-occurrence"
+                        ),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "interpreter -c/e with decode+execute".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Pattern C: PowerShell -EncodedCommand / -enc / -ec
+    for seg in segments {
+        if let Some(ref cmd) = seg.command {
+            let cmd_base = normalize_cmd_base(cmd, shell);
+            if cmd_base == "powershell" || cmd_base == "pwsh" {
+                let has_enc_flag = seg.args.iter().any(|arg| {
+                    let norm = normalize_shell_token(arg, shell);
+                    let lower = norm.to_lowercase();
+                    lower == "-encodedcommand" || lower == "-enc" || lower == "-ec"
+                });
+                if has_enc_flag {
+                    findings.push(Finding {
+                        rule_id: RuleId::Base64DecodeExecute,
+                        severity: Severity::High,
+                        title: "PowerShell encoded command".to_string(),
+                        description: format!(
+                            "PowerShell ({cmd_base}) invoked with -EncodedCommand, executing base64-encoded script"
+                        ),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "powershell -EncodedCommand".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data exfiltration detection (POSIX + Fish: curl/wget upload of sensitive data)
+// ---------------------------------------------------------------------------
+
+/// Sensitive file paths for data exfiltration detection.
+const SENSITIVE_PATHS: &[&str] = &[
+    "/etc/passwd",
+    "/etc/shadow",
+    "~/.ssh/id_rsa",
+    "~/.ssh/id_ed25519",
+    "~/.ssh/id_ecdsa",
+    "~/.ssh/id_dsa",
+    "~/.aws/credentials",
+    "~/.kube/config",
+    "~/.docker/config.json",
+    "~/.gnupg/",
+    "~/.netrc",
+    "~/.git-credentials",
+];
+
+fn is_sensitive_file_ref(value: &str) -> bool {
+    let v = value.trim_start_matches('@');
+    SENSITIVE_PATHS.iter().any(|p| v.contains(p))
+}
+
+fn has_sensitive_env_ref(value: &str) -> bool {
+    use crate::rules::shared::SENSITIVE_KEY_VARS;
+    for var in SENSITIVE_KEY_VARS {
+        // $VAR or ${VAR}
+        if value.contains(&format!("${var}")) || value.contains(&format!("${{{var}}}")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_sensitive_cmd_substitution(value: &str) -> bool {
+    // Check for $(cmd) with sensitive paths — no backtick detection (PowerShell conflict)
+    if let Some(start) = value.find("$(") {
+        let rest = &value[start..];
+        return SENSITIVE_PATHS.iter().any(|p| rest.contains(p));
+    }
+    false
+}
+
+fn check_data_exfiltration(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for seg in segments {
+        let Some(ref cmd) = seg.command else {
+            continue;
+        };
+        let cmd_base = normalize_cmd_base(cmd, shell);
+
+        match cmd_base.as_str() {
+            "curl" => check_curl_exfiltration(seg, shell, findings),
+            "wget" => check_wget_exfiltration(seg, shell, findings),
+            _ => {}
+        }
+    }
+}
+
+fn check_curl_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: &mut Vec<Finding>) {
+    let args = &seg.args;
+    let mut i = 0;
+    while i < args.len() {
+        let norm = normalize_shell_token(&args[i], shell);
+
+        // -d / --data / --data-binary / --data-raw / --data-urlencode
+        let is_data_flag =
+            norm == "-d" || norm.starts_with("--data") || norm.starts_with("-d") && norm.len() > 2; // combined form -dVAL
+
+        // -F / --form
+        let is_form_flag =
+            norm == "-F" || norm.starts_with("--form") || norm.starts_with("-F") && norm.len() > 2;
+
+        // -T / --upload-file
+        let is_upload_flag = norm == "-T" || norm.starts_with("--upload-file");
+
+        if is_data_flag || is_form_flag || is_upload_flag {
+            // Get the value: either from =VAL, combined form, or next arg
+            let value = if let Some(eq_pos) = norm.find('=') {
+                Some(norm[eq_pos + 1..].to_string())
+            } else if (norm == "-d"
+                || norm == "-F"
+                || norm == "-T"
+                || norm == "--data"
+                || norm == "--data-binary"
+                || norm == "--data-raw"
+                || norm == "--data-urlencode"
+                || norm == "--form"
+                || norm == "--upload-file")
+                && i + 1 < args.len()
+            {
+                i += 1;
+                Some(normalize_shell_token(&args[i], shell))
+            } else if norm.starts_with("-d") && norm.len() > 2 {
+                // Combined -dVAL
+                Some(norm[2..].to_string())
+            } else if norm.starts_with("-F") && norm.len() > 2 {
+                // Combined -FVAL
+                Some(norm[2..].to_string())
+            } else {
+                None
+            };
+
+            if let Some(val) = value {
+                let is_sensitive = if is_upload_flag {
+                    // -T uses direct file paths (no @)
+                    SENSITIVE_PATHS.iter().any(|p| val.contains(p))
+                } else {
+                    is_sensitive_file_ref(&val)
+                        || has_sensitive_env_ref(&val)
+                        || has_sensitive_cmd_substitution(&val)
+                };
+
+                if is_sensitive {
+                    findings.push(Finding {
+                        rule_id: RuleId::DataExfiltration,
+                        severity: Severity::High,
+                        title: "Data exfiltration via curl upload".to_string(),
+                        description: "curl command uploads sensitive data (credentials, keys, or private files) to a remote server".to_string(),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "curl upload sensitive data".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                    return; // One finding per segment
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+fn check_wget_exfiltration(seg: &tokenize::Segment, shell: ShellType, findings: &mut Vec<Finding>) {
+    let args = &seg.args;
+    let mut i = 0;
+    while i < args.len() {
+        let norm = normalize_shell_token(&args[i], shell);
+
+        let is_post_data = norm.starts_with("--post-data");
+        let is_post_file = norm.starts_with("--post-file");
+
+        if is_post_data || is_post_file {
+            let value = if let Some(eq_pos) = norm.find('=') {
+                Some(norm[eq_pos + 1..].to_string())
+            } else if i + 1 < args.len() {
+                i += 1;
+                Some(normalize_shell_token(&args[i], shell))
+            } else {
+                None
+            };
+
+            if let Some(val) = value {
+                let is_sensitive = if is_post_file {
+                    SENSITIVE_PATHS.iter().any(|p| val.contains(p))
+                } else {
+                    is_sensitive_file_ref(&val)
+                        || has_sensitive_env_ref(&val)
+                        || has_sensitive_cmd_substitution(&val)
+                };
+
+                if is_sensitive {
+                    findings.push(Finding {
+                        rule_id: RuleId::DataExfiltration,
+                        severity: Severity::High,
+                        title: "Data exfiltration via wget upload".to_string(),
+                        description: "wget command uploads sensitive data (credentials, keys, or private files) to a remote server".to_string(),
+                        evidence: vec![Evidence::CommandPattern {
+                            pattern: "wget upload sensitive data".to_string(),
+                            matched: redact::redact_shell_assignments(&seg.raw),
+                        }],
+                        human_view: None,
+                        agent_view: None,
+                        mitre_id: None,
+                        custom_rule_id: None,
+                    });
+                    return;
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]

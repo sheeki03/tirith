@@ -399,6 +399,18 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Archive extraction commands that may target sensitive paths",
     },
     PatternEntry {
+        id: "base64_decode_execute",
+        tier1_exec_fragments: &[
+            r"base64\s",
+            r"b64decode",
+            r"atob\s*\(",
+            r"(?i)-(?:EncodedCommand|enc|ec)\b",
+            r"(?i)Buffer\.from\(",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Base64 decode-and-execute patterns (pipe chain, inline, PowerShell)",
+    },
+    PatternEntry {
         id: "cargo_vet",
         tier1_exec_fragments: &[r"\bcargo\b"],
         tier1_paste_only_fragments: &[],

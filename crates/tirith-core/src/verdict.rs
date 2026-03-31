@@ -50,6 +50,13 @@ pub enum RuleId {
     ProcMemAccess,
     DockerRemotePrivEsc,
     CredentialFileSweep,
+    Base64DecodeExecute,
+    DataExfiltration,
+
+    // Code file scan rules
+    DynamicCodeExecution,
+    ObfuscatedPayload,
+    SuspiciousCodeExfiltration,
 
     // Environment rules
     ProxyEnvSet,

