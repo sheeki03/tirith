@@ -3,18 +3,13 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 /// Product tier levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Tier {
     Community,
+    #[default]
     Pro,
     Team,
     Enterprise,
-}
-
-impl Default for Tier {
-    fn default() -> Self {
-        Self::Pro
-    }
 }
 
 /// Extended license information parsed from a license token.

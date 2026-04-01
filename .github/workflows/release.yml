@@ -237,15 +237,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish tirith-core
-        run: cargo publish -p tirith-core --locked || echo "Already published or failed"
+        run: |
+          set +e
+          output=$(cargo publish -p tirith-core --locked 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ $status -ne 0 ] && ! echo "$output" | grep -qi "already uploaded"; then
+            exit $status
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for crates.io index
-        run: sleep 30
+      - name: Wait for tirith-core on crates.io
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${VERSION#v}"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "https://crates.io/api/v1/crates/tirith-core/${VER}" >/dev/null; then
+              echo "tirith-core ${VER} is visible on crates.io"
+              exit 0
+            fi
+            echo "Waiting for tirith-core ${VER} to appear on crates.io (${attempt}/30)..."
+            sleep 10
+          done
+          echo "timed out waiting for tirith-core ${VER} to appear on crates.io"
+          exit 1
 
       - name: Publish tirith
-        run: cargo publish -p tirith --locked || echo "Already published or failed"
+        run: |
+          set +e
+          output=$(cargo publish -p tirith --locked 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ $status -ne 0 ] && ! echo "$output" | grep -qi "already uploaded"; then
+            exit $status
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
