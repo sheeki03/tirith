@@ -255,12 +255,13 @@ jobs:
         run: |
           set -euo pipefail
           VER="${VERSION#v}"
-          for attempt in $(seq 1 30); do
-            if curl -fsS "https://crates.io/api/v1/crates/tirith-core/${VER}" >/dev/null; then
+          for attempt in $(seq 1 60); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/tirith-core/${VER}")
+            if [ "$HTTP_CODE" = "200" ]; then
               echo "tirith-core ${VER} is visible on crates.io"
               exit 0
             fi
-            echo "Waiting for tirith-core ${VER} to appear on crates.io (${attempt}/30)..."
+            echo "Waiting for tirith-core ${VER} to appear on crates.io (${attempt}/60, HTTP ${HTTP_CODE})..."
             sleep 10
           done
           echo "timed out waiting for tirith-core ${VER} to appear on crates.io"
