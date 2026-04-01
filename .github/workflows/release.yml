@@ -485,6 +485,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Prepare per-platform build contexts
+        run: |
+          set -euo pipefail
+          # amd64
+          mkdir -p docker-amd64/bin docker-amd64/shell
+          tar xzf artifacts/tirith-x86_64-unknown-linux-gnu.tar.gz -C docker-amd64/bin tirith
+          cp -r shell/* docker-amd64/shell/
+          cp Dockerfile docker-amd64/
+
+          # arm64
+          mkdir -p docker-arm64/bin docker-arm64/shell
+          tar xzf artifacts/tirith-aarch64-unknown-linux-gnu.tar.gz -C docker-arm64/bin tirith
+          cp -r shell/* docker-arm64/shell/
+          cp Dockerfile docker-arm64/
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -502,15 +523,31 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      - name: Build and push
+      - name: Build and push (amd64)
         uses: docker/build-push-action@v5
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
+          context: docker-amd64
+          platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/sheeki03/tirith:latest
-            ghcr.io/sheeki03/tirith:${{ steps.version.outputs.VERSION }}
+          tags: ghcr.io/sheeki03/tirith:${{ steps.version.outputs.VERSION }}-amd64
+
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: docker-arm64
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/sheeki03/tirith:${{ steps.version.outputs.VERSION }}-arm64
+
+      - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/sheeki03/tirith:latest \
+            -t "ghcr.io/sheeki03/tirith:${VERSION}" \
+            "ghcr.io/sheeki03/tirith:${VERSION}-amd64" \
+            "ghcr.io/sheeki03/tirith:${VERSION}-arm64"
 
   publish-deb:
     name: Build Debian Package

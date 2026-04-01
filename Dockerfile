@@ -1,12 +1,7 @@
-# Minimal image - reqwest uses rustls-tls, no OpenSSL needed
-FROM rust:1.83-slim-bookworm AS builder
-
-# Add 'git' here if Cargo.toml has any git dependencies
-WORKDIR /src
-COPY . .
-RUN cargo build --release --locked -p tirith
-
-# Runtime image
+# Runtime-only image — uses pre-built binaries from CI, no compilation.
+# Build context must contain:
+#   bin/tirith   — the pre-built binary for the target platform
+#   shell/       — shell hook scripts
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,8 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --user-group tirith
 
-COPY --from=builder /src/target/release/tirith /usr/local/bin/
-COPY --from=builder /src/shell /usr/share/tirith/shell
+COPY bin/tirith /usr/local/bin/tirith
+COPY shell /usr/share/tirith/shell
+
+RUN chmod +x /usr/local/bin/tirith
 
 USER tirith
 
