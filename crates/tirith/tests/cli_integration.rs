@@ -1130,6 +1130,209 @@ fn auto_checkpoint_cli_wiring_compiles_and_runs() {
 // ─── Security audit fix tests ───
 
 #[cfg(unix)]
+fn prepare_read_only_audit_log() -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let data_home = tmpdir.path().join("xdg-data");
+    let tirith_dir = data_home.join("tirith");
+    fs::create_dir_all(&tirith_dir).expect("create tirith data dir");
+
+    let log_path = tirith_dir.join("log.jsonl");
+    fs::write(&log_path, "{}\n").expect("seed audit log");
+    fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o400))
+        .expect("make audit log read-only");
+
+    (tmpdir, data_home)
+}
+
+#[cfg(unix)]
+fn run_check_with_audit_failure(debug: bool) -> std::process::Output {
+    let (tmpdir, data_home) = prepare_read_only_audit_log();
+
+    let mut cmd = tirith();
+    cmd.env("XDG_DATA_HOME", &data_home)
+        .env("APPDATA", tmpdir.path())
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ]);
+    if debug {
+        cmd.env("TIRITH_AUDIT_DEBUG", "1");
+    }
+
+    cmd.output().expect("failed to run tirith check")
+}
+
+#[cfg(unix)]
+fn run_paste_with_audit_failure(debug: bool) -> std::process::Output {
+    let (tmpdir, data_home) = prepare_read_only_audit_log();
+
+    let mut cmd = tirith();
+    cmd.env("XDG_DATA_HOME", &data_home)
+        .env("APPDATA", tmpdir.path())
+        .args(["paste", "--shell", "posix", "--non-interactive"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if debug {
+        cmd.env("TIRITH_AUDIT_DEBUG", "1");
+    }
+
+    let mut child = cmd.spawn().expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(b"curl https://example.com/install.sh | bash")
+        .expect("write paste input");
+    child.wait_with_output().expect("wait on tirith paste")
+}
+
+#[cfg(unix)]
+fn run_check_with_last_trigger_failure(debug: bool) -> std::process::Output {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let fake_data_home = tmpdir.path().join("xdg-data-file");
+    fs::write(&fake_data_home, "not a directory").expect("seed fake XDG data home");
+
+    let mut cmd = tirith();
+    cmd.env("XDG_DATA_HOME", &fake_data_home)
+        .env("APPDATA", tmpdir.path())
+        .env("TIRITH_LOG", "0")
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ]);
+    if debug {
+        cmd.env("TIRITH_AUDIT_DEBUG", "1");
+    }
+
+    cmd.output().expect("failed to run tirith check")
+}
+
+#[cfg(unix)]
+#[test]
+fn check_audit_failures_are_silent_by_default() {
+    let out = run_check_with_audit_failure(false);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked command should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("BLOCKED"),
+        "check output should still show the verdict, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tirith: audit:"),
+        "audit diagnostics should be suppressed by default, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_audit_failures_are_visible_with_debug_env() {
+    let out = run_check_with_audit_failure(true);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked command should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tirith: audit:"),
+        "debug env should surface audit diagnostics, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_last_trigger_failures_are_silent_by_default() {
+    let out = run_check_with_last_trigger_failure(false);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked command should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("BLOCKED"),
+        "check output should still show the verdict, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot create data dir"),
+        "last_trigger diagnostics should be suppressed by default, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_last_trigger_failures_are_visible_with_debug_env() {
+    let out = run_check_with_last_trigger_failure(true);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked command should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot create data dir"),
+        "debug env should surface last_trigger diagnostics, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn paste_audit_failures_are_silent_by_default() {
+    let out = run_paste_with_audit_failure(false);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked paste should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("BLOCKED"),
+        "paste output should still show the verdict, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tirith: audit:"),
+        "audit diagnostics should be suppressed by default, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn paste_audit_failures_are_visible_with_debug_env() {
+    let out = run_paste_with_audit_failure(true);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "blocked paste should still exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tirith: audit:"),
+        "debug env should surface audit diagnostics, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn paste_oversized_input_rejected() {
     use std::io::Write;

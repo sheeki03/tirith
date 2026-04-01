@@ -45,9 +45,9 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
     // Trim to max_events (drop oldest = front of vec)
     if result.len() > max_events {
         let drop_count = result.len() - max_events;
-        eprintln!(
+        crate::audit::audit_diagnostic(format!(
             "tirith: audit-spool: dropping {drop_count} oldest events (max_events={max_events})"
-        );
+        ));
         result = result.into_iter().skip(drop_count).collect();
     }
 
@@ -66,10 +66,10 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
             kept.push(line);
         }
         kept.reverse();
-        eprintln!(
+        crate::audit::audit_diagnostic(format!(
             "tirith: audit-spool: trimmed to {} events to stay under {max_bytes} bytes",
             kept.len()
-        );
+        ));
         result = kept;
     }
 
@@ -85,7 +85,7 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
 pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes: u64) {
     // SSRF protection
     if let Err(reason) = crate::url_validate::validate_server_url(server_url) {
-        eprintln!("tirith: audit-upload: {reason}");
+        crate::audit::audit_diagnostic(format!("tirith: audit-upload: {reason}"));
         return;
     }
 
@@ -109,7 +109,9 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
     if lines.is_empty() {
         // Everything was trimmed -- write empty spool
         if let Err(e) = fs::write(&path, "") {
-            eprintln!("tirith: audit-spool: failed to clear spool: {e}");
+            crate::audit::audit_diagnostic(format!(
+                "tirith: audit-spool: failed to clear spool: {e}"
+            ));
         }
         return;
     }
@@ -145,7 +147,9 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
                 }
                 Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
                     // Auth error -- stop trying entirely
-                    eprintln!("tirith: audit-upload: auth failed, stopping upload");
+                    crate::audit::audit_diagnostic(
+                        "tirith: audit-upload: auth failed, stopping upload",
+                    );
                     rewrite_spool(&path, &lines[sent_count..]);
                     return;
                 }
@@ -177,13 +181,17 @@ pub fn drain_spool(_server_url: &str, _api_key: &str, _max_events: usize, _max_b
 fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
     if remaining.is_empty() {
         if let Err(e) = fs::write(path, "") {
-            eprintln!("tirith: audit-spool: failed to clear spool: {e}");
+            crate::audit::audit_diagnostic(format!(
+                "tirith: audit-spool: failed to clear spool: {e}"
+            ));
         }
     } else {
         let mut content = remaining.join("\n");
         content.push('\n');
         if let Err(e) = fs::write(path, content) {
-            eprintln!("tirith: audit-spool: failed to rewrite spool: {e}");
+            crate::audit::audit_diagnostic(format!(
+                "tirith: audit-spool: failed to rewrite spool: {e}"
+            ));
         }
     }
 }
@@ -200,7 +208,7 @@ pub fn spool_and_upload(
     max_bytes: Option<u64>,
 ) {
     if let Err(e) = spool_event(event_json) {
-        eprintln!("tirith: audit-spool: failed to write event: {e}");
+        crate::audit::audit_diagnostic(format!("tirith: audit-spool: failed to write event: {e}"));
         return;
     }
 

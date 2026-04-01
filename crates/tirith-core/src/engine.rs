@@ -628,10 +628,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
         findings.extend(env_findings);
 
-        // Policy-driven network deny/allow (Team feature)
-        if crate::license::current_tier() >= crate::license::Tier::Team
-            && !policy.network_deny.is_empty()
-        {
+        // Policy-driven network deny/allow
+        if !policy.network_deny.is_empty() {
             let net_findings = crate::rules::command::check_network_policy(
                 &ctx.input,
                 ctx.shell,
@@ -642,10 +640,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         }
     }
 
-    // Custom YAML detection rules (Team-only, Phase 24)
-    if crate::license::current_tier() >= crate::license::Tier::Team
-        && !policy.custom_rules.is_empty()
-    {
+    // Custom YAML detection rules
+    if !policy.custom_rules.is_empty() {
         let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
         let custom_findings = crate::rules::custom::check(&ctx.input, ctx.scan_context, &compiled);
         findings.extend(custom_findings);
@@ -719,19 +715,12 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         });
     }
 
-    // Enrichment pass (ADR-13): detection is free, enrichment is paid.
-    // All detection rules have already run above. Now add tier-gated enrichment.
-    let tier = crate::license::current_tier();
-    if tier >= crate::license::Tier::Pro {
-        enrich_pro(&mut findings);
-    }
-    if tier >= crate::license::Tier::Team {
-        enrich_team(&mut findings);
-    }
+    // Enrichment is always enabled in the single-tier runtime.
+    enrich_pro(&mut findings);
+    enrich_team(&mut findings);
 
-    // Early access filter (ADR-14): suppress non-critical findings for rules
-    // in time-boxed early access windows when tier is below the minimum.
-    crate::rule_metadata::filter_early_access(&mut findings, tier);
+    // Early-access suppression is disabled in the single-tier runtime.
+    crate::rule_metadata::filter_early_access(&mut findings, crate::license::Tier::Enterprise);
 
     let tier3_ms = tier3_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -759,24 +748,21 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
 // Paranoia tier filtering (Phase 15)
 // ---------------------------------------------------------------------------
 
-/// Filter a verdict's findings by paranoia level and license tier.
+/// Filter a verdict's findings by paranoia level.
 ///
-/// This is an output-layer filter — the engine always detects everything (ADR-13).
+/// This is an output-layer filter — the engine always detects everything.
 /// CLI/MCP call this after `analyze()` to reduce noise at lower paranoia levels.
 ///
-/// - Paranoia 1-2 (any tier): Medium+ findings only
-/// - Paranoia 3 (Pro required): also show Low findings
-/// - Paranoia 4 (Pro required): also show Info findings
-///
-/// Free-tier users are capped at effective paranoia 2 regardless of policy setting.
+/// - Paranoia 1-2: Medium+ findings only
+/// - Paranoia 3: also show Low findings
+/// - Paranoia 4: also show Info findings
 pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
     retain_by_paranoia(&mut verdict.findings, paranoia);
     verdict.action = recalculate_action(&verdict.findings);
 }
 
-/// Filter a Vec<Finding> by paranoia level and license tier.
-/// Same logic as `filter_findings_by_paranoia` but operates on raw findings
-/// (for scan results that don't use the Verdict wrapper).
+/// Filter a Vec<Finding> by paranoia level.
+/// Same logic as `filter_findings_by_paranoia` but operates on raw findings.
 pub fn filter_findings_by_paranoia_vec(findings: &mut Vec<Finding>, paranoia: u8) {
     retain_by_paranoia(findings, paranoia);
 }
@@ -801,12 +787,7 @@ fn recalculate_action(findings: &[Finding]) -> crate::verdict::Action {
 
 /// Shared paranoia retention logic.
 fn retain_by_paranoia(findings: &mut Vec<Finding>, paranoia: u8) {
-    let tier = crate::license::current_tier();
-    let effective = if tier >= crate::license::Tier::Pro {
-        paranoia.min(4)
-    } else {
-        paranoia.min(2) // Free users capped at 2
-    };
+    let effective = paranoia.min(4);
 
     findings.retain(|f| match f.severity {
         crate::verdict::Severity::Info => effective >= 4,
@@ -816,7 +797,7 @@ fn retain_by_paranoia(findings: &mut Vec<Finding>, paranoia: u8) {
 }
 
 // ---------------------------------------------------------------------------
-// Tier-gated enrichment (ADR-13: detect free, enrich paid)
+// Finding enrichment
 // ---------------------------------------------------------------------------
 
 /// Pro enrichment: dual-view, decoded content, cloaking diffs, line numbers.

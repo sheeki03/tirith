@@ -70,17 +70,6 @@ pub fn show(json: bool) -> i32 {
 
     if json {
         print_license_json(&info);
-    } else if info.tier == license::Tier::Community {
-        // Check if there's actually a key file
-        if license::license_key_path()
-            .map(|p| p.exists())
-            .unwrap_or(false)
-        {
-            eprintln!("License: Community (free) — installed key is invalid or expired");
-        } else {
-            eprintln!("License: Community (free)");
-            eprintln!("  Run 'tirith activate <key>' to activate a license.");
-        }
     } else {
         print_license_info(&info);
     }
@@ -107,7 +96,7 @@ pub fn deactivate() -> i32 {
         return 1;
     }
 
-    eprintln!("License deactivated. Tier reverted to Community (free).");
+    eprintln!("License key removed. Baseline features remain available.");
     0
 }
 
@@ -295,22 +284,4 @@ fn days_remaining(exp: &str) -> Option<i64> {
         return Some((date - today).num_days());
     }
     None
-}
-
-/// Check license expiry and print a warning if it's within 7 days.
-/// Called from check.rs after printing the verdict.
-pub fn warn_if_expiring_soon() {
-    let info = license::license_info();
-    if info.tier < license::Tier::Pro {
-        return;
-    }
-    if let Some(ref exp) = info.expires {
-        if let Some(days) = days_remaining(exp) {
-            if days <= 7 {
-                eprintln!(
-                    "tirith: License expires in {days} day(s). Run 'tirith license refresh' to renew."
-                );
-            }
-        }
-    }
 }

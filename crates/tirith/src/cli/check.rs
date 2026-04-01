@@ -83,26 +83,12 @@ pub fn run(
 
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // Approval workflow (Team feature)
-    if tirith_core::license::current_tier() >= tirith_core::license::Tier::Team {
-        if let Some(meta) = tirith_core::approval::check_approval(&verdict, &policy) {
-            tirith_core::approval::apply_approval(&mut verdict, &meta);
+    // Approval workflow
+    if let Some(meta) = tirith_core::approval::check_approval(&verdict, &policy) {
+        tirith_core::approval::apply_approval(&mut verdict, &meta);
 
-            if approval_check {
-                match tirith_core::approval::write_approval_file(&meta) {
-                    Ok(path) => {
-                        println!("{}", path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("tirith: failed to write approval file: {e}");
-                        return 1;
-                    }
-                }
-                return verdict.action.exit_code();
-            }
-        } else if approval_check {
-            // No approval needed
-            match tirith_core::approval::write_no_approval_file() {
+        if approval_check {
+            match tirith_core::approval::write_approval_file(&meta) {
                 Ok(path) => {
                     println!("{}", path.display());
                 }
@@ -111,9 +97,10 @@ pub fn run(
                     return 1;
                 }
             }
+            return verdict.action.exit_code();
         }
     } else if approval_check {
-        // Not Team tier — no approval workflow, write no-approval
+        // No approval needed
         match tirith_core::approval::write_no_approval_file() {
             Ok(path) => {
                 println!("{}", path.display());
@@ -125,13 +112,12 @@ pub fn run(
         }
     }
 
-    // Auto-checkpoint before destructive commands (Pro feature).
+    // Auto-checkpoint before destructive commands.
     // Skip in non-interactive mode: hooks and scripts need fast responses, and
     // checkpoint::create() synchronously traverses the entire cwd which can take
     // seconds on large directories.
     if interactive
         && verdict.action != tirith_core::verdict::Action::Block
-        && tirith_core::license::current_tier() >= tirith_core::license::Tier::Pro
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
     {
         if let Some(cwd) = &ctx.cwd {
@@ -158,10 +144,8 @@ pub fn run(
         last_trigger::write_last_trigger(&verdict, cmd, &policy.dlp_custom_patterns);
     }
 
-    // Webhook dispatch (Team feature, non-blocking background thread)
-    if tirith_core::license::current_tier() >= tirith_core::license::Tier::Team
-        && !policy.webhooks.is_empty()
-    {
+    // Webhook dispatch (non-blocking background thread)
+    if !policy.webhooks.is_empty() {
         tirith_core::webhook::dispatch(
             &verdict,
             cmd,
@@ -193,9 +177,6 @@ pub fn run(
     } else if output::write_human_auto(&verdict).is_err() {
         eprintln!("tirith: failed to write output");
     }
-
-    // Warn if license is expiring soon (Pro+ only)
-    crate::cli::license_cmd::warn_if_expiring_soon();
 
     verdict.action.exit_code()
 }

@@ -111,14 +111,26 @@ _tirith_persist_safe_mode() {
 
 _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return
-  # Only run once per command (guard against DEBUG firing multiple times)
-  [[ "${_tirith_last_cmd:-}" == "$BASH_COMMAND" ]] && return
-  _tirith_last_cmd="$BASH_COMMAND"
+  local cmd="$BASH_COMMAND"
+  local history_line
+
+  # In DEBUG-trap mode, bash exposes each simple command in a pipeline via
+  # BASH_COMMAND. Prefer the latest history entry when available so we can scan
+  # the full typed line once instead of missing multi-part commands like
+  # `curl ... | bash`.
+  history_line="$(history 1 2>/dev/null | sed 's/^ *[0-9]* *//')"
+  if [[ -n "$history_line" ]]; then
+    cmd="$history_line"
+  fi
+
+  # Only run once per command line (guard against DEBUG firing multiple times)
+  [[ "${_tirith_last_cmd:-}" == "$cmd" ]] && return
+  _tirith_last_cmd="$cmd"
 
   # Warn-only: command is already committed, we can only print warnings
   local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
   _TIRITH_BASH_INTERNAL=1
-  command tirith check --shell posix -- "$BASH_COMMAND" || true
+  command tirith check --shell posix -- "$cmd" || true
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
 }
 

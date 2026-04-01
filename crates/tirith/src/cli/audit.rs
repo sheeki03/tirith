@@ -9,11 +9,6 @@ pub fn export(
     action: Option<&str>,
     rule_ids: &[String],
 ) -> i32 {
-    if tirith_core::license::current_tier() < tirith_core::license::Tier::Team {
-        eprintln!("tirith: audit export requires a Team license");
-        return 1;
-    }
-
     let log_path = match tirith_core::policy::data_dir() {
         Some(d) => d.join("log.jsonl"),
         None => {
@@ -62,11 +57,6 @@ pub fn export(
 
 /// Run the `tirith audit stats` subcommand.
 pub fn stats(session: Option<&str>, json: bool) -> i32 {
-    if tirith_core::license::current_tier() < tirith_core::license::Tier::Team {
-        eprintln!("tirith: audit stats requires a Team license");
-        return 1;
-    }
-
     let log_path = match tirith_core::policy::data_dir() {
         Some(d) => d.join("log.jsonl"),
         None => {
@@ -136,11 +126,6 @@ pub fn stats(session: Option<&str>, json: bool) -> i32 {
 
 /// Run the `tirith audit report` subcommand.
 pub fn report(format: &str, since: Option<&str>) -> i32 {
-    if tirith_core::license::current_tier() < tirith_core::license::Tier::Team {
-        eprintln!("tirith: audit report requires a Team license");
-        return 1;
-    }
-
     let log_path = match tirith_core::policy::data_dir() {
         Some(d) => d.join("log.jsonl"),
         None => {

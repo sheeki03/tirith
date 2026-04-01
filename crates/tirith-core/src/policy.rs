@@ -54,7 +54,7 @@ pub struct Policy {
     #[serde(default)]
     pub blocklist: Vec<String>,
 
-    // --- Team features (Phase 18) ---
+    // --- Centralized policy / remote features ---
     /// Approval rules: commands matching these rules require human approval.
     #[serde(default)]
     pub approval_rules: Vec<ApprovalRule>,
@@ -295,8 +295,8 @@ impl Policy {
     ///
     /// Resolution order:
     /// 1. Local policy (TIRITH_POLICY_ROOT, walk-up discovery, user-level)
-    /// 2. Team+ only: if `TIRITH_SERVER_URL` + `TIRITH_API_KEY` are set (or
-    ///    policy has `policy_server_url`), try remote fetch. On success the
+    /// 2. If `TIRITH_SERVER_URL` + `TIRITH_API_KEY` are set (or policy has
+    ///    `policy_server_url`), try remote fetch. On success the
     ///    remote policy **replaces** the local one entirely and is cached.
     /// 3. On remote failure, apply `policy_fetch_fail_mode`:
     ///    - `"open"` (default): warn and use local policy
@@ -306,11 +306,6 @@ impl Policy {
     pub fn discover(cwd: Option<&str>) -> Self {
         // --- Step 1: resolve local policy ---
         let local = Self::discover_local(cwd);
-
-        // Centralized policy fetch is a Team+ feature.
-        if crate::license::current_tier() < crate::license::Tier::Team {
-            return local;
-        }
 
         // --- Step 2: determine remote fetch parameters ---
         let server_url = std::env::var("TIRITH_SERVER_URL")
@@ -773,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_skips_remote_fetch_below_team_tier() {
+    fn test_discover_applies_remote_fetch_fail_mode_when_configured() {
         let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -785,23 +780,15 @@ mod tests {
         )
         .unwrap();
 
-        // Force Community tier regardless of host machine config.
-        unsafe { std::env::set_var("TIRITH_LICENSE", "!") };
         unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
         unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
 
         let policy = Policy::discover(Some(dir.path().to_str().unwrap()));
-        assert_ne!(policy.path.as_deref(), Some("fail-closed"));
-        assert_eq!(policy.fail_mode, FailMode::Open);
-        assert!(policy.allow_bypass_env_noninteractive);
-        assert!(policy
-            .path
-            .as_deref()
-            .unwrap_or_default()
-            .contains(".tirith"));
+        assert_eq!(policy.path.as_deref(), Some("fail-closed"));
+        assert_eq!(policy.fail_mode, FailMode::Closed);
+        assert!(!policy.allow_bypass_env_noninteractive);
 
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
-        unsafe { std::env::remove_var("TIRITH_LICENSE") };
     }
 }

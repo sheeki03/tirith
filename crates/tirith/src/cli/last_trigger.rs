@@ -7,10 +7,10 @@ pub fn write_last_trigger(
 ) {
     if let Some(dir) = tirith_core::policy::data_dir() {
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!(
+            tirith_core::audit::audit_diagnostic(format!(
                 "tirith: warning: cannot create data dir {}: {e}",
                 dir.display()
-            );
+            ));
             return;
         }
         let path = dir.join("last_trigger.json");
@@ -48,7 +48,9 @@ pub fn write_last_trigger(
         let json = match serde_json::to_string_pretty(&trigger) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("tirith: warning: failed to serialize last trigger: {e}");
+                tirith_core::audit::audit_diagnostic(format!(
+                    "tirith: warning: failed to serialize last trigger: {e}"
+                ));
                 return;
             }
         };

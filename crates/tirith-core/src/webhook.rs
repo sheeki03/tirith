@@ -1,4 +1,4 @@
-/// Webhook event dispatcher for finding notifications (Team feature).
+/// Webhook event dispatcher for finding notifications.
 ///
 /// Unix-only (ADR-8): depends on reqwest. Non-blocking: fires in a background
 /// thread so it never delays the verdict exit code.
@@ -8,8 +8,9 @@ use crate::verdict::{Severity, Verdict};
 /// Dispatch webhook notifications for a verdict, if configured.
 ///
 /// Spawns a background thread per webhook endpoint. The main thread is never
-/// blocked. If any webhook delivery fails after retries, errors are logged
-/// to stderr.
+/// blocked. Auxiliary delivery/configuration diagnostics are debug-only so
+/// shell hooks don't turn best-effort webhook failures into native-command
+/// noise.
 #[cfg(unix)]
 pub fn dispatch(
     verdict: &Verdict,
@@ -38,7 +39,10 @@ pub fn dispatch(
 
         // SSRF protection: validate webhook URL
         if let Err(reason) = crate::url_validate::validate_server_url(&wh.url) {
-            eprintln!("tirith: webhook: skipping {}: {reason}", wh.url);
+            crate::audit::audit_diagnostic(format!(
+                "tirith: webhook: skipping {}: {reason}",
+                wh.url
+            ));
             continue;
         }
 
@@ -48,7 +52,9 @@ pub fn dispatch(
 
         std::thread::spawn(move || {
             if let Err(e) = send_with_retry(&url, &payload, &headers, 3) {
-                eprintln!("tirith: webhook delivery to {url} failed: {e}");
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: webhook delivery to {url} failed: {e}"
+                ));
             }
         });
     }
@@ -96,7 +102,7 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
         if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
             return result;
         }
-        eprintln!(
+        crate::audit::audit_diagnostic(
             "tirith: webhook: warning: payload template produced invalid JSON, using default payload"
         );
     }
@@ -151,14 +157,20 @@ fn expand_env_value(input: &str) -> String {
                 chars.next(); // consume '{'
                 let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
                 if !var_name.starts_with("TIRITH_") {
-                    eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                    crate::audit::audit_diagnostic(format!(
+                        "tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)"
+                    ));
                 } else if is_sensitive_webhook_env_var(&var_name) {
-                    eprintln!("tirith: webhook: sensitive env var '{var_name}' blocked");
+                    crate::audit::audit_diagnostic(format!(
+                        "tirith: webhook: sensitive env var '{var_name}' blocked"
+                    ));
                 } else {
                     match std::env::var(&var_name) {
                         Ok(val) => result.push_str(&val),
                         Err(_) => {
-                            eprintln!("tirith: webhook: warning: env var '{var_name}' is not set");
+                            crate::audit::audit_diagnostic(format!(
+                                "tirith: webhook: warning: env var '{var_name}' is not set"
+                            ));
                         }
                     }
                 }
@@ -175,16 +187,20 @@ fn expand_env_value(input: &str) -> String {
                 }
                 if !var_name.is_empty() {
                     if !var_name.starts_with("TIRITH_") {
-                        eprintln!("tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)");
+                        crate::audit::audit_diagnostic(format!(
+                            "tirith: webhook: env var '{var_name}' blocked (only TIRITH_* vars allowed in webhooks)"
+                        ));
                     } else if is_sensitive_webhook_env_var(&var_name) {
-                        eprintln!("tirith: webhook: sensitive env var '{var_name}' blocked");
+                        crate::audit::audit_diagnostic(format!(
+                            "tirith: webhook: sensitive env var '{var_name}' blocked"
+                        ));
                     } else {
                         match std::env::var(&var_name) {
                             Ok(val) => result.push_str(&val),
                             Err(_) => {
-                                eprintln!(
+                                crate::audit::audit_diagnostic(format!(
                                     "tirith: webhook: warning: env var '{var_name}' is not set"
-                                );
+                                ));
                             }
                         }
                     }

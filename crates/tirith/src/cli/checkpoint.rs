@@ -1,25 +1,12 @@
 use tirith_core::checkpoint;
-use tirith_core::license;
 
 pub fn list_checkpoints(json: bool) -> i32 {
-    let is_pro = license::current_tier() >= license::Tier::Pro;
-
     match checkpoint::list() {
         Ok(entries) => {
             if json {
-                let mut json_val = serde_json::json!({
+                let json_val = serde_json::json!({
                     "checkpoints": entries,
                 });
-                if !is_pro {
-                    json_val.as_object_mut().unwrap().insert(
-                        "license_required".into(),
-                        serde_json::json!({
-                            "rule_id": "license_required",
-                            "severity": "INFO",
-                            "message": "Checkpoint features (create, restore, diff, purge) require a Pro license."
-                        }),
-                    );
-                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json_val).unwrap_or_else(|e| {
@@ -55,10 +42,6 @@ pub fn list_checkpoints(json: bool) -> i32 {
                     }
                     println!("\n{} checkpoint(s)", entries.len());
                 }
-                if !is_pro {
-                    eprintln!();
-                    eprintln!("\x1b[90m[INFO] Checkpoint create/restore/diff/purge require a Pro license.\x1b[0m");
-                }
             }
             0
         }
@@ -70,7 +53,6 @@ pub fn list_checkpoints(json: bool) -> i32 {
 }
 
 pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
-    // Core gates at Pro tier (ADR-6)
     match checkpoint::restore(id) {
         Ok(restored) => {
             if json {
@@ -101,7 +83,6 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
 }
 
 pub fn diff_checkpoint(id: &str, json: bool) -> i32 {
-    // Core gates at Pro tier (ADR-6)
     match checkpoint::diff(id) {
         Ok(diffs) => {
             if json {
@@ -139,7 +120,6 @@ pub fn diff_checkpoint(id: &str, json: bool) -> i32 {
 }
 
 pub fn purge_checkpoints(json: bool) -> i32 {
-    // Core gates at Pro tier (ADR-6)
     let config = checkpoint::CheckpointConfig::default();
     match checkpoint::purge(&config) {
         Ok(result) => {
@@ -171,7 +151,6 @@ pub fn purge_checkpoints(json: bool) -> i32 {
 }
 
 pub fn create_checkpoint(paths: &[String], trigger: Option<&str>, json: bool) -> i32 {
-    // Core gates at Pro tier (ADR-6)
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     match checkpoint::create(&path_refs, trigger) {
         Ok(meta) => {

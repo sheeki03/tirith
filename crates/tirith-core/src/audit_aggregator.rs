@@ -1,4 +1,4 @@
-/// Audit log aggregation, analytics, and compliance reporting (Team feature).
+/// Audit log aggregation, analytics, and compliance reporting.
 ///
 /// Reads JSONL audit log files and provides:
 /// - Export: filter + format as JSON/CSV

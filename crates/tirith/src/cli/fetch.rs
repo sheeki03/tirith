@@ -1,20 +1,12 @@
-use tirith_core::license;
 use tirith_core::rules::cloaking;
 
 pub fn run(url: &str, json: bool) -> i32 {
-    let is_pro = license::current_tier() >= license::Tier::Pro;
     match cloaking::check(url) {
-        Ok(mut result) => {
-            // Strip diff_text for Free tier (enrichment is Pro-gated per ADR-13)
-            if !is_pro {
-                for diff in &mut result.diff_pairs {
-                    diff.diff_text = None;
-                }
-            }
+        Ok(result) => {
             if json {
-                print_json(&result, is_pro);
+                print_json(&result);
             } else {
-                print_human(&result, is_pro);
+                print_human(&result);
             }
             if result.cloaking_detected {
                 1
@@ -29,8 +21,8 @@ pub fn run(url: &str, json: bool) -> i32 {
     }
 }
 
-fn print_json(result: &cloaking::CloakingResult, is_pro: bool) {
-    let json = result.to_json(is_pro);
+fn print_json(result: &cloaking::CloakingResult) {
+    let json = result.to_json(true);
     println!(
         "{}",
         serde_json::to_string_pretty(&json).unwrap_or_else(|e| {
@@ -40,7 +32,7 @@ fn print_json(result: &cloaking::CloakingResult, is_pro: bool) {
     );
 }
 
-fn print_human(result: &cloaking::CloakingResult, is_pro: bool) {
+fn print_human(result: &cloaking::CloakingResult) {
     println!("Cloaking check: {}", result.url);
     println!();
 
@@ -65,15 +57,9 @@ fn print_human(result: &cloaking::CloakingResult, is_pro: bool) {
                 "  {} vs {}: {} chars different",
                 diff.agent_a, diff.agent_b, diff.diff_chars
             );
-            if is_pro {
-                if let Some(ref text) = diff.diff_text {
-                    println!("    {text}");
-                }
+            if let Some(ref text) = diff.diff_text {
+                println!("    {text}");
             }
-        }
-        if !is_pro {
-            println!();
-            println!("  \x1b[90m(Pro license unlocks detailed diff text)\x1b[0m");
         }
     } else {
         println!("\x1b[32mNo cloaking detected.\x1b[0m");

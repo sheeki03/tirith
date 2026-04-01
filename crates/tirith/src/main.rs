@@ -35,7 +35,7 @@ enum Commands {
         interactive: bool,
 
         /// Write approval metadata to a temp file and print its path to stdout.
-        /// Used by shell hooks for the approval workflow (Team feature).
+        /// Used by shell hooks for the approval workflow.
         #[arg(long)]
         approval_check: bool,
 

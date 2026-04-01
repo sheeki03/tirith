@@ -1929,7 +1929,7 @@ fn extract_urls_from_args(args: &[String], shell: ShellType) -> Vec<String> {
     urls
 }
 
-/// Check command destination hosts against policy network deny/allow lists (Team feature).
+/// Check command destination hosts against policy network deny/allow lists.
 ///
 /// For each source command (curl, wget, etc.), extracts the destination host and
 /// checks against deny/allow lists. Allow takes precedence (exempts from deny).

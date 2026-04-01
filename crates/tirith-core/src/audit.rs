@@ -9,6 +9,26 @@ use serde::Serialize;
 
 use crate::verdict::Verdict;
 
+fn audit_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIRITH_AUDIT_DEBUG")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+/// Emit a non-fatal diagnostic only when debug logging is enabled.
+///
+/// This is used for auxiliary/background paths that must never interfere with
+/// shell-hook execution or change the command verdict.
+pub fn audit_diagnostic(msg: impl AsRef<str>) {
+    if audit_diagnostics_enabled() {
+        eprintln!("{}", msg.as_ref());
+    }
+}
+
 /// An audit log entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
@@ -51,10 +71,10 @@ pub fn log_verdict(
     // Ensure directory exists
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!(
+            audit_diagnostic(format!(
                 "tirith: audit: cannot create log dir {}: {e}",
                 parent.display()
-            );
+            ));
             return;
         }
     }
@@ -80,7 +100,7 @@ pub fn log_verdict(
     let line = match serde_json::to_string(&entry) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("tirith: audit: failed to serialize entry: {e}");
+            audit_diagnostic(format!("tirith: audit: failed to serialize entry: {e}"));
             return;
         }
     };
@@ -90,10 +110,10 @@ pub fn log_verdict(
     {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!(
+                audit_diagnostic(format!(
                     "tirith: audit: refusing to follow symlink at {}",
                     path.display()
-                );
+                ));
                 return;
             }
             _ => {}
@@ -113,7 +133,10 @@ pub fn log_verdict(
     let file = match file {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("tirith: audit: cannot open {}: {e}", path.display());
+            audit_diagnostic(format!(
+                "tirith: audit: cannot open {}: {e}",
+                path.display()
+            ));
             return;
         }
     };
@@ -126,21 +149,24 @@ pub fn log_verdict(
     }
 
     if let Err(e) = file.lock_exclusive() {
-        eprintln!("tirith: audit: cannot lock {}: {e}", path.display());
+        audit_diagnostic(format!(
+            "tirith: audit: cannot lock {}: {e}",
+            path.display()
+        ));
         return;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
-        eprintln!("tirith: audit: write failed: {e}");
+        audit_diagnostic(format!("tirith: audit: write failed: {e}"));
         let _ = fs2::FileExt::unlock(&file);
         return;
     }
     if let Err(e) = writer.flush() {
-        eprintln!("tirith: audit: flush failed: {e}");
+        audit_diagnostic(format!("tirith: audit: flush failed: {e}"));
     }
     if let Err(e) = file.sync_all() {
-        eprintln!("tirith: audit: sync failed: {e}");
+        audit_diagnostic(format!("tirith: audit: sync failed: {e}"));
     }
     let _ = fs2::FileExt::unlock(&file);
 
@@ -154,9 +180,7 @@ pub fn log_verdict(
         .ok()
         .filter(|s| !s.is_empty());
     if let (Some(url), Some(key)) = (server_url, api_key) {
-        if crate::license::current_tier() >= crate::license::Tier::Team {
-            crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
-        }
+        crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
     }
 }
 
@@ -229,6 +253,21 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_LOG") };
     }
 
+    #[test]
+    fn test_audit_diagnostics_disabled_by_default() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
+        assert!(!audit_diagnostics_enabled());
+    }
+
+    #[test]
+    fn test_audit_diagnostics_enabled_by_env() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TIRITH_AUDIT_DEBUG", "true") };
+        assert!(audit_diagnostics_enabled());
+        unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_audit_log_permissions_0600() {
@@ -258,16 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_audit_upload_requires_team_tier() {
+    fn test_remote_audit_upload_spools_when_configured() {
         let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");
         let state_home = dir.path().join("state");
 
-        // Force Community tier and set remote upload env vars.
-        unsafe { std::env::set_var("TIRITH_LICENSE", "!") };
-        unsafe { std::env::set_var("TIRITH_SERVER_URL", "https://example.com") };
+        // Use an invalid local URL so drain returns early after spooling.
+        unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
         unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
         unsafe { std::env::remove_var("TIRITH_LOG") };
@@ -298,15 +336,11 @@ mod tests {
         log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
 
         let spool = state_home.join("tirith").join("audit-queue.jsonl");
-        assert!(
-            !spool.exists(),
-            "Community tier must not spool remote audit uploads"
-        );
+        assert!(spool.exists(), "remote audit events should be spooled");
 
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
-        unsafe { std::env::remove_var("TIRITH_LICENSE") };
     }
 
     #[cfg(unix)]

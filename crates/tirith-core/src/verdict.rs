@@ -115,7 +115,7 @@ pub enum RuleId {
     // Policy rules
     PolicyBlocklisted,
 
-    // Custom rules (Team-only, Phase 24)
+    // Custom rules
     CustomRuleMatch,
 
     // License/infrastructure rules

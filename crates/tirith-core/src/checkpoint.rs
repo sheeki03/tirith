@@ -14,17 +14,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Check if the current license tier permits checkpoint operations.
-/// Returns `Ok(())` if Pro or above, `Err(message)` otherwise.
 fn require_pro() -> Result<(), String> {
-    let tier = crate::license::current_tier();
-    if tier >= crate::license::Tier::Pro {
-        Ok(())
-    } else {
-        Err(format!(
-            "Checkpoint features require a Pro license (current tier: {tier})."
-        ))
-    }
+    Ok(())
 }
 
 /// Commands that trigger automatic checkpointing.
@@ -123,7 +114,7 @@ pub fn checkpoints_dir() -> PathBuf {
     }
 }
 
-/// Create a checkpoint of the given paths. Requires Pro tier (ADR-6: gate in core).
+/// Create a checkpoint of the given paths.
 pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<CheckpointMeta, String> {
     require_pro()?;
     let base_dir = checkpoints_dir();
@@ -280,7 +271,7 @@ fn validate_sha256_filename(sha: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Restore files from a checkpoint. Requires Pro tier (ADR-6: gate in core).
+/// Restore files from a checkpoint.
 pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
     require_pro()?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
@@ -334,7 +325,7 @@ pub fn restore(checkpoint_id: &str) -> Result<Vec<String>, String> {
     Ok(restored)
 }
 
-/// Get diff between checkpoint and current filesystem state. Requires Pro tier (ADR-6: gate in core).
+/// Get diff between checkpoint and current filesystem state.
 pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     require_pro()?;
     let cp_dir = checkpoints_dir().join(checkpoint_id);
@@ -417,7 +408,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     Ok(diffs)
 }
 
-/// Purge old checkpoints based on configuration limits. Requires Pro tier (ADR-6: gate in core).
+/// Purge old checkpoints based on configuration limits.
 pub fn purge(config: &CheckpointConfig) -> Result<PurgeResult, String> {
     require_pro()?;
     let base_dir = checkpoints_dir();

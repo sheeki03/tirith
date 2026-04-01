@@ -3,13 +3,18 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 /// Product tier levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
-    #[default]
     Community,
     Pro,
     Team,
     Enterprise,
+}
+
+impl Default for Tier {
+    fn default() -> Self {
+        Self::Pro
+    }
 }
 
 /// Extended license information parsed from a license token.
@@ -364,20 +369,20 @@ fn decode_license_info_at(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> 
 /// Resolution order:
 /// 1. `TIRITH_LICENSE` env var (raw key)
 /// 2. `~/.config/tirith/license.key` file
-/// 3. Fallback: `Tier::Community`
+/// 3. Fallback: `Tier::Pro`
 ///
 /// Tier verification uses Ed25519-signed tokens. Legacy unsigned tokens are
 /// accepted during the transition period (v0.2.x) but will be rejected in
-/// v0.3.0+. Tiers gate enrichment depth, not security-critical detection
-/// (ADR-13).
+/// v0.3.0+. Runtime feature gating has been collapsed to an always-on Pro
+/// baseline; tier parsing remains for compatibility with existing tokens.
 ///
-/// Invalid, expired, or missing keys silently fall back to Community
+/// Invalid, expired, or missing keys silently fall back to Pro
 /// (no panic, no error exit).
 pub fn current_tier() -> Tier {
     match read_license_key() {
         Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or_else(|| {
-            eprintln!(
-                "tirith: warning: license key present but decode failed, falling back to Pro"
+            crate::audit::audit_diagnostic(
+                "tirith: warning: license key present but decode failed, falling back to Pro",
             );
             Tier::Pro
         }),
@@ -389,7 +394,9 @@ pub fn current_tier() -> Tier {
 pub fn license_info() -> LicenseInfo {
     match read_license_key() {
         Some(k) => decode_license_info_at(&k, Utc::now()).unwrap_or_else(|| {
-            eprintln!("tirith: warning: license key present but decode failed for license info");
+            crate::audit::audit_diagnostic(
+                "tirith: warning: license key present but decode failed for license info",
+            );
             LicenseInfo::default()
         }),
         None => LicenseInfo::default(),
@@ -810,7 +817,7 @@ mod tests {
     #[test]
     fn test_license_info_default() {
         let info = LicenseInfo::default();
-        assert_eq!(info.tier, Tier::Community);
+        assert_eq!(info.tier, Tier::Pro);
         assert!(info.org_id.is_none());
     }
 

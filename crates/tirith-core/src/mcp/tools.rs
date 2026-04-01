@@ -217,7 +217,7 @@ fn call_check_command(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_if_team(&mut verdict, &policy);
+    apply_approval_metadata(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -259,7 +259,7 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_if_team(&mut verdict, &policy);
+    apply_approval_metadata(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -299,7 +299,7 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_if_team(&mut verdict, &policy);
+    apply_approval_metadata(&mut verdict, &policy);
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -487,14 +487,12 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: url"),
     };
 
-    let is_pro = crate::license::current_tier() >= crate::license::Tier::Pro;
-
     let policy = crate::policy::Policy::discover(None);
 
     match crate::rules::cloaking::check(url) {
         Ok(mut result) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
-            build_cloaking_response(result, is_pro, &policy.dlp_custom_patterns)
+            build_cloaking_response(result, &policy.dlp_custom_patterns)
         }
         Err(e) => tool_error(&format!("Cloaking check failed: {e}")),
     }
@@ -505,7 +503,6 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
 #[cfg(unix)]
 fn build_cloaking_response(
     mut result: crate::rules::cloaking::CloakingResult,
-    is_pro: bool,
     dlp_patterns: &[String],
 ) -> ToolCallResult {
     let text = if result.cloaking_detected {
@@ -530,7 +527,7 @@ fn build_cloaking_response(
         }
     }
 
-    let structured = result.to_json(is_pro);
+    let structured = result.to_json(true);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -546,13 +543,10 @@ fn build_cloaking_response(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Apply approval metadata to a verdict if the current tier is Team+.
-/// Shared by all MCP check tools (ADR-6: gates in core, not CLI).
-fn apply_approval_if_team(verdict: &mut crate::verdict::Verdict, policy: &crate::policy::Policy) {
-    if crate::license::current_tier() >= crate::license::Tier::Team {
-        if let Some(meta) = crate::approval::check_approval(verdict, policy) {
-            crate::approval::apply_approval(verdict, &meta);
-        }
+/// Apply approval metadata to a verdict.
+fn apply_approval_metadata(verdict: &mut crate::verdict::Verdict, policy: &crate::policy::Policy) {
+    if let Some(meta) = crate::approval::check_approval(verdict, policy) {
+        crate::approval::apply_approval(verdict, &meta);
     }
 }
 
@@ -665,12 +659,11 @@ mod tests {
             }],
         };
 
-        // Simulate Pro tier seeing diff_text
-        let resp = build_cloaking_response(result, true, &[]);
+        let resp = build_cloaking_response(result, &[]);
         let structured = resp.structured_content.unwrap();
         let diff_text = structured["diffs"][0]["diff_text"]
             .as_str()
-            .expect("diff_text should be present for Pro");
+            .expect("diff_text should be present");
 
         // The OpenAI key pattern should be redacted
         assert!(
@@ -684,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cloaking_diff_text_absent_for_non_pro() {
+    fn test_cloaking_diff_text_present_in_structured_output() {
         use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
 
         let result = CloakingResult {
@@ -704,12 +697,11 @@ mod tests {
             }],
         };
 
-        // Non-Pro: diff_text should NOT appear in structured output
-        let resp = build_cloaking_response(result, false, &[]);
+        let resp = build_cloaking_response(result, &[]);
         let structured = resp.structured_content.unwrap();
         assert!(
-            structured["diffs"][0].get("diff_text").is_none(),
-            "diff_text should not be present for non-Pro"
+            structured["diffs"][0].get("diff_text").is_some(),
+            "diff_text should be present in structured output"
         );
     }
 
@@ -735,7 +727,7 @@ mod tests {
         };
 
         let custom = vec![r"PROJ-\d+".to_string()];
-        let resp = build_cloaking_response(result, true, &custom);
+        let resp = build_cloaking_response(result, &custom);
         let structured = resp.structured_content.unwrap();
         let diff_text = structured["diffs"][0]["diff_text"]
             .as_str()
