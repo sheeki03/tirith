@@ -302,7 +302,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_TEST_WH", "secret123") };
         assert_eq!(
             expand_env_value("Bearer $TIRITH_TEST_WH"),
@@ -319,7 +321,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value_preserves_delimiter() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // CR-6: The character after $VAR must not be swallowed
         unsafe { std::env::set_var("TIRITH_TEST_WH2", "val") };
         assert_eq!(expand_env_value("$TIRITH_TEST_WH2/extra"), "val/extra");
@@ -330,7 +334,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_expand_env_value_blocks_sensitive_vars() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("TIRITH_API_KEY", "secret-api-key");
             std::env::set_var("TIRITH_LICENSE", "secret-license");
@@ -350,7 +356,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bypass_sensitive_var_both_forms() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("TIRITH_API_KEY", "leaked");
             std::env::set_var("TIRITH_LICENSE", "leaked");
@@ -373,7 +381,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bypass_case_variation_is_different_var() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Unix env vars are case-sensitive: TIRITH_api_key != TIRITH_API_KEY
         // The blocklist is exact-match, so a case variant is a DIFFERENT var.
         // This is correct — TIRITH_api_key is not a real sensitive var.
@@ -389,7 +399,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bypass_non_sensitive_tirith_var_still_expands() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_ORG_NAME", "myorg") };
         assert_eq!(expand_env_value("$TIRITH_ORG_NAME"), "myorg");
         assert_eq!(expand_env_value("${TIRITH_ORG_NAME}"), "myorg");
@@ -399,7 +411,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bypass_double_dollar_does_not_expand() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
         // $$TIRITH_API_KEY: first $ sees second $ which is not '{' or alnum,
         // so it becomes a literal '$', then the second $ starts a new expansion
@@ -415,7 +429,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bypass_nested_braces_does_not_expand() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
         // ${TIRITH_${NESTED}} — the inner ${...} is consumed as the var name
         // "TIRITH_${NESTED" (take_while stops at '}'), which doesn't start

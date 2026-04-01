@@ -783,7 +783,9 @@ mod tests {
     fn test_create_and_purge_removes_expired() {
         // Verify create_and_purge() creates a new checkpoint AND purges
         // age-expired ones in a single call.
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");

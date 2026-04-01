@@ -211,7 +211,9 @@ mod tests {
 
     #[test]
     fn test_tirith_log_disabled() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
@@ -255,14 +257,18 @@ mod tests {
 
     #[test]
     fn test_audit_diagnostics_disabled_by_default() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
         assert!(!audit_diagnostics_enabled());
     }
 
     #[test]
     fn test_audit_diagnostics_enabled_by_env() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_AUDIT_DEBUG", "true") };
         assert!(audit_diagnostics_enabled());
         unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
@@ -296,9 +302,12 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_remote_audit_upload_spools_when_configured() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");

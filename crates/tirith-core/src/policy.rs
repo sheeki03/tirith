@@ -769,7 +769,9 @@ mod tests {
 
     #[test]
     fn test_discover_applies_remote_fetch_fail_mode_when_configured() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".tirith");

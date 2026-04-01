@@ -1205,7 +1205,9 @@ mod tests {
         assert!(token.contains('='));
 
         // Thread-safe env-var mutation
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_LICENSE", &token) };
         let status = key_format_status();
         unsafe { std::env::remove_var("TIRITH_LICENSE") };
