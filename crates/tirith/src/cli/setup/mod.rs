@@ -4,14 +4,17 @@
 //! Cursor, VS Code, Windsurf) by writing hook scripts, merging JSON configs,
 //! and registering MCP servers.
 
-#[cfg(unix)]
+// Conditional fs_helpers: Unix version uses PermissionsExt for chmod,
+// Windows version uses no-op permission shims (NTFS ACLs are default-secure).
+#[cfg_attr(unix, path = "fs_helpers.rs")]
+#[cfg_attr(not(unix), path = "fs_helpers_windows.rs")]
 mod fs_helpers;
-#[cfg(unix)]
+
 mod merge;
-#[cfg(unix)]
 mod shell_profile;
-#[cfg(unix)]
 mod tools;
+
+// zshenv is inherently Unix-specific (zsh configuration)
 #[cfg(unix)]
 mod zshenv;
 
@@ -21,23 +24,8 @@ mod zshenv;
 #[cfg(test)]
 static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(unix)]
 pub use self::run_impl::run;
 
-#[cfg(not(unix))]
-pub fn run(
-    _tool: &str,
-    _scope: Option<&str>,
-    _with_mcp: bool,
-    _install_zshenv: bool,
-    _dry_run: bool,
-    _force: bool,
-) -> i32 {
-    eprintln!("tirith setup is not supported on this platform");
-    1
-}
-
-#[cfg(unix)]
 mod run_impl {
     use super::fs_helpers;
     use etcetera::BaseStrategy;
@@ -179,12 +167,8 @@ mod run_impl {
     /// 2. If not on PATH, check `current_exe()` — use absolute path + warning.
     /// 3. If neither: hard error (or placeholder in dry-run).
     fn resolve_tirith_bin(dry_run: bool) -> Result<String, String> {
-        // Check if tirith is on PATH via `command -v`
-        if std::process::Command::new("sh")
-            .args(["-c", "command -v tirith >/dev/null 2>&1"])
-            .status()
-            .is_ok_and(|s| s.success())
-        {
+        // Check if tirith is on PATH
+        if is_on_path("tirith") {
             return Ok("tirith".into());
         }
 
@@ -216,11 +200,7 @@ mod run_impl {
     /// Check that a binary is available on PATH.
     /// In dry-run mode, warn but don't fail.
     fn check_binary_on_path(name: &str, dry_run: bool) -> Result<(), String> {
-        // Use `command -v` via sh to check PATH without relying on --version support
-        let found = std::process::Command::new("sh")
-            .args(["-c", &format!("command -v '{name}' >/dev/null 2>&1")])
-            .status()
-            .is_ok_and(|s| s.success());
+        let found = is_on_path(name);
 
         if !found {
             if dry_run {
@@ -231,6 +211,26 @@ mod run_impl {
             }
         } else {
             Ok(())
+        }
+    }
+
+    /// Check if a binary is on PATH (cross-platform).
+    fn is_on_path(name: &str) -> bool {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v '{name}' >/dev/null 2>&1")])
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+        #[cfg(not(unix))]
+        {
+            std::process::Command::new("where.exe")
+                .arg(name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
         }
     }
 

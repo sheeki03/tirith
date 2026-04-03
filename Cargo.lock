@@ -2598,6 +2598,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tirith-core",
+ "tokio",
  "uuid",
 ]
 

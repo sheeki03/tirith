@@ -29,7 +29,6 @@ impl fmt::Display for PolicyFetchError {
 ///
 /// Uses 5s connect timeout and 10s total timeout. The server endpoint
 /// is `{url}/api/policy/fetch` and requires Bearer token authentication.
-#[cfg(unix)]
 pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFetchError> {
     // SSRF protection: validate the URL before connecting
     if let Err(reason) = crate::url_validate::validate_server_url(url) {
@@ -61,14 +60,6 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
             "server returned HTTP {s}"
         ))),
     }
-}
-
-/// Stub for non-unix platforms where reqwest is not available.
-#[cfg(not(unix))]
-pub fn fetch_remote_policy(_url: &str, _api_key: &str) -> Result<String, PolicyFetchError> {
-    Err(PolicyFetchError::NetworkError(
-        "remote policy fetch is not supported on this platform".into(),
-    ))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 /// Webhook event dispatcher for finding notifications.
 ///
-/// Unix-only (ADR-8): depends on reqwest. Non-blocking: fires in a background
-/// thread so it never delays the verdict exit code.
+/// Non-blocking: fires in a background thread so it never delays the verdict
+/// exit code.
 use crate::policy::WebhookConfig;
 use crate::verdict::{Severity, Verdict};
 
@@ -11,7 +11,6 @@ use crate::verdict::{Severity, Verdict};
 /// blocked. Auxiliary delivery/configuration diagnostics are debug-only so
 /// shell hooks don't turn best-effort webhook failures into native-command
 /// noise.
-#[cfg(unix)]
 pub fn dispatch(
     verdict: &Verdict,
     command_preview: &str,
@@ -60,18 +59,7 @@ pub fn dispatch(
     }
 }
 
-/// No-op on non-Unix platforms.
-#[cfg(not(unix))]
-pub fn dispatch(
-    _verdict: &Verdict,
-    _command_preview: &str,
-    _webhooks: &[WebhookConfig],
-    _custom_dlp_patterns: &[String],
-) {
-}
-
 /// Build the webhook payload from a template or default JSON.
-#[cfg(unix)]
 fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -> String {
     if let Some(ref template) = wh.payload_template {
         let rule_ids: Vec<String> = verdict
@@ -132,7 +120,6 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
 }
 
 /// Expand environment variables in header values (`$VAR` or `${VAR}`).
-#[cfg(unix)]
 fn expand_env_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -146,7 +133,6 @@ fn expand_env_headers(
 }
 
 /// Expand `$VAR` and `${VAR}` references in a string.
-#[cfg(unix)]
 fn expand_env_value(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -214,13 +200,11 @@ fn expand_env_value(input: &str) -> String {
     result
 }
 
-#[cfg(unix)]
 fn is_sensitive_webhook_env_var(var_name: &str) -> bool {
     matches!(var_name, "TIRITH_API_KEY" | "TIRITH_LICENSE")
 }
 
 /// Send a webhook with exponential backoff retry.
-#[cfg(unix)]
 fn send_with_retry(
     url: &str,
     payload: &str,
@@ -299,7 +283,6 @@ mod tests {
         assert_eq!(result.len(), 200);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_expand_env_value() {
         let _guard = crate::TEST_ENV_LOCK
@@ -318,7 +301,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_TEST_WH") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_expand_env_value_preserves_delimiter() {
         let _guard = crate::TEST_ENV_LOCK
@@ -331,7 +313,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_TEST_WH2") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_expand_env_value_blocks_sensitive_vars() {
         let _guard = crate::TEST_ENV_LOCK
@@ -353,7 +334,6 @@ mod tests {
     // Adversarial bypass attempts: sensitive env var exfiltration
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     #[test]
     fn test_bypass_sensitive_var_both_forms() {
         let _guard = crate::TEST_ENV_LOCK
@@ -378,7 +358,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_bypass_case_variation_is_different_var() {
         let _guard = crate::TEST_ENV_LOCK
@@ -396,7 +375,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_api_key") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_bypass_non_sensitive_tirith_var_still_expands() {
         let _guard = crate::TEST_ENV_LOCK
@@ -408,7 +386,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_ORG_NAME") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_bypass_double_dollar_does_not_expand() {
         let _guard = crate::TEST_ENV_LOCK
@@ -426,7 +403,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_bypass_nested_braces_does_not_expand() {
         let _guard = crate::TEST_ENV_LOCK
@@ -444,7 +420,6 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_build_default_payload() {
         use crate::verdict::{Action, Finding, RuleId, Timings};
@@ -465,6 +440,7 @@ mod tests {
             tier_reached: 3,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: Timings::default(),
@@ -490,7 +466,6 @@ mod tests {
         assert_eq!(parsed["rule_ids"][0], "curl_pipe_shell");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_build_template_payload() {
         use crate::verdict::{Action, Finding, RuleId, Timings};
@@ -511,6 +486,7 @@ mod tests {
             tier_reached: 3,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: Timings::default(),

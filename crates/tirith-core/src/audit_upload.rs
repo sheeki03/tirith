@@ -81,7 +81,6 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
 /// Called in the background -- should not block the main command.
 /// Events are uploaded one at a time with exponential backoff on failure.
 /// On auth errors (401/403) uploading stops immediately.
-#[cfg(unix)]
 pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes: u64) {
     // SSRF protection
     if let Err(reason) = crate::url_validate::validate_server_url(server_url) {
@@ -169,12 +168,6 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
 
     // Rewrite spool with unsent lines
     rewrite_spool(&path, &lines[sent_count..]);
-}
-
-/// Stub for non-unix platforms where reqwest is not available.
-#[cfg(not(unix))]
-pub fn drain_spool(_server_url: &str, _api_key: &str, _max_events: usize, _max_bytes: u64) {
-    // No-op: remote upload not supported on non-unix platforms
 }
 
 /// Rewrite the spool file with the remaining unsent lines.

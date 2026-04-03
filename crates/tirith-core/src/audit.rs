@@ -233,6 +233,7 @@ mod tests {
             },
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             urls_extracted_count: None,
@@ -302,7 +303,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_remote_audit_upload_spools_when_configured() {
         let _guard = crate::TEST_ENV_LOCK
@@ -332,6 +332,7 @@ mod tests {
             },
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             urls_extracted_count: None,
@@ -375,6 +376,7 @@ mod tests {
             },
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             urls_extracted_count: None,
