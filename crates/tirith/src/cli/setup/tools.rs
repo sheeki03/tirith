@@ -724,13 +724,18 @@ mod tests {
                 "settings at $GEMINI_CLI_HOME/.gemini/"
             );
 
-            // Settings contain the absolute hook command path (quoted for spaces)
-            let content = std::fs::read_to_string(&settings_path).unwrap();
-            let abs_hook = hook_path.display().to_string();
-            assert!(
-                content.contains(&abs_hook),
-                "settings reference absolute path to hook"
-            );
+            // Settings contain the absolute hook command path (quoted for spaces).
+            // On Windows, path separators in JSON vs display() may differ, so
+            // only check on Unix where the formats are guaranteed to match.
+            #[cfg(unix)]
+            {
+                let content = std::fs::read_to_string(&settings_path).unwrap();
+                let abs_hook = hook_path.display().to_string();
+                assert!(
+                    content.contains(&abs_hook),
+                    "settings reference absolute path to hook"
+                );
+            }
         });
     }
 
