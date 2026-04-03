@@ -3,9 +3,11 @@
 //! Each function configures tirith protection for a specific AI coding tool:
 //! hook scripts, JSON config merges, MCP registration, and zshenv guard.
 
+use super::fs_helpers;
 use super::merge;
 use super::run_impl::{copy_gateway_config, Scope, SetupOpts};
-use super::{fs_helpers, zshenv};
+#[cfg(unix)]
+use super::zshenv;
 use serde_json::json;
 
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
@@ -210,6 +212,7 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
     }
 
     // 4. Offer zshenv guard
+    #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
         opts.force,
@@ -301,6 +304,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     }
 
     // Offer zshenv guard
+    #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
         opts.force,
@@ -368,6 +372,7 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     }
 
     // Offer zshenv guard
+    #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
         opts.force,
@@ -621,6 +626,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     }
 
     // Offer zshenv guard
+    #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
         opts.force,

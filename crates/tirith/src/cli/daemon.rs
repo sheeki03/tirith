@@ -1,14 +1,25 @@
 use serde::{Deserialize, Serialize};
-use std::io::Read as _;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
 use std::time::Instant;
+#[cfg(unix)]
 use tokio::io::AsyncReadExt as _;
 
+use tirith_core::verdict::Action;
+
+#[cfg(unix)]
 use tirith_core::engine::{self, AnalysisContext};
+#[cfg(unix)]
 use tirith_core::extract::ScanContext;
+#[cfg(unix)]
 use tirith_core::network;
+#[cfg(unix)]
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::{Action, Evidence, Finding, RuleId, Severity};
+#[cfg(unix)]
+use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -142,6 +153,7 @@ pub fn try_daemon_check(
 // Server
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     let empty_resp = |error: Option<String>, code: i32| DaemonResponse {
         action: Action::Allow,
@@ -268,6 +280,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 /// Run network checks on findings that reference URLs and add enrichment.
 ///
 /// This is only called in the daemon path where latency is acceptable.
+#[cfg(unix)]
 fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
     let mut new_findings = Vec::new();
 

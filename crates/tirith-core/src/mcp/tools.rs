@@ -33,6 +33,7 @@ fn validate_path_scope(path: &std::path::Path) -> Result<PathBuf, String> {
 
 /// Return the list of available tools.
 pub fn list() -> Vec<ToolDefinition> {
+    #[allow(unused_mut)]
     let mut tools = vec![
         ToolDefinition {
             name: "tirith_check_command".into(),
