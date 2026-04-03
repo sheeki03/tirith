@@ -32,6 +32,7 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 etcetera = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true }
 
 [dev-dependencies]
 
