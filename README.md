@@ -133,8 +133,9 @@ Nothing. Zero output. You forget tirith is running.
 
 | Category | What it stops |
 |----------|--------------|
-| **Homograph attacks** | Cyrillic/Greek lookalikes in hostnames, punycode domains, mixed-script labels, lookalike TLDs, confusable domains |
-| **Terminal injection** | ANSI escape sequences, bidi overrides, zero-width characters, unicode tags, invisible math operators, variation selectors |
+| **Homograph attacks** | Cyrillic/Greek lookalikes in hostnames, punycode domains, mixed-script labels, lookalike TLDs, confusable domains, text-level confusable detection (math alphanumerics, same-word mixed-script) |
+| **Terminal injection** | ANSI escape sequences, bidi overrides, zero-width characters, unicode tags, invisible math operators, variation selectors, Hangul fillers |
+| **Steganography defense** | Invisible whitespace encoding (12 Unicode space variants), Mongolian Vowel Separator, Hangul Filler characters, math alphanumeric substitution — defenses against st3gg-style text steganography |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)` — every source-to-sink pattern |
 | **Base64 decode-execute** | `base64 -d \| bash`, `python -c "exec(b64decode(...))"`, `powershell -EncodedCommand` — decode chains through sudo/env wrappers |
 | **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
@@ -194,7 +195,7 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 **What it catches in configs:**
 
 - **Prompt injection** — skill activation triggers, permission bypass attempts, safety dismissal, identity reassignment, cross-tool override instructions
-- **Invisible Unicode** — zero-width characters, bidi controls, soft hyphens, Unicode tags hiding instructions
+- **Invisible Unicode** — zero-width characters (including Mongolian Vowel Separator), bidi controls, soft hyphens, Unicode tags, Hangul fillers, invisible whitespace encoding, math alphanumeric confusables
 - **MCP config issues** — insecure HTTP connections, raw IP servers, shell metacharacters in args, duplicate server names, wildcard tool access
 
 ### Hidden content detection
@@ -255,6 +256,8 @@ nix profile install github:sheeki03/tirith
 ```
 
 ### Windows
+
+All core features work on Windows including detection, scanning, webhooks, policy management, and audit uploads. Shell hooks support PowerShell. Daemon mode and `tirith setup` are Unix-only for now.
 
 **Scoop:**
 
@@ -360,6 +363,37 @@ tirith setup windsurf                 # Windsurf
 
 For manual configuration, see `mcp/clients/` for per-tool guides.
 
+### CI/CD Integration
+
+**GitHub Action** with SARIF upload to GitHub Security tab:
+
+```yaml
+- uses: sheeki03/tirith@v1
+  with:
+    fail_on: high
+    sarif: true
+```
+
+Also available as a **pre-commit hook** — see `.pre-commit-hooks.yaml` in this repo.
+
+Scan supports `--include`, `--exclude`, `--profile` (loads named profiles from policy), and `--ignore` filters for targeted CI scanning.
+
+### Rule Documentation
+
+```bash
+tirith explain --rule pipe_to_interpreter   # severity, examples, remediation, MITRE ATT&CK
+tirith explain --list --category terminal   # all rules in a category
+```
+
+### Daemon Mode (Unix)
+
+Optional background process for sub-millisecond latency and network-aware enrichment (shortened URL resolution, DNS blocklist checks):
+
+```bash
+tirith daemon start       # tirith check auto-delegates when running
+tirith daemon stop
+```
+
 ---
 
 ## Commands
@@ -368,19 +402,25 @@ For manual configuration, see `mcp/clients/` for per-tool guides.
 |---------|-------------|
 | `tirith check -- <cmd>` | Analyze a command without executing it |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
-| `tirith scan [path]` | Scan files/directories for hidden content, config poisoning, malicious code patterns. Supports `--sarif` and `--ci --fail-on high` |
-| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, shows SHA256, opens for review, executes only after confirmation |
+| `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--sarif`, `--ci` |
+| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
+| `tirith policy init` | Generate a starter `.tirith/policy.yaml` in your repo |
+| `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
+| `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
+| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
 | `tirith score <url>` | Break down a URL's trust signals |
 | `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
 | `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) |
 | `tirith why` | Explain the last rule that triggered |
+| `tirith doctor` | Diagnose installation, hooks, and policy |
+| `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
+| `tirith daemon start` | Start background daemon for faster checks (Unix) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
 | `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
 | `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
 | `tirith audit {export,stats,report}` | Audit log management for compliance |
 | `tirith init` | Print the shell hook for your shell profile |
-| `tirith doctor` | Diagnostic check for hook status and configuration |
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
 
 ---
@@ -390,27 +430,50 @@ For manual configuration, see `mcp/clients/` for per-tool guides.
 - **Offline by default** — `check`, `paste`, `score`, `diff`, and `why` make zero network calls. All detection runs locally.
 - **No command rewriting** — tirith never modifies what you typed
 - **No telemetry** — no analytics, no crash reporting, no phone-home behavior
-- **No background processes** — invoked per-command, exits immediately
-- **Network only when you ask or configure it** — `run`, `fetch`, and `audit report --upload` reach the network on explicit invocation. Optional webhook and policy-server integrations can also make outbound requests when configured. Core detection itself does not phone home.
+- **No background processes by default** — invoked per-command, exits immediately. Optional `tirith daemon start` keeps patterns warm for faster checks.
+- **Network only when you ask or configure it** — `run`, `fetch`, and `audit report --upload` reach the network on explicit invocation. Daemon mode adds network-aware URL resolution. Optional webhook and policy-server integrations can also make outbound requests when configured. Core detection itself does not phone home.
 
 ---
 
 ## Configuration
+
+### Quick start
+
+```bash
+tirith policy init          # creates .tirith/policy.yaml in your repo
+tirith policy validate      # check for syntax/schema errors
+tirith policy test "curl https://example.com | bash"  # dry-run against policy
+```
+
+### Policy file
 
 Tirith uses a YAML policy file. Discovery order:
 1. `.tirith/policy.yaml` in current directory (walks up to repo root)
 2. `~/.config/tirith/policy.yaml`
 
 ```yaml
-version: 1
+fail_mode: open        # or "closed" for strict environments
+paranoia: 1            # 1-4: higher = more sensitive
+strict_warn: false     # require explicit acknowledgement for warnings
+
 allowlist:
   - "get.docker.com"
   - "sh.rustup.rs"
 
+blocklist:
+  - "evil.example.com"
+
 severity_overrides:
   docker_untrusted_registry: CRITICAL
 
-fail_mode: open  # or "closed" for strict environments
+scan:
+  ignore_patterns:
+    - "node_modules"
+    - "target"
+  profiles:
+    ci:
+      include: ["*.md", "*.json", "*.yaml", ".claude/*"]
+      fail_on: high
 ```
 
 Use `allowlist_rules` for rule-scoped suppressions when you trust a source for one rule but do not want to globally allowlist it:
@@ -424,7 +487,23 @@ allowlist_rules:
 
 More examples in [docs/cookbook.md](docs/cookbook.md).
 
-**Bypass** for the rare case you know exactly what you're doing:
+### Strict warn mode
+
+With `strict_warn: true` (or `--strict-warn` on the CLI), medium-risk findings prompt for explicit acknowledgement in interactive terminals instead of silently warning:
+
+```
+$ curl -sSL https://get.docker.com | sh
+
+tirith: WARNING
+  [MEDIUM] pipe_to_interpreter — Download piped to interpreter
+tirith: proceed with 1 warning(s)? [y/N]
+```
+
+Shell hooks use exit code 3 for the warn-ack protocol. Old hooks that don't know about exit code 3 fall through to fail-open behavior.
+
+### Bypass
+
+For the rare case you know exactly what you're doing:
 
 ```bash
 TIRITH=0 curl -L https://something.xyz | bash
