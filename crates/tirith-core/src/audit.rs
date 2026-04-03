@@ -303,6 +303,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_remote_audit_upload_spools_when_configured() {
         let _guard = crate::TEST_ENV_LOCK
