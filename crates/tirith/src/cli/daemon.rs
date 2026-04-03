@@ -8,7 +8,7 @@ use std::time::Instant;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt as _;
 
-use tirith_core::verdict::Action;
+use tirith_core::verdict::{Action, Finding};
 
 #[cfg(unix)]
 use tirith_core::engine::{self, AnalysisContext};
@@ -19,7 +19,7 @@ use tirith_core::network;
 #[cfg(unix)]
 use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
-use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+use tirith_core::verdict::{Evidence, RuleId, Severity};
 
 // ---------------------------------------------------------------------------
 // Paths
