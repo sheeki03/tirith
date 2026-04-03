@@ -1,0 +1,64 @@
+name: 'Tirith Security Scan'
+description: 'Scan repository for security issues — invisible Unicode, prompt injection, config poisoning'
+branding:
+  icon: 'shield'
+  color: 'red'
+inputs:
+  fail_on:
+    description: 'Minimum severity to fail the workflow (info, low, medium, high, critical)'
+    default: 'high'
+  path:
+    description: 'Path to scan'
+    default: '.'
+  sarif:
+    description: 'Upload SARIF results to GitHub Security tab'
+    default: 'true'
+  ignore:
+    description: 'Comma-separated glob patterns to ignore'
+    default: ''
+  version:
+    description: 'Tirith version to install (default: latest)'
+    default: 'latest'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install tirith
+      shell: bash
+      env:
+        TIRITH_VERSION: ${{ inputs.version }}
+      run: |
+        if [ "$TIRITH_VERSION" = "latest" ]; then
+          curl -sSfL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh -s -- --to /usr/local/bin
+        else
+          curl -sSfL https://raw.githubusercontent.com/sheeki03/tirith/main/scripts/install.sh | sh -s -- --to /usr/local/bin --tag "v$TIRITH_VERSION"
+        fi
+    - name: Run scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_FAIL_ON: ${{ inputs.fail_on }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SARIF: ${{ inputs.sarif }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+      run: |
+        IGNORE_ARGS=()
+        if [ -n "$INPUT_IGNORE" ]; then
+          IFS=',' read -ra PATTERNS <<< "$INPUT_IGNORE"
+          for p in "${PATTERNS[@]}"; do
+            IGNORE_ARGS+=(--ignore "$p")
+          done
+        fi
+
+        # Generate SARIF if requested
+        if [ "$INPUT_SARIF" = "true" ]; then
+          tirith scan "$INPUT_PATH" --sarif "${IGNORE_ARGS[@]}" > results.sarif || true
+        fi
+
+        # Run CI check (this sets the exit code)
+        tirith scan "$INPUT_PATH" --ci --fail-on "$INPUT_FAIL_ON" "${IGNORE_ARGS[@]}"
+    - name: Upload SARIF
+      if: always() && inputs.sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: results.sarif
+      continue-on-error: true

@@ -1,0 +1,7 @@
+- id: tirith-scan
+  name: Tirith Security Scan
+  entry: tirith scan --ci --fail-on high .
+  language: system
+  pass_filenames: false
+  stages: [pre-commit]
+  description: Scan repository for hidden Unicode, prompt injection, and config poisoning

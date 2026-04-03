@@ -1,4 +1,5 @@
 /// SARIF 2.1.0 output for scan findings.
+use crate::rule_explanations;
 use crate::verdict::{Finding, Severity};
 use std::collections::HashMap;
 
@@ -17,12 +18,38 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
         if !rule_map.contains_key(&rule_str) {
             let idx = rules.len();
             rule_map.insert(rule_str.clone(), idx);
-            rules.push(serde_json::json!({
+
+            let mut rule = serde_json::json!({
                 "id": rule_str,
                 "shortDescription": {
                     "text": f.finding.title
                 }
-            }));
+            });
+
+            // Enrich with explanation metadata when available
+            if let Some(explanation) = rule_explanations::explain(&rule_str) {
+                rule["fullDescription"] = serde_json::json!({
+                    "text": explanation.description
+                });
+
+                // Add MITRE ATT&CK tag if present
+                let mut tags: Vec<&str> = Vec::new();
+                if let Some(mitre) = explanation.mitre_id {
+                    tags.push(mitre);
+                }
+                if !tags.is_empty() {
+                    rule["properties"] = serde_json::json!({
+                        "tags": tags
+                    });
+                }
+
+                // Use first reference as helpUri
+                if let Some(uri) = explanation.references.first() {
+                    rule["helpUri"] = serde_json::json!(uri);
+                }
+            }
+
+            rules.push(rule);
         }
     }
 
@@ -42,6 +69,15 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
                 }
             });
 
+            // Fingerprint for deduplication across runs
+            let rule_id_str = &rule_str;
+            result["fingerprints"] = serde_json::json!({
+                "tirith/v1": format!("{}:{}:{}",
+                    rule_id_str,
+                    f.file_path.as_deref().unwrap_or(""),
+                    f.line_number.unwrap_or(0))
+            });
+
             if let Some(ref path) = f.file_path {
                 let mut location = serde_json::json!({
                     "physicalLocation": {
@@ -58,6 +94,14 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
                 }
 
                 result["locations"] = serde_json::json!([location]);
+            }
+
+            // Suppressions for policy-allowlisted findings
+            if f.suppressed {
+                result["suppressions"] = serde_json::json!([{
+                    "kind": "inSource",
+                    "justification": "Suppressed by policy allowlist"
+                }]);
             }
 
             result
@@ -86,6 +130,8 @@ pub struct SarifFinding<'a> {
     pub finding: &'a Finding,
     pub file_path: Option<String>,
     pub line_number: Option<u64>,
+    /// Whether this finding was suppressed by the policy allowlist.
+    pub suppressed: bool,
 }
 
 fn severity_to_level(severity: Severity) -> &'static str {
@@ -130,6 +176,7 @@ mod tests {
             finding: &f,
             file_path: Some("test.sh".to_string()),
             line_number: Some(5),
+            suppressed: false,
         }];
         let sarif = to_sarif(&findings, "0.1.0");
         let results = sarif["runs"][0]["results"].as_array().unwrap();
@@ -159,11 +206,13 @@ mod tests {
                 finding: &f1,
                 file_path: None,
                 line_number: None,
+                suppressed: false,
             },
             SarifFinding {
                 finding: &f2,
                 file_path: None,
                 line_number: None,
+                suppressed: false,
             },
         ];
         let sarif = to_sarif(&findings, "0.1.0");
@@ -171,5 +220,140 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(rules.len(), 1, "Duplicate rule IDs should be deduped");
+    }
+
+    #[test]
+    fn test_rule_enrichment_full_description() {
+        // AnsiEscapes has an explanation entry, so fullDescription should be populated
+        let f = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: None,
+            line_number: None,
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert!(
+            rule.get("fullDescription").is_some(),
+            "fullDescription should be present for rules with explanations"
+        );
+        assert!(
+            !rule["fullDescription"]["text"].as_str().unwrap().is_empty(),
+            "fullDescription text should not be empty"
+        );
+    }
+
+    #[test]
+    fn test_rule_enrichment_mitre_tags() {
+        // MixedScriptInLabel has mitre_id = "T1036.005" in rule_explanations.toml
+        let f = make_finding(RuleId::MixedScriptInLabel, Severity::High, "Mixed script");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: None,
+            line_number: None,
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        let rule = &rules[0];
+        let tags = rule["properties"]["tags"].as_array().unwrap();
+        assert!(
+            tags.iter().any(|t| t.as_str() == Some("T1036.005")),
+            "MITRE ATT&CK tag should be present"
+        );
+    }
+
+    #[test]
+    fn test_rule_enrichment_help_uri() {
+        // MixedScriptInLabel has references in rule_explanations.toml
+        let f = make_finding(RuleId::MixedScriptInLabel, Severity::High, "Mixed script");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: None,
+            line_number: None,
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        let rule = &rules[0];
+        assert!(
+            rule.get("helpUri").is_some(),
+            "helpUri should be present for rules with references"
+        );
+        let uri = rule["helpUri"].as_str().unwrap();
+        assert!(uri.starts_with("https://"), "helpUri should be a valid URL");
+    }
+
+    #[test]
+    fn test_fingerprint_present() {
+        let f = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: Some("test.sh".to_string()),
+            line_number: Some(5),
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let result = &results[0];
+        let fp = result["fingerprints"]["tirith/v1"].as_str().unwrap();
+        assert_eq!(fp, "ansi_escapes:test.sh:5");
+    }
+
+    #[test]
+    fn test_fingerprint_no_file() {
+        let f = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: None,
+            line_number: None,
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let fp = results[0]["fingerprints"]["tirith/v1"].as_str().unwrap();
+        assert_eq!(fp, "ansi_escapes::0");
+    }
+
+    #[test]
+    fn test_suppression_present_when_suppressed() {
+        let f = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: Some("test.sh".to_string()),
+            line_number: None,
+            suppressed: true,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let suppressions = results[0]["suppressions"].as_array().unwrap();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0]["kind"], "inSource");
+    }
+
+    #[test]
+    fn test_no_suppression_when_not_suppressed() {
+        let f = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &f,
+            file_path: None,
+            line_number: None,
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert!(
+            results[0].get("suppressions").is_none(),
+            "suppressions should not be present when not suppressed"
+        );
     }
 }
