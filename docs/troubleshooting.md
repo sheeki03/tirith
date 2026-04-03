@@ -26,6 +26,26 @@ rm -rf ~/.local/share/tirith/shell
 exec zsh   # or exec bash / restart terminal
 ```
 
+## Wrong `tirith` binary on PATH
+
+An unrelated Python package named `tirith` exists on PyPI. If an AI agent or script runs `pip install tirith`, that package lands in `~/.local/bin/tirith` and may shadow the Rust binary.
+
+Symptoms: `tirith init` produces a Python traceback mentioning `autobahn`, `asyncio`, or `tirith monitor`.
+
+`tirith doctor` and `tirith init` will warn automatically if they detect a conflicting binary. To check manually:
+
+```bash
+which -a tirith        # list all tirith binaries on PATH
+file $(which tirith)   # should say "Mach-O" or "ELF", not "Python script"
+```
+
+Fix: remove the Python package and clear the shell hash:
+
+```bash
+pip uninstall tirith
+hash -r
+```
+
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:

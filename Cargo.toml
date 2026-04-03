@@ -40,6 +40,7 @@ time = ">=0.3, <0.3.38"
 # Transitive dep via ed25519-dalek → ed25519 → pkcs8 → spki → base64ct.
 base64ct = ">=1, <1.8"
 libc = "0.2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "signal", "macros"] }
 lopdf = "0.34"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 

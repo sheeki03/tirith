@@ -171,9 +171,9 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     if scan.has_variation_selectors {
         findings.push(Finding {
             rule_id: RuleId::VariationSelector,
-            severity: Severity::Info,
+            severity: Severity::Medium,
             title: "Variation selector characters detected".to_string(),
-            description: "Content contains Unicode variation selectors (VS1-256). These are commonly used in emoji sequences but may indicate obfuscation in command contexts".to_string(),
+            description: "Content contains Unicode variation selectors (VS1-256). These are commonly used in emoji sequences but may indicate steganographic encoding or obfuscation".to_string(),
             evidence: scan.details.iter()
                 .filter(|d| d.description.contains("variation selector"))
                 .map(|d| Evidence::ByteSequence {
@@ -194,7 +194,7 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
             rule_id: RuleId::InvisibleWhitespace,
             severity: Severity::Medium,
             title: "Invisible whitespace characters detected".to_string(),
-            description: "Content contains unusual invisible whitespace (hair space, thin space, narrow no-break space) that could be used to obfuscate commands or URLs".to_string(),
+            description: "Content contains unusual Unicode whitespace variants (en space, em space, figure space, etc.) that could be used for steganographic encoding or command obfuscation".to_string(),
             evidence: scan.details.iter()
                 .filter(|d| d.description.contains("invisible whitespace"))
                 .map(|d| Evidence::ByteSequence {
@@ -205,8 +205,79 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 .collect(),
             human_view: None,
             agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    if scan.has_confusable_text {
+        // Two-tier suppression to avoid false positives on natural multilingual text:
+        // 1. Math alphanumerics ("text confusable"): always suspicious — use broad ±16 byte window
+        // 2. Standard confusables ("confusable"): only flag when mixed INTO the same word as ASCII
+        //    e.g. "gіthub" (attack) vs "Note: Привет" (benign multilingual)
+        let confusable_details: Vec<_> = scan
+            .details
+            .iter()
+            .filter(|d| {
+                d.description.contains("confusable U+")
+                    || d.description.contains("text confusable U+")
+            })
+            .collect();
+
+        let has_suspicious = confusable_details.iter().any(|d| {
+            if d.description.contains("text confusable U+") {
+                // Math alphanumerics: broad window — no legitimate terminal use
+                is_ascii_nearby(input, d.offset)
+            } else {
+                // Standard Cyrillic/Greek confusables: must be in the SAME word as ASCII
+                is_same_word_as_ascii(input, d.offset)
+            }
+        });
+
+        if has_suspicious {
+            findings.push(Finding {
+                rule_id: RuleId::ConfusableText,
+                severity: Severity::High,
+                title: "Confusable Unicode characters in text".to_string(),
+                description: "Content contains Unicode characters visually identical to ASCII (math alphanumerics, Cyrillic/Greek lookalikes) appearing near ASCII text, which may indicate a homoglyph attack".to_string(),
+                evidence: confusable_details
+                    .iter()
+                    .take(10)
+                    .map(|d| Evidence::ByteSequence {
+                        offset: d.offset,
+                        hex: d.codepoint.map_or_else(
+                            || format!("0x{:02x}", d.byte),
+                            |cp| format!("U+{cp:04X}"),
+                        ),
+                        description: d.description.clone(),
+                    })
+                    .collect(),
+                human_view: None,
+                agent_view: None,
                 mitre_id: None,
                 custom_rule_id: None,
+            });
+        }
+    }
+
+    if scan.has_hangul_fillers {
+        findings.push(Finding {
+            rule_id: RuleId::HangulFiller,
+            severity: Severity::Medium,
+            title: "Hangul Filler characters detected".to_string(),
+            description: "Content contains invisible Hangul Filler characters (U+3164, U+115F, U+1160) that could be used to hide content or obfuscate commands".to_string(),
+            evidence: scan.details.iter()
+                .filter(|d| d.description.contains("hangul filler"))
+                .map(|d| Evidence::ByteSequence {
+                    offset: d.offset,
+                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
+                    description: d.description.clone(),
+                })
+                .collect(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -436,6 +507,62 @@ fn strip_html_tags(html: &str) -> String {
     let s = ENTITIES.replace_all(&s, " ");
     let s = WHITESPACE.replace_all(&s, " ");
     s.trim().to_string()
+}
+
+/// Broad proximity check: ASCII letters within ±16 bytes.
+/// Used for math alphanumeric symbols which have no legitimate terminal use.
+fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
+    let start = offset.saturating_sub(16);
+    let end = (offset + 16).min(input.len());
+    input[start..end].iter().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Same-word check: the confusable char and ASCII letters share the same word
+/// (no whitespace or common punctuation separating them).
+/// "gіthub" → true (і mixed into ASCII word)
+/// "Note: Привет" → false (different words separated by ": ")
+fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
+    fn is_word_boundary(b: u8) -> bool {
+        matches!(
+            b,
+            b' ' | b'\t'
+                | b'\n'
+                | b'\r'
+                | b':'
+                | b';'
+                | b','
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'"'
+                | b'\''
+                | b'='
+                | b'|'
+                | b'&'
+                | b'<'
+                | b'>'
+        )
+    }
+
+    // Walk backwards to word start
+    let mut word_start = offset;
+    while word_start > 0 && !is_word_boundary(input[word_start - 1]) {
+        word_start -= 1;
+    }
+
+    // Walk forwards to word end (skip past the multi-byte char at offset)
+    let mut word_end = offset;
+    while word_end < input.len() && !is_word_boundary(input[word_end]) {
+        word_end += 1;
+    }
+
+    // Check if any byte in this word is an ASCII letter
+    input[word_start..word_end]
+        .iter()
+        .any(|b| b.is_ascii_alphabetic())
 }
 
 fn looks_like_hidden_command(line: &str) -> bool {

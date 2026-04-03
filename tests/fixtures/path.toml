@@ -5,8 +5,8 @@ name = "non_ascii_path"
 min_milestone = 1
 input = "curl https://example.com/іnstall"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["non_ascii_path"]
+expected_action = "block"
+expected_rules = ["non_ascii_path", "confusable_text"]
 
 [[fixture]]
 name = "clean_path"
@@ -37,8 +37,8 @@ name = "homoglyph_in_path_install"
 min_milestone = 1
 input = "curl https://example.com/іnstаll.sh"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["non_ascii_path"]
+expected_action = "block"
+expected_rules = ["non_ascii_path", "confusable_text"]
 
 [[fixture]]
 name = "normal_encoded_path"
@@ -77,8 +77,8 @@ name = "non_ascii_path_cyrillic"
 min_milestone = 1
 input = "curl https://example.com/раyload"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["non_ascii_path"]
+expected_action = "block"
+expected_rules = ["non_ascii_path", "confusable_text"]
 
 [[fixture]]
 name = "clean_path_query"
@@ -117,8 +117,8 @@ name = "homoglyph_in_path_segment"
 min_milestone = 1
 input = "curl https://example.com/іnstall/payload"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["homoglyph_in_path"]
+expected_action = "block"
+expected_rules = ["homoglyph_in_path", "confusable_text"]
 
 [[fixture]]
 name = "invalid_percent_triplet_ok"

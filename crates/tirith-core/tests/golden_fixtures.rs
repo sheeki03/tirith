@@ -348,7 +348,9 @@ fn test_tier1_coverage() {
                     || byte_scan.has_unicode_tags
                     || byte_scan.has_variation_selectors
                     || byte_scan.has_invisible_math_operators
-                    || byte_scan.has_invisible_whitespace;
+                    || byte_scan.has_invisible_whitespace
+                    || byte_scan.has_hangul_fillers
+                    || byte_scan.has_confusable_text;
 
                 if byte_triggered {
                     continue; // Byte scan catches it
@@ -364,6 +366,8 @@ fn test_tier1_coverage() {
                     || byte_scan.has_variation_selectors
                     || byte_scan.has_invisible_math_operators
                     || byte_scan.has_invisible_whitespace
+                    || byte_scan.has_hangul_fillers
+                    || byte_scan.has_confusable_text
                 {
                     continue;
                 }
@@ -440,6 +444,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "invisible_math_operator",
     "variation_selector",
     "invisible_whitespace",
+    "hangul_filler",
+    "confusable_text",
     // Command shape
     "pipe_to_interpreter",
     "curl_pipe_shell",
@@ -616,6 +622,8 @@ fn test_rule_id_list_is_complete() {
         RuleId::InvisibleMathOperator,
         RuleId::VariationSelector,
         RuleId::InvisibleWhitespace,
+        RuleId::HangulFiller,
+        RuleId::ConfusableText,
         RuleId::PipeToInterpreter,
         RuleId::CurlPipeShell,
         RuleId::WgetPipeShell,
@@ -732,6 +740,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "dynamic_code_execution",       // file scan, no URL needed
         "obfuscated_payload",           // file scan, no URL needed
         "suspicious_code_exfiltration", // file scan, no URL needed
+        "hangul_filler",                // byte-level, no URL needed
+        "confusable_text",              // byte-level, no URL needed
     ]
     .into_iter()
     .collect();

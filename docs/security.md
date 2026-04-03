@@ -39,4 +39,5 @@ The following are **not** in scope:
 
 | Version | Supported |
 |---------|-----------|
+| 0.2.x   | Yes       |
 | 0.1.x   | Yes       |

@@ -25,7 +25,7 @@ input = "Some config \u200B content"
 context = "file"
 file_path = "random.cfg"
 expected_action = "block"
-expected_rules = ["config_invisible_unicode"]
+expected_rules = ["zero_width_chars"]
 
 [[fixture]]
 name = "prompt_injection_in_cursorrules"
@@ -51,8 +51,8 @@ min_milestone = 1
 input = "{\"n\u0430me\": \"value\"}"
 context = "file"
 file_path = "mcp.json"
-expected_action = "warn"
-expected_rules = ["config_non_ascii"]
+expected_action = "block"
+expected_rules = ["config_non_ascii", "confusable_text"]
 
 [[fixture]]
 name = "mcp_http_server"
@@ -141,8 +141,8 @@ min_milestone = 1
 input = "Use TypeScr\u0456pt for all code"
 context = "file"
 file_path = ".cursorrules"
-expected_action = "warn"
-expected_rules = ["config_non_ascii"]
+expected_action = "block"
+expected_rules = ["config_non_ascii", "confusable_text"]
 
 [[fixture]]
 name = "multibyte_near_injection_no_panic"

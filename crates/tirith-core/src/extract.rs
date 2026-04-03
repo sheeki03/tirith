@@ -56,6 +56,8 @@ pub struct ByteScanResult {
     pub has_variation_selectors: bool,
     pub has_invisible_math_operators: bool,
     pub has_invisible_whitespace: bool,
+    pub has_hangul_fillers: bool,
+    pub has_confusable_text: bool,
     pub details: Vec<ByteFinding>,
 }
 
@@ -89,6 +91,8 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         has_variation_selectors: false,
         has_invisible_math_operators: false,
         has_invisible_whitespace: false,
+        has_hangul_fillers: false,
+        has_confusable_text: false,
         details: Vec::new(),
     };
 
@@ -231,7 +235,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         description: format!("invisible math operator U+{:04X}", ch as u32),
                     });
                 }
-                // Invisible whitespace: Hair Space, Thin Space, Narrow No-Break Space
+                // Invisible whitespace: stealth encoding spaces
                 if is_invisible_whitespace(ch) {
                     result.has_invisible_whitespace = true;
                     result.details.push(ByteFinding {
@@ -239,6 +243,40 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
                         byte: b,
                         codepoint: Some(ch as u32),
                         description: format!("invisible whitespace U+{:04X}", ch as u32),
+                    });
+                }
+                // Hangul Fillers (invisible Korean characters)
+                if is_hangul_filler(ch) {
+                    result.has_hangul_fillers = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!("hangul filler U+{:04X}", ch as u32),
+                    });
+                }
+                // Text-level confusable characters (math alphanumerics + hostname confusables)
+                if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
+                    result.has_confusable_text = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!(
+                            "text confusable U+{:04X} (looks like '{target}')",
+                            ch as u32
+                        ),
+                    });
+                } else if let Some(target) = crate::confusables::is_confusable(ch) {
+                    result.has_confusable_text = true;
+                    result.details.push(ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: Some(ch as u32),
+                        description: format!(
+                            "confusable U+{:04X} (looks like '{target}')",
+                            ch as u32
+                        ),
                     });
                 }
                 i += ch.len_utf8();
@@ -274,7 +312,8 @@ fn is_bidi_control(ch: char) -> bool {
 fn is_zero_width(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200B}' // ZWSP
+        '\u{180E}' // Mongolian Vowel Separator
+        | '\u{200B}' // ZWSP
         | '\u{200C}' // ZWNJ
         | '\u{200D}' // ZWJ
         | '\u{FEFF}' // BOM / ZWNBSP
@@ -297,19 +336,41 @@ fn is_variation_selector(ch: char) -> bool {
     || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
 }
 
+/// Check if a character is a Hangul Filler (invisible Korean character).
+fn is_hangul_filler(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3164}' // Hangul Filler
+        | '\u{115F}' // Hangul Choseong Filler
+        | '\u{1160}' // Hangul Jungseong Filler
+    )
+}
+
 /// Check if a character is an invisible math operator.
 fn is_invisible_math_operator(ch: char) -> bool {
     // Function Application, Invisible Times, Invisible Separator, Invisible Plus
     ('\u{2061}'..='\u{2064}').contains(&ch)
 }
 
-/// Check if a character is an invisible whitespace variant.
+/// Check if a character is a stealth-encoding whitespace variant.
+/// These are Unicode spaces used in steganographic encoding (e.g. st3gg confusable
+/// whitespace). Layout spaces (U+00A0 NBSP, U+202F Narrow NBSP, U+3000 Ideographic)
+/// are deliberately excluded — they appear legitimately in localized prose.
 fn is_invisible_whitespace(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200A}' // Hair Space
+        '\u{2000}' // En Quad
+        | '\u{2001}' // Em Quad
+        | '\u{2002}' // En Space
+        | '\u{2003}' // Em Space
+        | '\u{2004}' // Three-Per-Em Space
+        | '\u{2005}' // Four-Per-Em Space
+        | '\u{2006}' // Six-Per-Em Space
+        | '\u{2007}' // Figure Space
+        | '\u{2008}' // Punctuation Space
         | '\u{2009}' // Thin Space
-        | '\u{202F}' // Narrow No-Break Space
+        | '\u{200A}' // Hair Space
+        | '\u{205F}' // Medium Mathematical Space
     )
 }
 

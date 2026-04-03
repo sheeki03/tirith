@@ -15,7 +15,30 @@ fn powershell_single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "''"))
 }
 
+/// Check if another `tirith` binary shadows us on PATH.
+/// Returns a warning message if a shadow is detected.
+fn check_path_shadow() -> Option<String> {
+    let shadows = super::find_shadow_binaries();
+    if shadows.is_empty() {
+        return None;
+    }
+    let our_exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    Some(format!(
+        "tirith: WARNING: '{}' shadows this binary ({})\n\
+         tirith: This may be a different package (e.g. pip-installed).\n\
+         tirith: Run 'which -a tirith' to inspect, and remove the conflicting binary.",
+        shadows[0], our_exe,
+    ))
+}
+
 pub fn run(shell: Option<&str>) -> i32 {
+    // Warn if another `tirith` binary (e.g. pip-installed Python package) shadows us on PATH.
+    if let Some(warning) = check_path_shadow() {
+        eprintln!("{warning}");
+    }
+
     let shell = shell.unwrap_or_else(|| detect_shell());
 
     let hook_dir = find_hook_dir();
