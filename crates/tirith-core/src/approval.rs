@@ -133,6 +133,37 @@ pub fn write_no_approval_file() -> Result<PathBuf, std::io::Error> {
     Ok(path)
 }
 
+/// Write warn-ack metadata to a secure temp file for hook-driven strict_warn.
+///
+/// The shell hook reads this file to know how many warnings need acknowledgement
+/// and the maximum severity. Follows the same security pattern as
+/// `write_approval_file()`: O_EXCL + O_CREAT, mode 0600, `.keep()` before return.
+pub fn write_warn_ack_file(
+    finding_count: usize,
+    max_severity: &crate::verdict::Severity,
+) -> Result<PathBuf, std::io::Error> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tirith-warnack-")
+        .suffix(".env")
+        .tempfile()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(tmp.path(), perms)?;
+    }
+
+    writeln!(tmp, "TIRITH_WARN_ACK_REQUIRED=yes")?;
+    writeln!(tmp, "TIRITH_WARN_ACK_FINDINGS={finding_count}")?;
+    writeln!(tmp, "TIRITH_WARN_ACK_MAX_SEVERITY={max_severity}")?;
+
+    tmp.flush()?;
+
+    let (_, path) = tmp.keep().map_err(|e| e.error)?;
+    Ok(path)
+}
+
 /// Check if a finding's rule_id string matches an approval rule.
 fn approval_rule_matches(rule_id_str: &str, approval_rule: &ApprovalRule) -> bool {
     approval_rule.rule_ids.iter().any(|r| r == rule_id_str)
@@ -232,6 +263,7 @@ mod tests {
             tier_reached: 3,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: Timings::default(),
@@ -403,6 +435,26 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("read should succeed");
         assert!(content.contains("TIRITH_REQUIRES_APPROVAL=no"));
         assert!(!content.contains("TIRITH_APPROVAL_TIMEOUT"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_warn_ack_file() {
+        let path = write_warn_ack_file(3, &Severity::Medium).expect("write should succeed");
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).expect("read should succeed");
+        assert!(content.contains("TIRITH_WARN_ACK_REQUIRED=yes"));
+        assert!(content.contains("TIRITH_WARN_ACK_FINDINGS=3"));
+        assert!(content.contains("TIRITH_WARN_ACK_MAX_SEVERITY=MEDIUM"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&path).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
 
         let _ = std::fs::remove_file(&path);
     }

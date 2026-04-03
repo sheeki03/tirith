@@ -119,6 +119,42 @@ function global:_tirith_read_with_timeout {
     return $buffer
 }
 
+# --- Warn-ack helpers (strict_warn, exit code 3) ---
+
+function global:_tirith_parse_warn_ack {
+    param($FilePath)
+    $script:_tirith_wa_findings = 0
+    $script:_tirith_wa_max_severity = ""
+
+    if (-not (Test-Path $FilePath -ErrorAction SilentlyContinue)) {
+        Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    try {
+        foreach ($rawLine in [System.IO.File]::ReadAllLines($FilePath)) {
+            $parts = $rawLine -split '=', 2
+            if ($parts.Count -ge 2) {
+                switch ($parts[0]) {
+                    "TIRITH_WARN_ACK_FINDINGS" {
+                        $parsed = 0
+                        if ([int]::TryParse($parts[1], [ref]$parsed)) {
+                            $script:_tirith_wa_findings = $parsed
+                        }
+                    }
+                    "TIRITH_WARN_ACK_MAX_SEVERITY" { $script:_tirith_wa_max_severity = $parts[1] }
+                }
+            }
+        }
+    } catch {
+        $script:_tirith_wa_findings = 0
+        $script:_tirith_wa_max_severity = ""
+    }
+
+    Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
 # Override Enter key
 Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     $line = $null
@@ -138,9 +174,22 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
     $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $errfile -Force -ErrorAction SilentlyContinue
 
+    # Exit code 3 (WarnAck): stdout has two lines — approval path + warn-ack path.
+    $warnAckPath = ""
+    if ($rc -eq 3 -and $approvalPath -is [array]) {
+        $warnAckPath = $approvalPath[1]
+        $approvalPath = $approvalPath[0]
+    } elseif ($rc -eq 3 -and -not [string]::IsNullOrWhiteSpace($approvalPath)) {
+        $lines = $approvalPath -split "`n"
+        if ($lines.Count -ge 2) {
+            $approvalPath = $lines[0].Trim()
+            $warnAckPath = $lines[1].Trim()
+        }
+    }
+
     if ($rc -eq 0) {
         # Allow: no output
-    } elseif ($rc -eq 2) {
+    } elseif ($rc -eq 2 -or $rc -eq 3) {
         Write-Host "command> $(_tirith_escape_preview $line)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
     } elseif ($rc -eq 1) {
@@ -153,11 +202,14 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         if (-not [string]::IsNullOrWhiteSpace($approvalPath)) {
             Remove-Item $approvalPath.Trim() -Force -ErrorAction SilentlyContinue
         }
+        if (-not [string]::IsNullOrWhiteSpace($warnAckPath)) {
+            Remove-Item $warnAckPath.Trim() -Force -ErrorAction SilentlyContinue
+        }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
         return
     }
 
-    # Approval workflow: runs for ALL exit codes (0, 1, 2).
+    # Approval workflow: runs for ALL exit codes (0, 1, 2, 3).
     # For rc=1 (block), approval gives user a chance to override.
     if (-not [string]::IsNullOrWhiteSpace($approvalPath)) {
         _tirith_parse_approval $approvalPath.Trim()
@@ -184,6 +236,9 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
                     }
                     default {
                         Write-Host "tirith: approval not granted - fallback: block"
+                        if (-not [string]::IsNullOrWhiteSpace($warnAckPath)) {
+                            Remove-Item $warnAckPath.Trim() -Force -ErrorAction SilentlyContinue
+                        }
                         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
                         return
                     }
@@ -191,6 +246,9 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
             }
         } elseif ($rc -eq 1) {
             # Approval not required but command was blocked: honor block
+            if (-not [string]::IsNullOrWhiteSpace($warnAckPath)) {
+                Remove-Item $warnAckPath.Trim() -Force -ErrorAction SilentlyContinue
+            }
             [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
             return
         }
@@ -198,6 +256,22 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         # No approval file: honor block
         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
         return
+    }
+
+    # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
+    if ($rc -eq 3 -and -not [string]::IsNullOrWhiteSpace($warnAckPath)) {
+        _tirith_parse_warn_ack $warnAckPath.Trim()
+        Write-Host -NoNewline "tirith: proceed with $($script:_tirith_wa_findings) warning(s)? [y/N] "
+        $response = Read-Host
+        if ($response -match '^[yY]') {
+            # Acknowledged: fall through to execute
+        } else {
+            Write-Host "tirith: warnings not acknowledged - command blocked"
+            [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+            return
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($warnAckPath)) {
+        Remove-Item $warnAckPath.Trim() -Force -ErrorAction SilentlyContinue
     }
 
     [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()

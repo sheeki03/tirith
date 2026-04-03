@@ -79,6 +79,33 @@ function _tirith_parse_approval
     return 0
 end
 
+# ─── Warn-ack helpers (strict_warn, exit code 3) ───
+
+function _tirith_parse_warn_ack
+    set -g _tirith_wa_findings 0
+    set -g _tirith_wa_max_severity ""
+
+    if not test -r "$argv[1]"
+        command rm -f "$argv[1]"
+        return 1
+    end
+
+    while read -l line
+        set -l parts (string split -m1 = "$line")
+        if test (count $parts) -ge 2
+            switch $parts[1]
+                case TIRITH_WARN_ACK_FINDINGS
+                    set -g _tirith_wa_findings $parts[2]
+                case TIRITH_WARN_ACK_MAX_SEVERITY
+                    set -g _tirith_wa_max_severity $parts[2]
+            end
+        end
+    end < "$argv[1]"
+
+    command rm -f "$argv[1]"
+    return 0
+end
+
 # Save original key bindings function BEFORE defining our new one
 if functions -q fish_user_key_bindings; and not functions -q _tirith_original_fish_user_key_bindings
     functions -c fish_user_key_bindings _tirith_original_fish_user_key_bindings
@@ -152,9 +179,17 @@ function _tirith_check_command
     set -l errfile (mktemp)
     command tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
     set -l rc $status
+    # Read stdout lines: line 1 = approval path, line 2 = warn-ack path (exit code 3 only)
     set -l approval_path ""
+    set -l warn_ack_path ""
     if test -s $outfile
-        read approval_path < $outfile
+        set -l _stdout_lines (string split \n < $outfile)
+        if test (count $_stdout_lines) -ge 1
+            set approval_path $_stdout_lines[1]
+        end
+        if test (count $_stdout_lines) -ge 2
+            set warn_ack_path $_stdout_lines[2]
+        end
     end
     set -l output ""
     if test -s $errfile
@@ -164,7 +199,7 @@ function _tirith_check_command
 
     if test $rc -eq 0
         # Allow: no output
-    else if test $rc -eq 2
+    else if test $rc -eq 2; or test $rc -eq 3
         set -l escaped_cmd (_tirith_escape_preview "$cmd")
         _tirith_output ""
         _tirith_output "command> $escaped_cmd"
@@ -186,11 +221,12 @@ function _tirith_check_command
         end
         _tirith_output "tirith: unexpected exit code $rc — running unprotected"
         test -n "$approval_path"; and command rm -f "$approval_path"
+        test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
         commandline -f execute
         return
     end
 
-    # Approval workflow: runs for ALL exit codes (0, 1, 2).
+    # Approval workflow: runs for ALL exit codes (0, 1, 2, 3).
     # For rc=1 (block), approval gives user a chance to override.
     if test -n "$approval_path"
         _tirith_parse_approval "$approval_path"
@@ -222,6 +258,7 @@ function _tirith_check_command
                         _tirith_output "tirith: approval not granted — fallback: warn"
                     case '*'
                         _tirith_output "tirith: approval not granted — fallback: block"
+                        test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
                         commandline -r ""
                         commandline -f repaint
                         return 1
@@ -229,6 +266,7 @@ function _tirith_check_command
             end
         else if test $rc -eq 1
             # Approval not required but command was blocked: honor block
+            test -n "$warn_ack_path"; and command rm -f "$warn_ack_path"
             commandline -r ""
             commandline -f repaint
             return 1
@@ -238,6 +276,23 @@ function _tirith_check_command
         commandline -r ""
         commandline -f repaint
         return 1
+    end
+
+    # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
+    if test $rc -eq 3; and test -n "$warn_ack_path"
+        _tirith_parse_warn_ack "$warn_ack_path"
+        set -l response ""
+        read -P "tirith: proceed with $_tirith_wa_findings warning(s)? [y/N] " response
+        if string match -qi 'y*' -- "$response"
+            # Acknowledged: fall through to execute
+        else
+            _tirith_output "tirith: warnings not acknowledged — command blocked"
+            commandline -r ""
+            commandline -f repaint
+            return 1
+        end
+    else if test -n "$warn_ack_path"
+        command rm -f "$warn_ack_path"
     end
 
     commandline -f execute

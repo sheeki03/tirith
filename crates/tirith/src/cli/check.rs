@@ -4,6 +4,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::output;
 use tirith_core::tokenize::ShellType;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cmd: &str,
     shell: &str,
@@ -11,6 +12,8 @@ pub fn run(
     non_interactive: bool,
     interactive_flag: bool,
     approval_check: bool,
+    strict_warn: bool,
+    no_daemon: bool,
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
@@ -47,25 +50,75 @@ pub fn run(
         is_terminal::is_terminal(std::io::stderr())
     };
 
-    let ctx = AnalysisContext {
-        input: cmd.to_string(),
-        shell: shell_type,
-        scan_context: ScanContext::Exec,
-        raw_bytes: None,
-        interactive,
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
-        file_path: None,
-        repo_root: None,
-        is_config_override: false,
-        clipboard_html: None,
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+
+    // Check TIRITH=0 bypass early so it works regardless of daemon/local path.
+    let bypass_requested = std::env::var("TIRITH")
+        .ok()
+        .map(|v| v == "0")
+        .unwrap_or(false);
+
+    // Try daemon delegation: skip for --approval-check (requires local policy
+    // + approval file writes) and --no-daemon (explicit opt-out).
+    let mut verdict = if !approval_check && !no_daemon {
+        if let Some(resp) =
+            crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
+        {
+            // Reconstruct a Verdict from the daemon response, preserving metadata
+            // so the normal post-processing pipeline (audit, output) gets faithful data.
+            tirith_core::verdict::Verdict {
+                action: resp.action,
+                findings: resp.findings,
+                tier_reached: resp.tier_reached,
+                bypass_requested,
+                bypass_honored: resp.bypass_honored,
+                bypass_available: resp.bypass_available,
+                interactive_detected: interactive,
+                policy_path_used: resp.policy_path_used,
+                timings_ms: resp.timings_ms,
+                urls_extracted_count: resp.urls_extracted_count,
+                requires_approval: None,
+                approval_timeout_secs: None,
+                approval_fallback: None,
+                approval_rule: None,
+                approval_description: None,
+            }
+        } else {
+            // Daemon unavailable — fall through to local analysis
+            let ctx = AnalysisContext {
+                input: cmd.to_string(),
+                shell: shell_type,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive,
+                cwd: cwd.clone(),
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+            };
+            engine::analyze(&ctx)
+        }
+    } else {
+        let ctx = AnalysisContext {
+            input: cmd.to_string(),
+            shell: shell_type,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive,
+            cwd: cwd.clone(),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        };
+        engine::analyze(&ctx)
     };
 
-    let mut verdict = engine::analyze(&ctx);
-
     // Apply paranoia filter (suppress Info/Low findings based on policy + tier)
-    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
 
     // Log to audit BEFORE paranoia filtering so the audit captures full detection
     // (ADR-13: engine always detects everything; paranoia is an output-layer filter).
@@ -120,8 +173,8 @@ pub fn run(
         && verdict.action != tirith_core::verdict::Action::Block
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
     {
-        if let Some(cwd) = &ctx.cwd {
-            let cwd_owned = cwd.clone();
+        if let Some(cwd_val) = &cwd {
+            let cwd_owned = cwd_val.clone();
             let cmd_owned = cmd.to_string();
             std::thread::spawn(move || {
                 if let Err(e) =
@@ -160,6 +213,34 @@ pub fn run(
         if output::write_human(&verdict, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write approval output");
         }
+
+        // Mode B: hook-driven strict_warn — write warn-ack temp file and exit 3.
+        // Shell hooks handle the interactive prompt. Exit code 3 is fail-open on
+        // old hooks (they fall through to "unexpected rc" path).
+        // NOTE: Hook version gating is a follow-up — exit code 3 is safe as-is.
+        if verdict.action == tirith_core::verdict::Action::Warn
+            && (strict_warn || policy.strict_warn)
+        {
+            let max_sev = verdict
+                .findings
+                .iter()
+                .map(|f| f.severity)
+                .max()
+                .unwrap_or(tirith_core::verdict::Severity::Low);
+            match tirith_core::approval::write_warn_ack_file(verdict.findings.len(), &max_sev) {
+                Ok(path) => {
+                    // Print warn-ack file path on a NEW line after the approval path
+                    // already on stdout. Hooks read line 1 = approval, line 2 = warn-ack.
+                    println!("{}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("tirith: failed to write warn-ack file: {e}");
+                    return 1;
+                }
+            }
+            return tirith_core::verdict::Action::WarnAck.exit_code(); // exit 3
+        }
+
         return verdict.action.exit_code();
     }
 
@@ -178,5 +259,22 @@ pub fn run(
         eprintln!("tirith: failed to write output");
     }
 
-    verdict.action.exit_code()
+    // strict_warn promotion: prompt user in interactive mode (Mode A: direct CLI)
+    let exit_code = verdict.action.exit_code();
+    if exit_code == 2 && (strict_warn || policy.strict_warn) && interactive {
+        // Mode A: direct CLI — prompt the user interactively
+        eprint!(
+            "tirith: proceed with {} warning(s)? [y/N] ",
+            verdict.findings.len()
+        );
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
+            return 0; // user acknowledged
+        }
+        return 1; // user declined
+    }
+    // strict_warn + non-interactive: return exit code 2 (backward-compatible Warn)
+
+    exit_code
 }

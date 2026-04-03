@@ -90,6 +90,29 @@ _tirith_parse_approval() {
   return 0
 }
 
+# ─── Warn-ack helpers (strict_warn, exit code 3) ───
+
+_tirith_parse_warn_ack() {
+  local file="$1"
+  _tirith_wa_findings=0
+  _tirith_wa_max_severity=""
+
+  if [[ ! -r "$file" ]]; then
+    command rm -f "$file"
+    return 1
+  fi
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TIRITH_WARN_ACK_FINDINGS) _tirith_wa_findings="$value" ;;
+      TIRITH_WARN_ACK_MAX_SEVERITY) _tirith_wa_max_severity="$value" ;;
+    esac
+  done < "$file"
+
+  command rm -f "$file"
+  return 0
+}
+
 # ─── Persistent safe mode infrastructure ───
 
 # Trim whitespace to match Rust policy.rs:state_dir() behavior
@@ -349,9 +372,22 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       local output=$(<"$errfile")
       command rm -f "$errfile"
 
+      # Exit code 3 (WarnAck): stdout has two lines — approval path + warn-ack path.
+      # Split them so approval workflow gets the right file.
+      local warn_ack_path=""
+      if [[ $rc -eq 3 ]]; then
+        local _first_line _rest
+        IFS=$'\n' read -r _first_line <<< "$approval_path"
+        _rest="${approval_path#*$'\n'}"
+        if [[ "$_rest" != "$approval_path" ]]; then
+          warn_ack_path="$_rest"
+        fi
+        approval_path="$_first_line"
+      fi
+
       if [[ $rc -eq 0 ]]; then
         :  # Allow: no output
-      elif [[ $rc -eq 2 ]]; then
+      elif [[ $rc -eq 2 || $rc -eq 3 ]]; then
         local escaped_line
         escaped_line=$(_tirith_escape_preview "$READLINE_LINE")
         _tirith_output ""
@@ -371,11 +407,12 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         _tirith_output "command> $escaped_line"
         [[ -n "$output" ]] && _tirith_output "$output"
         [[ -n "$approval_path" ]] && command rm -f "$approval_path"
+        [[ -n "$warn_ack_path" ]] && command rm -f "$warn_ack_path"
         _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
         return  # READLINE_LINE preserved for re-execution via preexec
       fi
 
-      # Approval workflow: runs for ALL exit codes (0, 1, 2).
+      # Approval workflow: runs for ALL exit codes (0, 1, 2, 3).
       # For rc=1 (block), approval gives user a chance to override.
       if [[ -n "$approval_path" ]]; then
         _tirith_parse_approval "$approval_path"
@@ -400,6 +437,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
                 ;;
               *)
                 _tirith_output "tirith: approval not granted — fallback: block"
+                [[ -n "$warn_ack_path" ]] && command rm -f "$warn_ack_path"
                 READLINE_LINE=""
                 READLINE_POINT=0
                 return
@@ -408,6 +446,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           fi
         elif [[ $rc -eq 1 ]]; then
           # Approval not required but command was blocked: honor block
+          [[ -n "$warn_ack_path" ]] && command rm -f "$warn_ack_path"
           READLINE_LINE=""
           READLINE_POINT=0
           return
@@ -417,6 +456,23 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         READLINE_LINE=""
         READLINE_POINT=0
         return
+      fi
+
+      # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
+      if [[ $rc -eq 3 && -n "$warn_ack_path" ]]; then
+        _tirith_parse_warn_ack "$warn_ack_path"
+        local response=""
+        read -p "tirith: proceed with ${_tirith_wa_findings} warning(s)? [y/N] " response </dev/tty 2>/dev/null
+        if [[ "$response" == [yY]* ]]; then
+          :  # Acknowledged: fall through to execute
+        else
+          _tirith_output "tirith: warnings not acknowledged — command blocked"
+          READLINE_LINE=""
+          READLINE_POINT=0
+          return
+        fi
+      elif [[ -n "$warn_ack_path" ]]; then
+        command rm -f "$warn_ack_path"
       fi
 
       # Execute the command (approval workflow above handled block cases)

@@ -38,6 +38,8 @@ pub enum RuleId {
     InvisibleMathOperator,
     VariationSelector,
     InvisibleWhitespace,
+    HangulFiller,
+    ConfusableText,
 
     // Command shape rules
     PipeToInterpreter,
@@ -238,6 +240,9 @@ pub enum Action {
     Allow,
     Warn,
     Block,
+    /// Warn findings require explicit interactive acknowledgement.
+    /// Used by `strict_warn` in hook-driven mode (exit code 3).
+    WarnAck,
 }
 
 impl Action {
@@ -246,6 +251,7 @@ impl Action {
             Action::Allow => 0,
             Action::Block => 1,
             Action::Warn => 2,
+            Action::WarnAck => 3,
         }
     }
 }
@@ -258,6 +264,7 @@ pub struct Verdict {
     pub tier_reached: u8,
     pub bypass_requested: bool,
     pub bypass_honored: bool,
+    pub bypass_available: bool,
     pub interactive_detected: bool,
     pub policy_path_used: Option<String>,
     pub timings_ms: Timings,
@@ -302,6 +309,7 @@ impl Verdict {
             tier_reached,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: timings,
@@ -336,6 +344,7 @@ impl Verdict {
             tier_reached,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: timings,

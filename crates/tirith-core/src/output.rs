@@ -52,7 +52,7 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
 
     let action_str = match verdict.action {
         Action::Allow => "INFO",
-        Action::Warn => "WARNING",
+        Action::Warn | Action::WarnAck => "WARNING",
         Action::Block => "BLOCKED",
     };
 
@@ -105,7 +105,7 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
         }
     }
 
-    if verdict.action == Action::Block {
+    if verdict.action == Action::Block && verdict.bypass_available {
         writeln!(
             w,
             "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
@@ -164,7 +164,7 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
 
     let action_str = match verdict.action {
         Action::Allow => "INFO",
-        Action::Warn => "WARNING",
+        Action::Warn | Action::WarnAck => "WARNING",
         Action::Block => "BLOCKED",
     };
 
@@ -208,7 +208,7 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
         }
     }
 
-    if verdict.action == Action::Block {
+    if verdict.action == Action::Block && verdict.bypass_available {
         writeln!(
             w,
             "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"

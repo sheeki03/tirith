@@ -75,6 +75,29 @@ _tirith_parse_approval() {
   return 0
 }
 
+# ─── Warn-ack helpers (strict_warn, exit code 3) ───
+
+_tirith_parse_warn_ack() {
+  local file="$1"
+  _tirith_wa_findings=0
+  _tirith_wa_max_severity=""
+
+  if [[ ! -r "$file" ]]; then
+    command rm -f "$file"
+    return 1
+  fi
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TIRITH_WARN_ACK_FINDINGS) _tirith_wa_findings="$value" ;;
+      TIRITH_WARN_ACK_MAX_SEVERITY) _tirith_wa_max_severity="$value" ;;
+    esac
+  done < "$file"
+
+  command rm -f "$file"
+  return 0
+}
+
 # Save original accept-line widget if it exists
 if zle -la | grep -q '^accept-line$'; then
   zle -A accept-line _tirith_original_accept_line
@@ -98,9 +121,19 @@ _tirith_accept_line() {
   local output=$(<"$errfile")
   command rm -f "$errfile"
 
+  # Exit code 3 (WarnAck): stdout has two lines — approval path + warn-ack path.
+  # Split them so approval workflow gets the right file.
+  local warn_ack_path=""
+  if [[ $rc -eq 3 ]]; then
+    # Split multi-line stdout: line 1 = approval, line 2 = warn-ack
+    local _lines=("${(f)approval_path}")
+    approval_path="${_lines[1]}"
+    warn_ack_path="${_lines[2]}"
+  fi
+
   if [[ $rc -eq 0 ]]; then
     :  # Allow: no output
-  elif [[ $rc -eq 2 ]]; then
+  elif [[ $rc -eq 2 || $rc -eq 3 ]]; then
     local escaped_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
     _tirith_output "command> $escaped_buf"
@@ -120,7 +153,7 @@ _tirith_accept_line() {
     return
   fi
 
-  # Approval workflow: runs for ALL exit codes (0, 1, 2).
+  # Approval workflow: runs for ALL exit codes (0, 1, 2, 3).
   # For rc=1 (block), approval gives user a chance to override.
   if [[ -n "$approval_path" ]]; then
     _tirith_parse_approval "$approval_path"
@@ -145,6 +178,7 @@ _tirith_accept_line() {
             ;;
           *)
             _tirith_output "tirith: approval not granted — fallback: block"
+            [[ -n "$warn_ack_path" ]] && command rm -f "$warn_ack_path"
             BUFFER=""
             zle send-break
             return
@@ -153,6 +187,7 @@ _tirith_accept_line() {
       fi
     elif [[ $rc -eq 1 ]]; then
       # Approval not required but command was blocked: honor block
+      [[ -n "$warn_ack_path" ]] && command rm -f "$warn_ack_path"
       BUFFER=""
       zle send-break
       return
@@ -164,7 +199,25 @@ _tirith_accept_line() {
     return
   fi
 
-  # Execute (rc=0, rc=2, or approval granted)
+  # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
+  if [[ $rc -eq 3 && -n "$warn_ack_path" ]]; then
+    _tirith_parse_warn_ack "$warn_ack_path"
+    local response=""
+    read "response?tirith: proceed with ${_tirith_wa_findings} warning(s)? [y/N] " </dev/tty 2>/dev/null
+    if [[ "$response" == [yY]* ]]; then
+      :  # Acknowledged: fall through to execute
+    else
+      _tirith_output "tirith: warnings not acknowledged — command blocked"
+      BUFFER=""
+      zle send-break
+      return
+    fi
+  elif [[ -n "$warn_ack_path" ]]; then
+    # Clean up warn-ack file if present but not rc=3 (shouldn't happen, but be safe)
+    command rm -f "$warn_ack_path"
+  fi
+
+  # Execute (rc=0, rc=2, rc=3 acknowledged, or approval granted)
   zle _tirith_original_accept_line 2>/dev/null || zle .accept-line
 }
 

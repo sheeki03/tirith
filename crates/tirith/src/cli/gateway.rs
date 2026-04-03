@@ -567,7 +567,7 @@ fn handle_guarded_call(
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let should_deny = match verdict.action {
                 Action::Block => true,
-                Action::Warn => config.policy.warn_action == "deny",
+                Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
                 Action::Allow => false,
             };
 
@@ -738,7 +738,7 @@ fn handle_guarded_notification(
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let should_deny = match verdict.action {
                 Action::Block => true,
-                Action::Warn => config.policy.warn_action == "deny",
+                Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
                 Action::Allow => false,
             };
 
@@ -1032,7 +1032,7 @@ fn build_deny_response(
 
     let verdict_action = match verdict.action {
         Action::Block => "block",
-        Action::Warn => "warn",
+        Action::Warn | Action::WarnAck => "warn",
         Action::Allow => "allow",
     };
 
@@ -1900,6 +1900,7 @@ policy:
             tier_reached: 3,
             bypass_requested: false,
             bypass_honored: false,
+            bypass_available: false,
             interactive_detected: false,
             policy_path_used: None,
             timings_ms: Timings::default(),
