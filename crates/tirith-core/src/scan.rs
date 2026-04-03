@@ -15,6 +15,10 @@ pub struct ScanConfig {
     pub fail_on: Severity,
     /// Glob patterns to ignore.
     pub ignore_patterns: Vec<String>,
+    /// Include only files matching these patterns (empty = include all).
+    pub include_patterns: Vec<String>,
+    /// Exclude files matching these patterns (applied after include).
+    pub exclude_patterns: Vec<String>,
     /// Max files to scan (None = unlimited).
     pub max_files: Option<usize>,
 }
@@ -71,7 +75,13 @@ const PRIORITY_PARENT_DIRS: &[&str] = &[
 /// Detection is always free (ADR-13). `max_files` is a caller-provided safety
 /// cap (e.g. for resource-constrained CI), not a license gate.
 pub fn scan(config: &ScanConfig) -> ScanResult {
-    let mut files = collect_files(&config.path, config.recursive, &config.ignore_patterns);
+    let mut files = collect_files(
+        &config.path,
+        config.recursive,
+        &config.ignore_patterns,
+        &config.include_patterns,
+        &config.exclude_patterns,
+    );
 
     // Sort: known config files first, then lexicographic
     files.sort_by(|a, b| {
@@ -239,7 +249,13 @@ fn is_priority_file(path: &Path) -> bool {
 }
 
 /// Collect files from a path (directory or single file).
-fn collect_files(path: &Path, recursive: bool, ignore_patterns: &[String]) -> Vec<PathBuf> {
+fn collect_files(
+    path: &Path,
+    recursive: bool,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
     }
@@ -250,14 +266,25 @@ fn collect_files(path: &Path, recursive: bool, ignore_patterns: &[String]) -> Ve
     }
 
     let mut files = Vec::new();
-    collect_files_recursive(path, recursive, ignore_patterns, &mut files);
+    collect_files_recursive(
+        path,
+        path,
+        recursive,
+        ignore_patterns,
+        include_patterns,
+        exclude_patterns,
+        &mut files,
+    );
     files
 }
 
 fn collect_files_recursive(
+    root: &Path,
     dir: &Path,
     recursive: bool,
     ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
     files: &mut Vec<PathBuf>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -288,7 +315,15 @@ fn collect_files_recursive(
                 continue;
             }
             if recursive || is_known_config_dir(name) {
-                collect_files_recursive(&path, recursive, ignore_patterns, files);
+                collect_files_recursive(
+                    root,
+                    &path,
+                    recursive,
+                    ignore_patterns,
+                    include_patterns,
+                    exclude_patterns,
+                    files,
+                );
             }
             continue;
         }
@@ -298,10 +333,54 @@ fn collect_files_recursive(
             continue;
         }
 
-        // Apply ignore patterns
+        // Apply ignore patterns against basename and relative path
+        let rel_path = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or(name);
         if ignore_patterns
             .iter()
-            .any(|pat| name.contains(pat.as_str()))
+            .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
+        {
+            continue;
+        }
+
+        // Apply include patterns with negation support.
+        // Patterns prefixed with `!` act as excludes within the include set.
+        if !include_patterns.is_empty() {
+            let mut included = false;
+            let mut negated = false;
+            let has_positive = include_patterns.iter().any(|p| !p.starts_with('!'));
+
+            for pat in include_patterns {
+                if let Some(stripped) = pat.strip_prefix('!') {
+                    // Negation: exclude from the include set
+                    if matches_ignore_pattern(name, stripped)
+                        || matches_ignore_pattern(rel_path, stripped)
+                    {
+                        negated = true;
+                    }
+                } else {
+                    // Positive: file must match at least one
+                    if matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat) {
+                        included = true;
+                    }
+                }
+            }
+
+            // A file passes include if:
+            // - No positive includes OR matches at least one positive include
+            // - AND does not match any negated include
+            if negated || (has_positive && !included) {
+                continue;
+            }
+        }
+
+        // Apply exclude patterns: skip matching files
+        if exclude_patterns
+            .iter()
+            .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
         {
             continue;
         }
@@ -352,6 +431,53 @@ fn is_binary_extension(name: &str) -> bool {
     ];
     let name_lower = name.to_lowercase();
     binary_exts.iter().any(|ext| name_lower.ends_with(ext))
+}
+
+/// Match a filename against an ignore pattern.
+/// Supports simple glob patterns: `*.ext` (suffix), `prefix*` (prefix),
+/// `*middle*` (contains), and exact matches. Falls back to substring
+/// matching for patterns without `*`.
+pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
+    if pattern.contains('*') {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        match parts.as_slice() {
+            // "*.ext" — suffix match
+            [prefix, suffix] if prefix.is_empty() && !suffix.is_empty() => name.ends_with(suffix),
+            // "prefix*" — prefix match
+            [prefix, suffix] if !prefix.is_empty() && suffix.is_empty() => name.starts_with(prefix),
+            // "pre*suf" — prefix + suffix match
+            [prefix, suffix] if !prefix.is_empty() && !suffix.is_empty() => {
+                name.starts_with(prefix)
+                    && name.ends_with(suffix)
+                    && name.len() >= prefix.len() + suffix.len()
+            }
+            // "*" alone matches everything
+            [_, _] => true,
+            // Fallback for multiple wildcards: all parts must appear in order
+            _ => {
+                let mut remaining = name;
+                for (i, part) in parts.iter().enumerate() {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if i == 0 {
+                        if !remaining.starts_with(part) {
+                            return false;
+                        }
+                        remaining = &remaining[part.len()..];
+                    } else if let Some(pos) = remaining.find(part) {
+                        remaining = &remaining[pos + part.len()..];
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    } else {
+        // No wildcard: substring match (backwards compatible)
+        name.contains(pattern)
+    }
 }
 
 impl ScanResult {
@@ -413,5 +539,113 @@ mod tests {
         assert!(is_known_config_dir(".cursor"));
         assert!(!is_known_config_dir("src"));
         assert!(!is_known_config_dir(".git"));
+    }
+
+    #[test]
+    fn test_ignore_pattern_matching() {
+        // Suffix glob
+        assert!(matches_ignore_pattern("test.log", "*.log"));
+        assert!(!matches_ignore_pattern("test.txt", "*.log"));
+
+        // Prefix glob
+        assert!(matches_ignore_pattern("test_output.txt", "test_*"));
+        assert!(!matches_ignore_pattern("my_test.txt", "test_*"));
+
+        // Contains (no wildcard — backward compatible)
+        assert!(matches_ignore_pattern("my_test_file.txt", "test"));
+        assert!(!matches_ignore_pattern("readme.md", "test"));
+
+        // Prefix + suffix glob
+        assert!(matches_ignore_pattern("test_file.log", "test_*.log"));
+        assert!(!matches_ignore_pattern("test_file.txt", "test_*.log"));
+
+        // Exact match
+        assert!(matches_ignore_pattern("Cargo.lock", "Cargo.lock"));
+
+        // Path-aware patterns (matched against relative paths)
+        assert!(matches_ignore_pattern(".claude/settings.json", ".claude/*"));
+        assert!(!matches_ignore_pattern("src/main.rs", ".claude/*"));
+        assert!(matches_ignore_pattern("docs/CLAUDE.md", "*/CLAUDE.md"));
+        assert!(!matches_ignore_pattern("README.md", "*/CLAUDE.md"));
+    }
+
+    #[test]
+    fn test_variation_selector_visible_in_scan() {
+        // Write a temp file with a variation selector (U+FE0F = EF B8 8F in UTF-8)
+        // into a temp directory with no local policy so paranoia is deterministic.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file_path = tmp.path().join("test_vs.txt");
+        std::fs::write(&file_path, b"A\xef\xb8\x8f").expect("write temp file");
+
+        let result = scan_single_file(&file_path).expect("scan should succeed");
+
+        // VariationSelector is now Medium — should survive default paranoia filtering
+        let policy = crate::policy::Policy::discover(Some(tmp.path().to_str().unwrap()));
+        let mut findings = result.findings;
+        crate::engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::VariationSelector),
+            "VariationSelector should be visible in scan at default paranoia: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_negated_include_patterns() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(tmp.path().join("a.md"), "hello").unwrap();
+        std::fs::write(tmp.path().join("b.test.md"), "world").unwrap();
+        std::fs::write(tmp.path().join("c.rs"), "fn main() {}").unwrap();
+
+        // Include *.md but exclude *.test.md via negation
+        let files = collect_files(
+            tmp.path(),
+            false,
+            &[],
+            &["*.md".to_string(), "!*.test.md".to_string()],
+            &[],
+        );
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"a.md"), "a.md should be included");
+        assert!(
+            !names.contains(&"b.test.md"),
+            "b.test.md should be excluded by negation"
+        );
+        assert!(
+            !names.contains(&"c.rs"),
+            "c.rs should not match *.md include"
+        );
+    }
+
+    #[test]
+    fn test_negation_only_include_patterns() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(tmp.path().join("a.md"), "hello").unwrap();
+        std::fs::write(tmp.path().join("b.test.md"), "world").unwrap();
+        std::fs::write(tmp.path().join("c.rs"), "fn main() {}").unwrap();
+
+        // Only negation patterns (no positive includes) — include everything
+        // except negated patterns
+        let files = collect_files(tmp.path(), false, &[], &["!*.test.md".to_string()], &[]);
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"a.md"), "a.md should be included");
+        assert!(
+            !names.contains(&"b.test.md"),
+            "b.test.md should be excluded by negation"
+        );
+        assert!(
+            names.contains(&"c.rs"),
+            "c.rs should be included (no positive filter)"
+        );
     }
 }

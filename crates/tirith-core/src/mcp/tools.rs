@@ -378,6 +378,8 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         recursive,
         fail_on: crate::verdict::Severity::Critical,
         ignore_patterns: vec![],
+        include_patterns: vec![],
+        exclude_patterns: vec![],
         max_files: Some(crate::mcp::resources::MCP_SCAN_MAX_FILES),
     };
 

@@ -47,6 +47,8 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 recursive: true,
                 fail_on: crate::verdict::Severity::Critical,
                 ignore_patterns: policy.scan.ignore_patterns.clone(),
+                include_patterns: vec![],
+                exclude_patterns: vec![],
                 max_files: Some(MCP_SCAN_MAX_FILES),
             };
             let mut result = scan::scan(&config);
@@ -105,6 +107,8 @@ fn read_project_safety() -> ToolCallResult {
         recursive: true,
         fail_on: crate::verdict::Severity::Critical,
         ignore_patterns: policy.scan.ignore_patterns.clone(),
+        include_patterns: vec![],
+        exclude_patterns: vec![],
         max_files: Some(MCP_SCAN_MAX_FILES),
     };
     let mut result = scan::scan(&config);

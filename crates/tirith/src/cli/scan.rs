@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use tirith_core::policy::Policy;
 use tirith_core::scan::{self, ScanConfig};
 use tirith_core::verdict::Severity;
 
@@ -14,8 +15,42 @@ pub fn run(
     json: bool,
     sarif: bool,
     ignore: &[String],
+    include: &[String],
+    exclude: &[String],
+    profile: Option<&str>,
 ) -> i32 {
-    let fail_on_severity = parse_severity(fail_on);
+    // Resolve effective settings: CLI args merged with profile (if any)
+    let mut effective_include: Vec<String> = include.to_vec();
+    let mut effective_exclude: Vec<String> = exclude.to_vec();
+    let mut effective_ignore: Vec<String> = ignore.to_vec();
+    let mut effective_fail_on = fail_on.to_string();
+
+    if let Some(profile_name) = profile {
+        let policy = Policy::discover(None);
+        if let Some(scan_profile) = policy.scan.profiles.get(profile_name) {
+            // Profile values are defaults; CLI flags override when non-empty
+            if effective_include.is_empty() {
+                effective_include = scan_profile.include.clone();
+            }
+            if effective_exclude.is_empty() {
+                effective_exclude = scan_profile.exclude.clone();
+            }
+            if effective_ignore.is_empty() {
+                // Merge profile ignore and profile exclude-as-ignore
+                effective_ignore = scan_profile.ignore.clone();
+            }
+            // Profile fail_on is used only when CLI is at the default value
+            if fail_on == "critical" {
+                if let Some(ref profile_fail_on) = scan_profile.fail_on {
+                    effective_fail_on = profile_fail_on.clone();
+                }
+            }
+        } else {
+            eprintln!("tirith scan: warning: profile '{profile_name}' not found in policy");
+        }
+    }
+
+    let fail_on_severity = parse_severity(&effective_fail_on);
 
     // --stdin mode: read from stdin
     if stdin {
@@ -24,6 +59,14 @@ pub fn run(
 
     // --file mode: scan a single file
     if let Some(file_path) = file {
+        if should_skip_file(
+            file_path,
+            &effective_include,
+            &effective_exclude,
+            &effective_ignore,
+        ) {
+            return 0;
+        }
         return run_single_file(file_path, json, sarif, ci, fail_on_severity);
     }
 
@@ -34,20 +77,25 @@ pub fn run(
 
     // Single file passed as positional argument
     if scan_path.is_file() {
-        return run_single_file(
-            &scan_path.display().to_string(),
-            json,
-            sarif,
-            ci,
-            fail_on_severity,
-        );
+        let path_str = scan_path.display().to_string();
+        if should_skip_file(
+            &path_str,
+            &effective_include,
+            &effective_exclude,
+            &effective_ignore,
+        ) {
+            return 0;
+        }
+        return run_single_file(&path_str, json, sarif, ci, fail_on_severity);
     }
 
     let config = ScanConfig {
         path: scan_path,
         recursive: true,
         fail_on: fail_on_severity,
-        ignore_patterns: ignore.to_vec(),
+        ignore_patterns: effective_ignore,
+        include_patterns: effective_include,
+        exclude_patterns: effective_exclude,
         max_files: None,
     };
 
@@ -57,7 +105,7 @@ pub fn run(
         print_sarif_result(&result);
     } else if json {
         print_json_result(&result);
-    } else {
+    } else if !ci {
         print_human_result(&result);
     }
 
@@ -70,7 +118,7 @@ pub fn run(
     }
 }
 
-fn run_stdin(json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
+fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     const MAX_STDIN: u64 = 10 * 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -96,7 +144,7 @@ fn run_stdin(json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
         print_sarif_file_result(&result);
     } else if json {
         print_json_file_result(&result);
-    } else {
+    } else if !ci {
         print_human_file_result(&result);
     }
 
@@ -109,7 +157,7 @@ fn run_stdin(json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
     }
 }
 
-fn run_single_file(file_path: &str, json: bool, sarif: bool, _ci: bool, fail_on: Severity) -> i32 {
+fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
@@ -128,7 +176,7 @@ fn run_single_file(file_path: &str, json: bool, sarif: bool, _ci: bool, fail_on:
         print_sarif_file_result(&result);
     } else if json {
         print_json_file_result(&result);
-    } else {
+    } else if !ci {
         print_human_file_result(&result);
     }
 
@@ -293,6 +341,7 @@ fn print_sarif_result(result: &scan::ScanResult) {
                 finding: f,
                 file_path: Some(fr.path.display().to_string()),
                 line_number: None,
+                suppressed: false,
             })
         })
         .collect();
@@ -315,6 +364,7 @@ fn print_sarif_file_result(result: &scan::FileScanResult) {
             finding: f,
             file_path: Some(result.path.display().to_string()),
             line_number: None,
+            suppressed: false,
         })
         .collect();
 
@@ -351,4 +401,63 @@ fn print_human_file_result(result: &scan::FileScanResult) {
         );
         eprintln!("    {}", finding.description);
     }
+}
+
+/// Check whether a single file should be skipped based on include/exclude/ignore filters.
+fn should_skip_file(
+    file_path: &str,
+    include: &[String],
+    exclude: &[String],
+    ignore: &[String],
+) -> bool {
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file_path);
+
+    let matches = |patterns: &[String]| -> bool {
+        patterns.iter().any(|p| {
+            tirith_core::scan::matches_ignore_pattern(file_name, p)
+                || tirith_core::scan::matches_ignore_pattern(file_path, p)
+        })
+    };
+
+    // Ignore patterns: skip if matched
+    if matches(ignore) {
+        return true;
+    }
+
+    // Exclude patterns: skip if matched
+    if matches(exclude) {
+        return true;
+    }
+
+    // Include patterns: if non-empty, file must match at least one positive include
+    // (negation patterns starting with '!' are treated as excludes, not includes)
+    let positive_includes: Vec<&String> = include.iter().filter(|p| !p.starts_with('!')).collect();
+    let negated_includes: Vec<String> = include
+        .iter()
+        .filter(|p| p.starts_with('!'))
+        .map(|p| p[1..].to_string())
+        .collect();
+
+    if !positive_includes.is_empty() {
+        let matches_any = positive_includes.iter().any(|p| {
+            tirith_core::scan::matches_ignore_pattern(file_name, p)
+                || tirith_core::scan::matches_ignore_pattern(file_path, p)
+        });
+        if !matches_any {
+            return true;
+        }
+    }
+
+    // Negated includes: skip if matched
+    if negated_includes.iter().any(|p| {
+        tirith_core::scan::matches_ignore_pattern(file_name, p)
+            || tirith_core::scan::matches_ignore_pattern(file_path, p)
+    }) {
+        return true;
+    }
+
+    false
 }
