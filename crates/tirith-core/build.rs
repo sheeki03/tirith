@@ -3,6 +3,15 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+/// Escape a string for embedding in a Rust string literal.
+fn esc_rust_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 #[derive(Deserialize)]
 struct CredentialPatternsFile {
     pattern: Option<Vec<CredPattern>>,
@@ -45,25 +54,63 @@ fn main() {
     let data_dir = Path::new(&manifest_dir).join("assets").join("data");
 
     compile_confusables(&data_dir, &out_dir);
+    compile_text_confusables(&data_dir, &out_dir);
     compile_known_domains(&data_dir, &out_dir);
     compile_popular_repos(&data_dir, &out_dir);
     compile_public_suffix_list(&data_dir, &out_dir);
     compile_ocr_confusions(&data_dir, &out_dir);
     generate_tier1_regex(&out_dir);
+    compile_rule_explanations(&data_dir, &out_dir);
 
     println!("cargo:rerun-if-changed=assets/data/confusables.txt");
+    println!("cargo:rerun-if-changed=assets/data/text_confusables.txt");
     println!("cargo:rerun-if-changed=assets/data/known_domains.csv");
     println!("cargo:rerun-if-changed=assets/data/popular_repos.csv");
     println!("cargo:rerun-if-changed=assets/data/public_suffix_list.dat");
     println!("cargo:rerun-if-changed=assets/data/ocr_confusions.tsv");
     println!("cargo:rerun-if-changed=assets/data/credential_patterns.toml");
+    println!("cargo:rerun-if-changed=assets/data/rule_explanations.toml");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
 fn compile_confusables(data_dir: &Path, out_dir: &str) {
-    let confusables_path = data_dir.join("confusables.txt");
-    let content = fs::read_to_string(&confusables_path)
-        .unwrap_or_else(|e| panic!("Failed to read confusables.txt: {e}"));
+    compile_confusable_file(
+        data_dir,
+        out_dir,
+        "confusables.txt",
+        "CONFUSABLE_TABLE",
+        "CONFUSABLE_COUNT",
+        "/// Auto-generated confusable character table.\n",
+        "confusables_gen.rs",
+    );
+}
+
+fn compile_text_confusables(data_dir: &Path, out_dir: &str) {
+    compile_confusable_file(
+        data_dir,
+        out_dir,
+        "text_confusables.txt",
+        "TEXT_CONFUSABLE_TABLE",
+        "TEXT_CONFUSABLE_COUNT",
+        "/// Auto-generated text-level confusable character table.\n\
+         /// Separate from hostname confusables — used by ConfusableText rule.\n",
+        "text_confusables_gen.rs",
+    );
+}
+
+/// Shared parser for confusable mapping files (format: `hex hex # comment`).
+fn compile_confusable_file(
+    data_dir: &Path,
+    out_dir: &str,
+    filename: &str,
+    table_name: &str,
+    count_name: &str,
+    doc_comment: &str,
+    out_filename: &str,
+) {
+    let path = data_dir.join(filename);
+    let content =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("Failed to read {filename}: {e}"));
 
     let mut entries = Vec::new();
     for line in content.lines() {
@@ -88,16 +135,16 @@ fn compile_confusables(data_dir: &Path, out_dir: &str) {
     }
 
     let mut code = String::new();
-    code.push_str("/// Auto-generated confusable character table.\n");
-    code.push_str("pub const CONFUSABLE_TABLE: &[(u32, u32)] = &[\n");
+    code.push_str(doc_comment);
+    code.push_str(&format!("pub const {table_name}: &[(u32, u32)] = &[\n"));
     for (src, tgt) in &entries {
         code.push_str(&format!("    (0x{src:04X}, 0x{tgt:04X}),\n"));
     }
     code.push_str("];\n");
     let count = entries.len();
-    code.push_str(&format!("\npub const CONFUSABLE_COUNT: usize = {count};\n"));
+    code.push_str(&format!("\npub const {count_name}: usize = {count};\n"));
 
-    let out_path = Path::new(out_dir).join("confusables_gen.rs");
+    let out_path = Path::new(out_dir).join(out_filename);
     fs::write(&out_path, code).unwrap();
 }
 
@@ -235,10 +282,11 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
     );
     code.push_str("pub const OCR_CONFUSIONS: &[(&str, &str)] = &[\n");
     for (confusable, canonical) in &entries {
-        // Escape for Rust string literal
-        let esc_c = confusable.replace('\\', "\\\\").replace('"', "\\\"");
-        let esc_k = canonical.replace('\\', "\\\\").replace('"', "\\\"");
-        code.push_str(&format!("    (\"{esc_c}\", \"{esc_k}\"),\n"));
+        code.push_str(&format!(
+            "    (\"{}\", \"{}\"),\n",
+            esc_rust_str(confusable),
+            esc_rust_str(canonical)
+        ));
     }
     code.push_str("];\n");
     let count = entries.len();
@@ -620,5 +668,322 @@ fn generate_tier1_regex(out_dir: &str) {
     code.push_str("];\n");
 
     let out_path = Path::new(out_dir).join("tier1_gen.rs");
+    fs::write(&out_path, code).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Rule explanations
+// ---------------------------------------------------------------------------
+
+/// (snake_case id, PascalCase enum variant) for every RuleId in verdict.rs.
+/// build.rs uses snake_case for TOML validation, PascalCase for generating
+/// the mitre_id match function.
+///
+/// SYNC: must match `enum RuleId` in src/verdict.rs exactly.
+/// The `test_all_rule_ids_have_explanation` test catches drift at CI time.
+const EXPECTED_RULES: &[(&str, &str)] = &[
+    // Hostname
+    ("non_ascii_hostname", "NonAsciiHostname"),
+    ("punycode_domain", "PunycodeDomain"),
+    ("mixed_script_in_label", "MixedScriptInLabel"),
+    ("userinfo_trick", "UserinfoTrick"),
+    ("confusable_domain", "ConfusableDomain"),
+    ("raw_ip_url", "RawIpUrl"),
+    ("non_standard_port", "NonStandardPort"),
+    ("invalid_host_chars", "InvalidHostChars"),
+    ("trailing_dot_whitespace", "TrailingDotWhitespace"),
+    ("lookalike_tld", "LookalikeTld"),
+    // Path
+    ("non_ascii_path", "NonAsciiPath"),
+    ("homoglyph_in_path", "HomoglyphInPath"),
+    ("double_encoding", "DoubleEncoding"),
+    // Transport
+    ("plain_http_to_sink", "PlainHttpToSink"),
+    ("schemeless_to_sink", "SchemelessToSink"),
+    ("insecure_tls_flags", "InsecureTlsFlags"),
+    ("shortened_url", "ShortenedUrl"),
+    // Terminal deception
+    ("ansi_escapes", "AnsiEscapes"),
+    ("control_chars", "ControlChars"),
+    ("bidi_controls", "BidiControls"),
+    ("zero_width_chars", "ZeroWidthChars"),
+    ("hidden_multiline", "HiddenMultiline"),
+    ("unicode_tags", "UnicodeTags"),
+    ("invisible_math_operator", "InvisibleMathOperator"),
+    ("variation_selector", "VariationSelector"),
+    ("invisible_whitespace", "InvisibleWhitespace"),
+    ("hangul_filler", "HangulFiller"),
+    ("confusable_text", "ConfusableText"),
+    // Command shape
+    ("pipe_to_interpreter", "PipeToInterpreter"),
+    ("curl_pipe_shell", "CurlPipeShell"),
+    ("wget_pipe_shell", "WgetPipeShell"),
+    ("httpie_pipe_shell", "HttpiePipeShell"),
+    ("xh_pipe_shell", "XhPipeShell"),
+    ("dotfile_overwrite", "DotfileOverwrite"),
+    ("archive_extract", "ArchiveExtract"),
+    ("proc_mem_access", "ProcMemAccess"),
+    ("docker_remote_priv_esc", "DockerRemotePrivEsc"),
+    ("credential_file_sweep", "CredentialFileSweep"),
+    ("base64_decode_execute", "Base64DecodeExecute"),
+    ("data_exfiltration", "DataExfiltration"),
+    // Code file scan
+    ("dynamic_code_execution", "DynamicCodeExecution"),
+    ("obfuscated_payload", "ObfuscatedPayload"),
+    ("suspicious_code_exfiltration", "SuspiciousCodeExfiltration"),
+    // Environment
+    ("proxy_env_set", "ProxyEnvSet"),
+    ("sensitive_env_export", "SensitiveEnvExport"),
+    ("code_injection_env", "CodeInjectionEnv"),
+    ("interpreter_hijack_env", "InterpreterHijackEnv"),
+    ("shell_injection_env", "ShellInjectionEnv"),
+    // Network destination
+    ("metadata_endpoint", "MetadataEndpoint"),
+    ("private_network_access", "PrivateNetworkAccess"),
+    ("command_network_deny", "CommandNetworkDeny"),
+    // Config file
+    ("config_injection", "ConfigInjection"),
+    ("config_suspicious_indicator", "ConfigSuspiciousIndicator"),
+    ("config_malformed", "ConfigMalformed"),
+    ("config_non_ascii", "ConfigNonAscii"),
+    ("config_invisible_unicode", "ConfigInvisibleUnicode"),
+    ("mcp_insecure_server", "McpInsecureServer"),
+    ("mcp_untrusted_server", "McpUntrustedServer"),
+    ("mcp_duplicate_server_name", "McpDuplicateServerName"),
+    ("mcp_overly_permissive", "McpOverlyPermissive"),
+    ("mcp_suspicious_args", "McpSuspiciousArgs"),
+    // Ecosystem
+    ("git_typosquat", "GitTyposquat"),
+    ("docker_untrusted_registry", "DockerUntrustedRegistry"),
+    ("pip_url_install", "PipUrlInstall"),
+    ("npm_url_install", "NpmUrlInstall"),
+    ("web3_rpc_endpoint", "Web3RpcEndpoint"),
+    ("web3_address_in_url", "Web3AddressInUrl"),
+    ("vet_not_configured", "VetNotConfigured"),
+    // Rendered content
+    ("hidden_css_content", "HiddenCssContent"),
+    ("hidden_color_content", "HiddenColorContent"),
+    ("hidden_html_attribute", "HiddenHtmlAttribute"),
+    ("markdown_comment", "MarkdownComment"),
+    ("html_comment", "HtmlComment"),
+    // Cloaking
+    ("server_cloaking", "ServerCloaking"),
+    // Clipboard
+    ("clipboard_hidden", "ClipboardHidden"),
+    // PDF
+    ("pdf_hidden_text", "PdfHiddenText"),
+    // Credential
+    ("credential_in_text", "CredentialInText"),
+    ("high_entropy_secret", "HighEntropySecret"),
+    ("private_key_exposed", "PrivateKeyExposed"),
+    // Policy
+    ("policy_blocklisted", "PolicyBlocklisted"),
+    // Custom
+    ("custom_rule_match", "CustomRuleMatch"),
+    // License/infrastructure
+    ("license_required", "LicenseRequired"),
+];
+
+const VALID_CATEGORIES: &[&str] = &[
+    "hostname",
+    "path",
+    "transport",
+    "terminal",
+    "command",
+    "code",
+    "environment",
+    "network",
+    "config",
+    "ecosystem",
+    "rendered",
+    "cloaking",
+    "clipboard",
+    "pdf",
+    "credential",
+    "policy",
+    "custom",
+    "license",
+];
+
+#[derive(Deserialize)]
+struct RuleExplanationsFile {
+    rule: Vec<RuleExplanationEntry>,
+}
+
+#[derive(Deserialize)]
+struct RuleExplanationEntry {
+    id: String,
+    title: String,
+    category: String,
+    severity_rationale: String,
+    description: String,
+    #[serde(default)]
+    examples_bad: Vec<String>,
+    #[serde(default)]
+    examples_good: Vec<String>,
+    false_positive_guidance: String,
+    remediation: String,
+    mitre_id: Option<String>,
+    #[serde(default)]
+    references: Vec<String>,
+}
+
+fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
+    let path = data_dir.join("rule_explanations.toml");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read rule_explanations.toml: {e}"));
+    let file: RuleExplanationsFile = toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse rule_explanations.toml: {e}"));
+
+    // Build lookup of expected IDs → PascalCase variant
+    let expected: std::collections::HashMap<&str, &str> = EXPECTED_RULES.iter().copied().collect();
+
+    // Validate: no duplicates
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &file.rule {
+        if !seen.insert(entry.id.clone()) {
+            panic!("rule_explanations.toml: duplicate id '{}'", entry.id);
+        }
+    }
+
+    // Validate: every entry has a valid id
+    for entry in &file.rule {
+        if !expected.contains_key(entry.id.as_str()) {
+            panic!(
+                "rule_explanations.toml: unknown id '{}' — not a RuleId variant",
+                entry.id
+            );
+        }
+    }
+
+    // Validate: every expected id is present
+    for (snake, _pascal) in EXPECTED_RULES {
+        if !seen.contains(*snake) {
+            panic!("rule_explanations.toml: missing entry for '{snake}'");
+        }
+    }
+
+    // Validate: categories
+    for entry in &file.rule {
+        if !VALID_CATEGORIES.contains(&entry.category.as_str()) {
+            panic!(
+                "rule_explanations.toml: invalid category '{}' for rule '{}' — \
+                 valid: {:?}",
+                entry.category, entry.id, VALID_CATEGORIES
+            );
+        }
+    }
+
+    // --- Generate code ---
+    let esc = |s: &str| esc_rust_str(s);
+
+    let mut code = String::new();
+    code.push_str(
+        "// Auto-generated from rule_explanations.toml — DO NOT EDIT.\n\
+         // Modify assets/data/rule_explanations.toml and rebuild.\n\n",
+    );
+
+    // Per-entry static arrays for slice fields
+    for entry in &file.rule {
+        let upper_id = entry.id.to_uppercase();
+        if !entry.examples_bad.is_empty() {
+            code.push_str(&format!(
+                "static RULE_{upper_id}_EXAMPLES_BAD: &[&str] = &[\n"
+            ));
+            for ex in &entry.examples_bad {
+                code.push_str(&format!("    \"{}\",\n", esc(ex)));
+            }
+            code.push_str("];\n");
+        }
+        if !entry.examples_good.is_empty() {
+            code.push_str(&format!(
+                "static RULE_{upper_id}_EXAMPLES_GOOD: &[&str] = &[\n"
+            ));
+            for ex in &entry.examples_good {
+                code.push_str(&format!("    \"{}\",\n", esc(ex)));
+            }
+            code.push_str("];\n");
+        }
+        if !entry.references.is_empty() {
+            code.push_str(&format!(
+                "static RULE_{upper_id}_REFERENCES: &[&str] = &[\n"
+            ));
+            for r in &entry.references {
+                code.push_str(&format!("    \"{}\",\n", esc(r)));
+            }
+            code.push_str("];\n");
+        }
+    }
+
+    // Main explanations array
+    code.push_str("\npub const RULE_EXPLANATIONS: &[RuleExplanation] = &[\n");
+    for entry in &file.rule {
+        let upper_id = entry.id.to_uppercase();
+        let mitre = match &entry.mitre_id {
+            Some(id) => format!("Some(\"{}\")", esc(id)),
+            None => "None".to_string(),
+        };
+        let bad = if entry.examples_bad.is_empty() {
+            "&[]".to_string()
+        } else {
+            format!("RULE_{upper_id}_EXAMPLES_BAD")
+        };
+        let good = if entry.examples_good.is_empty() {
+            "&[]".to_string()
+        } else {
+            format!("RULE_{upper_id}_EXAMPLES_GOOD")
+        };
+        let refs = if entry.references.is_empty() {
+            "&[]".to_string()
+        } else {
+            format!("RULE_{upper_id}_REFERENCES")
+        };
+        code.push_str(&format!(
+            "    RuleExplanation {{\n\
+             \x20       id: \"{}\",\n\
+             \x20       title: \"{}\",\n\
+             \x20       category: \"{}\",\n\
+             \x20       severity_rationale: \"{}\",\n\
+             \x20       description: \"{}\",\n\
+             \x20       examples_bad: {bad},\n\
+             \x20       examples_good: {good},\n\
+             \x20       false_positive_guidance: \"{}\",\n\
+             \x20       remediation: \"{}\",\n\
+             \x20       mitre_id: {mitre},\n\
+             \x20       references: {refs},\n\
+             \x20   }},\n",
+            esc(&entry.id),
+            esc(&entry.title),
+            esc(&entry.category),
+            esc(&entry.severity_rationale),
+            esc(&entry.description),
+            esc(&entry.false_positive_guidance),
+            esc(&entry.remediation),
+        ));
+    }
+    code.push_str("];\n");
+
+    // MITRE ATT&CK match function over RuleId enum
+    code.push_str(
+        "\n/// MITRE ATT&CK lookup generated from rule_explanations.toml.\n\
+         /// Single source of truth — replaces the hand-written match in engine.rs.\n\
+         pub fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {\n\
+         \x20   use crate::verdict::RuleId;\n\
+         \x20   match rule_id {\n",
+    );
+    for entry in &file.rule {
+        if let Some(mitre) = &entry.mitre_id {
+            let pascal = expected
+                .get(entry.id.as_str())
+                .unwrap_or_else(|| panic!("no PascalCase for '{}'", entry.id));
+            code.push_str(&format!(
+                "        RuleId::{pascal} => Some(\"{}\"),\n",
+                esc(mitre)
+            ));
+        }
+    }
+    code.push_str("        _ => None,\n    }\n}\n");
+
+    let out_path = Path::new(out_dir).join("rule_explanations_gen.rs");
     fs::write(&out_path, code).unwrap();
 }

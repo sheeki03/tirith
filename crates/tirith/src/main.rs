@@ -16,6 +16,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage the tirith background daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
     /// Check a command for URL security issues before execution
     Check {
         /// Shell type for tokenization
@@ -38,6 +44,14 @@ enum Commands {
         /// Used by shell hooks for the approval workflow.
         #[arg(long)]
         approval_check: bool,
+
+        /// Require acknowledgement for warnings (overrides policy)
+        #[arg(long)]
+        strict_warn: bool,
+
+        /// Skip daemon and run analysis locally
+        #[arg(long)]
+        no_daemon: bool,
 
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -106,6 +120,25 @@ enum Commands {
         json: bool,
     },
 
+    /// Show documentation for a detection rule
+    Explain {
+        /// Rule ID to explain (e.g., pipe_to_interpreter)
+        #[arg(long, conflicts_with = "list")]
+        rule: Option<String>,
+
+        /// List all rules, optionally filtered by category
+        #[arg(long, conflicts_with = "rule")]
+        list: bool,
+
+        /// Filter --list by category (hostname, path, transport, terminal, command, etc.)
+        #[arg(long, requires = "list")]
+        category: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Explain the last triggered rule
     Why {
         /// Output as JSON
@@ -164,6 +197,18 @@ enum Commands {
         /// Patterns to ignore
         #[arg(long)]
         ignore: Vec<String>,
+
+        /// Include only files matching these patterns
+        #[arg(long)]
+        include: Vec<String>,
+
+        /// Exclude files matching these patterns (same as --ignore)
+        #[arg(long)]
+        exclude: Vec<String>,
+
+        /// Load a named scan profile from policy
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// Check a URL for server-side cloaking (different content for bots vs browsers)
@@ -213,6 +258,12 @@ enum Commands {
         force: bool,
     },
 
+    /// Manage security policies
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+
     /// Audit log management: export, stats, compliance reports (Team)
     Audit {
         #[command(subcommand)]
@@ -242,6 +293,12 @@ enum Commands {
         /// Remove persistent bash safe-mode flag (re-enables enter mode)
         #[arg(long, conflicts_with = "json")]
         reset_bash_safe_mode: bool,
+        /// Auto-fix detected issues
+        #[arg(long, conflicts_with = "json")]
+        fix: bool,
+        /// Auto-approve all fixes (no prompting)
+        #[arg(long, requires = "fix")]
+        yes: bool,
     },
 
     /// Generate shell completions
@@ -390,6 +447,50 @@ enum GatewayAction {
     },
 }
 
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Generate a starter policy file
+    Init {
+        /// Overwrite existing policy file
+        #[arg(long)]
+        force: bool,
+        /// Generate minimal template (default: full)
+        #[arg(long)]
+        minimal: bool,
+    },
+    /// Validate a policy file for errors
+    Validate {
+        /// Path to policy file (default: auto-discover)
+        #[arg(long)]
+        path: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test a command or file against the current policy
+    Test {
+        /// Command to test
+        #[arg(conflicts_with = "file")]
+        command: Option<String>,
+        /// File to test
+        #[arg(long, conflicts_with = "command")]
+        file: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon in the foreground
+    Start,
+    /// Stop a running daemon
+    Stop,
+    /// Check if daemon is running and measure latency
+    Status,
+}
+
 fn main() {
     // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
     #[cfg(unix)]
@@ -400,12 +501,20 @@ fn main() {
     let cli = Cli::parse();
 
     let exit_code = match cli.command {
+        Commands::Daemon { action } => match action {
+            DaemonAction::Start => cli::daemon::start(),
+            DaemonAction::Stop => cli::daemon::stop(),
+            DaemonAction::Status => cli::daemon::status(),
+        },
+
         Commands::Check {
             shell,
             json,
             non_interactive,
             interactive,
             approval_check,
+            strict_warn,
+            no_daemon,
             cmd,
         } => cli::check::run(
             &cmd.join(" "),
@@ -414,6 +523,8 @@ fn main() {
             non_interactive,
             interactive,
             approval_check,
+            strict_warn,
+            no_daemon,
         ),
 
         Commands::Paste {
@@ -436,6 +547,13 @@ fn main() {
 
         Commands::Diff { url, json } => cli::diff::run(&url, json),
 
+        Commands::Explain {
+            rule,
+            list,
+            category,
+            json,
+        } => cli::explain::run(rule.as_deref(), list, category.as_deref(), json),
+
         Commands::Why { json } => cli::why::run(json),
 
         Commands::Scan {
@@ -447,6 +565,9 @@ fn main() {
             json,
             sarif,
             ignore,
+            include,
+            exclude,
+            profile,
         } => cli::scan::run(
             path.as_deref(),
             file.as_deref(),
@@ -456,6 +577,9 @@ fn main() {
             json,
             sarif,
             &ignore,
+            &include,
+            &exclude,
+            profile.as_deref(),
         ),
 
         #[cfg(unix)]
@@ -487,6 +611,16 @@ fn main() {
             dry_run,
             force,
         ),
+
+        Commands::Policy { action } => match action {
+            PolicyAction::Init { force, minimal } => cli::policy::init(force, minimal),
+            PolicyAction::Validate { path, json } => cli::policy::validate(path.as_deref(), json),
+            PolicyAction::Test {
+                command,
+                file,
+                json,
+            } => cli::policy::test(command.as_deref(), file.as_deref(), json),
+        },
 
         Commands::Audit { action } => match action {
             AuditAction::Export {
@@ -541,7 +675,9 @@ fn main() {
         Commands::Doctor {
             json,
             reset_bash_safe_mode,
-        } => cli::doctor::run(json, reset_bash_safe_mode),
+            fix,
+            yes,
+        } => cli::doctor::run(json, reset_bash_safe_mode, fix, yes),
 
         Commands::Completions { shell } => cli::completions::run(shell),
 

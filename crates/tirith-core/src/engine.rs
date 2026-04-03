@@ -390,6 +390,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_variation_selectors
                 || scan.has_invisible_math_operators
                 || scan.has_invisible_whitespace
+                || scan.has_hangul_fillers
+                || scan.has_confusable_text
         } else {
             false
         }
@@ -409,6 +411,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
             || scan.has_variation_selectors
             || scan.has_invisible_math_operators
             || scan.has_invisible_whitespace
+            || scan.has_hangul_fillers
+            || scan.has_confusable_text
     } else {
         false
     };
@@ -565,6 +569,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 || scan.has_variation_selectors
                 || scan.has_invisible_math_operators
                 || scan.has_invisible_whitespace
+                || scan.has_hangul_fillers
+                || scan.has_confusable_text
             {
                 let byte_findings = crate::rules::terminal::check_bytes(byte_input);
                 // Only keep invisible-char findings for exec context
@@ -577,6 +583,8 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                             | crate::verdict::RuleId::InvisibleMathOperator
                             | crate::verdict::RuleId::VariationSelector
                             | crate::verdict::RuleId::InvisibleWhitespace
+                            | crate::verdict::RuleId::HangulFiller
+                            | crate::verdict::RuleId::ConfusableText
                     )
                 }));
             }
@@ -737,6 +745,11 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
         },
     );
     verdict.bypass_requested = bypass_requested;
+    verdict.bypass_available = if ctx.interactive {
+        policy.allow_bypass_env
+    } else {
+        policy.allow_bypass_env_noninteractive
+    };
     verdict.interactive_detected = ctx.interactive;
     verdict.policy_path_used = policy.path.clone();
     verdict.urls_extracted_count = Some(extracted.len());
@@ -883,76 +896,13 @@ fn evidence_summary(evidence: &[crate::verdict::Evidence]) -> String {
     }
 }
 
-/// MITRE ATT&CK technique mapping for built-in rules.
-fn mitre_id_for_rule(rule_id: crate::verdict::RuleId) -> Option<&'static str> {
-    use crate::verdict::RuleId;
-    match rule_id {
-        // Execution
-        RuleId::PipeToInterpreter
-        | RuleId::CurlPipeShell
-        | RuleId::WgetPipeShell
-        | RuleId::HttpiePipeShell
-        | RuleId::XhPipeShell => Some("T1059.004"), // Command and Scripting Interpreter: Unix Shell
-
-        // Persistence
-        RuleId::DotfileOverwrite => Some("T1546.004"), // Event Triggered Execution: Unix Shell Config
-
-        // Defense Evasion
-        RuleId::BidiControls
-        | RuleId::UnicodeTags
-        | RuleId::ZeroWidthChars
-        | RuleId::InvisibleMathOperator
-        | RuleId::VariationSelector
-        | RuleId::InvisibleWhitespace => {
-            Some("T1036.005") // Masquerading: Match Legitimate Name or Location
-        }
-        RuleId::HiddenMultiline | RuleId::AnsiEscapes | RuleId::ControlChars => Some("T1036.005"),
-
-        // Hijack Execution Flow
-        RuleId::CodeInjectionEnv => Some("T1574.006"), // Hijack Execution Flow: Dynamic Linker Hijacking
-        RuleId::InterpreterHijackEnv => Some("T1574.007"), // Path Interception by PATH
-        RuleId::ShellInjectionEnv => Some("T1546.004"), // Shell Config Modification
-
-        // Credential Access
-        RuleId::CredentialInText | RuleId::HighEntropySecret => Some("T1552"), // Unsecured Credentials
-        RuleId::PrivateKeyExposed => Some("T1552.004"),                        // Private Keys
-        RuleId::MetadataEndpoint => Some("T1552.005"), // Unsecured Credentials: Cloud Instance Metadata
-        RuleId::SensitiveEnvExport | RuleId::CredentialFileSweep => Some("T1552.001"), // Credentials In Files
-        RuleId::ProcMemAccess => Some("T1003.007"), // OS Credential Dumping: Proc Filesystem
-        RuleId::DockerRemotePrivEsc => Some("T1611"), // Escape to Host
-
-        // Supply Chain
-        RuleId::ConfigInjection => Some("T1195.001"), // Supply Chain Compromise: Dev Tools
-        RuleId::McpInsecureServer | RuleId::McpSuspiciousArgs => Some("T1195.002"), // Compromise Software Supply Chain
-        RuleId::GitTyposquat => Some("T1195.001"),
-        RuleId::DockerUntrustedRegistry => Some("T1195.002"),
-
-        // Discovery / Lateral Movement
-        RuleId::PrivateNetworkAccess => Some("T1046"), // Network Service Discovery
-        RuleId::ServerCloaking => Some("T1036"),       // Masquerading
-
-        // Collection
-        RuleId::ArchiveExtract => Some("T1560.001"), // Archive Collected Data: Archive via Utility
-
-        // Exfiltration
-        RuleId::ProxyEnvSet => Some("T1090.001"), // Proxy: Internal Proxy
-        RuleId::DataExfiltration => Some("T1048.003"), // Exfiltration Over Unencrypted Non-C2 Protocol
-        RuleId::SuspiciousCodeExfiltration => Some("T1041"), // Exfiltration Over C2 Channel
-
-        // Command Obfuscation
-        RuleId::Base64DecodeExecute => Some("T1027.010"), // Command Obfuscation
-        RuleId::ObfuscatedPayload => Some("T1027"),       // Obfuscated Files or Information
-        RuleId::DynamicCodeExecution => Some("T1059"),    // Command and Scripting Interpreter
-
-        _ => None,
-    }
-}
-
 /// Team enrichment: MITRE ATT&CK classification.
+/// Uses the generated `mitre_id_for_rule` from `rule_explanations.toml` (single source of truth).
 fn enrich_team(findings: &mut [Finding]) {
     for finding in findings.iter_mut() {
         if finding.mitre_id.is_none() {
-            finding.mitre_id = mitre_id_for_rule(finding.rule_id).map(String::from);
+            finding.mitre_id =
+                crate::rule_explanations::mitre_id_for_rule(finding.rule_id).map(String::from);
         }
     }
 }
@@ -999,7 +949,8 @@ mod tests {
 
         let findings = vec![
             Finding {
-                rule_id: RuleId::VariationSelector,
+                // Synthetic Info finding — VariationSelector is now Medium
+                rule_id: RuleId::NonStandardPort,
                 severity: Severity::Info,
                 title: "info finding".into(),
                 description: String::new(),
