@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A named scan profile for reusable filter configurations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanProfile {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub fail_on: Option<String>,
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
 use crate::verdict::{RuleId, Severity};
 
 /// Try both `.yaml` and `.yml` extensions in a directory.
@@ -91,6 +104,10 @@ pub struct Policy {
     /// built-in patterns when redacting commands in audit logs and webhooks.
     #[serde(default)]
     pub dlp_custom_patterns: Vec<String>,
+
+    /// Require explicit acknowledgement for warn findings in interactive mode.
+    #[serde(default)]
+    pub strict_warn: bool,
 
     // --- Policy server (Phase 27, Team) ---
     /// URL of the centralized policy server (e.g., "https://policy.example.com").
@@ -182,6 +199,9 @@ pub struct ScanPolicyConfig {
     /// Severity threshold for CI failure (default: "critical").
     #[serde(default)]
     pub fail_on: Option<String>,
+    /// Named scan profiles with preset include/exclude/fail_on.
+    #[serde(default)]
+    pub profiles: HashMap<String, ScanProfile>,
 }
 
 /// Per-rule allowlist scoping.
@@ -251,6 +271,7 @@ impl Default for Policy {
             allowlist_rules: Vec::new(),
             custom_rules: Vec::new(),
             dlp_custom_patterns: Vec::new(),
+            strict_warn: false,
             policy_server_url: None,
             policy_server_api_key: None,
             policy_fetch_fail_mode: None,
@@ -262,33 +283,10 @@ impl Default for Policy {
 impl Policy {
     /// Discover and load partial policy (just bypass + fail_mode fields).
     /// Used in Tier 2 for fast bypass resolution.
+    /// Uses the same resolution order as full discovery (TIRITH_POLICY_ROOT,
+    /// walk-up, user-level) so bypass settings are consistent.
     pub fn discover_partial(cwd: Option<&str>) -> Self {
-        match discover_policy_path(cwd) {
-            Some(path) => match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_yaml::from_str::<Policy>(&content) {
-                    Ok(mut p) => {
-                        p.path = Some(path.display().to_string());
-                        p
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "tirith: warning: failed to parse policy at {}: {e}",
-                            path.display()
-                        );
-                        // Parse error: use fail_mode default behavior
-                        Policy::default()
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "tirith: warning: cannot read policy at {}: {e}",
-                        path.display()
-                    );
-                    Policy::default()
-                }
-            },
-            None => Policy::default(),
-        }
+        Self::discover_local(cwd)
     }
 
     /// Discover and load full policy.
@@ -598,7 +596,7 @@ fn domain_matches(host: &str, pattern: &str) -> bool {
     host == pattern || host.ends_with(&format!(".{pattern}"))
 }
 
-fn allowlist_pattern_matches(pattern: &str, url: &str) -> bool {
+pub fn allowlist_pattern_matches(pattern: &str, url: &str) -> bool {
     let p = pattern.to_lowercase();
     if p.is_empty() {
         return false;
@@ -642,7 +640,7 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Find the repository root (directory containing .git).
-fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
+pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
     let start = cwd
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())?;
