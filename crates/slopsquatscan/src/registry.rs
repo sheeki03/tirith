@@ -44,342 +44,344 @@ fn days_since_epoch(epoch: i64) -> i64 {
     (Utc::now().timestamp() - epoch) / 86400
 }
 
+fn check_npm_package(client: &Client, pkg: &str) -> PackageResult {
+    let resp = client
+        .get(format!("https://registry.npmjs.org/{pkg}"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send();
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => {
+            return PackageResult {
+                registry: "npm",
+                name: pkg.to_string(),
+                status: PackageStatus::Suspicious {
+                    reason: "registry unreachable".into(),
+                },
+            };
+        }
+    };
+
+    let body: Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => {
+            return PackageResult {
+                registry: "npm",
+                name: pkg.to_string(),
+                status: PackageStatus::Warning {
+                    reason: "failed to parse registry response".into(),
+                },
+            };
+        }
+    };
+
+    if body.get("error").is_some() {
+        return PackageResult {
+            registry: "npm",
+            name: pkg.to_string(),
+            status: PackageStatus::Suspicious {
+                reason: "NOT FOUND on npm registry".into(),
+            },
+        };
+    }
+
+    // Check age
+    if let Some(created) = body.pointer("/time/created").and_then(|v| v.as_str()) {
+        if let Some(age) = days_since_iso(created) {
+            if age < DAYS_NEW_THRESHOLD {
+                return PackageResult {
+                    registry: "npm",
+                    name: pkg.to_string(),
+                    status: PackageStatus::Warning {
+                        reason: format!("created {age}d ago"),
+                    },
+                };
+            }
+        }
+    }
+
+    // Check weekly downloads
+    let weekly = client
+        .get(format!(
+            "https://api.npmjs.org/downloads/point/last-week/{pkg}"
+        ))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<Value>().ok())
+        .and_then(|v| v.get("downloads")?.as_u64())
+        .unwrap_or(0);
+
+    if weekly < NPM_WEEKLY_THRESHOLD {
+        return PackageResult {
+            registry: "npm",
+            name: pkg.to_string(),
+            status: PackageStatus::Warning {
+                reason: format!("only {weekly} downloads/week"),
+            },
+        };
+    }
+
+    PackageResult {
+        registry: "npm",
+        name: pkg.to_string(),
+        status: PackageStatus::Clean {
+            detail: format!("{weekly} dl/week"),
+        },
+    }
+}
+
+fn check_pip_package(client: &Client, pkg: &str) -> PackageResult {
+    let resp = client
+        .get(format!("https://pypi.org/pypi/{pkg}/json"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send();
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => {
+            return PackageResult {
+                registry: "pip",
+                name: pkg.to_string(),
+                status: PackageStatus::Suspicious {
+                    reason: "registry unreachable".into(),
+                },
+            };
+        }
+    };
+
+    if resp.status() == 404 {
+        return PackageResult {
+            registry: "pip",
+            name: pkg.to_string(),
+            status: PackageStatus::Suspicious {
+                reason: "NOT FOUND on PyPI".into(),
+            },
+        };
+    }
+
+    let body: Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => {
+            return PackageResult {
+                registry: "pip",
+                name: pkg.to_string(),
+                status: PackageStatus::Warning {
+                    reason: "failed to parse registry response".into(),
+                },
+            };
+        }
+    };
+
+    // Check age — find earliest upload_time across all releases
+    if let Some(releases) = body.get("releases").and_then(|r| r.as_object()) {
+        let earliest = releases
+            .values()
+            .filter_map(|files| files.as_array())
+            .flatten()
+            .filter_map(|f| f.get("upload_time").and_then(|t| t.as_str()))
+            .min();
+        if let Some(upload) = earliest {
+            if let Some(age) = days_since_iso(upload) {
+                if age < DAYS_NEW_THRESHOLD {
+                    return PackageResult {
+                        registry: "pip",
+                        name: pkg.to_string(),
+                        status: PackageStatus::Warning {
+                            reason: format!("first upload {age}d ago"),
+                        },
+                    };
+                }
+            }
+        }
+    }
+
+    // Check weekly downloads via pypistats
+    let weekly = client
+        .get(format!("https://pypistats.org/api/packages/{pkg}/recent"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<Value>().ok())
+        .and_then(|v| v.pointer("/data/last_week")?.as_u64())
+        .unwrap_or(0);
+
+    if weekly < PYPI_WEEKLY_THRESHOLD {
+        return PackageResult {
+            registry: "pip",
+            name: pkg.to_string(),
+            status: PackageStatus::Warning {
+                reason: format!("only {weekly} downloads/week"),
+            },
+        };
+    }
+
+    PackageResult {
+        registry: "pip",
+        name: pkg.to_string(),
+        status: PackageStatus::Clean {
+            detail: format!("{weekly} dl/week"),
+        },
+    }
+}
+
+fn check_aur_package(client: &Client, pkg: &str) -> PackageResult {
+    let resp = client
+        .get(format!("https://aur.archlinux.org/rpc/v5/info?arg[]={pkg}"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send();
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => {
+            return PackageResult {
+                registry: "aur",
+                name: pkg.to_string(),
+                status: PackageStatus::Suspicious {
+                    reason: "AUR unreachable".into(),
+                },
+            };
+        }
+    };
+
+    let body: Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => {
+            return PackageResult {
+                registry: "aur",
+                name: pkg.to_string(),
+                status: PackageStatus::Warning {
+                    reason: "failed to parse registry response".into(),
+                },
+            };
+        }
+    };
+
+    let count = body
+        .get("resultcount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if count == 0 {
+        return PackageResult {
+            registry: "aur",
+            name: pkg.to_string(),
+            status: PackageStatus::Suspicious {
+                reason: "NOT FOUND on AUR".into(),
+            },
+        };
+    }
+
+    let votes = body
+        .pointer("/results/0/NumVotes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let first_submitted = body
+        .pointer("/results/0/FirstSubmitted")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    if first_submitted > 0 {
+        let age = days_since_epoch(first_submitted);
+        if age < DAYS_NEW_THRESHOLD {
+            return PackageResult {
+                registry: "aur",
+                name: pkg.to_string(),
+                status: PackageStatus::Warning {
+                    reason: format!("submitted {age}d ago, {votes} votes"),
+                },
+            };
+        }
+    }
+
+    if votes < AUR_VOTES_THRESHOLD {
+        return PackageResult {
+            registry: "aur",
+            name: pkg.to_string(),
+            status: PackageStatus::Warning {
+                reason: format!("only {votes} AUR votes"),
+            },
+        };
+    }
+
+    PackageResult {
+        registry: "aur",
+        name: pkg.to_string(),
+        status: PackageStatus::Clean {
+            detail: format!("{votes} votes"),
+        },
+    }
+}
+
 pub fn scan_npm(client: &Client) -> Vec<PackageResult> {
-    let mut results = Vec::new();
-
-    let output = std::process::Command::new("npm")
+    let output = match std::process::Command::new("npm")
         .args(["list", "-g", "--depth=0", "--json"])
-        .output();
-
-    let output = match output {
+        .output()
+    {
         Ok(o) => o,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
 
     let json: Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
 
     let deps = match json.get("dependencies").and_then(|d| d.as_object()) {
         Some(d) => d,
-        None => return results,
+        None => return Vec::new(),
     };
 
-    for pkg in deps.keys() {
-        if pkg == "npm" {
-            continue;
-        }
-
-        let resp = client
-            .get(format!("https://registry.npmjs.org/{pkg}"))
-            .timeout(std::time::Duration::from_secs(10))
-            .send();
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(_) => {
-                results.push(PackageResult {
-                    registry: "npm",
-                    name: pkg.clone(),
-                    status: PackageStatus::Suspicious {
-                        reason: "registry unreachable".into(),
-                    },
-                });
-                continue;
-            }
-        };
-
-        let body: Value = match resp.json() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if body.get("error").is_some() {
-            results.push(PackageResult {
-                registry: "npm",
-                name: pkg.clone(),
-                status: PackageStatus::Suspicious {
-                    reason: "NOT FOUND on npm registry".into(),
-                },
-            });
-            continue;
-        }
-
-        // Check age
-        if let Some(created) = body.pointer("/time/created").and_then(|v| v.as_str()) {
-            if let Some(age) = days_since_iso(created) {
-                if age < DAYS_NEW_THRESHOLD {
-                    results.push(PackageResult {
-                        registry: "npm",
-                        name: pkg.clone(),
-                        status: PackageStatus::Warning {
-                            reason: format!("created {age}d ago"),
-                        },
-                    });
-                    continue;
-                }
-            }
-        }
-
-        // Check weekly downloads
-        let weekly = client
-            .get(format!(
-                "https://api.npmjs.org/downloads/point/last-week/{pkg}"
-            ))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .ok()
-            .and_then(|r| r.json::<Value>().ok())
-            .and_then(|v| v.get("downloads")?.as_u64())
-            .unwrap_or(0);
-
-        if weekly < NPM_WEEKLY_THRESHOLD {
-            results.push(PackageResult {
-                registry: "npm",
-                name: pkg.clone(),
-                status: PackageStatus::Warning {
-                    reason: format!("only {weekly} downloads/week"),
-                },
-            });
-            continue;
-        }
-
-        results.push(PackageResult {
-            registry: "npm",
-            name: pkg.clone(),
-            status: PackageStatus::Clean {
-                detail: format!("{weekly} dl/week"),
-            },
-        });
-    }
-
-    results
+    deps.keys()
+        .filter(|pkg| pkg.as_str() != "npm")
+        .map(|pkg| check_npm_package(client, pkg))
+        .collect()
 }
 
 pub fn scan_pip(client: &Client) -> Vec<PackageResult> {
-    let mut results = Vec::new();
-
     let pip_cmd = if which("pip3") {
         "pip3"
     } else if which("pip") {
         "pip"
     } else {
-        return results;
+        return Vec::new();
     };
 
-    let output = std::process::Command::new(pip_cmd)
+    let output = match std::process::Command::new(pip_cmd)
         .args(["list", "--format=json"])
-        .output();
-
-    let output = match output {
+        .output()
+    {
         Ok(o) => o,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
 
     let pkgs: Vec<Value> = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
 
-    for entry in &pkgs {
-        let pkg = match entry.get("name").and_then(|n| n.as_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        let resp = client
-            .get(format!("https://pypi.org/pypi/{pkg}/json"))
-            .timeout(std::time::Duration::from_secs(10))
-            .send();
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(_) => {
-                results.push(PackageResult {
-                    registry: "pip",
-                    name: pkg.to_string(),
-                    status: PackageStatus::Suspicious {
-                        reason: "registry unreachable".into(),
-                    },
-                });
-                continue;
-            }
-        };
-
-        if resp.status() == 404 {
-            results.push(PackageResult {
-                registry: "pip",
-                name: pkg.to_string(),
-                status: PackageStatus::Suspicious {
-                    reason: "NOT FOUND on PyPI".into(),
-                },
-            });
-            continue;
-        }
-
-        let body: Value = match resp.json() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Check age — find earliest upload_time across all releases
-        if let Some(releases) = body.get("releases").and_then(|r| r.as_object()) {
-            let earliest = releases
-                .values()
-                .filter_map(|files| files.as_array())
-                .flatten()
-                .filter_map(|f| f.get("upload_time").and_then(|t| t.as_str()))
-                .min();
-            if let Some(upload) = earliest {
-                if let Some(age) = days_since_iso(upload) {
-                    if age < DAYS_NEW_THRESHOLD {
-                        results.push(PackageResult {
-                            registry: "pip",
-                            name: pkg.to_string(),
-                            status: PackageStatus::Warning {
-                                reason: format!("first upload {age}d ago"),
-                            },
-                        });
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Check weekly downloads via pypistats
-        let weekly = client
-            .get(format!("https://pypistats.org/api/packages/{pkg}/recent"))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .ok()
-            .and_then(|r| r.json::<Value>().ok())
-            .and_then(|v| v.pointer("/data/last_week")?.as_u64())
-            .unwrap_or(0);
-
-        if weekly < PYPI_WEEKLY_THRESHOLD {
-            results.push(PackageResult {
-                registry: "pip",
-                name: pkg.to_string(),
-                status: PackageStatus::Warning {
-                    reason: format!("only {weekly} downloads/week"),
-                },
-            });
-            continue;
-        }
-
-        results.push(PackageResult {
-            registry: "pip",
-            name: pkg.to_string(),
-            status: PackageStatus::Clean {
-                detail: format!("{weekly} dl/week"),
-            },
-        });
-    }
-
-    results
+    pkgs.iter()
+        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
+        .map(|pkg| check_pip_package(client, pkg))
+        .collect()
 }
 
 pub fn scan_aur(client: &Client) -> Vec<PackageResult> {
-    let mut results = Vec::new();
-
-    let output = std::process::Command::new("pacman").args(["-Qm"]).output();
-
-    let output = match output {
+    let output = match std::process::Command::new("pacman").args(["-Qm"]).output() {
         Ok(o) => o,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pkgs: Vec<&str> = stdout
+    let pkgs: Vec<String> = stdout
         .lines()
         .filter_map(|line| line.split_whitespace().next())
+        .map(|s| s.to_string())
         .collect();
 
-    for pkg in pkgs {
-        let resp = client
-            .get(format!("https://aur.archlinux.org/rpc/v5/info?arg[]={pkg}"))
-            .timeout(std::time::Duration::from_secs(10))
-            .send();
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(_) => {
-                results.push(PackageResult {
-                    registry: "aur",
-                    name: pkg.to_string(),
-                    status: PackageStatus::Suspicious {
-                        reason: "AUR unreachable".into(),
-                    },
-                });
-                continue;
-            }
-        };
-
-        let body: Value = match resp.json() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let count = body
-            .get("resultcount")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if count == 0 {
-            results.push(PackageResult {
-                registry: "aur",
-                name: pkg.to_string(),
-                status: PackageStatus::Suspicious {
-                    reason: "NOT FOUND on AUR".into(),
-                },
-            });
-            continue;
-        }
-
-        let votes = body
-            .pointer("/results/0/NumVotes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let first_submitted = body
-            .pointer("/results/0/FirstSubmitted")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        if first_submitted > 0 {
-            let age = days_since_epoch(first_submitted);
-            if age < DAYS_NEW_THRESHOLD {
-                results.push(PackageResult {
-                    registry: "aur",
-                    name: pkg.to_string(),
-                    status: PackageStatus::Warning {
-                        reason: format!("submitted {age}d ago, {votes} votes"),
-                    },
-                });
-                continue;
-            }
-        }
-
-        if votes < AUR_VOTES_THRESHOLD {
-            results.push(PackageResult {
-                registry: "aur",
-                name: pkg.to_string(),
-                status: PackageStatus::Warning {
-                    reason: format!("only {votes} AUR votes"),
-                },
-            });
-            continue;
-        }
-
-        results.push(PackageResult {
-            registry: "aur",
-            name: pkg.to_string(),
-            status: PackageStatus::Clean {
-                detail: format!("{votes} votes"),
-            },
-        });
-    }
-
-    results
+    pkgs.iter()
+        .map(|pkg| check_aur_package(client, pkg))
+        .collect()
 }
 
 fn which(cmd: &str) -> bool {
