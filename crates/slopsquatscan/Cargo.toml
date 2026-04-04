@@ -1,0 +1,19 @@
+[package]
+name = "slopsquatscan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scan installed packages for slopsquatting — hallucinated, typosquatted, or suspicious dependencies"
+repository = "https://github.com/sheeki03/tirith"
+
+[[bin]]
+name = "slopsquatscan"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
