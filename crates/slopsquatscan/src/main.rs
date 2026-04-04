@@ -59,29 +59,50 @@ fn main() {
     let mut all_results: Vec<PackageResult> = Vec::new();
 
     if scan_npm {
-        if !cli.json { eprintln!("\n{}npm (global){}", output::BOLD, output::RST); }
+        if !cli.json {
+            eprintln!("\n{}npm (global){}", output::BOLD, output::RST);
+        }
         let results = registry::scan_npm(&client);
-        if !cli.json { print_results(&results, cli.verbose); }
+        if !cli.json {
+            print_results(&results, cli.verbose);
+        }
         all_results.extend(results);
     }
 
     if scan_pip {
-        if !cli.json { eprintln!("\n{}pip{}", output::BOLD, output::RST); }
+        if !cli.json {
+            eprintln!("\n{}pip{}", output::BOLD, output::RST);
+        }
         let results = registry::scan_pip(&client);
-        if !cli.json { print_results(&results, cli.verbose); }
+        if !cli.json {
+            print_results(&results, cli.verbose);
+        }
         all_results.extend(results);
     }
 
     if scan_aur {
-        if !cli.json { eprintln!("\n{}AUR (foreign packages){}", output::BOLD, output::RST); }
+        if !cli.json {
+            eprintln!("\n{}AUR (foreign packages){}", output::BOLD, output::RST);
+        }
         let results = registry::scan_aur(&client);
-        if !cli.json { print_results(&results, cli.verbose); }
+        if !cli.json {
+            print_results(&results, cli.verbose);
+        }
         all_results.extend(results);
     }
 
-    let clean = all_results.iter().filter(|r| matches!(r.status, PackageStatus::Clean { .. })).count();
-    let warnings = all_results.iter().filter(|r| matches!(r.status, PackageStatus::Warning { .. })).count();
-    let suspicious: Vec<_> = all_results.iter().filter(|r| matches!(r.status, PackageStatus::Suspicious { .. })).collect();
+    let clean = all_results
+        .iter()
+        .filter(|r| matches!(r.status, PackageStatus::Clean { .. }))
+        .count();
+    let warnings = all_results
+        .iter()
+        .filter(|r| matches!(r.status, PackageStatus::Warning { .. }))
+        .count();
+    let suspicious: Vec<_> = all_results
+        .iter()
+        .filter(|r| matches!(r.status, PackageStatus::Suspicious { .. }))
+        .collect();
 
     if cli.json {
         print_json(&all_results, clean, warnings, suspicious.len());
@@ -89,20 +110,40 @@ fn main() {
         eprintln!("\n{}Summary{}", output::BOLD, output::RST);
         eprintln!("  {}Clean:{}      {clean}", output::GRN, output::RST);
         eprintln!("  {}Warnings:{}   {warnings}", output::YLW, output::RST);
-        eprintln!("  {}Suspicious:{} {}", output::RED, output::RST, suspicious.len());
+        eprintln!(
+            "  {}Suspicious:{} {}",
+            output::RED,
+            output::RST,
+            suspicious.len()
+        );
 
         if !suspicious.is_empty() {
             eprintln!();
-            eprintln!("{}{}Action required:{} these packages were NOT FOUND on their registry:", output::RED, output::BOLD, output::RST);
+            eprintln!(
+                "{}{}Action required:{} these packages were NOT FOUND on their registry:",
+                output::RED,
+                output::BOLD,
+                output::RST
+            );
             for s in &suspicious {
-                eprintln!("  {}→{} {}:{}", output::RED, output::RST, s.registry, s.name);
+                eprintln!(
+                    "  {}→{} {}:{}",
+                    output::RED,
+                    output::RST,
+                    s.registry,
+                    s.name
+                );
             }
             eprintln!();
             eprintln!("This could mean: typosquatted name, removed package, or private package.");
             eprintln!("Investigate before continuing to use them.");
         } else if warnings > 0 {
             eprintln!();
-            eprintln!("{}Some packages have low popularity or are very new — worth a quick check.{}", output::YLW, output::RST);
+            eprintln!(
+                "{}Some packages have low popularity or are very new — worth a quick check.{}",
+                output::YLW,
+                output::RST
+            );
         } else {
             eprintln!("\n{}All clear.{}", output::GRN, output::RST);
         }
@@ -147,22 +188,29 @@ fn print_json(results: &[PackageResult], clean: usize, warnings: usize, suspicio
         detail: String,
     }
 
-    let packages: Vec<JsonPackage> = results.iter().map(|r| {
-        let (status, detail) = match &r.status {
-            PackageStatus::Clean { detail } => ("clean", detail.clone()),
-            PackageStatus::Warning { reason } => ("warning", reason.clone()),
-            PackageStatus::Suspicious { reason } => ("suspicious", reason.clone()),
-        };
-        JsonPackage {
-            registry: r.registry.to_string(),
-            name: r.name.clone(),
-            status: status.to_string(),
-            detail,
-        }
-    }).collect();
+    let packages: Vec<JsonPackage> = results
+        .iter()
+        .map(|r| {
+            let (status, detail) = match &r.status {
+                PackageStatus::Clean { detail } => ("clean", detail.clone()),
+                PackageStatus::Warning { reason } => ("warning", reason.clone()),
+                PackageStatus::Suspicious { reason } => ("suspicious", reason.clone()),
+            };
+            JsonPackage {
+                registry: r.registry.to_string(),
+                name: r.name.clone(),
+                status: status.to_string(),
+                detail,
+            }
+        })
+        .collect();
 
     let out = JsonOutput {
-        summary: JsonSummary { clean, warnings, suspicious },
+        summary: JsonSummary {
+            clean,
+            warnings,
+            suspicious,
+        },
         packages,
     };
 
