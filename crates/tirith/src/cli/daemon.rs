@@ -80,6 +80,12 @@ pub struct DaemonResponse {
     pub urls_extracted_count: Option<usize>,
     #[serde(default)]
     pub tier_reached: u8,
+    /// All findings AFTER enrichment but BEFORE paranoia filtering.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_findings: Option<Vec<Finding>>,
+    /// Action AFTER enrichment but BEFORE paranoia.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_action: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +172,8 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         timings_ms: Default::default(),
         urls_extracted_count: None,
         tier_reached: 0,
+        raw_findings: None,
+        raw_action: None,
     };
 
     if req.command == "ping" {
@@ -216,6 +224,8 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
                 },
                 urls_extracted_count: None,
                 tier_reached: 2,
+                raw_findings: None,
+                raw_action: None,
             };
         }
     }
@@ -234,10 +244,6 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     };
 
     let mut verdict = engine::analyze(&ctx);
-
-    // Apply paranoia filter
-    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
-    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     // --- Network-aware enrichment (daemon-only, too slow for sync path) ---
     enrich_with_network_checks(&mut verdict.findings);
@@ -263,6 +269,14 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         verdict.action = new_action;
     }
 
+    // Snapshot raw findings/action AFTER enrichment but BEFORE paranoia filtering.
+    let raw_findings = Some(verdict.findings.clone());
+    let raw_action_str = Some(format!("{:?}", verdict.action));
+
+    // Apply paranoia filter
+    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+
     DaemonResponse {
         action: verdict.action,
         findings: verdict.findings,
@@ -274,6 +288,8 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         timings_ms: verdict.timings_ms,
         urls_extracted_count: verdict.urls_extracted_count,
         tier_reached: verdict.tier_reached,
+        raw_findings,
+        raw_action: raw_action_str,
     }
 }
 
@@ -479,6 +495,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 bypass_honored: false, bypass_available: false,
                                                 policy_path_used: None, timings_ms: Default::default(),
                                                 urls_extracted_count: None, tier_reached: 0,
+                                                raw_findings: None, raw_action: None,
                                             })
                                     }
                                     Err(e) => DaemonResponse {
@@ -487,6 +504,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         bypass_honored: false, bypass_available: false,
                                         policy_path_used: None, timings_ms: Default::default(),
                                         urls_extracted_count: None, tier_reached: 0,
+                                        raw_findings: None, raw_action: None,
                                     },
                                 };
 

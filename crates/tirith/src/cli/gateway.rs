@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCallResult};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::Action;
+use tirith_core::verdict::{Action, Finding};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -51,7 +52,7 @@ pub struct PolicyConfig {
 }
 
 fn default_warn_action() -> String {
-    "deny".to_string()
+    "forward".to_string()
 }
 fn default_fail_mode() -> String {
     "open".to_string()
@@ -104,19 +105,24 @@ impl CompiledConfig {
             });
         }
         validate_policy_values(&config.policy)?;
+        // Normalize "allow" → "forward" so downstream only checks == "deny"
+        let mut policy = config.policy;
+        if policy.warn_action == "allow" {
+            policy.warn_action = "forward".to_string();
+        }
         Ok(Self {
             guarded_tools: guarded,
-            policy: config.policy,
+            policy,
         })
     }
 }
 
 fn validate_policy_values(policy: &PolicyConfig) -> Result<(), String> {
     match policy.warn_action.as_str() {
-        "deny" | "forward" => {}
+        "deny" | "forward" | "allow" => {}
         other => {
             return Err(format!(
-                "invalid warn_action '{other}': must be \"deny\" or \"forward\""
+                "invalid warn_action '{other}': must be \"deny\", \"forward\", or \"allow\""
             ))
         }
     }
@@ -201,6 +207,12 @@ struct AuditEntry<'a> {
     elapsed_ms: f64,
     fail_mode_triggered: bool,
     timeout_triggered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_decision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_rule_ids: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -215,6 +227,37 @@ fn write_audit(
     fail_mode_triggered: bool,
     timeout_triggered: bool,
 ) {
+    write_audit_with_raw(
+        decision,
+        action_taken,
+        rule_ids,
+        highest_severity,
+        tool_name,
+        cmd_hash,
+        elapsed_ms,
+        fail_mode_triggered,
+        timeout_triggered,
+        None,
+        None,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_audit_with_raw(
+    decision: &str,
+    action_taken: &str,
+    rule_ids: &[String],
+    highest_severity: Option<&str>,
+    tool_name: &str,
+    cmd_hash: &str,
+    elapsed_ms: f64,
+    fail_mode_triggered: bool,
+    timeout_triggered: bool,
+    raw_decision: Option<&str>,
+    raw_rule_ids: Option<&[String]>,
+    session_id: Option<&str>,
+) {
     let entry = AuditEntry {
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         decision,
@@ -227,9 +270,16 @@ fn write_audit(
         elapsed_ms,
         fail_mode_triggered,
         timeout_triggered,
+        raw_decision,
+        raw_rule_ids,
+        session_id,
     };
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
+    match serde_json::to_string(&entry) {
+        Ok(json) => eprintln!("{json}"),
+        Err(e) => eprintln!(
+            "tirith gateway: audit serialization failed: {e} — decision={} tool={}",
+            entry.decision, entry.tool_name
+        ),
     }
 }
 
@@ -334,10 +384,18 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
     let config = Arc::new(config);
     let max_bytes = config.policy.max_message_bytes;
 
+    // Shared state: pending warn-forwarded request IDs → findings.
+    // Thread 1 inserts before forwarding; Thread 2 removes on response match.
+    // Key is serde_json::Value because JSON-RPC IDs can be string, number, or null.
+    #[allow(clippy::type_complexity)]
+    let pending_warns: Arc<Mutex<HashMap<Value, (Vec<Finding>, Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // Thread 2: upstream stdout reader
     // Sets shutdown on EOF so main thread exits even if Thread 1 is blocked on stdin.
     let tx2 = output_tx.clone();
     let sd2 = shutdown.clone();
+    let pw2 = Arc::clone(&pending_warns);
     let t_upstream = thread::spawn(move || {
         let mut reader = BufReader::new(child_stdout);
         loop {
@@ -346,7 +404,8 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
             }
             match read_bounded_line(&mut reader, max_bytes) {
                 Ok(Some(line)) => {
-                    if tx2.send(line).is_err() {
+                    let to_send = augment_if_pending(&line, &pw2).unwrap_or(line);
+                    if tx2.send(to_send).is_err() {
                         break;
                     }
                 }
@@ -386,6 +445,7 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
     let sd1 = shutdown.clone();
     let cd1 = client_done.clone();
     let cfg = config.clone();
+    let pw1 = Arc::clone(&pending_warns);
     let t_client = thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin.lock());
@@ -423,7 +483,9 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
                     // Non-object, non-array → forward raw bytes
                     forward(&mut upstream, &raw_line).err()
                 }
-                Ok(ref obj) => process_object(obj, &raw_line, &cfg, &mut upstream, &tx1).err(),
+                Ok(ref obj) => {
+                    process_object(obj, &raw_line, &cfg, &mut upstream, &tx1, &pw1).err()
+                }
             };
             if let Some(e) = write_err {
                 eprintln!("tirith gateway: upstream write failed: {e}");
@@ -437,6 +499,7 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
     // Main thread: output writer with recv_timeout for shutdown observability
     let sd_main = shutdown.clone();
     let mut stdout = io::stdout().lock();
+    let mut last_sweep = Instant::now();
     loop {
         match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
@@ -456,6 +519,15 @@ pub fn run_gateway(upstream_bin: &str, upstream_args: &[String], config_path: &s
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Periodically evict stale pending_warns entries (TTL 30s, sweep every 10s)
+        if last_sweep.elapsed() > Duration::from_secs(10) {
+            if let Ok(mut map) = pending_warns.lock() {
+                let cutoff = Instant::now() - Duration::from_secs(30);
+                map.retain(|_, (_, ts)| *ts > cutoff);
+            }
+            last_sweep = Instant::now();
         }
     }
     drop(stdout);
@@ -497,6 +569,7 @@ fn process_object(
     config: &CompiledConfig,
     upstream: &mut impl Write,
     output_tx: &mpsc::Sender<Vec<u8>>,
+    pending_warns: &Mutex<HashMap<Value, (Vec<Finding>, Instant)>>,
 ) -> io::Result<()> {
     match check_guarded(obj, config) {
         GuardedResult::NotGuarded => forward(upstream, raw_line),
@@ -506,7 +579,15 @@ fn process_object(
             tool_name,
             shell,
         } => handle_guarded_call(
-            id, &command, &tool_name, shell, raw_line, config, upstream, output_tx,
+            id,
+            &command,
+            &tool_name,
+            shell,
+            raw_line,
+            config,
+            upstream,
+            output_tx,
+            pending_warns,
         ),
         GuardedResult::GuardedNotification {
             command,
@@ -535,16 +616,20 @@ fn handle_guarded_call(
     config: &CompiledConfig,
     upstream: &mut impl Write,
     output_tx: &mpsc::Sender<Vec<u8>>,
+    pending_warns: &Mutex<HashMap<Value, (Vec<Finding>, Instant)>>,
 ) -> io::Result<()> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let hash = cmd_hash_prefix(command);
 
-    // Inline analysis with oneshot thread + timeout
+    // Inline analysis with oneshot thread + timeout.
+    // Channel carries (Verdict, Policy) so we reuse the engine's loaded policy
+    // instead of calling Policy::discover() a second time.
     let (tx, rx) = mpsc::channel();
     let cmd_owned = command.to_string();
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
+    let cwd_for_thread = cwd.clone();
     thread::spawn(move || {
         let ctx = AnalysisContext {
             input: cmd_owned,
@@ -552,31 +637,55 @@ fn handle_guarded_call(
             scan_context: ScanContext::Exec,
             raw_bytes: None,
             interactive: true,
-            cwd,
+            cwd: cwd_for_thread,
             file_path: None,
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
         };
-        let _ = tx.send(engine::analyze(&ctx));
+        let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });
 
     let timeout = Duration::from_millis(config.policy.timeout_ms);
     match rx.recv_timeout(timeout) {
-        Ok(verdict) => {
+        Ok((raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let should_deny = match verdict.action {
+
+            // Capture raw info before post-processing
+            let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
+            let raw_rule_ids_vec: Vec<String>;
+            let session_id = tirith_core::session::resolve_session_id();
+
+            let effective = if raw_verdict.bypass_honored {
+                raw_rule_ids_vec = vec![];
+                raw_verdict
+            } else {
+                raw_rule_ids_vec = raw_verdict
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_id.to_string())
+                    .collect();
+                tirith_core::escalation::post_process_verdict(
+                    &raw_verdict,
+                    &engine_policy,
+                    command,
+                    &session_id,
+                    tirith_core::escalation::CallerContext::Gateway,
+                )
+            };
+
+            let should_deny = match effective.action {
                 Action::Block => true,
                 Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
                 Action::Allow => false,
             };
 
-            let rule_ids: Vec<String> = verdict
+            let rule_ids: Vec<String> = effective
                 .findings
                 .iter()
                 .map(|f| f.rule_id.to_string())
                 .collect();
-            let max_sev = verdict
+            let max_sev = effective
                 .findings
                 .iter()
                 .map(|f| f.severity)
@@ -584,12 +693,12 @@ fn handle_guarded_call(
                 .map(|s| s.to_string());
 
             if should_deny {
-                let decision = if verdict.action == Action::Block {
+                let decision = if effective.action == Action::Block {
                     "block"
                 } else {
                     "warn"
                 };
-                write_audit(
+                write_audit_with_raw(
                     decision,
                     "denied",
                     &rule_ids,
@@ -599,16 +708,19 @@ fn handle_guarded_call(
                     elapsed,
                     false,
                     false,
+                    Some(&raw_decision_str),
+                    Some(&raw_rule_ids_vec),
+                    Some(&session_id),
                 );
-                let _ = output_tx.send(build_deny_response(id, &verdict, elapsed).into_bytes());
+                let _ = output_tx.send(build_deny_response(id, &effective, elapsed).into_bytes());
                 Ok(())
             } else {
-                let decision = if verdict.action == Action::Warn {
+                let decision = if effective.action == Action::Warn {
                     "warn"
                 } else {
                     "allow"
                 };
-                write_audit(
+                write_audit_with_raw(
                     decision,
                     "forwarded",
                     &rule_ids,
@@ -618,7 +730,31 @@ fn handle_guarded_call(
                     elapsed,
                     false,
                     false,
+                    Some(&raw_decision_str),
+                    Some(&raw_rule_ids_vec),
+                    Some(&session_id),
                 );
+
+                // For warn-forwarded requests with findings, insert into pending
+                // map BEFORE forward so Thread 2 can augment the upstream response.
+                // Insert before forward to prevent race: a fast upstream could
+                // return before the map entry exists, causing Thread 2 to miss it.
+                if !effective.findings.is_empty() {
+                    match pending_warns.lock() {
+                        Ok(mut map) => {
+                            map.insert(id, (effective.findings, Instant::now()));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "tirith gateway: pending_warns mutex poisoned on insert: {e}"
+                            );
+                        }
+                    }
+                }
+
+                // On forward failure, Thread 1 triggers shutdown (caller sets
+                // sd1=true and breaks). The pending map is cleaned up when all
+                // Arcs drop, so no explicit removal is needed on failure.
                 forward(upstream, raw_line)
             }
         }
@@ -716,6 +852,7 @@ fn handle_guarded_notification(
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
+    let cwd_for_thread = cwd.clone();
     thread::spawn(move || {
         let ctx = AnalysisContext {
             input: cmd_owned,
@@ -723,31 +860,54 @@ fn handle_guarded_notification(
             scan_context: ScanContext::Exec,
             raw_bytes: None,
             interactive: true,
-            cwd,
+            cwd: cwd_for_thread,
             file_path: None,
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
         };
-        let _ = tx.send(engine::analyze(&ctx));
+        let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });
 
     let timeout = Duration::from_millis(config.policy.timeout_ms);
     match rx.recv_timeout(timeout) {
-        Ok(verdict) => {
+        Ok((raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let should_deny = match verdict.action {
+
+            let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
+            let raw_rule_ids_vec: Vec<String>;
+            let session_id = tirith_core::session::resolve_session_id();
+
+            let effective = if raw_verdict.bypass_honored {
+                raw_rule_ids_vec = vec![];
+                raw_verdict
+            } else {
+                raw_rule_ids_vec = raw_verdict
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_id.to_string())
+                    .collect();
+                tirith_core::escalation::post_process_verdict(
+                    &raw_verdict,
+                    &engine_policy,
+                    command,
+                    &session_id,
+                    tirith_core::escalation::CallerContext::Gateway,
+                )
+            };
+
+            let should_deny = match effective.action {
                 Action::Block => true,
                 Action::Warn | Action::WarnAck => config.policy.warn_action == "deny",
                 Action::Allow => false,
             };
 
-            let rule_ids: Vec<String> = verdict
+            let rule_ids: Vec<String> = effective
                 .findings
                 .iter()
                 .map(|f| f.rule_id.to_string())
                 .collect();
-            let max_sev = verdict
+            let max_sev = effective
                 .findings
                 .iter()
                 .map(|f| f.severity)
@@ -755,12 +915,12 @@ fn handle_guarded_notification(
                 .map(|s| s.to_string());
 
             if should_deny {
-                let decision = if verdict.action == Action::Block {
+                let decision = if effective.action == Action::Block {
                     "block"
                 } else {
                     "warn"
                 };
-                write_audit(
+                write_audit_with_raw(
                     decision,
                     "dropped_notification",
                     &rule_ids,
@@ -770,15 +930,18 @@ fn handle_guarded_notification(
                     elapsed,
                     false,
                     false,
+                    Some(&raw_decision_str),
+                    Some(&raw_rule_ids_vec),
+                    Some(&session_id),
                 );
                 Ok(())
             } else {
-                let decision = if verdict.action == Action::Warn {
+                let decision = if effective.action == Action::Warn {
                     "warn"
                 } else {
                     "allow"
                 };
-                write_audit(
+                write_audit_with_raw(
                     decision,
                     "forwarded_notification",
                     &rule_ids,
@@ -788,24 +951,42 @@ fn handle_guarded_notification(
                     elapsed,
                     false,
                     false,
+                    Some(&raw_decision_str),
+                    Some(&raw_rule_ids_vec),
+                    Some(&session_id),
                 );
                 forward(upstream, raw_line)
             }
         }
         Err(_) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            write_audit(
-                "block",
-                "dropped_notification",
-                &[],
-                None,
-                tool_name,
-                &hash,
-                elapsed,
-                true,
-                true,
-            );
-            Ok(())
+            if config.policy.fail_mode == "open" {
+                write_audit(
+                    "allow",
+                    "forwarded_notification",
+                    &[],
+                    None,
+                    tool_name,
+                    &hash,
+                    elapsed,
+                    true,
+                    true,
+                );
+                forward(upstream, raw_line)
+            } else {
+                write_audit(
+                    "block",
+                    "dropped_notification",
+                    &[],
+                    None,
+                    tool_name,
+                    &hash,
+                    elapsed,
+                    true,
+                    true,
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -1109,6 +1290,79 @@ fn build_invalid_id_request_response() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Warn augmentation — inject findings into upstream responses
+// ---------------------------------------------------------------------------
+
+/// Check if an upstream response line matches a pending warn-forwarded request.
+/// If so, augment the response with findings and remove the entry from the map.
+/// Returns `Some(augmented_bytes)` on success, `None` to pass through original.
+fn augment_if_pending(
+    line: &[u8],
+    pending: &Mutex<HashMap<Value, (Vec<Finding>, Instant)>>,
+) -> Option<Vec<u8>> {
+    // Parse the upstream line to extract its id
+    let parsed: Value = serde_json::from_slice(line).ok()?;
+    let resp_id = parsed.get("id")?;
+
+    // Brief lock: check if this id is in the pending map and remove it
+    let findings = {
+        let mut map = match pending.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tirith gateway: pending_warns mutex poisoned: {e}");
+                return None;
+            }
+        };
+        let (findings, _ts) = map.remove(resp_id)?;
+        findings
+    };
+
+    // Augment outside the lock — no I/O while holding the mutex
+    build_warn_augmented_response(parsed, &findings)
+}
+
+/// Build an augmented upstream response with warn findings prepended to `result.content`.
+///
+/// Operates entirely on `serde_json::Value` — NOT typed MCP structs (they are
+/// Serialize-only and assume Tirith-shaped responses). The gateway is a generic
+/// proxy over arbitrary upstreams, so augmentation must be defensive:
+/// - Navigate to result.content (must exist and be an array)
+/// - Prepend a text content item with formatted findings
+/// - Re-serialize
+/// - Return None on any failure (caller forwards original bytes)
+fn build_warn_augmented_response(mut parsed: Value, findings: &[Finding]) -> Option<Vec<u8>> {
+    if findings.is_empty() {
+        return None;
+    }
+
+    // Navigate to result.content — must exist and be an array
+    let content = parsed
+        .get_mut("result")?
+        .get_mut("content")?
+        .as_array_mut()?;
+
+    // Format findings as a warning text block
+    let warning_lines: Vec<String> = findings
+        .iter()
+        .map(|f| format!("  [{}] {}: {}", f.severity, f.rule_id, f.title))
+        .collect();
+    let warning_text = format!(
+        "\u{26a0} Tirith warnings (non-blocking):\n{}",
+        warning_lines.join("\n")
+    );
+
+    // Prepend a text content item
+    let warning_item = serde_json::json!({
+        "type": "text",
+        "text": warning_text
+    });
+    content.insert(0, warning_item);
+
+    // Re-serialize
+    serde_json::to_vec(&parsed).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1304,7 +1558,7 @@ guarded_tools:
     fn test_config_defaults() {
         let yaml = "guarded_tools: []\n";
         let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.policy.warn_action, "deny");
+        assert_eq!(config.policy.warn_action, "forward");
         assert_eq!(config.policy.fail_mode, "open");
         assert_eq!(config.policy.timeout_ms, 10000);
         assert_eq!(config.policy.max_message_bytes, 1_048_576);
@@ -1664,6 +1918,21 @@ policy:
     }
 
     #[test]
+    fn test_config_allow_synonym_normalized_to_forward() {
+        let yaml = r#"
+guarded_tools: []
+policy:
+  warn_action: "allow"
+"#;
+        let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let compiled = CompiledConfig::from_config(config).unwrap();
+        assert_eq!(
+            compiled.policy.warn_action, "forward",
+            "\"allow\" should be normalized to \"forward\" at config load"
+        );
+    }
+
+    #[test]
     fn test_config_bad_fail_mode() {
         let yaml = r#"
 guarded_tools: []
@@ -1704,6 +1973,9 @@ policy:
             elapsed_ms: 2.3,
             fail_mode_triggered: false,
             timeout_triggered: false,
+            raw_decision: None,
+            raw_rule_ids: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: Value = serde_json::from_str(&json).unwrap();
@@ -1727,6 +1999,9 @@ policy:
             elapsed_ms: 0.0,
             fail_mode_triggered: false,
             timeout_triggered: false,
+            raw_decision: None,
+            raw_rule_ids: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: Value = serde_json::from_str(&json).unwrap();
@@ -1837,7 +2112,8 @@ policy:
         });
         let raw = serde_json::to_vec(&obj).unwrap();
         let mut writer = BrokenWriter;
-        let err = process_object(&obj, &raw, &config, &mut writer, &tx).unwrap_err();
+        let pw = Mutex::new(HashMap::new());
+        let err = process_object(&obj, &raw, &config, &mut writer, &tx, &pw).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
@@ -1853,7 +2129,8 @@ policy:
         });
         let raw = serde_json::to_vec(&obj).unwrap();
         let mut writer = Vec::new();
-        process_object(&obj, &raw, &config, &mut writer, &tx).unwrap();
+        let pw = Mutex::new(HashMap::new());
+        process_object(&obj, &raw, &config, &mut writer, &tx, &pw).unwrap();
         assert!(
             writer.is_empty(),
             "invalid guarded requests should not be forwarded"
@@ -1910,6 +2187,7 @@ policy:
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         };
 
         let resp = build_deny_response(Value::from(1), &verdict, 5.0);
@@ -1931,5 +2209,215 @@ policy:
         // Must NOT contain Debug-style formatting
         assert!(!text.contains("ShortenedUrl"));
         assert!(!text.contains("CurlPipeShell"));
+    }
+
+    // -- Warn augmentation tests --
+
+    fn test_finding(
+        rule_id: tirith_core::verdict::RuleId,
+        severity: tirith_core::verdict::Severity,
+        title: &str,
+    ) -> Finding {
+        Finding {
+            rule_id,
+            severity,
+            title: title.to_string(),
+            description: String::new(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn test_warn_augmented_response_prepends_findings() {
+        use tirith_core::verdict::{RuleId, Severity};
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "original tool output"}
+                ],
+                "isError": false
+            }
+        });
+
+        let findings = vec![test_finding(
+            RuleId::PlainHttpToSink,
+            Severity::Low,
+            "Plain HTTP URL",
+        )];
+
+        let augmented = build_warn_augmented_response(upstream, &findings).unwrap();
+        let v: Value = serde_json::from_slice(&augmented).unwrap();
+
+        let content = v["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "should have warning + original");
+
+        // First item is the prepended warning
+        let warning = &content[0];
+        assert_eq!(warning["type"], "text");
+        let warning_text = warning["text"].as_str().unwrap();
+        assert!(warning_text.contains("Tirith warnings"));
+        assert!(warning_text.contains("plain_http_to_sink"));
+        assert!(warning_text.contains("Plain HTTP URL"));
+
+        // Second item is the original
+        assert_eq!(content[1]["text"], "original tool output");
+    }
+
+    #[test]
+    fn test_warn_augmented_response_returns_none_for_no_content() {
+        // Response without result.content → None (pass-through)
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        });
+        let findings = vec![test_finding(
+            tirith_core::verdict::RuleId::PlainHttpToSink,
+            tirith_core::verdict::Severity::Low,
+            "test",
+        )];
+        assert!(build_warn_augmented_response(upstream, &findings).is_none());
+    }
+
+    #[test]
+    fn test_warn_augmented_response_returns_none_for_non_array_content() {
+        // result.content is a string, not array → None
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": "not an array"}
+        });
+        let findings = vec![test_finding(
+            tirith_core::verdict::RuleId::PlainHttpToSink,
+            tirith_core::verdict::Severity::Low,
+            "test",
+        )];
+        assert!(build_warn_augmented_response(upstream, &findings).is_none());
+    }
+
+    #[test]
+    fn test_warn_augmented_response_returns_none_for_empty_findings() {
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": []}
+        });
+        assert!(build_warn_augmented_response(upstream, &[]).is_none());
+    }
+
+    #[test]
+    fn test_warn_augmented_response_returns_none_for_error_response() {
+        // JSON-RPC error response (no result) → None
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32600, "message": "bad request"}
+        });
+        let findings = vec![test_finding(
+            tirith_core::verdict::RuleId::PlainHttpToSink,
+            tirith_core::verdict::Severity::Low,
+            "test",
+        )];
+        assert!(build_warn_augmented_response(upstream, &findings).is_none());
+    }
+
+    #[test]
+    fn test_augment_if_pending_matches_and_removes() {
+        use tirith_core::verdict::{RuleId, Severity};
+
+        let pending: Mutex<HashMap<Value, (Vec<Finding>, Instant)>> = Mutex::new(HashMap::new());
+        let id = Value::from(42);
+        let findings = vec![test_finding(
+            RuleId::PlainHttpToSink,
+            Severity::Low,
+            "Plain HTTP",
+        )];
+        pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (findings, Instant::now()));
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {"content": [{"type": "text", "text": "ok"}]}
+        });
+        let line = serde_json::to_vec(&upstream).unwrap();
+
+        // Should match and augment
+        let result = augment_if_pending(&line, &pending);
+        assert!(result.is_some());
+
+        // Entry should be removed from map
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_augment_if_pending_no_match_passes_through() {
+        let pending: Mutex<HashMap<Value, (Vec<Finding>, Instant)>> = Mutex::new(HashMap::new());
+        // Map has id=42 but response has id=99
+        pending.lock().unwrap().insert(
+            Value::from(42),
+            (
+                vec![test_finding(
+                    tirith_core::verdict::RuleId::PlainHttpToSink,
+                    tirith_core::verdict::Severity::Low,
+                    "test",
+                )],
+                Instant::now(),
+            ),
+        );
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "result": {"content": [{"type": "text", "text": "ok"}]}
+        });
+        let line = serde_json::to_vec(&upstream).unwrap();
+
+        assert!(augment_if_pending(&line, &pending).is_none());
+        // Original entry should still be in the map
+        assert_eq!(pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_augment_if_pending_string_id() {
+        use tirith_core::verdict::{RuleId, Severity};
+
+        let pending: Mutex<HashMap<Value, (Vec<Finding>, Instant)>> = Mutex::new(HashMap::new());
+        let id = Value::from("req-abc");
+        pending.lock().unwrap().insert(
+            id,
+            (
+                vec![test_finding(
+                    RuleId::ShortenedUrl,
+                    Severity::Medium,
+                    "Shortened URL",
+                )],
+                Instant::now(),
+            ),
+        );
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "req-abc",
+            "result": {"content": [{"type": "text", "text": "ok"}]}
+        });
+        let line = serde_json::to_vec(&upstream).unwrap();
+
+        let result = augment_if_pending(&line, &pending);
+        assert!(result.is_some());
+        let v: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("shortened_url"));
     }
 }
