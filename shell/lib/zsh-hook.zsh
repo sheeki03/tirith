@@ -271,3 +271,12 @@ _tirith_bracketed_paste() {
 }
 
 zle -N bracketed-paste _tirith_bracketed_paste
+
+# Exit summary: show session warnings on shell exit
+_tirith_exit_summary() {
+  [[ -n "${TIRITH_SESSION_ID:-}" ]] || return
+  local _sd="${XDG_STATE_HOME:-$HOME/.local/state}/tirith"
+  [[ -f "$_sd/sessions/$TIRITH_SESSION_ID.json" ]] || return
+  command tirith warnings --summary
+}
+autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook zshexit _tirith_exit_summary

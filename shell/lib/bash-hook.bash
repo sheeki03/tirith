@@ -580,3 +580,18 @@ elif [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
   # Non-interactive sourcing (bash -c, BASH_ENV, scripts) is a clean no-op.
   trap '_tirith_preexec' DEBUG
 fi
+
+# Exit summary: show session warnings on shell exit
+_tirith_exit_summary() {
+  [[ -n "${TIRITH_SESSION_ID:-}" ]] || return
+  local _sd="${XDG_STATE_HOME:-$HOME/.local/state}/tirith"
+  [[ -f "$_sd/sessions/$TIRITH_SESSION_ID.json" ]] || return
+  command tirith warnings --summary
+}
+_tirith_prev_exit_trap=$(trap -p EXIT 2>/dev/null | sed "s/^trap -- '//;s/' EXIT$//")
+if [[ -n "$_tirith_prev_exit_trap" ]]; then
+  eval "trap '${_tirith_prev_exit_trap}; _tirith_exit_summary' EXIT"
+else
+  trap '_tirith_exit_summary' EXIT
+fi
+unset _tirith_prev_exit_trap

@@ -5,21 +5,21 @@ Reads JSON from stdin (Claude Code hook protocol), extracts the command,
 and delegates to `tirith check --json` for security analysis.
 
 Exit codes:
-  0 — hook completed successfully (decision in stdout JSON if blocking)
-  Non-zero — hook error (Claude Code treats as allow / fail-open)
+  0 — hook completed successfully (decision in stdout JSON)
+  Non-zero — hook error (fail-closed by default; set TIRITH_FAIL_OPEN=1 for fail-open)
 
-Output (stdout, only for deny):
-  {
-    "hookSpecificOutput": {
-      "hookEventName": "PreToolUse",
-      "permissionDecision": "deny",
-      "permissionDecisionReason": "..."
-    }
-  }
+Output (stdout):
+  For deny:
+    {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+      "permissionDecision": "deny", "permissionDecisionReason": "..."}}
+  For warn-allow:
+    {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+      "permissionDecision": "allow", "permissionDecisionReason": "...",
+      "additionalContext": "..."}}
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
-  TIRITH_HOOK_WARN_ACTION — "deny" (default) or "allow"
+  TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
 """
 
 import json
@@ -53,17 +53,78 @@ def deny(reason):
     sys.exit(0)
 
 
+def fail_action():
+    """Return the fail action: deny (default, fail-closed) or allow (fail-open via env)."""
+    return "allow" if os.environ.get("TIRITH_FAIL_OPEN") == "1" else "deny"
+
+
+def fail_closed(reason):
+    """Deny or allow based on TIRITH_FAIL_OPEN, for error/missing-binary paths."""
+    action = fail_action()
+    if action == "deny":
+        deny(reason)
+    else:
+        sys.exit(0)
+
+
+def _hook_event(event, detail=None):
+    """Log a hook telemetry event via tirith hook-event (fire-and-forget)."""
+    tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
+    try:
+        cmd = [
+            tirith_bin,
+            "hook-event",
+            "--integration",
+            "claude-code",
+            "--hook-type",
+            "pre_tool_use",
+            "--event",
+            event,
+        ]
+        if detail:
+            cmd.extend(["--detail", detail])
+        subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def _build_warning_text(stdout):
+    """Extract finding titles from tirith JSON output into a human-readable string."""
+    text = "Tirith security check failed"
+    if stdout and stdout.strip():
+        try:
+            verdict = json.loads(stdout)
+            findings = verdict.get("findings", [])
+            if findings:
+                parts = []
+                for f in findings:
+                    title = f.get("title", f.get("rule_id", "unknown"))
+                    severity = f.get("severity", "")
+                    parts.append(f"[{severity}] {title}" if severity else title)
+                text = "Tirith: " + "; ".join(parts)
+        except json.JSONDecodeError:
+            text = stdout.strip()[:500]
+    return text
+
+
 def main():
     try:
         raw = sys.stdin.read()
         if not raw.strip():
-            sys.exit(0)
+            # Empty input — cannot determine command, fail-closed
+            fail_closed("tirith: empty hook input — blocked for safety")
+            return
         data = json.loads(raw)
     except (json.JSONDecodeError, OSError):
-        sys.exit(0)
+        _hook_event("parse_error")
+        fail_closed("tirith: failed to parse hook input — blocked for safety")
+        return
 
     if not isinstance(data, dict):
-        sys.exit(0)
+        fail_closed("tirith: invalid hook input format — blocked for safety")
+        return
 
     # Dual-case field extraction (camelCase and snake_case)
     event = get(data, "hook_event_name", "hookEventName")
@@ -75,14 +136,19 @@ def main():
         sys.exit(0)
 
     if not isinstance(tool_input, dict):
-        sys.exit(0)
+        fail_closed("tirith: invalid tool_input format — blocked for safety")
+        return
 
     command = tool_input.get("command")
     if not isinstance(command, str) or not command.strip():
-        sys.exit(0)
+        fail_closed("tirith: no command found in hook input — blocked for safety")
+        return
 
     # Locate tirith binary
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
+
+    env = os.environ.copy()
+    env["TIRITH_INTEGRATION"] = "claude-code"
 
     try:
         result = subprocess.run(
@@ -99,44 +165,67 @@ def main():
             capture_output=True,
             text=True,
             timeout=10,
+            env=env,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        # Fail open — tirith missing, timed out, or other OS error
-        sys.exit(0)
+    except FileNotFoundError:
+        fail_closed(f"tirith: {tirith_bin} not found — install tirith or set TIRITH_FAIL_OPEN=1")
+        return
+    except subprocess.TimeoutExpired:
+        _hook_event("timeout")
+        fail_closed("tirith: check timed out — blocked for safety")
+        return
+    except OSError as e:
+        _hook_event("unexpected_exit", str(e))
+        fail_closed(f"tirith: OS error running check — {e}")
+        return
 
-    # Fail open if tirith produced no parseable JSON verdict (e.g. unknown flag)
+    # Unexpected exit code — fail-closed
     if result.returncode not in (0, 1, 2):
-        sys.exit(0)
+        _hook_event("unexpected_exit", f"exit code {result.returncode}")
+        fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
+        return
     if result.returncode != 0 and not result.stdout.strip():
-        sys.exit(0)
+        _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
+        fail_closed("tirith: check returned non-zero with no output — blocked for safety")
+        return
 
     # Exit 0 = clean, allow
     if result.returncode == 0:
+        _hook_event("check_ok")
         sys.exit(0)
 
     # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION
     if result.returncode == 2:
-        warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "deny").lower()
-        if warn_action == "allow":
+        warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
+        if warn_action not in ("allow", "deny"):
+            print(
+                f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{warn_action}', defaulting to 'allow'",
+                file=sys.stderr,
+            )
+            warn_action = "allow"
+        if warn_action != "deny":
+            _hook_event("warn_allowed")
+            warning_text = _build_warning_text(result.stdout)
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": warning_text,
+                            "additionalContext": warning_text,
+                        }
+                    }
+                )
+            )
             sys.exit(0)
 
     # Exit 1 = block, Exit 2 + deny = block
-    # Build reason from tirith JSON output
-    reason = "Tirith security check failed"
-    if result.stdout.strip():
-        try:
-            verdict = json.loads(result.stdout)
-            findings = verdict.get("findings", [])
-            if findings:
-                parts = []
-                for f in findings:
-                    title = f.get("title", f.get("rule_id", "unknown"))
-                    severity = f.get("severity", "")
-                    parts.append(f"[{severity}] {title}" if severity else title)
-                reason = "Tirith: " + "; ".join(parts)
-        except json.JSONDecodeError:
-            reason = result.stdout.strip()[:500]
-
+    if result.returncode == 1:
+        _hook_event("check_block")
+    else:
+        _hook_event("warn_denied")
+    reason = _build_warning_text(result.stdout)
     deny(reason)
 
 
@@ -144,5 +233,19 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Fail open on any unexpected error
+        # Fail-closed on unexpected errors (respects TIRITH_FAIL_OPEN)
+        if os.environ.get("TIRITH_FAIL_OPEN") == "1":
+            sys.exit(0)
+        # Deny — print structured output so Claude Code shows a message
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "tirith: unexpected hook error — blocked for safety",
+                    }
+                }
+            )
+        )
         sys.exit(0)
