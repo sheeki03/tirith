@@ -1560,3 +1560,261 @@ expect eof
         "safe-mode flag should be persisted after unexpected rc degrade"
     );
 }
+
+// ─── Escalation + session warnings integration ───
+
+/// Helper: build a tirith Command with session and state isolation.
+fn tirith_isolated(
+    session_id: &str,
+    state_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Command {
+    let mut cmd = tirith();
+    cmd.env("TIRITH_SESSION_ID", session_id)
+        .env("XDG_STATE_HOME", state_dir)
+        .env("TIRITH_LOG", "0")
+        .current_dir(cwd);
+    cmd
+}
+
+#[test]
+fn escalation_repeat_count_blocks_at_threshold() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let policy = r#"paranoia: 1
+escalation:
+  - trigger: repeat_count
+    rule_ids: ["*"]
+    threshold: 3
+    action: block
+"#;
+    fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
+
+    // Also create a .git directory so policy discovery finds .tirith/policy.yaml
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-escalation-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+
+    // Command 1: should warn (exit 2)
+    let out1 = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://bit.ly/aaa",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out1.status.code(),
+        Some(2),
+        "1st shortened URL should exit 2 (warn), got stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Command 2: should warn (exit 2)
+    let out2 = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://bit.ly/bbb",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out2.status.code(),
+        Some(2),
+        "2nd shortened URL should exit 2 (warn), got stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // Command 3: should block (exit 1) due to escalation (threshold=3)
+    let out3 = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://bit.ly/ccc",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out3.status.code(),
+        Some(1),
+        "3rd shortened URL should exit 1 (escalated to block), got stderr: {}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
+}
+
+#[test]
+fn escalation_blocked_not_recorded_as_warning() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let policy = r#"paranoia: 1
+escalation:
+  - trigger: repeat_count
+    rule_ids: ["*"]
+    threshold: 3
+    action: block
+"#;
+    fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-blocked-warn-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+
+    // Run 3 commands: 2 warn, 1 block
+    for slug in &["aaa", "bbb", "ccc"] {
+        let _ = tirith_isolated(&session_id, &state_dir, &project_dir)
+            .args([
+                "check",
+                "--non-interactive",
+                "--no-daemon",
+                "--shell",
+                "posix",
+                "--",
+                &format!("curl https://bit.ly/{slug}"),
+            ])
+            .output()
+            .expect("failed to run tirith");
+    }
+
+    // Query warnings as JSON
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args(["warnings", "--json", "--session", &session_id])
+        .output()
+        .expect("failed to run tirith warnings");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("warnings --json should be valid JSON");
+    assert_eq!(
+        json["total_warnings"], 2,
+        "only 2 warnings should be recorded (3rd was blocked, not a warning): {json}"
+    );
+}
+
+#[test]
+fn warnings_clear_resets_session() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let policy = "paranoia: 1\n";
+    fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-clear-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+
+    // Generate a warning
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://bit.ly/abc",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "shortened URL should warn (exit 2)"
+    );
+
+    // Verify warning is recorded
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args(["warnings", "--json", "--session", &session_id])
+        .output()
+        .expect("failed to run tirith warnings");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(
+        json["total_warnings"].as_u64().unwrap() > 0,
+        "should have at least one warning before clear"
+    );
+
+    // Clear session
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args(["warnings", "--clear", "--session", &session_id])
+        .output()
+        .expect("failed to run tirith warnings --clear");
+    assert_eq!(out.status.code(), Some(0));
+
+    // Verify session is empty
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args(["warnings", "--json", "--session", &session_id])
+        .output()
+        .expect("failed to run tirith warnings after clear");
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(
+        json["total_warnings"], 0,
+        "warnings should be 0 after clear: {json}"
+    );
+}
+
+#[test]
+fn paranoia_filters_low_finding_to_allow() {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmpdir.path().join("state");
+    let policy_dir = tmpdir.path().join("project/.tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    // Override shortened_url to LOW severity + paranoia 1 filters out LOW
+    let policy = r#"paranoia: 1
+severity_overrides:
+  shortened_url: LOW
+"#;
+    fs::write(policy_dir.join("policy.yaml"), policy).unwrap();
+    fs::create_dir_all(tmpdir.path().join("project/.git")).unwrap();
+
+    let session_id = format!("test-paranoia-low-{}", std::process::id());
+    let project_dir = tmpdir.path().join("project");
+
+    let out = tirith_isolated(&session_id, &state_dir, &project_dir)
+        .args([
+            "check",
+            "--non-interactive",
+            "--no-daemon",
+            "--shell",
+            "posix",
+            "--",
+            "curl https://bit.ly/x",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "LOW finding at paranoia=1 should be filtered to Allow (exit 0), got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
