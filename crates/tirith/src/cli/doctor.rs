@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub fn run(json: bool, reset_bash_safe_mode: bool, fix: bool, yes: bool) -> i32 {
@@ -90,7 +91,7 @@ fn run_fix(yes: bool) -> i32 {
             println!("Fix: Configure tirith for AI coding tools");
             for tool in &tools {
                 if yes || confirm(&format!("  Configure tirith for {tool}?")) {
-                    let rc = crate::cli::setup::run(tool, None, false, false, false, false);
+                    let rc = crate::cli::setup::run(tool, None, false, false, false, false, false);
                     if rc == 0 {
                         println!("  Configured {tool}.");
                         fixed += 1;
@@ -172,8 +173,8 @@ fn policy_missing() -> bool {
         }
     }
 
-    // Check walk-up discovery (reuse Policy::discover_local behavior)
-    let policy = tirith_core::policy::Policy::discover(None);
+    // Check walk-up discovery (local-only, no network fetch)
+    let policy = tirith_core::policy::Policy::discover_partial(None);
     policy.path.is_none()
 }
 
@@ -245,6 +246,140 @@ blocklist: []
     Err("could not determine a location for policy file".to_string())
 }
 
+/// Detection gap analysis: what findings are hidden by the current paranoia level.
+#[derive(Debug, Clone, serde::Serialize)]
+struct DetectionGapInfo {
+    total_commands: usize,
+    blocked: usize,
+    warned: usize,
+    records_analyzed: usize,
+    records_with_raw: usize,
+    records_without_raw: usize,
+    total_findings: usize,
+    raw_total_findings: usize,
+    hidden_findings: usize,
+    hidden_top_rules: Vec<(String, usize)>,
+    current_paranoia: u8,
+}
+
+/// Analyze audit log data from the last 7 days to show detection coverage gaps.
+///
+/// For each verdict record that has `raw_rule_ids`, computes the multiset diff
+/// (raw minus effective) to find exactly which rules were suppressed by paranoia
+/// filtering. Records without `raw_rule_ids` (legacy, pre-upgrade) are counted
+/// but skipped in the delta computation.
+fn check_detection_gaps() -> Option<DetectionGapInfo> {
+    let data_dir = tirith_core::policy::data_dir()?;
+    let log_path = data_dir.join("log.jsonl");
+    if !log_path.exists() {
+        return None;
+    }
+
+    let read_result = match tirith_core::audit_aggregator::read_log(&log_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "tirith: doctor: cannot read audit log {}: {e}",
+                log_path.display()
+            );
+            return None;
+        }
+    };
+    if read_result.records.is_empty() {
+        return None;
+    }
+
+    // Filter to verdict entries from the last 7 days
+    let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
+    let since_str = seven_days_ago.to_rfc3339();
+
+    let filter = tirith_core::audit_aggregator::AuditFilter {
+        since: Some(since_str),
+        entry_type: Some("verdict".to_string()),
+        ..Default::default()
+    };
+    let verdicts = tirith_core::audit_aggregator::filter_records(&read_result.records, &filter);
+    if verdicts.is_empty() {
+        return None;
+    }
+
+    let total_commands = verdicts.len();
+    let blocked = verdicts
+        .iter()
+        .filter(|r| r.action.eq_ignore_ascii_case("Block"))
+        .count();
+    let warned = verdicts
+        .iter()
+        .filter(|r| {
+            r.action.eq_ignore_ascii_case("Warn") || r.action.eq_ignore_ascii_case("WarnAck")
+        })
+        .count();
+
+    let mut records_with_raw = 0usize;
+    let mut records_without_raw = 0usize;
+    let mut total_findings = 0usize;
+    let mut raw_total_findings_analyzed = 0usize; // only from records with raw data
+    let mut hidden_findings = 0usize;
+    let mut hidden_rule_counts: HashMap<String, usize> = HashMap::new();
+
+    for record in &verdicts {
+        total_findings += record.rule_ids.len();
+
+        match record.raw_rule_ids {
+            Some(ref raw_ids) => {
+                records_with_raw += 1;
+                raw_total_findings_analyzed += raw_ids.len();
+
+                // Multiset diff: raw_rule_ids minus rule_ids
+                let mut effective_counts: HashMap<&str, u32> = HashMap::new();
+                for rid in &record.rule_ids {
+                    *effective_counts.entry(rid.as_str()).or_insert(0) += 1;
+                }
+                for raw_rid in raw_ids {
+                    match effective_counts.get_mut(raw_rid.as_str()) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1; // matched, not hidden
+                        }
+                        _ => {
+                            hidden_findings += 1;
+                            *hidden_rule_counts.entry(raw_rid.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                records_without_raw += 1;
+            }
+        }
+    }
+
+    let records_analyzed = records_with_raw;
+
+    let mut hidden_top_rules: Vec<(String, usize)> = hidden_rule_counts.into_iter().collect();
+    hidden_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    hidden_top_rules.truncate(5);
+
+    // Get current paranoia level (local-only, no network fetch)
+    let cwd = std::env::current_dir().ok();
+    let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
+    let policy = tirith_core::policy::Policy::discover_partial(cwd_str);
+    let current_paranoia = policy.paranoia;
+
+    Some(DetectionGapInfo {
+        total_commands,
+        blocked,
+        warned,
+        records_analyzed,
+        records_with_raw,
+        records_without_raw,
+        total_findings,
+        raw_total_findings: raw_total_findings_analyzed,
+        hidden_findings,
+        hidden_top_rules,
+        current_paranoia,
+    })
+}
+
 #[derive(serde::Serialize)]
 struct DoctorInfo {
     version: String,
@@ -267,6 +402,9 @@ struct DoctorInfo {
     webhooks_available: bool,
     /// Other `tirith` binaries found on PATH that shadow or conflict with this one.
     shadow_binaries: Vec<String>,
+    /// Detection gap analysis from audit log data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detection_gaps: Option<DetectionGapInfo>,
 }
 
 fn gather_info() -> DoctorInfo {
@@ -327,6 +465,7 @@ fn gather_info() -> DoctorInfo {
     }
 
     let shadow_binaries = super::find_shadow_binaries();
+    let detection_gaps = check_detection_gaps();
 
     DoctorInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -346,6 +485,7 @@ fn gather_info() -> DoctorInfo {
         cloaking_available: cfg!(unix),
         webhooks_available: cfg!(unix),
         shadow_binaries,
+        detection_gaps,
     }
 }
 
@@ -465,6 +605,89 @@ fn print_human(info: &DoctorInfo) {
             "not available (Unix-only)"
         }
     );
+
+    // Detection gap analysis
+    if let Some(ref gaps) = info.detection_gaps {
+        println!();
+        println!("Detection coverage (last 7 days)");
+        println!(
+            "  {} commands scanned, {} blocked, {} warned",
+            gaps.total_commands, gaps.blocked, gaps.warned
+        );
+        println!(
+            "  {} of {} records have full detection data{}",
+            gaps.records_with_raw,
+            gaps.total_commands,
+            if gaps.records_without_raw > 0 {
+                format!(" ({} legacy, pre-upgrade)", gaps.records_without_raw)
+            } else {
+                String::new()
+            }
+        );
+
+        if gaps.hidden_findings == 0 && gaps.records_with_raw > 0 {
+            println!(
+                "  No hidden findings — detection coverage is complete at current paranoia level"
+            );
+        } else if gaps.hidden_findings == 0 && gaps.records_with_raw == 0 {
+            println!(
+                "  No raw detection data available (all records are pre-upgrade). Cannot assess hidden findings."
+            );
+        } else {
+            let pct = if gaps.raw_total_findings > 0 {
+                // raw_total_findings is scoped to analyzed records (those with raw_rule_ids)
+                (gaps.hidden_findings as f64 / gaps.raw_total_findings as f64 * 100.0) as usize
+            } else {
+                0
+            };
+            println!(
+                "  Hidden: {} findings detected but not surfaced ({}% of raw detections in {} analyzed records)",
+                gaps.hidden_findings, pct, gaps.records_analyzed
+            );
+            if !gaps.hidden_top_rules.is_empty() {
+                let top_str: Vec<String> = gaps
+                    .hidden_top_rules
+                    .iter()
+                    .map(|(rule, count)| format!("{rule} ({count})"))
+                    .collect();
+                println!("  Top hidden: {}", top_str.join(", "));
+            }
+        }
+
+        // Paranoia guidance text — mark the current level
+        println!();
+        println!("  Paranoia levels:");
+        let levels: [(u8, &str, &str); 3] = [
+            (1, "1-2", "Medium+ only — hides Low and Info findings"),
+            (3, "3", "Low+ — shows low-severity security patterns"),
+            (4, "4", "All — full detection visibility"),
+        ];
+        for (threshold, label, desc) in &levels {
+            let marker = if (*threshold <= 2 && gaps.current_paranoia <= 2)
+                || (*threshold > 2 && gaps.current_paranoia == *threshold)
+            {
+                " (current)"
+            } else {
+                ""
+            };
+            println!("    {label}{marker}: {desc}");
+        }
+
+        if gaps.hidden_findings > 0 {
+            let next_level = match gaps.current_paranoia {
+                1 | 2 => 3,
+                3 => 4,
+                _ => gaps.current_paranoia, // already max
+            };
+            println!();
+            if next_level > gaps.current_paranoia {
+                println!(
+                    "  \u{2192} Set 'paranoia: {}' in .tirith/policy.yaml to surface these detections",
+                    next_level
+                );
+            }
+        }
+    }
 
     // License key format diagnostics
     use tirith_core::license::KeyFormatStatus;
