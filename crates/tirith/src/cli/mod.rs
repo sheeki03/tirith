@@ -7,6 +7,7 @@ pub mod diff;
 pub mod doctor;
 pub mod explain;
 pub mod gateway;
+pub mod hook_event;
 pub mod init;
 pub mod last_trigger;
 pub mod license_cmd;
@@ -17,6 +18,8 @@ pub mod policy;
 pub mod receipt;
 pub mod scan;
 pub mod score;
+pub mod trust;
+pub mod warnings;
 pub mod why;
 
 #[cfg(unix)]

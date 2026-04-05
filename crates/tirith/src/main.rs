@@ -256,6 +256,12 @@ enum Commands {
         /// Overwrite existing files and update stale entries
         #[arg(long)]
         force: bool,
+
+        /// Refresh embedded hook scripts and gateway config to latest defaults.
+        /// WARNING: overwrites local edits to generated hook scripts and gateway.yaml.
+        /// Does not re-register MCP servers or modify shell profiles — use full setup for that.
+        #[arg(long)]
+        update_configs: bool,
     },
 
     /// Manage security policies
@@ -283,6 +289,54 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Log a hook telemetry event (called by hook scripts, always exits 0)
+    HookEvent {
+        /// Integration name (e.g., claude-code, cursor, vscode)
+        #[arg(long)]
+        integration: String,
+        /// Hook type (e.g., pre_tool_use, before_shell_execution)
+        #[arg(long)]
+        hook_type: String,
+        /// Event name (e.g., check_ok, check_block, warn_allowed, timeout)
+        #[arg(long)]
+        event: String,
+        /// Hook-level timing in milliseconds
+        #[arg(long)]
+        elapsed_ms: Option<f64>,
+        /// Freeform detail text
+        #[arg(long)]
+        detail: Option<String>,
+    },
+
+    /// Manage trusted patterns (allowlist entries with TTL, scoping, and audit)
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+
+    /// Show accumulated session warnings
+    Warnings {
+        /// Clear session warnings after display
+        #[arg(long)]
+        clear: bool,
+
+        /// Override session ID
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// One-line summary (for shell exit hooks)
+        #[arg(long)]
+        summary: bool,
+
+        /// Show findings hidden by paranoia filtering
+        #[arg(long)]
+        hidden: bool,
     },
 
     /// Diagnose tirith installation and configuration
@@ -344,6 +398,9 @@ enum AuditAction {
         /// Filter: only records matching these rule IDs
         #[arg(long)]
         rule_id: Vec<String>,
+        /// Entry type filter: verdict (default), hook_telemetry, or all
+        #[arg(long, default_value = "verdict")]
+        entry_type: String,
     },
     /// Show summary statistics from the audit log
     Stats {
@@ -353,6 +410,9 @@ enum AuditAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Entry type filter: verdict (default) or hook_telemetry
+        #[arg(long, default_value = "verdict")]
+        entry_type: String,
     },
     /// Generate a compliance report from the audit log
     Report {
@@ -362,6 +422,9 @@ enum AuditAction {
         /// Filter: only records since this ISO 8601 date
         #[arg(long)]
         since: Option<String>,
+        /// Entry type filter: only verdict is supported
+        #[arg(long, default_value = "verdict")]
+        entry_type: String,
     },
 }
 
@@ -478,6 +541,58 @@ enum PolicyAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Add a trusted pattern
+    Add {
+        /// Pattern to trust (domain, URL fragment, etc.)
+        pattern: String,
+        /// Scope trust to a specific rule ID
+        #[arg(long)]
+        rule: Option<String>,
+        /// TTL duration (e.g., 1h, 7d, 30d)
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Scope: user (default) or repo
+        #[arg(long, default_value = "user")]
+        scope: String,
+    },
+    /// List trusted patterns from all sources
+    List {
+        /// Filter by rule ID
+        #[arg(long)]
+        rule: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Include expired entries
+        #[arg(long)]
+        expired: bool,
+        /// Scope: user, repo, or all (default)
+        #[arg(long, default_value = "all")]
+        scope: String,
+    },
+    /// Remove a trusted pattern
+    Remove {
+        /// Pattern to remove
+        pattern: String,
+        /// Only remove entries scoped to this rule ID
+        #[arg(long)]
+        rule: Option<String>,
+        /// Scope: user (default) or repo
+        #[arg(long, default_value = "user")]
+        scope: String,
+    },
+    /// Show last trigger and interactively trust domains
+    Last,
+    /// Remove expired entries from trust stores
+    Gc {
+        /// Scope: user, repo, or all (default)
+        #[arg(long, default_value = "all")]
+        scope: String,
     },
 }
 
@@ -603,6 +718,7 @@ fn main() {
             install_zshenv,
             dry_run,
             force,
+            update_configs,
         } => cli::setup::run(
             &tool,
             scope.as_deref(),
@@ -610,6 +726,7 @@ fn main() {
             install_zshenv,
             dry_run,
             force,
+            update_configs,
         ),
 
         Commands::Policy { action } => match action {
@@ -622,6 +739,20 @@ fn main() {
             } => cli::policy::test(command.as_deref(), file.as_deref(), json),
         },
 
+        Commands::HookEvent {
+            integration,
+            hook_type,
+            event,
+            elapsed_ms,
+            detail,
+        } => cli::hook_event::run(
+            &integration,
+            &hook_type,
+            &event,
+            elapsed_ms,
+            detail.as_deref(),
+        ),
+
         Commands::Audit { action } => match action {
             AuditAction::Export {
                 format,
@@ -630,6 +761,7 @@ fn main() {
                 session,
                 action,
                 rule_id,
+                entry_type,
             } => cli::audit::export(
                 &format,
                 since.as_deref(),
@@ -637,9 +769,18 @@ fn main() {
                 session.as_deref(),
                 action.as_deref(),
                 &rule_id,
+                &entry_type,
             ),
-            AuditAction::Stats { session, json } => cli::audit::stats(session.as_deref(), json),
-            AuditAction::Report { format, since } => cli::audit::report(&format, since.as_deref()),
+            AuditAction::Stats {
+                session,
+                json,
+                entry_type,
+            } => cli::audit::stats(session.as_deref(), json, &entry_type),
+            AuditAction::Report {
+                format,
+                since,
+                entry_type,
+            } => cli::audit::report(&format, since.as_deref(), &entry_type),
         },
 
         Commands::Receipt { action } => match action {
@@ -670,7 +811,37 @@ fn main() {
             Some(LicenseAction::Refresh) => cli::license_cmd::refresh(),
         },
 
+        Commands::Trust { action } => match action {
+            TrustAction::Add {
+                pattern,
+                rule,
+                ttl,
+                scope,
+            } => cli::trust::add(&pattern, rule.as_deref(), ttl.as_deref(), &scope),
+            TrustAction::List {
+                rule,
+                json,
+                expired,
+                scope,
+            } => cli::trust::list(rule.as_deref(), json, expired, &scope),
+            TrustAction::Remove {
+                pattern,
+                rule,
+                scope,
+            } => cli::trust::remove(&pattern, rule.as_deref(), &scope),
+            TrustAction::Last => cli::trust::last(),
+            TrustAction::Gc { scope } => cli::trust::gc(&scope),
+        },
+
         Commands::Init { shell } => cli::init::run(shell.as_deref()),
+
+        Commands::Warnings {
+            clear,
+            session,
+            json,
+            summary,
+            hidden,
+        } => cli::warnings::run(clear, session.as_deref(), json, summary, hidden),
 
         Commands::Doctor {
             json,
