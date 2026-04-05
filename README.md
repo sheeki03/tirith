@@ -419,6 +419,7 @@ tirith daemon stop
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
 | `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
 | `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
+| `tirith warnings` | Show accumulated session warnings, suggest trust entries. `--summary` for shell exit hooks |
 | `tirith audit {export,stats,report}` | Audit log management for compliance |
 | `tirith init` | Print the shell hook for your shell profile |
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
@@ -485,6 +486,35 @@ allowlist_rules:
       - "get.docker.com"
 ```
 
+### Escalation and action overrides
+
+Warnings are tracked per session. If the same rule fires repeatedly, escalation rules can upgrade to a block:
+
+```yaml
+action_overrides:
+  shortened_url: block            # always block, regardless of default severity
+
+escalation:
+  - trigger: repeat_count
+    rule_ids: ["*"]               # any rule
+    threshold: 5
+    window_minutes: 60
+    action: block
+  - trigger: multi_medium
+    min_findings: 3               # 3+ medium findings on one command → block
+    action: block
+```
+
+Review accumulated warnings at any time:
+
+```bash
+tirith warnings               # table of session warnings
+tirith warnings --json        # structured output
+tirith warnings --clear       # clear after viewing
+```
+
+On shell exit, a one-line summary is printed if any warnings were recorded during the session.
+
 More examples in [docs/cookbook.md](docs/cookbook.md).
 
 ### Strict warn mode
@@ -516,7 +546,9 @@ This is a standard shell per-command prefix — the variable only exists for tha
 ## Data handling
 
 Local JSONL audit log at `~/.local/share/tirith/log.jsonl`:
-- Timestamp, action, rule ID, redacted command preview
+- Timestamp, session ID, action, rule IDs, redacted command preview
+- Raw detection data (`raw_action`, `raw_rule_ids`) preserved alongside enforced action for coverage auditing
+- Session warning state at `~/.local/state/tirith/sessions/`
 - **No** full commands, environment variables, or file contents
 
 Disable: `export TIRITH_LOG=0`
