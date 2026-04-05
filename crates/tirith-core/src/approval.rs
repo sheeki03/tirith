@@ -273,6 +273,7 @@ mod tests {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         }
     }
 

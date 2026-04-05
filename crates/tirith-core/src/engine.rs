@@ -365,6 +365,19 @@ fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
 
 /// Run the tiered analysis pipeline.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
+    analyze_inner(ctx).0
+}
+
+/// Run the tiered analysis pipeline, returning the loaded policy alongside the verdict.
+///
+/// Use this from enforcement callers (check, gateway, MCP) that need the policy
+/// for post-processing — avoids a redundant `Policy::discover()` call.
+pub fn analyze_returning_policy(ctx: &AnalysisContext) -> (Verdict, Policy) {
+    analyze_inner(ctx)
+}
+
+/// Shared implementation for `analyze()` and `analyze_returning_policy()`.
+fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     let start = Instant::now();
 
     // Tier 0: Check bypass flag
@@ -422,15 +435,20 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     // If nothing triggered, fast exit
     if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        return Verdict::allow_fast(
-            1,
-            Timings {
-                tier0_ms,
-                tier1_ms,
-                tier2_ms: None,
-                tier3_ms: None,
-                total_ms,
-            },
+        return (
+            Verdict::allow_fast(
+                1,
+                Timings {
+                    tier0_ms,
+                    tier1_ms,
+                    tier2_ms: None,
+                    tier3_ms: None,
+                    total_ms,
+                },
+            ),
+            // Load partial policy even on fast-exit so callers get DLP patterns
+            // for audit redaction. discover_partial is local-only and cheap.
+            Policy::discover_partial(ctx.cwd.as_deref()),
         );
     }
 
@@ -471,13 +489,14 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
                 None,
                 &policy.dlp_custom_patterns,
             );
-            return verdict;
+            return (verdict, policy);
         }
     }
 
     let mut policy = Policy::discover(ctx.cwd.as_deref());
     policy.load_user_lists();
     policy.load_org_lists(ctx.cwd.as_deref());
+    policy.load_trust_entries(ctx.cwd.as_deref());
     let tier2_ms = tier2_start.elapsed().as_secs_f64() * 1000.0;
 
     // Tier 3: Full analysis
@@ -754,7 +773,7 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     verdict.policy_path_used = policy.path.clone();
     verdict.urls_extracted_count = Some(extracted.len());
 
-    verdict
+    (verdict, policy)
 }
 
 // ---------------------------------------------------------------------------

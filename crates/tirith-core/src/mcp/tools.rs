@@ -215,10 +215,21 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         clipboard_html: None,
     };
 
-    let mut verdict = engine::analyze(&ctx);
-    let policy = crate::policy::Policy::discover(cwd.as_deref());
-    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_metadata(&mut verdict, &policy);
+    let (raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
+
+    let mut verdict = if raw_verdict.bypass_honored {
+        raw_verdict
+    } else {
+        let session_id = crate::session::resolve_session_id();
+        crate::escalation::post_process_verdict(
+            &raw_verdict,
+            &policy,
+            command,
+            &session_id,
+            crate::escalation::CallerContext::McpServer,
+        )
+    };
+
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -245,7 +256,7 @@ fn call_check_url(args: &Value) -> ToolCallResult {
     // Shell-quote the URL to prevent metacharacters from being tokenized as separate commands.
     let input = format!("curl '{}'", url.replace('\'', "'\\''"));
     let ctx = AnalysisContext {
-        input,
+        input: input.clone(),
         shell: ShellType::Posix,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
@@ -259,8 +270,13 @@ fn call_check_url(args: &Value) -> ToolCallResult {
 
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
+
+    // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_metadata(&mut verdict, &policy);
+    if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
+        crate::approval::apply_approval(&mut verdict, &meta);
+    }
+
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -284,8 +300,9 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
     };
 
     let raw_bytes = content.as_bytes().to_vec();
+    let input = content.to_string();
     let ctx = AnalysisContext {
-        input: content.to_string(),
+        input: input.clone(),
         shell: ShellType::Posix,
         scan_context: ScanContext::Paste,
         raw_bytes: Some(raw_bytes),
@@ -299,8 +316,13 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
 
     let mut verdict = engine::analyze(&ctx);
     let policy = crate::policy::Policy::discover(None);
+
+    // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    apply_approval_metadata(&mut verdict, &policy);
+    if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
+        crate::approval::apply_approval(&mut verdict, &meta);
+    }
+
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
@@ -545,13 +567,6 @@ fn build_cloaking_response(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Apply approval metadata to a verdict.
-fn apply_approval_metadata(verdict: &mut crate::verdict::Verdict, policy: &crate::policy::Policy) {
-    if let Some(meta) = crate::approval::check_approval(verdict, policy) {
-        crate::approval::apply_approval(verdict, &meta);
-    }
-}
 
 fn tool_error(msg: &str) -> ToolCallResult {
     ToolCallResult {

@@ -9,6 +9,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+fn default_entry_type() -> String {
+    "verdict".to_string()
+}
+
 /// A parsed audit log entry (superset of what we write — tolerates missing fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -32,6 +36,40 @@ pub struct AuditRecord {
     pub event_id: Option<String>,
     #[serde(default)]
     pub tier_reached: u8,
+
+    // --- Tagged-union discriminator ---
+    #[serde(default = "default_entry_type")]
+    pub entry_type: String,
+
+    // --- Hook telemetry fields ---
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub integration: Option<String>,
+    #[serde(default)]
+    pub hook_type: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms: Option<f64>,
+
+    // --- Raw verdict fields (before post-processing) ---
+    #[serde(default)]
+    pub raw_action: Option<String>,
+    #[serde(default)]
+    pub raw_rule_ids: Option<Vec<String>>,
+
+    // --- Trust change fields ---
+    #[serde(default)]
+    pub trust_pattern: Option<String>,
+    #[serde(default)]
+    pub trust_rule_id: Option<String>,
+    #[serde(default)]
+    pub trust_action: Option<String>,
+    #[serde(default)]
+    pub trust_ttl_expires: Option<String>,
+    #[serde(default)]
+    pub trust_scope: Option<String>,
 }
 
 /// Filters for audit log queries.
@@ -47,6 +85,9 @@ pub struct AuditFilter {
     pub action: Option<String>,
     /// Filter to records matching any of these rule IDs.
     pub rule_ids: Vec<String>,
+    /// Filter by entry type ("verdict", "hook_telemetry", "trust_change").
+    /// Defaults to "verdict" when None to preserve backward compatibility.
+    pub entry_type: Option<String>,
 }
 
 /// Summary statistics from audit records.
@@ -59,6 +100,18 @@ pub struct AuditStats {
     pub block_rate: f64,
     pub sessions_seen: usize,
     pub time_range: Option<(String, String)>,
+    /// Total findings from raw detection (before paranoia filtering).
+    pub raw_total_findings: usize,
+    /// Top rules from raw detection (before paranoia filtering).
+    pub raw_top_rules: Vec<(String, usize)>,
+}
+
+/// Summary statistics for hook telemetry events.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookStats {
+    pub total_events: usize,
+    pub events_by_integration: HashMap<String, HashMap<String, usize>>,
+    pub top_events: Vec<(String, usize)>,
 }
 
 /// Result of reading an audit log, including accounting for skipped lines.
@@ -102,11 +155,32 @@ fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(ts).ok()
 }
 
+/// Returns true if a record's entry_type matches the requested filter value.
+/// Empty string and "verdict" are treated equivalently (backward compat for old log entries).
+fn entry_type_matches(record_type: &str, filter_type: &str) -> bool {
+    if filter_type == "all" {
+        return true;
+    }
+    let normalized = if record_type.is_empty() {
+        "verdict"
+    } else {
+        record_type
+    };
+    normalized == filter_type
+}
+
 /// Filter records by the given criteria.
 pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord> {
+    // Default entry_type filter to "verdict" when not set
+    let entry_type_filter = filter.entry_type.as_deref().unwrap_or("verdict");
+
     records
         .iter()
         .filter(|r| {
+            // Entry type filter (default: verdict-only for backward compat)
+            if !entry_type_matches(&r.entry_type, entry_type_filter) {
+                return false;
+            }
             // CR-10: Parse timestamps for proper timezone-aware comparison
             if let Some(ref since) = filter.since {
                 match (parse_ts(&r.timestamp), parse_ts(since)) {
@@ -159,23 +233,44 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
 }
 
 /// Compute summary statistics from a set of audit records.
+/// Only considers records with entry_type "verdict" (or empty, for old records).
 pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut actions: HashMap<String, usize> = HashMap::new();
     let mut rule_counts: HashMap<String, usize> = HashMap::new();
+    let mut raw_rule_counts: HashMap<String, usize> = HashMap::new();
     let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut total_findings = 0usize;
+    let mut raw_total_findings = 0usize;
+    let mut total_commands = 0usize;
 
-    for record in records {
+    // Filter to verdict entries inline (empty entry_type = old records = verdict)
+    let is_verdict = |r: &&AuditRecord| r.entry_type.is_empty() || r.entry_type == "verdict";
+
+    for record in records.iter().filter(is_verdict) {
+        total_commands += 1;
         *actions.entry(record.action.clone()).or_insert(0) += 1;
         sessions.insert(record.session_id.clone());
         total_findings += record.rule_ids.len();
         for rid in &record.rule_ids {
             *rule_counts.entry(rid.clone()).or_insert(0) += 1;
         }
+        // Raw detection stats (pre-paranoia). Falls back to effective rule_ids
+        // for old records without raw_rule_ids.
+        if let Some(ref raw_ids) = record.raw_rule_ids {
+            raw_total_findings += raw_ids.len();
+            for rid in raw_ids {
+                *raw_rule_counts.entry(rid.clone()).or_insert(0) += 1;
+            }
+        } else {
+            raw_total_findings += record.rule_ids.len();
+            for rid in &record.rule_ids {
+                *raw_rule_counts.entry(rid.clone()).or_insert(0) += 1;
+            }
+        }
     }
 
     let block_count = *actions.get("Block").unwrap_or(&0) as f64;
-    let total = records.len() as f64;
+    let total = total_commands as f64;
     let block_rate = if total > 0.0 {
         block_count / total
     } else {
@@ -186,12 +281,13 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     top_rules.sort_by(|a, b| b.1.cmp(&a.1));
     top_rules.truncate(10);
 
-    let time_range = if records.is_empty() {
+    let time_range = if total_commands == 0 {
         None
     } else {
         // Use min/max by parsed timestamp (not first/last which assumes order)
         let min_ts = records
             .iter()
+            .filter(is_verdict)
             .min_by(
                 |a, b| match (parse_ts(&a.timestamp), parse_ts(&b.timestamp)) {
                     (Some(ta), Some(tb)) => ta.cmp(&tb),
@@ -202,6 +298,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
             .unwrap_or_default();
         let max_ts = records
             .iter()
+            .filter(is_verdict)
             .max_by(
                 |a, b| match (parse_ts(&a.timestamp), parse_ts(&b.timestamp)) {
                     (Some(ta), Some(tb)) => ta.cmp(&tb),
@@ -213,14 +310,54 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
         Some((min_ts, max_ts))
     };
 
+    let mut raw_top_rules: Vec<(String, usize)> = raw_rule_counts.into_iter().collect();
+    raw_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    raw_top_rules.truncate(10);
+
     AuditStats {
-        total_commands: records.len(),
+        total_commands,
         total_findings,
         actions,
         top_rules,
         block_rate,
         sessions_seen: sessions.len(),
         time_range,
+        raw_total_findings,
+        raw_top_rules,
+    }
+}
+
+/// Compute summary statistics for hook telemetry events.
+pub fn compute_hook_stats(records: &[AuditRecord]) -> HookStats {
+    let mut events_by_integration: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let mut event_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_events = 0usize;
+
+    for record in records.iter().filter(|r| r.entry_type == "hook_telemetry") {
+        total_events += 1;
+        let integration = record
+            .integration
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+        let event = record.event.as_deref().unwrap_or("unknown").to_string();
+
+        *events_by_integration
+            .entry(integration)
+            .or_default()
+            .entry(event.clone())
+            .or_insert(0) += 1;
+        *event_counts.entry(event).or_insert(0) += 1;
+    }
+
+    let mut top_events: Vec<(String, usize)> = event_counts.into_iter().collect();
+    top_events.sort_by(|a, b| b.1.cmp(&a.1));
+    top_events.truncate(10);
+
+    HookStats {
+        total_events,
+        events_by_integration,
+        top_events,
     }
 }
 
@@ -232,7 +369,7 @@ pub fn export_json(records: &[AuditRecord]) -> String {
     })
 }
 
-/// Export records as CSV (RFC 4180 compliant).
+/// Export records as CSV (RFC 4180 compliant). Only supports verdict entries.
 pub fn export_csv(records: &[AuditRecord]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -487,6 +624,19 @@ mod tests {
                 policy_path: None,
                 event_id: Some("evt-1".into()),
                 tier_reached: 3,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
             },
             AuditRecord {
                 timestamp: "2026-01-15T10:01:00Z".into(),
@@ -500,6 +650,19 @@ mod tests {
                 policy_path: None,
                 event_id: Some("evt-2".into()),
                 tier_reached: 1,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
             },
             AuditRecord {
                 timestamp: "2026-01-16T12:00:00Z".into(),
@@ -513,6 +676,19 @@ mod tests {
                 policy_path: None,
                 event_id: None,
                 tier_reached: 3,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
             },
         ]
     }
@@ -628,6 +804,19 @@ mod tests {
             policy_path: None,
             event_id: None,
             tier_reached: 3,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
         }];
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();

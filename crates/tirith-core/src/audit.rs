@@ -44,29 +44,51 @@ pub struct AuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     pub tier_reached: u8,
+
+    // --- Tagged-union discriminator ---
+    pub entry_type: String,
+
+    // --- Hook telemetry fields ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<f64>,
+
+    // --- Raw verdict fields (before post-processing) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rule_ids: Option<Vec<String>>,
+
+    // --- Trust change fields ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_ttl_expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_scope: Option<String>,
 }
 
-/// Append an entry to the audit log. Never panics or changes verdict on failure.
-///
-/// `custom_dlp_patterns` are Team-tier regex patterns applied alongside built-in
-/// DLP redaction before the command is written to the log.
-pub fn log_verdict(
-    verdict: &Verdict,
-    command: &str,
-    log_path: Option<PathBuf>,
-    event_id: Option<String>,
-    custom_dlp_patterns: &[String],
-) {
+/// Shared I/O helper: serialize an AuditEntry and append it to the audit log.
+/// Handles TIRITH_LOG check, path resolution, dir creation, symlink guard,
+/// open, lock, write, sync, unlock. Never panics or changes behavior on failure.
+fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> Option<String> {
     // Early exit if logging disabled
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
-        return;
+        return None;
     }
 
-    let path = log_path.or_else(default_log_path);
-    let path = match path {
-        Some(p) => p,
-        None => return,
-    };
+    let path = log_path.or_else(default_log_path)?;
 
     // Ensure directory exists
     if let Some(parent) = path.parent() {
@@ -75,33 +97,15 @@ pub fn log_verdict(
                 "tirith: audit: cannot create log dir {}: {e}",
                 parent.display()
             ));
-            return;
+            return None;
         }
     }
 
-    let entry = AuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        session_id: crate::session::session_id().to_string(),
-        action: format!("{:?}", verdict.action),
-        rule_ids: verdict
-            .findings
-            .iter()
-            .map(|f| f.rule_id.to_string())
-            .collect(),
-        command_redacted: redact_command(command, custom_dlp_patterns),
-        bypass_requested: verdict.bypass_requested,
-        bypass_honored: verdict.bypass_honored,
-        interactive: verdict.interactive_detected,
-        policy_path: verdict.policy_path_used.clone(),
-        event_id,
-        tier_reached: verdict.tier_reached,
-    };
-
-    let line = match serde_json::to_string(&entry) {
+    let line = match serde_json::to_string(entry) {
         Ok(l) => l,
         Err(e) => {
             audit_diagnostic(format!("tirith: audit: failed to serialize entry: {e}"));
-            return;
+            return None;
         }
     };
 
@@ -114,7 +118,7 @@ pub fn log_verdict(
                     "tirith: audit: refusing to follow symlink at {}",
                     path.display()
                 ));
-                return;
+                return None;
             }
             _ => {}
         }
@@ -137,7 +141,7 @@ pub fn log_verdict(
                 "tirith: audit: cannot open {}: {e}",
                 path.display()
             ));
-            return;
+            return None;
         }
     };
 
@@ -153,14 +157,14 @@ pub fn log_verdict(
             "tirith: audit: cannot lock {}: {e}",
             path.display()
         ));
-        return;
+        return None;
     }
 
     let mut writer = std::io::BufWriter::new(&file);
     if let Err(e) = writeln!(writer, "{line}") {
         audit_diagnostic(format!("tirith: audit: write failed: {e}"));
         let _ = fs2::FileExt::unlock(&file);
-        return;
+        return None;
     }
     if let Err(e) = writer.flush() {
         audit_diagnostic(format!("tirith: audit: flush failed: {e}"));
@@ -169,6 +173,80 @@ pub fn log_verdict(
         audit_diagnostic(format!("tirith: audit: sync failed: {e}"));
     }
     let _ = fs2::FileExt::unlock(&file);
+
+    Some(line)
+}
+
+/// Append an entry to the audit log. Never panics or changes verdict on failure.
+///
+/// `custom_dlp_patterns` are Team-tier regex patterns applied alongside built-in
+/// DLP redaction before the command is written to the log.
+pub fn log_verdict(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+) {
+    log_verdict_with_raw(
+        verdict,
+        command,
+        log_path,
+        event_id,
+        custom_dlp_patterns,
+        None,
+        None,
+    );
+}
+
+/// Like `log_verdict` but accepts optional raw (pre-post-processing) action and rule_ids.
+///
+/// `raw_action` captures the engine's original action before overrides/escalation.
+/// `raw_rule_ids` captures all rule_ids from raw detection (before paranoia).
+pub fn log_verdict_with_raw(
+    verdict: &Verdict,
+    command: &str,
+    log_path: Option<PathBuf>,
+    event_id: Option<String>,
+    custom_dlp_patterns: &[String],
+    raw_action: Option<String>,
+    raw_rule_ids: Option<Vec<String>>,
+) {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::session::resolve_session_id(),
+        action: format!("{:?}", verdict.action),
+        rule_ids: verdict
+            .findings
+            .iter()
+            .map(|f| f.rule_id.to_string())
+            .collect(),
+        command_redacted: redact_command(command, custom_dlp_patterns),
+        bypass_requested: verdict.bypass_requested,
+        bypass_honored: verdict.bypass_honored,
+        interactive: verdict.interactive_detected,
+        policy_path: verdict.policy_path_used.clone(),
+        event_id,
+        tier_reached: verdict.tier_reached,
+        entry_type: "verdict".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        detail: None,
+        elapsed_ms: None,
+        raw_action,
+        raw_rule_ids,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+    };
+
+    let line = match append_to_audit_log(&entry, log_path) {
+        Some(l) => l,
+        None => return,
+    };
 
     // --- Remote audit upload (Phase 10) ---
     // Check if a policy server is configured via env vars. If so, spool the
@@ -182,6 +260,88 @@ pub fn log_verdict(
     if let (Some(url), Some(key)) = (server_url, api_key) {
         crate::audit_upload::spool_and_upload(&line, &url, &key, None, None);
     }
+}
+
+/// Log a hook telemetry event to the audit log. Never panics or changes behavior on failure.
+///
+/// This reuses the same log file and I/O pattern as `log_verdict`, but with
+/// `entry_type = "hook_telemetry"` and `action = "hook"` (sentinel).
+pub fn log_hook_event(
+    integration: &str,
+    hook_type: &str,
+    event: &str,
+    elapsed_ms: Option<f64>,
+    detail: Option<&str>,
+) {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::session::resolve_session_id(),
+        action: "hook".to_string(),
+        rule_ids: vec![],
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "hook_telemetry".to_string(),
+        event: Some(event.to_string()),
+        integration: Some(integration.to_string()),
+        hook_type: Some(hook_type.to_string()),
+        detail: detail.map(String::from),
+        elapsed_ms,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+    };
+
+    append_to_audit_log(&entry, None);
+}
+
+/// Log a trust change (add/remove) to the audit log. Never panics or changes behavior on failure.
+///
+/// This reuses the same log file and I/O pattern as `log_verdict`, but with
+/// `entry_type = "trust_change"` and `action = "trust"` (sentinel).
+pub fn log_trust_change(
+    pattern: &str,
+    rule_id: Option<&str>,
+    trust_action: &str,
+    ttl_expires: Option<&str>,
+    scope: &str,
+) {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::session::resolve_session_id(),
+        action: "trust".to_string(),
+        rule_ids: vec![],
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "trust_change".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        detail: None,
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: Some(pattern.to_string()),
+        trust_rule_id: rule_id.map(String::from),
+        trust_action: Some(trust_action.to_string()),
+        trust_ttl_expires: ttl_expires.map(String::from),
+        trust_scope: Some(scope.to_string()),
+    };
+
+    append_to_audit_log(&entry, None);
 }
 
 fn default_log_path() -> Option<PathBuf> {
@@ -242,6 +402,7 @@ mod tests {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         };
 
         log_verdict(&verdict, "test cmd", Some(log_path.clone()), None, &[]);
@@ -342,6 +503,7 @@ mod tests {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         };
 
         log_verdict(&verdict, "echo hello", Some(log_path), None, &[]);
@@ -386,6 +548,7 @@ mod tests {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         };
 
         log_verdict(&verdict, "test cmd", Some(symlink_path), None, &[]);
