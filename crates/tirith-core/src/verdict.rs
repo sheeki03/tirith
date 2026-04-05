@@ -288,6 +288,11 @@ pub struct Verdict {
     /// Sanitized single-line description of why approval is required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_description: Option<String>,
+
+    // --- Escalation metadata ---
+    /// Human-readable reason when escalation upgraded the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<String>,
 }
 
 /// Per-tier timing information.
@@ -319,6 +324,7 @@ impl Verdict {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         }
     }
 
@@ -354,6 +360,7 @@ impl Verdict {
             approval_fallback: None,
             approval_rule: None,
             approval_description: None,
+            escalation_reason: None,
         }
     }
 }

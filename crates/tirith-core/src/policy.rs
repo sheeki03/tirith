@@ -109,6 +109,14 @@ pub struct Policy {
     #[serde(default)]
     pub strict_warn: bool,
 
+    /// Per-rule action overrides: force action for specific rules (upgrade only: "block").
+    #[serde(default)]
+    pub action_overrides: HashMap<String, String>,
+
+    /// Escalation rules: upgrade action based on session history or finding count.
+    #[serde(default)]
+    pub escalation: Vec<crate::escalation::EscalationRule>,
+
     // --- Policy server (Phase 27, Team) ---
     /// URL of the centralized policy server (e.g., "https://policy.example.com").
     #[serde(default)]
@@ -272,6 +280,8 @@ impl Default for Policy {
             custom_rules: Vec::new(),
             dlp_custom_patterns: Vec::new(),
             strict_warn: false,
+            action_overrides: HashMap::new(),
+            escalation: Vec::new(),
             policy_server_url: None,
             policy_server_api_key: None,
             policy_fetch_fail_mode: None,
@@ -517,6 +527,96 @@ impl Policy {
                     let line = line.trim();
                     if !line.is_empty() && !line.starts_with('#') {
                         self.blocklist.push(line.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load trust entries from trust.json files and merge non-expired entries
+    /// into the policy's allowlist and allowlist_rules.
+    ///
+    /// This is called on the analysis hot path but is READ-ONLY -- no file mutation.
+    pub fn load_trust_entries(&mut self, cwd: Option<&str>) {
+        // User-scope trust store
+        if let Some(config) = config_dir() {
+            let user_trust = config.join("trust.json");
+            self.merge_trust_store(&user_trust);
+        }
+        // Repo-scope trust store
+        if let Some(repo_root) = find_repo_root(cwd) {
+            let repo_trust = repo_root.join(".tirith").join("trust.json");
+            self.merge_trust_store(&repo_trust);
+        }
+    }
+
+    /// Read a trust.json file and merge non-expired entries into the policy.
+    fn merge_trust_store(&mut self, path: &Path) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return, // File doesn't exist or can't be read -- not an error
+        };
+
+        let store: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: trust: corrupt trust store at {} — trust entries skipped: {e}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+
+        let entries = match store.get("entries").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return,
+        };
+
+        let now = chrono::Utc::now();
+
+        for entry in entries {
+            // Check TTL expiry — treat unparseable timestamps as expired
+            if let Some(exp_str) = entry.get("ttl_expires").and_then(|v| v.as_str()) {
+                match chrono::DateTime::parse_from_rfc3339(exp_str) {
+                    Ok(expiry) if expiry < now => continue, // Expired -- skip
+                    Ok(_) => {}                             // Valid, not expired
+                    Err(_) => continue, // Malformed timestamp -- treat as expired
+                }
+            }
+
+            let pattern = match entry.get("pattern").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => continue,
+            };
+
+            let rule_id = entry
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            match rule_id {
+                Some(rid) => {
+                    // Per-rule trust: merge into allowlist_rules
+                    if let Some(existing) = self
+                        .allowlist_rules
+                        .iter_mut()
+                        .find(|r| r.rule_id.eq_ignore_ascii_case(&rid))
+                    {
+                        if !existing.patterns.contains(&pattern) {
+                            existing.patterns.push(pattern);
+                        }
+                    } else {
+                        self.allowlist_rules.push(AllowlistRule {
+                            rule_id: rid,
+                            patterns: vec![pattern],
+                        });
+                    }
+                }
+                None => {
+                    // Global trust: merge into allowlist
+                    if !self.allowlist.contains(&pattern) {
+                        self.allowlist.push(pattern);
                     }
                 }
             }

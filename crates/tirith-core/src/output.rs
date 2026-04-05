@@ -56,7 +56,11 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
         Action::Block => "BLOCKED",
     };
 
-    writeln!(w, "tirith: {action_str}")?;
+    if let Some(ref reason) = verdict.escalation_reason {
+        writeln!(w, "tirith: {action_str} (escalated: {reason})")?;
+    } else {
+        writeln!(w, "tirith: {action_str}")?;
+    }
 
     for finding in &verdict.findings {
         let severity_color = match finding.severity {
@@ -168,7 +172,11 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
         Action::Block => "BLOCKED",
     };
 
-    writeln!(w, "tirith: {action_str}")?;
+    if let Some(ref reason) = verdict.escalation_reason {
+        writeln!(w, "tirith: {action_str} (escalated: {reason})")?;
+    } else {
+        writeln!(w, "tirith: {action_str}")?;
+    }
 
     for finding in &verdict.findings {
         writeln!(

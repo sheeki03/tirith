@@ -56,6 +56,8 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_fail_mode_fields(&policy, &mut issues);
     validate_scan_config(&policy, &mut issues);
     validate_network_entries(&policy, &mut issues);
+    validate_action_overrides(&policy, &mut issues);
+    validate_escalation_rules(&policy, &mut issues);
 
     // Phase 3: check for unknown top-level and nested fields
     validate_unknown_fields(yaml, &mut issues);
@@ -304,6 +306,82 @@ fn parse_ipv6(s: &str) -> bool {
         .all(|g| g.is_empty() || (g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit())))
 }
 
+fn validate_action_overrides(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for (key, value) in &policy.action_overrides {
+        // Validate value: only "block" is allowed
+        if value != "block" {
+            let hint = match value.as_str() {
+                "allow" | "warn" | "warn_ack" => {
+                    " (use severity_overrides to change rule severity instead)"
+                }
+                _ => "",
+            };
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "action_overrides.{key}: invalid value '{value}' \
+                     (only 'block' is supported){hint}"
+                ),
+                field: Some(format!("action_overrides.{key}")),
+            });
+        }
+
+        // Validate key is a known RuleId
+        let parsed: Result<RuleId, _> =
+            serde_json::from_value(serde_json::Value::String(key.clone()));
+        if parsed.is_err() {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!("action_overrides: unknown rule ID '{key}'"),
+                field: Some(format!("action_overrides.{key}")),
+            });
+        }
+    }
+}
+
+fn validate_escalation_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for (i, rule) in policy.escalation.iter().enumerate() {
+        match rule {
+            crate::escalation::EscalationRule::RepeatCount {
+                rule_ids,
+                threshold,
+                ..
+            } => {
+                if *threshold == 0 {
+                    issues.push(PolicyIssue {
+                        level: IssueLevel::Error,
+                        message: format!("escalation[{i}]: threshold must be > 0"),
+                        field: Some(format!("escalation[{i}].threshold")),
+                    });
+                }
+                for rule_id_str in rule_ids {
+                    if rule_id_str == "*" {
+                        continue; // wildcard is valid
+                    }
+                    let parsed: Result<RuleId, _> =
+                        serde_json::from_value(serde_json::Value::String(rule_id_str.clone()));
+                    if parsed.is_err() {
+                        issues.push(PolicyIssue {
+                            level: IssueLevel::Error,
+                            message: format!("escalation[{i}]: unknown rule ID '{rule_id_str}'"),
+                            field: Some(format!("escalation[{i}].rule_ids")),
+                        });
+                    }
+                }
+            }
+            crate::escalation::EscalationRule::MultiMedium { min_findings, .. } => {
+                if *min_findings == 0 {
+                    issues.push(PolicyIssue {
+                        level: IssueLevel::Error,
+                        message: format!("escalation[{i}]: min_findings must be > 0"),
+                        field: Some(format!("escalation[{i}].min_findings")),
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     let known_top_level = [
         "fail_mode",
@@ -324,6 +402,8 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "custom_rules",
         "dlp_custom_patterns",
         "strict_warn",
+        "action_overrides",
+        "escalation",
         "policy_server_url",
         "policy_server_api_key",
         "policy_fetch_fail_mode",
