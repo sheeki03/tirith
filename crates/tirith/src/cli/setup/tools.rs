@@ -36,6 +36,13 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     let hook_content = crate::assets::TIRITH_CHECK_PY;
     fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
 
+    // --update-configs: only refresh hook scripts, skip MCP/settings/shell profile
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Claude Code hook scripts refreshed");
+        return Ok(());
+    }
+
     // Step 2: Merge settings.json with PreToolUse hook
     let settings_path = target.join("settings.json");
     let hook_command = match opts.scope {
@@ -99,6 +106,13 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
 pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
     // 1. Copy gateway YAML
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+
+    // --update-configs: only refresh gateway config, skip MCP registration/shell profile/zshenv
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Codex gateway config refreshed");
+        return Ok(());
+    }
 
     // 2. Register via codex mcp add
     let gw_path_str = gateway_path.display().to_string();
@@ -253,6 +267,16 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
     let hook_content = crate::assets::CURSOR_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
+    // Copy gateway config (refreshed in both full and update-configs mode)
+    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+
+    // --update-configs: only refresh hook scripts and gateway config
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Cursor hook scripts and gateway config refreshed");
+        return Ok(());
+    }
+
     // Merge hooks.json with beforeShellExecution entry
     let hooks_json_path = target.join("hooks.json");
     let hook_cmd = match opts.scope {
@@ -276,8 +300,7 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         true, // Cursor requires "version": 1
     )?;
 
-    // Copy gateway config + merge MCP JSON
-    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+    // Merge MCP JSON
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = target.join("mcp.json");
     merge::merge_mcp_json(
@@ -336,14 +359,23 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
     let hook_content = crate::assets::VSCODE_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
+    // Copy gateway config (refreshed in both full and update-configs mode)
+    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+
+    // --update-configs: only refresh hook scripts and gateway config
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: VS Code hook scripts and gateway config refreshed");
+        return Ok(());
+    }
+
     // Merge settings.json with managed-block hook entry
     let settings_path = target.join("settings.json");
     let hook_cmd = "hooks/tirith-hook.sh".to_string(); // VS Code is project-only
     merge::merge_vscode_settings(&settings_path, &hook_cmd, opts.force, opts.dry_run)?;
 
-    // Copy gateway config + merge MCP JSON
+    // Merge MCP JSON
     // VS Code uses "servers" as the top-level key (not "mcpServers") and requires "type": "stdio"
-    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = cwd.join(".vscode").join("mcp.json");
     merge::merge_mcp_json_with_key(
@@ -417,6 +449,13 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
     let hook_path = hooks_dir.join("tirith-security-guard-gemini.py");
     let hook_content = crate::assets::GEMINI_HOOK_PY;
     fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
+
+    // --update-configs: only refresh hook scripts, skip settings/MCP/shell profile
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Gemini CLI hook scripts refreshed");
+        return Ok(());
+    }
 
     // Step 2: Merge settings.json with BeforeTool hook
     let settings_path = target.join("settings.json");
@@ -494,6 +533,13 @@ pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
     let guard_content = crate::assets::TIRITH_GUARD_TS;
     fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
 
+    // --update-configs: only refresh hook scripts, skip shell profile
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Pi CLI hook scripts refreshed");
+        return Ok(());
+    }
+
     // Step 2: Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
@@ -552,6 +598,13 @@ pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
     let guard_content = crate::assets::OPENCLAW_GUARD_TS;
     fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
 
+    // --update-configs: only refresh hook scripts, skip shell profile
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: OpenClaw hook scripts refreshed");
+        return Ok(());
+    }
+
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
@@ -582,6 +635,16 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
     let hook_content = crate::assets::WINDSURF_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
+    // Copy gateway config (refreshed in both full and update-configs mode)
+    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+
+    // --update-configs: only refresh hook scripts and gateway config
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Windsurf hook scripts and gateway config refreshed");
+        return Ok(());
+    }
+
     // Merge hooks.json with pre_run_command entry (absolute path for user-global)
     let hooks_json_path = target.join("hooks.json");
     let hook_cmd = hooks_dir.join("tirith-hook.sh").display().to_string();
@@ -598,8 +661,7 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         false, // Windsurf doesn't require "version" key
     )?;
 
-    // Copy gateway config + merge MCP JSON
-    let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
+    // Merge MCP JSON
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = target.join("mcp_config.json");
     merge::merge_mcp_json(
@@ -702,6 +764,7 @@ mod tests {
                 dry_run: false,
                 force: false,
                 tirith_bin: "tirith".to_string(),
+                update_configs: false,
             };
 
             setup_gemini_cli(&opts).unwrap();
@@ -754,6 +817,7 @@ mod tests {
                 dry_run: false,
                 force: false,
                 tirith_bin: "tirith".to_string(),
+                update_configs: false,
             };
 
             setup_pi_cli(&opts).unwrap();

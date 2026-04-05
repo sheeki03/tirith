@@ -36,6 +36,21 @@ allowlist: []
 # URL patterns to always block (overrides allowlist)
 blocklist: []
 
+# Force specific rules to block (upgrade only, cannot downgrade)
+# action_overrides:
+#   shortened_url: block
+
+# Escalation: upgrade warnings to blocks based on session history
+# escalation:
+#   - trigger: repeat_count    # block after N warnings for the same rule
+#     rule_ids: ["*"]          # "*" = any rule, or list specific rule IDs
+#     threshold: 5
+#     window_minutes: 60
+#     action: block
+#   - trigger: multi_medium    # block when N+ medium findings on one command
+#     min_findings: 3
+#     action: block
+
 # Glob patterns to ignore during scan
 scan:
   ignore_patterns: []

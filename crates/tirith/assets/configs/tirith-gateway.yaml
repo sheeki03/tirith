@@ -25,14 +25,26 @@ guarded_tools:
 
 policy:
   # What to do when tirith reports a "warn" verdict:
-  #   "deny"    - treat warnings as denials (default, safer)
-  #   "forward" - forward the command unchanged, log warning only
-  warn_action: "deny"
+  #   "forward" - forward the command and inject findings into the response (default)
+  #   "allow"   - synonym for "forward"
+  #   "deny"    - treat warnings as denials (stricter, blocks on Medium/Low findings)
+  warn_action: "forward"
 
   # What to do when tirith analysis fails (timeout, crash, etc):
   #   "open"   - forward the command (fail open, default)
   #   "closed" - deny the command (fail closed, stricter)
   fail_mode: "open"
+
+  # Fail-mode rationale:
+  # The gateway defaults fail-open because it proxies MCP tool calls for AI agents.
+  # A false positive or infrastructure failure (tirith crash, timeout) should not
+  # silently break the user's coding session — the agent would see an opaque denial
+  # with no way to recover. High/Critical findings still block unconditionally
+  # (warn_action only affects Medium/Low).
+  #
+  # Shell hooks (bash, zsh, fish) default fail-closed because they intercept
+  # human-initiated commands where the user can immediately see and respond to a
+  # false positive. The asymmetry is intentional: human-in-the-loop vs autonomous.
 
   # Maximum time (ms) to wait for tirith analysis before applying fail_mode
   timeout_ms: 10000

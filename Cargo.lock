@@ -2599,6 +2599,7 @@ dependencies = [
  "tempfile",
  "tirith-core",
  "tokio",
+ "url",
  "uuid",
 ]
 

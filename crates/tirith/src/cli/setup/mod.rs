@@ -47,6 +47,9 @@ mod run_impl {
         pub force: bool,
         /// `"tirith"` (portable) when on PATH, or absolute path as fallback.
         pub tirith_bin: String,
+        /// When true, only refresh embedded hook scripts and gateway config.
+        /// Skips MCP registration, shell profile installation, and zshenv setup.
+        pub update_configs: bool,
     }
 
     /// Entry point for `tirith setup <tool>`.
@@ -57,8 +60,17 @@ mod run_impl {
         install_zshenv: bool,
         dry_run: bool,
         force: bool,
+        update_configs: bool,
     ) -> i32 {
-        match run_inner(tool, scope, with_mcp, install_zshenv, dry_run, force) {
+        match run_inner(
+            tool,
+            scope,
+            with_mcp,
+            install_zshenv,
+            dry_run,
+            force,
+            update_configs,
+        ) {
             Ok(()) => 0,
             Err(msg) => {
                 eprintln!("tirith: {msg}");
@@ -74,6 +86,7 @@ mod run_impl {
         install_zshenv: bool,
         dry_run: bool,
         force: bool,
+        update_configs: bool,
     ) -> Result<(), String> {
         // --with-mcp only supported for claude-code and gemini-cli;
         // other tools include MCP configuration automatically or don't support it.
@@ -106,13 +119,17 @@ mod run_impl {
             check_binary_on_path("zsh", dry_run)?;
         }
 
+        // --update-configs implies --force for file overwrites
+        let effective_force = force || update_configs;
+
         let opts = SetupOpts {
             scope,
             with_mcp,
             install_zshenv,
             dry_run,
-            force,
+            force: effective_force,
             tirith_bin,
+            update_configs,
         };
 
         match tool {
