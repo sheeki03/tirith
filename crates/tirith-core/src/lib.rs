@@ -29,6 +29,8 @@ pub mod session;
 pub mod session_warnings;
 pub mod text_confusables;
 pub mod threatdb;
+pub mod threatdb_api;
+pub mod threatdb_feeds;
 pub mod tokenize;
 pub mod url_validate;
 pub mod util;

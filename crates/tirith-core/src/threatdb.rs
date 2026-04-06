@@ -55,6 +55,7 @@ const SIG_OFFSET: usize = 108;
 const FINGERPRINT_OFFSET: usize = 76;
 const FINGERPRINT_LEN: usize = 32;
 const DB_FILENAME: &str = "tirith-threatdb.dat";
+const SUPPLEMENTAL_DB_FILENAME: &str = "tirith-threatdb-supplemental.dat";
 /// Re-check file mtime at most every 60 seconds.
 const MTIME_CHECK_INTERVAL_SECS: u64 = 60;
 
@@ -181,10 +182,31 @@ impl ThreatSource {
             Self::TorExit => "Tor Exit Node",
         }
     }
+
+    /// Default confidence level for network-indicator sources (hostnames, IPs).
+    /// Package-level matches carry their own per-record confidence from the DB.
+    pub fn default_confidence(self) -> Confidence {
+        match self {
+            Self::TorExit => Confidence::Medium,
+            Self::OssfMalicious
+            | Self::DatadogMalicious
+            | Self::FeodoTracker
+            | Self::EcosystemsTyposquat
+            | Self::CisaKev
+            | Self::Urlhaus
+            | Self::PhishingArmy
+            | Self::PhishTank
+            | Self::ThreatFoxIoc
+            | Self::FireholIp => Confidence::Confirmed,
+        }
+    }
 }
 
 /// Confidence level for a threat match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 #[repr(u8)]
 pub enum Confidence {
     Low = 0,
@@ -207,10 +229,14 @@ impl Confidence {
 // Match result types
 // ---------------------------------------------------------------------------
 
-/// Result of a package lookup in the threat DB.
+/// Result of a package, hostname, or IP lookup in the threat DB.
+///
+/// `ecosystem` is `Some` for package matches and `None` for hostname/IP matches
+/// (where the concept of ecosystem does not apply).
+/// `all_versions_malicious` is only meaningful for package matches.
 #[derive(Debug, Clone)]
 pub struct ThreatMatch {
-    pub ecosystem: Ecosystem,
+    pub ecosystem: Option<Ecosystem>,
     pub name: String,
     pub source: ThreatSource,
     pub confidence: Confidence,
@@ -227,7 +253,7 @@ pub struct TyposquatMatch {
 }
 
 /// Aggregate statistics about a loaded DB.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreatDbStats {
     pub format_version: u32,
     pub build_timestamp: u64,
@@ -352,6 +378,7 @@ fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
 #[derive(Debug)]
 pub struct ThreatDb {
     data: Vec<u8>,
+    supplemental: Option<Box<ThreatDb>>,
     // Parsed header fields cached for fast access
     format_version: u32,
     build_timestamp: u64,
@@ -470,6 +497,7 @@ impl ThreatDb {
 
         Ok(Self {
             data,
+            supplemental: None,
             format_version: version,
             build_timestamp,
             build_sequence,
@@ -516,6 +544,22 @@ impl ThreatDb {
             }
         }
         policy::data_dir().map(|d| d.join(DB_FILENAME))
+    }
+
+    /// Optional supplemental DB path for user-local keyed feeds compiled on the
+    /// user's machine during `tirith threat-db update`.
+    pub fn supplemental_path() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_SUPPLEMENTAL_PATH") {
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+        policy::data_dir().map(|d| d.join(SUPPLEMENTAL_DB_FILENAME))
+    }
+
+    fn with_supplemental(mut self, supplemental: Option<ThreatDb>) -> Self {
+        self.supplemental = supplemental.map(Box::new);
+        self
     }
 
     // ------------------------------------------------------------------
@@ -568,16 +612,21 @@ impl ThreatDb {
     }
 
     pub fn stats(&self) -> ThreatDbStats {
+        let overlay = self
+            .supplemental
+            .as_deref()
+            .map(|db| db.stats())
+            .unwrap_or_default();
         ThreatDbStats {
             format_version: self.format_version,
             build_timestamp: self.build_timestamp,
             build_sequence: self.build_sequence,
-            package_count: self.pkg_index_count,
-            hostname_count: self.hostname_index_count,
-            ip_count: self.ip_count,
-            typosquat_count: self.typosquat_index_count,
-            popular_count: self.popular_index_count,
-            string_table_bytes: self.string_table_size,
+            package_count: self.pkg_index_count + overlay.package_count,
+            hostname_count: self.hostname_index_count + overlay.hostname_count,
+            ip_count: self.ip_count + overlay.ip_count,
+            typosquat_count: self.typosquat_index_count + overlay.typosquat_count,
+            popular_count: self.popular_index_count + overlay.popular_count,
+            string_table_bytes: self.string_table_size + overlay.string_table_bytes,
         }
     }
 
@@ -673,38 +722,47 @@ impl ThreatDb {
     ) -> Option<ThreatMatch> {
         let target_hash = pkg_key_hash(eco, name.as_bytes());
 
-        // Binary search over the sorted index
-        let idx = self.binary_search_pkg_index(eco, name, target_hash)?;
+        if let Some(idx) = self.binary_search_pkg_index(eco, name, target_hash) {
+            let (data_off, _) = self.pkg_index_entry(idx)?;
+            let rec = self.parse_pkg_record(data_off as usize)?;
 
-        let (data_off, _) = self.pkg_index_entry(idx)?;
-        let rec = self.parse_pkg_record(data_off as usize)?;
-
-        // Version-aware matching
-        match version {
-            Some(v) => {
-                if !rec.all_versions_malicious && !rec.versions.iter().any(|rv| rv == &v) {
-                    return None;
+            // Version-aware matching
+            match version {
+                Some(v) => {
+                    if !rec.all_versions_malicious && !rec.versions.iter().any(|rv| rv == &v) {
+                        return self
+                            .supplemental
+                            .as_deref()
+                            .and_then(|db| db.check_package(eco, name, version));
+                    }
+                }
+                None => {
+                    if !rec.all_versions_malicious {
+                        return self
+                            .supplemental
+                            .as_deref()
+                            .and_then(|db| db.check_package(eco, name, version));
+                    }
                 }
             }
-            None => {
-                if !rec.all_versions_malicious {
-                    return None;
-                }
-            }
+
+            let reference_url = self
+                .read_string_table_entry(rec.reference_offset)
+                .map(String::from);
+
+            return Some(ThreatMatch {
+                ecosystem: Some(rec.ecosystem),
+                name: rec.name.to_string(),
+                source: rec.source,
+                confidence: rec.confidence,
+                reference_url,
+                all_versions_malicious: rec.all_versions_malicious,
+            });
         }
 
-        let reference_url = self
-            .read_string_table_entry(rec.reference_offset)
-            .map(String::from);
-
-        Some(ThreatMatch {
-            ecosystem: rec.ecosystem,
-            name: rec.name.to_string(),
-            source: rec.source,
-            confidence: rec.confidence,
-            reference_url,
-            all_versions_malicious: rec.all_versions_malicious,
-        })
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_package(eco, name, version))
     }
 
     fn binary_search_pkg_index(&self, eco: Ecosystem, name: &str, target_hash: u32) -> Option<u32> {
@@ -742,12 +800,20 @@ impl ThreatDb {
     /// Check a hostname against the threat DB.
     pub fn check_hostname(&self, host: &str) -> Option<ThreatMatch> {
         if self.hostname_index_count == 0 {
-            return None;
+            return self
+                .supplemental
+                .as_deref()
+                .and_then(|db| db.check_hostname(host));
         }
         let normalized = host.to_ascii_lowercase();
         let target_hash = fnv1a_hash(normalized.as_bytes());
 
-        let idx = self.binary_search_hostname_index(&normalized, target_hash)?;
+        let Some(idx) = self.binary_search_hostname_index(&normalized, target_hash) else {
+            return self
+                .supplemental
+                .as_deref()
+                .and_then(|db| db.check_hostname(host));
+        };
         let base = self.hostname_index_offset as usize + idx as usize * HOSTNAME_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
 
@@ -761,10 +827,10 @@ impl ThreatDb {
         }
 
         Some(ThreatMatch {
-            ecosystem: Ecosystem::Npm, // not applicable, placeholder
+            ecosystem: None,
             name: normalized,
+            confidence: source.default_confidence(),
             source,
-            confidence: Confidence::Confirmed,
             reference_url: None,
             all_versions_malicious: false,
         })
@@ -813,18 +879,20 @@ impl ThreatDb {
     /// Check an IPv4 address against the threat DB.
     pub fn check_ip(&self, ip: Ipv4Addr) -> Option<ThreatMatch> {
         if self.ip_count == 0 {
-            return None;
+            return self.supplemental.as_deref().and_then(|db| db.check_ip(ip));
         }
         let target = u32::from(ip);
-        let idx = self.binary_search_ip(target)?;
+        let Some(idx) = self.binary_search_ip(target) else {
+            return self.supplemental.as_deref().and_then(|db| db.check_ip(ip));
+        };
         let base = self.ip_offset as usize + idx as usize * IP_RECORD_SIZE;
         let source = ThreatSource::from_u8(*self.data.get(base + 4)?)?;
 
         Some(ThreatMatch {
-            ecosystem: Ecosystem::Npm, // not applicable, placeholder
+            ecosystem: None,
             name: ip.to_string(),
+            confidence: source.default_confidence(),
             source,
-            confidence: Confidence::Confirmed,
             reference_url: None,
             all_versions_malicious: false,
         })
@@ -853,10 +921,18 @@ impl ThreatDb {
     /// Check a package name against known typosquats.
     pub fn check_typosquat(&self, eco: Ecosystem, name: &str) -> Option<TyposquatMatch> {
         if self.typosquat_index_count == 0 {
-            return None;
+            return self
+                .supplemental
+                .as_deref()
+                .and_then(|db| db.check_typosquat(eco, name));
         }
         let target_hash = pkg_key_hash(eco, name.as_bytes());
-        let idx = self.binary_search_typosquat_index(eco, name, target_hash)?;
+        let Some(idx) = self.binary_search_typosquat_index(eco, name, target_hash) else {
+            return self
+                .supplemental
+                .as_deref()
+                .and_then(|db| db.check_typosquat(eco, name));
+        };
         let base = self.typosquat_index_offset as usize + idx as usize * TYPOSQUAT_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
 
@@ -988,7 +1064,17 @@ impl ThreatDb {
             }
         }
 
-        best
+        let overlay = self
+            .supplemental
+            .as_deref()
+            .and_then(|db| db.check_popular_distance(eco, name));
+
+        // Return whichever result has the smaller edit distance; prefer primary on tie.
+        match (best, overlay) {
+            (Some(a), Some(b)) if b.1 < a.1 => Some(b),
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1054,7 +1140,7 @@ impl ThreatDbCache {
         let last_check = self.last_mtime_check.load(Ordering::Relaxed);
         if now.saturating_sub(last_check) >= MTIME_CHECK_INTERVAL_SECS {
             self.last_mtime_check.store(now, Ordering::Relaxed);
-            if let Some(file_mtime) = file_mtime_epoch() {
+            if let Some(file_mtime) = combined_mtime_epoch() {
                 if file_mtime != self.loaded_mtime.load(Ordering::Relaxed) {
                     self.reload(file_mtime);
                 }
@@ -1064,7 +1150,7 @@ impl ThreatDbCache {
     }
 
     fn force_reload(&self) {
-        if let Some(file_mtime) = file_mtime_epoch() {
+        if let Some(file_mtime) = combined_mtime_epoch() {
             self.reload(file_mtime);
         }
     }
@@ -1078,13 +1164,30 @@ impl ThreatDbCache {
             .unwrap_or(0);
 
         match ThreatDb::load_from_data_dir() {
-            Ok(new_db) => {
-                if let Err(e) = new_db.verify_signature() {
+            Ok(primary_db) => {
+                if let Err(e) = primary_db.verify_signature() {
                     eprintln!(
                         "tirith: warning: threat DB failed signature verification, ignoring update: {e}"
                     );
                     return;
                 }
+                // Supplemental DBs are user-local overlays built from optional keyed feeds.
+                // They are intentionally not verified against the pinned release signing key:
+                // `load_from_path()` still validates the binary structure/header/version, but
+                // authenticity is anchored to the local machine policy and filesystem, not CI.
+                let supplemental_db = ThreatDb::supplemental_path()
+                    .filter(|path| path.exists())
+                    .and_then(|path| match ThreatDb::load_from_path(&path, 0) {
+                        Ok(db) => Some(db),
+                        Err(e) => {
+                            eprintln!(
+                                "tirith: warning: failed to load supplemental threat DB {}: {e}",
+                                path.display()
+                            );
+                            None
+                        }
+                    });
+                let new_db = primary_db.with_supplemental(supplemental_db);
                 // Skip rollback check on reload — the from_bytes already checks min_sequence=0.
                 // We accept any newer sequence.
                 if new_db.build_sequence > min_seq || min_seq == 0 {
@@ -1116,6 +1219,21 @@ fn file_mtime_epoch() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
+}
+
+fn combined_mtime_epoch() -> Option<u64> {
+    let primary = file_mtime_epoch();
+    let supplemental = ThreatDb::supplemental_path()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // A supplemental DB is never authoritative on its own, so we only expose a
+    // combined mtime when the primary signed DB exists.
+    primary
+        .map(|mtime| mtime.rotate_left(13) ^ supplemental.rotate_left(29) ^ 0x5448_5245_4154_4442)
 }
 
 // ---------------------------------------------------------------------------
@@ -1584,6 +1702,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper: create a writer, add test data, build, and return a ThreatDb.
     fn build_test_db(signing_key: &SigningKey) -> ThreatDb {
@@ -2100,6 +2221,139 @@ mod tests {
             "duplicate packages should be deduped"
         );
         assert_eq!(db.stats().ip_count, 1, "duplicate IPs should be deduped");
+    }
+
+    #[test]
+    fn test_supplemental_overlay_lookup_and_stats() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_package(
+            Ecosystem::Npm,
+            "primary-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let primary = ThreatDb::from_bytes(primary_writer.build(&key).expect("primary build"), 0)
+            .expect("primary load");
+
+        let mut supplemental_writer = ThreatDbWriter::new(1700000001, 1);
+        supplemental_writer.add_package(
+            Ecosystem::PyPI,
+            "overlay-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        supplemental_writer.add_hostname("overlay.example", ThreatSource::Urlhaus);
+        supplemental_writer.add_ip(Ipv4Addr::new(203, 0, 113, 77), ThreatSource::ThreatFoxIoc);
+        supplemental_writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
+        supplemental_writer.add_popular(Ecosystem::Npm, "react");
+
+        let supplemental = ThreatDb::from_bytes(
+            supplemental_writer.build(&key).expect("supplemental build"),
+            0,
+        )
+        .expect("supplemental load");
+
+        let db = primary.with_supplemental(Some(supplemental));
+
+        assert!(db
+            .check_package(Ecosystem::Npm, "primary-pkg", Some("1.0.0"))
+            .is_some());
+        assert!(db
+            .check_package(Ecosystem::PyPI, "overlay-pkg", Some("2.0.0"))
+            .is_some());
+        assert!(db.check_hostname("overlay.example").is_some());
+        assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 77)).is_some());
+        assert!(db.check_typosquat(Ecosystem::Npm, "reacct").is_some());
+        assert_eq!(
+            db.check_popular_distance(Ecosystem::Npm, "reac"),
+            Some(("react".to_string(), 1))
+        );
+
+        let stats = db.stats();
+        assert_eq!(stats.package_count, 2);
+        assert_eq!(stats.hostname_count, 1);
+        assert_eq!(stats.ip_count, 1);
+        assert_eq!(stats.typosquat_count, 1);
+        assert_eq!(stats.popular_count, 1);
+    }
+
+    #[test]
+    fn test_supplemental_overlay_falls_through_on_primary_version_mismatch() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_package(
+            Ecosystem::Npm,
+            "shared-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let primary = ThreatDb::from_bytes(primary_writer.build(&key).expect("primary build"), 0)
+            .expect("primary load");
+
+        let mut supplemental_writer = ThreatDbWriter::new(1700000001, 1);
+        supplemental_writer.add_package(
+            Ecosystem::Npm,
+            "shared-pkg",
+            &["2.0.0"],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let supplemental = ThreatDb::from_bytes(
+            supplemental_writer.build(&key).expect("supplemental build"),
+            0,
+        )
+        .expect("supplemental load");
+
+        let db = primary.with_supplemental(Some(supplemental));
+        let threat = db
+            .check_package(Ecosystem::Npm, "shared-pkg", Some("2.0.0"))
+            .expect("supplemental version should match");
+        assert_eq!(threat.source, ThreatSource::DatadogMalicious);
+    }
+
+    #[test]
+    fn test_combined_mtime_requires_primary_db() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary.dat");
+        let supplemental = tmp.path().join("supplemental.dat");
+
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_PATH", &primary);
+            std::env::set_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH", &supplemental);
+        }
+
+        assert_eq!(combined_mtime_epoch(), None);
+
+        std::fs::write(&supplemental, b"overlay").unwrap();
+        assert_eq!(combined_mtime_epoch(), None);
+
+        std::fs::remove_file(&supplemental).unwrap();
+        std::fs::write(&primary, b"primary").unwrap();
+        let primary_only = combined_mtime_epoch().expect("primary mtime");
+
+        std::fs::write(&supplemental, b"overlay-updated").unwrap();
+        let combined = combined_mtime_epoch().expect("combined mtime");
+        assert_ne!(primary_only, combined);
+
+        unsafe {
+            std::env::remove_var("TIRITH_THREATDB_PATH");
+            std::env::remove_var("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        }
     }
 
     // ----- String table -----
