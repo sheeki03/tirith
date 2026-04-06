@@ -20,6 +20,10 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
+use tirith_core::threatdb_feeds::{
+    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
+    parse_urlhaus_csv,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -57,6 +61,26 @@ struct Cli {
     /// popular_packages.csv (default: built-in asset)
     #[arg(long)]
     popular: Option<PathBuf>,
+
+    /// URLhaus bulk CSV export (Phase B)
+    #[arg(long)]
+    urlhaus: Option<PathBuf>,
+
+    /// ThreatFox full CSV zip export (Phase B)
+    #[arg(long)]
+    threatfox: Option<PathBuf>,
+
+    /// Phishing Army blocklist text file (Phase B)
+    #[arg(long)]
+    phishing_army: Option<PathBuf>,
+
+    /// PhishTank verified CSV (Phase B)
+    #[arg(long)]
+    phishtank: Option<PathBuf>,
+
+    /// Tor bulk exit list (Phase B)
+    #[arg(long)]
+    tor_exit: Option<PathBuf>,
 
     /// Env var name containing Ed25519 private key (base64-encoded)
     #[arg(long)]
@@ -547,6 +571,96 @@ fn parse_cisa_kev(path: &Path) -> Vec<KevVulnerability> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase B feed parsers
+// ---------------------------------------------------------------------------
+
+fn parse_urlhaus_file(path: &Path) -> Vec<String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("warning: cannot open URLhaus file {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+
+    match parse_urlhaus_csv(file) {
+        Ok(entries) => entries.hostnames,
+        Err(e) => {
+            eprintln!("warning: cannot parse URLhaus CSV {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn parse_threatfox_file(path: &Path) -> (Vec<String>, Vec<Ipv4Addr>) {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot open ThreatFox file {}: {e}",
+                path.display()
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    match parse_threatfox_zip(file) {
+        Ok(entries) => (entries.hostnames, entries.ips),
+        Err(e) => {
+            eprintln!(
+                "warning: cannot parse ThreatFox ZIP {}: {e}",
+                path.display()
+            );
+            (Vec::new(), Vec::new())
+        }
+    }
+}
+
+fn parse_blocklist_file(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_domain_blocklist(&contents).hostnames,
+        Err(e) => {
+            eprintln!("warning: cannot read blocklist {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn parse_phishtank_file(path: &Path) -> Vec<String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot open PhishTank file {}: {e}",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    match parse_phishtank_csv(file) {
+        Ok(entries) => entries.hostnames,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot parse PhishTank CSV {}: {e}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn parse_tor_exit_file(path: &Path) -> Vec<Ipv4Addr> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_tor_exit_list(&contents).ips,
+        Err(e) => {
+            eprintln!("warning: cannot read Tor exit list {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ecosyste.ms typosquats CSV parser
 // ---------------------------------------------------------------------------
 
@@ -921,6 +1035,52 @@ fn main() {
     let popular = parse_popular_csv(cli.popular.as_deref());
     eprintln!("    {} popular packages", popular.len());
 
+    // 8. Phase B hostname/IP feeds
+    let urlhaus_hosts = if let Some(ref path) = cli.urlhaus {
+        eprintln!("  parsing URLhaus hostnames from {}", path.display());
+        let hosts = parse_urlhaus_file(path);
+        eprintln!("    {} hostnames", hosts.len());
+        hosts
+    } else {
+        Vec::new()
+    };
+
+    let (threatfox_hosts, threatfox_ips) = if let Some(ref path) = cli.threatfox {
+        eprintln!("  parsing ThreatFox IOCs from {}", path.display());
+        let parsed = parse_threatfox_file(path);
+        eprintln!("    {} hostnames, {} IPs", parsed.0.len(), parsed.1.len());
+        parsed
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let phishing_army_hosts = if let Some(ref path) = cli.phishing_army {
+        eprintln!("  parsing Phishing Army blocklist from {}", path.display());
+        let hosts = parse_blocklist_file(path);
+        eprintln!("    {} hostnames", hosts.len());
+        hosts
+    } else {
+        Vec::new()
+    };
+
+    let phishtank_hosts = if let Some(ref path) = cli.phishtank {
+        eprintln!("  parsing PhishTank CSV from {}", path.display());
+        let hosts = parse_phishtank_file(path);
+        eprintln!("    {} hostnames", hosts.len());
+        hosts
+    } else {
+        Vec::new()
+    };
+
+    let tor_exit_ips = if let Some(ref path) = cli.tor_exit {
+        eprintln!("  parsing Tor exit nodes from {}", path.display());
+        let ips = parse_tor_exit_file(path);
+        eprintln!("    {} IPs", ips.len());
+        ips
+    } else {
+        Vec::new()
+    };
+
     // Load signing key
     let signing_key = load_signing_key(cli.sign_key_env.as_deref(), cli.sign_key_file.as_deref());
 
@@ -954,6 +1114,30 @@ fn main() {
     // Feed IPs
     for ip in &ips {
         writer.add_ip(*ip, ThreatSource::FeodoTracker);
+    }
+
+    for host in &urlhaus_hosts {
+        writer.add_hostname(host, ThreatSource::Urlhaus);
+    }
+
+    for host in &threatfox_hosts {
+        writer.add_hostname(host, ThreatSource::ThreatFoxIoc);
+    }
+
+    for ip in &threatfox_ips {
+        writer.add_ip(*ip, ThreatSource::ThreatFoxIoc);
+    }
+
+    for host in &phishing_army_hosts {
+        writer.add_hostname(host, ThreatSource::PhishingArmy);
+    }
+
+    for host in &phishtank_hosts {
+        writer.add_hostname(host, ThreatSource::PhishTank);
+    }
+
+    for ip in &tor_exit_ips {
+        writer.add_ip(*ip, ThreatSource::TorExit);
     }
 
     // Feed typosquats

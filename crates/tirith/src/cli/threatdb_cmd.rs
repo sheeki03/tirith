@@ -1,15 +1,19 @@
 //! CLI subcommands for threat DB management: update, status, and background auto-update.
 
-use std::io::Write as _;
+use std::io::{Cursor, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use sha2::{Digest, Sha256};
 
 use tirith_core::policy;
-use tirith_core::threatdb::ThreatDb;
+use tirith_core::threatdb::{ThreatDb, ThreatDbWriter, ThreatSource};
+use tirith_core::threatdb_feeds::{
+    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
+    parse_urlhaus_csv,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,6 +38,10 @@ const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
 /// HTTP timeout for DB download.
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+/// HTTP timeout for Phase B supplemental feed downloads.
+const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+/// Max bytes read from any single supplemental feed response.
+const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = 256 * 1024 * 1024;
 
 const LOCKFILE_NAME: &str = "threatdb-update.lock";
 const NEXT_CHECK_FILE: &str = "threatdb-next-check-at";
@@ -42,6 +50,14 @@ const SPAWNED_AT_FILE: &str = "threatdb-spawned-at";
 const SPAWNED_AT_DEDUP_SECS: u64 = 30;
 /// Backoff interval on failure (1 hour).
 const BACKOFF_SECS: u64 = 3600;
+const URLHAUS_EXPORT_TEMPLATE: &str =
+    "https://urlhaus-api.abuse.ch/files/exports/full.csv?auth-key={auth_key}";
+const THREATFOX_EXPORT_TEMPLATE: &str =
+    "https://threatfox-api.abuse.ch/files/exports/full.csv.zip?auth-key={auth_key}";
+const PHISHING_ARMY_URL: &str =
+    "https://phishing.army/download/phishing_army_blocklist_extended.txt";
+const PHISHTANK_URL: &str = "https://data.phishtank.com/data/online-valid.csv";
+const TOR_EXIT_URL: &str = "https://check.torproject.org/torbulkexitlist";
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -184,7 +200,261 @@ fn do_update(force: bool) -> Result<(), String> {
         manifest.version, total_entries
     );
 
+    if let Err(e) = update_supplemental_db(&policy::Policy::discover(None)) {
+        eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
+    }
+
     Ok(())
+}
+
+#[derive(Default)]
+struct SupplementalEntries {
+    hostnames: Vec<(String, ThreatSource)>,
+    ips: Vec<(std::net::Ipv4Addr, ThreatSource)>,
+}
+
+impl SupplementalEntries {
+    fn is_empty(&self) -> bool {
+        self.hostnames.is_empty() && self.ips.is_empty()
+    }
+
+    /// Merge parsed feed entries, tagging each with the given source.
+    /// Returns the total number of entries ingested.
+    fn ingest(
+        &mut self,
+        entries: tirith_core::threatdb_feeds::FeedEntries,
+        source: ThreatSource,
+    ) -> usize {
+        let count = entries.hostnames.len() + entries.ips.len();
+        self.hostnames
+            .extend(entries.hostnames.into_iter().map(|h| (h, source)));
+        self.ips
+            .extend(entries.ips.into_iter().map(|ip| (ip, source)));
+        count
+    }
+}
+
+fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
+    let supplemental_path = match ThreatDb::supplemental_path() {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+
+    let abusech_enabled = policy
+        .threat_intel
+        .abusech_auth_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let phishing_enabled = policy.threat_intel.phishing_army_enabled;
+
+    if !abusech_enabled && !phishing_enabled {
+        let _ = std::fs::remove_file(&supplemental_path);
+        ThreatDb::refresh_cache();
+        return Ok(());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS,
+        ))
+        .build()
+        .map_err(|e| format!("supplemental feed HTTP client error: {e}"))?;
+
+    let mut supplemental = SupplementalEntries::default();
+    let mut attempted_feeds = 0usize;
+
+    if let Some(auth_key) = policy.threat_intel.abusech_auth_key.as_deref() {
+        if !auth_key.trim().is_empty() {
+            attempted_feeds += 1;
+            log_feed_result(
+                "URLhaus",
+                fetch_urlhaus_feed(&client, auth_key.trim(), &mut supplemental),
+            );
+            attempted_feeds += 1;
+            log_feed_result(
+                "ThreatFox",
+                fetch_threatfox_feed(&client, auth_key.trim(), &mut supplemental),
+            );
+        }
+    }
+
+    if policy.threat_intel.phishing_army_enabled {
+        attempted_feeds += 1;
+        log_feed_result(
+            "Phishing Army",
+            fetch_phishing_army_feed(&client, &mut supplemental),
+        );
+        attempted_feeds += 1;
+        log_feed_result(
+            "PhishTank",
+            fetch_phishtank_feed(&client, &mut supplemental),
+        );
+    }
+
+    // At least one group is enabled (early return above handles the disabled case),
+    // so always fetch Tor exit nodes as a supplemental IP signal.
+    attempted_feeds += 1;
+    log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental));
+
+    if supplemental.is_empty() {
+        eprintln!(
+            "tirith: warning: supplemental feeds produced no IOC data across {attempted_feeds} attempted feed(s); leaving existing supplemental threat DB unchanged"
+        );
+        return Ok(());
+    }
+
+    let mut writer = ThreatDbWriter::new(unix_now(), 0);
+    for (host, source) in &supplemental.hostnames {
+        writer.add_hostname(host, *source);
+    }
+    for (ip, source) in &supplemental.ips {
+        writer.add_ip(*ip, *source);
+    }
+
+    if let Some(parent) = supplemental_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create supplemental DB directory: {e}"))?;
+    }
+    let data = writer
+        .build(&local_overlay_signing_key())
+        .map_err(|e| format!("failed to build supplemental threat DB: {e}"))?;
+    atomic_write(&supplemental_path, &data)?;
+    ThreatDb::refresh_cache();
+    eprintln!(
+        "tirith: supplemental threat DB updated ({} hostnames, {} IPs)",
+        supplemental.hostnames.len(),
+        supplemental.ips.len()
+    );
+    Ok(())
+}
+
+fn log_feed_result(feed_name: &str, result: Result<usize, String>) {
+    match result {
+        Ok(0) => eprintln!("tirith: warning: {feed_name} feed returned no entries"),
+        Ok(_) => {}
+        Err(e) => eprintln!("tirith: warning: {feed_name} feed failed: {e}"),
+    }
+}
+
+fn fetch_urlhaus_feed(
+    client: &reqwest::blocking::Client,
+    auth_key: &str,
+    supplemental: &mut SupplementalEntries,
+) -> Result<usize, String> {
+    let url = URLHAUS_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
+    let body = fetch_text(client, &url)?;
+    let entries = parse_urlhaus_csv(Cursor::new(body.into_bytes()))
+        .map_err(|e| format!("URLhaus parse failed: {e}"))?;
+    Ok(supplemental.ingest(entries, ThreatSource::Urlhaus))
+}
+
+fn fetch_threatfox_feed(
+    client: &reqwest::blocking::Client,
+    auth_key: &str,
+    supplemental: &mut SupplementalEntries,
+) -> Result<usize, String> {
+    let url = THREATFOX_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
+    let zip_bytes = fetch_bytes(client, &url)?;
+    let entries = parse_threatfox_zip(Cursor::new(zip_bytes))?;
+    Ok(supplemental.ingest(entries, ThreatSource::ThreatFoxIoc))
+}
+
+fn fetch_phishing_army_feed(
+    client: &reqwest::blocking::Client,
+    supplemental: &mut SupplementalEntries,
+) -> Result<usize, String> {
+    let body = fetch_text(client, PHISHING_ARMY_URL)?;
+    let entries = parse_domain_blocklist(&body);
+    Ok(supplemental.ingest(entries, ThreatSource::PhishingArmy))
+}
+
+fn fetch_phishtank_feed(
+    client: &reqwest::blocking::Client,
+    supplemental: &mut SupplementalEntries,
+) -> Result<usize, String> {
+    let body = fetch_text(client, PHISHTANK_URL)?;
+    let entries = parse_phishtank_csv(Cursor::new(body.into_bytes()))
+        .map_err(|e| format!("PhishTank parse failed: {e}"))?;
+    Ok(supplemental.ingest(entries, ThreatSource::PhishTank))
+}
+
+fn fetch_tor_exit_feed(
+    client: &reqwest::blocking::Client,
+    supplemental: &mut SupplementalEntries,
+) -> Result<usize, String> {
+    let body = fetch_text(client, TOR_EXIT_URL)?;
+    let entries = parse_tor_exit_list(&body);
+    Ok(supplemental.ingest(entries, ThreatSource::TorExit))
+}
+
+/// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for safe
+/// use in log/error messages.
+fn redact_url(url: &str) -> String {
+    if let Some(q) = url.find('?') {
+        format!("{}?<redacted>", &url[..q])
+    } else {
+        url.to_string()
+    }
+}
+
+fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
+    let bytes = fetch_bytes(client, url)?;
+    let safe = redact_url(url);
+    String::from_utf8(bytes)
+        .map_err(|e| format!("failed to decode UTF-8 response body for {safe}: {e}"))
+}
+
+fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    let safe = redact_url(url);
+    let response = client
+        .get(url)
+        .header(
+            "User-Agent",
+            format!("tirith/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .and_then(|resp| resp.error_for_status())
+        .map_err(|e| format!("fetch failed for {safe}: {e}"))?;
+
+    let content_length = response.content_length();
+    read_bounded_bytes(response, &safe, content_length, MAX_SUPPLEMENTAL_FEED_SIZE)
+}
+
+fn read_bounded_bytes<R: std::io::Read>(
+    reader: R,
+    url: &str,
+    content_length: Option<u64>,
+    max_size: u64,
+) -> Result<Vec<u8>, String> {
+    if content_length.is_some_and(|len| len > max_size) {
+        return Err(format!(
+            "response body for {url} is too large: {content_length:?} bytes exceeds {max_size}"
+        ));
+    }
+
+    let mut limited = reader.take(max_size + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read response body for {url}: {e}"))?;
+
+    if bytes.len() as u64 > max_size {
+        return Err(format!(
+            "response body for {url} exceeded max size of {max_size} bytes"
+        ));
+    }
+
+    Ok(bytes)
+}
+
+fn local_overlay_signing_key() -> SigningKey {
+    // This key is not an authenticity root. It only satisfies the on-disk
+    // ThreatDb format for a mutable, user-local supplemental overlay that is
+    // intentionally loaded without pinned-key signature verification.
+    let digest = Sha256::digest(b"tirith-local-supplemental-threatdb-v1");
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&digest[..32]);
+    SigningKey::from_bytes(&key_bytes)
 }
 
 /// Run the background update (called with --background flag).
@@ -1863,5 +2133,29 @@ mod tests {
         let _ = fetch_with_state(&url, tmp.path());
 
         mock.assert(); // Fails if User-Agent didn't match
+    }
+
+    #[test]
+    fn read_bounded_bytes_rejects_declared_oversize_body() {
+        let err = super::read_bounded_bytes(
+            std::io::Cursor::new(b"abcd".to_vec()),
+            "https://example.test/feed",
+            Some(10),
+            4,
+        )
+        .unwrap_err();
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn read_bounded_bytes_rejects_stream_that_exceeds_limit() {
+        let err = super::read_bounded_bytes(
+            std::io::Cursor::new(b"abcde".to_vec()),
+            "https://example.test/feed",
+            None,
+            4,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeded max size"));
     }
 }
