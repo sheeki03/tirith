@@ -646,21 +646,68 @@ pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
     ip_str.parse::<Ipv4Addr>().ok()
 }
 
-/// Confidence level label for evidence output.
-fn confidence_label(c: threatdb::Confidence) -> &'static str {
-    match c {
-        threatdb::Confidence::Confirmed => "confirmed",
-        threatdb::Confidence::Medium => "medium",
-        threatdb::Confidence::Low => "low",
-    }
-}
-
 /// Map threat-DB confidence to finding severity.
 fn confidence_to_severity(c: threatdb::Confidence) -> Severity {
     match c {
         threatdb::Confidence::Confirmed => Severity::Critical,
         threatdb::Confidence::Medium => Severity::Medium,
         threatdb::Confidence::Low => Severity::Medium,
+    }
+}
+
+fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'static str) {
+    match source {
+        threatdb::ThreatSource::Urlhaus => (
+            RuleId::ThreatMaliciousUrl,
+            Severity::High,
+            "malicious hostname",
+        ),
+        threatdb::ThreatSource::PhishingArmy | threatdb::ThreatSource::PhishTank => (
+            RuleId::ThreatPhishingUrl,
+            Severity::High,
+            "phishing hostname",
+        ),
+        threatdb::ThreatSource::ThreatFoxIoc => {
+            (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC hostname")
+        }
+        // Phase A sources (package/IP-oriented) and FireHOL are not expected to
+        // appear on hostname records, but map defensively rather than using a
+        // catch-all so the compiler flags new variants.
+        threatdb::ThreatSource::OssfMalicious
+        | threatdb::ThreatSource::DatadogMalicious
+        | threatdb::ThreatSource::FeodoTracker
+        | threatdb::ThreatSource::EcosystemsTyposquat
+        | threatdb::ThreatSource::CisaKev
+        | threatdb::ThreatSource::FireholIp
+        | threatdb::ThreatSource::TorExit => (
+            RuleId::ThreatMaliciousUrl,
+            Severity::High,
+            "malicious hostname",
+        ),
+    }
+}
+
+fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'static str) {
+    match source {
+        threatdb::ThreatSource::TorExit => {
+            (RuleId::ThreatTorExitNode, Severity::Medium, "Tor exit node")
+        }
+        threatdb::ThreatSource::ThreatFoxIoc => {
+            (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC IP")
+        }
+        // Phase A sources (package/hostname-oriented) and phishing feeds are not
+        // expected on IP records, but list explicitly for exhaustive matching.
+        threatdb::ThreatSource::OssfMalicious
+        | threatdb::ThreatSource::DatadogMalicious
+        | threatdb::ThreatSource::FeodoTracker
+        | threatdb::ThreatSource::EcosystemsTyposquat
+        | threatdb::ThreatSource::CisaKev
+        | threatdb::ThreatSource::Urlhaus
+        | threatdb::ThreatSource::PhishingArmy
+        | threatdb::ThreatSource::PhishTank
+        | threatdb::ThreatSource::FireholIp => {
+            (RuleId::ThreatMaliciousIp, Severity::High, "malicious IP")
+        }
     }
 }
 
@@ -709,7 +756,7 @@ pub fn check(
                 evidence: vec![Evidence::ThreatIntel {
                     source: m.source.label().to_string(),
                     threat_type: "malicious_package".to_string(),
-                    confidence: confidence_label(m.confidence).to_string(),
+                    confidence: m.confidence,
                     reference: m.reference_url,
                 }],
                 human_view: None,
@@ -735,7 +782,7 @@ pub fn check(
                 evidence: vec![Evidence::ThreatIntel {
                     source: "ecosyste.ms Typosquats".to_string(),
                     threat_type: "typosquat".to_string(),
-                    confidence: "confirmed".to_string(),
+                    confidence: threatdb::Confidence::Confirmed,
                     reference: None,
                 }],
                 human_view: None,
@@ -762,7 +809,7 @@ pub fn check(
                 evidence: vec![Evidence::ThreatIntel {
                     source: "popular package names".to_string(),
                     threat_type: "similar_name".to_string(),
-                    confidence: "low".to_string(),
+                    confidence: threatdb::Confidence::Low,
                     reference: None,
                 }],
                 human_view: None,
@@ -779,10 +826,11 @@ pub fn check(
         if let Some(host) = url_info.parsed.host() {
             // Check hostname against threat DB (Phase B data, empty in Phase A but wired)
             if let Some(m) = db.check_hostname(host) {
+                let (rule_id, severity, threat_type) = hostname_rule_for_source(m.source);
                 findings.push(Finding {
-                    rule_id: RuleId::ThreatMaliciousUrl,
-                    severity: Severity::High,
-                    title: format!("Malicious hostname detected: {}", host),
+                    rule_id,
+                    severity,
+                    title: format!("Threat intelligence hostname match: {}", host),
                     description: format!(
                         "Hostname '{}' appears in threat intelligence feed ({}).",
                         host,
@@ -790,8 +838,8 @@ pub fn check(
                     ),
                     evidence: vec![Evidence::ThreatIntel {
                         source: m.source.label().to_string(),
-                        threat_type: "malicious_hostname".to_string(),
-                        confidence: confidence_label(m.confidence).to_string(),
+                        threat_type: threat_type.to_string(),
+                        confidence: m.confidence,
                         reference: m.reference_url,
                     }],
                     human_view: None,
@@ -805,19 +853,20 @@ pub fn check(
             if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
+                        let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
                         findings.push(Finding {
-                            rule_id: RuleId::ThreatMaliciousIp,
-                            severity: Severity::High,
-                            title: format!("Known malicious IP in URL: {}", ip),
+                            rule_id,
+                            severity,
+                            title: format!("Threat intelligence IP match in URL: {}", ip),
                             description: format!(
-                                "IP address {} (from URL) is flagged by {} as part of botnet C2 infrastructure.",
+                                "IP address {} (from URL) is flagged by {}.",
                                 ip,
                                 m.source.label()
                             ),
                             evidence: vec![Evidence::ThreatIntel {
                                 source: m.source.label().to_string(),
-                                threat_type: "malicious_ip".to_string(),
-                                confidence: confidence_label(m.confidence).to_string(),
+                                threat_type: threat_type.to_string(),
+                                confidence: m.confidence,
                                 reference: m.reference_url,
                             }],
                             human_view: None,
@@ -837,19 +886,20 @@ pub fn check(
             if let Some(ip) = extract_ipv4_from_token(arg) {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
+                        let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
                         findings.push(Finding {
-                            rule_id: RuleId::ThreatMaliciousIp,
-                            severity: Severity::High,
-                            title: format!("Known malicious IP: {}", ip),
+                            rule_id,
+                            severity,
+                            title: format!("Threat intelligence IP match: {}", ip),
                             description: format!(
-                                "IP address {} is flagged by {} as part of botnet C2 infrastructure.",
+                                "IP address {} is flagged by {}.",
                                 ip,
                                 m.source.label()
                             ),
                             evidence: vec![Evidence::ThreatIntel {
                                 source: m.source.label().to_string(),
-                                threat_type: "malicious_ip".to_string(),
-                                confidence: confidence_label(m.confidence).to_string(),
+                                threat_type: threat_type.to_string(),
+                                confidence: m.confidence,
                                 reference: m.reference_url,
                             }],
                             human_view: None,
@@ -1316,5 +1366,54 @@ mod tests {
     fn check_returns_empty_without_db() {
         let findings = check("pip install malicious-pkg", ShellType::Posix, &[], None);
         assert!(findings.is_empty(), "check() must be fail-open without DB");
+    }
+
+    // ── Rule mapping tests ──────────────────────────────────────────────
+
+    #[test]
+    fn hostname_rule_urlhaus_maps_to_malicious_url() {
+        let (rule, sev, _) = hostname_rule_for_source(threatdb::ThreatSource::Urlhaus);
+        assert_eq!(rule, RuleId::ThreatMaliciousUrl);
+        assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn hostname_rule_phishing_sources_map_to_phishing_url() {
+        for source in [
+            threatdb::ThreatSource::PhishingArmy,
+            threatdb::ThreatSource::PhishTank,
+        ] {
+            let (rule, sev, _) = hostname_rule_for_source(source);
+            assert_eq!(rule, RuleId::ThreatPhishingUrl);
+            assert_eq!(sev, Severity::High);
+        }
+    }
+
+    #[test]
+    fn hostname_rule_threatfox_maps_to_ioc() {
+        let (rule, sev, _) = hostname_rule_for_source(threatdb::ThreatSource::ThreatFoxIoc);
+        assert_eq!(rule, RuleId::ThreatThreatFoxIoc);
+        assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn ip_rule_tor_exit_maps_to_medium() {
+        let (rule, sev, _) = ip_rule_for_source(threatdb::ThreatSource::TorExit);
+        assert_eq!(rule, RuleId::ThreatTorExitNode);
+        assert_eq!(sev, Severity::Medium);
+    }
+
+    #[test]
+    fn ip_rule_threatfox_maps_to_ioc() {
+        let (rule, sev, _) = ip_rule_for_source(threatdb::ThreatSource::ThreatFoxIoc);
+        assert_eq!(rule, RuleId::ThreatThreatFoxIoc);
+        assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn ip_rule_feodo_maps_to_malicious_ip() {
+        let (rule, sev, _) = ip_rule_for_source(threatdb::ThreatSource::FeodoTracker);
+        assert_eq!(rule, RuleId::ThreatMaliciousIp);
+        assert_eq!(sev, Severity::High);
     }
 }

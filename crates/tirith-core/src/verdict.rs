@@ -203,7 +203,7 @@ pub enum Evidence {
     ThreatIntel {
         source: String,
         threat_type: String,
-        confidence: String,
+        confidence: crate::threatdb::Confidence,
         #[serde(skip_serializing_if = "Option::is_none")]
         reference: Option<String>,
     },
@@ -276,6 +276,41 @@ impl Action {
             Action::Warn => 2,
             Action::WarnAck => 3,
         }
+    }
+
+    pub fn rank(self) -> u8 {
+        match self {
+            Action::Allow => 0,
+            Action::Warn | Action::WarnAck => 1,
+            Action::Block => 2,
+        }
+    }
+}
+
+pub fn action_from_findings(findings: &[Finding]) -> Action {
+    if findings.is_empty() {
+        return Action::Allow;
+    }
+
+    let max_severity = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Info);
+
+    match max_severity {
+        Severity::Critical | Severity::High => Action::Block,
+        Severity::Medium | Severity::Low => Action::Warn,
+        Severity::Info => Action::Allow,
+    }
+}
+
+pub fn upgraded_action_from_findings(findings: &[Finding], current: Action) -> Action {
+    let derived = action_from_findings(findings);
+    if derived.rank() > current.rank() {
+        derived
+    } else {
+        current
     }
 }
 
@@ -353,20 +388,7 @@ impl Verdict {
 
     /// Determine action from findings: max severity → action mapping.
     pub fn from_findings(findings: Vec<Finding>, tier_reached: u8, timings: Timings) -> Self {
-        let action = if findings.is_empty() {
-            Action::Allow
-        } else {
-            let max_severity = findings
-                .iter()
-                .map(|f| f.severity)
-                .max()
-                .unwrap_or(Severity::Low);
-            match max_severity {
-                Severity::Critical | Severity::High => Action::Block,
-                Severity::Medium | Severity::Low => Action::Warn,
-                Severity::Info => Action::Allow,
-            }
-        };
+        let action = action_from_findings(&findings);
         Self {
             action,
             findings,
@@ -418,5 +440,106 @@ mod tests {
     fn test_info_severity_ordering() {
         assert!(Severity::Info < Severity::Low);
         assert!(Severity::Low < Severity::Medium);
+    }
+
+    #[test]
+    fn test_upgraded_action_from_findings_upgrades_when_findings_are_stronger() {
+        let findings = vec![Finding {
+            rule_id: RuleId::ThreatSuspiciousPackage,
+            severity: Severity::Medium,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+
+        assert_eq!(
+            upgraded_action_from_findings(&findings, Action::Allow),
+            Action::Warn
+        );
+    }
+
+    #[test]
+    fn test_upgraded_action_from_findings_preserves_stronger_current_action() {
+        let findings = vec![Finding {
+            rule_id: RuleId::ThreatSuspiciousPackage,
+            severity: Severity::Medium,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+
+        assert_eq!(
+            upgraded_action_from_findings(&findings, Action::Block),
+            Action::Block
+        );
+    }
+
+    #[test]
+    fn test_action_from_findings_empty_returns_allow() {
+        assert_eq!(action_from_findings(&[]), Action::Allow);
+    }
+
+    #[test]
+    fn test_action_from_findings_high_returns_block() {
+        let findings = vec![Finding {
+            rule_id: RuleId::ThreatOsvVulnerable,
+            severity: Severity::High,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+        assert_eq!(action_from_findings(&findings), Action::Block);
+    }
+
+    #[test]
+    fn test_action_from_findings_critical_returns_block() {
+        let findings = vec![Finding {
+            rule_id: RuleId::ThreatMaliciousPackage,
+            severity: Severity::Critical,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+        assert_eq!(action_from_findings(&findings), Action::Block);
+    }
+
+    #[test]
+    fn test_action_from_findings_low_returns_warn() {
+        let findings = vec![Finding {
+            rule_id: RuleId::ThreatSuspiciousPackage,
+            severity: Severity::Low,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+        assert_eq!(action_from_findings(&findings), Action::Warn);
+    }
+
+    #[test]
+    fn test_upgraded_action_preserves_current_on_empty_findings() {
+        assert_eq!(
+            upgraded_action_from_findings(&[], Action::Block),
+            Action::Block
+        );
     }
 }
