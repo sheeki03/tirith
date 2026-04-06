@@ -339,6 +339,13 @@ enum Commands {
         hidden: bool,
     },
 
+    /// Manage the threat intelligence database
+    #[command(name = "threat-db")]
+    ThreatDb {
+        #[command(subcommand)]
+        action: ThreatDbAction,
+    },
+
     /// Diagnose tirith installation and configuration
     Doctor {
         /// Output as JSON
@@ -606,6 +613,26 @@ enum DaemonAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum ThreatDbAction {
+    /// Download or update the threat intelligence database
+    Update {
+        /// Force re-download even if up to date (bypasses rollback protection)
+        #[arg(long)]
+        force: bool,
+
+        /// Run as a background update process (used internally by auto-update)
+        #[arg(long, hide = true)]
+        background: bool,
+    },
+    /// Show threat DB status, age, and entry counts
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() {
     // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
     #[cfg(unix)]
@@ -842,6 +869,13 @@ fn main() {
             summary,
             hidden,
         } => cli::warnings::run(clear, session.as_deref(), json, summary, hidden),
+
+        Commands::ThreatDb { action } => match action {
+            ThreatDbAction::Update { force, background } => {
+                cli::threatdb_cmd::update(force, background)
+            }
+            ThreatDbAction::Status { json } => cli::threatdb_cmd::status(json),
+        },
 
         Commands::Doctor {
             json,

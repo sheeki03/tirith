@@ -71,7 +71,16 @@ mod run_impl {
             force,
             update_configs,
         ) {
-            Ok(()) => 0,
+            Ok(()) => {
+                // Hint: suggest threat DB setup if no DB is cached yet
+                if tirith_core::threatdb::ThreatDb::cached().is_none() {
+                    eprintln!();
+                    eprintln!(
+                        "Optional: Run 'tirith threat-db update' to enable malicious package detection."
+                    );
+                }
+                0
+            }
             Err(msg) => {
                 eprintln!("tirith: {msg}");
                 1

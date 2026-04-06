@@ -17,6 +17,10 @@ fuzz/corpus/
 # Local env
 .env
 
+# Threat DB signing key (private — NEVER commit)
+threatdb-signing.key
+crates/tirith-core/assets/keys/threatdb-signing.key
+
 # Claude Code context
 CLAUDE.md
 

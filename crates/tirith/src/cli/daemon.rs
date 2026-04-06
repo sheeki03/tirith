@@ -462,9 +462,45 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
 
         tokio::pin!(shutdown);
 
+        // Spawn periodic threat DB update task.
+        // Uses its own timer independent of the per-CLI-process UPDATE_ATTEMPTED guard.
+        // Coordinates with concurrent `tirith check` processes via the same lockfile
+        // and next-check-at state file.
+        let threatdb_update_handle = tokio::spawn(async {
+            // Initial delay: wait 60s before first check to let daemon stabilize
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            loop {
+                // Check if update is due (on a blocking thread since it does I/O)
+                let should_spawn =
+                    tokio::task::spawn_blocking(daemon_should_spawn_update)
+                        .await
+                        .unwrap_or(false);
+
+                if should_spawn {
+                    // Spawn as a detached child process (same as check.rs path)
+                    // so the daemon doesn't block on download.
+                    let _ = tokio::task::spawn_blocking(|| {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe)
+                                .args(["threat-db", "update", "--background"])
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn();
+                        }
+                    })
+                    .await;
+                }
+
+                // Re-check every 15 minutes
+                tokio::time::sleep(tokio::time::Duration::from_secs(15 * 60)).await;
+            }
+        });
+
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
+                    threatdb_update_handle.abort();
                     eprintln!("tirith: daemon shutting down");
                     break;
                 }
@@ -531,6 +567,55 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
     let _ = std::fs::remove_file(pid);
 
     exit
+}
+
+// ---------------------------------------------------------------------------
+// Threat DB periodic update (daemon-only)
+// ---------------------------------------------------------------------------
+
+/// Check whether a background threat DB update should be spawned.
+/// Called from the daemon's periodic timer task (blocking context).
+#[cfg(unix)]
+fn daemon_should_spawn_update() -> bool {
+    let policy = tirith_core::policy::Policy::discover(None);
+    if policy.threat_intel.auto_update_hours == 0 {
+        return false;
+    }
+
+    let state = match tirith_core::policy::state_dir() {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let next_check_path = state.join("threatdb-next-check-at");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(content) = std::fs::read_to_string(&next_check_path) {
+        if let Ok(next_ts) = content.trim().parse::<u64>() {
+            if now < next_ts {
+                return false; // not yet due
+            }
+        }
+    }
+
+    // Check spawned-at dedup (same as check.rs path)
+    let spawned_at_path = state.join("threatdb-spawned-at");
+    if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
+        if let Ok(spawned_ts) = content.trim().parse::<u64>() {
+            if now.saturating_sub(spawned_ts) < 30 {
+                return false; // another process spawned recently
+            }
+        }
+    }
+
+    // Write spawned-at
+    let _ = std::fs::create_dir_all(&state);
+    let _ = std::fs::write(&spawned_at_path, now.to_string());
+
+    true
 }
 
 // ---------------------------------------------------------------------------

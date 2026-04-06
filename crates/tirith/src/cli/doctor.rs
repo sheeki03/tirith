@@ -103,7 +103,34 @@ fn run_fix(yes: bool) -> i32 {
         }
     }
 
-    // 5. Bash safe-mode: if active, offer to clear
+    // 5. Threat DB: if missing or stale, offer to download
+    if let Some(tdb) = gather_threat_db_info() {
+        if !tdb.installed || tdb.stale || tdb.signature_valid == Some(false) || tdb.error.is_some()
+        {
+            let reason = if !tdb.installed {
+                "not installed"
+            } else if tdb.signature_valid == Some(false) {
+                "invalid signature"
+            } else if tdb.error.is_some() {
+                "load error"
+            } else {
+                "stale"
+            };
+            println!("Fix: Download threat DB ({reason})");
+            if yes || confirm("  Download threat DB?") {
+                let force = tdb.signature_valid == Some(false) || tdb.error.is_some();
+                let rc = crate::cli::threatdb_cmd::update(force, false);
+                if rc == 0 {
+                    println!("  Threat DB downloaded.");
+                    fixed += 1;
+                } else {
+                    eprintln!("  Threat DB download failed.");
+                }
+            }
+        }
+    }
+
+    // 6. Bash safe-mode: if active, offer to clear
     if bash_safe_mode_active() {
         println!("Fix: Clear bash safe-mode flag");
         if yes || confirm("  Clear safe-mode?") {
@@ -405,6 +432,20 @@ struct DoctorInfo {
     /// Detection gap analysis from audit log data.
     #[serde(skip_serializing_if = "Option::is_none")]
     detection_gaps: Option<DetectionGapInfo>,
+    /// Threat intelligence database status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threat_db: Option<ThreatDbDoctorInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ThreatDbDoctorInfo {
+    installed: bool,
+    path: Option<String>,
+    age_hours: Option<f64>,
+    total_entries: Option<u32>,
+    signature_valid: Option<bool>,
+    stale: bool,
+    error: Option<String>,
 }
 
 fn gather_info() -> DoctorInfo {
@@ -466,6 +507,7 @@ fn gather_info() -> DoctorInfo {
 
     let shadow_binaries = super::find_shadow_binaries();
     let detection_gaps = check_detection_gaps();
+    let threat_db = gather_threat_db_info();
 
     DoctorInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -486,6 +528,69 @@ fn gather_info() -> DoctorInfo {
         webhooks_available: cfg!(unix),
         shadow_binaries,
         detection_gaps,
+        threat_db,
+    }
+}
+
+fn gather_threat_db_info() -> Option<ThreatDbDoctorInfo> {
+    use tirith_core::threatdb::ThreatDb;
+
+    let db_path = ThreatDb::default_path()?;
+    if !db_path.exists() {
+        return Some(ThreatDbDoctorInfo {
+            installed: false,
+            path: Some(db_path.display().to_string()),
+            age_hours: None,
+            total_entries: None,
+            signature_valid: None,
+            stale: true,
+            error: None,
+        });
+    }
+
+    match ThreatDb::load_from_path(&db_path, 0) {
+        Ok(db) => {
+            let sig_valid = db.verify_signature().is_ok();
+            let stats = db.stats();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let age_secs = now.saturating_sub(stats.build_timestamp);
+            let age_hours = age_secs as f64 / 3600.0;
+            let total = stats.package_count
+                + stats.hostname_count
+                + stats.ip_count
+                + stats.typosquat_count
+                + stats.popular_count;
+
+            let policy = tirith_core::policy::Policy::discover(None);
+            let stale_hours = policy.threat_intel.auto_update_hours;
+            let is_stale = if stale_hours == 0 {
+                false
+            } else {
+                age_hours > (stale_hours as f64 * 2.0)
+            };
+
+            Some(ThreatDbDoctorInfo {
+                installed: true,
+                path: Some(db_path.display().to_string()),
+                age_hours: Some(age_hours),
+                total_entries: Some(total),
+                signature_valid: Some(sig_valid),
+                stale: is_stale,
+                error: None,
+            })
+        }
+        Err(e) => Some(ThreatDbDoctorInfo {
+            installed: true,
+            path: Some(db_path.display().to_string()),
+            age_hours: None,
+            total_entries: None,
+            signature_valid: None,
+            stale: true,
+            error: Some(format!("{e}")),
+        }),
     }
 }
 
@@ -605,6 +710,44 @@ fn print_human(info: &DoctorInfo) {
             "not available (Unix-only)"
         }
     );
+
+    // Threat DB status
+    if let Some(ref tdb) = info.threat_db {
+        if !tdb.installed {
+            println!("  threat DB:    not installed — run 'tirith threat-db update'");
+        } else if let Some(ref err) = tdb.error {
+            println!("  threat DB:    ERROR: {err}");
+            println!("                re-download with 'tirith threat-db update --force'");
+        } else if tdb.signature_valid == Some(false) {
+            println!(
+                "  threat DB:    INVALID SIGNATURE — re-download with 'tirith threat-db update --force'"
+            );
+        } else if tdb.stale {
+            let age_str = match tdb.age_hours {
+                Some(h) if h < 48.0 => format!("{:.0}h old", h),
+                Some(h) => format!("{:.0}d old", h / 24.0),
+                None => "unknown age".to_string(),
+            };
+            println!("  threat DB:    STALE ({age_str}) — run 'tirith threat-db update'");
+        } else {
+            let path = tdb.path.as_deref().unwrap_or("unknown");
+            let age_str = match tdb.age_hours {
+                Some(h) if h < 1.0 => format!("{:.0}m old", h * 60.0),
+                Some(h) if h < 48.0 => format!("{:.0}h old", h),
+                Some(h) => format!("{:.0}d old", h / 24.0),
+                None => "unknown age".to_string(),
+            };
+            let total = tdb.total_entries.unwrap_or(0);
+            let sig = if tdb.signature_valid == Some(true) {
+                "signature ok"
+            } else {
+                "signature unknown"
+            };
+            println!("  threat DB:    {path} ({age_str}, {total} entries, {sig})");
+        }
+    } else {
+        println!("  threat DB:    not available");
+    }
 
     // Detection gap analysis
     if let Some(ref gaps) = info.detection_gaps {

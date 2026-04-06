@@ -62,6 +62,11 @@ pub fn run(
         .map(|v| v == "0")
         .unwrap_or(false);
 
+    // Trigger background threat DB update early (detached child, non-blocking).
+    // Must run before any early return (--approval-check, daemon path, etc.)
+    // so that hooks calling `tirith check --approval-check` still trigger updates.
+    crate::cli::threatdb_cmd::maybe_background_update();
+
     // Resolve session ID for post-processing and audit
     let session_id = tirith_core::session::resolve_session_id();
 
