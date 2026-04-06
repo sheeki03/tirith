@@ -15,6 +15,10 @@ categories = ["command-line-utilities"]
 name = "tirith"
 path = "src/main.rs"
 
+[[bin]]
+name = "tirith-threatdb-compile"
+path = "src/bin/tirith_threatdb_compile.rs"
+
 [dependencies]
 tirith-core = { workspace = true }
 clap = { workspace = true }
@@ -34,8 +38,15 @@ etcetera = { workspace = true }
 url = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+walkdir = { workspace = true }
+csv = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+fs2 = { workspace = true }
 
 [dev-dependencies]
+mockito = "1"
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
