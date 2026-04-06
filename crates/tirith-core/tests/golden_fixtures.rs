@@ -277,6 +277,30 @@ fn test_codefile_fixtures() {
     eprintln!("Passed {count} codefile fixtures");
 }
 
+#[test]
+fn test_threatintel_fixtures() {
+    // Point the threat DB cache at the test fixture DB so that DB-dependent
+    // rules (threat_malicious_package, threat_malicious_ip, etc.) can fire.
+    let test_db_path = fixtures_dir().join("test-threatdb.dat");
+    assert!(
+        test_db_path.exists(),
+        "Test threat DB not found at {}. Run: cargo test -p tirith-core --test generate_test_fixtures -- --ignored",
+        test_db_path.display()
+    );
+    std::env::set_var("TIRITH_THREATDB_PATH", &test_db_path);
+    tirith_core::threatdb::ThreatDb::refresh_cache();
+
+    let fixtures = load_fixtures("threatintel.toml");
+    let count = fixtures.len();
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} threatintel fixtures");
+
+    // Clean up env var (best-effort; tests are single-threaded by default)
+    std::env::remove_var("TIRITH_THREATDB_PATH");
+}
+
 /// Verify total fixture count across all files.
 #[test]
 fn test_fixture_count() {
@@ -295,6 +319,7 @@ fn test_fixture_count() {
         "rendered.toml",
         "credential.toml",
         "codefile.toml",
+        "threatintel.toml",
     ];
 
     let total: usize = files.iter().map(|f| load_fixtures(f).len()).sum();
@@ -408,6 +433,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "rendered.toml",
     "credential.toml",
     "codefile.toml",
+    "threatintel.toml",
 ];
 
 /// Complete list of all RuleId variants (snake_case serialized form).
@@ -492,6 +518,21 @@ const ALL_RULE_IDS: &[&str] = &[
     "web3_rpc_endpoint",
     "web3_address_in_url",
     "vet_not_configured",
+    // Threat intelligence — Phase A (local DB)
+    "threat_malicious_package",
+    "threat_malicious_ip",
+    "threat_package_typosquat",
+    "threat_package_similar_name",
+    // Threat intelligence — Phase B (keyed feeds)
+    "threat_malicious_url",
+    "threat_phishing_url",
+    "threat_tor_exit_node",
+    "threat_threat_fox_ioc",
+    // Threat intelligence — Phase C (real-time API)
+    "threat_osv_vulnerable",
+    "threat_cisa_kev",
+    "threat_suspicious_package",
+    "threat_safe_browsing",
     // Rendered content
     "hidden_css_content",
     "hidden_color_content",
@@ -563,6 +604,17 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "pdf_hidden_text",    // requires .pdf file input
     "config_malformed",   // requires MCP config filename context in file scan
     "vet_not_configured", // requires cargo install without cargo-vet
+    // Threat intelligence — Phase A rules are now tested with test-threatdb.dat
+    // (see test_threatintel_fixtures which sets TIRITH_THREATDB_PATH).
+    // Phase B/C rules still require external feeds or real-time APIs.
+    "threat_malicious_url",      // Phase B: requires keyed URLhaus feed
+    "threat_phishing_url",       // Phase B: requires keyed phishing feed
+    "threat_tor_exit_node",      // Phase B: requires Tor exit node list
+    "threat_threat_fox_ioc",     // Phase B: requires keyed ThreatFox feed
+    "threat_osv_vulnerable",     // Phase C: requires real-time OSV.dev API
+    "threat_cisa_kev",           // Phase C: requires real-time CISA KEV correlation
+    "threat_suspicious_package", // Phase C: requires real-time deps.dev/ecosyste.ms API
+    "threat_safe_browsing",      // Phase C: requires Google Safe Browsing API key
 ];
 
 #[test]
@@ -664,6 +716,21 @@ fn test_rule_id_list_is_complete() {
         RuleId::Web3RpcEndpoint,
         RuleId::Web3AddressInUrl,
         RuleId::VetNotConfigured,
+        // Threat intelligence — Phase A (local DB)
+        RuleId::ThreatMaliciousPackage,
+        RuleId::ThreatMaliciousIp,
+        RuleId::ThreatPackageTyposquat,
+        RuleId::ThreatPackageSimilarName,
+        // Threat intelligence — Phase B (keyed feeds)
+        RuleId::ThreatMaliciousUrl,
+        RuleId::ThreatPhishingUrl,
+        RuleId::ThreatTorExitNode,
+        RuleId::ThreatThreatFoxIoc,
+        // Threat intelligence — Phase C (real-time API)
+        RuleId::ThreatOsvVulnerable,
+        RuleId::ThreatCisaKev,
+        RuleId::ThreatSuspiciousPackage,
+        RuleId::ThreatSafeBrowsing,
         RuleId::HiddenCssContent,
         RuleId::HiddenColorContent,
         RuleId::HiddenHtmlAttribute,

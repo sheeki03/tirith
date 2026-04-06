@@ -1,0 +1,120 @@
+# Threat intelligence rule fixtures
+#
+# These fixtures test Phase A local-DB threat intelligence detection.
+# They require TIRITH_THREATDB_PATH to point to tests/fixtures/test-threatdb.dat,
+# which is set up automatically by the test_threatintel_fixtures() test.
+#
+# The test DB contains:
+#   - npm/evil-package versions 1.0.0, 1.0.1 (Confirmed malicious)
+#   - pypi/malware-pkg all versions (Confirmed, all_versions_malicious)
+#   - npm/borderline-pkg version 2.0.0 (Medium confidence)
+#   - IP 203.0.113.50 (Feodo C2)
+#   - Typosquat: npm/reacct -> react
+#   - Typosquat: pypi/reqeusts -> requests
+#   - Popular: npm/react, npm/express, pypi/requests, pypi/flask
+
+# --- Tier-3 reachability (no DB needed, verify PATTERN_TABLE) ---
+
+[[fixture]]
+name = "pip_install_reaches_tier3"
+min_milestone = 1
+input = "pip install some-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "npm_install_reaches_tier3"
+min_milestone = 1
+input = "npm install some-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "npx_reaches_tier3"
+min_milestone = 1
+input = "npx some-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "gem_install_reaches_tier3"
+min_milestone = 1
+input = "gem install some-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "cargo_install_reaches_tier3"
+min_milestone = 1
+input = "cargo install some-crate"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# --- Malicious package detection (DB-dependent) ---
+
+[[fixture]]
+name = "npm_install_malicious_version_match"
+min_milestone = 1
+input = "npm install evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "npm_install_malicious_version_no_match"
+min_milestone = 1
+input = "npm install evil-package@2.0.0"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "pip_install_all_versions_malicious"
+min_milestone = 1
+input = "pip install malware-pkg"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+# --- Typosquat detection (DB-dependent) ---
+
+[[fixture]]
+name = "npm_install_confirmed_typosquat"
+min_milestone = 1
+input = "npm install reacct"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_package_typosquat"]
+
+[[fixture]]
+name = "pip_install_confirmed_typosquat"
+min_milestone = 1
+input = "pip install reqeusts"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_package_typosquat"]
+
+# --- Similar name detection (Levenshtein, DB-dependent) ---
+
+[[fixture]]
+name = "npm_install_similar_to_popular"
+min_milestone = 1
+input = "npm install expresss"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["threat_package_similar_name"]
+
+# --- Malicious IP detection (DB-dependent) ---
+
+[[fixture]]
+name = "ssh_to_malicious_ip"
+min_milestone = 1
+input = "ssh 203.0.113.50"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_ip"]
