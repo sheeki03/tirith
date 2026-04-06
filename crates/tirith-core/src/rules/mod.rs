@@ -11,4 +11,5 @@ pub mod path;
 pub mod rendered;
 pub mod shared;
 pub mod terminal;
+pub mod threatintel;
 pub mod transport;

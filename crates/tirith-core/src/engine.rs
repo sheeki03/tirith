@@ -497,6 +497,11 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     policy.load_user_lists();
     policy.load_org_lists(ctx.cwd.as_deref());
     policy.load_trust_entries(ctx.cwd.as_deref());
+
+    // Load threat intelligence DB (fail-open: None if unavailable)
+    let threat_db: Option<std::sync::Arc<crate::threatdb::ThreatDb>> =
+        crate::threatdb::ThreatDb::cached();
+
     let tier2_ms = tier2_start.elapsed().as_secs_f64() * 1000.0;
 
     // Tier 3: Full analysis
@@ -636,6 +641,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
             findings.extend(ecosystem_findings);
         }
+
+        // Threat intelligence rules (local DB lookup, no network I/O)
+        let threat_findings = crate::rules::threatintel::check(
+            &ctx.input,
+            ctx.shell,
+            &extracted,
+            threat_db.as_deref(),
+        );
+        findings.extend(threat_findings);
 
         // Run command-shape rules on full input
         let command_findings = crate::rules::command::check(

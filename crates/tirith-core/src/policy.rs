@@ -130,6 +130,44 @@ pub struct Policy {
     /// Whether to enforce the fetch fail mode strictly (ignore local fallback on auth errors).
     #[serde(default)]
     pub enforce_fail_mode: Option<bool>,
+
+    // --- Threat intelligence (Phase A) ---
+    /// Threat intelligence configuration.
+    #[serde(default)]
+    pub threat_intel: ThreatIntelConfig,
+}
+
+/// Threat intelligence configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreatIntelConfig {
+    /// Auto-update interval in hours. 0 = disabled. Default: 24.
+    pub auto_update_hours: u64,
+    /// Enable real-time OSV.dev queries. Default: true.
+    pub osv_enabled: bool,
+    /// Enable real-time deps.dev queries. Default: true.
+    pub deps_dev_enabled: bool,
+    /// Optional: Google Safe Browsing API key (user gets own free key).
+    #[serde(skip_serializing)]
+    pub google_safe_browsing_key: Option<String>,
+    /// Optional: abuse.ch Auth-Key for URLhaus/ThreatFox feeds.
+    #[serde(skip_serializing)]
+    pub abusech_auth_key: Option<String>,
+    /// Optional: enable Phishing Army feed (CC BY-NC 4.0, non-commercial only).
+    pub phishing_army_enabled: bool,
+}
+
+impl Default for ThreatIntelConfig {
+    fn default() -> Self {
+        Self {
+            auto_update_hours: 24,
+            osv_enabled: true,
+            deps_dev_enabled: true,
+            google_safe_browsing_key: None,
+            abusech_auth_key: None,
+            phishing_army_enabled: false,
+        }
+    }
 }
 
 /// Approval rule: when a command matches, require human approval before execution.
@@ -286,6 +324,7 @@ impl Default for Policy {
             policy_server_api_key: None,
             policy_fetch_fail_mode: None,
             enforce_fail_mode: None,
+            threat_intel: ThreatIntelConfig::default(),
         }
     }
 }

@@ -93,6 +93,22 @@ pub enum RuleId {
     Web3AddressInUrl,
     VetNotConfigured,
 
+    // Threat intelligence rules — local DB (Phase A)
+    ThreatMaliciousPackage,
+    ThreatMaliciousIp,
+    ThreatPackageTyposquat,
+    ThreatPackageSimilarName,
+    // Phase B (keyed feeds) — define now so RuleId is stable
+    ThreatMaliciousUrl,
+    ThreatPhishingUrl,
+    ThreatTorExitNode,
+    ThreatThreatFoxIoc,
+    // Phase C (real-time API)
+    ThreatOsvVulnerable,
+    ThreatCisaKev,
+    ThreatSuspiciousPackage,
+    ThreatSafeBrowsing,
+
     // Rendered content rules
     HiddenCssContent,
     HiddenColorContent,
@@ -183,6 +199,13 @@ pub enum Evidence {
     },
     Text {
         detail: String,
+    },
+    ThreatIntel {
+        source: String,
+        threat_type: String,
+        confidence: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
     },
     /// Detailed character analysis for homograph detection
     HomoglyphAnalysis {

