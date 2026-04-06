@@ -47,6 +47,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.9.2"
 
 [[bench]]
 name = "perf"
