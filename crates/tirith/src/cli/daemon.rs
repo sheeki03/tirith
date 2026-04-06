@@ -17,9 +17,11 @@ use tirith_core::extract::ScanContext;
 #[cfg(unix)]
 use tirith_core::network;
 #[cfg(unix)]
+use tirith_core::threatdb_api::RuntimeThreatMode;
+#[cfg(unix)]
 use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
-use tirith_core::verdict::{Evidence, RuleId, Severity};
+use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Severity};
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -244,37 +246,27 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     };
 
     let mut verdict = engine::analyze(&ctx);
+    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    let runtime_findings = tirith_core::threatdb_api::enrich_command(
+        &req.input,
+        shell_type,
+        &policy.threat_intel,
+        RuntimeThreatMode::Daemon,
+    );
+    verdict.findings.extend(runtime_findings);
 
     // --- Network-aware enrichment (daemon-only, too slow for sync path) ---
     enrich_with_network_checks(&mut verdict.findings);
 
     // Recalculate action after enrichment may have added higher-severity findings.
-    let max_severity = verdict
-        .findings
-        .iter()
-        .map(|f| f.severity)
-        .max()
-        .unwrap_or(Severity::Info);
-    let new_action = match max_severity {
-        Severity::Critical | Severity::High => Action::Block,
-        Severity::Medium | Severity::Low => Action::Warn,
-        Severity::Info => Action::Allow,
-    };
-    let action_rank = |a: Action| match a {
-        Action::Allow => 0,
-        Action::Warn | Action::WarnAck => 1,
-        Action::Block => 2,
-    };
-    if action_rank(new_action) > action_rank(verdict.action) {
-        verdict.action = new_action;
-    }
+    verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
 
     // Snapshot raw findings/action AFTER enrichment but BEFORE paranoia filtering.
     let raw_findings = Some(verdict.findings.clone());
     let raw_action_str = Some(format!("{:?}", verdict.action));
 
     // Apply paranoia filter
-    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
     DaemonResponse {

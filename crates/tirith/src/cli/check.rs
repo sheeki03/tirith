@@ -3,8 +3,9 @@ use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::escalation::CallerContext;
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
+use tirith_core::threatdb_api::RuntimeThreatMode;
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::Action;
+use tirith_core::verdict::{upgraded_action_from_findings, Action};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -76,7 +77,7 @@ pub fn run(
     // Returns (verdict, Option<Policy>). Local analysis paths return the policy
     // from the engine to avoid a redundant Policy::discover() call. The daemon
     // path returns None because analysis already happened server-side.
-    let (raw_verdict, engine_policy) = if !approval_check && !no_daemon {
+    let (mut raw_verdict, engine_policy) = if !approval_check && !no_daemon {
         if let Some(resp) =
             crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
         {
@@ -178,9 +179,24 @@ pub fn run(
         return 0;
     }
 
+    let ran_locally = engine_policy.is_some();
     // Use policy from engine when available, otherwise load it (daemon path only)
     let policy =
         engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
+
+    if ran_locally {
+        let runtime_findings = tirith_core::threatdb_api::enrich_command(
+            cmd,
+            shell_type,
+            &policy.threat_intel,
+            RuntimeThreatMode::Inline,
+        );
+        if !runtime_findings.is_empty() {
+            raw_verdict.findings.extend(runtime_findings);
+            raw_verdict.action =
+                upgraded_action_from_findings(&raw_verdict.findings, raw_verdict.action);
+        }
+    }
 
     // Capture raw info for audit BEFORE post-processing
     let raw_action_str = format!("{:?}", raw_verdict.action);
