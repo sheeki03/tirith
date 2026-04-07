@@ -1,0 +1,18 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+Compare a URL against known-good patterns
+
+Usage: tirith diff [OPTIONS] <URL>
+
+Arguments:
+  <URL>  URL to analyze
+
+Options:
+      --format <FORMAT>  Output format (default: human) [possible values: human, json]
+  -h, --help             Print help
+
+Examples:
+  tirith diff https://install.example-cli.dev
+  tirith diff --format json https://install.example-cli.dev

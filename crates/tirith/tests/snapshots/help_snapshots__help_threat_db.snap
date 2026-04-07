@@ -1,0 +1,20 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: cleaned
+---
+Manage the threat intelligence database
+
+Usage: tirith threat-db <COMMAND>
+
+Commands:
+  update  Download or update the threat intelligence database
+  status  Show threat DB status, age, and entry counts
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  tirith threat-db update
+  tirith threat-db update --force
+  tirith threat-db status --format json

@@ -1,0 +1,19 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+MCP gateway proxy — intercepts shell tool calls for security analysis
+
+Usage: tirith gateway <COMMAND>
+
+Commands:
+  run              Run the gateway proxy
+  validate-config  Validate gateway config file
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml
+  tirith gateway validate-config --config gateway.yaml

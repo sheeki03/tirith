@@ -1,0 +1,19 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: cleaned
+---
+Diagnose tirith installation and configuration
+
+Usage: tirith doctor [OPTIONS]
+
+Options:
+      --format <FORMAT>       Output format (default: human) [possible values: human, json]
+      --reset-bash-safe-mode  Remove persistent bash safe-mode flag (re-enables enter mode)
+      --fix                   Auto-fix detected issues
+      --yes                   Auto-approve all fixes (no prompting)
+  -h, --help                  Print help
+
+Examples:
+  tirith doctor
+  tirith doctor --fix
+  tirith doctor --fix --yes

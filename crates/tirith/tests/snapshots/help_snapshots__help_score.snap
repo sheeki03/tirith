@@ -1,0 +1,18 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+Score a URL for security risk
+
+Usage: tirith score [OPTIONS] <URL>
+
+Arguments:
+  <URL>  URL to score
+
+Options:
+      --format <FORMAT>  Output format (default: human) [possible values: human, json]
+  -h, --help             Print help
+
+Examples:
+  tirith score https://get.example-tool.sh
+  tirith score --format json https://example.com

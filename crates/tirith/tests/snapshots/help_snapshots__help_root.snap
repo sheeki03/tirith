@@ -1,0 +1,38 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: cleaned
+---
+URL security analysis for shell environments
+
+Usage: tirith <COMMAND>
+
+Commands:
+  daemon      Manage the tirith background daemon
+  check       Check a command for URL security issues before execution
+  paste       Check pasted content for security issues
+  run         Safely download and execute a script
+  score       Score a URL for security risk
+  diff        Compare a URL against known-good patterns
+  explain     Show documentation for a detection rule
+  why         Explain the last triggered rule
+  receipt     Manage execution receipts
+  checkpoint  Manage file checkpoints for rollback (experimental)
+  init        Initialize tirith shell hooks
+  scan        Scan files for hidden content and config poisoning
+  fetch       Check a URL for server-side cloaking (different content for bots vs browsers)
+  mcp-server  Run as MCP server (JSON-RPC over stdio)
+  gateway     MCP gateway proxy — intercepts shell tool calls for security analysis
+  setup       Configure tirith protection for an AI coding tool
+  policy      Manage security policies
+  audit       Audit log management: export, stats, compliance reports (Team)
+  activate    Activate a license key
+  license     Show or manage license status
+  trust       Manage trusted patterns (allowlist entries with TTL, scoping, and audit)
+  warnings    Show accumulated session warnings
+  threat-db   Manage the threat intelligence database
+  doctor      Diagnose tirith installation and configuration
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

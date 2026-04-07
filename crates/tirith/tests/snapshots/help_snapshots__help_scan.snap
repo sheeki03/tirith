@@ -1,0 +1,27 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+Scan files for hidden content and config poisoning
+
+Usage: tirith scan [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]  Path to scan (directory or file)
+
+Options:
+      --file <FILE>        Scan a single file explicitly
+      --stdin              Read content from stdin
+      --ci                 Exit non-zero in CI when findings meet threshold
+      --fail-on <FAIL_ON>  Severity threshold for CI failure [default: critical]
+      --format <FORMAT>    Output format (default: human) [possible values: human, json, sarif]
+      --ignore <IGNORE>    Patterns to ignore
+      --include <INCLUDE>  Include only files matching these patterns
+      --exclude <EXCLUDE>  Exclude files matching these patterns (same as --ignore)
+      --profile <PROFILE>  Load a named scan profile from policy
+  -h, --help               Print help
+
+Examples:
+  tirith scan ./
+  tirith scan --ci --fail-on high ./
+  tirith scan --format sarif ./ > results.sarif

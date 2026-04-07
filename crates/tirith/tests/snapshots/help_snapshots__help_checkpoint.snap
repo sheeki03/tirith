@@ -1,0 +1,25 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+Manage file checkpoints for rollback (experimental)
+
+Usage: tirith checkpoint <COMMAND>
+
+Commands:
+  create   Create a checkpoint of specified paths
+  list     List all checkpoints
+  restore  Restore files from a checkpoint
+  diff     Show differences between checkpoint and current state
+  purge    Remove old checkpoints based on age/count/size limits
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  tirith checkpoint create src/ Cargo.toml
+  tirith checkpoint list
+  tirith checkpoint restore <id>
+  tirith checkpoint diff <id>
+  tirith checkpoint purge

@@ -1,0 +1,21 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: cleaned
+---
+Manage execution receipts
+
+Usage: tirith receipt <COMMAND>
+
+Commands:
+  last    Show the last receipt
+  list    List all receipts
+  verify  Verify a receipt by SHA256
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  tirith receipt last
+  tirith receipt list
+  tirith receipt verify a1b2c3d4e5f6

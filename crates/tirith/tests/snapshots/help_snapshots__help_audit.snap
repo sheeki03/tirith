@@ -1,0 +1,22 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: stdout.to_string()
+---
+Audit log management: export, stats, compliance reports (Team)
+
+Usage: tirith audit <COMMAND>
+
+Commands:
+  export  Export audit log records as JSON or CSV
+  stats   Show summary statistics from the audit log
+  report  Generate a compliance report from the audit log
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  tirith audit export
+  tirith audit export --format csv --since 2025-01-01
+  tirith audit stats --format json
+  tirith audit report --format html > report.html

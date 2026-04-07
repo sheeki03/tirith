@@ -1,0 +1,24 @@
+---
+source: crates/tirith/tests/help_snapshots.rs
+expression: cleaned
+---
+Configure tirith protection for an AI coding tool
+
+Usage: tirith setup [OPTIONS] <TOOL>
+
+Arguments:
+  <TOOL>  Tool to configure: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf
+
+Options:
+      --scope <SCOPE>   Scope: project (default for most tools) or user
+      --with-mcp        Also register tirith MCP server (Claude Code and Gemini CLI)
+      --install-zshenv  Append zshenv guard to ~/.zshenv (default: print snippet only)
+      --dry-run         Show what would be written without writing
+      --force           Overwrite existing files and update stale entries
+      --update-configs  Refresh embedded hook scripts and gateway config to latest defaults. WARNING: overwrites local edits to generated hook scripts and gateway.yaml. Does not re-register MCP servers or modify shell profiles — use full setup for that
+  -h, --help            Print help
+
+Examples:
+  tirith setup claude-code --with-mcp
+  tirith setup cursor
+  tirith setup claude-code --dry-run
