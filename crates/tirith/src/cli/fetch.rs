@@ -51,7 +51,10 @@ fn print_human(result: &cloaking::CloakingResult) {
     println!();
 
     if result.cloaking_detected {
-        println!("\x1b[1;31mCloaking detected!\x1b[0m");
+        println!(
+            "{}",
+            tirith_core::style::bold_red("Cloaking detected!", tirith_core::style::Stream::Stdout)
+        );
         for diff in &result.diff_pairs {
             println!(
                 "  {} vs {}: {} chars different",
@@ -62,6 +65,9 @@ fn print_human(result: &cloaking::CloakingResult) {
             }
         }
     } else {
-        println!("\x1b[32mNo cloaking detected.\x1b[0m");
+        println!(
+            "{}",
+            tirith_core::style::green("No cloaking detected.", tirith_core::style::Stream::Stdout)
+        );
     }
 }

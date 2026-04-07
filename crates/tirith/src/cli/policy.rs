@@ -216,9 +216,10 @@ fn print_validate_human(path: &std::path::Path, issues: &[policy_validate::Polic
     );
 
     for issue in issues {
+        let s = tirith_core::style::Stream::Stderr;
         let prefix = match issue.level {
-            IssueLevel::Error => "\x1b[31merror\x1b[0m",
-            IssueLevel::Warning => "\x1b[33mwarning\x1b[0m",
+            IssueLevel::Error => tirith_core::style::red("error", s),
+            IssueLevel::Warning => tirith_core::style::yellow("warning", s),
         };
         let field_suffix = issue
             .field
@@ -434,17 +435,11 @@ fn print_test_command_human(
     eprintln!("  findings: {}", verdict.findings.len());
 
     for finding in &verdict.findings {
-        let severity_color = match finding.severity {
-            Severity::Critical => "\x1b[91m",
-            Severity::High => "\x1b[31m",
-            Severity::Medium => "\x1b[33m",
-            Severity::Low => "\x1b[36m",
-            Severity::Info => "\x1b[90m",
-        };
-        eprintln!(
-            "    {}[{}]\x1b[0m {} — {}",
-            severity_color, finding.severity, finding.rule_id, finding.title
+        let sev = tirith_core::style::severity_label(
+            &finding.severity,
+            tirith_core::style::Stream::Stderr,
         );
+        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
     }
 
     // Show allowlist/blocklist trace
@@ -475,17 +470,11 @@ fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy
     );
 
     for finding in &result.findings {
-        let severity_color = match finding.severity {
-            Severity::Critical => "\x1b[91m",
-            Severity::High => "\x1b[31m",
-            Severity::Medium => "\x1b[33m",
-            Severity::Low => "\x1b[36m",
-            Severity::Info => "\x1b[90m",
-        };
-        eprintln!(
-            "  {}[{}]\x1b[0m {} — {}",
-            severity_color, finding.severity, finding.rule_id, finding.title
+        let sev = tirith_core::style::severity_label(
+            &finding.severity,
+            tirith_core::style::Stream::Stderr,
         );
+        eprintln!("  {} {} — {}", sev, finding.rule_id, finding.title);
         eprintln!("    {}", finding.description);
     }
 }

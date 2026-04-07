@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::verdict::{Action, Evidence, Finding, Severity, Verdict};
+use crate::verdict::{Action, Evidence, Finding, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
 
@@ -63,20 +63,9 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
     }
 
     for finding in &verdict.findings {
-        let severity_color = match finding.severity {
-            Severity::Critical => "\x1b[91m", // bright red
-            Severity::High => "\x1b[31m",     // red
-            Severity::Medium => "\x1b[33m",   // yellow
-            Severity::Low => "\x1b[36m",      // cyan
-            Severity::Info => "\x1b[90m",     // dim/gray
-        };
-        let reset = "\x1b[0m";
+        let sev = crate::style::severity_label(&finding.severity, crate::style::Stream::Stderr);
 
-        writeln!(
-            w,
-            "  {}[{}]{} {} — {}",
-            severity_color, finding.severity, reset, finding.rule_id, finding.title
-        )?;
+        writeln!(w, "  {} {} — {}", sev, finding.rule_id, finding.title)?;
         writeln!(w, "    {}", finding.description)?;
 
         // Display detailed evidence for homoglyph findings
@@ -91,12 +80,19 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
                 // Visual line with markers
                 let visual = format_visual_with_markers(raw, suspicious_chars);
                 writeln!(w, "    Visual:  {visual}")?;
-                writeln!(w, "    Escaped: \x1b[33m{escaped}\x1b[0m")?;
+                let esc_styled = if crate::style::use_color_for(crate::style::Stream::Stderr) {
+                    format!("\x1b[33m{escaped}\x1b[0m")
+                } else {
+                    escaped.to_string()
+                };
+                writeln!(w, "    Escaped: {esc_styled}")?;
 
                 // Suspicious bytes section
                 if !suspicious_chars.is_empty() {
                     writeln!(w)?;
-                    writeln!(w, "    \x1b[33mSuspicious bytes:\x1b[0m")?;
+                    let header =
+                        crate::style::bold("Suspicious bytes:", crate::style::Stream::Stderr);
+                    writeln!(w, "    {header}")?;
                     for sc in suspicious_chars {
                         writeln!(
                             w,
@@ -119,25 +115,31 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Format a string with red markers on suspicious characters
+/// Format a string highlighting suspicious characters — red background when
+/// color is enabled, bracket-wrapped (`[x]`) when color is off.
 fn format_visual_with_markers(
     raw: &str,
     suspicious_chars: &[crate::verdict::SuspiciousChar],
 ) -> String {
     use std::collections::HashSet;
 
-    // Build a set of suspicious byte offsets
     let suspicious_offsets: HashSet<usize> = suspicious_chars.iter().map(|sc| sc.offset).collect();
+    let use_color = crate::style::use_color_for(crate::style::Stream::Stderr);
 
     let mut result = String::new();
     let mut byte_offset = 0;
 
     for ch in raw.chars() {
         if suspicious_offsets.contains(&byte_offset) {
-            // Red background for suspicious character
-            result.push_str("\x1b[41m\x1b[97m"); // red bg, white fg
-            result.push(ch);
-            result.push_str("\x1b[0m"); // reset
+            if use_color {
+                result.push_str("\x1b[41m\x1b[97m"); // red bg, white fg
+                result.push(ch);
+                result.push_str("\x1b[0m");
+            } else {
+                result.push('[');
+                result.push(ch);
+                result.push(']');
+            }
         } else {
             result.push(ch);
         }
@@ -147,16 +149,13 @@ fn format_visual_with_markers(
     result
 }
 
-/// Write human-readable output to stderr, respecting TTY detection.
-/// If stderr is not a TTY, strip ANSI colors.
+/// Write human-readable output to stderr, respecting color preferences.
+/// Uses the no-color path when stderr is not a TTY or `NO_COLOR` is set.
 pub fn write_human_auto(verdict: &Verdict) -> std::io::Result<()> {
-    let stderr = std::io::stderr();
-    let is_tty = is_terminal::is_terminal(&stderr);
-
-    if is_tty {
-        write_human(verdict, stderr.lock())
+    if crate::style::use_color_for(crate::style::Stream::Stderr) {
+        write_human(verdict, std::io::stderr().lock())
     } else {
-        write_human_no_color(verdict, stderr.lock())
+        write_human_no_color(verdict, std::io::stderr().lock())
     }
 }
 

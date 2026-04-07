@@ -131,6 +131,7 @@ fn run_stdin(json: bool, sarif: bool, ci: bool, fail_on: Severity) -> i32 {
     }
     if raw_bytes.len() as u64 > MAX_STDIN {
         eprintln!("tirith scan: stdin exceeds 10 MiB limit");
+        eprintln!("  try: tirith scan --file /path/to/file  (scan the file directly)");
         return 1;
     }
     if raw_bytes.is_empty() {
@@ -161,6 +162,7 @@ fn run_single_file(file_path: &str, json: bool, sarif: bool, ci: bool, fail_on: 
     let path = PathBuf::from(file_path);
     if !path.exists() {
         eprintln!("tirith scan: file not found: {file_path}");
+        eprintln!("  try: tirith scan ./  (scan the current directory)");
         return 1;
     }
 
@@ -307,24 +309,19 @@ fn print_human_result(result: &scan::ScanResult) {
         };
         eprintln!("  {}{label}", file_result.path.display());
         for finding in &file_result.findings {
-            let severity_color = match finding.severity {
-                Severity::Critical => "\x1b[91m",
-                Severity::High => "\x1b[31m",
-                Severity::Medium => "\x1b[33m",
-                Severity::Low => "\x1b[36m",
-                Severity::Info => "\x1b[90m",
-            };
-            eprintln!(
-                "    {}[{}]\x1b[0m {} — {}",
-                severity_color, finding.severity, finding.rule_id, finding.title
+            let sev = tirith_core::style::severity_label(
+                &finding.severity,
+                tirith_core::style::Stream::Stderr,
             );
+            eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
         }
     }
 
     if result.truncated {
         if let Some(ref reason) = result.truncation_reason {
             eprintln!();
-            eprintln!("  \x1b[33m{reason}\x1b[0m");
+            let styled = tirith_core::style::dim(reason, tirith_core::style::Stream::Stderr);
+            eprintln!("  {styled}");
         }
     }
 }
@@ -388,17 +385,11 @@ fn print_human_file_result(result: &scan::FileScanResult) {
     );
 
     for finding in &result.findings {
-        let severity_color = match finding.severity {
-            Severity::Critical => "\x1b[91m",
-            Severity::High => "\x1b[31m",
-            Severity::Medium => "\x1b[33m",
-            Severity::Low => "\x1b[36m",
-            Severity::Info => "\x1b[90m",
-        };
-        eprintln!(
-            "  {}[{}]\x1b[0m {} — {}",
-            severity_color, finding.severity, finding.rule_id, finding.title
+        let sev = tirith_core::style::severity_label(
+            &finding.severity,
+            tirith_core::style::Stream::Stderr,
         );
+        eprintln!("  {} {} — {}", sev, finding.rule_id, finding.title);
         eprintln!("    {}", finding.description);
     }
 }

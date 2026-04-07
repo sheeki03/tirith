@@ -31,6 +31,31 @@ mod run_impl {
     use etcetera::BaseStrategy;
     use std::path::PathBuf;
 
+    /// All tools recognized by `tirith setup`.
+    const KNOWN_TOOLS: &[&str] = &[
+        "claude-code",
+        "codex",
+        "cursor",
+        "gemini-cli",
+        "openclaw",
+        "pi-cli",
+        "vscode",
+        "windsurf",
+    ];
+
+    /// Build an error message for an unrecognized tool name, with a
+    /// Levenshtein-based "did you mean" suggestion when close enough.
+    fn unknown_tool_error(tool: &str) -> String {
+        let mut msg = format!(
+            "unknown tool '{tool}' — expected one of: {}",
+            KNOWN_TOOLS.join(", ")
+        );
+        if let Some(suggestion) = crate::cli::suggest_closest(tool, KNOWN_TOOLS, 3) {
+            msg.push_str(&format!("\n  did you mean: tirith setup {suggestion}?"));
+        }
+        msg
+    }
+
     /// Scope of the setup operation.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Scope {
@@ -150,9 +175,7 @@ mod run_impl {
             "pi-cli" => setup_pi_cli(&opts),
             "vscode" => setup_vscode(&opts),
             "windsurf" => setup_windsurf(&opts),
-            _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf"
-            )),
+            _ => Err(unknown_tool_error(tool)),
         }
     }
 
@@ -162,28 +185,34 @@ mod run_impl {
             "claude-code" | "cursor" | "gemini-cli" | "openclaw" | "pi-cli" => match scope {
                 Some("project") | None => Ok(Scope::Project),
                 Some("user") => Ok(Scope::User),
-                Some(other) => Err(format!("invalid scope '{other}' — expected 'project' or 'user'")),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'project' or 'user'\n  try: tirith setup {tool} --scope project"
+                )),
             },
             "vscode" => match scope {
                 Some("project") | None => Ok(Scope::Project),
                 Some("user") => Err(
                     "VS Code user settings use JSONC — run tirith setup vscode in your project directory instead, or configure manually".into(),
                 ),
-                Some(other) => Err(format!("invalid scope '{other}' — expected 'project' or 'user'")),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup vscode --scope project"
+                )),
             },
             "codex" => match scope {
                 Some("project") => Err("Codex is always user-global — omit --scope or use --scope user".into()),
                 Some("user") | None => Ok(Scope::User),
-                Some(other) => Err(format!("invalid scope '{other}' — expected 'user'")),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup codex --scope user"
+                )),
             },
             "windsurf" => match scope {
                 Some("project") => Err("Windsurf is always user-global — omit --scope or use --scope user".into()),
                 Some("user") | None => Ok(Scope::User),
-                Some(other) => Err(format!("invalid scope '{other}' — expected 'user'")),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup windsurf --scope user"
+                )),
             },
-            _ => Err(format!(
-                "unknown tool '{tool}' — expected one of: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf"
-            )),
+            _ => Err(unknown_tool_error(tool)),
         }
     }
 

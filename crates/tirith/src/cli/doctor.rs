@@ -26,11 +26,8 @@ pub fn run(json: bool, reset_bash_safe_mode: bool, fix: bool, yes: bool) -> i32 
     0
 }
 
-fn confirm(prompt: &str) -> bool {
-    eprint!("{prompt} [y/N] ");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
-    matches!(input.trim(), "y" | "Y" | "yes" | "Yes")
+fn confirm(prompt: &str, yes: bool) -> bool {
+    crate::cli::confirm(prompt, yes)
 }
 
 fn run_fix(yes: bool) -> i32 {
@@ -39,7 +36,7 @@ fn run_fix(yes: bool) -> i32 {
     // 1. Shell hooks: if not installed, run init logic
     if !hooks_installed() {
         println!("Fix: Install shell hooks");
-        if yes || confirm("  Install hooks?") {
+        if confirm("  Install hooks?", yes) {
             let rc = crate::cli::init::run(None);
             if rc == 0 {
                 println!("  Hooks installed.");
@@ -53,7 +50,7 @@ fn run_fix(yes: bool) -> i32 {
     // 2. Hook assets: if stale, re-materialize embedded hooks
     if hooks_stale() {
         println!("Fix: Re-materialize stale hook assets");
-        if yes || confirm("  Re-materialize hooks?") {
+        if confirm("  Re-materialize hooks?", yes) {
             // find_hook_dir() materializes as a side effect when needed
             match crate::cli::init::find_hook_dir() {
                 Some(dir) => {
@@ -70,7 +67,7 @@ fn run_fix(yes: bool) -> i32 {
     // 3. Policy: if no policy found, create a starter policy
     if policy_missing() {
         println!("Fix: Create starter policy");
-        if yes || confirm("  Create .tirith/policy.yaml?") {
+        if confirm("  Create .tirith/policy.yaml?", yes) {
             match create_default_policy() {
                 Ok(path) => {
                     println!("  Created {}", path.display());
@@ -90,7 +87,7 @@ fn run_fix(yes: bool) -> i32 {
         if !tools.is_empty() {
             println!("Fix: Configure tirith for AI coding tools");
             for tool in &tools {
-                if yes || confirm(&format!("  Configure tirith for {tool}?")) {
+                if confirm(&format!("  Configure tirith for {tool}?"), yes) {
                     let rc = crate::cli::setup::run(tool, None, false, false, false, false, false);
                     if rc == 0 {
                         println!("  Configured {tool}.");
@@ -117,7 +114,7 @@ fn run_fix(yes: bool) -> i32 {
                 "stale"
             };
             println!("Fix: Download threat DB ({reason})");
-            if yes || confirm("  Download threat DB?") {
+            if confirm("  Download threat DB?", yes) {
                 let force = tdb.signature_valid == Some(false) || tdb.error.is_some();
                 let rc = crate::cli::threatdb_cmd::update(force, false);
                 if rc == 0 {
@@ -133,7 +130,7 @@ fn run_fix(yes: bool) -> i32 {
     // 6. Bash safe-mode: if active, offer to clear
     if bash_safe_mode_active() {
         println!("Fix: Clear bash safe-mode flag");
-        if yes || confirm("  Clear safe-mode?") {
+        if confirm("  Clear safe-mode?", yes) {
             if let Some(state) = tirith_core::policy::state_dir() {
                 let flag = state.join("bash-safe-mode");
                 match std::fs::remove_file(&flag) {

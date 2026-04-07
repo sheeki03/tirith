@@ -109,6 +109,7 @@ pub fn run(shell: Option<&str>) -> i32 {
         _ => {
             eprintln!("tirith: unsupported shell '{shell}'");
             eprintln!("Supported: zsh, bash, fish, powershell, nushell");
+            eprintln!("  try: tirith init --shell zsh");
             1
         }
     }

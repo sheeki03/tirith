@@ -101,10 +101,15 @@ pub fn diff_checkpoint(id: &str, json: bool) -> i32 {
                 println!("No differences found — all files match checkpoint.");
             } else {
                 for d in &diffs {
+                    let s = tirith_core::style::Stream::Stdout;
                     let status = match d.status {
-                        checkpoint::DiffStatus::Deleted => "\x1b[31mdeleted\x1b[0m",
-                        checkpoint::DiffStatus::Modified => "\x1b[33mmodified\x1b[0m",
-                        checkpoint::DiffStatus::BackupCorrupt => "\x1b[31mcorrupt\x1b[0m",
+                        checkpoint::DiffStatus::Deleted => tirith_core::style::red("deleted", s),
+                        checkpoint::DiffStatus::Modified => {
+                            tirith_core::style::yellow("modified", s)
+                        }
+                        checkpoint::DiffStatus::BackupCorrupt => {
+                            tirith_core::style::red("corrupt", s)
+                        }
                     };
                     println!("  {status:>18}  {}", d.path);
                 }

@@ -18,6 +18,7 @@ pub fn export(
         eprintln!(
             "tirith: unknown entry type '{entry_type}' (use 'verdict', 'hook_telemetry', 'trust_change', or 'all')"
         );
+        eprintln!("  try: tirith audit export --entry-type verdict");
         return 1;
     }
 
