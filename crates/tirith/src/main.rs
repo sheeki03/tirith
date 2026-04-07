@@ -1,6 +1,7 @@
 mod assets;
 mod cli;
 
+use crate::cli::{HumanJsonFormat, HumanJsonSarifFormat};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -17,19 +18,31 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Manage the tirith background daemon
+    #[command(after_help = "\
+Examples:
+  tirith daemon start
+  tirith daemon stop
+  tirith daemon status")]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
 
     /// Check a command for URL security issues before execution
+    #[command(after_help = "\
+Examples:
+  tirith check -- 'curl https://example.com | bash'
+  tirith check --format json -- 'npm install suspicious-pkg'")]
     Check {
         /// Shell type for tokenization
         #[arg(long, default_value = "posix")]
         shell: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
 
         /// Force non-interactive mode
@@ -59,13 +72,20 @@ enum Commands {
     },
 
     /// Check pasted content for security issues
+    #[command(after_help = "\
+Examples:
+  echo \"suspicious\" | tirith paste
+  tirith paste --format json < clipboard.txt")]
     Paste {
         /// Shell type for tokenization
         #[arg(long, default_value = "posix")]
         shell: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
 
         /// Force non-interactive mode
@@ -83,6 +103,11 @@ enum Commands {
 
     /// Safely download and execute a script
     #[cfg(unix)]
+    #[command(after_help = "\
+Examples:
+  tirith run https://get.example-tool.sh
+  tirith run --no-exec https://example.com/install.sh
+  tirith run --sha256 abc123 https://example.com/install.sh")]
     Run {
         /// URL to download and execute
         url: String,
@@ -91,8 +116,11 @@ enum Commands {
         #[arg(long)]
         no_exec: bool,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
 
         /// Expected SHA-256 hash of the downloaded script (abort if mismatch)
@@ -101,26 +129,44 @@ enum Commands {
     },
 
     /// Score a URL for security risk
+    #[command(after_help = "\
+Examples:
+  tirith score https://get.example-tool.sh
+  tirith score --format json https://example.com")]
     Score {
         /// URL to score
         url: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Compare a URL against known-good patterns
+    #[command(after_help = "\
+Examples:
+  tirith diff https://install.example-cli.dev
+  tirith diff --format json https://install.example-cli.dev")]
     Diff {
         /// URL to analyze
         url: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Show documentation for a detection rule
+    #[command(after_help = "\
+Examples:
+  tirith explain --rule pipe_to_interpreter
+  tirith explain --list --category terminal")]
     Explain {
         /// Rule ID to explain (e.g., pipe_to_interpreter)
         #[arg(long, conflicts_with = "list")]
@@ -134,31 +180,57 @@ enum Commands {
         #[arg(long, requires = "list")]
         category: Option<String>,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Explain the last triggered rule
+    #[command(after_help = "\
+Examples:
+  tirith why
+  tirith why --format json")]
     Why {
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Manage execution receipts
+    #[command(after_help = "\
+Examples:
+  tirith receipt last
+  tirith receipt list
+  tirith receipt verify a1b2c3d4e5f6")]
     Receipt {
         #[command(subcommand)]
         action: ReceiptAction,
     },
 
     /// Manage file checkpoints for rollback (experimental)
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint create src/ Cargo.toml
+  tirith checkpoint list
+  tirith checkpoint restore <id>
+  tirith checkpoint diff <id>
+  tirith checkpoint purge")]
     Checkpoint {
         #[command(subcommand)]
         action: CheckpointAction,
     },
 
     /// Initialize tirith shell hooks
+    #[command(after_help = "\
+Examples:
+  eval \"$(tirith init --shell zsh)\"
+  eval \"$(tirith init --shell bash)\"")]
     Init {
         /// Target shell (default: auto-detect)
         #[arg(long)]
@@ -166,6 +238,11 @@ enum Commands {
     },
 
     /// Scan files for hidden content and config poisoning
+    #[command(after_help = "\
+Examples:
+  tirith scan ./
+  tirith scan --ci --fail-on high ./
+  tirith scan --format sarif ./ > results.sarif")]
     Scan {
         /// Path to scan (directory or file)
         path: Option<String>,
@@ -186,12 +263,14 @@ enum Commands {
         #[arg(long, default_value = "critical")]
         fail_on: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonSarifFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format", conflicts_with = "sarif")]
         json: bool,
-
-        /// Output as SARIF 2.1.0 JSON
-        #[arg(long)]
+        /// Alias for --format sarif
+        #[arg(long, hide = true, conflicts_with = "format", conflicts_with = "json")]
         sarif: bool,
 
         /// Patterns to ignore
@@ -213,26 +292,49 @@ enum Commands {
 
     /// Check a URL for server-side cloaking (different content for bots vs browsers)
     #[cfg(unix)]
+    #[command(after_help = "\
+Examples:
+  tirith fetch https://example.com/install.sh
+  tirith fetch --format json https://example.com/install.sh")]
     Fetch {
         /// URL to check for cloaking
         url: String,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Run as MCP server (JSON-RPC over stdio)
-    #[command(name = "mcp-server")]
+    #[command(
+        name = "mcp-server",
+        after_help = "\
+Examples:
+  tirith mcp-server
+
+Used by MCP client configurations to run tirith as a local tool server."
+    )]
     McpServer,
 
     /// MCP gateway proxy — intercepts shell tool calls for security analysis
+    #[command(after_help = "\
+Examples:
+  tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml
+  tirith gateway validate-config --config gateway.yaml")]
     Gateway {
         #[command(subcommand)]
         action: GatewayAction,
     },
 
     /// Configure tirith protection for an AI coding tool
+    #[command(after_help = "\
+Examples:
+  tirith setup claude-code --with-mcp
+  tirith setup cursor
+  tirith setup claude-code --dry-run")]
     Setup {
         /// Tool to configure: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf
         tool: String,
@@ -265,33 +367,55 @@ enum Commands {
     },
 
     /// Manage security policies
+    #[command(after_help = "\
+Examples:
+  tirith policy init
+  tirith policy validate
+  tirith policy test 'curl https://example.com | bash'")]
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
     },
 
     /// Audit log management: export, stats, compliance reports (Team)
+    #[command(after_help = "\
+Examples:
+  tirith audit export
+  tirith audit export --format csv --since 2025-01-01
+  tirith audit stats --format json
+  tirith audit report --format html > report.html")]
     Audit {
         #[command(subcommand)]
         action: AuditAction,
     },
 
     /// Activate a license key
+    #[command(after_help = "\
+Examples:
+  tirith activate <license-key>")]
     Activate {
         /// The signed license token
         key: String,
     },
 
     /// Show or manage license status
+    #[command(after_help = "\
+Examples:
+  tirith license
+  tirith license --format json")]
     License {
         #[command(subcommand)]
         action: Option<LicenseAction>,
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 
     /// Log a hook telemetry event (called by hook scripts, always exits 0)
+    #[command(hide = true)]
     HookEvent {
         /// Integration name (e.g., claude-code, cursor, vscode)
         #[arg(long)]
@@ -311,12 +435,25 @@ enum Commands {
     },
 
     /// Manage trusted patterns (allowlist entries with TTL, scoping, and audit)
+    #[command(after_help = "\
+Examples:
+  tirith trust add example.com
+  tirith trust add example.com --ttl 7d
+  tirith trust list --format json --expired
+  tirith trust remove example.com
+  tirith trust last
+  tirith trust gc")]
     Trust {
         #[command(subcommand)]
         action: TrustAction,
     },
 
     /// Show accumulated session warnings
+    #[command(after_help = "\
+Examples:
+  tirith warnings
+  tirith warnings --format json
+  tirith warnings --hidden")]
     Warnings {
         /// Clear session warnings after display
         #[arg(long)]
@@ -326,12 +463,15 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
 
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
 
         /// One-line summary (for shell exit hooks)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "format", conflicts_with = "json")]
         summary: bool,
 
         /// Show findings hidden by paranoia filtering
@@ -340,22 +480,43 @@ enum Commands {
     },
 
     /// Manage the threat intelligence database
-    #[command(name = "threat-db")]
+    #[command(
+        name = "threat-db",
+        after_help = "\
+Examples:
+  tirith threat-db update
+  tirith threat-db update --force
+  tirith threat-db status --format json"
+    )]
     ThreatDb {
         #[command(subcommand)]
         action: ThreatDbAction,
     },
 
     /// Diagnose tirith installation and configuration
+    #[command(after_help = "\
+Examples:
+  tirith doctor
+  tirith doctor --fix
+  tirith doctor --fix --yes")]
     Doctor {
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with = "format",
+            conflicts_with = "fix",
+            conflicts_with = "reset_bash_safe_mode"
+        )]
         json: bool,
         /// Remove persistent bash safe-mode flag (re-enables enter mode)
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long, conflicts_with = "format")]
         reset_bash_safe_mode: bool,
         /// Auto-fix detected issues
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long, conflicts_with = "format")]
         fix: bool,
         /// Auto-approve all fixes (no prompting)
         #[arg(long, requires = "fix")]
@@ -386,10 +547,14 @@ enum LicenseAction {
 #[derive(Subcommand)]
 enum AuditAction {
     /// Export audit log records as JSON or CSV
+    #[command(after_help = "\
+Examples:
+  tirith audit export
+  tirith audit export --format csv --since 2025-01-01")]
     Export {
-        /// Output format: json or csv
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = AuditExportFormat::Json)]
+        format: AuditExportFormat,
         /// Filter: only records since this ISO 8601 date
         #[arg(long)]
         since: Option<String>,
@@ -410,22 +575,33 @@ enum AuditAction {
         entry_type: String,
     },
     /// Show summary statistics from the audit log
+    #[command(after_help = "\
+Examples:
+  tirith audit stats
+  tirith audit stats --format json")]
     Stats {
         /// Filter to a specific session ID
         #[arg(long)]
         session: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
         /// Entry type filter: verdict (default) or hook_telemetry
         #[arg(long, default_value = "verdict")]
         entry_type: String,
     },
     /// Generate a compliance report from the audit log
+    #[command(after_help = "\
+Examples:
+  tirith audit report
+  tirith audit report --format html > report.html")]
     Report {
-        /// Output format: markdown, json, or html
-        #[arg(long, default_value = "markdown")]
-        format: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = AuditReportFormat::Markdown)]
+        format: AuditReportFormat,
         /// Filter: only records since this ISO 8601 date
         #[arg(long)]
         since: Option<String>,
@@ -438,19 +614,40 @@ enum AuditAction {
 #[derive(Subcommand)]
 enum ReceiptAction {
     /// Show the last receipt
+    #[command(after_help = "\
+Examples:
+  tirith receipt last")]
     Last {
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// List all receipts
+    #[command(after_help = "\
+Examples:
+  tirith receipt list")]
     List {
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// Verify a receipt by SHA256
+    #[command(after_help = "\
+Examples:
+  tirith receipt verify a1b2c3d4e5f6")]
     Verify {
         sha256: String,
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -458,37 +655,72 @@ enum ReceiptAction {
 #[derive(Subcommand)]
 enum CheckpointAction {
     /// Create a checkpoint of specified paths
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint create src/ Cargo.toml")]
     Create {
         /// Paths to checkpoint
         paths: Vec<String>,
         /// Command that triggered the checkpoint
         #[arg(long)]
         trigger: Option<String>,
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// List all checkpoints
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint list")]
     List {
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// Restore files from a checkpoint
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint restore <id>")]
     Restore {
         /// Checkpoint ID
         id: String,
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// Show differences between checkpoint and current state
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint diff <id>")]
     Diff {
         /// Checkpoint ID
         id: String,
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// Remove old checkpoints based on age/count/size limits
+    #[command(after_help = "\
+Examples:
+  tirith checkpoint purge")]
     Purge {
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -496,6 +728,9 @@ enum CheckpointAction {
 #[derive(Subcommand)]
 enum GatewayAction {
     /// Run the gateway proxy
+    #[command(after_help = "\
+Examples:
+  tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml")]
     Run {
         /// Path to upstream MCP server binary
         #[arg(long)]
@@ -510,6 +745,9 @@ enum GatewayAction {
         config: String,
     },
     /// Validate gateway config file
+    #[command(after_help = "\
+Examples:
+  tirith gateway validate-config --config gateway.yaml")]
     ValidateConfig {
         /// Path to gateway config YAML
         #[arg(long)]
@@ -520,6 +758,10 @@ enum GatewayAction {
 #[derive(Subcommand)]
 enum PolicyAction {
     /// Generate a starter policy file
+    #[command(after_help = "\
+Examples:
+  tirith policy init
+  tirith policy init --force")]
     Init {
         /// Overwrite existing policy file
         #[arg(long)]
@@ -529,15 +771,26 @@ enum PolicyAction {
         minimal: bool,
     },
     /// Validate a policy file for errors
+    #[command(after_help = "\
+Examples:
+  tirith policy validate
+  tirith policy validate --format json")]
     Validate {
         /// Path to policy file (default: auto-discover)
         #[arg(long)]
         path: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
     /// Test a command or file against the current policy
+    #[command(after_help = "\
+Examples:
+  tirith policy test 'curl https://example.com | bash'
+  tirith policy test --file script.sh")]
     Test {
         /// Command to test
         #[arg(conflicts_with = "file")]
@@ -545,8 +798,11 @@ enum PolicyAction {
         /// File to test
         #[arg(long, conflicts_with = "command")]
         file: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -554,6 +810,11 @@ enum PolicyAction {
 #[derive(Subcommand)]
 enum TrustAction {
     /// Add a trusted pattern
+    #[command(after_help = "\
+Examples:
+  tirith trust add example.com
+  tirith trust add example.com --ttl 7d
+  tirith trust add example.com --rule pipe_to_interpreter")]
     Add {
         /// Pattern to trust (domain, URL fragment, etc.)
         pattern: String,
@@ -568,12 +829,19 @@ enum TrustAction {
         scope: String,
     },
     /// List trusted patterns from all sources
+    #[command(after_help = "\
+Examples:
+  tirith trust list
+  tirith trust list --format json --expired")]
     List {
         /// Filter by rule ID
         #[arg(long)]
         rule: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
         /// Include expired entries
         #[arg(long)]
@@ -583,6 +851,9 @@ enum TrustAction {
         scope: String,
     },
     /// Remove a trusted pattern
+    #[command(after_help = "\
+Examples:
+  tirith trust remove example.com")]
     Remove {
         /// Pattern to remove
         pattern: String,
@@ -594,8 +865,14 @@ enum TrustAction {
         scope: String,
     },
     /// Show last trigger and interactively trust domains
+    #[command(after_help = "\
+Examples:
+  tirith trust last")]
     Last,
     /// Remove expired entries from trust stores
+    #[command(after_help = "\
+Examples:
+  tirith trust gc")]
     Gc {
         /// Scope: user, repo, or all (default)
         #[arg(long, default_value = "all")]
@@ -606,16 +883,44 @@ enum TrustAction {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Start the daemon in the foreground
+    #[command(after_help = "\
+Examples:
+  tirith daemon start")]
     Start,
     /// Stop a running daemon
+    #[command(after_help = "\
+Examples:
+  tirith daemon stop")]
     Stop,
     /// Check if daemon is running and measure latency
+    #[command(after_help = "\
+Examples:
+  tirith daemon status")]
     Status,
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum AuditExportFormat {
+    #[default]
+    Json,
+    Csv,
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum AuditReportFormat {
+    #[default]
+    Markdown,
+    Json,
+    Html,
 }
 
 #[derive(Subcommand)]
 enum ThreatDbAction {
     /// Download or update the threat intelligence database
+    #[command(after_help = "\
+Examples:
+  tirith threat-db update
+  tirith threat-db update --force")]
     Update {
         /// Force re-download even if up to date (bypasses rollback protection)
         #[arg(long)]
@@ -626,9 +931,16 @@ enum ThreatDbAction {
         background: bool,
     },
     /// Show threat DB status, age, and entry counts
+    #[command(after_help = "\
+Examples:
+  tirith threat-db status
+  tirith threat-db status --format json")]
     Status {
-        /// Output as JSON
-        #[arg(long)]
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -651,6 +963,7 @@ fn main() {
 
         Commands::Check {
             shell,
+            format,
             json,
             non_interactive,
             interactive,
@@ -658,45 +971,69 @@ fn main() {
             strict_warn,
             no_daemon,
             cmd,
-        } => cli::check::run(
-            &cmd.join(" "),
-            &shell,
-            json,
-            non_interactive,
-            interactive,
-            approval_check,
-            strict_warn,
-            no_daemon,
-        ),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::check::run(
+                &cmd.join(" "),
+                &shell,
+                json,
+                non_interactive,
+                interactive,
+                approval_check,
+                strict_warn,
+                no_daemon,
+            )
+        }
 
         Commands::Paste {
             shell,
+            format,
             json,
             non_interactive,
             interactive,
             html,
-        } => cli::paste::run(&shell, json, non_interactive, interactive, html.as_deref()),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::paste::run(&shell, json, non_interactive, interactive, html.as_deref())
+        }
 
         #[cfg(unix)]
         Commands::Run {
             url,
             no_exec,
+            format,
             json,
             sha256,
-        } => cli::run::run(&url, no_exec, json, sha256),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::run::run(&url, no_exec, json, sha256)
+        }
 
-        Commands::Score { url, json } => cli::score::run(&url, json),
+        Commands::Score { url, format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::score::run(&url, json)
+        }
 
-        Commands::Diff { url, json } => cli::diff::run(&url, json),
+        Commands::Diff { url, format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::diff::run(&url, json)
+        }
 
         Commands::Explain {
             rule,
             list,
             category,
+            format,
             json,
-        } => cli::explain::run(rule.as_deref(), list, category.as_deref(), json),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::explain::run(rule.as_deref(), list, category.as_deref(), json)
+        }
 
-        Commands::Why { json } => cli::why::run(json),
+        Commands::Why { format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::why::run(json)
+        }
 
         Commands::Scan {
             path,
@@ -704,28 +1041,35 @@ fn main() {
             stdin,
             ci,
             fail_on,
+            format,
             json,
             sarif,
             ignore,
             include,
             exclude,
             profile,
-        } => cli::scan::run(
-            path.as_deref(),
-            file.as_deref(),
-            stdin,
-            ci,
-            &fail_on,
-            json,
-            sarif,
-            &ignore,
-            &include,
-            &exclude,
-            profile.as_deref(),
-        ),
+        } => {
+            let (_, json, sarif) = HumanJsonSarifFormat::resolve(format, json, sarif);
+            cli::scan::run(
+                path.as_deref(),
+                file.as_deref(),
+                stdin,
+                ci,
+                &fail_on,
+                json,
+                sarif,
+                &ignore,
+                &include,
+                &exclude,
+                profile.as_deref(),
+            )
+        }
 
         #[cfg(unix)]
-        Commands::Fetch { url, json } => cli::fetch::run(&url, json),
+        Commands::Fetch { url, format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::fetch::run(&url, json)
+        }
 
         Commands::McpServer => cli::mcp_server::run(),
 
@@ -758,12 +1102,19 @@ fn main() {
 
         Commands::Policy { action } => match action {
             PolicyAction::Init { force, minimal } => cli::policy::init(force, minimal),
-            PolicyAction::Validate { path, json } => cli::policy::validate(path.as_deref(), json),
+            PolicyAction::Validate { path, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::policy::validate(path.as_deref(), json)
+            }
             PolicyAction::Test {
                 command,
                 file,
+                format,
                 json,
-            } => cli::policy::test(command.as_deref(), file.as_deref(), json),
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::policy::test(command.as_deref(), file.as_deref(), json)
+            }
         },
 
         Commands::HookEvent {
@@ -789,54 +1140,105 @@ fn main() {
                 action,
                 rule_id,
                 entry_type,
-            } => cli::audit::export(
-                &format,
-                since.as_deref(),
-                until.as_deref(),
-                session.as_deref(),
-                action.as_deref(),
-                &rule_id,
-                &entry_type,
-            ),
+            } => {
+                let format_str = match format {
+                    AuditExportFormat::Json => "json",
+                    AuditExportFormat::Csv => "csv",
+                };
+                cli::audit::export(
+                    format_str,
+                    since.as_deref(),
+                    until.as_deref(),
+                    session.as_deref(),
+                    action.as_deref(),
+                    &rule_id,
+                    &entry_type,
+                )
+            }
             AuditAction::Stats {
                 session,
+                format,
                 json,
                 entry_type,
-            } => cli::audit::stats(session.as_deref(), json, &entry_type),
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::audit::stats(session.as_deref(), json, &entry_type)
+            }
             AuditAction::Report {
                 format,
                 since,
                 entry_type,
-            } => cli::audit::report(&format, since.as_deref(), &entry_type),
+            } => {
+                let format_str = match format {
+                    AuditReportFormat::Markdown => "markdown",
+                    AuditReportFormat::Json => "json",
+                    AuditReportFormat::Html => "html",
+                };
+                cli::audit::report(format_str, since.as_deref(), &entry_type)
+            }
         },
 
         Commands::Receipt { action } => match action {
-            ReceiptAction::Last { json } => cli::receipt::last(json),
-            ReceiptAction::List { json } => cli::receipt::list(json),
-            ReceiptAction::Verify { sha256, json } => cli::receipt::verify(&sha256, json),
+            ReceiptAction::Last { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::receipt::last(json)
+            }
+            ReceiptAction::List { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::receipt::list(json)
+            }
+            ReceiptAction::Verify {
+                sha256,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::receipt::verify(&sha256, json)
+            }
         },
 
         Commands::Checkpoint { action } => match action {
             CheckpointAction::Create {
                 paths,
                 trigger,
+                format,
                 json,
-            } => cli::checkpoint::create_checkpoint(&paths, trigger.as_deref(), json),
-            CheckpointAction::List { json } => cli::checkpoint::list_checkpoints(json),
-            CheckpointAction::Restore { id, json } => {
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::checkpoint::create_checkpoint(&paths, trigger.as_deref(), json)
+            }
+            CheckpointAction::List { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::checkpoint::list_checkpoints(json)
+            }
+            CheckpointAction::Restore { id, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::checkpoint::restore_checkpoint(&id, json)
             }
-            CheckpointAction::Diff { id, json } => cli::checkpoint::diff_checkpoint(&id, json),
-            CheckpointAction::Purge { json } => cli::checkpoint::purge_checkpoints(json),
+            CheckpointAction::Diff { id, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::checkpoint::diff_checkpoint(&id, json)
+            }
+            CheckpointAction::Purge { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::checkpoint::purge_checkpoints(json)
+            }
         },
 
         Commands::Activate { key } => cli::license_cmd::activate(&key),
 
-        Commands::License { action, json } => match action {
-            None => cli::license_cmd::show(json),
-            Some(LicenseAction::Deactivate) => cli::license_cmd::deactivate(),
-            Some(LicenseAction::Refresh) => cli::license_cmd::refresh(),
-        },
+        Commands::License {
+            action,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            match action {
+                None => cli::license_cmd::show(json),
+                Some(LicenseAction::Deactivate) => cli::license_cmd::deactivate(),
+                Some(LicenseAction::Refresh) => cli::license_cmd::refresh(),
+            }
+        }
 
         Commands::Trust { action } => match action {
             TrustAction::Add {
@@ -847,10 +1249,14 @@ fn main() {
             } => cli::trust::add(&pattern, rule.as_deref(), ttl.as_deref(), &scope),
             TrustAction::List {
                 rule,
+                format,
                 json,
                 expired,
                 scope,
-            } => cli::trust::list(rule.as_deref(), json, expired, &scope),
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::list(rule.as_deref(), json, expired, &scope)
+            }
             TrustAction::Remove {
                 pattern,
                 rule,
@@ -865,24 +1271,35 @@ fn main() {
         Commands::Warnings {
             clear,
             session,
+            format,
             json,
             summary,
             hidden,
-        } => cli::warnings::run(clear, session.as_deref(), json, summary, hidden),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::warnings::run(clear, session.as_deref(), json, summary, hidden)
+        }
 
         Commands::ThreatDb { action } => match action {
             ThreatDbAction::Update { force, background } => {
                 cli::threatdb_cmd::update(force, background)
             }
-            ThreatDbAction::Status { json } => cli::threatdb_cmd::status(json),
+            ThreatDbAction::Status { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::status(json)
+            }
         },
 
         Commands::Doctor {
+            format,
             json,
             reset_bash_safe_mode,
             fix,
             yes,
-        } => cli::doctor::run(json, reset_bash_safe_mode, fix, yes),
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::doctor::run(json, reset_bash_safe_mode, fix, yes)
+        }
 
         Commands::Completions { shell } => cli::completions::run(shell),
 
