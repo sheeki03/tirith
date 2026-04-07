@@ -34,7 +34,7 @@ Default severity mappings. Allowlisted URLs skip analysis.
 
 ```bash
 # In CI pipeline
-tirith check --non-interactive --json -- curl https://example.com/setup.sh | bash
+tirith check --non-interactive --format json -- curl https://example.com/setup.sh | bash
 EXIT=$?
 if [ $EXIT -eq 1 ]; then
   echo "BLOCKED by tirith" >&2

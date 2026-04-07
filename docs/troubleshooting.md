@@ -91,7 +91,7 @@ If using PSReadLine, ensure the tirith hook loads after PSReadLine initializatio
 
 tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency:
 
-1. Run `tirith check --json -- "your command"` and check `timings_ms`
+1. Run `tirith check --format json -- "your command"` and check `timings_ms`
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
 

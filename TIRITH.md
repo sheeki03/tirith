@@ -68,7 +68,7 @@ tirith binary (Rust, statically linked)
        │   1 = block (print reason to stderr)
        │   2 = warn (print prompt payload to stderr, wait for user input on /dev/tty)
        |
-       └── Structured JSON output available via --json flag
+       └── Structured JSON output available via --format json flag
 ```
 
 Benefits:

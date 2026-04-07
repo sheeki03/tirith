@@ -402,7 +402,7 @@ tirith daemon stop
 |---------|-------------|
 | `tirith check -- <cmd>` | Analyze a command without executing it |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
-| `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--sarif`, `--ci` |
+| `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` in your repo |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
@@ -509,7 +509,7 @@ Review accumulated warnings at any time:
 
 ```bash
 tirith warnings               # table of session warnings
-tirith warnings --json        # structured output
+tirith warnings --format json # structured output
 tirith warnings --clear       # clear after viewing
 ```
 
