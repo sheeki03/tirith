@@ -47,6 +47,7 @@ fs2 = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"
+insta = "1"
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"

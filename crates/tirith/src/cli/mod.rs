@@ -1,3 +1,93 @@
+use std::io::Write;
+
+/// Output format for commands that support human and JSON output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum HumanJsonFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+impl HumanJsonFormat {
+    /// Resolve the effective format from an optional `--format` value and a
+    /// `--json` boolean alias.  Returns `(format, is_json)` so callers can
+    /// destructure both in one step.
+    pub fn resolve(format: Option<Self>, json_flag: bool) -> (Self, bool) {
+        let resolved = if json_flag {
+            Self::Json
+        } else {
+            format.unwrap_or(Self::Human)
+        };
+        (resolved, resolved == Self::Json)
+    }
+}
+
+/// Output format for scan, which additionally supports SARIF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum HumanJsonSarifFormat {
+    #[default]
+    Human,
+    Json,
+    Sarif,
+}
+
+impl HumanJsonSarifFormat {
+    /// Resolve the effective format from optional `--format`, `--json`, and
+    /// `--sarif` boolean aliases.  Returns `(format, is_json, is_sarif)`.
+    pub fn resolve(format: Option<Self>, json_flag: bool, sarif_flag: bool) -> (Self, bool, bool) {
+        let resolved = if json_flag {
+            Self::Json
+        } else if sarif_flag {
+            Self::Sarif
+        } else {
+            format.unwrap_or(Self::Human)
+        };
+        (resolved, resolved == Self::Json, resolved == Self::Sarif)
+    }
+}
+
+/// Suggest the closest match from a list of candidates using Levenshtein distance.
+/// Returns `None` if no candidate is within `max_distance`.
+pub fn suggest_closest<'a>(
+    query: &str,
+    candidates: &[&'a str],
+    max_distance: usize,
+) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(|c| (*c, tirith_core::util::levenshtein(query, c)))
+        .filter(|(_, d)| *d <= max_distance)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
+}
+
+/// Prompt user for confirmation. Returns true only if:
+/// - `yes` is true (`--yes` was passed), OR
+/// - stderr is a TTY AND user types y/yes
+///
+/// Returns **false** in non-interactive contexts without `--yes`,
+/// preventing silent approval of destructive operations.
+pub fn confirm(prompt: &str, yes: bool) -> bool {
+    if yes {
+        return true;
+    }
+    if !is_terminal::is_terminal(std::io::stderr()) {
+        eprintln!("tirith: skipping prompt (not a TTY — use --yes to auto-approve)");
+        return false;
+    }
+    eprint!("{prompt} [y/N] ");
+    // Flush is best-effort; if it fails the prompt may not be visible but read_line still works.
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(_) => matches!(input.trim(), "y" | "Y" | "yes" | "Yes"),
+        Err(e) => {
+            eprintln!("tirith: could not read confirmation input: {e}");
+            false
+        }
+    }
+}
+
 pub mod audit;
 pub mod check;
 pub mod checkpoint;

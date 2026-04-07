@@ -36,6 +36,7 @@ toml = "0.8"
 ed25519-dalek = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 csv = { workspace = true }
+owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
