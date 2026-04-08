@@ -38,6 +38,16 @@ jobs:
           wait
           echo "Sources fetched successfully"
 
+      # Bail early if signing key is not configured
+      - name: Check signing key
+        env:
+          TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
+        run: |
+          if [ -z "$TIRITH_THREATDB_SIGNING_KEY" ]; then
+            echo "::error::THREATDB_SIGNING_KEY secret is not configured. Set it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+
       # Compile + sign
       - name: Compile threat database
         env:
