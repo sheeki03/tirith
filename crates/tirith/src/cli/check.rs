@@ -17,6 +17,7 @@ pub fn run(
     approval_check: bool,
     strict_warn: bool,
     no_daemon: bool,
+    warn_only: bool,
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
@@ -316,7 +317,7 @@ pub fn run(
     // For --approval-check mode, stdout has ONLY the temp-file path.
     // Write human-readable output to stderr so hooks can display it.
     if approval_check {
-        if output::write_human(&effective, std::io::stderr().lock()).is_err() {
+        if output::write_human(&effective, warn_only, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write approval output");
         }
 
@@ -359,7 +360,7 @@ pub fn run(
         {
             eprintln!("tirith: failed to write JSON output");
         }
-    } else if output::write_human_auto(&effective).is_err() {
+    } else if output::write_human_auto(&effective, warn_only).is_err() {
         eprintln!("tirith: failed to write output");
     }
 

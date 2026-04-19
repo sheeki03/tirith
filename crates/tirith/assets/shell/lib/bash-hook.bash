@@ -150,10 +150,14 @@ _tirith_preexec() {
   [[ "${_tirith_last_cmd:-}" == "$cmd" ]] && return
   _tirith_last_cmd="$cmd"
 
-  # Warn-only: command is already committed, we can only print warnings
+  # Warn-only: the command has already been committed by the DEBUG trap, so we
+  # can only print a notice. Pass --warn-only so tirith renders block verdicts
+  # as "DETECTED (shell hook cannot block in preexec mode…)" instead of the
+  # misleading "BLOCKED" banner (issue #77). Exit code is still 1 for blocks,
+  # which `|| true` masks because bash preexec physically cannot abort here.
   local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
   _TIRITH_BASH_INTERNAL=1
-  command tirith check --shell posix -- "$cmd" || true
+  command tirith check --shell posix --warn-only -- "$cmd" || true
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
 }
 

@@ -66,6 +66,15 @@ Examples:
         #[arg(long)]
         no_daemon: bool,
 
+        /// Caller cannot enforce a block (human output is rendered as
+        /// `DETECTED (shell hook cannot block in preexec mode…)` instead of
+        /// `BLOCKED`). Exit codes, JSON, and audit logs are unchanged — this
+        /// flag only changes the human rendering. Used by bash preexec mode
+        /// where the DEBUG trap can warn but can't abort the command.
+        /// See issue #77.
+        #[arg(long)]
+        warn_only: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -970,6 +979,7 @@ fn main() {
             approval_check,
             strict_warn,
             no_daemon,
+            warn_only,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -982,6 +992,7 @@ fn main() {
                 approval_check,
                 strict_warn,
                 no_daemon,
+                warn_only,
             )
         }
 

@@ -45,14 +45,25 @@ pub fn write_json(
 }
 
 /// Write human-readable verdict to stderr.
-pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+///
+/// `warn_only` indicates the caller cannot actually enforce a block (e.g. bash
+/// preexec `DEBUG` trap). In that mode, Block verdicts render as `DETECTED
+/// (shell hook cannot block in preexec mode — command will still run)` instead
+/// of `BLOCKED`, and the bypass hint line is rewritten accordingly. The flag
+/// is human-only — it never reaches `write_json`, audit logs, or exit codes
+/// (see issue #77).
+pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std::io::Result<()> {
     if verdict.findings.is_empty() {
         return Ok(());
     }
 
+    let is_warn_only_block = warn_only && verdict.action == Action::Block;
     let action_str = match verdict.action {
         Action::Allow => "INFO",
         Action::Warn | Action::WarnAck => "WARNING",
+        Action::Block if is_warn_only_block => {
+            "DETECTED (shell hook cannot block in preexec mode — command will still run)"
+        }
         Action::Block => "BLOCKED",
     };
 
@@ -106,10 +117,17 @@ pub fn write_human(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> 
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
-        writeln!(
-            w,
-            "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
-        )?;
+        if is_warn_only_block {
+            writeln!(
+                w,
+                "  Safer: use an enter-capable shell (bash 5+/zsh/fish) to actually block this, or prefix with TIRITH=0 to suppress."
+            )?;
+        } else {
+            writeln!(
+                w,
+                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+            )?;
+        }
     }
 
     Ok(())
@@ -151,23 +169,31 @@ fn format_visual_with_markers(
 
 /// Write human-readable output to stderr, respecting color preferences.
 /// Uses the no-color path when stderr is not a TTY or `NO_COLOR` is set.
-pub fn write_human_auto(verdict: &Verdict) -> std::io::Result<()> {
+pub fn write_human_auto(verdict: &Verdict, warn_only: bool) -> std::io::Result<()> {
     if crate::style::use_color_for(crate::style::Stream::Stderr) {
-        write_human(verdict, std::io::stderr().lock())
+        write_human(verdict, warn_only, std::io::stderr().lock())
     } else {
-        write_human_no_color(verdict, std::io::stderr().lock())
+        write_human_no_color(verdict, warn_only, std::io::stderr().lock())
     }
 }
 
 /// Write human-readable output without ANSI colors.
-fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+fn write_human_no_color(
+    verdict: &Verdict,
+    warn_only: bool,
+    mut w: impl Write,
+) -> std::io::Result<()> {
     if verdict.findings.is_empty() {
         return Ok(());
     }
 
+    let is_warn_only_block = warn_only && verdict.action == Action::Block;
     let action_str = match verdict.action {
         Action::Allow => "INFO",
         Action::Warn | Action::WarnAck => "WARNING",
+        Action::Block if is_warn_only_block => {
+            "DETECTED (shell hook cannot block in preexec mode — command will still run)"
+        }
         Action::Block => "BLOCKED",
     };
 
@@ -216,10 +242,17 @@ fn write_human_no_color(verdict: &Verdict, mut w: impl Write) -> std::io::Result
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
-        writeln!(
-            w,
-            "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
-        )?;
+        if is_warn_only_block {
+            writeln!(
+                w,
+                "  Safer: use an enter-capable shell (bash 5+/zsh/fish) to actually block this, or prefix with TIRITH=0 to suppress."
+            )?;
+        } else {
+            writeln!(
+                w,
+                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+            )?;
+        }
     }
 
     Ok(())
@@ -249,4 +282,105 @@ fn format_visual_with_brackets(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
+
+    fn block_verdict_with_bypass() -> Verdict {
+        let mut v = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::PlainHttpToSink,
+                severity: Severity::High,
+                title: "Plain HTTP URL in execution context".to_string(),
+                description: "test".to_string(),
+                evidence: vec![Evidence::Url {
+                    raw: "http://evil.com/x.sh".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings {
+                tier0_ms: 0.0,
+                tier1_ms: 0.0,
+                tier2_ms: None,
+                tier3_ms: None,
+                total_ms: 0.0,
+            },
+        );
+        // from_findings sets action based on severity; ensure it's Block for this test
+        v.action = Action::Block;
+        v.bypass_available = true;
+        v
+    }
+
+    #[test]
+    fn write_human_no_color_warn_only_renders_detected() {
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, true, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains("BLOCKED"),
+            "warn-only must not render BLOCKED: {out}"
+        );
+        assert!(
+            out.contains("DETECTED (shell hook cannot block in preexec mode"),
+            "warn-only must render DETECTED with explanation: {out}"
+        );
+        assert!(
+            !out.contains("Bypass:"),
+            "warn-only must replace the Bypass hint: {out}"
+        );
+        assert!(
+            out.contains("Safer:"),
+            "warn-only must render the Safer hint: {out}"
+        );
+    }
+
+    #[test]
+    fn write_human_no_color_plain_renders_blocked() {
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("BLOCKED"),
+            "default must still render BLOCKED: {out}"
+        );
+        assert!(
+            !out.contains("DETECTED"),
+            "default must not render DETECTED: {out}"
+        );
+        assert!(
+            out.contains("Bypass:"),
+            "default must render the Bypass hint: {out}"
+        );
+    }
+
+    #[test]
+    fn warn_only_flag_does_not_reach_write_json() {
+        // Invariant: `write_json` takes a `Verdict` (no warn_only parameter),
+        // so the flag literally cannot be serialized into machine output.
+        // This test pins down the shape — any refactor that passes warn_only
+        // into write_json would require updating this assertion too, which
+        // is the review bar the plan wants.
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_json(&verdict, &[], &mut buf).unwrap();
+        let json = String::from_utf8(buf).unwrap();
+        assert!(
+            !json.contains("warn_only"),
+            "JSON must not carry warn_only: {json}"
+        );
+        assert!(
+            !json.contains("DETECTED"),
+            "JSON must not carry the DETECTED banner string: {json}"
+        );
+    }
 }

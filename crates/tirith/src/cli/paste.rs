@@ -114,7 +114,7 @@ pub fn run(
         {
             eprintln!("tirith: failed to write JSON output");
         }
-    } else if output::write_human_auto(&verdict).is_err() {
+    } else if output::write_human_auto(&verdict, false).is_err() {
         eprintln!("tirith: failed to write output");
     }
 

