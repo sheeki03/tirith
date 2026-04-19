@@ -134,6 +134,16 @@ _tirith_persist_safe_mode() {
 
 _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return
+
+  # Once-per-shell warn-only banner for interactive preexec users.
+  if [[ -z "${_TIRITH_PREEXEC_WARNED:-}" ]] \
+     && [[ $- == *i* ]] \
+     && [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" != "1" ]]; then
+    _TIRITH_PREEXEC_WARNED=1
+    _tirith_output "tirith: bash is in preexec mode (warn-only, does not block)"
+    _tirith_output "  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)"
+  fi
+
   local cmd="$BASH_COMMAND"
   local history_line
 
@@ -253,6 +263,26 @@ elif [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" ]]
   _TIRITH_BASH_MODE="preexec"
 else
   _TIRITH_BASH_MODE="enter"
+fi
+
+# ─── Effective-state exports (for `tirith doctor` live reporting) ───
+#
+# Doctor is a child process and cannot read shell-local `_TIRITH_*` variables,
+# so the hook exports a small public contract: `TIRITH_BASH_EFFECTIVE_MODE` and
+# `TIRITH_BASH_EFFECTIVE_PROTECTION`. These are re-exported on every state
+# change (degrade, enforcement flip) so a subsequent `tirith doctor` invocation
+# in the same shell sees truthful live state. Only exported in interactive
+# shells where the hook actually installs interception; non-interactive
+# sourcing is a no-op and must not leak status vars into child processes.
+if [[ $- == *i* ]]; then
+  export TIRITH_BASH_EFFECTIVE_MODE="$_TIRITH_BASH_MODE"
+  # Phase 0: preexec is always warn-only; enter mode blocks. Phase 1 will
+  # refine this when enforcement lands.
+  if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+  else
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+  fi
 fi
 
 # ─── Helpers ───

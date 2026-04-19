@@ -233,6 +233,15 @@ fn bash_safe_mode_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Match the truthy values the bash hook accepts for `TIRITH_BASH_*` boolean
+/// env vars: `1`, `true`, `yes`, `on` (case-insensitive).
+fn env_is_truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Create a minimal starter policy at .tirith/policy.yaml in the repo root,
 /// or fall back to the user config dir.
 fn create_default_policy() -> Result<PathBuf, String> {
@@ -415,6 +424,22 @@ struct DoctorInfo {
     shell_profile: Option<String>,
     hook_configured: bool,
     bash_safe_mode: bool,
+    /// Requested bash mode from `TIRITH_BASH_MODE` env var (empty = default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_requested_mode: Option<String>,
+    /// Requested preexec enforcement from `TIRITH_BASH_PREEXEC_ENFORCE` env var.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_requested_enforce: Option<String>,
+    /// Require-enter strict mode from `TIRITH_BASH_REQUIRE_ENTER` env var.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_requested_require_enter: Option<String>,
+    /// Effective bash mode exported by the hook (`TIRITH_BASH_EFFECTIVE_MODE`).
+    /// Absent means the hook was not sourced in this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_mode: Option<String>,
+    /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_protection: Option<String>,
     policy_paths: Vec<String>,
     policy_root_env: Option<String>,
     data_dir: Option<String>,
@@ -474,6 +499,26 @@ fn gather_info() -> DoctorInfo {
         .map(|d| d.join("bash-safe-mode").exists())
         .unwrap_or(false);
 
+    // Raw env vars the user may have set (requested state).
+    let bash_requested_mode = std::env::var("TIRITH_BASH_MODE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let bash_requested_enforce = std::env::var("TIRITH_BASH_PREEXEC_ENFORCE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let bash_requested_require_enter = std::env::var("TIRITH_BASH_REQUIRE_ENTER")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    // Live state vars exported by the hook (effective state). Absence means the
+    // bash hook was not sourced in this process.
+    let bash_effective_mode = std::env::var("TIRITH_BASH_EFFECTIVE_MODE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let bash_effective_protection = std::env::var("TIRITH_BASH_EFFECTIVE_PROTECTION")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     let data_dir = tirith_core::policy::data_dir();
     let log_path = data_dir.as_ref().map(|d| d.join("log.jsonl"));
     let last_trigger_path = data_dir.as_ref().map(|d| d.join("last_trigger.json"));
@@ -516,6 +561,11 @@ fn gather_info() -> DoctorInfo {
         shell_profile: shell_profile.map(|p| p.display().to_string()),
         hook_configured,
         bash_safe_mode,
+        bash_requested_mode,
+        bash_requested_enforce,
+        bash_requested_require_enter,
+        bash_effective_mode,
+        bash_effective_protection,
         policy_paths,
         policy_root_env,
         data_dir: data_dir.map(|d| d.display().to_string()),
@@ -659,11 +709,64 @@ fn print_human(info: &DoctorInfo) {
         }
         println!();
     }
-    if info.bash_safe_mode {
-        println!("  bash mode:    SAFE MODE (preexec fallback — previous enter-mode failure)");
-        println!("                Reset: tirith doctor --reset-bash-safe-mode");
-    } else {
-        println!("  bash mode:    normal");
+    // Bash-only block: show requested vs effective state so mid-session
+    // degrades and env misconfigurations are legible. Also shown whenever any
+    // bash-related env var is present, so users who source the hook from a
+    // non-bash parent (e.g. a zsh login shell that spawns bash) still get the
+    // right diagnostics.
+    let has_any_bash_env = info.bash_requested_mode.is_some()
+        || info.bash_requested_enforce.is_some()
+        || info.bash_requested_require_enter.is_some()
+        || info.bash_effective_mode.is_some()
+        || info.bash_effective_protection.is_some();
+    if info.detected_shell == "bash" || has_any_bash_env {
+        let requested_mode = info.bash_requested_mode.as_deref().unwrap_or("(default)");
+        let requested_enforce = if info
+            .bash_requested_enforce
+            .as_deref()
+            .map(env_is_truthy)
+            .unwrap_or(false)
+        {
+            "on"
+        } else {
+            "off"
+        };
+        let require_enter = if info
+            .bash_requested_require_enter
+            .as_deref()
+            .map(env_is_truthy)
+            .unwrap_or(false)
+        {
+            "on"
+        } else {
+            "off"
+        };
+        println!("  requested mode:       {requested_mode}");
+        println!("  requested enforce:    {requested_enforce}");
+        println!("  require-enter:        {require_enter}");
+
+        match (
+            info.bash_effective_mode.as_deref(),
+            info.bash_effective_protection.as_deref(),
+        ) {
+            (Some(mode), Some(protection)) => {
+                println!("  bash mode:            {mode}");
+                println!("  effective protection: {protection}");
+            }
+            _ => {
+                println!("  bash hook:            not loaded in this process");
+            }
+        }
+
+        if info.bash_safe_mode {
+            println!("  safe mode:            on (previous enter-mode failure)");
+            println!("                        Reset: tirith doctor --reset-bash-safe-mode");
+        } else {
+            println!("  safe mode:            off");
+        }
+    } else if info.bash_safe_mode {
+        // Non-bash shell but safe-mode flag exists: still surface it.
+        println!("  bash safe mode:       on (Reset: tirith doctor --reset-bash-safe-mode)");
     }
     if info.policy_paths.is_empty() {
         println!("  policies:     (none found)");

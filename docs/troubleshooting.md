@@ -54,6 +54,32 @@ tirith supports two bash integration modes:
 
 Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec` (set before `tirith init` in your shell rc)
 
+### Checking live state with `tirith doctor`
+
+`tirith doctor` reports bash state on two separate lines so requested configuration and live hook state are legible even when they disagree (e.g. after a mid-session degrade):
+
+```
+  requested mode:       preexec          ← from TIRITH_BASH_MODE env var
+  requested enforce:    off              ← from TIRITH_BASH_PREEXEC_ENFORCE
+  require-enter:        off              ← from TIRITH_BASH_REQUIRE_ENTER
+  bash mode:            preexec          ← live, exported by the hook
+  effective protection: warn-only        ← live, exported by the hook
+  safe mode:            off              ← persistent enter-mode-failure flag
+```
+
+If you see `bash hook: not loaded in this process`, the hook did not run in the shell that invoked `doctor` — typically because `doctor` was called from a non-interactive subshell. Source the hook in your `.bashrc` and open a new interactive shell.
+
+### First-use preexec banner
+
+On the first command it intercepts in an interactive bash session, the preexec hook prints a one-line reminder:
+
+```
+tirith: bash is in preexec mode (warn-only, does not block)
+  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)
+```
+
+This is intentional: preexec mode cannot stop a command once bash has committed to running it. The banner fires once per shell, on the first intercepted command.
+
 ### Persistent safe mode
 
 If enter mode detects a failure (bind-x not taking effect, PROMPT_COMMAND delivery broken, etc.), it automatically degrades to preexec and writes a persistent flag at `~/.local/state/tirith/bash-safe-mode`. All subsequent shells will start in preexec until you explicitly re-enable enter mode.
