@@ -780,6 +780,19 @@ fn resolve_segment_command(segment: &Segment) -> Option<ResolvedCommand<'_>> {
     resolve_named_command(command, &segment.args)
 }
 
+/// Resolve a segment's command through wrappers (`env`, `command`, `time`,
+/// `sudo`/`doas`, `tirith`) and return the resolved name and the wrapped
+/// command's args. Callers outside the extractor (e.g. `check_network_policy`)
+/// use this so wrapped invocations like `sudo curl …` or `env curl …` get the
+/// same policy treatment as the bare command.
+///
+/// Returns `None` if the segment has no command or the wrapper chain can't be
+/// resolved (e.g. `sudo` with no command word).
+pub fn resolve_wrapped_command(segment: &Segment) -> Option<(String, Vec<String>)> {
+    let resolved = resolve_segment_command(segment)?;
+    Some((resolved.name, resolved.args.to_vec()))
+}
+
 fn resolve_named_command<'a>(command: &str, args: &'a [String]) -> Option<ResolvedCommand<'a>> {
     let name = command_base_name(command);
     match name.as_str() {

