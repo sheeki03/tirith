@@ -251,11 +251,17 @@ _tirith_enable_extdebug() {
 # Idempotent DEBUG-trap installer. Chains through any pre-existing user DEBUG
 # trap via a trampoline so warn-only + enforcement do not clobber the user's
 # own instrumentation. Second and later calls are no-ops.
+#
+# We capture the caller's line number (BASH_LINENO[0] here, since the
+# trampoline IS the topmost function called from the trap) and pass it
+# explicitly to _tirith_preexec — otherwise preexec would see only its own
+# call frame's line, not the user-typed line.
 _tirith_debug_trampoline() {
+  local _user_line_id="${BASH_LINENO[0]:-0}"
   if [[ -n "${_TIRITH_PREV_DEBUG_TRAP:-}" ]]; then
     eval "$_TIRITH_PREV_DEBUG_TRAP" || true
   fi
-  _tirith_preexec
+  _tirith_preexec "$_user_line_id"
 }
 
 _tirith_install_debug_trap() {
@@ -304,15 +310,16 @@ _tirith_preexec() {
     history_line="${entry#*|}"
   fi
 
-  # Cross-path pinned-verdict check. Any degrade-and-block path writes the
-  # current history index plus rc into (_tirith_last_key, _tirith_last_rc)
-  # BEFORE flipping the session state. Honour that pin here regardless of
-  # enforce-vs-warn-only branching, so the remaining DEBUG fires on the same
-  # typed line stay blocked even though the session is now warn-only.
-  if [[ -n "$history_index" ]] \
-     && [[ "${_tirith_last_key:-}" == "$history_index" ]]; then
-    return "${_tirith_last_rc:-0}"
-  fi
+  # Per-typed-line cache key. The trampoline captures the caller's line
+  # number (BASH_LINENO[0] from its own frame) and passes it as $1; that
+  # value advances on each prompt-boundary even when the user's
+  # HISTCONTROL/HISTIGNORE settings make `history 1` skip entries, so it
+  # identifies "same typed line" reliably even in filtered shells. All
+  # simple commands of one typed line (`a; b`, `a | b`, `a && b`) share
+  # the same value. Fall back to the topmost BASH_LINENO frame for the
+  # rare case preexec is invoked directly without going through the
+  # trampoline.
+  local line_id="${1:-${BASH_LINENO[${#BASH_LINENO[@]}-1]:-0}}"
 
   local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
   local rc
@@ -327,17 +334,26 @@ _tirith_preexec() {
       return 1
     fi
 
-    # Drift check: BASH_COMMAND must appear inside history_line.
+    # Drift check FIRST. Critical: a stale history index (e.g. when a
+    # filtered command leaves history_index unchanged from a prior allow)
+    # MUST NOT short-circuit to the cache before we re-validate that the
+    # current BASH_COMMAND still belongs to the typed line. Otherwise an
+    # attacker can flip on `HISTCONTROL=ignorespace` mid-session and reuse
+    # an earlier allow verdict for a brand-new blocked command.
     if ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
-      _tirith_last_key="$history_index"
+      _tirith_last_key="$line_id"
       _tirith_last_rc=1
       _tirith_session_degrade_to_warn_only \
         "tirith: bash history no longer matches BASH_COMMAND (likely HISTCONTROL/HISTIGNORE filtering, an alias, or a shell transformation outside Phase 1 scope); cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
       return 1
     fi
 
-    # Cache miss (a hit was handled by the top-level pinned-verdict check
-    # above). Fresh whole-line scan.
+    # Cache hit on the current typed line (drift just validated).
+    if [[ "${_tirith_last_key:-}" == "$line_id" ]]; then
+      return "${_tirith_last_rc:-0}"
+    fi
+
+    # Cache miss: fresh whole-line scan.
     _TIRITH_BASH_INTERNAL=1
     command tirith check --shell posix -- "$history_line"
     rc=$?
@@ -345,17 +361,17 @@ _tirith_preexec() {
 
     case "$rc" in
       0|2)
-        _tirith_last_key="$history_index"
+        _tirith_last_key="$line_id"
         _tirith_last_rc=0
         return 0
         ;;
       1)
-        _tirith_last_key="$history_index"
+        _tirith_last_key="$line_id"
         _tirith_last_rc=1
         return 1
         ;;
       *)
-        _tirith_last_key="$history_index"
+        _tirith_last_key="$line_id"
         _tirith_last_rc=1
         _tirith_session_degrade_to_warn_only \
           "tirith: preexec enforcement failed unexpectedly (exit $rc), blocking this command and disabling enforcement for this shell"
@@ -365,6 +381,16 @@ _tirith_preexec() {
   fi
 
   # ─── Warn-only path ──────────────────────────────────────────────
+  # Cross-path pinned-block carryover: a prior degrade may have written
+  # (_tirith_last_key=$line_id, _tirith_last_rc=1) so the rest of the same
+  # typed line continues to be skipped by extdebug. Keying on LINENO means
+  # a later prompt cannot inherit the block — even in shells where history
+  # filtering keeps history_index pinned across prompts.
+  if [[ "${_tirith_last_key:-}" == "$line_id" ]] \
+     && [[ "${_tirith_last_rc:-}" == "1" ]]; then
+    return 1
+  fi
+
   # When the session has been degraded (install-time hostile-config or
   # runtime drift), history_line can no longer be trusted to correspond to
   # the current simple command, so scan BASH_COMMAND instead. Otherwise
@@ -527,6 +553,12 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     _tirith_enable_extdebug
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
   else
+    # Same hostile-history check that triggers a runtime drift downgrade —
+    # so the warn-only scan target must also flip to BASH_COMMAND, not the
+    # untrustworthy history_line. Without this the warn-only path would
+    # produce stale DETECTED banners scanned against whatever entry
+    # `history 1` happens to surface.
+    _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
     _tirith_output "tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
   fi
 fi

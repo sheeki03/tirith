@@ -484,6 +484,120 @@ printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
     );
 }
 
+// ─── Mid-session HISTCONTROL bypass (regression for P1 review finding) ──
+
+#[test]
+fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
+    // Reproducer for the P1 manual-review finding: with enforcement on,
+    // (1) a clean command produces a cached allow keyed by the current
+    // line, then (2) the user enables HISTCONTROL=ignorespace, then (3) a
+    // leading-space `curl BLOCK_TOKEN-...` is filtered out of history, so
+    // history_index does not advance. The hook MUST detect drift before
+    // honoring the cache and block the new command instead of returning
+    // the cached allow.
+    //
+    // We install a fake `curl` shim and a downstream `&& touch` segment.
+    // Both must be skipped — the curl by drift-detection, the touch by
+    // the LINENO-keyed cross-path pin so the rest of the same typed line
+    // stays blocked even though the session has flipped to warn-only.
+    let tmpdir = tempfile::tempdir().unwrap();
+    let bin_dir = tmpdir.path().join("bin");
+    let log_path = tmpdir.path().join("tirith.log");
+    install_fake_tirith(&bin_dir, &log_path);
+
+    let curl_sentinel = tmpdir.path().join("curl_actually_ran");
+    let touch_sentinel = tmpdir.path().join("downstream_touch_ran");
+    let curl_script = format!(
+        "#!/bin/bash\ntouch {}\n",
+        shell_escape(curl_sentinel.to_string_lossy().as_ref())
+    );
+    fs::write(bin_dir.join("curl"), curl_script).unwrap();
+    fs::set_permissions(bin_dir.join("curl"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let hook = hook_path();
+    let script = format!(
+        "source '{hook}'\n\
+         echo first_clean_one\n\
+         export HISTCONTROL=ignorespace\n\
+         \x20curl BLOCK_TOKEN-bypass && touch {touch}\n",
+        touch = touch_sentinel.display()
+    );
+
+    let mut child = Command::new("bash")
+        .args(["--norc", "--noprofile", "-i"])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .env("TIRITH_BASH_MODE", "preexec")
+        .env("TIRITH_BASH_PREEXEC_ENFORCE", "1")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !curl_sentinel.exists(),
+        "filtered curl must not bypass enforcement via stale-index cache; stderr: {stderr}"
+    );
+    assert!(
+        !touch_sentinel.exists(),
+        "downstream segment of drift-blocked line must also be skipped \
+         (LINENO-keyed cross-path pin); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("bash history no longer matches BASH_COMMAND"),
+        "expected drift banner on bypass attempt, got: {stderr}"
+    );
+}
+
+#[test]
+fn install_time_hostile_config_uses_bash_command_for_warn_only() {
+    // Regression for the P2 review finding: when enforcement is refused at
+    // install time because history is hostile, the warn-only scan target must
+    // be BASH_COMMAND (not the stale history_line). Otherwise the DETECTED
+    // banners reference whatever history 1 happens to surface, which is by
+    // construction not what the user just ran.
+    let (_out, _err, invocations, _tmp) = run_with_sentinels(
+        r#"
+ echo from_user_command
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+            ("HISTCONTROL", "ignorespace"),
+        ],
+    );
+
+    // Tirith was invoked in warn-only mode and its target was the actual user
+    // command, not whatever stale entry history 1 returned.
+    assert!(
+        invocations
+            .iter()
+            .any(|i| i.contains("--warn-only") && i.contains("from_user_command")),
+        "warn-only scan must target BASH_COMMAND under hostile install-time config; \
+         invocations: {invocations:#?}"
+    );
+}
+
 // ─── Warn-only post-degrade scan target ────────────────────────────
 
 #[test]

