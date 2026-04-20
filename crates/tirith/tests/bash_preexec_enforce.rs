@@ -602,6 +602,7 @@ fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
         "warn-only must scan each prompt's repeated command (got {scan_count}); \
          invocations: {invocations:#?}"
     );
+    let _ = fs::remove_dir_all(&_tmp);
 }
 
 #[test]
