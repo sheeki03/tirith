@@ -191,7 +191,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) { exit 1 }
           & "$tmpdir\tirith.exe" check -- "dir"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Remove-Item -Recurse -Force $tmpdir
+          Remove-Item -Recurse -Force $tmpdir -ErrorAction SilentlyContinue
 
   release:
     name: Create Release
@@ -776,7 +776,7 @@ jobs:
           sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/aur/PKGBUILD
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
         with:
           pkgname: tirith
           pkgbuild: packaging/aur/PKGBUILD

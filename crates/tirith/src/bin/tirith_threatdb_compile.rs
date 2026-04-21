@@ -717,9 +717,9 @@ fn parse_typosquats_csv(path: &Path) -> Vec<TyposquatEntry> {
 // Popular packages CSV parser
 // ---------------------------------------------------------------------------
 
-/// Default popular packages CSV embedded from assets.
-const DEFAULT_POPULAR_CSV: &str =
-    include_str!("../../../tirith-core/assets/data/popular_packages.csv");
+/// Default popular packages CSV embedded from the tirith crate's own
+/// assets so `cargo publish` can verify the tarball in isolation.
+const DEFAULT_POPULAR_CSV: &str = include_str!("../../assets/data/popular_packages.csv");
 
 fn parse_popular_csv(path: Option<&Path>) -> Vec<PopularEntry> {
     let content = match path {
