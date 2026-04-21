@@ -50,16 +50,13 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Run a bash script against the hook with enforcement controls. Returns
-/// (stdout, stderr, tirith_invocations).
-fn run_bash(script: &str, env_vars: &[(&str, &str)]) -> (String, String, Vec<String>) {
+/// Run a fully-formed bash script against a fake `tirith` binary. Returns
+/// `(stdout, stderr, tirith_invocations)`.
+fn run_bash_script(script: &str, env_vars: &[(&str, &str)]) -> (String, String, Vec<String>) {
     let tmpdir = tempfile::tempdir().unwrap();
     let bin_dir = tmpdir.path().join("bin");
     let log_path = tmpdir.path().join("tirith.log");
     install_fake_tirith(&bin_dir, &log_path);
-
-    let hook = hook_path();
-    let full_script = format!("source '{hook}'\n{script}\n");
 
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
@@ -90,7 +87,7 @@ fn run_bash(script: &str, env_vars: &[(&str, &str)]) -> (String, String, Vec<Str
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(full_script.as_bytes())
+        .write_all(script.as_bytes())
         .unwrap();
     drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();
@@ -115,6 +112,14 @@ fn run_bash(script: &str, env_vars: &[(&str, &str)]) -> (String, String, Vec<Str
     )
 }
 
+/// Run a bash script against the hook with enforcement controls. Returns
+/// `(stdout, stderr, tirith_invocations)`.
+fn run_bash(script: &str, env_vars: &[(&str, &str)]) -> (String, String, Vec<String>) {
+    let hook = hook_path();
+    let full_script = format!("source '{hook}'\n{script}\n");
+    run_bash_script(&full_script, env_vars)
+}
+
 fn sentinel_path(root: &Path, name: &str) -> PathBuf {
     root.join(name)
 }
@@ -137,7 +142,7 @@ fn enforce_blocks_bare_command_with_rc1() {
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
 # Each command is a separate prompt cycle so history advances normally.
-curl BLOCK_TOKEN-one && touch {sentinels}/should_not_exist
+printf BLOCK_TOKEN-one >/dev/null && touch {sentinels}/should_not_exist
 echo clean_post_block && touch {sentinels}/clean_ran
 "#,
         &[
@@ -164,10 +169,12 @@ echo clean_post_block && touch {sentinels}/clean_ran
 
 #[test]
 fn enforce_blocks_whole_pipeline() {
-    // curl triggers a block; the downstream `sh` segment must also not run.
+    // Any blocked producer must keep the downstream `sh` segment from running.
+    // Use `printf` rather than a real network client so an unexpected execute
+    // fails immediately instead of hanging on DNS or connection retries.
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
-curl BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
+printf BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
@@ -184,12 +191,12 @@ curl BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
 
 #[test]
 fn enforce_blocks_whole_sequence() {
-    // `ls ; curl BLOCK` — when the second segment blocks, the whole line must
-    // skip. The cache key is the same history index, so both DEBUG fires
-    // return 1.
+    // `ls ; printf BLOCK` — when the second segment blocks, the whole line
+    // must skip. Use `printf` rather than a real `curl` so an unexpected
+    // execution fails fast instead of hanging on network resolution.
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
-ls / >/dev/null && touch {sentinels}/ls_ran; curl BLOCK_TOKEN-seq && touch {sentinels}/curl_ran
+ls / >/dev/null && touch {sentinels}/ls_ran; printf BLOCK_TOKEN-seq >/dev/null && touch {sentinels}/curl_ran
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
@@ -448,14 +455,15 @@ trap -p DEBUG | grep -c '_tirith_debug_trampoline' >&2
 
 #[test]
 fn extdebug_left_alone_when_user_enabled_it_first() {
-    let (_out, stderr, _inv, _tmp) = run_with_sentinels(
-        r#"
+    let hook = hook_path();
+    let (_out, stderr, _inv) = run_bash_script(
+        format!(
+            r#"
 shopt -s extdebug
-unset _TIRITH_BASH_LOADED
-source '__HOOK__'
+source '{hook}'
 printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
-"#
-        .replace("__HOOK__", &hook_path())
+            "#
+        )
         .as_str(),
         &[
             ("TIRITH_BASH_MODE", "preexec"),
