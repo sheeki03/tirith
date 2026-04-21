@@ -33,7 +33,6 @@ fn confirm(prompt: &str, yes: bool) -> bool {
 fn run_fix(yes: bool) -> i32 {
     let mut fixed = 0;
 
-    // 1. Shell hooks: if not installed, run init logic
     if !hooks_installed() {
         println!("Fix: Install shell hooks");
         if confirm("  Install hooks?", yes) {
@@ -47,11 +46,10 @@ fn run_fix(yes: bool) -> i32 {
         }
     }
 
-    // 2. Hook assets: if stale, re-materialize embedded hooks
     if hooks_stale() {
         println!("Fix: Re-materialize stale hook assets");
         if confirm("  Re-materialize hooks?", yes) {
-            // find_hook_dir() materializes as a side effect when needed
+            // find_hook_dir() materializes as a side effect when needed.
             match crate::cli::init::find_hook_dir() {
                 Some(dir) => {
                     println!("  Hooks materialized to {}.", dir.display());
@@ -64,7 +62,6 @@ fn run_fix(yes: bool) -> i32 {
         }
     }
 
-    // 3. Policy: if no policy found, create a starter policy
     if policy_missing() {
         println!("Fix: Create starter policy");
         if confirm("  Create .tirith/policy.yaml?", yes) {
@@ -80,27 +77,33 @@ fn run_fix(yes: bool) -> i32 {
         }
     }
 
-    // 4. AI tool setup: detect installed tools and offer to configure
     #[cfg(unix)]
     {
         let tools = detect_ai_tools();
         if !tools.is_empty() {
             println!("Fix: Configure tirith for AI coding tools");
             for tool in &tools {
-                if confirm(&format!("  Configure tirith for {tool}?"), yes) {
-                    let rc = crate::cli::setup::run(tool, None, false, false, false, false, false);
+                if confirm(&format!("  Configure tirith for {}?", tool.name), yes) {
+                    let rc = crate::cli::setup::run(
+                        tool.name,
+                        tool.configured_scope,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
                     if rc == 0 {
-                        println!("  Configured {tool}.");
+                        println!("  Configured {}.", tool.name);
                         fixed += 1;
                     } else {
-                        eprintln!("  Failed to configure {tool}.");
+                        eprintln!("  Failed to configure {}.", tool.name);
                     }
                 }
             }
         }
     }
 
-    // 5. Threat DB: if missing or stale, offer to download
     if let Some(tdb) = gather_threat_db_info() {
         if !tdb.installed || tdb.stale || tdb.signature_valid == Some(false) || tdb.error.is_some()
         {
@@ -127,7 +130,6 @@ fn run_fix(yes: bool) -> i32 {
         }
     }
 
-    // 6. Bash safe-mode: if active, offer to clear
     if bash_safe_mode_active() {
         println!("Fix: Clear bash safe-mode flag");
         if confirm("  Clear safe-mode?", yes) {
@@ -187,7 +189,6 @@ fn hooks_stale() -> bool {
 
 /// Check whether any policy file can be discovered.
 fn policy_missing() -> bool {
-    // Check TIRITH_POLICY_ROOT
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         let tirith_dir = PathBuf::from(&root).join(".tirith");
         for ext in &["policy.yaml", "policy.yml"] {
@@ -197,31 +198,112 @@ fn policy_missing() -> bool {
         }
     }
 
-    // Check walk-up discovery (local-only, no network fetch)
+    // discover_partial is local-only — doctor must not trigger a network fetch.
     let policy = tirith_core::policy::Policy::discover_partial(None);
     policy.path.is_none()
 }
 
+/// One detected AI coding tool. `configured_scope` carries the scope at
+/// which a tirith-managed file was found (so `--fix` can pass it through to
+/// `setup::run`); `None` means we found a coarse "tool installed but tirith
+/// not configured yet" signal and `--fix` should bootstrap with the tool's
+/// default scope.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct DetectedTool {
+    name: &'static str,
+    configured_scope: Option<&'static str>,
+}
+
 /// Detect installed AI coding tools by checking for their config directories.
 #[cfg(unix)]
-fn detect_ai_tools() -> Vec<&'static str> {
-    let mut tools = Vec::new();
+fn detect_ai_tools() -> Vec<DetectedTool> {
     let home = match home::home_dir() {
         Some(h) => h,
-        None => return tools,
+        None => return Vec::new(),
     };
+    let cwd = std::env::current_dir().ok();
+    detect_ai_tools_with(&home, cwd.as_deref())
+}
+
+/// Inner implementation parameterized on home and cwd for testability.
+#[cfg(unix)]
+fn detect_ai_tools_with(
+    home: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> Vec<DetectedTool> {
+    let mut tools = Vec::new();
 
     if home.join(".claude").exists() {
-        tools.push("claude-code");
+        tools.push(DetectedTool {
+            name: "claude-code",
+            configured_scope: None,
+        });
     }
     if home.join(".cursor").exists() {
-        tools.push("cursor");
+        tools.push(DetectedTool {
+            name: "cursor",
+            configured_scope: None,
+        });
     }
     if home.join(".vscode").exists() {
-        tools.push("vscode");
+        tools.push(DetectedTool {
+            name: "vscode",
+            configured_scope: None,
+        });
     }
     if home.join(".codeium").exists() {
-        tools.push("windsurf");
+        tools.push(DetectedTool {
+            name: "windsurf",
+            configured_scope: None,
+        });
+    }
+
+    // Copilot CLI: only push when our managed file is at the repo root, to
+    // avoid false-positive matches on every GitHub repo.
+    if tirith_core::policy::find_repo_root(None)
+        .map(|r| r.join(".github/hooks/tirith-security.json").exists())
+        .unwrap_or(false)
+    {
+        tools.push(DetectedTool {
+            name: "copilot-cli",
+            configured_scope: Some("project"),
+        });
+    }
+
+    // Kiro: precedence-ordered, single winner.
+    //   1. project configured
+    //   2. user configured
+    //   3. project bootstrap
+    //   4. user bootstrap
+    let project_kiro_dir = cwd.and_then(tirith_core::policy::find_workspace_kiro_dir);
+    let project_managed = project_kiro_dir
+        .as_ref()
+        .map(|d| d.join(".kiro/agents/tirith-security.json").exists())
+        .unwrap_or(false);
+    let user_managed = home.join(".kiro/agents/tirith-security.json").exists();
+    let user_kiro = home.join(".kiro").exists();
+
+    if project_managed {
+        tools.push(DetectedTool {
+            name: "kiro",
+            configured_scope: Some("project"),
+        });
+    } else if user_managed {
+        tools.push(DetectedTool {
+            name: "kiro",
+            configured_scope: Some("user"),
+        });
+    } else if project_kiro_dir.is_some() || user_kiro {
+        // Bootstrap: workspace `.kiro/` or `~/.kiro/` exists with no managed
+        // file. Both bootstrap branches collapse into one push because they
+        // both pass `configured_scope: None` to setup (which then defaults
+        // to project scope). The project-vs-user precedence only matters for
+        // the configured cases above.
+        tools.push(DetectedTool {
+            name: "kiro",
+            configured_scope: None,
+        });
     }
 
     tools
@@ -246,7 +328,7 @@ fn env_is_truthy(s: &str) -> bool {
 /// or fall back to the user config dir.
 fn create_default_policy() -> Result<PathBuf, String> {
     let content = "\
-# tirith policy — see https://github.com/anthropics/tirith for options
+# tirith policy — see https://github.com/sheeki03/tirith for options
 fail_mode: open
 allow_bypass_env: true
 paranoia: 1
@@ -322,7 +404,6 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
         return None;
     }
 
-    // Filter to verdict entries from the last 7 days
     let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
     let since_str = seven_days_ago.to_rfc3339();
 
@@ -351,7 +432,8 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
     let mut records_with_raw = 0usize;
     let mut records_without_raw = 0usize;
     let mut total_findings = 0usize;
-    let mut raw_total_findings_analyzed = 0usize; // only from records with raw data
+    // Scoped only to records with raw data — legacy pre-upgrade rows are excluded.
+    let mut raw_total_findings_analyzed = 0usize;
     let mut hidden_findings = 0usize;
     let mut hidden_rule_counts: HashMap<String, usize> = HashMap::new();
 
@@ -363,7 +445,8 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
                 records_with_raw += 1;
                 raw_total_findings_analyzed += raw_ids.len();
 
-                // Multiset diff: raw_rule_ids minus rule_ids
+                // Multiset diff: raw_rule_ids minus rule_ids — an unmatched
+                // raw entry means paranoia filtering suppressed it.
                 let mut effective_counts: HashMap<&str, u32> = HashMap::new();
                 for rid in &record.rule_ids {
                     *effective_counts.entry(rid.as_str()).or_insert(0) += 1;
@@ -371,7 +454,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
                 for raw_rid in raw_ids {
                     match effective_counts.get_mut(raw_rid.as_str()) {
                         Some(count) if *count > 0 => {
-                            *count -= 1; // matched, not hidden
+                            *count -= 1;
                         }
                         _ => {
                             hidden_findings += 1;
@@ -392,7 +475,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
     hidden_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
     hidden_top_rules.truncate(5);
 
-    // Get current paranoia level (local-only, no network fetch)
+    // discover_partial is local-only so doctor never triggers a network fetch.
     let cwd = std::env::current_dir().ok();
     let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
     let policy = tirith_core::policy::Policy::discover_partial(cwd_str);
@@ -482,7 +565,7 @@ fn gather_info() -> DoctorInfo {
     let hooks_materialized = hook_dir
         .as_ref()
         .map(|d| {
-            // If the hook dir is inside the data dir, it was materialized
+            // Hook dir inside data_dir means it was materialized (vs system/homebrew).
             if let Some(data) = tirith_core::policy::data_dir() {
                 d.starts_with(&data)
             } else {
@@ -491,10 +574,8 @@ fn gather_info() -> DoctorInfo {
         })
         .unwrap_or(false);
 
-    // Check if shell profile has tirith init configured
     let (shell_profile, hook_configured) = check_shell_profile(&detected_shell);
 
-    // Check if bash safe-mode flag exists (persistent preexec fallback)
     let bash_safe_mode = tirith_core::policy::state_dir()
         .map(|d| d.join("bash-safe-mode").exists())
         .unwrap_or(false);
@@ -524,7 +605,6 @@ fn gather_info() -> DoctorInfo {
     let last_trigger_path = data_dir.as_ref().map(|d| d.join("last_trigger.json"));
 
     let mut policy_paths = Vec::new();
-    // User-level policy
     if let Some(config) = tirith_core::policy::config_dir() {
         for ext in &["policy.yaml", "policy.yml"] {
             let user_policy = config.join(ext);
@@ -534,7 +614,6 @@ fn gather_info() -> DoctorInfo {
             }
         }
     }
-    // TIRITH_POLICY_ROOT override
     let policy_root_env = std::env::var("TIRITH_POLICY_ROOT").ok();
     if let Some(ref root) = policy_root_env {
         let tirith_dir = PathBuf::from(root).join(".tirith");
@@ -811,7 +890,6 @@ fn print_human(info: &DoctorInfo) {
         }
     );
 
-    // Threat DB status
     if let Some(ref tdb) = info.threat_db {
         if !tdb.installed {
             println!("  threat DB:    not installed — run 'tirith threat-db update'");
@@ -849,7 +927,6 @@ fn print_human(info: &DoctorInfo) {
         println!("  threat DB:    not available");
     }
 
-    // Detection gap analysis
     if let Some(ref gaps) = info.detection_gaps {
         println!();
         println!("Detection coverage (last 7 days)");
@@ -878,7 +955,7 @@ fn print_human(info: &DoctorInfo) {
             );
         } else {
             let pct = if gaps.raw_total_findings > 0 {
-                // raw_total_findings is scoped to analyzed records (those with raw_rule_ids)
+                // Scoped to analyzed records (those with raw_rule_ids), not the full set.
                 (gaps.hidden_findings as f64 / gaps.raw_total_findings as f64 * 100.0) as usize
             } else {
                 0
@@ -897,7 +974,6 @@ fn print_human(info: &DoctorInfo) {
             }
         }
 
-        // Paranoia guidance text — mark the current level
         println!();
         println!("  Paranoia levels:");
         let levels: [(u8, &str, &str); 3] = [
@@ -920,7 +996,7 @@ fn print_human(info: &DoctorInfo) {
             let next_level = match gaps.current_paranoia {
                 1 | 2 => 3,
                 3 => 4,
-                _ => gaps.current_paranoia, // already max
+                _ => gaps.current_paranoia,
             };
             println!();
             if next_level > gaps.current_paranoia {
@@ -932,7 +1008,6 @@ fn print_human(info: &DoctorInfo) {
         }
     }
 
-    // License key format diagnostics
     use tirith_core::license::KeyFormatStatus;
     match tirith_core::license::key_format_status() {
         KeyFormatStatus::LegacyUnsigned => {
@@ -961,7 +1036,6 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
         None => return (None, false),
     };
 
-    // Determine which profile files to check based on shell
     let profile_candidates: Vec<PathBuf> = match shell {
         "zsh" => vec![
             home.join(".zshrc"),
@@ -987,7 +1061,6 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
             candidates
         }
         "powershell" | "pwsh" => {
-            // PowerShell profile locations vary; check common ones
             let docs = home.join("Documents");
             vec![
                 docs.join("PowerShell/Microsoft.PowerShell_profile.ps1"),
@@ -1006,7 +1079,8 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
         _ => return (None, false),
     };
 
-    // Check ALL candidates — don't early-return on first existing profile
+    // Scan ALL candidates — a profile can exist without containing the hook,
+    // so the first existing file is not necessarily the configured one.
     let mut first_existing = None;
     for profile in &profile_candidates {
         if profile.exists() {
@@ -1061,5 +1135,193 @@ fn reset_safe_mode() -> i32 {
     } else {
         println!("tirith: no bash safe-mode flag found (enter mode is already enabled)");
         0
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use crate::cli::test_harness::with_fake_env;
+
+    fn first_kiro(tools: &[DetectedTool]) -> Option<&DetectedTool> {
+        tools.iter().find(|t| t.name == "kiro")
+    }
+
+    fn count_named(tools: &[DetectedTool], name: &str) -> usize {
+        tools.iter().filter(|t| t.name == name).count()
+    }
+
+    #[test]
+    fn detect_ai_tools_passes_kiro_user_scope() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(home.join(".kiro/agents")).unwrap();
+            std::fs::write(home.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(k.configured_scope, Some("user"));
+            assert_eq!(count_named(&tools, "kiro"), 1, "exactly one kiro entry");
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_passes_kiro_project_scope() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".kiro/agents")).unwrap();
+            std::fs::write(cwd.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(k.configured_scope, Some("project"));
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_passes_kiro_project_scope_from_subdir() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".kiro/agents")).unwrap();
+            std::fs::write(cwd.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+            let subdir = cwd.join("sub").join("dir");
+            std::fs::create_dir_all(&subdir).unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(&subdir));
+            let k = first_kiro(&tools).expect("kiro detected from subdir");
+            assert_eq!(k.configured_scope, Some("project"));
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_kiro_user_bootstrap_only() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(home.join(".kiro")).unwrap();
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro bootstrap");
+            assert_eq!(k.configured_scope, None);
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_kiro_project_bootstrap_from_subdir() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // Workspace .kiro/ but no managed file — bootstrap path.
+            std::fs::create_dir_all(cwd.join(".kiro")).unwrap();
+            let subdir = cwd.join("sub").join("dir");
+            std::fs::create_dir_all(&subdir).unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(&subdir));
+            let k = first_kiro(&tools).expect("kiro project-bootstrap");
+            assert_eq!(k.configured_scope, None);
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_kiro_project_bootstrap_beats_user_bootstrap() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(home.join(".kiro")).unwrap();
+            std::fs::create_dir_all(cwd.join(".kiro")).unwrap();
+            // Neither has a managed file
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(
+                k.configured_scope, None,
+                "bootstrap (no managed file) is the right verdict"
+            );
+            assert_eq!(
+                count_named(&tools, "kiro"),
+                1,
+                "exactly one entry, not duplicate project+user bootstrap"
+            );
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_kiro_prefers_project_over_user() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(home.join(".kiro/agents")).unwrap();
+            std::fs::write(home.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+            std::fs::create_dir_all(cwd.join(".kiro/agents")).unwrap();
+            std::fs::write(cwd.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(k.configured_scope, Some("project"));
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    /// Regression for the fix in policy.rs::find_workspace_kiro_dir: when cwd
+    /// is *under* $HOME and only `~/.kiro/agents/tirith-security.json` exists
+    /// (no project workspace), detection must report user-scope. Without the
+    /// home-exclusion, find_workspace_kiro_dir would walk up to $HOME, find
+    /// `~/.kiro/`, and incorrectly classify it as a project workspace.
+    #[test]
+    fn detect_ai_tools_does_not_classify_home_kiro_as_project() {
+        with_fake_env(true, |home, _cwd| {
+            // User-scope managed file at ~/.kiro/agents/tirith-security.json.
+            std::fs::create_dir_all(home.join(".kiro/agents")).unwrap();
+            std::fs::write(home.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+
+            // Cwd is a subdirectory *inside* HOME — no project .kiro/ anywhere.
+            let project = home.join("projects").join("myrepo");
+            std::fs::create_dir_all(&project).unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(&project));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(
+                k.configured_scope,
+                Some("user"),
+                "user-scope agent must NOT be misclassified as project just because cwd is under $HOME"
+            );
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    /// Regression: even WITHOUT a managed file, a cwd under $HOME must not
+    /// pick up `~/.kiro/` as a project-bootstrap signal — that should fire
+    /// the user-bootstrap branch, not project-bootstrap.
+    #[test]
+    fn detect_ai_tools_home_kiro_only_is_user_bootstrap_not_project() {
+        with_fake_env(true, |home, _cwd| {
+            // Only ~/.kiro/ exists, no managed file.
+            std::fs::create_dir_all(home.join(".kiro")).unwrap();
+
+            // Cwd inside $HOME with no project .kiro/.
+            let project = home.join("projects").join("myrepo");
+            std::fs::create_dir_all(&project).unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(&project));
+            let k = first_kiro(&tools).expect("kiro bootstrap");
+            assert_eq!(
+                k.configured_scope, None,
+                "bootstrap entry, not configured project"
+            );
+            // Sanity: ensure we collapsed to one entry (no duplicate project+user).
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_kiro_prefers_user_over_bootstrap() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(home.join(".kiro/agents")).unwrap();
+            std::fs::write(home.join(".kiro/agents/tirith-security.json"), "{}").unwrap();
+            // No project workspace
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let k = first_kiro(&tools).expect("kiro detected");
+            assert_eq!(k.configured_scope, Some("user"));
+            assert_eq!(count_named(&tools, "kiro"), 1);
+        });
     }
 }

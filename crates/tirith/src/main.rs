@@ -71,7 +71,6 @@ Examples:
         /// `BLOCKED`). Exit codes, JSON, and audit logs are unchanged — this
         /// flag only changes the human rendering. Used by bash preexec mode
         /// where the DEBUG trap can warn but can't abort the command.
-        /// See issue #77.
         #[arg(long)]
         warn_only: bool,
 
@@ -343,9 +342,11 @@ Examples:
 Examples:
   tirith setup claude-code --with-mcp
   tirith setup cursor
+  tirith setup copilot-cli
+  tirith setup kiro --scope user
   tirith setup claude-code --dry-run")]
     Setup {
-        /// Tool to configure: claude-code, codex, cursor, gemini-cli, openclaw, pi-cli, vscode, windsurf
+        /// Tool to configure: claude-code, codex, copilot-cli, cursor, gemini-cli, kiro, openclaw, pi-cli, vscode, windsurf
         tool: String,
 
         /// Scope: project (default for most tools) or user

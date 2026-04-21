@@ -24,7 +24,6 @@ pub const POWERSHELL_HOOK: &str = include_str!(concat!(
     "/assets/shell/lib/powershell-hook.ps1"
 ));
 
-// Setup hooks embedded at compile time.
 pub const TIRITH_CHECK_PY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/tirith-check.py"
@@ -56,6 +55,14 @@ pub const TIRITH_GUARD_TS: &str = include_str!(concat!(
 pub const OPENCLAW_GUARD_TS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/openclaw-tirith-guard.ts"
+));
+pub const COPILOT_HOOK_PY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/copilot-cli-hook.py"
+));
+pub const KIRO_HOOK_PY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/kiro-hook.py"
 ));
 pub const GATEWAY_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),

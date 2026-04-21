@@ -37,18 +37,15 @@ pub fn offer_zshenv_guard(
         String::new()
     };
 
-    // Count BEGIN markers
     let begin_count = existing
         .lines()
         .filter(|line| line.starts_with(BEGIN_PREFIX))
         .count();
 
-    // Validate marker pairing: each BEGIN must have a matching END
     validate_marker_pairing(&existing)?;
 
     match begin_count {
         0 => {
-            // No existing block — append
             if dry_run {
                 eprintln!(
                     "[dry-run] would append tirith-guard block to {}",
@@ -56,7 +53,7 @@ pub fn offer_zshenv_guard(
                 );
                 return Ok(());
             }
-            // Syntax validation (not in dry-run)
+            // Syntax validation runs only on the live path — dry-run returns early.
             validate_zsh_syntax(&managed_block)?;
 
             let mut content = existing;
@@ -79,7 +76,6 @@ pub fn offer_zshenv_guard(
                 );
                 return Ok(());
             }
-            // force: remove old block, append fresh
             if dry_run {
                 eprintln!(
                     "[dry-run] would replace tirith-guard block in {}",
@@ -103,14 +99,12 @@ pub fn offer_zshenv_guard(
             );
         }
         _ => {
-            // Multiple blocks
             if !force {
                 return Err(format!(
                     "tirith: multiple tirith-guard blocks found in {} — use --force to deduplicate",
                     zshenv_path.display()
                 ));
             }
-            // force: remove all, append one
             if dry_run {
                 eprintln!(
                     "[dry-run] would deduplicate tirith-guard blocks in {}",
@@ -218,8 +212,6 @@ pub(crate) fn validate_zsh_syntax(snippet: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // --- validate_marker_pairing ---
-
     #[test]
     fn pairing_valid_single_block() {
         let content =
@@ -260,8 +252,6 @@ mod tests {
         assert!(err.contains("nested BEGIN"), "got: {err}");
     }
 
-    // --- remove_guard_blocks ---
-
     #[test]
     fn remove_single_block() {
         let content = "before\n# BEGIN tirith-guard v1\nguard\n# END tirith-guard\nafter\n";
@@ -289,8 +279,6 @@ mod tests {
         let result = remove_guard_blocks(content);
         assert_eq!(result, "export FOO=bar\nexport BAZ=qux\n");
     }
-
-    // --- validate_zsh_syntax ---
 
     #[test]
     fn valid_zsh_syntax() {
@@ -320,11 +308,10 @@ mod tests {
         assert!(validate_zsh_syntax(snippet).is_err());
     }
 
-    // --- offer_zshenv_guard integration tests ---
-
     #[cfg(unix)]
     mod integration {
         use super::*;
+        use crate::cli::test_harness::with_fake_env;
 
         fn zsh_available() -> bool {
             std::process::Command::new("zsh")
@@ -333,40 +320,8 @@ mod tests {
                 .is_ok_and(|o| o.status.success())
         }
 
-        /// RAII guard that restores (or removes) an env var on Drop.
-        struct EnvGuard {
-            key: &'static str,
-            old: Option<std::ffi::OsString>,
-        }
-
-        impl EnvGuard {
-            fn set(key: &'static str, val: &std::path::Path) -> Self {
-                let old = std::env::var_os(key);
-                unsafe { std::env::set_var(key, val) };
-                Self { key, old }
-            }
-        }
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.old {
-                    Some(h) => unsafe { std::env::set_var(self.key, h) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
-
         fn with_fake_home<F: std::panic::UnwindSafe + FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
-            let _lock = super::super::super::HOME_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let tmp = tempfile::tempdir().unwrap();
-            let _home_guard = EnvGuard::set("HOME", tmp.path());
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
-            match result {
-                Ok(v) => v,
-                Err(e) => std::panic::resume_unwind(e),
-            }
+            with_fake_env(false, |home, _cwd| f(home))
         }
 
         #[test]
@@ -554,10 +509,9 @@ mod tests {
                 return;
             }
             with_fake_home(|home| {
-                // tirith_bin is nonexistent — guard would block if it ran.
-                // With VSCODE_RESOLVING_ENVIRONMENT the compound condition
-                // is false, so the guard block is skipped entirely and the
-                // trailing export must still load.
+                // With VSCODE_RESOLVING_ENVIRONMENT the compound condition is
+                // false, so the guard block is skipped entirely even though
+                // tirith_bin points to a nonexistent binary.
                 let (stdout, code) = run_guard_scenario(
                     home,
                     "/nonexistent/tirith",

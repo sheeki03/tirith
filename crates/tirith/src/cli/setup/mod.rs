@@ -18,12 +18,6 @@ mod tools;
 #[cfg(unix)]
 mod zshenv;
 
-/// Shared mutex for tests that mutate the process-global HOME env var.
-/// Both `tools::tests` and `zshenv::tests::integration` acquire this lock
-/// so they don't race when running in parallel.
-#[cfg(test)]
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 pub use self::run_impl::run;
 
 mod run_impl {
@@ -35,8 +29,10 @@ mod run_impl {
     const KNOWN_TOOLS: &[&str] = &[
         "claude-code",
         "codex",
+        "copilot-cli",
         "cursor",
         "gemini-cli",
+        "kiro",
         "openclaw",
         "pi-cli",
         "vscode",
@@ -97,7 +93,6 @@ mod run_impl {
             update_configs,
         ) {
             Ok(()) => {
-                // Hint: suggest threat DB setup if no DB is cached yet
                 if tirith_core::threatdb::ThreatDb::cached().is_none() {
                     eprintln!();
                     eprintln!(
@@ -131,29 +126,25 @@ mod run_impl {
             );
         }
 
-        // Resolve and validate scope per tool
         let scope = resolve_scope(tool, scope)?;
 
-        // Preflight: resolve tirith binary
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Preflight: python3 check (all tools except codex, pi-cli, openclaw)
+        // Most hook scripts are Python; codex/pi-cli/openclaw use TypeScript or
+        // the codex CLI instead.
         if tool != "codex" && tool != "pi-cli" && tool != "openclaw" {
             check_binary_on_path("python3", dry_run)?;
         }
 
-        // Preflight: tool-specific binary checks
-        // (claude-code user MCP now merges settings.json directly — no `claude` CLI needed)
         if tool == "codex" {
             check_binary_on_path("codex", dry_run)?;
         }
 
-        // Preflight: zsh check when --install-zshenv
         if install_zshenv {
             check_binary_on_path("zsh", dry_run)?;
         }
 
-        // --update-configs implies --force for file overwrites
+        // --update-configs implies --force: refreshing implies overwriting stale files.
         let effective_force = force || update_configs;
 
         let opts = SetupOpts {
@@ -169,8 +160,10 @@ mod run_impl {
         match tool {
             "claude-code" => setup_claude_code(&opts),
             "codex" => setup_codex(&opts),
+            "copilot-cli" => setup_copilot_cli(&opts),
             "cursor" => setup_cursor(&opts),
             "gemini-cli" => setup_gemini_cli(&opts),
+            "kiro" => setup_kiro(&opts),
             "openclaw" => setup_openclaw(&opts),
             "pi-cli" => setup_pi_cli(&opts),
             "vscode" => setup_vscode(&opts),
@@ -180,15 +173,17 @@ mod run_impl {
     }
 
     /// Resolve scope for a given tool, applying defaults and validation.
-    fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
+    pub(super) fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
         match tool {
-            "claude-code" | "cursor" | "gemini-cli" | "openclaw" | "pi-cli" => match scope {
-                Some("project") | None => Ok(Scope::Project),
-                Some("user") => Ok(Scope::User),
-                Some(other) => Err(format!(
-                    "invalid scope '{other}' — expected 'project' or 'user'\n  try: tirith setup {tool} --scope project"
-                )),
-            },
+            "claude-code" | "cursor" | "gemini-cli" | "kiro" | "openclaw" | "pi-cli" => {
+                match scope {
+                    Some("project") | None => Ok(Scope::Project),
+                    Some("user") => Ok(Scope::User),
+                    Some(other) => Err(format!(
+                        "invalid scope '{other}' — expected 'project' or 'user'\n  try: tirith setup {tool} --scope project"
+                    )),
+                }
+            }
             "vscode" => match scope {
                 Some("project") | None => Ok(Scope::Project),
                 Some("user") => Err(
@@ -196,6 +191,15 @@ mod run_impl {
                 ),
                 Some(other) => Err(format!(
                     "invalid scope '{other}' — expected 'project'\n  try: tirith setup vscode --scope project"
+                )),
+            },
+            "copilot-cli" => match scope {
+                Some("project") | None => Ok(Scope::Project),
+                Some("user") => Err(
+                    "Copilot CLI loads hooks from the repo root — project-only. Omit --scope or use --scope project".into(),
+                ),
+                Some(other) => Err(format!(
+                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup copilot-cli --scope project"
                 )),
             },
             "codex" => match scope {
@@ -222,12 +226,11 @@ mod run_impl {
     /// 2. If not on PATH, check `current_exe()` — use absolute path + warning.
     /// 3. If neither: hard error (or placeholder in dry-run).
     fn resolve_tirith_bin(dry_run: bool) -> Result<String, String> {
-        // Check if tirith is on PATH
         if is_on_path("tirith") {
             return Ok("tirith".into());
         }
 
-        // Not on PATH — try current_exe()
+        // Fallback: use current_exe() as an absolute path.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(name) = exe.file_name() {
                 if name == "tirith" {
@@ -241,7 +244,6 @@ mod run_impl {
             }
         }
 
-        // Neither found
         if dry_run {
             eprintln!(
                 "tirith: WARNING: tirith not found — previewing with portable name 'tirith' (actual setup would fail)"
@@ -299,7 +301,6 @@ mod run_impl {
 
         let content = crate::assets::GATEWAY_YAML;
 
-        // Check existing
         if gateway_path.exists() {
             let existing = std::fs::read_to_string(&gateway_path)
                 .map_err(|e| format!("read {}: {e}", gateway_path.display()))?;
@@ -341,14 +342,16 @@ mod run_impl {
         Ok(gateway_path)
     }
 
-    // ── Tool-specific setup functions (delegated to tools.rs) ──────────
-
     pub(crate) fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_claude_code(opts)
     }
 
     fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_codex(opts)
+    }
+
+    fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_copilot_cli(opts)
     }
 
     fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
@@ -363,6 +366,10 @@ mod run_impl {
         super::tools::setup_gemini_cli(opts)
     }
 
+    fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_kiro(opts)
+    }
+
     fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_openclaw(opts)
     }
@@ -373,5 +380,40 @@ mod run_impl {
 
     fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_windsurf(opts)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn resolve_scope_rejects_user_for_copilot_cli() {
+            let result = resolve_scope("copilot-cli", Some("user"));
+            assert!(result.is_err(), "expected Err");
+            let msg = result.unwrap_err();
+            assert!(
+                msg.contains("project") && msg.contains("repo root"),
+                "expected project-only/repo-root message, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn resolve_scope_accepts_project_for_copilot_cli() {
+            assert_eq!(
+                resolve_scope("copilot-cli", Some("project")).unwrap(),
+                Scope::Project
+            );
+            assert_eq!(resolve_scope("copilot-cli", None).unwrap(), Scope::Project);
+        }
+
+        #[test]
+        fn resolve_scope_accepts_both_for_kiro() {
+            assert_eq!(resolve_scope("kiro", None).unwrap(), Scope::Project);
+            assert_eq!(
+                resolve_scope("kiro", Some("project")).unwrap(),
+                Scope::Project
+            );
+            assert_eq!(resolve_scope("kiro", Some("user")).unwrap(), Scope::User);
+        }
     }
 }

@@ -31,19 +31,17 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
     }
 
-    // Step 1: Write tirith-check.py hook (Python hook doesn't use __TIRITH_BIN__ placeholder)
+    // The Python hook is used verbatim — no __TIRITH_BIN__ placeholder.
     let hook_path = hooks_dir.join("tirith-check.py");
     let hook_content = crate::assets::TIRITH_CHECK_PY;
     fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts, skip MCP/settings/shell profile
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Claude Code hook scripts refreshed");
         return Ok(());
     }
 
-    // Step 2: Merge settings.json with PreToolUse hook
     let settings_path = target.join("settings.json");
     let hook_command = match opts.scope {
         Scope::Project => {
@@ -53,7 +51,6 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     };
     merge::merge_claude_settings(&settings_path, &hook_command, opts.force, opts.dry_run)?;
 
-    // Step 3: --with-mcp support
     if opts.with_mcp {
         match opts.scope {
             Scope::Project => {
@@ -88,15 +85,13 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
         }
     }
 
-    // Step 4: Install shell hook (eval "$(tirith init)" in shell profile)
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
-        // Non-fatal: shell hook is best-effort — print warning but don't fail setup
+        // Shell hook failure is best-effort — warn but don't fail setup.
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Claude Code setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -104,17 +99,14 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
 }
 
 pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
-    // 1. Copy gateway YAML
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh gateway config, skip MCP registration/shell profile/zshenv
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Codex gateway config refreshed");
         return Ok(());
     }
 
-    // 2. Register via codex mcp add
     let gw_path_str = gateway_path.display().to_string();
     let tirith_bin = &opts.tirith_bin;
     let add_args: Vec<&str> = vec![
@@ -154,7 +146,8 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         };
 
         if exists && !opts.force {
-            // Drift detection via structured JSON
+            // Drift detection: compare existing registration's command+args
+            // with what we would write, via `codex mcp get --json`.
             let json_out =
                 fs_helpers::run_cli("codex", &["mcp", "get", "--json", "tirith-gateway"]);
             let expected_args: Vec<&str> = vec![
@@ -218,14 +211,12 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         }
     }
 
-    // 3. Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // 4. Offer zshenv guard
     #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
@@ -234,7 +225,6 @@ pub fn setup_codex(opts: &SetupOpts) -> Result<(), String> {
         &opts.tirith_bin,
     )?;
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Codex setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -262,22 +252,19 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
     }
 
-    // Write cursor hook script
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::CURSOR_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
-    // Copy gateway config (refreshed in both full and update-configs mode)
+    // Gateway config is refreshed in both full and --update-configs modes.
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts and gateway config
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Cursor hook scripts and gateway config refreshed");
         return Ok(());
     }
 
-    // Merge hooks.json with beforeShellExecution entry
     let hooks_json_path = target.join("hooks.json");
     let hook_cmd = match opts.scope {
         Scope::Project => "hooks/tirith-hook.sh".to_string(),
@@ -300,7 +287,6 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         true, // Cursor requires "version": 1
     )?;
 
-    // Merge MCP JSON
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = target.join("mcp.json");
     merge::merge_mcp_json(
@@ -319,14 +305,12 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         opts.dry_run,
     )?;
 
-    // Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Offer zshenv guard
     #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
@@ -335,7 +319,6 @@ pub fn setup_cursor(opts: &SetupOpts) -> Result<(), String> {
         &opts.tirith_bin,
     )?;
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Cursor setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -354,28 +337,25 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
     }
 
-    // Write vscode hook script
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::VSCODE_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
-    // Copy gateway config (refreshed in both full and update-configs mode)
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts and gateway config
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: VS Code hook scripts and gateway config refreshed");
         return Ok(());
     }
 
-    // Merge settings.json with managed-block hook entry
     let settings_path = target.join("settings.json");
-    let hook_cmd = "hooks/tirith-hook.sh".to_string(); // VS Code is project-only
+    // VS Code is project-only, so the hook command is a relative path.
+    let hook_cmd = "hooks/tirith-hook.sh".to_string();
     merge::merge_vscode_settings(&settings_path, &hook_cmd, opts.force, opts.dry_run)?;
 
-    // Merge MCP JSON
-    // VS Code uses "servers" as the top-level key (not "mcpServers") and requires "type": "stdio"
+    // VS Code uses "servers" as the top-level key (not "mcpServers") and
+    // requires "type": "stdio" — see merge_mcp_json_with_key callsite.
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = cwd.join(".vscode").join("mcp.json");
     merge::merge_mcp_json_with_key(
@@ -396,14 +376,12 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
         opts.dry_run,
     )?;
 
-    // Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Offer zshenv guard
     #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
@@ -412,7 +390,6 @@ pub fn setup_vscode(opts: &SetupOpts) -> Result<(), String> {
         &opts.tirith_bin,
     )?;
 
-    // Summary
     eprintln!();
     eprintln!("tirith: VS Code setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -445,19 +422,16 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
     }
 
-    // Step 1: Write tirith-security-guard-gemini.py
     let hook_path = hooks_dir.join("tirith-security-guard-gemini.py");
     let hook_content = crate::assets::GEMINI_HOOK_PY;
     fs_helpers::write_hook_script(&hook_path, hook_content, opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts, skip settings/MCP/shell profile
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Gemini CLI hook scripts refreshed");
         return Ok(());
     }
 
-    // Step 2: Merge settings.json with BeforeTool hook
     let settings_path = target.join("settings.json");
     let hook_command = match opts.scope {
         Scope::Project => {
@@ -474,7 +448,6 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
     };
     merge::merge_gemini_settings(&settings_path, &hook_command, opts.force, opts.dry_run)?;
 
-    // Step 3: --with-mcp support
     if opts.with_mcp {
         merge::merge_mcp_json_with_key(
             &settings_path,
@@ -489,14 +462,12 @@ pub fn setup_gemini_cli(opts: &SetupOpts) -> Result<(), String> {
         )?;
     }
 
-    // Step 4: Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Gemini CLI setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -528,26 +499,22 @@ pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", extensions_dir.display()))?;
     }
 
-    // Step 1: Write tirith-guard.ts
     let guard_path = extensions_dir.join("tirith-guard.ts");
     let guard_content = crate::assets::TIRITH_GUARD_TS;
     fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts, skip shell profile
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Pi CLI hook scripts refreshed");
         return Ok(());
     }
 
-    // Step 2: Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Pi CLI setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
@@ -598,7 +565,6 @@ pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
     let guard_content = crate::assets::OPENCLAW_GUARD_TS;
     fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts, skip shell profile
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: OpenClaw hook scripts refreshed");
@@ -630,22 +596,19 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
     }
 
-    // Write windsurf hook script
     let hook_path = hooks_dir.join("tirith-hook.sh");
     let hook_content = crate::assets::WINDSURF_HOOK_SH.replace("__TIRITH_BIN__", &opts.tirith_bin);
     fs_helpers::write_hook_script(&hook_path, &hook_content, opts.force, opts.dry_run)?;
 
-    // Copy gateway config (refreshed in both full and update-configs mode)
     let gateway_path = copy_gateway_config(opts.force, opts.dry_run)?;
 
-    // --update-configs: only refresh hook scripts and gateway config
     if opts.update_configs {
         eprintln!();
         eprintln!("tirith: Windsurf hook scripts and gateway config refreshed");
         return Ok(());
     }
 
-    // Merge hooks.json with pre_run_command entry (absolute path for user-global)
+    // Windsurf is user-global, so hooks.json references an absolute path.
     let hooks_json_path = target.join("hooks.json");
     let hook_cmd = hooks_dir.join("tirith-hook.sh").display().to_string();
     merge::merge_hooks_json(
@@ -661,7 +624,6 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         false, // Windsurf doesn't require "version" key
     )?;
 
-    // Merge MCP JSON
     let gw_path_str = gateway_path.display().to_string();
     let mcp_json_path = target.join("mcp_config.json");
     merge::merge_mcp_json(
@@ -680,14 +642,12 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         opts.dry_run,
     )?;
 
-    // Install shell hook
     if let Err(e) =
         super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
     {
         eprintln!("tirith: WARNING: {e}");
     }
 
-    // Offer zshenv guard
     #[cfg(unix)]
     zshenv::offer_zshenv_guard(
         opts.install_zshenv,
@@ -696,64 +656,236 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         &opts.tirith_bin,
     )?;
 
-    // Summary
     eprintln!();
     eprintln!("tirith: Windsurf setup complete");
     eprintln!("  Run `tirith doctor` to verify your configuration.");
     Ok(())
 }
 
+pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
+    // Copilot CLI loads .github/hooks/*.json from the *current working
+    // directory*, with no walk-up. Tirith requires a git repo so doctor
+    // detection has a stable root to look at.
+    let repo_root = tirith_core::policy::find_repo_root(None).ok_or_else(|| {
+        "tirith setup copilot-cli requires being run inside a git repository — \
+         Copilot CLI loads hooks from the repo root"
+            .to_string()
+    })?;
+
+    fs_helpers::validate_target_dir(&repo_root, Some(&repo_root))?;
+
+    let hooks_dir = repo_root.join(".github").join("hooks");
+    if !opts.dry_run {
+        std::fs::create_dir_all(&hooks_dir)
+            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
+    }
+
+    let hook_path = hooks_dir.join("copilot-cli-hook.py");
+    fs_helpers::write_hook_script(
+        &hook_path,
+        crate::assets::COPILOT_HOOK_PY,
+        opts.force,
+        opts.dry_run,
+    )?;
+
+    // Tirith owns this file entirely (no merge) — we rewrite on every setup.
+    let config_path = hooks_dir.join("tirith-security.json");
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "preToolUse": [
+                {
+                    "type": "command",
+                    "bash": "python3 .github/hooks/copilot-cli-hook.py",
+                    "timeoutSec": 30
+                }
+            ]
+        }
+    });
+    let config_str =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+    write_owned_json(&config_path, &config_str, opts.force, opts.dry_run)?;
+
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Copilot CLI hook scripts and config refreshed");
+        return Ok(());
+    }
+
+    if let Err(e) =
+        super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
+    {
+        eprintln!("tirith: WARNING: {e}");
+    }
+
+    eprintln!();
+    eprintln!("tirith: Copilot CLI setup complete");
+    eprintln!("  Hook config: {}", config_path.display());
+    eprintln!("  IMPORTANT: Copilot CLI loads hooks from the current working directory.");
+    eprintln!(
+        "  Always launch `copilot` from the repository root ({}) so the hook is loaded.",
+        repo_root.display()
+    );
+    eprintln!("  Run `tirith doctor` to verify your configuration.");
+    Ok(())
+}
+
+pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
+    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
+
+    // Resolve the .kiro root according to scope. For project, walk up from
+    // cwd looking for an existing .kiro/ — if found, honor it. Otherwise
+    // create a new .kiro at cwd. For user, always ~/.kiro.
+    let (kiro_root, scope_root, created_new_workspace) = match opts.scope {
+        Scope::Project => {
+            let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+            match tirith_core::policy::find_workspace_kiro_dir(&cwd) {
+                Some(parent) => (parent.join(".kiro"), Some(parent), false),
+                None => (cwd.join(".kiro"), Some(cwd), true),
+            }
+        }
+        Scope::User => (home.join(".kiro"), Some(home.clone()), false),
+    };
+
+    fs_helpers::validate_target_dir(&kiro_root, scope_root.as_deref())?;
+
+    let hooks_dir = kiro_root.join("hooks");
+    let agents_dir = kiro_root.join("agents");
+    if !opts.dry_run {
+        std::fs::create_dir_all(&hooks_dir)
+            .map_err(|e| format!("create {}: {e}", hooks_dir.display()))?;
+        std::fs::create_dir_all(&agents_dir)
+            .map_err(|e| format!("create {}: {e}", agents_dir.display()))?;
+    }
+
+    let hook_path = hooks_dir.join("kiro-hook.py");
+    fs_helpers::write_hook_script(
+        &hook_path,
+        crate::assets::KIRO_HOOK_PY,
+        opts.force,
+        opts.dry_run,
+    )?;
+
+    // Both scopes use absolute hook paths since Kiro does not document
+    // hook-command path resolution relative to the agent file. tools=["*"]
+    // preserves default tool access; includeMcpJson=true preserves the
+    // user's MCP servers.
+    let agent_path = agents_dir.join("tirith-security.json");
+    let quoted = super::shell_profile::shell_quote(&hook_path.display().to_string(), "bash");
+    let command = format!("python3 {quoted}");
+    let agent = serde_json::json!({
+        "description": "Tirith security guard: intercepts execute_bash tool calls and blocks dangerous commands.",
+        "tools": ["*"],
+        "includeMcpJson": true,
+        "hooks": {
+            "preToolUse": [
+                {
+                    "matcher": "execute_bash",
+                    "command": command
+                }
+            ]
+        }
+    });
+    let agent_str = serde_json::to_string_pretty(&agent).map_err(|e| format!("serialize: {e}"))?;
+    write_owned_json(&agent_path, &agent_str, opts.force, opts.dry_run)?;
+
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Kiro hook scripts and agent refreshed");
+        return Ok(());
+    }
+
+    if let Err(e) =
+        super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
+    {
+        eprintln!("tirith: WARNING: {e}");
+    }
+
+    eprintln!();
+    eprintln!("tirith: Kiro CLI setup complete");
+    eprintln!("  Agent file: {}", agent_path.display());
+    if created_new_workspace {
+        eprintln!(
+            "  Note: created a new Kiro workspace rooted at {} (no ancestor .kiro/ found).",
+            kiro_root
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    if matches!(opts.scope, Scope::Project) {
+        eprintln!("  Note: project-scope agent uses an absolute hook path (machine-specific).");
+        eprintln!(
+            "  Add {} and {} to .gitignore for shared repos, or prefer --scope user.",
+            agent_path.display(),
+            hook_path.display()
+        );
+    }
+    eprintln!("  To use: kiro-cli --agent tirith-security  (or merge the hooks block from");
+    eprintln!(
+        "  {} into your existing custom agent).",
+        agent_path.display()
+    );
+    eprintln!("  Run `tirith doctor` to verify your configuration.");
+    Ok(())
+}
+
+/// Write a tirith-owned JSON config file with drift detection.
+/// Used for files where tirith owns the entire file (no merge with user content).
+fn write_owned_json(
+    path: &std::path::Path,
+    content: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    if path.exists() {
+        let existing =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        if existing == content {
+            eprintln!("tirith: {} already configured, up to date", path.display());
+            return Ok(());
+        }
+        if !force {
+            if dry_run {
+                eprintln!(
+                    "[dry-run] would error: {} exists with different content — use --force to update",
+                    path.display()
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "{} exists with different content — use --force to update",
+                path.display()
+            ));
+        }
+        if !dry_run {
+            fs_helpers::create_backup(path, true)?;
+        }
+    }
+    if dry_run {
+        eprintln!(
+            "[dry-run] would write {} ({} bytes)",
+            path.display(),
+            content.len()
+        );
+        return Ok(());
+    }
+    fs_helpers::atomic_write(path, content, 0o644)?;
+    eprintln!("tirith: wrote {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// RAII guard that restores (or removes) an env var on Drop,
-    /// so panics inside test closures can't leak env state.
-    struct EnvGuard {
-        key: &'static str,
-        old: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, val: &std::path::Path) -> Self {
-            let old = std::env::var_os(key);
-            unsafe { std::env::set_var(key, val) };
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(h) => unsafe { std::env::set_var(self.key, h) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    /// Run `f` with HOME pointed at a fresh temp dir, holding the shared
-    /// HOME_LOCK so parallel tests (including zshenv's) don't race on env vars.
-    /// Uses catch_unwind so HOME is restored even if `f` panics.
-    /// Tolerates a poisoned mutex so one panic doesn't cascade to all later tests.
-    fn with_fake_home<F: std::panic::UnwindSafe + FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
-        let _lock = super::super::HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", tmp.path());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
-        match result {
-            Ok(v) => v,
-            Err(e) => std::panic::resume_unwind(e),
-        }
-    }
+    use crate::cli::test_harness::{with_fake_env, EnvGuard};
 
     /// GEMINI_CLI_HOME env override: writes to $GEMINI_CLI_HOME/.gemini/...
     /// and uses scope_root=None (skips containment check), which allows the
     /// target dir to be outside $HOME (e.g., in /tmp).
     #[test]
     fn gemini_cli_home_env_override_writes_correct_path() {
-        with_fake_home(|_home| {
+        with_fake_env(false, |_home, _cwd| {
             let dir = tempfile::tempdir().unwrap();
             let _env = EnvGuard::set("GEMINI_CLI_HOME", dir.path());
 
@@ -806,7 +938,7 @@ mod tests {
     /// and uses scope_root=None (skips containment check).
     #[test]
     fn pi_coding_agent_dir_env_override_writes_correct_path() {
-        with_fake_home(|_home| {
+        with_fake_env(false, |_home, _cwd| {
             let dir = tempfile::tempdir().unwrap();
             let _env = EnvGuard::set("PI_CODING_AGENT_DIR", dir.path());
 
@@ -848,5 +980,180 @@ mod tests {
             result.is_err(),
             "containment check should fail when target is outside scope_root"
         );
+    }
+
+    fn opts_for(scope: Scope) -> SetupOpts {
+        SetupOpts {
+            scope,
+            with_mcp: false,
+            install_zshenv: false,
+            dry_run: false,
+            force: false,
+            tirith_bin: "tirith".to_string(),
+            update_configs: false,
+        }
+    }
+
+    /// Strip surrounding single quotes (POSIX `shell_quote` style).
+    fn unquote_posix(s: &str) -> String {
+        let trimmed = s.trim();
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+            trimmed[1..trimmed.len() - 1].replace("'\\''", "'")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    #[test]
+    fn setup_copilot_cli_writes_both_files_in_project() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // Fake the cwd into a git repo so find_repo_root resolves here.
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            // Descend into a subdirectory — setup must still write at repo root.
+            let subdir = cwd.join("sub").join("dir");
+            std::fs::create_dir_all(&subdir).unwrap();
+            std::env::set_current_dir(&subdir).unwrap();
+
+            setup_copilot_cli(&opts_for(Scope::Project)).unwrap();
+
+            let hook = cwd.join(".github/hooks/copilot-cli-hook.py");
+            let cfg = cwd.join(".github/hooks/tirith-security.json");
+            assert!(hook.exists(), "hook at repo root, not subdir");
+            assert!(cfg.exists(), "config at repo root, not subdir");
+            assert!(
+                !subdir.join(".github").exists(),
+                "must NOT create .github under subdir"
+            );
+
+            let raw = std::fs::read_to_string(&cfg).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["version"], 1);
+            let entry = &v["hooks"]["preToolUse"][0];
+            assert_eq!(entry["type"], "command");
+            assert_eq!(
+                entry["bash"], "python3 .github/hooks/copilot-cli-hook.py",
+                "relative bash path, not absolute"
+            );
+            assert_eq!(entry["timeoutSec"], 30);
+            assert!(
+                entry.get("cwd").is_none(),
+                "no cwd field — Copilot loads relative to its own cwd"
+            );
+        });
+    }
+
+    #[test]
+    fn setup_copilot_cli_errors_outside_git_repo() {
+        with_fake_env(true, |_home, _cwd| {
+            let result = setup_copilot_cli(&opts_for(Scope::Project));
+            assert!(result.is_err(), "expected Err");
+            let msg = result.unwrap_err();
+            assert!(
+                msg.contains("requires being run inside a git repository"),
+                "expected git-repo message, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn setup_kiro_user_scope_writes_hook_and_agent() {
+        with_fake_env(false, |home, _cwd| {
+            setup_kiro(&opts_for(Scope::User)).unwrap();
+
+            let hook = home.join(".kiro/hooks/kiro-hook.py");
+            let agent = home.join(".kiro/agents/tirith-security.json");
+            assert!(hook.exists(), "hook at ~/.kiro/hooks/");
+            assert!(agent.exists(), "agent at ~/.kiro/agents/");
+
+            let raw = std::fs::read_to_string(&agent).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["tools"], serde_json::json!(["*"]));
+            assert_eq!(v["includeMcpJson"], true);
+            let entry = &v["hooks"]["preToolUse"][0];
+            assert_eq!(entry["matcher"], "execute_bash");
+
+            let cmd = entry["command"].as_str().expect("command is string");
+            let prefix = "python3 ";
+            assert!(
+                cmd.starts_with(prefix),
+                "command should start with `python3 `, got: {cmd}"
+            );
+            let path_part = unquote_posix(&cmd[prefix.len()..]);
+            let expected = hook.display().to_string();
+            assert_eq!(
+                path_part, expected,
+                "command path (after unquote) must equal absolute hook path"
+            );
+        });
+    }
+
+    #[test]
+    fn setup_kiro_project_scope_uses_absolute_command() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            setup_kiro(&opts_for(Scope::Project)).unwrap();
+
+            let agent = cwd.join(".kiro/agents/tirith-security.json");
+            assert!(agent.exists());
+            let raw = std::fs::read_to_string(&agent).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let cmd = v["hooks"]["preToolUse"][0]["command"]
+                .as_str()
+                .expect("command is string");
+            let prefix = "python3 ";
+            assert!(
+                cmd.starts_with(prefix),
+                "command starts with python3: {cmd}"
+            );
+            let path_part = unquote_posix(&cmd[prefix.len()..]);
+            let path = std::path::Path::new(&path_part);
+            assert!(
+                path.is_absolute(),
+                "command path must be absolute, got: {path_part}"
+            );
+            // Resolve symlinks on both sides — macOS /var vs /private/var trips this.
+            let canon_cmd = path.canonicalize().expect("canonicalize cmd path");
+            let canon_cwd = cwd.canonicalize().expect("canonicalize cwd");
+            assert!(
+                canon_cmd.starts_with(&canon_cwd),
+                "absolute path must be under tempdir cwd. cmd canon: {} ; cwd canon: {}",
+                canon_cmd.display(),
+                canon_cwd.display()
+            );
+        });
+    }
+
+    #[test]
+    fn setup_kiro_project_honors_ancestor_kiro_dir() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".kiro")).unwrap();
+            let subdir = cwd.join("sub").join("dir");
+            std::fs::create_dir_all(&subdir).unwrap();
+            std::env::set_current_dir(&subdir).unwrap();
+
+            setup_kiro(&opts_for(Scope::Project)).unwrap();
+
+            let agent_at_root = cwd.join(".kiro/agents/tirith-security.json");
+            let agent_at_subdir = subdir.join(".kiro/agents/tirith-security.json");
+            assert!(agent_at_root.exists(), "agent must land at ancestor .kiro/");
+            assert!(
+                !agent_at_subdir.exists(),
+                "must NOT create nested .kiro/ at subdir"
+            );
+        });
+    }
+
+    #[test]
+    fn setup_kiro_project_creates_new_kiro_dir_when_none_upward() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            setup_kiro(&opts_for(Scope::Project)).unwrap();
+            assert!(
+                cwd.join(".kiro/agents/tirith-security.json").exists(),
+                "creates new .kiro/ at cwd when no ancestor exists"
+            );
+        });
     }
 }

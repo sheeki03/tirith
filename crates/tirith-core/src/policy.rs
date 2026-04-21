@@ -67,7 +67,6 @@ pub struct Policy {
     #[serde(default)]
     pub blocklist: Vec<String>,
 
-    // --- Centralized policy / remote features ---
     /// Approval rules: commands matching these rules require human approval.
     #[serde(default)]
     pub approval_rules: Vec<ApprovalRule>,
@@ -117,7 +116,6 @@ pub struct Policy {
     #[serde(default)]
     pub escalation: Vec<crate::escalation::EscalationRule>,
 
-    // --- Policy server (Phase 27, Team) ---
     /// URL of the centralized policy server (e.g., "https://policy.example.com").
     #[serde(default)]
     pub policy_server_url: Option<String>,
@@ -131,7 +129,6 @@ pub struct Policy {
     #[serde(default)]
     pub enforce_fail_mode: Option<bool>,
 
-    // --- Threat intelligence (Phase A) ---
     /// Threat intelligence configuration.
     #[serde(default)]
     pub threat_intel: ThreatIntelConfig,
@@ -351,10 +348,8 @@ impl Policy {
     ///    - `"cached"`: try cached remote policy, else fall back to local
     /// 4. Auth errors (401/403) always fail closed regardless of mode.
     pub fn discover(cwd: Option<&str>) -> Self {
-        // --- Step 1: resolve local policy ---
         let local = Self::discover_local(cwd);
 
-        // --- Step 2: determine remote fetch parameters ---
         let server_url = std::env::var("TIRITH_SERVER_URL")
             .ok()
             .filter(|s| !s.is_empty())
@@ -366,20 +361,18 @@ impl Policy {
 
         let (server_url, api_key) = match (server_url, api_key) {
             (Some(u), Some(k)) => (u, k),
-            _ => return local, // no remote configured
+            _ => return local,
         };
 
         let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
 
-        // --- Step 3: attempt remote fetch ---
         match crate::policy_client::fetch_remote_policy(&server_url, &api_key) {
             Ok(yaml) => {
-                // Cache the fetched policy for offline use
                 let _ = cache_remote_policy(&yaml);
                 match serde_yaml::from_str::<Policy>(&yaml) {
                     Ok(mut p) => {
                         p.path = Some(format!("remote:{server_url}"));
-                        // Carry over server connection info so audit upload can use it
+                        // Retain connection details so audit upload can reuse them.
                         if p.policy_server_url.is_none() {
                             p.policy_server_url = Some(server_url);
                         }
@@ -417,46 +410,38 @@ impl Policy {
                 }
             }
             Err(crate::policy_client::PolicyFetchError::AuthError(code)) => {
-                // Auth errors always fail closed
+                // Auth errors always fail closed, regardless of fail_mode —
+                // the server is explicitly saying "no".
                 eprintln!("tirith: error: policy server auth failed (HTTP {code}), failing closed");
                 Self::fail_closed_policy()
             }
-            Err(e) => {
-                // Apply fail mode
-                match fail_mode {
-                    "closed" => {
-                        eprintln!(
-                            "tirith: error: remote policy fetch failed ({e}), failing closed"
-                        );
-                        Self::fail_closed_policy()
-                    }
-                    "cached" => {
-                        eprintln!(
-                            "tirith: warning: remote policy fetch failed ({e}), trying cache"
-                        );
-                        match load_cached_remote_policy() {
-                            Some(p) => p,
-                            None => {
-                                eprintln!("tirith: warning: no cached remote policy, using local");
-                                local
-                            }
+            Err(e) => match fail_mode {
+                "closed" => {
+                    eprintln!("tirith: error: remote policy fetch failed ({e}), failing closed");
+                    Self::fail_closed_policy()
+                }
+                "cached" => {
+                    eprintln!("tirith: warning: remote policy fetch failed ({e}), trying cache");
+                    match load_cached_remote_policy() {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("tirith: warning: no cached remote policy, using local");
+                            local
                         }
                     }
-                    _ => {
-                        // "open" (default): warn and use local
-                        eprintln!(
-                            "tirith: warning: remote policy fetch failed ({e}), using local policy"
-                        );
-                        local
-                    }
                 }
-            }
+                _ => {
+                    eprintln!(
+                        "tirith: warning: remote policy fetch failed ({e}), using local policy"
+                    );
+                    local
+                }
+            },
         }
     }
 
     /// Discover local policy only (no remote fetch).
     fn discover_local(cwd: Option<&str>) -> Self {
-        // Check env override first
         if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
             if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
                 return Self::load_from_path(&path);
@@ -466,7 +451,6 @@ impl Policy {
         match discover_policy_path(cwd) {
             Some(path) => Self::load_from_path(&path),
             None => {
-                // Try user-level policy
                 if let Some(user_path) = user_policy_path() {
                     if user_path.exists() {
                         return Self::load_from_path(&user_path);
@@ -575,14 +559,12 @@ impl Policy {
     /// Load trust entries from trust.json files and merge non-expired entries
     /// into the policy's allowlist and allowlist_rules.
     ///
-    /// This is called on the analysis hot path but is READ-ONLY -- no file mutation.
+    /// Called on the analysis hot path — MUST stay read-only (no file mutation).
     pub fn load_trust_entries(&mut self, cwd: Option<&str>) {
-        // User-scope trust store
         if let Some(config) = config_dir() {
             let user_trust = config.join("trust.json");
             self.merge_trust_store(&user_trust);
         }
-        // Repo-scope trust store
         if let Some(repo_root) = find_repo_root(cwd) {
             let repo_trust = repo_root.join(".tirith").join("trust.json");
             self.merge_trust_store(&repo_trust);
@@ -593,7 +575,7 @@ impl Policy {
     fn merge_trust_store(&mut self, path: &Path) {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return, // File doesn't exist or can't be read -- not an error
+            Err(_) => return,
         };
 
         let store: serde_json::Value = match serde_json::from_str(&content) {
@@ -615,12 +597,12 @@ impl Policy {
         let now = chrono::Utc::now();
 
         for entry in entries {
-            // Check TTL expiry — treat unparseable timestamps as expired
+            // Unparseable or past-expiry timestamps are treated as expired.
             if let Some(exp_str) = entry.get("ttl_expires").and_then(|v| v.as_str()) {
                 match chrono::DateTime::parse_from_rfc3339(exp_str) {
-                    Ok(expiry) if expiry < now => continue, // Expired -- skip
-                    Ok(_) => {}                             // Valid, not expired
-                    Err(_) => continue, // Malformed timestamp -- treat as expired
+                    Ok(expiry) if expiry < now => continue,
+                    Ok(_) => {}
+                    Err(_) => continue,
                 }
             }
 
@@ -636,7 +618,6 @@ impl Policy {
 
             match rule_id {
                 Some(rid) => {
-                    // Per-rule trust: merge into allowlist_rules
                     if let Some(existing) = self
                         .allowlist_rules
                         .iter_mut()
@@ -653,7 +634,6 @@ impl Policy {
                     }
                 }
                 None => {
-                    // Global trust: merge into allowlist
                     if !self.allowlist.contains(&pattern) {
                         self.allowlist.push(pattern);
                     }
@@ -757,18 +737,16 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
 
     let mut current = start.as_path();
     loop {
-        // Check for .tirith/policy.yaml or .tirith/policy.yml
         if let Some(candidate) = find_policy_in_dir(&current.join(".tirith")) {
             return Some(candidate);
         }
 
-        // Check for .git boundary (directory or file for worktrees)
+        // `.git` may be a directory or a file (worktrees), so `.exists()` handles both.
         let git_dir = current.join(".git");
         if git_dir.exists() {
-            return None; // Hit repo root without finding policy
+            return None;
         }
 
-        // Go up
         match current.parent() {
             Some(parent) if parent != current => current = parent,
             _ => break,
@@ -787,6 +765,31 @@ pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
     loop {
         let git = current.join(".git");
         if git.exists() {
+            return Some(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Find the nearest ancestor directory containing a `.kiro/` subdirectory.
+///
+/// Mirrors Kiro CLI's own workspace-local agent discovery. Returns the
+/// directory that CONTAINS `.kiro/` (not `.kiro/` itself), so callers can
+/// `dir.join(".kiro/agents/foo.json")`.
+///
+/// Excludes `$HOME`: `~/.kiro` is the user-scope agent root, not a project
+/// workspace. Without this guard, any project inside `$HOME` would collapse
+/// onto the user-scope dir.
+pub fn find_workspace_kiro_dir(start: &Path) -> Option<PathBuf> {
+    let home = home::home_dir();
+    let mut current = start;
+    loop {
+        let is_home = home.as_deref().map(|h| current == h).unwrap_or(false);
+        if !is_home && current.join(".kiro").is_dir() {
             return Some(current.to_path_buf());
         }
         match current.parent() {
@@ -816,7 +819,11 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 /// Get tirith state directory.
-/// Must match bash-hook.bash path: ${XDG_STATE_HOME:-$HOME/.local/state}/tirith
+///
+/// MUST match the path computed by bash-hook.bash:
+/// `${XDG_STATE_HOME:-$HOME/.local/state}/tirith`. Any divergence here will
+/// make the hook and the binary disagree about where session state lives.
+/// Treat an empty `XDG_STATE_HOME` as unset to mirror `${VAR:-fallback}`.
 pub fn state_dir() -> Option<PathBuf> {
     match std::env::var("XDG_STATE_HOME") {
         Ok(val) if !val.trim().is_empty() => Some(PathBuf::from(val.trim()).join("tirith")),
@@ -840,7 +847,6 @@ fn cache_remote_policy(yaml: &str) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write with restricted permissions (owner-only)
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]

@@ -119,6 +119,9 @@ pub mod fetch;
 pub mod run;
 pub mod setup;
 
+#[cfg(test)]
+pub(crate) mod test_harness;
+
 /// Resolve all `tirith` executables on PATH using the shell's own command resolution.
 /// Returns paths that the shell would actually execute, not just filesystem entries.
 pub fn resolve_tirith_on_path() -> Vec<std::path::PathBuf> {
