@@ -1061,8 +1061,16 @@ mod tests {
         with_fake_env(false, |home, _cwd| {
             setup_kiro(&opts_for(Scope::User)).unwrap();
 
-            let hook = home.join(".kiro/hooks/kiro-hook.py");
-            let agent = home.join(".kiro/agents/tirith-security.json");
+            // Build paths via chained `.join` (single component each) so the
+            // separator on Windows matches what production code emits.
+            // `home.join(".kiro/hooks/kiro-hook.py")` would produce mixed
+            // separators on Windows (`\\` from home, `/` from the embedded
+            // slashes) and break the strict-equality assertion below.
+            let hook = home.join(".kiro").join("hooks").join("kiro-hook.py");
+            let agent = home
+                .join(".kiro")
+                .join("agents")
+                .join("tirith-security.json");
             assert!(hook.exists(), "hook at ~/.kiro/hooks/");
             assert!(agent.exists(), "agent at ~/.kiro/agents/");
 

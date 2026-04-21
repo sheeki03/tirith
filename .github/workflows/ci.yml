@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel any in-progress run for the same ref when a new commit lands.
+# Prevents stacked runs from saturating the (limited) Linux runner pool.
+# `github.ref` is used only as a key (not interpolated into any run: step),
+# so this is not a command-injection surface.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

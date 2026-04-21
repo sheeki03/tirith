@@ -1305,7 +1305,12 @@ mod tests {
             "second lock acquisition should fail while first is held"
         );
 
-        drop(lock1);
+        // Explicit unlock then drop: relying on Drop alone races on macOS BSD
+        // `flock` semantics where release-on-close isn't always observable to
+        // an immediate re-acquire. `unlock()` is deterministic.
+        let l1 = lock1.unwrap();
+        fs2::FileExt::unlock(&l1).expect("unlock lock1");
+        drop(l1);
 
         let lock3 = try_acquire_update_lock(state);
         assert!(

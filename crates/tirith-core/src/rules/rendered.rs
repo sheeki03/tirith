@@ -621,22 +621,18 @@ pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
                     }
                 }
                 // Text matrix `Tm a b c d e f` — `a` and `d` are x/y scale factors.
-                "Tm" if in_text_block => {
-                    if op.operands.len() >= 4 {
-                        let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
-                        let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
-                        current_scale = a.abs().min(d.abs());
-                    }
+                "Tm" if in_text_block && op.operands.len() >= 4 => {
+                    let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
+                    let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
+                    current_scale = a.abs().min(d.abs());
                 }
                 // CTM `cm a b c d e f` — only adopt sub-1.0 scales (avoid clobbering normal layout).
-                "cm" => {
-                    if op.operands.len() >= 4 {
-                        let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
-                        let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
-                        let scale = a.abs().min(d.abs());
-                        if (0.0..1.0).contains(&scale) {
-                            current_scale = scale;
-                        }
+                "cm" if op.operands.len() >= 4 => {
+                    let a = pdf_operand_to_f64(&op.operands[0]).unwrap_or(1.0);
+                    let d = pdf_operand_to_f64(&op.operands[3]).unwrap_or(1.0);
+                    let scale = a.abs().min(d.abs());
+                    if (0.0..1.0).contains(&scale) {
+                        current_scale = scale;
                     }
                 }
                 "Tj" | "TJ" | "'" | "\"" if in_text_block => {

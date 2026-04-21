@@ -273,7 +273,7 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
     }
 
     // Sort by confusable length descending (multi-char first for longest-match)
-    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
 
     let mut code = String::new();
     code.push_str("/// Auto-generated OCR confusion table.\n");

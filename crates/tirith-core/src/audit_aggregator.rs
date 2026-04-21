@@ -274,7 +274,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     };
 
     let mut top_rules: Vec<(String, usize)> = rule_counts.into_iter().collect();
-    top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    top_rules.sort_by_key(|r| std::cmp::Reverse(r.1));
     top_rules.truncate(10);
 
     let time_range = if total_commands == 0 {
@@ -307,7 +307,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     };
 
     let mut raw_top_rules: Vec<(String, usize)> = raw_rule_counts.into_iter().collect();
-    raw_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    raw_top_rules.sort_by_key(|r| std::cmp::Reverse(r.1));
     raw_top_rules.truncate(10);
 
     AuditStats {
@@ -347,7 +347,7 @@ pub fn compute_hook_stats(records: &[AuditRecord]) -> HookStats {
     }
 
     let mut top_events: Vec<(String, usize)> = event_counts.into_iter().collect();
-    top_events.sort_by(|a, b| b.1.cmp(&a.1));
+    top_events.sort_by_key(|e| std::cmp::Reverse(e.1));
     top_events.truncate(10);
 
     HookStats {
@@ -427,7 +427,7 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
     report.push_str("## Action Breakdown\n\n");
     report.push_str("| Action | Count |\n|--------|-------|\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
-    actions.sort_by(|(a, _), (b, _)| a.cmp(b));
+    actions.sort_by_key(|(a, _)| *a);
     for (action, count) in &actions {
         report.push_str(&format!("| {} | {count} |\n", escape_md_cell(action)));
     }
@@ -529,7 +529,7 @@ tr:nth-child(even) { background: #e9ecef; }
 
     html.push_str("<h2>Action Breakdown</h2>\n<table><tr><th>Action</th><th>Count</th></tr>\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
-    actions.sort_by(|(a, _), (b, _)| a.cmp(b));
+    actions.sort_by_key(|(a, _)| *a);
     for (action, count) in &actions {
         html.push_str(&format!(
             "<tr><td>{}</td><td>{}</td></tr>\n",

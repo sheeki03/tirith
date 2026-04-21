@@ -142,7 +142,7 @@ impl SessionWarnings {
             *counts.entry(e.rule_id.clone()).or_default() += 1;
         }
         let mut sorted: Vec<_> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
         sorted
     }
 }

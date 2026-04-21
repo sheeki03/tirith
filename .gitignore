@@ -13,6 +13,10 @@
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/
+fuzz/target/
+# Not currently load-bearing — CI runs `cargo fuzz run` without --locked.
+# Re-track if the workflow switches to --locked for reproducibility.
+fuzz/Cargo.lock
 
 # Local env
 .env

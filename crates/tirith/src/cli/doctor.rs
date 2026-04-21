@@ -472,7 +472,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
     let records_analyzed = records_with_raw;
 
     let mut hidden_top_rules: Vec<(String, usize)> = hidden_rule_counts.into_iter().collect();
-    hidden_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    hidden_top_rules.sort_by_key(|r| std::cmp::Reverse(r.1));
     hidden_top_rules.truncate(5);
 
     // discover_partial is local-only so doctor never triggers a network fetch.

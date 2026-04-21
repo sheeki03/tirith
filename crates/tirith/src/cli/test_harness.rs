@@ -72,7 +72,11 @@ where
 {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_tmp = tempfile::tempdir().expect("home tempdir");
+    // The `home` crate reads `$HOME` on Unix and `%USERPROFILE%` on Windows
+    // (with `$HOME` as a fallback). Override BOTH so a fake-HOME test isolates
+    // production code that calls `home::home_dir()` regardless of platform.
     let _home_guard = EnvGuard::set("HOME", home_tmp.path());
+    let _userprofile_guard = EnvGuard::set("USERPROFILE", home_tmp.path());
 
     let cwd_tmp = if set_cwd {
         Some(tempfile::tempdir().expect("cwd tempdir"))
