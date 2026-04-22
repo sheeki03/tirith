@@ -77,12 +77,19 @@ fetch() {
 }
 
 verify_sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then
+  # Probe capability, not just presence. Apple's /sbin/sha256sum accepts `-c` as
+  # a flag but does not read checksum lines from stdin, so the real invocation
+  # (`sha256sum -c` with piped stdin) fails with a usage error. Feed the known
+  # empty-string SHA-256 (the hash of /dev/null) through stdin to confirm the
+  # binary actually validates before trusting it.
+  _empty_sha=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  if command -v sha256sum >/dev/null 2>&1 && \
+     printf '%s  /dev/null\n' "$_empty_sha" | sha256sum -c >/dev/null 2>&1; then
     sha256sum -c
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 -c
   else
-    err "No sha256sum or shasum found"
+    err "No GNU-compatible sha256sum or shasum found"
   fi
 }
 
