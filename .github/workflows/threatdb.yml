@@ -82,6 +82,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: threatdb-${{ github.run_id }}-${{ github.run_attempt }}
+          make_latest: false
           files: |
             tirith-threatdb.dat
             threatdb-manifest.json
