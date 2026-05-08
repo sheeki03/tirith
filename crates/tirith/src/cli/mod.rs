@@ -166,9 +166,82 @@ fn resolve_shim_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
     target.canonicalize().ok().or(Some(target))
 }
 
+/// Map (`OS`, `ARCH`) to the platform-specific package name used under the
+/// `@sheeki03/` npm scope (e.g. `tirith-linux-x64`, joined later as
+/// `@sheeki03/tirith-linux-x64`). Returns `None` on unsupported Unix
+/// targets (e.g. FreeBSD). Mirrors `npm/tirith/bin/tirith` exactly.
+#[cfg(unix)]
+fn npm_platform_package() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("tirith-linux-x64"),
+        ("linux", "aarch64") => Some("tirith-linux-arm64"),
+        ("macos", "x86_64") => Some("tirith-darwin-x64"),
+        ("macos", "aarch64") => Some("tirith-darwin-arm64"),
+        _ => None,
+    }
+}
+
+/// If `path` is the official tirith npm wrapper at
+/// `…/node_modules/tirith/bin/tirith`, resolve to the platform-package native
+/// binary at `…/node_modules/@sheeki03/tirith-{platform}-{arch}/bin/tirith`.
+///
+/// The wrapper is a Node script that `execFileSync`s the native binary, so
+/// `current_exe()` returns the native ELF while `which -a tirith` returns the
+/// wrapper — naive `canonicalize()` makes them appear to be different installs
+/// and triggers a false-positive shadow warning. See issue #105.
+#[cfg(unix)]
+fn resolve_npm_wrapper_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    // Canonicalize FIRST. The path on PATH is typically a symlink (e.g.
+    // `~/.nvm/.../bin/tirith` → `…/node_modules/tirith/bin/tirith`) and the
+    // layout check has to happen on the resolved target.
+    let canonical = path.canonicalize().ok()?;
+
+    // Verify the canonicalized path's last four components are exactly
+    // `node_modules`, `tirith`, `bin`, `tirith` (in that order). Anything
+    // else falls through to the existing `canonicalize()` behavior.
+    let components: Vec<Component> = canonical.components().collect();
+    if components.len() < 4 {
+        return None;
+    }
+    let tail = &components[components.len() - 4..];
+    let expected = [
+        Component::Normal("node_modules".as_ref()),
+        Component::Normal("tirith".as_ref()),
+        Component::Normal("bin".as_ref()),
+        Component::Normal("tirith".as_ref()),
+    ];
+    if tail != expected {
+        return None;
+    }
+
+    // Walk up to the `node_modules` ancestor (parent of the `tirith` package
+    // directory). `canonical` ends in `…/node_modules/tirith/bin/tirith`, so
+    // `node_modules` is three parents up.
+    let node_modules = canonical.ancestors().nth(3)?;
+
+    let platform = npm_platform_package()?;
+    let native = node_modules
+        .join("@sheeki03")
+        .join(platform)
+        .join("bin")
+        .join("tirith");
+
+    if !native.is_file() {
+        return None;
+    }
+    native.canonicalize().ok()
+}
+
 fn resolve_effective_tirith_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     if let Some(target) = resolve_shim_target(path) {
+        return Some(target);
+    }
+
+    #[cfg(unix)]
+    if let Some(target) = resolve_npm_wrapper_target(path) {
         return Some(target);
     }
 
@@ -312,5 +385,103 @@ mod tests {
             resolve_shim_target(&shim).unwrap().canonicalize().unwrap(),
             real.canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    mod npm_wrapper_tests {
+        use super::super::{npm_platform_package, resolve_npm_wrapper_target};
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        /// Build the canonical npm layout under `root` and return
+        /// `Some((path-to-symlink-on-PATH, path-to-native-binary))`. Returns
+        /// `None` on Unix targets that aren't in `npm_platform_package`'s
+        /// mapping (FreeBSD, OpenBSD, etc.) so tests can early-skip without
+        /// panicking on platforms the npm distribution doesn't ship for.
+        fn build_layout(
+            root: &std::path::Path,
+        ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+            let platform = npm_platform_package()?;
+
+            let wrapper_dir = root.join("lib/node_modules/tirith/bin");
+            let native_dir = root
+                .join("lib/node_modules/@sheeki03")
+                .join(platform)
+                .join("bin");
+            let bin_dir = root.join("bin");
+
+            fs::create_dir_all(&wrapper_dir).unwrap();
+            fs::create_dir_all(&native_dir).unwrap();
+            fs::create_dir_all(&bin_dir).unwrap();
+
+            let wrapper = wrapper_dir.join("tirith");
+            let native = native_dir.join("tirith");
+            fs::write(&wrapper, b"#!/usr/bin/env node\n// wrapper").unwrap();
+            fs::write(&native, b"\x7fELF native bytes").unwrap();
+
+            let symlinked = bin_dir.join("tirith");
+            symlink(&wrapper, &symlinked).unwrap();
+
+            Some((symlinked, native))
+        }
+
+        /// The actual bug path: PATH entry → symlink → wrapper. Without the
+        /// canonicalize-first step in `resolve_npm_wrapper_target`, this fails.
+        #[test]
+        fn resolve_npm_wrapper_target_via_symlink_resolves_native_binary() {
+            let dir = tempfile::tempdir().unwrap();
+            let Some((symlinked, native)) = build_layout(dir.path()) else {
+                eprintln!("skipping: npm distribution doesn't ship for this Unix target");
+                return;
+            };
+
+            assert_eq!(
+                resolve_npm_wrapper_target(&symlinked),
+                Some(native.canonicalize().unwrap())
+            );
+        }
+
+        #[test]
+        fn resolve_npm_wrapper_target_resolves_native_binary_when_called_with_wrapper_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let Some((_symlinked, native)) = build_layout(dir.path()) else {
+                eprintln!("skipping: npm distribution doesn't ship for this Unix target");
+                return;
+            };
+
+            let wrapper = dir.path().join("lib/node_modules/tirith/bin/tirith");
+            assert_eq!(
+                resolve_npm_wrapper_target(&wrapper),
+                Some(native.canonicalize().unwrap())
+            );
+        }
+
+        #[test]
+        fn resolve_npm_wrapper_target_returns_none_when_native_missing() {
+            // Build wrapper layout WITHOUT the platform sibling — simulates a
+            // broken install. Helper must return None so the existing
+            // canonicalize path still warns naturally.
+            let dir = tempfile::tempdir().unwrap();
+            let wrapper_dir = dir.path().join("lib/node_modules/tirith/bin");
+            fs::create_dir_all(&wrapper_dir).unwrap();
+            let wrapper = wrapper_dir.join("tirith");
+            fs::write(&wrapper, b"wrapper").unwrap();
+
+            assert_eq!(resolve_npm_wrapper_target(&wrapper), None);
+        }
+
+        #[test]
+        fn resolve_npm_wrapper_target_ignores_non_npm_paths() {
+            // Pip-style layout: a tirith binary outside any node_modules tree.
+            // Helper must return None so the documented PyPI conflict warning
+            // (docs/troubleshooting.md:29-47) is preserved.
+            let dir = tempfile::tempdir().unwrap();
+            let pip_dir = dir.path().join("local/bin");
+            fs::create_dir_all(&pip_dir).unwrap();
+            let pip = pip_dir.join("tirith");
+            fs::write(&pip, b"pip-installed").unwrap();
+
+            assert_eq!(resolve_npm_wrapper_target(&pip), None);
+        }
     }
 }
