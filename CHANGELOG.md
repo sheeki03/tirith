@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-08
+
+### Fixed
+
+- **`tirith setup codex` against current Codex CLI versions** — recognises the new `Error: No MCP server named 'X' found.` stderr message instead of treating it as an unexpected failure, and accepts both the legacy top-level `command`/`args` JSON shape and the current nested `transport.command`/`args` shape returned by `codex mcp get --json`. Drift detection still works against either shape.
+- **Non-interactive `zsh -lc ...` no longer blocked by stale `.zshenv` guard** — the guard now bakes a stable absolute path to the tirith binary at install time (resolved via PATH lookup with symlink canonicalisation, falling back to `current_exe()` when the PATH entry is a `#!` wrapper script for npm/pnpm). Previously the guard relied on the bare name `tirith` being on PATH, which fails before `.zshrc`/`.zprofile` populate PATH. The path is shell-quoted so spaces and apostrophes round-trip safely.
+- **Windows path-shadow false positive on Scoop installs** — `tirith doctor`/`tirith init` no longer warn that the Scoop shim at `~\scoop\shims\tirith.exe` shadows the real binary; the shim is resolved through its `.shim` sidecar to the real path before the equality check.
+- **Installer `verify_sha256` portability** — `scripts/install.sh` now probes whether `sha256sum -c` reads from stdin and falls back to `shasum -a 256 -c` when not (some BSDs, busybox). Regression harness added.
+
+### Security
+
+- `rand` bumped to 0.9.3 (RUSTSEC-2026-0097).
+- `rustls-webpki` bumped to a version unaffected by upstream advisories.
+
+### Docs
+
+- README: expanded threat intel attribution table; added incident summary; added Nixpkgs install line.
+
+### Internal
+
+- Daily threat-DB manifest direct-pushes to `main` instead of opening auto-merge PRs that silently no-op'd when no required checks were present, accumulating an unmerged backlog.
+- Scoop helper code moved under `#[cfg(windows)]` to silence a clippy warning surfaced by recent toolchain versions.
+
 ## [0.3.0] - 2026-04-21
 
 ### Added
