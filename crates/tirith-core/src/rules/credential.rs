@@ -120,6 +120,12 @@ fn check_known_patterns(input: &str) -> Vec<Finding> {
             if is_covered_by_env_export(input, m.start()) {
                 continue;
             }
+            // AWS access keys legitimately appear in SigV4 pre-signed URLs and
+            // SigV4 Authorization headers. The signature is the secret, not
+            // the access key ID. See issue #101.
+            if pat.name == "AWS Access Key" && is_covered_by_aws_sigv4(input, &m) {
+                continue;
+            }
             findings.push(Finding {
                 rule_id: RuleId::CredentialInText,
                 severity: Severity::High,
@@ -241,6 +247,269 @@ fn is_covered_by_env_export(input: &str, match_start: usize) -> bool {
             false
         }
     })
+}
+
+/// Suppress an `AWS Access Key` match that sits inside a SigV4 signed URL
+/// (query-param form) or a SigV4 Authorization header. The access key ID is
+/// the public part of a SigV4 signature — the actual secret is the
+/// X-Amz-Signature value. See issue #101.
+fn is_covered_by_aws_sigv4(input: &str, m: &regex::Match) -> bool {
+    covered_by_url_sigv4(input, m) || covered_by_header_sigv4(input, m)
+}
+
+/// True if `m` sits inside the `X-Amz-Credential` value of a parsed URL that
+/// also has `X-Amz-Algorithm=AWS4-HMAC-SHA256` and a non-empty
+/// `X-Amz-Signature`.
+fn covered_by_url_sigv4(input: &str, m: &regex::Match) -> bool {
+    let Some((url_str, url_offset)) = extract_url_token(input, m.start()) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(url_str) else {
+        return false;
+    };
+
+    let mut credential_value: Option<String> = None;
+    let mut has_correct_algorithm = false;
+    let mut has_signature = false;
+
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "X-Amz-Credential" => credential_value = Some(v.into_owned()),
+            "X-Amz-Algorithm" if v == "AWS4-HMAC-SHA256" => {
+                has_correct_algorithm = true;
+            }
+            "X-Amz-Signature" if !v.is_empty() => {
+                has_signature = true;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(credential_value) = credential_value else {
+        return false;
+    };
+    if !has_correct_algorithm || !has_signature {
+        return false;
+    }
+
+    // Anchor to the actual credential parameter, not just "any AKIA in this URL".
+    // The match must fall inside that query pair's value when looked up by
+    // byte position in the original URL token.
+    let match_in_url_start = match m.start().checked_sub(url_offset) {
+        Some(off) => off,
+        None => return false,
+    };
+    let match_in_url_end = match_in_url_start + m.as_str().len();
+    let Some((cred_start, cred_end)) =
+        find_query_value_span(url_str, "X-Amz-Credential", &credential_value)
+    else {
+        return false;
+    };
+    match_in_url_start >= cred_start && match_in_url_end <= cred_end
+}
+
+/// Locate the byte span (within `url_str`) of the value of the query parameter
+/// named `name`. The value as parsed by `url::Url` is `decoded_value`, which
+/// may differ from the raw bytes (percent-decoded). We scan the raw query
+/// string for the parameter and accept any encoded form whose decoded form
+/// matches `decoded_value`.
+fn find_query_value_span(url_str: &str, name: &str, decoded_value: &str) -> Option<(usize, usize)> {
+    let q_start = url_str.find('?')? + 1;
+    let query = &url_str[q_start..];
+    // Strip any fragment.
+    let query = query.split('#').next()?;
+    let mut cursor = 0usize;
+    while cursor <= query.len() {
+        let segment_end = query[cursor..]
+            .find('&')
+            .map(|i| cursor + i)
+            .unwrap_or(query.len());
+        let segment = &query[cursor..segment_end];
+        if let Some(eq_idx) = segment.find('=') {
+            let raw_name = &segment[..eq_idx];
+            let raw_value = &segment[eq_idx + 1..];
+            // Compare names case-sensitively (AWS uses exact `X-Amz-Credential`).
+            if raw_name == name {
+                let dec: String = url::form_urlencoded::parse(raw_value.as_bytes())
+                    .next()
+                    .map(|(k, _)| k.into_owned())
+                    .unwrap_or_default();
+                // `form_urlencoded::parse` on a bare value (no `=`) returns it
+                // as the key; that's what we want.
+                if dec == decoded_value {
+                    let value_start = q_start + cursor + eq_idx + 1;
+                    let value_end = q_start + segment_end;
+                    return Some((value_start, value_end));
+                }
+            }
+        }
+        if segment_end >= query.len() {
+            break;
+        }
+        cursor = segment_end + 1;
+    }
+    None
+}
+
+/// Find the URL token containing byte offset `match_pos`. Extends left and
+/// right to whitespace/quote/control boundaries. Returns the URL slice plus
+/// its byte offset within `input`. UTF-8-safe (uses `char_indices`).
+fn extract_url_token(input: &str, match_pos: usize) -> Option<(&str, usize)> {
+    if match_pos > input.len() {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let is_boundary = |b: u8| {
+        matches!(
+            b,
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'`' | b'<' | b'>'
+        )
+    };
+
+    // Walk left (byte-by-byte is fine — boundary chars are ASCII).
+    let mut start = match_pos;
+    while start > 0 {
+        let prev = start - 1;
+        if is_boundary(bytes[prev]) {
+            break;
+        }
+        start = prev;
+    }
+    // Walk right.
+    let mut end = match_pos;
+    while end < bytes.len() && !is_boundary(bytes[end]) {
+        end += 1;
+    }
+    // Ensure char boundaries (start/end already aligned because boundary
+    // chars are single-byte ASCII, but be defensive).
+    while start < input.len() && !input.is_char_boundary(start) {
+        start += 1;
+    }
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    let token = input.get(start..end)?;
+    // A URL-looking token must start with a scheme.
+    if !token.starts_with("http://") && !token.starts_with("https://") {
+        return None;
+    }
+    Some((token, start))
+}
+
+/// True if `m` sits inside the value of a `Credential=` field of an
+/// Authorization header that also contains `AWS4-HMAC-SHA256` and a
+/// non-empty `Signature=` field. ASCII-case-insensitive on the header name.
+///
+/// Suppression is anchored to absolute byte spans: the match must fall
+/// entirely inside the header value's span AND inside the `Credential=`
+/// value's span. A second occurrence of the same key elsewhere in the
+/// input (URL, body, another header) is *not* suppressed even if the
+/// SigV4 header above contains the same key string.
+fn covered_by_header_sigv4(input: &str, m: &regex::Match) -> bool {
+    // Find the nearest preceding `authorization:` (ASCII-case-insensitive)
+    // before the match. Use the LAST such occurrence so nested/repeated
+    // headers anchor on the rightmost one.
+    let prefix = &input[..m.start()];
+    let auth_pos = match find_last_ascii_ignore_case(prefix, "authorization:") {
+        Some(i) => i,
+        None => return false,
+    };
+    let header_value_start = auth_pos + "authorization:".len();
+
+    // Bound the header value at the first newline / single-quote /
+    // double-quote at-or-after `header_value_start`. Curl headers are
+    // typically wrapped in `'...'` or `"..."`; HTTP wire format ends a
+    // header at LF/CR.
+    let bytes = input.as_bytes();
+    let mut header_value_end = header_value_start;
+    while header_value_end < bytes.len() {
+        let b = bytes[header_value_end];
+        if b == b'\n' || b == b'\r' || b == b'"' || b == b'\'' {
+            break;
+        }
+        header_value_end += 1;
+    }
+    while header_value_end > header_value_start && !input.is_char_boundary(header_value_end) {
+        header_value_end -= 1;
+    }
+
+    // The match must fall ENTIRELY inside the header value range. This is
+    // the key span check the previous implementation lacked: a second AKIA
+    // after the closing quote must not be suppressed.
+    if m.start() < header_value_start || m.end() > header_value_end {
+        return false;
+    }
+
+    let header_value = &input[header_value_start..header_value_end];
+
+    if !header_value.contains("AWS4-HMAC-SHA256") {
+        return false;
+    }
+
+    // Locate the `Credential=` field's absolute byte span in `input`.
+    // A well-formed SigV4 header is comma-separated:
+    // `AWS4-HMAC-SHA256 Credential=…, SignedHeaders=…, Signature=…`.
+    // The `Credential=` field is NEVER the last field, so it must be
+    // followed by a comma. Without that comma we treat the header as
+    // malformed and refuse to suppress — otherwise an unquoted header
+    // like `Credential=AKIA Signature=abc https://…/AKIA` would let the
+    // span extend to end of input and swallow a later, unrelated AKIA.
+    let cred_idx_in_value = match header_value.find("Credential=") {
+        Some(i) => i,
+        None => return false,
+    };
+    let cred_search_offset = cred_idx_in_value + "Credential=".len();
+    let cred_end_in_value = match header_value[cred_search_offset..].find(',') {
+        Some(i) => cred_search_offset + i,
+        None => return false, // malformed: Credential= has no closing comma
+    };
+    let cred_value_start_abs = header_value_start + cred_search_offset;
+    let cred_value_end_abs = header_value_start + cred_end_in_value;
+
+    // The match must fall ENTIRELY inside the Credential= value's span.
+    // Pure string containment isn't enough — a second occurrence of the
+    // same key elsewhere in the header (or input) would otherwise be
+    // incorrectly suppressed.
+    if m.start() < cred_value_start_abs || m.end() > cred_value_end_abs {
+        return false;
+    }
+
+    // Require a non-empty `Signature=` somewhere in the header value.
+    let sig_idx = match header_value.find("Signature=") {
+        Some(i) => i,
+        None => return false,
+    };
+    let sig_value_start = sig_idx + "Signature=".len();
+    let sig_value_end = header_value[sig_value_start..]
+        .find(',')
+        .map(|i| sig_value_start + i)
+        .unwrap_or(header_value.len());
+    let sig_value = header_value[sig_value_start..sig_value_end].trim();
+    if sig_value.is_empty() {
+        return false;
+    }
+
+    true
+}
+
+/// Find the LAST byte position in `haystack` where `needle` occurs,
+/// matching ASCII characters case-insensitively. Returns `None` if absent.
+fn find_last_ascii_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    let n = needle.as_bytes();
+    if n.is_empty() || haystack.len() < n.len() {
+        return None;
+    }
+    let h = haystack.as_bytes();
+    let mut last: Option<usize> = None;
+    'outer: for i in 0..=(h.len() - n.len()) {
+        for j in 0..n.len() {
+            if !h[i + j].eq_ignore_ascii_case(&n[j]) {
+                continue 'outer;
+            }
+        }
+        last = Some(i);
+    }
+    last
 }
 
 /// Check if `before` ends with a chain starting from `cmd`, allowing intervening
@@ -463,6 +732,204 @@ mod tests {
                 "title must not contain the raw secret"
             );
         }
+    }
+
+    // ── AWS SigV4 carve-out tests (issue #101) ─────────────────────────────
+
+    #[test]
+    fn test_bare_aws_key_still_fires() {
+        let input = "AKIAIOSFODNN7EXAMPLE";
+        let findings = check(input, ShellType::Posix, ScanContext::Paste);
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::CredentialInText));
+    }
+
+    #[test]
+    fn test_aws_key_in_url_without_signature_fires() {
+        // X-Amz-Credential present, X-Amz-Signature missing → still leaks.
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20260504/us-east-1/s3/aws4_request'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "URL with credential but no signature should still fire"
+        );
+    }
+
+    #[test]
+    fn test_aws_key_in_url_without_algorithm_fires() {
+        // X-Amz-Credential and X-Amz-Signature, but no AWS4-HMAC-SHA256.
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc123'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "URL without AWS4-HMAC-SHA256 algorithm should still fire"
+        );
+    }
+
+    #[test]
+    fn test_aws_key_in_authorization_header_without_sigv4_fires() {
+        let input = "curl -H 'Authorization: Bearer AKIAIOSFODNN7EXAMPLE' https://api.example.com";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "Bearer-style header without SigV4 markers should still fire"
+        );
+    }
+
+    #[test]
+    fn test_second_aws_key_in_url_path_still_fires() {
+        // SigV4-formed URL whose PATH also embeds a stray AKIA outside the
+        // X-Amz-Credential value. Both AKIAs are in the same URL token, but
+        // only the credential-anchored one is suppressed.
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/AKIAIOSFODNN7EXAMPLE/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "stray AKIA in URL path must still fire even when SigV4 markers are present"
+        );
+    }
+
+    #[test]
+    fn test_s3_presigned_url_suppressed() {
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Date=20260504T034020Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "fully-formed SigV4 pre-signed URL must not flag credential_in_text; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_s3_presigned_url_url_encoded_credential_value_suppressed() {
+        // %2F encoding inside the X-Amz-Credential value (real-world form
+        // from issue #101). url::Url decodes the value so AKIA still matches.
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20260504%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260504T034020Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "URL-encoded credential scope must still be suppressed; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_aws_sigv4_authorization_header_suppressed() {
+        let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e' https://s3.amazonaws.com/bucket/file";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "SigV4 Authorization header must not flag credential_in_text; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_aws_sigv4_authorization_header_lowercased_suppressed() {
+        // Lowercase header name — ASCII-case-insensitive match must work.
+        let input = "curl -H 'authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' https://s3.amazonaws.com/bucket/file";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "lowercase authorization header must still be suppressed; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_second_aws_key_after_sigv4_header_still_fires() {
+        // Span anchoring: a SigV4-formed Authorization header followed by
+        // the SAME AKIA in the URL after the closing quote. The first
+        // match (inside Credential=) is suppressed; the second (in the URL
+        // path) must still fire. Regression for the absolute-byte-span fix.
+        let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' https://example.com/AKIAVCODYLSA53PQK4ZA";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "second AKIA after a SigV4 Authorization header must still fire; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_aws_key_in_other_header_after_sigv4_still_fires() {
+        // SigV4 header followed by the same key string in another
+        // (non-SigV4) header. Only the SigV4 occurrence is suppressed;
+        // the X-Custom-Key header must still flag.
+        let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' -H 'X-Custom-Key: AKIAVCODYLSA53PQK4ZA' https://example.com/";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "AKIA in a separate non-SigV4 header after a SigV4 header must still fire; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_aws_key_in_body_after_sigv4_still_fires() {
+        // SigV4 header followed by the same key string in a POST body.
+        let input = "curl -X POST -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' -d 'leaked=AKIAVCODYLSA53PQK4ZA' https://example.com/";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "AKIA in body data after a SigV4 header must still fire; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_unquoted_authorization_header_does_not_suppress() {
+        // Malformed header: no quotes, no comma after `Credential=`. A real
+        // SigV4 header is comma-separated, so this is not valid SigV4. The
+        // suppression must reject it — otherwise the credential value span
+        // extends past the next AKIA and swallows it.
+        let input = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA Signature=abc https://example.com/AKIAVCODYLSA53PQK4ZA";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "malformed unquoted SigV4 header must NOT suppress; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_reordered_query_params_suppressed() {
+        // Same SigV4 markers, different parameter order. url::Url query_pairs
+        // doesn't care about order.
+        let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Signature=abc&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Algorithm=AWS4-HMAC-SHA256'";
+        let findings = check(input, ShellType::Posix, ScanContext::Exec);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "reordered SigV4 query params must still be suppressed; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_prefix_does_not_panic() {
+        // Multi-byte UTF-8 chars before the URL. Byte-window scanning must
+        // respect char boundaries.
+        let input = "echo «attempt» wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc'";
+        // No assertion on result — the test passes if there's no panic.
+        let _ = check(input, ShellType::Posix, ScanContext::Exec);
     }
 
     #[test]
