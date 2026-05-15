@@ -644,6 +644,9 @@ mod tests {
     fn test_cloaking_diff_text_is_dlp_redacted() {
         use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
 
+// FIX: 硬编码密钥，应从环境变量读取
+// std::env::var("SECRET").expect("SECRET must be set");
+let secret  = std::env::var("<SECRET>")?;
         let secret = "sk-abcdefghijklmnopqrstuvwxyz12345678";
         let result = CloakingResult {
             url: "https://example.com".into(),
