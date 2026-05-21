@@ -816,14 +816,25 @@ enum PolicyAction {
     #[command(after_help = "\
 Examples:
   tirith policy init
-  tirith policy init --force")]
+  tirith policy init --force
+  tirith policy init --template individual
+  tirith policy init --template ci-strict
+  tirith policy init --template ai-agent-heavy
+
+Templates:
+  individual      sensible defaults for a single developer
+  ci-strict       strict CI settings (fail-closed, no bypass, scan fail-on)
+  ai-agent-heavy  tuned for environments where AI agents run many commands")]
     Init {
         /// Overwrite existing policy file
         #[arg(long)]
         force: bool,
         /// Generate minimal template (default: full)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "template")]
         minimal: bool,
+        /// Use a curated starter policy: individual, ci-strict, or ai-agent-heavy
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
     },
     /// Validate a policy file for errors
     #[command(after_help = "\
@@ -1160,7 +1171,11 @@ fn main() {
         ),
 
         Commands::Policy { action } => match action {
-            PolicyAction::Init { force, minimal } => cli::policy::init(force, minimal),
+            PolicyAction::Init {
+                force,
+                minimal,
+                template,
+            } => cli::policy::init(force, minimal, template.as_deref()),
             PolicyAction::Validate { path, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::validate(path.as_deref(), json)

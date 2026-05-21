@@ -2087,6 +2087,106 @@ fn check_offline_composes_with_approval_check() {
     );
 }
 
+/// Roadmap item 23: `tirith policy init --template <name>` must write a valid
+/// policy for each curated template, and `tirith policy validate` must then
+/// pass on it. Exercises the real binary end-to-end (init → validate).
+#[test]
+fn policy_init_templates_generate_and_validate() {
+    for template in ["individual", "ci-strict", "ai-agent-heavy"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let init = tirith()
+            .args(["policy", "init", "--template", template])
+            .current_dir(dir.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("failed to run tirith policy init");
+        assert_eq!(
+            init.status.code(),
+            Some(0),
+            "policy init --template {template} should exit 0: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let policy_path = dir.path().join(".tirith/policy.yaml");
+        assert!(
+            policy_path.exists(),
+            "policy init --template {template} should write {}",
+            policy_path.display()
+        );
+
+        let validate = tirith()
+            .args(["policy", "validate"])
+            .current_dir(dir.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("failed to run tirith policy validate");
+        let stderr = String::from_utf8_lossy(&validate.stderr);
+        assert_eq!(
+            validate.status.code(),
+            Some(0),
+            "policy validate must pass on the {template} template: {stderr}"
+        );
+        assert!(
+            stderr.contains("valid, no issues"),
+            "policy validate on {template} template should report no issues: {stderr}"
+        );
+    }
+}
+
+/// An unrecognized `--template` name must fail fast with exit 1 and list the
+/// valid template names. `fintech` / `windows-enterprise` are deliberately
+/// deferred and must be rejected.
+#[test]
+fn policy_init_rejects_unknown_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .args(["policy", "init", "--template", "fintech"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith policy init");
+    assert_eq!(out.status.code(), Some(1), "unknown template should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown template 'fintech'"),
+        "error should name the bad template: {stderr}"
+    );
+    assert!(
+        stderr.contains("individual")
+            && stderr.contains("ci-strict")
+            && stderr.contains("ai-agent-heavy"),
+        "error should list valid templates: {stderr}"
+    );
+    assert!(
+        !dir.path().join(".tirith/policy.yaml").exists(),
+        "a rejected template must not write a policy file"
+    );
+}
+
+/// `tirith policy init` with no `--template` must keep writing the default
+/// full template — the new option must not change default behavior.
+#[test]
+fn policy_init_default_unchanged_without_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .args(["policy", "init"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith policy init");
+    assert_eq!(out.status.code(), Some(0), "default init should exit 0");
+
+    let body = fs::read_to_string(dir.path().join(".tirith/policy.yaml"))
+        .expect("default init should write policy.yaml");
+    // The default (full) template carries the section comments the curated
+    // templates' headers do not — a cheap discriminator that it is unchanged.
+    assert!(
+        body.contains("# Tirith security policy") && body.contains("# Paranoia level (1-4)"),
+        "default init should still write the full template: {body}"
+    );
+}
+
 /// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
 /// policy and report its error, rather than collapsing to "no policy file found"
 /// the way the old parse-aware discovery (`Policy::discover().path`) did.

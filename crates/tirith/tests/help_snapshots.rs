@@ -101,6 +101,25 @@ fn help_scan_shows_sarif_format() {
 }
 
 #[test]
+fn help_policy_init_documents_templates() {
+    let out = tirith()
+        .args(["policy", "init", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--template"),
+        "policy init --help should document --template: {stdout}"
+    );
+    for name in ["individual", "ci-strict", "ai-agent-heavy"] {
+        assert!(
+            stdout.contains(name),
+            "policy init --help should list the {name} template: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn conflict_json_and_format() {
     let out = tirith()
         .args(["check", "--json", "--format", "json", "--", "echo", "hi"])
