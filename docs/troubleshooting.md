@@ -17,6 +17,61 @@ If hooks are not found:
 2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)
 3. Set `TIRITH_SHELL_DIR` to point to your shell hooks directory explicitly
 
+## Filing a bug report: `tirith doctor --bundle`
+
+To attach a complete, **redacted** diagnostic to a bug report, run:
+
+```
+tirith doctor --bundle
+```
+
+It writes a single text file (path printed on completion, under
+`~/.local/state/tirith/`) containing the doctor info, tirith and hook
+versions, shell / mode / effective protection, hook-chain state, policy
+discovery, threat-DB status, and a curated slice of the environment. The
+aliases `tirith doctor --redacted-report` and `tirith doctor --shell-trace`
+produce the same file.
+
+The bundle is **redacted by design**:
+
+- Only a curated allowlist of tirith-relevant environment variables is
+  included — unrelated cloud credentials and API keys are never even
+  candidates.
+- Any value that still looks like a token or secret is masked as
+  `<redacted>`.
+- The literal home-directory path is replaced with `~`, so absolute paths in
+  the report do not reveal your username.
+
+It is safe to attach to a public issue. Review it first if you want to be
+sure. Add `--format json` to get `{"bundle_path": "..."}` instead of the
+human summary.
+
+## Protection downgraded (`degraded` status)
+
+tirith can downgrade protection during a session — most commonly bash enter
+mode falling back to preexec warn-only when it detects a delivery failure. A
+downgrade is **never silent**: the hook prints one consolidated message,
+
+```
+tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details
+```
+
+and updates the exported `TIRITH_STATUS` variable to `degraded`.
+
+To see the current protection level at any time, run `tirith doctor` — a
+`protection:` line reports `blocks` / `warn-only` / `degraded` / `off`, and a
+`degraded` state gets an explicit callout. `tirith doctor --compat` shows a
+`protection status:` line in the same spirit.
+
+If you want the protection level visible in your shell prompt, the hook
+exports `TIRITH_STATUS` for exactly that — see
+[`docs/prompt-status.md`](prompt-status.md) for ready-to-paste prompt snippets
+for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
+output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
+
+To recover full protection after a degrade, restart your shell (and see
+"Persistent safe mode" below if it keeps happening).
+
 ## Brew upgrade applied but behavior did not change
 
 If `brew` reports a newer version but `tirith --version` is older, or shell behavior looks unchanged:

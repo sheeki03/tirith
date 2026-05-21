@@ -558,6 +558,24 @@ Examples:
             conflicts_with = "reset_bash_safe_mode"
         )]
         compat: bool,
+
+        /// Write a redacted diagnostic bundle to a file and print its path.
+        /// The bundle (doctor info, tirith + hook versions, shell/mode/effective
+        /// protection, hook-chain state, policy discovery, threat-DB status, and
+        /// relevant environment) is safe to attach to a bug report: secrets,
+        /// tokens, and the literal home-directory path are redacted. Accepts the
+        /// aliases --redacted-report and --shell-trace. Mutually exclusive with
+        /// --fix, --simulate-enter, --reset-bash-safe-mode, and --compat.
+        #[arg(
+            long,
+            visible_alias = "redacted-report",
+            visible_alias = "shell-trace",
+            conflicts_with = "fix",
+            conflicts_with = "simulate_enter",
+            conflicts_with = "reset_bash_safe_mode",
+            conflicts_with = "compat"
+        )]
+        bundle: bool,
     },
 
     /// Generate shell completions
@@ -1339,9 +1357,18 @@ fn main() {
             yes,
             simulate_enter,
             compat,
+            bundle,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::doctor::run(json, reset_bash_safe_mode, fix, yes, simulate_enter, compat)
+            cli::doctor::run(
+                json,
+                reset_bash_safe_mode,
+                fix,
+                yes,
+                simulate_enter,
+                compat,
+                bundle,
+            )
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),

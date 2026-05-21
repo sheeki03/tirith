@@ -54,6 +54,17 @@ discovery consistency.
   `TIRITH_OFFLINE` environment variable ship: an opt-in switch that suppresses
   the periodic background threat-DB refresh so `check` runs purely locally.
   This is a mechanism only; the online default is unchanged.
+- **Visible degraded-protection indicator** — ships. When a shell hook
+  downgrades protection (e.g. bash enter mode → preexec warn-only), the hook
+  emits one consolidated one-shot message and exports a `TIRITH_STATUS`
+  variable (`blocks` / `warn-only` / `degraded` / `off`) that a user can wire
+  into their prompt; `tirith doctor` calls out a degraded session explicitly.
+  tirith adds no per-prompt output of its own.
+- **`tirith doctor` troubleshooting bundle** — `tirith doctor --bundle`
+  (aliases `--redacted-report`, `--shell-trace`) ships: a redacted diagnostic
+  bundle — doctor info, versions, shell/mode/protection, hook chain, policy
+  discovery, threat-DB status, curated environment — safe to attach to a bug
+  report.
 
 ## Next
 
@@ -64,8 +75,6 @@ Planned, not yet started.
   The bash enter-mode capability cache (issue #111) is the first instance.
 - **Terminal / prompt / history-tool regression tests** — automated coverage
   for the integrations that historically break hook delivery.
-- **Visible degraded-protection status indicator** — a clear, always-visible
-  signal when a session has downgraded from blocking to warn-only.
 
 ## Later
 
