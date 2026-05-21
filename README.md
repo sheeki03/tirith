@@ -534,8 +534,32 @@ Scan supports `--include`, `--exclude`, `--profile` (loads named profiles from p
 
 ```bash
 tirith explain --rule pipe_to_interpreter   # severity, examples, remediation, MITRE ATT&CK
+tirith explain --rule curl_pipe_shell --fix # just the remediation ("what to do instead")
 tirith explain --list --category terminal   # all rules in a category
 ```
+
+### Remediation — "what to run instead"
+
+Every finding carries a per-rule remediation: a short, accurate "how to make
+this safe" line, shown under each finding (`Fix:`) and in `--format json`.
+`tirith explain --rule <id> --fix` prints that remediation on its own.
+
+When a command is blocked or warned, `tirith check --suggest-safe-command`
+additionally prints a concrete safer rewrite of the *actual* command — but only
+where a transformation is genuinely safer and correct:
+
+```bash
+tirith check --suggest-safe-command -- 'curl https://example-cli.dev/i.sh | bash'
+# → try: curl -fsSL -o /tmp/tirith-review.sh https://example-cli.dev/i.sh \
+#        && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+```
+
+It rewrites pipe-to-shell into download-review-run, drops insecure-TLS flags
+(`-k` / `--insecure` / `--no-check-certificate`), and switches plain `http://`
+to `https://`. For findings with no safe mechanical rewrite (homograph
+hostnames, archive-extract targets, …) it says so plainly and shows the
+remediation instead — it never emits a bogus suggestion. The flag is advisory:
+it changes neither the verdict nor the exit code.
 
 ### Daemon Mode (Unix)
 
@@ -555,7 +579,7 @@ tirith daemon stop
 
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it |
+| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest-safe-command` adds a concrete safer rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
 | `tirith threat-db update` | Download, verify, and install the signed threat database |
@@ -564,7 +588,7 @@ tirith daemon stop
 | `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
 | `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
 | `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
-| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
+| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule (`--fix` shows just the remediation) |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
