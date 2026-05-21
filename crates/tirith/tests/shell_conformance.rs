@@ -54,8 +54,8 @@ use std::time::Duration;
 mod pty_support;
 
 use pty_support::{
-    bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, IsolatedEnv,
-    PtySession,
+    bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, wait_for_marker,
+    IsolatedEnv, PtySession,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,12 @@ use pty_support::{
 const QUIET: Duration = Duration::from_millis(700);
 /// Hard cap on waiting for one command to settle.
 const SETTLE_MAX: Duration = Duration::from_secs(12);
+/// Hard cap on waiting for a *side-effect-only* command's marker file to
+/// appear. A command like `printf >> marker` produces no terminal output, so
+/// [`PtySession::wait_idle`] cannot tell when it finished — the test must poll
+/// the marker file instead (see [`wait_for_marker`]). This bound is generous
+/// for a loaded CI box yet still fails fast on a genuinely swallowed command.
+const MARKER_MAX: Duration = Duration::from_secs(15);
 
 // ===========================================================================
 // bash — PREEXEC mode (DEBUG-trap, warn-only by default)
@@ -115,11 +121,12 @@ fn bash_preexec_allowed_command_executes_exactly_once() {
         }
     };
 
+    // `printf >> marker` produces no terminal output, so `wait_idle` cannot
+    // tell when it finished — poll the marker file directly.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
 
-    let body = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&body, "RAN"),
         1,
@@ -205,15 +212,16 @@ fn bash_preexec_warned_command_executes_once() {
     };
 
     // `echo`-ing a shortened URL trips the `shortened_url` warn rule
-    // (tirith exit 2) while staying a benign, side-effect-only command.
+    // (tirith exit 2) while staying a benign, side-effect-only command. The
+    // `>> marker` redirect means there is no terminal output to settle on, so
+    // poll the marker file.
     sess.send_line(&format!(
         "echo https://bit.ly/warnprobe >> '{}'",
         marker.display()
     ));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let body = wait_for_marker(&marker, "bit.ly/warnprobe", MARKER_MAX);
     sess.close();
 
-    let body = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&body, "bit.ly/warnprobe"),
         1,
@@ -423,11 +431,13 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
+    // No terminal output from `printf >> marker`; poll the marker file rather
+    // than rely on terminal-quiet (`wait_idle` would return before the hook
+    // finished shelling out to `tirith` and delivering the command).
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
 
-    let body = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&body, "RAN"),
         1,
@@ -478,12 +488,15 @@ fn bash_enter_blocked_command_does_not_execute() {
 
     // Anti-vacuous guard: an allowed command must actually run. If this marker
     // is empty the session is swallowing commands and the blocked-command
-    // assertion below would be meaningless.
+    // assertion below would be meaningless. The allowed command is
+    // side-effect-only (`printf >> marker`, no terminal output) and an allowed
+    // verdict makes `tirith check` print nothing either, so terminal-quiet
+    // (`wait_idle`) is reached *before* delivery — poll the marker file.
     sess.send_line(&format!(
         "printf 'ALLOWED\\n' >> '{}'",
         allowed_marker.display()
     ));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let allowed_body = wait_for_marker(&allowed_marker, "ALLOWED", MARKER_MAX);
     sess.clear_buffer();
 
     // A blocked pipe-to-interpreter; the `&&`-guarded marker write only happens
@@ -491,7 +504,8 @@ fn bash_enter_blocked_command_does_not_execute() {
     // producer is a local `printf` — not `curl` — so an absent marker can only
     // mean "blocked", never "the network was down" (which would make the
     // assertion pass vacuously). tirith blocks `printf | bash` via the same
-    // `pipe_to_interpreter` rule.
+    // `pipe_to_interpreter` rule. A blocked command *does* produce terminal
+    // output (tirith's block message), so `wait_idle` settles correctly here.
     sess.send_line(&format!(
         "printf 'true' | bash && touch '{}'",
         blocked_marker.display()
@@ -499,7 +513,6 @@ fn bash_enter_blocked_command_does_not_execute() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.close();
 
-    let allowed_body = std::fs::read_to_string(&allowed_marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&allowed_body, "ALLOWED"),
         1,
@@ -549,6 +562,12 @@ fn bash_capability_cache_steers_default_mode() {
     // false ⇒ enter mode swallowed it) for a given seeded verdict. `seed_bash`
     // is the bash path written into the cache: passing the real spawn path
     // makes the verdict apply; a bogus path makes it read as stale.
+    //
+    // The probe command (`printf >> marker`) produces no terminal output, so
+    // completion cannot be inferred from terminal-quiet — `wait_for_marker`
+    // polls the file. A `true` return is fast (the marker appears as soon as
+    // preexec delivers); a `false` return (enter mode swallowed the command)
+    // necessarily waits out `MARKER_MAX` to be sure the marker never appears.
     let marker_written =
         |verdict: &str, seed_bash_ver: &str, seed_bash: &Path, tag: &str| -> bool {
             let env = IsolatedEnv::new();
@@ -563,11 +582,9 @@ fn bash_capability_cache_steers_default_mode() {
             sess.wait_idle(QUIET, SETTLE_MAX);
             sess.clear_buffer();
             sess.send_line(&format!("printf 'STEERED\\n' >> '{}'", marker.display()));
-            sess.wait_idle(QUIET, SETTLE_MAX);
+            let body = wait_for_marker(&marker, "STEERED", MARKER_MAX);
             sess.close();
-            std::fs::read_to_string(&marker)
-                .map(|b| count_occurrences(&b, "STEERED") == 1)
-                .unwrap_or(false)
+            count_occurrences(&body, "STEERED") == 1
         };
 
     // `broken` verdict ⇒ preexec ⇒ command delivered ⇒ marker written.
@@ -648,11 +665,11 @@ fn fish_allowed_command_executes_exactly_once() {
         }
     };
 
+    // `printf >> marker` has no terminal output; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
 
-    let body = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&body, "RAN"),
         1,
@@ -732,14 +749,14 @@ fn fish_warned_command_executes_once() {
         }
     };
 
+    // `>> marker` redirect ⇒ no terminal output to settle on; poll the marker.
     sess.send_line(&format!(
         "echo https://bit.ly/fishwarn >> '{}'",
         marker.display()
     ));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    let body = wait_for_marker(&marker, "bit.ly/fishwarn", MARKER_MAX);
     sess.close();
 
-    let body = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         count_occurrences(&body, "bit.ly/fishwarn"),
         1,

@@ -586,3 +586,36 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     }
     count
 }
+
+/// Poll `marker` until it contains `needle` at least once, or `timeout`
+/// elapses. Returns the file's final contents either way.
+///
+/// ## Why this exists — the no-output race
+///
+/// [`PtySession::wait_idle`] keys on *terminal output* going quiet. That is the
+/// right "command finished" signal for a command that prints — but a
+/// side-effect-only command like `printf 'RAN\n' >> marker` writes nothing to
+/// the terminal. Worse, when tirith *allows* such a command it shells out to
+/// `tirith check`, which on an allow verdict also prints nothing. So the only
+/// terminal output is the keystroke echo: `wait_idle` sees "quiet" and returns
+/// *before* the hook has finished shelling out to `tirith` and delivered the
+/// command. The marker is then read while still empty. macOS happens to win
+/// that race; a slower Linux CI box does not (issue surfaced in #116 CI).
+///
+/// The fix is to stop inferring completion from terminal silence and instead
+/// poll the filesystem side effect directly — the marker file is the ground
+/// truth the conformance contract already relies on. This is correct by
+/// construction on any machine speed: a generous timeout, not a fixed sleep.
+pub fn wait_for_marker(marker: &Path, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let body = std::fs::read_to_string(marker).unwrap_or_default();
+        if count_occurrences(&body, needle) >= 1 {
+            return body;
+        }
+        if Instant::now() >= deadline {
+            return body;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -461,6 +461,24 @@ fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
 /// because `curl` is missing or the network is down, which is indistinguishable
 /// from a correct block and would falsely upgrade a broken hook to `works`.
 ///
+/// ## Why an empty-policy probe environment is correct
+///
+/// [`ProbeEnv::new`] points `XDG_CONFIG_HOME` / `XDG_DATA_HOME` /
+/// `XDG_STATE_HOME` at fresh empty temp dirs — no policy file, no threat
+/// database. This is deliberate, not an oversight: tirith's detection rules
+/// (including `pipe_to_interpreter`) fire **unconditionally**, independent of
+/// any policy. A policy file only *adds* allowlist / blocklist / severity
+/// overrides on top of the rule engine — there is no "allow-all when no policy"
+/// default. So `printf 'true' | bash` is a HIGH `pipe_to_interpreter` block
+/// (`tirith check` exit 1) in a zero-policy environment, exactly as it is with
+/// a policy present. Verified empirically: `tirith check` on that command in an
+/// env with an empty `XDG_CONFIG_HOME` exits 1 / `BLOCKED`.
+///
+/// Were tirith ever to gain an allow-by-default-without-policy mode, this probe
+/// would have to seed a minimal blocking policy first — but as built, an empty
+/// probe environment is the correct, network-free way to assert "enter mode can
+/// block".
+///
 /// Returns `Ok(true)` when the command was blocked (marker absent), `Ok(false)`
 /// when it executed anyway, and `Err` when the probe could not run.
 fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {

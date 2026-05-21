@@ -657,10 +657,30 @@ echo post_scan_target
 // Enter-mode capability cache — mode-decision sharp edges (issue #111)
 //
 // The hook reads `bash-enter-capability` at startup to decide enter-vs-preexec.
-// `run_bash` here drives a non-PTY interactive bash, so a `works` verdict can
-// still be observed: the hook sets and exports `TIRITH_BASH_EFFECTIVE_MODE`
-// during sourcing — before any command runs — so reading that variable does
-// not depend on `bind -x` delivery working.
+// `run_bash` here drives a non-PTY interactive bash. A `works` verdict that
+// resolves to enter mode is observable *during sourcing* — the hook sets and
+// exports `TIRITH_BASH_EFFECTIVE_MODE` before any command runs, so reading
+// that variable does not depend on `bind -x` *delivery* working.
+//
+// It does, however, depend on `bind -x` *installing*. When the hook selects
+// enter mode it binds `\C-m` and then runs `_tirith_startup_health_check`,
+// which verifies via `bind -X` that the bind took effect; if it did not, the
+// hook degrades enter -> preexec right there during sourcing. On a modern bash
+// (>= 5) the bind installs even in this non-PTY piped-stdin shell. macOS's
+// ancient `/bin/bash` 3.2 does NOT honour `bind -x` here, so the health check
+// fails and the hook (correctly) degrades to preexec — which would make an
+// `EFFMODE=<enter>` assertion fail on bash 3.2 even though the capability cache
+// and its reader are entirely correct.
+//
+// These tests verify the cache *reader*, not whether `bind -x` installs, so
+// the ones that assert `EFFMODE=<enter>` pass `_TIRITH_TEST_SKIP_HEALTH=1` —
+// the hook's documented test-only escape hatch that bypasses the startup
+// health gate. That keeps them meaningful and green on any bash (including
+// bash 3.2 on CI) without losing coverage; actual `bind -x` delivery is the
+// PTY conformance harness's job. `bash_hook_exports.rs` uses the same override
+// for the same reason. Tests that assert the preexec *fallback* (`broken` /
+// `absent` / `stale` verdicts) need no override — preexec is observable on any
+// bash.
 //
 // These tests pin that the cache reader is robust against the bash history
 // configurations that historically perturbed the hook: HISTCONTROL,
@@ -668,6 +688,44 @@ echo post_scan_target
 // None of those affect a file read, but the cache reader uses `wc` and an
 // `IFS='='` loop, so a regression test is cheap insurance.
 // ===========================================================================
+
+/// The hook's test-only switch that bypasses `_tirith_startup_health_check`
+/// (see `_TIRITH_TEST_SKIP_HEALTH` in `bash-hook.bash`).
+///
+/// Enter mode binds `\C-m` with `bind -x` and then health-checks the bind.
+/// macOS's `/bin/bash` 3.2 does not honour `bind -x` in this non-PTY
+/// piped-stdin harness, so without this override the health check fails and
+/// the hook degrades enter -> preexec. The capability-cache tests below verify
+/// *mode resolution from the cache*, not bind-x viability, so they skip the
+/// gate; the PTY conformance harness covers real delivery.
+///
+/// CRITICAL: this MUST be delivered as a *session-local shell variable*, never
+/// as a process env var. The hook deliberately unsets any `_TIRITH_TEST_*`
+/// value it sees as *exported* (line ~24 of `bash-hook.bash`) — treating an
+/// inherited env var as attacker-controllable — and honours only a
+/// session-local one. `split_test_env` enforces that: `_TIRITH_TEST_*` entries
+/// become a shell prelude, everything else stays a real env var.
+const SKIP_HEALTH: (&str, &str) = ("_TIRITH_TEST_SKIP_HEALTH", "1");
+
+/// Split `extra_env` into a session-local shell prelude and real process env
+/// vars. `_TIRITH_TEST_*` overrides MUST be session-local: the hook
+/// deliberately unsets exported (env-inherited) `_TIRITH_TEST_*` values —
+/// treating them as attacker-controllable — and honors only session-local
+/// ones. The prelude is prepended to the sourcing line so the variable is set
+/// (un-exported) before the hook runs. Mirrors `split_test_env` in
+/// `bash_hook_exports.rs`.
+fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>) {
+    let mut prelude = String::new();
+    let mut env_vars = Vec::new();
+    for (k, v) in extra_env {
+        if k.starts_with("_TIRITH_TEST_") {
+            prelude.push_str(&format!("{k}='{v}'; "));
+        } else {
+            env_vars.push((k.to_string(), v.to_string()));
+        }
+    }
+    (prelude, env_vars)
+}
 
 /// `($BASH_VERSION, $BASH)` for the bash a bare `Command::new("bash")` runs.
 ///
@@ -725,8 +783,14 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
     }
 
     let hook = hook_path();
-    let full_script =
-        format!("source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n");
+    // `_TIRITH_TEST_*` overrides must be session-local shell variables, not
+    // exported env vars (the hook strips exported ones — see `split_test_env`).
+    // The prelude is on the *same physical line* as `source`, so the whole
+    // sourcing unit is accepted before any `bind -x` Enter override exists.
+    let (prelude, real_env) = split_test_env(env_vars);
+    let full_script = format!(
+        "{prelude}source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n"
+    );
 
     let bin_dir = state_path.join("fakebin");
     let log_path = state_path.join("tirith.log");
@@ -754,7 +818,7 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in env_vars {
+    for (k, v) in &real_env {
         cmd.env(k, v);
     }
 
@@ -777,8 +841,9 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
 #[test]
 fn capability_works_cache_selects_enter_mode() {
     // Baseline: a fresh `works` verdict for the running bash makes the hook
-    // pick enter mode.
-    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[]);
+    // pick enter mode. `SKIP_HEALTH` bypasses the startup health gate so the
+    // mode-resolution assertion holds on any bash (incl. bash 3.2 on CI).
+    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[SKIP_HEALTH]);
     assert!(
         stdout.contains("EFFMODE=<enter>"),
         "a fresh `works` capability cache must select enter mode, stdout: {stdout}"
@@ -808,8 +873,11 @@ fn capability_cache_read_survives_hostile_histcontrol() {
     // HISTCONTROL=ignorespace is the classic hostile-history config. It gates
     // preexec *enforcement*, but must not affect the capability cache read or
     // the enter-vs-preexec decision: a `works` verdict still selects enter.
-    let (stdout, _stderr) =
-        run_hook_with_capability(Some("works"), &[("HISTCONTROL", "ignorespace")]);
+    // `SKIP_HEALTH` bypasses the startup health gate (see its doc comment).
+    let (stdout, _stderr) = run_hook_with_capability(
+        Some("works"),
+        &[("HISTCONTROL", "ignorespace"), SKIP_HEALTH],
+    );
     assert!(
         stdout.contains("EFFMODE=<enter>"),
         "HISTCONTROL must not perturb the capability-cache mode decision, stdout: {stdout}"
@@ -818,7 +886,9 @@ fn capability_cache_read_survives_hostile_histcontrol() {
 
 #[test]
 fn capability_cache_read_survives_histignore() {
-    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[("HISTIGNORE", "ls:cd:pwd")]);
+    // `SKIP_HEALTH` bypasses the startup health gate (see its doc comment).
+    let (stdout, _stderr) =
+        run_hook_with_capability(Some("works"), &[("HISTIGNORE", "ls:cd:pwd"), SKIP_HEALTH]);
     assert!(
         stdout.contains("EFFMODE=<enter>"),
         "HISTIGNORE must not perturb the capability-cache mode decision, stdout: {stdout}"
@@ -829,9 +899,12 @@ fn capability_cache_read_survives_histignore() {
 fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
     // The reader uses an `IFS='='` loop and `wc`. A pre-set `IFS` in the
     // environment, or a `HISTTIMEFORMAT`, must not break parsing — the reader
-    // sets `IFS` locally per-read.
-    let (stdout, _stderr) =
-        run_hook_with_capability(Some("works"), &[("HISTTIMEFORMAT", "%F %T "), ("IFS", ":")]);
+    // sets `IFS` locally per-read. `SKIP_HEALTH` bypasses the startup health
+    // gate (see its doc comment).
+    let (stdout, _stderr) = run_hook_with_capability(
+        Some("works"),
+        &[("HISTTIMEFORMAT", "%F %T "), ("IFS", ":"), SKIP_HEALTH],
+    );
     assert!(
         stdout.contains("EFFMODE=<enter>"),
         "a pre-set IFS / HISTTIMEFORMAT must not break the cache reader, stdout: {stdout}"
@@ -843,8 +916,10 @@ fn capability_cache_decision_independent_of_preset_extdebug() {
     // `extdebug` already enabled by the user must not change the capability
     // decision: a `works` verdict still selects enter mode. (extdebug is set
     // via `shopt`, not an env var; pass it through BASHOPTS, which bash applies
-    // at startup.)
-    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[("BASHOPTS", "extdebug")]);
+    // at startup.) `SKIP_HEALTH` bypasses the startup health gate (see its doc
+    // comment).
+    let (stdout, _stderr) =
+        run_hook_with_capability(Some("works"), &[("BASHOPTS", "extdebug"), SKIP_HEALTH]);
     assert!(
         stdout.contains("EFFMODE=<enter>"),
         "a pre-enabled extdebug must not change the capability decision, stdout: {stdout}"
@@ -858,17 +933,24 @@ fn capability_cache_read_survives_set_plus_o_history() {
     // still select enter mode. A regression here would mean the reader (its
     // `wc` / `IFS='='` loop) accidentally depends on history being on.
     //
+    // `_TIRITH_TEST_SKIP_HEALTH=1` bypasses the startup health gate so this
+    // mode-resolution assertion holds on any bash (see `SKIP_HEALTH`).
+    //
     // `TempDir` (not `.keep()`) so the directory is cleaned up on return.
     let state = tempfile::tempdir().unwrap();
     let state_path = state.path();
     seed_capability_cache(state_path, "works");
 
     let hook = hook_path();
-    // Disable history first, *then* source the hook and report the mode on one
-    // line (so enter mode's `bind -x`, if selected, cannot swallow the report).
+    // Disable history first, *then* set the session-local health-skip override
+    // and source the hook + report the mode on one line (so enter mode's
+    // `bind -x`, if selected, cannot swallow the report, and so the override is
+    // an un-exported shell variable the hook will honour — see `SKIP_HEALTH`).
+    let (skip_key, skip_val) = SKIP_HEALTH;
     let full_script = format!(
         "set +o history\n\
-         source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n"
+         {skip_key}='{skip_val}'; source '{hook}'; \
+         printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n"
     );
 
     let bin_dir = state_path.join("fakebin");
