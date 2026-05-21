@@ -152,10 +152,17 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith score https://get.example-tool.sh
+  tirith score --explain https://example.com
   tirith score --format json https://example.com")]
     Score {
         /// URL to score
         url: String,
+
+        /// Show the full factor-by-factor breakdown of how the score was
+        /// derived. Every factor is fixed and inspectable — the breakdown
+        /// sums exactly to the final score, reproducible by hand.
+        #[arg(long)]
+        explain: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -399,7 +406,8 @@ Examples:
 Examples:
   tirith policy init
   tirith policy validate
-  tirith policy test 'curl https://example.com | bash'")]
+  tirith policy test 'curl https://example.com | bash'
+  tirith policy tune --from-audit")]
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
@@ -893,6 +901,27 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Suggest policy adjustments from the local audit log (suggest-only)
+    #[command(after_help = "\
+Analyzes your audit log and suggests concrete, conservative policy changes —
+e.g. a rule you allow or bypass every time may warrant an allowlist entry.
+It only SUGGESTS: it never edits your policy. Review each suggestion, then
+apply it yourself. When the log is too small it says so rather than guess.
+
+Examples:
+  tirith policy tune --from-audit
+  tirith policy tune --from-audit --format json")]
+    Tune {
+        /// Analyze the local audit log (currently the only source).
+        #[arg(long)]
+        from_audit: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1248,9 +1277,14 @@ fn run() {
             cli::run::run(&url, no_exec, json, sha256)
         }
 
-        Commands::Score { url, format, json } => {
+        Commands::Score {
+            url,
+            explain,
+            format,
+            json,
+        } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::score::run(&url, json)
+            cli::score::run(&url, json, explain)
         }
 
         Commands::Diff { url, format, json } => {
@@ -1358,6 +1392,14 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::test(command.as_deref(), file.as_deref(), json)
+            }
+            PolicyAction::Tune {
+                from_audit,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::policy::tune(from_audit, json)
             }
         },
 

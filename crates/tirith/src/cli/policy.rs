@@ -545,6 +545,117 @@ fn test_file(file_path: &str, json: bool) -> i32 {
     }
 }
 
+/// Run `tirith policy tune --from-audit`.
+///
+/// Reads the local audit log, rolls up per-rule statistics, and prints
+/// conservative, deterministic tuning suggestions. It never edits the policy —
+/// the user reviews each suggestion and applies it by hand.
+pub fn tune(from_audit: bool, json: bool) -> i32 {
+    if !from_audit {
+        eprintln!("tirith policy tune: specify a source — currently only --from-audit");
+        eprintln!("  try: tirith policy tune --from-audit");
+        return 1;
+    }
+
+    let log_path = match tirith_core::policy::data_dir() {
+        Some(d) => d.join("log.jsonl"),
+        None => {
+            eprintln!("tirith policy tune: could not determine audit log path");
+            return 1;
+        }
+    };
+
+    if !log_path.exists() {
+        eprintln!(
+            "tirith policy tune: no audit log found at {}",
+            log_path.display()
+        );
+        eprintln!("  tirith records an audit log as you use it; come back once you have history.");
+        return 1;
+    }
+
+    let result = match tirith_core::audit_aggregator::read_log(&log_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tirith policy tune: {e}");
+            return 1;
+        }
+    };
+    if result.skipped_lines > 0 {
+        eprintln!(
+            "tirith policy tune: warning: {} malformed audit log line(s) skipped",
+            result.skipped_lines
+        );
+    }
+
+    // Every rule tirith can emit — used to point out rules that never fired.
+    let known_rules: Vec<&str> = tirith_core::rule_explanations::list_all()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+
+    let report = tirith_core::audit_tune::analyze(&result.records, &known_rules);
+
+    if json {
+        if serde_json::to_writer_pretty(std::io::stdout().lock(), &report).is_err() {
+            eprintln!("tirith policy tune: failed to write JSON output");
+            return 1;
+        }
+        println!();
+    } else {
+        print_tune_human(&report);
+    }
+
+    0
+}
+
+fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
+    eprintln!(
+        "tirith policy tune: analyzed {} audit record(s)",
+        report.records_analyzed
+    );
+
+    if report.data_is_thin {
+        eprintln!(
+            "  not enough audit history to suggest anything yet (need at least {}).",
+            tirith_core::audit_tune::MIN_OBSERVATIONS
+        );
+        eprintln!("  keep using tirith and re-run this once more commands have been analyzed.");
+        return;
+    }
+
+    if report.suggestions.is_empty() {
+        eprintln!(
+            "  no policy changes suggested — your current policy looks well matched to your usage."
+        );
+        return;
+    }
+
+    eprintln!(
+        "  {} suggestion(s) — these are SUGGESTIONS only; review each, then edit your policy yourself:",
+        report.suggestions.len()
+    );
+    eprintln!();
+
+    for (i, s) in report.suggestions.iter().enumerate() {
+        let conf = match s.confidence {
+            tirith_core::audit_tune::Confidence::Strong => "strong",
+            tirith_core::audit_tune::Confidence::Moderate => "moderate",
+        };
+        eprintln!("  {}. [{}] {}", i + 1, conf, s.observation);
+        eprintln!("     {}", s.recommendation);
+        if let Some(snippet) = &s.policy_snippet {
+            eprintln!("     suggested policy snippet:");
+            for line in snippet.lines() {
+                eprintln!("       {line}");
+            }
+        }
+        eprintln!();
+    }
+
+    eprintln!("  tirith did not change your policy. Apply any suggestion by editing your .tirith/policy.yaml.");
+}
+
 #[derive(serde::Serialize)]
 struct PolicyTrace {
     policy_path: Option<String>,

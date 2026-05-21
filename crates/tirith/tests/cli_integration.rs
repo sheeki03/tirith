@@ -583,6 +583,287 @@ fn why_no_trigger() {
     );
 }
 
+// ── item 21: scoring calibration — `score --explain` and `policy tune` ──
+
+/// `score --explain` must show a factor breakdown, and the breakdown's factor
+/// contributions must sum exactly to the displayed score — reproducible by hand.
+#[test]
+fn score_explain_human_breakdown_sums_to_score() {
+    let out = tirith()
+        .args(["score", "--explain", "https://bit.ly/abc123"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("score breakdown"),
+        "score --explain should print a breakdown: {stderr}"
+    );
+    assert!(
+        stderr.contains("Highest-severity finding"),
+        "breakdown should name the base-severity factor: {stderr}"
+    );
+    assert!(
+        stderr.contains("no model, no learned weights"),
+        "breakdown must state it is deterministic, not a model: {stderr}"
+    );
+}
+
+/// The JSON `score_breakdown.factors` array must sum to `score_breakdown.score`,
+/// which must equal the top-level `score`. This is the machine-checkable form
+/// of "reproducible by hand".
+#[test]
+fn score_explain_json_factors_sum_to_score() {
+    let out = tirith()
+        .args([
+            "score",
+            "--explain",
+            "--format",
+            "json",
+            "https://bit.ly/abc123",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("score --explain --format json must be valid JSON");
+
+    let score = json["score"].as_u64().expect("score must be a number");
+    let breakdown = &json["score_breakdown"];
+    assert!(
+        breakdown.is_object(),
+        "score --explain must include score_breakdown: {json}"
+    );
+    assert_eq!(
+        breakdown["score"].as_u64(),
+        Some(score),
+        "score_breakdown.score must equal top-level score"
+    );
+
+    let factors = breakdown["factors"]
+        .as_array()
+        .expect("score_breakdown.factors must be an array");
+    assert!(!factors.is_empty(), "there must be at least one factor");
+    let sum: i64 = factors
+        .iter()
+        .map(|f| {
+            f["points"]
+                .as_i64()
+                .expect("each factor needs integer points")
+        })
+        .sum();
+    assert_eq!(
+        sum, score as i64,
+        "factor points must sum exactly to the score (reproducible by hand)"
+    );
+}
+
+/// A multi-finding URL exercises the additional-findings factor: there must be
+/// a separate `additional_findings` factor with positive points, and the
+/// factors must still sum to the score.
+#[test]
+fn score_explain_multi_finding_has_additional_findings_factor() {
+    // A homograph "github" (Cyrillic U+0456 for the 'i') trips several
+    // independent hostname rules at once. The escape keeps the test source
+    // ASCII; the codepoint expands to the real Cyrillic character.
+    let homograph_url = "https://g\u{0456}thub.com/install.sh";
+    let out = tirith()
+        .args(["score", "--explain", "--format", "json", homograph_url])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert!(
+        findings.len() >= 2,
+        "homograph URL should produce multiple findings, got: {json}"
+    );
+    let factors = json["score_breakdown"]["factors"].as_array().unwrap();
+    let additional = factors
+        .iter()
+        .find(|f| f["id"] == "additional_findings")
+        .expect("additional_findings factor must exist");
+    assert!(
+        additional["points"].as_i64().unwrap() > 0,
+        "multi-finding URL must contribute additional-findings points: {json}"
+    );
+    // The reproducible-by-hand invariant must hold for multi-finding scores too.
+    let score = json["score"].as_i64().unwrap();
+    let sum: i64 = factors.iter().map(|f| f["points"].as_i64().unwrap()).sum();
+    assert_eq!(
+        sum, score,
+        "factors must sum to score for a multi-finding URL"
+    );
+}
+
+/// Without `--explain`, the JSON output must NOT carry `score_breakdown` — the
+/// breakdown is opt-in and the base output stays backward-compatible.
+#[test]
+fn score_without_explain_omits_breakdown() {
+    let out = tirith()
+        .args(["score", "--format", "json", "https://bit.ly/abc123"])
+        .output()
+        .expect("failed to run tirith");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json.get("score_breakdown").is_none(),
+        "score_breakdown must be absent without --explain"
+    );
+    // The pre-existing fields must still be there.
+    assert!(json["url"].is_string());
+    assert!(json["score"].is_number());
+    assert!(json["risk_level"].is_string());
+    assert!(json["findings"].is_array());
+}
+
+/// `policy tune` without `--from-audit` must error and point at the right flag.
+#[test]
+fn policy_tune_requires_from_audit() {
+    let out = tirith()
+        .args(["policy", "tune"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--from-audit"),
+        "policy tune should point at --from-audit: {stderr}"
+    );
+}
+
+/// `policy tune --from-audit` on an empty data dir (no audit log) must exit
+/// non-zero and say so plainly — never crash, never invent suggestions.
+#[test]
+fn policy_tune_no_audit_log_is_handled() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .args(["policy", "tune", "--from-audit"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no audit log"),
+        "should report the missing audit log: {stderr}"
+    );
+}
+
+/// A synthesized audit log where one rule is always allowed (never blocked)
+/// must yield a `frequently_bypassed` suggestion — and `policy tune` must NOT
+/// modify the policy. Suggest-only is the hard contract.
+#[test]
+fn policy_tune_suggests_for_always_allowed_rule_without_writing_policy() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // 25 verdict records, shortened_url always Allow.
+    let mut log = String::new();
+    for i in 0..25 {
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:{:02}:00Z","session_id":"s1","action":"Allow","rule_ids":["shortened_url"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#,
+            i % 60
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["data_is_thin"], false);
+    let suggestions = json["suggestions"].as_array().unwrap();
+    let s = suggestions
+        .iter()
+        .find(|s| s["rule_id"] == "shortened_url")
+        .expect("expected a suggestion for the always-allowed rule");
+    assert_eq!(s["kind"], "frequently_bypassed");
+    assert_eq!(s["confidence"], "strong");
+
+    // The hard contract: tune must not have written or mutated any policy file.
+    assert!(
+        !data_dir.path().join(".tirith").exists(),
+        "policy tune must not create a policy directory"
+    );
+}
+
+/// A rule that is sometimes blocked must NEVER be suggested for a downgrade —
+/// the rule is doing its job. End-to-end check of the conservative behavior.
+#[test]
+fn policy_tune_does_not_suggest_downgrade_for_blocked_rule() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // 25 records: curl_pipe_shell — 20 Allow, 5 Block. Sometimes blocked.
+    let mut log = String::new();
+    for i in 0..25 {
+        let action = if i < 20 { "Allow" } else { "Block" };
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:{:02}:00Z","session_id":"s1","action":"{action}","rule_ids":["curl_pipe_shell"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#,
+            i % 60
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let suggestions = json["suggestions"].as_array().unwrap();
+    assert!(
+        suggestions
+            .iter()
+            .all(|s| s["rule_id"] != "curl_pipe_shell"),
+        "a sometimes-blocked rule must never be suggested for a downgrade: {json}"
+    );
+}
+
+/// A too-small audit log must report `data_is_thin` and make no suggestions —
+/// honest about insufficient data rather than guessing.
+#[test]
+fn policy_tune_thin_data_makes_no_suggestions() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // Only 5 records — well below the minimum-observations threshold.
+    let mut log = String::new();
+    for i in 0..5 {
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:0{i}:00Z","session_id":"s1","action":"Allow","rule_ids":["shortened_url"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["data_is_thin"], true);
+    assert!(
+        json["suggestions"].as_array().unwrap().is_empty(),
+        "thin data must yield no suggestions: {json}"
+    );
+}
+
 #[test]
 fn check_last_trigger_redacts_assignment_values_in_findings() {
     let dir = tempfile::tempdir().expect("tempdir");

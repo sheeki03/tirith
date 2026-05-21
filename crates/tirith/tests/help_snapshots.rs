@@ -42,6 +42,8 @@ help_example_tests! {
     #[cfg(unix)]
     help_run        => (["run", "--help"], "tirith run");
     help_score      => (["score", "--help"], "tirith score");
+    help_score_explain => (["score", "--help"], "tirith score --explain");
+    help_policy_tune => (["policy", "tune", "--help"], "tirith policy tune --from-audit");
     help_diff       => (["diff", "--help"], "tirith diff");
     help_explain    => (["explain", "--help"], "tirith explain --rule");
     help_why        => (["why", "--help"], "tirith why");

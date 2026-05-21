@@ -26,6 +26,25 @@ tirith policy init --template ai-agent-heavy  # heavy AI-agent environments
 `tirith policy init` with no `--template` writes the full default policy.
 The recipes below show hand-tuned variations on these baselines.
 
+## 0b. Tune From Your Audit Log
+
+Once tirith has some history, `tirith policy tune --from-audit` reads your
+audit log and *suggests* conservative policy adjustments:
+
+```bash
+tirith policy tune --from-audit
+tirith policy tune --from-audit --format json   # machine-readable
+```
+
+It is **suggest-only** — it never edits your policy. The headline suggestion
+is a rule you allowed or bypassed *every* time and *never* blocked: that rule
+is probably firing on something you trust, so an `allowlist` entry or a
+`severity_overrides` downgrade may be warranted. A rule you *sometimes* block
+on is never suggested for a downgrade — it is doing its job. Every suggestion
+is a plain count from the log, not an inference; when the log is too small to
+be meaningful, `policy tune` says so rather than guessing. Review each
+suggestion, then apply it by hand to `.tirith/policy.yaml`.
+
 ## 1. Strict Organization (Fail Closed, No Bypass)
 
 ```yaml

@@ -592,8 +592,9 @@ tirith daemon stop
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
+| `tirith policy tune --from-audit` | Suggest conservative policy adjustments from your audit log (suggest-only — never edits the policy) |
 | `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
-| `tirith score <url>` | Break down a URL's trust signals |
+| `tirith score <url>` | Break down a URL's trust signals (`--explain` shows the deterministic factor-by-factor score derivation) |
 | `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
 | `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) |
 | `tirith why` | Explain the last rule that triggered |
