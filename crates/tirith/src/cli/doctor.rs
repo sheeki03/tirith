@@ -198,16 +198,17 @@ fn policy_missing() -> bool {
 }
 
 /// Build the de-duplicated list of policy paths `doctor` should display. The
-/// first entry (if any) is the policy the engine would actually load; the rest
-/// are present-but-shadowed policy files (user config dir, TIRITH_POLICY_ROOT).
+/// first entry (if any) is the policy the engine would actually load. A second
+/// entry can appear only for a present-but-shadowed user-config-dir policy — a
+/// `TIRITH_POLICY_ROOT` policy, when present, has top resolution priority, so it
+/// is always the active first entry and never a shadowed one.
 fn collect_policy_paths(cwd: Option<&str>) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
 
+    // The active policy is the first entry; `paths` is empty here, so the dedup
+    // guard the later push sites use is not needed.
     if let Some(active) = tirith_core::policy::discover_local_policy_path(cwd) {
-        let s = active.display().to_string();
-        if !paths.contains(&s) {
-            paths.push(s);
-        }
+        paths.push(active.display().to_string());
     }
     if let Some(config) = tirith_core::policy::config_dir() {
         for ext in &["policy.yaml", "policy.yml"] {
