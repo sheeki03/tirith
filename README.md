@@ -535,6 +535,7 @@ tirith daemon stop
 | `tirith why` | Explain the last rule that triggered |
 | `tirith doctor` | Diagnose installation, hooks, and policy |
 | `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
+| `tirith doctor --compat` | Shell/terminal compatibility report (detected shell, bash mode, install checks, co-installed hook-interacting tools) |
 | `tirith daemon start` | Start background daemon for faster checks (Unix) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
@@ -553,13 +554,17 @@ tirith daemon stop
   network calls; all of their analysis is local. `tirith check` (including the
   `--approval-check` path that shell hooks use) also analyzes locally, but
   before analysis it triggers a *periodic background threat-DB refresh check*
-  (see below) — so `check` is not strictly offline.
+  (see below) — so `check` is not strictly offline. Pass `tirith check
+  --offline` (or set `TIRITH_OFFLINE=1`) to suppress that refresh and keep
+  `check` fully local.
 - **Periodic background threat-DB refresh** — `tirith check` and the shell hooks
   trigger a cheap background check, at most once every 24 hours by default
   (`threat_intel.auto_update_hours`), to keep the signed threat database fresh.
   The check is detached and does not block the command; set
-  `auto_update_hours: 0` in policy to disable it entirely. `tirith paste` does
-  **not** trigger this — it goes straight through the local engine.
+  `auto_update_hours: 0` in policy to disable it entirely, or pass
+  `tirith check --offline` / set `TIRITH_OFFLINE=1` to suppress it per
+  invocation. `tirith paste` does **not** trigger this — it goes straight
+  through the local engine.
 - **No command rewriting** — tirith never modifies what you typed.
 - **No telemetry** — no analytics, no crash reporting, no phone-home behavior.
 - **No long-lived background processes by default** — tirith is invoked

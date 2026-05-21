@@ -4,6 +4,14 @@
 
 Run `tirith doctor` to see the hook directory being used and whether hooks were materialized from the embedded binary.
 
+For a focused, single-screen compatibility view — detected shell, requested-vs-effective bash mode, install checks (PATH shadowing, profile wiring, materialized-hook staleness, policy discovery, threat-DB status), and any co-installed shell tools that interact with hooks (Atuin, Starship, fzf, zoxide, direnv, mise, asdf) — run:
+
+```
+tirith doctor --compat
+```
+
+Add `--format json` for a machine-readable report. `--compat` is a static report; to (re)measure bash enter-mode delivery use `tirith doctor --simulate-enter`.
+
 If hooks are not found:
 1. Ensure `tirith` is in your PATH
 2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)

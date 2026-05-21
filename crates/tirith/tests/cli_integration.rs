@@ -1974,6 +1974,119 @@ fn warn_only_json_output_matches_plain_when_timings_stripped() {
     );
 }
 
+// --- `--offline` / `TIRITH_OFFLINE` (roadmap M0.3) -------------------------
+//
+// The offline switch suppresses the periodic background threat-DB refresh
+// that `tirith check` triggers on the hot path. The observable proof that no
+// network attempt was made is the absence of the `threatdb-spawned-at`
+// breadcrumb file — `tirith check` writes it into the state dir immediately
+// before launching the background update child, so no breadcrumb means no
+// child and no network.
+
+/// Run `tirith check` against a clean command with an isolated state dir, and
+/// return whether the background-update `spawned-at` breadcrumb was written.
+#[cfg(unix)]
+fn check_left_background_breadcrumb(
+    extra_env: &[(&str, &str)],
+    extra_args: &[&str],
+) -> (bool, i32) {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let mut args: Vec<&str> = vec!["check", "--shell", "posix"];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&["--", "ls -la"]);
+
+    let mut cmd = tirith();
+    cmd.args(&args)
+        .env("XDG_STATE_HOME", state.path())
+        // A fresh state dir has no next-check-at file, so the online path is
+        // "due" and would write the breadcrumb. Empty HOME-derived dirs are
+        // fine; only the breadcrumb presence matters.
+        .env_remove("TIRITH_OFFLINE");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run tirith check");
+    let breadcrumb = state.path().join("tirith").join("threatdb-spawned-at");
+    (breadcrumb.exists(), out.status.code().unwrap_or(-1))
+}
+
+/// `tirith check --offline` must not trigger the background threat-DB refresh:
+/// no `spawned-at` breadcrumb, and the local verdict is still correct.
+#[cfg(unix)]
+#[test]
+fn check_offline_flag_suppresses_background_update() {
+    let (breadcrumb, code) = check_left_background_breadcrumb(&[], &["--offline"]);
+    assert!(
+        !breadcrumb,
+        "--offline must suppress the background threat-DB refresh (no breadcrumb)"
+    );
+    assert_eq!(
+        code, 0,
+        "offline check of a clean command must still produce a local Allow verdict"
+    );
+}
+
+/// `TIRITH_OFFLINE=1` must have the same effect as `--offline` — this is the
+/// path the shell hooks and the PTY conformance harness use.
+#[cfg(unix)]
+#[test]
+fn check_offline_env_suppresses_background_update() {
+    let (breadcrumb, code) = check_left_background_breadcrumb(&[("TIRITH_OFFLINE", "1")], &[]);
+    assert!(
+        !breadcrumb,
+        "TIRITH_OFFLINE=1 must suppress the background threat-DB refresh (no breadcrumb)"
+    );
+    assert_eq!(code, 0, "offline check must still produce a local verdict");
+}
+
+/// A falsey `TIRITH_OFFLINE` value must NOT activate offline mode — the env
+/// var is opt-in and only truthy values count.
+#[cfg(unix)]
+#[test]
+fn check_offline_env_falsey_does_not_suppress() {
+    // `TIRITH_OFFLINE=0` is explicitly not offline. We assert the verdict is
+    // unaffected; we deliberately do not assert breadcrumb presence here,
+    // since whether the online path is "due" depends on global dedup state.
+    let (_breadcrumb, code) = check_left_background_breadcrumb(&[("TIRITH_OFFLINE", "0")], &[]);
+    assert_eq!(
+        code, 0,
+        "TIRITH_OFFLINE=0 is not offline; a clean command still exits 0"
+    );
+}
+
+/// `--approval-check` is the hook-driven path; `--offline` must compose with
+/// it so shell hooks can run fully local. The approval temp-file path is
+/// still printed on stdout and the breadcrumb is still suppressed.
+#[cfg(unix)]
+#[test]
+fn check_offline_composes_with_approval_check() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--offline",
+            "--approval-check",
+            "--",
+            "ls -la",
+        ])
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("TIRITH_OFFLINE")
+        .output()
+        .expect("failed to run tirith check");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offline approval-check of a clean command should exit 0"
+    );
+    let breadcrumb = state.path().join("tirith").join("threatdb-spawned-at");
+    assert!(
+        !breadcrumb.exists(),
+        "--offline must suppress the background refresh even on the approval-check path"
+    );
+}
+
 /// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
 /// policy and report its error, rather than collapsing to "no policy file found"
 /// the way the old parse-aware discovery (`Policy::discover().path`) did.

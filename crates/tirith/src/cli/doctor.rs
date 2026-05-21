@@ -7,6 +7,7 @@ pub fn run(
     fix: bool,
     yes: bool,
     simulate_enter: bool,
+    compat: bool,
 ) -> i32 {
     if reset_bash_safe_mode {
         return reset_safe_mode();
@@ -18,6 +19,10 @@ pub fn run(
 
     if fix {
         return run_fix(yes);
+    }
+
+    if compat {
+        return run_compat(json);
     }
 
     // A plain `tirith doctor` refreshes the bash enter-mode capability cache as
@@ -841,6 +846,342 @@ fn gather_threat_db_info() -> Option<ThreatDbDoctorInfo> {
     }
 }
 
+// --- Compatibility report (`tirith doctor --compat`) -----------------------
+//
+// A focused, static shell/terminal compatibility view. It reuses the existing
+// `gather_info()` machinery rather than re-deriving install state, and adds
+// best-effort detection of co-installed shell tools that historically interact
+// with shell hooks. It introspects NOTHING about the parent shell's live
+// state — a child process cannot — it only consumes what the hook exports.
+
+/// One co-installed shell tool that historically interacts with shell hooks.
+/// `on_path` and `in_profile` are independent best-effort signals; presence is
+/// reported honestly without claiming a definite conflict.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ShellToolPresence {
+    name: &'static str,
+    /// The tool's binary was found on `PATH`.
+    on_path: bool,
+    /// The tool's name appeared in the detected shell's profile file(s).
+    in_profile: bool,
+    /// Why this tool can interact with shell hooks (advisory, not a verdict).
+    note: &'static str,
+}
+
+/// Shell tools known to install their own preexec/precmd/keymap integrations,
+/// which can interleave with tirith's hook. `(binary, note)`.
+const KNOWN_SHELL_TOOLS: &[(&str, &str)] = &[
+    (
+        "atuin",
+        "rebinds Enter / Up and installs preexec hooks (history)",
+    ),
+    ("starship", "installs precmd/preexec prompt hooks"),
+    ("fzf", "installs key bindings and a completion widget"),
+    ("zoxide", "installs a chpwd/precmd hook (directory jumping)"),
+    ("direnv", "installs a precmd/chpwd hook (per-dir env)"),
+    ("mise", "installs a precmd/chpwd hook (runtime/env manager)"),
+    (
+        "asdf",
+        "sources shims and shell functions (version manager)",
+    ),
+];
+
+/// True when `binary` resolves on `PATH` via the shell's own lookup.
+fn tool_on_path(binary: &str) -> bool {
+    let lookup = {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
+                .status()
+        }
+        #[cfg(not(unix))]
+        {
+            std::process::Command::new("where.exe")
+                .arg(binary)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        }
+    };
+    lookup.map(|s| s.success()).unwrap_or(false)
+}
+
+/// True when `tool` is mentioned in any existing profile file for `shell`.
+/// Best-effort: a missing or unreadable profile simply yields `false`.
+fn tool_in_profile(tool: &str, profile: Option<&std::path::Path>) -> bool {
+    let profile = match profile {
+        Some(p) => p,
+        None => return false,
+    };
+    match std::fs::read_to_string(profile) {
+        Ok(contents) => contents.contains(tool),
+        Err(_) => false,
+    }
+}
+
+/// Detect co-installed shell tools that interact with hooks. Only tools with
+/// at least one positive signal (on PATH or in the profile) are returned.
+fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellToolPresence> {
+    KNOWN_SHELL_TOOLS
+        .iter()
+        .filter_map(|(name, note)| {
+            let on_path = tool_on_path(name);
+            let in_profile = tool_in_profile(name, profile);
+            if on_path || in_profile {
+                Some(ShellToolPresence {
+                    name,
+                    on_path,
+                    in_profile,
+                    note,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Machine-readable compatibility report for `tirith doctor --compat --format json`.
+#[derive(serde::Serialize)]
+struct CompatReport {
+    version: String,
+    binary_path: String,
+    detected_shell: String,
+    interactive: bool,
+    /// Requested bash mode (`TIRITH_BASH_MODE`); absent = default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_requested_mode: Option<String>,
+    /// Effective bash mode exported by the hook; absent = hook not sourced here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_mode: Option<String>,
+    /// Effective protection exported by the hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_protection: Option<String>,
+    /// Cached bash enter-mode delivery capability verdict (issue #111).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability: Option<String>,
+    /// Whether the cached enter-capability verdict is for the running bash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_fresh: Option<bool>,
+    bash_safe_mode: bool,
+    hook_dir: Option<String>,
+    hooks_materialized: bool,
+    /// Materialized hook assets exist but are a stale version.
+    hooks_stale: bool,
+    shell_profile: Option<String>,
+    hook_configured: bool,
+    /// Other `tirith` binaries on PATH that may shadow this one.
+    shadow_binaries: Vec<String>,
+    policy_paths: Vec<String>,
+    /// Threat-DB status (reused verbatim from the standard doctor report).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threat_db: Option<ThreatDbDoctorInfo>,
+    /// Co-installed shell tools that historically interact with hooks.
+    shell_tools: Vec<ShellToolPresence>,
+}
+
+/// Build the compat report from the shared `gather_info()` state plus
+/// shell-tool conflict detection.
+fn gather_compat() -> CompatReport {
+    let info = gather_info();
+    let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
+    let shell_tools = detect_shell_tool_conflicts(profile.as_deref());
+
+    CompatReport {
+        version: info.version,
+        binary_path: info.binary_path,
+        detected_shell: info.detected_shell,
+        interactive: info.interactive,
+        bash_requested_mode: info.bash_requested_mode,
+        bash_effective_mode: info.bash_effective_mode,
+        bash_effective_protection: info.bash_effective_protection,
+        bash_enter_capability: info.bash_enter_capability,
+        bash_enter_capability_fresh: info.bash_enter_capability_fresh,
+        bash_safe_mode: info.bash_safe_mode,
+        hook_dir: info.hook_dir,
+        hooks_materialized: info.hooks_materialized,
+        hooks_stale: hooks_stale(),
+        shell_profile: info.shell_profile,
+        hook_configured: info.hook_configured,
+        shadow_binaries: info.shadow_binaries,
+        policy_paths: info.policy_paths,
+        threat_db: info.threat_db,
+        shell_tools,
+    }
+}
+
+/// `tirith doctor --compat`: print a focused shell/terminal compatibility
+/// report. Human-readable by default; `--format json` emits `CompatReport`.
+fn run_compat(json: bool) -> i32 {
+    let report = gather_compat();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("tirith: JSON serialization failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        print_compat_human(&report);
+    }
+    0
+}
+
+fn print_compat_human(r: &CompatReport) {
+    println!("tirith compatibility report");
+    println!();
+    println!("tirith {}", r.version);
+    println!("  binary:        {}", r.binary_path);
+    println!("  shell:         {}", r.detected_shell);
+    println!("  interactive:   {}", r.interactive);
+    println!();
+
+    // Shell mode / protection. Bash is the only shell with a requested-vs-
+    // effective split today; for other shells we just report what (if
+    // anything) the hook exported into this process.
+    println!("Shell hook mode");
+    if r.detected_shell == "bash"
+        || r.bash_requested_mode.is_some()
+        || r.bash_effective_mode.is_some()
+    {
+        let requested = r.bash_requested_mode.as_deref().unwrap_or("(default)");
+        println!("  requested bash mode:  {requested}");
+        match (
+            r.bash_effective_mode.as_deref(),
+            r.bash_effective_protection.as_deref(),
+        ) {
+            (Some(mode), Some(protection)) => {
+                println!("  effective bash mode:  {mode}");
+                println!("  effective protection: {protection}");
+            }
+            _ => {
+                println!("  effective bash mode:  hook not loaded in this process");
+            }
+        }
+        match r.bash_enter_capability.as_deref() {
+            Some(verdict) => {
+                let fresh = r.bash_enter_capability_fresh.unwrap_or(false);
+                if fresh {
+                    println!("  enter capability:     {verdict} (self-test verdict)");
+                } else {
+                    println!(
+                        "  enter capability:     {verdict} (STALE — measured on a different bash)"
+                    );
+                }
+            }
+            None => {
+                println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
+        }
+        println!(
+            "  bash safe mode:       {}",
+            if r.bash_safe_mode { "on" } else { "off" }
+        );
+    } else {
+        println!(
+            "  (no bash-specific mode state — detected shell is {})",
+            r.detected_shell
+        );
+    }
+    println!();
+
+    // Install checks.
+    println!("Install checks");
+    let shadow_status = if r.shadow_binaries.is_empty() {
+        "no shadowing tirith binaries on PATH".to_string()
+    } else {
+        format!(
+            "{} shadowing binary/binaries on PATH",
+            r.shadow_binaries.len()
+        )
+    };
+    println!("  PATH shadowing:       {shadow_status}");
+    for shadow in &r.shadow_binaries {
+        println!("    - {shadow}");
+    }
+    println!(
+        "  shell profile:        {}",
+        r.shell_profile.as_deref().unwrap_or("not found")
+    );
+    println!(
+        "  profile wiring:       {}",
+        if r.hook_configured {
+            "tirith hook configured"
+        } else {
+            "NOT configured — commands are not intercepted"
+        }
+    );
+    println!(
+        "  hook dir:             {}",
+        r.hook_dir.as_deref().unwrap_or("not found")
+    );
+    let hook_freshness = if !r.hooks_materialized {
+        "system/packaged hooks (not materialized)"
+    } else if r.hooks_stale {
+        "STALE — re-run tirith init (or tirith doctor --fix)"
+    } else {
+        "materialized, up to date"
+    };
+    println!("  materialized hooks:   {hook_freshness}");
+    if r.policy_paths.is_empty() {
+        println!("  policy discovery:     no policy found (built-in defaults apply)");
+    } else {
+        for (i, p) in r.policy_paths.iter().enumerate() {
+            if i == 0 {
+                println!("  policy discovery:     {p}");
+            } else {
+                println!("                        {p}");
+            }
+        }
+    }
+    match &r.threat_db {
+        Some(tdb) if !tdb.installed => {
+            println!("  threat DB:            not installed");
+        }
+        Some(tdb) if tdb.error.is_some() => {
+            println!(
+                "  threat DB:            error: {}",
+                tdb.error.as_deref().unwrap_or("unknown")
+            );
+        }
+        Some(tdb) if tdb.signature_valid == Some(false) => {
+            println!("  threat DB:            invalid signature");
+        }
+        Some(tdb) if tdb.stale => {
+            println!("  threat DB:            installed but stale");
+        }
+        Some(_) => {
+            println!("  threat DB:            installed, current");
+        }
+        None => {
+            println!("  threat DB:            not available");
+        }
+    }
+    println!();
+
+    // Conflict detection — honest about being best-effort.
+    println!("Shell tool detection");
+    if r.shell_tools.is_empty() {
+        println!("  no known hook-interacting shell tools detected");
+    } else {
+        println!("  detected co-installed shell tools that interact with shell hooks.");
+        println!("  presence does not necessarily mean a conflict — tirith's hooks are");
+        println!("  designed to coexist. Listed for awareness:");
+        for tool in &r.shell_tools {
+            let signals = match (tool.on_path, tool.in_profile) {
+                (true, true) => "on PATH, in shell profile",
+                (true, false) => "on PATH",
+                (false, true) => "in shell profile",
+                (false, false) => "detected",
+            };
+            println!("    - {} ({})", tool.name, signals);
+            println!("        {}", tool.note);
+        }
+    }
+}
+
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
     println!("  binary:       {}", info.binary_path);
@@ -1650,5 +1991,76 @@ mod tests {
         assert!(!safe_mode_overridden_by_env(true, Some("preexec"))); // not enter
         assert!(!safe_mode_overridden_by_env(true, None)); // env unset
         assert!(!safe_mode_overridden_by_env(true, Some("Enter"))); // case-sensitive
+    }
+
+    // --- compat report: shell-tool conflict detection ----------------------
+
+    #[test]
+    fn tool_in_profile_detects_mention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join(".zshrc");
+        std::fs::write(
+            &profile,
+            "eval \"$(tirith init --shell zsh)\"\neval \"$(starship init zsh)\"\n",
+        )
+        .unwrap();
+        assert!(
+            tool_in_profile("starship", Some(&profile)),
+            "starship init line must be detected in the profile"
+        );
+        assert!(
+            !tool_in_profile("atuin", Some(&profile)),
+            "atuin is absent from the profile and must not be detected"
+        );
+    }
+
+    #[test]
+    fn tool_in_profile_handles_missing_profile() {
+        // No profile path, and a non-existent path, both yield false rather
+        // than erroring — detection is best-effort.
+        assert!(!tool_in_profile("starship", None));
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(!tool_in_profile("starship", Some(&missing)));
+    }
+
+    #[test]
+    fn detect_shell_tool_conflicts_reports_only_profile_hits_when_offline_of_path() {
+        // A tool mentioned only in the profile (not on PATH) must still be
+        // surfaced, with `in_profile` true and `on_path` reflecting reality.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        std::fs::write(&profile, "eval \"$(zoxide init bash)\"\n").unwrap();
+
+        let found = detect_shell_tool_conflicts(Some(&profile));
+        let zoxide = found.iter().find(|t| t.name == "zoxide");
+        assert!(
+            zoxide.is_some(),
+            "zoxide mentioned in profile must be reported, got: {found:?}"
+        );
+        assert!(
+            zoxide.unwrap().in_profile,
+            "zoxide must be flagged as present in the profile"
+        );
+        // A tool that is neither on PATH nor in the profile must be absent.
+        assert!(
+            !found.iter().any(|t| t.name == "direnv" && !t.on_path),
+            "direnv with no signal at all must not appear"
+        );
+    }
+
+    #[test]
+    fn known_shell_tools_covers_the_documented_set() {
+        // The compat report promises detection of these specific tools; guard
+        // against an accidental removal from the table.
+        let names: Vec<&str> = KNOWN_SHELL_TOOLS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "atuin", "starship", "fzf", "zoxide", "direnv", "mise", "asdf",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} must be in the known shell-tool table"
+            );
+        }
     }
 }

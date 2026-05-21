@@ -168,5 +168,8 @@ an already-enabled `extdebug`) is covered by the `capability_*` tests in
   gap.
 - **Offline isolation.** The bash enter-mode hook shells out to `tirith
   check`, which may attempt a background threat-DB refresh. The conformance
-  tests do not assert on network behaviour, but a dedicated `--offline`
-  switch (roadmap M0.3) would let the harness pin this deterministically.
+  tests do not currently assert on network behaviour. The `--offline` switch
+  (and the `TIRITH_OFFLINE` environment variable) now exists: setting
+  `TIRITH_OFFLINE=1` in a harness session makes that background refresh a
+  guaranteed no-op, so a future conformance test can pin network behaviour
+  deterministically.

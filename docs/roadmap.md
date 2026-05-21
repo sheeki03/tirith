@@ -46,14 +46,19 @@ discovery consistency.
 - **Doctor compatibility diagnostics** — surfacing shell/terminal compatibility
   state more clearly in `tirith doctor`. `tirith doctor --simulate-enter`
   ships: it runs the bash enter-mode delivery self-test on demand and reports
-  the verdict.
+  the verdict. `tirith doctor --compat` ships: a dedicated, static
+  shell/terminal compatibility report (human + `--format json`) covering the
+  detected shell, requested-vs-effective bash mode, install checks, and
+  best-effort detection of co-installed hook-interacting shell tools.
+- **Offline mode for the hot path** — `tirith check --offline` and the
+  `TIRITH_OFFLINE` environment variable ship: an opt-in switch that suppresses
+  the periodic background threat-DB refresh so `check` runs purely locally.
+  This is a mechanism only; the online default is unchanged.
 
 ## Next
 
 Planned, not yet started.
 
-- **`tirith doctor --compat`** — a dedicated compatibility report covering the
-  current shell, terminal, and prompt/history tooling.
 - **Capability-based compatibility matrix** — classify each shell/terminal
   combination by the capabilities tirith actually needs, rather than by name.
   The bash enter-mode capability cache (issue #111) is the first instance.
