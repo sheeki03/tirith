@@ -156,6 +156,55 @@ Nothing. Zero output. You forget tirith is running.
 
 ---
 
+## What tirith does NOT protect against
+
+Tirith analyzes the **structure** of commands, pasted text, and files *before*
+they execute. It is a pre-execution gate, not a runtime defense. By design, it
+does not cover:
+
+- **Runtime sandboxing** — tirith does not sandbox or contain a command once it
+  runs. It decides whether to warn or block; it does not isolate execution.
+- **Post-execution network monitoring** — tirith does not inspect network
+  traffic after a command runs. What a process does on the network once
+  launched is out of scope.
+- **Malware / payload detection** — tirith analyzes command and file
+  *structure*, not payload behavior. It is not an antivirus and does not
+  detonate or signature-match payloads. (`tirith run` analyzes a downloaded
+  script's structure before execution, but it is still not malware analysis.)
+- **A privileged root/admin attacker** — a user who is already root or admin can
+  bypass tirith trivially. Tirith defends against tricked input, not against an
+  attacker who already owns the machine.
+- **Anti-debugging / anti-tampering** — tirith does not resist analysis or
+  reverse engineering, and does not protect its own binary from a local
+  attacker.
+
+See [docs/threat-model.md](docs/threat-model.md) for the full threat model and
+explicit non-goals.
+
+---
+
+## Known limitations
+
+- **Shell-hook fragility** — tirith protection depends on a shell hook staying
+  correctly installed and active. Hooks can break or silently degrade across
+  shells (zsh, bash, fish, PowerShell), shell versions, prompt frameworks, and
+  history tools. Run `tirith doctor` to check live hook state, and watch for
+  warn-only degradation messages.
+- **Unix-only features** — daemon mode and `tirith setup` are Unix-only today.
+  `tirith run` and `tirith fetch` are likewise Unix-only.
+- **Package-name extraction scope** — package-name matching against the threat
+  database covers language ecosystems (pip, npm/yarn/pnpm/bun, cargo, gem, go,
+  composer, dotnet, mvn/gradle). It does **not** cover distro-level package
+  managers (`apt`, `dnf`, `yum`, `pacman`).
+- **AI-agent integration caveats** — shell-hook interception only guards
+  commands that actually go through a hooked interactive shell; an agent that
+  spawns a non-interactive shell, calls `exec` directly, or runs in an
+  environment where the hook is not loaded is not covered. MCP-based protection
+  requires the agent to actually call the tirith MCP tools — it is advisory, not
+  enforced.
+
+---
+
 ## Threat intelligence
 
 Tirith ships a signed local threat database for package, hostname, and IP reputation. When a shell hook or `tirith check` sees a package install or suspicious infrastructure reference, it matches that input against the database before the command executes, instead of relying only on static heuristics.
@@ -500,11 +549,29 @@ tirith daemon stop
 
 ## Design principles
 
-- **Offline by default** — `check`, `paste`, `score`, `diff`, and `why` make zero network calls. All detection runs locally.
-- **No command rewriting** — tirith never modifies what you typed
-- **No telemetry** — no analytics, no crash reporting, no phone-home behavior
-- **No background processes by default** — invoked per-command, exits immediately. Optional `tirith daemon start` keeps patterns warm for faster checks.
-- **Network only when you ask or configure it** — `run`, `fetch`, and `audit report --upload` reach the network on explicit invocation. Daemon mode adds network-aware URL resolution. Optional webhook and policy-server integrations can also make outbound requests when configured. Core detection itself does not phone home.
+- **Detection runs locally** — `paste`, `score`, `diff`, and `why` make zero
+  network calls; all of their analysis is local. `tirith check` (including the
+  `--approval-check` path that shell hooks use) also analyzes locally, but
+  before analysis it triggers a *periodic background threat-DB refresh check*
+  (see below) — so `check` is not strictly offline.
+- **Periodic background threat-DB refresh** — `tirith check` and the shell hooks
+  trigger a cheap background check, at most once every 24 hours by default
+  (`threat_intel.auto_update_hours`), to keep the signed threat database fresh.
+  The check is detached and does not block the command; set
+  `auto_update_hours: 0` in policy to disable it entirely. `tirith paste` does
+  **not** trigger this — it goes straight through the local engine.
+- **No command rewriting** — tirith never modifies what you typed.
+- **No telemetry** — no analytics, no crash reporting, no phone-home behavior.
+- **No long-lived background processes by default** — tirith is invoked
+  per-command and exits immediately. The threat-DB refresh above is a
+  short-lived detached update, not a resident process. Optional `tirith daemon
+  start` is the only resident process, and it is opt-in.
+- **Network only when you ask, configure it, or for the threat-DB refresh** —
+  `run`, `fetch`, and `audit report --upload` reach the network on explicit
+  invocation. The periodic threat-DB refresh check reaches the network on the
+  schedule above. Daemon mode adds network-aware URL resolution. Optional
+  webhook and policy-server integrations can also make outbound requests when
+  configured. Core detection itself does not phone home.
 
 ---
 
