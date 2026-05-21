@@ -1,34 +1,79 @@
 # Compatibility and Stability
 
-## Stable Subcommands
+## Stability Tiers
 
-The following subcommands are considered stable. Their flags, exit codes, and output format will not change in a backwards-incompatible way within a major version:
+Tirith subcommands fall into two stability tiers:
 
-- `check` — analyze a command before execution
-- `paste` — analyze pasted content
-- `score` — risk score a URL
-- `diff` — compare URL against known-good
-- `why` — explain last triggered rule
-- `receipt` — manage execution receipts
-- `init` — initialize shell hooks
+- **Stable** — flags, exit codes, and output format will not change in a
+  backwards-incompatible way within a major version.
+- **Experimental** — surface may change without notice while the command and
+  its schema are still being shaped.
 
-## Experimental Subcommands
+## Per-Command Stability Matrix
 
-These subcommands may change without notice:
+This table reflects the **current** state of each subcommand. It is descriptive,
+not a promise of future classification — see "Graduation criteria" below for
+what an experimental command must satisfy to move to stable.
 
-- `run` — safe script download/execute
-- `scan` — file and directory scanning for hidden content and config poisoning
-- `fetch` — server-side cloaking detection
-- `checkpoint` — file checkpoint and rollback
-- `gateway` — MCP gateway proxy for AI agent security
-- `setup` — configure tirith for AI coding tools
-- `audit` — audit log export, stats, and compliance reports
-- `activate` — license key activation
-- `license` — license status and management
-- `mcp-server` — MCP server mode (JSON-RPC over stdio)
-- `doctor` — diagnostic output
-- `completions` — shell completion generation (hidden)
-- `manpage` — man page generation (hidden)
+| Command | Stability | Notes |
+|---------|-----------|-------|
+| `check` | Stable | Analyze a command before execution. Integration-critical (shell hooks, MCP). |
+| `paste` | Stable | Analyze pasted content. |
+| `score` | Stable | Risk-score a URL. |
+| `diff` | Stable | Compare a URL against known-good patterns. |
+| `why` | Stable | Explain the last triggered rule. |
+| `receipt` | Stable | Manage execution receipts. |
+| `init` | Stable | Initialize shell hooks. |
+| `scan` | Experimental | File/directory scanning for hidden content and config poisoning. Integration-critical (CI, MCP). |
+| `doctor` | Experimental | Installation and configuration diagnostics. Integration-critical. |
+| `run` | Experimental | Safe script download/execute (Unix only). |
+| `fetch` | Experimental | Server-side cloaking detection (Unix only). |
+| `checkpoint` | Experimental | File checkpoint and rollback. |
+| `gateway` | Experimental | MCP gateway proxy for AI-agent security. |
+| `setup` | Experimental | Configure tirith for AI coding tools. |
+| `policy` | Experimental | Policy `init` / `validate` / `test`. |
+| `trust` | Experimental | Manage trusted patterns (allowlist entries with TTL and scoping). |
+| `warnings` | Experimental | Show accumulated session warnings. |
+| `threat-db` | Experimental | Manage the threat intelligence database. |
+| `daemon` | Experimental | Background daemon (Unix only). |
+| `audit` | Experimental | Audit log export, stats, and compliance reports. |
+| `activate` | Experimental | License key activation. |
+| `license` | Experimental | License status and management. |
+| `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
+| `completions` | Experimental | Shell completion generation (hidden). |
+| `manpage` | Experimental | Man page generation (hidden). |
+
+The MCP tools exposed by `mcp-server` (`tirith_check_command`, `tirith_check_url`,
+`tirith_check_paste`, `tirith_scan_file`, `tirith_scan_directory`,
+`tirith_verify_mcp_config`, `tirith_fetch_cloaking`) are also treated as an
+integration-critical surface for graduation purposes.
+
+## Graduation Criteria
+
+An experimental command graduates to **stable** only once it satisfies all of
+the following:
+
+- **Stable JSON schema** — the `--format json` output has a fixed, documented
+  schema. `schema_version` is emitted, and existing fields are not removed or
+  retyped within a major version.
+- **Golden snapshot tests** — representative inputs are covered by golden
+  snapshot tests so output drift is caught in CI.
+- **Versioned config/policy migration** — any config or policy keys the command
+  reads have a defined migration path; format changes are versioned, not silent.
+- **Exit-code compatibility promise** — the command's exit codes are documented
+  and committed to (see "Exit Codes" below).
+- **`--format json` consistency** — the JSON output is consistent with the
+  shared output conventions used by the already-stable commands.
+- **Backward-compatible MCP tool schemas** — for commands exposed through the
+  MCP server, the corresponding tool input/output schemas evolve only in a
+  backward-compatible way.
+- **CLI deprecation policy** — flags and behaviors are removed only through a
+  documented deprecation cycle, never abruptly.
+
+These criteria are applied **first** to the integration-critical commands —
+`check`, `scan`, `doctor`, and the MCP tools — because shell hooks, CI
+pipelines, and AI agents depend on them most directly. Other experimental
+commands graduate after the integration-critical surface is locked down.
 
 ## Exit Codes
 
@@ -39,6 +84,11 @@ Exit codes are stable:
 | 0    | Allow (no issues found) |
 | 1    | Block (high/critical severity findings) |
 | 2    | Warn (medium/low severity findings) |
+| 3    | WarnAck — acknowledgement required (warn-ack hook protocol) |
+
+Exit code 3 is the warn-ack hook protocol path used by shell hooks under strict
+warn mode, not the normal direct-CLI contract. Non-hook callers should not
+normally see exit code 3.
 
 ## JSON Output
 
