@@ -1,5 +1,5 @@
-//! Tests for the bash hook's effective-state exports and `tirith doctor`'s
-//! rendering of them.
+//! Tests for the bash hook's effective-state exports, the non-exported
+//! `TIRITH_STATUS` prompt indicator, and `tirith doctor`'s rendering of them.
 //!
 //! The hook exports two public env vars so that `tirith doctor` — a child
 //! process that cannot read the parent shell's locals — can truthfully
@@ -11,6 +11,14 @@
 //! Both exports are gated on interactive shells (`[[ $- == *i* ]]`) so that
 //! a non-interactive `source` does not leak a misleading status into child
 //! processes.
+//!
+//! `TIRITH_STATUS` — the opt-in prompt indicator — is by contrast a plain,
+//! **non-exported** shell variable. The prompt that reads it runs *in* the
+//! interactive shell, so it never needs to be in the environment; and a
+//! non-interactive child process has no tirith protection, so it must not
+//! inherit a status that would misrepresent it. The tests below assert both
+//! that the in-shell value is correct and that a child process does *not*
+//! inherit it.
 
 #![cfg(unix)]
 
@@ -223,20 +231,21 @@ fn hook_does_not_export_in_noninteractive_shell() {
     );
     assert!(
         stdout.contains("STATUS=unset"),
-        "non-interactive hook must not export TIRITH_STATUS — invariant (g), got:\n{stdout}"
+        "non-interactive hook must not set TIRITH_STATUS — invariant (g), got:\n{stdout}"
     );
 }
 
-// --- TIRITH_STATUS: the opt-in prompt indicator ---------------------------
+// --- TIRITH_STATUS: the opt-in prompt indicator (non-exported) ------------
 
 #[test]
 fn hook_exports_status_blocks_in_enter_mode() {
     // A proven-`works` capability cache resolves to enter mode, which blocks.
-    // `TIRITH_STATUS` is the prompt-facing contract and must read `blocks`.
+    // `TIRITH_STATUS` is the prompt-facing contract and must read `blocks`. It
+    // is a non-exported shell variable; the dump `printf` reads it in-shell.
     let out = source_hook_and_dump_exports(Some("works"), &[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
     assert!(
         out.contains("STATUS=blocks"),
-        "enter mode must export TIRITH_STATUS=blocks, got:\n{out}"
+        "enter mode must set TIRITH_STATUS=blocks, got:\n{out}"
     );
 }
 
@@ -244,15 +253,64 @@ fn hook_exports_status_blocks_in_enter_mode() {
 fn hook_exports_status_warn_only_in_plain_preexec() {
     // With no capability proof the hook falls back to preexec warn-only; the
     // status is `warn-only`, NOT `degraded` — a shell that simply starts in
-    // warn-only has not been downgraded.
+    // warn-only has not been downgraded. (`TIRITH_STATUS` is a non-exported
+    // shell variable; the dump `printf` reads it in the same shell.)
     let out = source_hook_and_dump_exports(None, &[]);
     assert!(
         out.contains("STATUS=warn-only"),
-        "plain preexec must export TIRITH_STATUS=warn-only, got:\n{out}"
+        "plain preexec must set TIRITH_STATUS=warn-only, got:\n{out}"
     );
     assert!(
         !out.contains("STATUS=degraded"),
         "a shell that starts in preexec is warn-only, not degraded, got:\n{out}"
+    );
+}
+
+/// `TIRITH_STATUS` must NOT be exported: a non-interactive child process — one
+/// the hook never protects — must not inherit the parent interactive shell's
+/// status. The variable exists only for a prompt segment, which runs *in* the
+/// interactive shell and reads a non-exported variable fine.
+///
+/// This guards the P2 leak: before the fix the hook `export`ed `TIRITH_STATUS`,
+/// so `bash -i` (status set) spawning `bash -c 'echo $TIRITH_STATUS'` printed
+/// the parent's `warn-only` into an unprotected child.
+#[test]
+fn status_is_not_exported_to_child_processes() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let hook = hook_path();
+    // An interactive bash sources the hook (which sets TIRITH_STATUS), then
+    // spawns a *non-interactive* child bash and asks the child to print what,
+    // if anything, it inherited. The child must see the empty fallback.
+    let script = format!(
+        "source '{hook}' 2>/dev/null; \
+         printf 'PARENT=%s\\n' \"${{TIRITH_STATUS:-unset}}\"; \
+         bash --norc --noprofile -c 'printf \"CHILD=[%s]\\n\" \"${{TIRITH_STATUS:-}}\"'"
+    );
+    let out = Command::new("bash")
+        .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("failed to run bash");
+    assert!(
+        out.status.success(),
+        "bash exited non-zero: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The parent interactive shell does have a status set — proving the test
+    // is not vacuous (the hook ran and set the variable).
+    assert!(
+        stdout.contains("PARENT=warn-only") || stdout.contains("PARENT=blocks"),
+        "anti-vacuous: the parent interactive shell must have TIRITH_STATUS set, got:\n{stdout}"
+    );
+    // The non-interactive child must NOT have inherited it.
+    assert!(
+        stdout.contains("CHILD=[]"),
+        "TIRITH_STATUS must not be exported — a non-interactive child must not \
+         inherit it, got:\n{stdout}"
     );
 }
 
@@ -272,7 +330,7 @@ fn degrade_to_preexec_exports_status_degraded() {
     );
     assert!(
         out.contains("STATUS=degraded"),
-        "a runtime degrade must export TIRITH_STATUS=degraded, got:\n{out}"
+        "a runtime degrade must set TIRITH_STATUS=degraded, got:\n{out}"
     );
 }
 

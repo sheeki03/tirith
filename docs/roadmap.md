@@ -58,10 +58,10 @@ discovery consistency.
   This is a mechanism only; the online default is unchanged.
 - **Visible degraded-protection indicator** — ships. When a shell hook
   downgrades protection (e.g. bash enter mode → preexec warn-only), the hook
-  emits one consolidated one-shot message and exports a `TIRITH_STATUS`
-  variable (`blocks` / `warn-only` / `degraded` / `off`) that a user can wire
-  into their prompt; `tirith doctor` calls out a degraded session explicitly.
-  tirith adds no per-prompt output of its own.
+  emits one consolidated one-shot message and sets a non-exported
+  `TIRITH_STATUS` shell variable (`blocks` / `warn-only` / `degraded` / `off`)
+  that a user can wire into their prompt; `tirith doctor` calls out a degraded
+  session explicitly. tirith adds no per-prompt output of its own.
 - **`tirith doctor` troubleshooting bundle** — `tirith doctor --bundle`
   (aliases `--redacted-report`, `--shell-trace`) ships: a redacted diagnostic
   bundle — doctor info, versions, shell/mode/protection, hook chain, policy

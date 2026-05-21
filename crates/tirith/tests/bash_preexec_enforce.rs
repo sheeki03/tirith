@@ -389,11 +389,12 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
         stderr.contains("PROT=blocks"),
         "expected PROT=blocks, got stderr: {stderr}"
     );
-    // The opt-in prompt indicator must also report `blocks` once enforcement
-    // engages — it starts `warn-only` and upgrades.
+    // The opt-in prompt indicator (a non-exported shell variable, read here in
+    // the same shell) must also report `blocks` once enforcement engages — it
+    // starts `warn-only` and upgrades.
     assert!(
         stderr.contains("STATUS=blocks"),
-        "engaged enforcement must export TIRITH_STATUS=blocks, got stderr: {stderr}"
+        "engaged enforcement must set TIRITH_STATUS=blocks, got stderr: {stderr}"
     );
     let _ = fs::remove_dir_all(&_tmp);
 }
@@ -416,11 +417,12 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
         "hostile install-time config must export warn-only, got: {stderr}"
     );
     // The user asked for blocking but a hostile history config refused it —
-    // that downgrade from intent surfaces to the prompt indicator as
-    // `degraded`, distinct from a shell that simply starts in warn-only.
+    // that downgrade from intent surfaces to the prompt indicator (a
+    // non-exported shell variable, read here in the same shell) as `degraded`,
+    // distinct from a shell that simply starts in warn-only.
     assert!(
         stderr.contains("STATUS=degraded"),
-        "enforcement refused by hostile history must export TIRITH_STATUS=degraded, got: {stderr}"
+        "enforcement refused by hostile history must set TIRITH_STATUS=degraded, got: {stderr}"
     );
     let _ = fs::remove_dir_all(&_tmp);
 }

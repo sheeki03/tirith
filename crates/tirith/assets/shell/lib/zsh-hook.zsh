@@ -281,12 +281,18 @@ autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook zshexit _tirith_exit_summa
 
 # TIRITH_STATUS: a small public contract a user can reference in their PS1 to
 # surface tirith's live protection level in their prompt (see
-# docs/prompt-status.md). tirith prints NOTHING per-prompt — it only exports
-# the variable; wiring it into a prompt is opt-in. The zsh hook overrides the
+# docs/prompt-status.md). tirith prints NOTHING per-prompt — it only sets the
+# variable; wiring it into a prompt is opt-in. The zsh hook overrides the
 # accept-line widget, which can abort a blocked command, so its protection
 # level is always `blocks`; zsh has no runtime-degrade path. Interactive-only,
-# so a non-interactive `source` (a script, `zsh -c`) leaks no status var —
+# so a non-interactive `source` (a script, `zsh -c`) sets no status var —
 # conformance invariant (g).
+#
+# Deliberately NOT exported: the prompt runs in THIS interactive shell, which
+# reads a plain shell variable fine, and a non-interactive child process has no
+# tirith protection — so it must not inherit a status that would misrepresent
+# it. (A `typeset -g` is unnecessary here: the hook is sourced at top level, so
+# a bare assignment already creates the shell-global parameter.)
 if [[ -o interactive ]]; then
-  export TIRITH_STATUS="blocks"
+  TIRITH_STATUS="blocks"
 fi
