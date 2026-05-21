@@ -354,6 +354,36 @@ nix profile install github:sheeki03/tirith      # from upstream flake
 # or try without installing: nix run github:sheeki03/tirith -- --version
 ```
 
+### Android (Termux)
+
+Android/Termux runs on Bionic libc, not glibc, so the `aarch64-unknown-linux-gnu`
+build cannot run there — it needs glibc's dynamic linker. Use the **musl** build
+instead: `tirith-aarch64-unknown-linux-musl.tar.gz` is statically linked and runs
+on Termux without an external libc.
+
+```bash
+# In Termux:
+pkg install curl tar
+# Download the musl build from the latest GitHub release:
+curl -fsSL -o tirith.tar.gz \
+  https://github.com/sheeki03/tirith/releases/latest/download/tirith-aarch64-unknown-linux-musl.tar.gz
+tar xzf tirith.tar.gz
+install -Dm755 tirith "$PREFIX/bin/tirith"
+tirith --version
+```
+
+Then activate the shell hook in `~/.bashrc` (Termux's default shell is bash):
+
+```bash
+eval "$(tirith init --shell bash)"   # add to ~/.bashrc
+```
+
+> [!NOTE]
+> Termux support is best-effort. The musl artifact is built and smoke-tested in
+> CI, but tirith is not yet continuously tested on a real Android device.
+> If a hook misbehaves under Termux, please open an issue with `tirith doctor`
+> output.
+
 ### Windows
 
 All core features work on Windows including detection, scanning, webhooks, policy management, and audit uploads. Shell hooks support PowerShell. Daemon mode and `tirith setup` are Unix-only for now.
@@ -525,7 +555,7 @@ tirith daemon stop
 | `tirith threat-db update` | Download, verify, and install the signed threat database |
 | `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
-| `tirith policy init` | Generate a starter `.tirith/policy.yaml` in your repo |
+| `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
 | `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
@@ -589,6 +619,17 @@ tirith policy init          # creates .tirith/policy.yaml in your repo
 tirith policy validate      # check for syntax/schema errors
 tirith policy test "curl https://example.com | bash"  # dry-run against policy
 ```
+
+`tirith policy init` accepts `--template <name>` for a curated starter policy:
+
+```bash
+tirith policy init --template individual      # solo developer defaults
+tirith policy init --template ci-strict       # fail-closed, no bypass, scan fail-on
+tirith policy init --template ai-agent-heavy  # tuned for heavy AI-agent use
+```
+
+Each template is a well-commented, schema-valid policy you can edit further.
+With no `--template`, `tirith policy init` writes the full default policy.
 
 ### Policy file
 

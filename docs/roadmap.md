@@ -15,7 +15,9 @@ Shipped and available in the current release line (see [CHANGELOG.md](../CHANGEL
 - **Pre-commit hook** — `.pre-commit-hooks.yaml` entry for local scanning.
 - **`tirith policy init / validate / test`** — generate a starter policy,
   validate YAML syntax and conflicts, and dry-run a command or file against the
-  active policy.
+  active policy. `tirith policy init --template <name>` offers three curated
+  starter policies — `individual`, `ci-strict`, and `ai-agent-heavy` — each a
+  well-commented, schema-valid policy.
 - **`tirith explain --rule <id>`** — detailed per-rule documentation, including
   examples and remediation, plus `--list` / `--category` filtering.
 - **`tirith scan` include/exclude/profile filters** — `--include`, `--exclude`,
@@ -65,6 +67,12 @@ discovery consistency.
   bundle — doctor info, versions, shell/mode/protection, hook chain, policy
   discovery, threat-DB status, curated environment — safe to attach to a bug
   report.
+- **Android / Termux support** — partially landed. Termux runs on Bionic
+  libc, so the `aarch64-unknown-linux-musl` static build is the supported
+  artifact; the release workflow builds it and smoke-tests it (static-linkage
+  check plus `--version` and a block check under QEMU user emulation). Install
+  docs are in the README. Still outstanding: continuous verification on a real
+  Android device, which needs device-backed CI.
 
 ## Next
 
