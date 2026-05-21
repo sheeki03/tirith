@@ -47,6 +47,10 @@ fs2 = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"
+# PTY conformance harness (tests/shell_conformance.rs): drives disposable
+# shells through a real pseudo-terminal so shell-hook tests need no external
+# `expect` Tcl tool.
+portable-pty = "0.9"
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
