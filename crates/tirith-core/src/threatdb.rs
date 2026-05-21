@@ -121,6 +121,26 @@ impl Ecosystem {
     }
 }
 
+/// Which physical DB file a threat source's records live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceTier {
+    /// Compiled and Ed25519-signed by CI; verified on download and load.
+    Primary,
+    /// Compiled on the user's own machine from optional opt-in feeds; an
+    /// unsigned user-local overlay.
+    Supplemental,
+}
+
+impl SourceTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Supplemental => "supplemental",
+        }
+    }
+}
+
 /// Origin of the threat intelligence signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -153,6 +173,85 @@ impl ThreatSource {
             9 => Some(Self::FireholIp),
             10 => Some(Self::TorExit),
             _ => None,
+        }
+    }
+
+    /// Every threat source variant, in stable declaration order. Used by the
+    /// `threat-db sources` transparency command and the snapshot history.
+    pub const ALL: [ThreatSource; 11] = [
+        Self::OssfMalicious,
+        Self::DatadogMalicious,
+        Self::FeodoTracker,
+        Self::EcosystemsTyposquat,
+        Self::CisaKev,
+        Self::Urlhaus,
+        Self::PhishingArmy,
+        Self::PhishTank,
+        Self::ThreatFoxIoc,
+        Self::FireholIp,
+        Self::TorExit,
+    ];
+
+    /// Stable machine-readable identifier (snake_case). Distinct from
+    /// [`label`](Self::label), which is a human display string that may change.
+    /// This is the key used in `--format json` output and the snapshot history,
+    /// so it must remain stable across releases.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OssfMalicious => "ossf_malicious",
+            Self::DatadogMalicious => "datadog_malicious",
+            Self::FeodoTracker => "feodo_tracker",
+            Self::EcosystemsTyposquat => "ecosystems_typosquat",
+            Self::CisaKev => "cisa_kev",
+            Self::Urlhaus => "urlhaus",
+            Self::PhishingArmy => "phishing_army",
+            Self::PhishTank => "phishtank",
+            Self::ThreatFoxIoc => "threatfox_ioc",
+            Self::FireholIp => "firehol_ip",
+            Self::TorExit => "tor_exit",
+        }
+    }
+
+    /// Whether this source is carried in the signed CI-built primary DB or in
+    /// the optional user-local supplemental overlay.
+    ///
+    /// The two-way split mirrors how the DB is actually built: the primary
+    /// `.dat` is compiled and Ed25519-signed by CI from a fixed set of feeds;
+    /// the supplemental `.dat` is compiled on the user's own machine from
+    /// optional keyed/opt-in feeds during `tirith threat-db update`.
+    pub fn tier(&self) -> SourceTier {
+        match self {
+            Self::OssfMalicious
+            | Self::DatadogMalicious
+            | Self::FeodoTracker
+            | Self::EcosystemsTyposquat
+            | Self::CisaKev => SourceTier::Primary,
+            Self::Urlhaus
+            | Self::PhishingArmy
+            | Self::PhishTank
+            | Self::ThreatFoxIoc
+            | Self::FireholIp
+            | Self::TorExit => SourceTier::Supplemental,
+        }
+    }
+
+    /// Upstream project / homepage for the feed, for attribution in
+    /// `threat-db sources`.
+    pub fn upstream_url(&self) -> &'static str {
+        match self {
+            Self::OssfMalicious => "https://github.com/ossf/malicious-packages",
+            Self::DatadogMalicious => {
+                "https://github.com/DataDog/malicious-software-packages-dataset"
+            }
+            Self::FeodoTracker => "https://feodotracker.abuse.ch/",
+            Self::EcosystemsTyposquat => "https://ecosyste.ms/",
+            Self::CisaKev => "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+            Self::Urlhaus => "https://urlhaus.abuse.ch/",
+            Self::PhishingArmy => "https://phishing.army/",
+            Self::PhishTank => "https://phishtank.org/",
+            Self::ThreatFoxIoc => "https://threatfox.abuse.ch/",
+            Self::FireholIp => "https://iplists.firehol.org/",
+            Self::TorExit => "https://www.torproject.org/",
         }
     }
 
@@ -250,6 +349,44 @@ pub struct ThreatDbStats {
     pub typosquat_count: u32,
     pub popular_count: u32,
     pub string_table_bytes: u32,
+}
+
+/// Per-source record counts derived by walking a loaded DB's sections.
+///
+/// `per_source` covers package, hostname, and IP records (the record types
+/// that carry a `ThreatSource` byte on disk). `typosquat_count` and
+/// `popular_count` are reported separately because the on-disk typosquat and
+/// popular-package records do not store a source.
+#[derive(Debug, Clone, Default)]
+pub struct SourceBreakdown {
+    pub per_source: Vec<(ThreatSource, u64)>,
+    pub typosquat_count: u64,
+    pub popular_count: u64,
+}
+
+impl SourceBreakdown {
+    /// Add another breakdown's counts into this one (used to fold a
+    /// supplemental overlay's counts into the primary's).
+    fn merge(&mut self, other: SourceBreakdown) {
+        for (src, count) in other.per_source {
+            if let Some((_, existing)) = self.per_source.iter_mut().find(|(s, _)| *s == src) {
+                *existing += count;
+            } else {
+                self.per_source.push((src, count));
+            }
+        }
+        self.typosquat_count += other.typosquat_count;
+        self.popular_count += other.popular_count;
+    }
+
+    /// Count for a specific source (0 if absent).
+    pub fn count_for(&self, src: ThreatSource) -> u64 {
+        self.per_source
+            .iter()
+            .find(|(s, _)| *s == src)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -582,6 +719,76 @@ impl ThreatDb {
             typosquat_count: self.typosquat_index_count + overlay.typosquat_count,
             popular_count: self.popular_index_count + overlay.popular_count,
             string_table_bytes: self.string_table_size + overlay.string_table_bytes,
+        }
+    }
+
+    /// Count how many records each [`ThreatSource`] contributes, across this DB
+    /// and any supplemental overlay.
+    ///
+    /// The DB header does not store a per-source manifest, so this walks every
+    /// section's records. Malformed records are skipped (best-effort, never
+    /// panics) — a malformed record will not be counted, mirroring how lookups
+    /// already treat unparseable records as a miss.
+    pub fn source_breakdown(&self) -> SourceBreakdown {
+        let mut breakdown = self.source_breakdown_self();
+        if let Some(overlay) = self.supplemental.as_deref() {
+            breakdown.merge(overlay.source_breakdown());
+        }
+        breakdown
+    }
+
+    /// Per-source counts for this DB file only (no overlay recursion).
+    fn source_breakdown_self(&self) -> SourceBreakdown {
+        let mut counts: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+        let mut bump = |src: ThreatSource| {
+            *counts.entry(src as u8).or_insert(0) += 1;
+        };
+
+        // Packages: index entries point to variable-size records.
+        for i in 0..self.pkg_index_count {
+            if let Some((data_off, _)) = self.pkg_index_entry(i) {
+                if let Some(rec) = self.parse_pkg_record(data_off as usize) {
+                    bump(rec.source);
+                }
+            }
+        }
+
+        // Hostnames: record layout is source(u8) + name_len(u16 LE) + name.
+        for i in 0..self.hostname_index_count {
+            let base = self.hostname_index_offset as usize + i as usize * HOSTNAME_INDEX_ENTRY_SIZE;
+            if let Some(data_off) = read_u32_le(&self.data, base) {
+                if let Some(src) = self
+                    .data
+                    .get(data_off as usize)
+                    .and_then(|&b| ThreatSource::from_u8(b))
+                {
+                    bump(src);
+                }
+            }
+        }
+
+        // IPs: fixed-size records, source byte at offset+4.
+        for i in 0..self.ip_count {
+            let base = self.ip_offset as usize + i as usize * IP_RECORD_SIZE;
+            if let Some(src) = self
+                .data
+                .get(base + 4)
+                .and_then(|&b| ThreatSource::from_u8(b))
+            {
+                bump(src);
+            }
+        }
+
+        SourceBreakdown {
+            per_source: ThreatSource::ALL
+                .iter()
+                .map(|src| (*src, counts.get(&(*src as u8)).copied().unwrap_or(0)))
+                .collect(),
+            // Typosquats and popular packages carry no per-record source byte
+            // in the on-disk format, so they are surfaced as their own
+            // categories rather than attributed to a source.
+            typosquat_count: self.typosquat_index_count as u64,
+            popular_count: self.popular_index_count as u64,
         }
     }
 
@@ -2425,5 +2632,164 @@ mod tests {
             m.reference_url.as_deref(),
             Some("https://example.com/advisory/123")
         );
+    }
+
+    #[test]
+    fn threat_source_all_covers_every_variant() {
+        // Every u8 discriminant 0..N must round-trip through ALL, and ALL must
+        // have no duplicates. This guards `threat-db sources` against silently
+        // dropping a source if a new variant is added without updating ALL.
+        for src in ThreatSource::ALL {
+            assert_eq!(
+                ThreatSource::from_u8(src as u8),
+                Some(src),
+                "ALL entry {src:?} must round-trip through from_u8"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for src in ThreatSource::ALL {
+            assert!(seen.insert(src as u8), "ALL has a duplicate: {src:?}");
+        }
+        // The discriminants are 0..=10 contiguous; ALL must cover all 11.
+        assert_eq!(ThreatSource::ALL.len(), 11);
+        assert!(
+            ThreatSource::from_u8(11).is_none(),
+            "from_u8 must reject an out-of-range discriminant"
+        );
+    }
+
+    #[test]
+    fn threat_source_as_str_is_unique_and_stable() {
+        let mut seen = std::collections::HashSet::new();
+        for src in ThreatSource::ALL {
+            let s = src.as_str();
+            assert!(!s.is_empty());
+            assert!(seen.insert(s), "as_str collision on {s:?}");
+        }
+        // Spot-check a couple of stable identifiers.
+        assert_eq!(ThreatSource::OssfMalicious.as_str(), "ossf_malicious");
+        assert_eq!(ThreatSource::TorExit.as_str(), "tor_exit");
+    }
+
+    #[test]
+    fn threat_source_tier_split_matches_feed_origin() {
+        // Primary feeds are the five compiled into the signed CI DB.
+        for src in [
+            ThreatSource::OssfMalicious,
+            ThreatSource::DatadogMalicious,
+            ThreatSource::FeodoTracker,
+            ThreatSource::EcosystemsTyposquat,
+            ThreatSource::CisaKev,
+        ] {
+            assert_eq!(src.tier(), SourceTier::Primary, "{src:?} should be primary");
+        }
+        // The rest are opt-in supplemental feeds.
+        for src in [
+            ThreatSource::Urlhaus,
+            ThreatSource::PhishingArmy,
+            ThreatSource::PhishTank,
+            ThreatSource::ThreatFoxIoc,
+            ThreatSource::FireholIp,
+            ThreatSource::TorExit,
+        ] {
+            assert_eq!(
+                src.tier(),
+                SourceTier::Supplemental,
+                "{src:?} should be supplemental"
+            );
+        }
+    }
+
+    #[test]
+    fn source_breakdown_counts_records_per_source() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-a",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::PyPI,
+            "evil-b",
+            &[],
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "evil-c",
+            &["2.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Medium,
+            false,
+            None,
+        );
+        writer.add_hostname("bad.example", ThreatSource::Urlhaus);
+        writer.add_hostname("phish.example", ThreatSource::PhishTank);
+        writer.add_ip(Ipv4Addr::new(203, 0, 113, 1), ThreatSource::FeodoTracker);
+        writer.add_ip(Ipv4Addr::new(203, 0, 113, 2), ThreatSource::TorExit);
+        writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
+        writer.add_popular(Ecosystem::Npm, "react");
+
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let bd = db.source_breakdown();
+
+        assert_eq!(bd.count_for(ThreatSource::OssfMalicious), 2);
+        assert_eq!(bd.count_for(ThreatSource::DatadogMalicious), 1);
+        assert_eq!(bd.count_for(ThreatSource::Urlhaus), 1);
+        assert_eq!(bd.count_for(ThreatSource::PhishTank), 1);
+        assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
+        assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
+        assert_eq!(bd.count_for(ThreatSource::CisaKev), 0);
+        assert_eq!(bd.typosquat_count, 1);
+        assert_eq!(bd.popular_count, 1);
+
+        // Per-source counts cover pkg+host+ip records only (3 packages +
+        // 2 hostnames + 2 IPs = 7); typosquat/popular are reported separately.
+        let total: u64 = bd.per_source.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 7);
+    }
+
+    #[test]
+    fn source_breakdown_folds_in_supplemental_overlay() {
+        let key = SigningKey::generate(&mut OsRng);
+
+        let mut primary_writer = ThreatDbWriter::new(1700000000, 1);
+        primary_writer.add_ip(Ipv4Addr::new(203, 0, 113, 1), ThreatSource::FeodoTracker);
+        let primary =
+            ThreatDb::from_bytes(primary_writer.build(&key).expect("build"), 0).expect("load");
+
+        let mut overlay_writer = ThreatDbWriter::new(1700000001, 1);
+        overlay_writer.add_hostname("bad.example", ThreatSource::Urlhaus);
+        overlay_writer.add_ip(Ipv4Addr::new(203, 0, 113, 9), ThreatSource::TorExit);
+        let overlay =
+            ThreatDb::from_bytes(overlay_writer.build(&key).expect("build"), 0).expect("load");
+
+        let db = primary.with_supplemental(Some(overlay));
+        let bd = db.source_breakdown();
+
+        assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
+        assert_eq!(bd.count_for(ThreatSource::Urlhaus), 1);
+        assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
+    }
+
+    #[test]
+    fn source_breakdown_empty_db_is_all_zero() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let bd = db.source_breakdown();
+        for (_, count) in &bd.per_source {
+            assert_eq!(*count, 0);
+        }
+        assert_eq!(bd.typosquat_count, 0);
+        assert_eq!(bd.popular_count, 0);
     }
 }

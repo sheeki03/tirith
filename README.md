@@ -229,11 +229,17 @@ Tirith ships a signed local threat database for package, hostname, and IP reputa
 - [Google Safe Browsing](https://safebrowsing.google.com/) URL reputation with your own API key
 
 ```bash
-tirith threat-db update           # download + verify the signed DB
-tirith threat-db status           # age, signature, version, entry counts
+tirith threat-db update              # download + verify the signed DB
+tirith threat-db status              # age, signature, version, entry counts
+tirith threat-db health              # install, signature, staleness, counts
+tirith threat-db sources             # list every feed the DB is built from
+tirith threat-db explain react       # what the DB knows about an indicator
+tirith threat-db diff --since 2026-01-01   # count changes since a version/date
 ```
 
 By default, shell hooks and `tirith check` trigger a cheap background refresh check every 24 hours. Daemon mode keeps the same enrichment path warm in the background.
+
+`threat-db explain` accepts a domain, a package name (`name`, `ecosystem:name`, or `name@version`), or an IPv4 address; `threat-db sources` groups feeds into the signed primary database and the optional user-local supplemental overlay. The threat-DB binary retains no per-entry history, so `threat-db diff` reports category and per-source count deltas between snapshots rather than the exact entries added or removed. Every `threat-db` command takes `--format json`; `threatdb` works as an alias for `threat-db`.
 
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
@@ -554,6 +560,10 @@ tirith daemon stop
 | `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
 | `tirith threat-db update` | Download, verify, and install the signed threat database |
 | `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
+| `tirith threat-db explain <indicator>` | Explain what the threat DB knows about a domain, package, or IP |
+| `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
+| `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
+| `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |

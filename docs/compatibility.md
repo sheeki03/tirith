@@ -34,7 +34,7 @@ what an experimental command must satisfy to move to stable.
 | `policy` | Experimental | Policy `init` / `validate` / `test`. |
 | `trust` | Experimental | Manage trusted patterns (allowlist entries with TTL and scoping). |
 | `warnings` | Experimental | Show accumulated session warnings. |
-| `threat-db` | Experimental | Manage the threat intelligence database. |
+| `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `daemon` | Experimental | Background daemon (Unix only). |
 | `audit` | Experimental | Audit log export, stats, and compliance reports. |
 | `activate` | Experimental | License key activation. |

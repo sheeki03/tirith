@@ -498,11 +498,15 @@ Examples:
     /// Manage the threat intelligence database
     #[command(
         name = "threat-db",
+        visible_alias = "threatdb",
         after_help = "\
 Examples:
   tirith threat-db update
-  tirith threat-db update --force
-  tirith threat-db status --format json"
+  tirith threat-db status --format json
+  tirith threat-db explain react
+  tirith threat-db sources
+  tirith threat-db health
+  tirith threat-db diff --since 2026-01-01"
     )]
     ThreatDb {
         #[command(subcommand)]
@@ -1009,6 +1013,68 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Explain what the threat DB knows about a domain, package, or IP
+    #[command(after_help = "\
+Examples:
+  tirith threat-db explain react
+  tirith threat-db explain npm:left-pad
+  tirith threat-db explain example.com
+  tirith threat-db explain 203.0.113.50 --format json")]
+    Explain {
+        /// Indicator to look up: a domain, a package name (optionally
+        /// `ecosystem:name` or `name@version`), or an IPv4 address.
+        indicator: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// List the threat-intelligence sources the DB is built from
+    #[command(after_help = "\
+Examples:
+  tirith threat-db sources
+  tirith threat-db sources --format json")]
+    Sources {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Report threat DB health: install, signature, staleness, counts
+    #[command(after_help = "\
+Examples:
+  tirith threat-db health
+  tirith threat-db health --format json")]
+    Health {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Summarize what changed in the DB since a given version or date
+    #[command(after_help = "\
+Examples:
+  tirith threat-db diff --since 42
+  tirith threat-db diff --since 2026-01-15
+  tirith threat-db diff --since 2026-01-15 --format json")]
+    Diff {
+        /// Compare against this point: a DB version number (build sequence)
+        /// or an ISO date (YYYY-MM-DD).
+        #[arg(long)]
+        since: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -1361,6 +1427,30 @@ fn main() {
             ThreatDbAction::Status { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::threatdb_cmd::status(json)
+            }
+            ThreatDbAction::Explain {
+                indicator,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::explain(&indicator, json)
+            }
+            ThreatDbAction::Sources { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::sources(json)
+            }
+            ThreatDbAction::Health { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::health(json)
+            }
+            ThreatDbAction::Diff {
+                since,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::diff(&since, json)
             }
         },
 

@@ -1135,6 +1135,1190 @@ mod hex {
     }
 }
 
+// ===========================================================================
+// Threat-DB transparency subcommands (roadmap M2 item 11)
+//
+// `explain`, `sources`, `health`, and `diff` are read-only inspection
+// commands. They never download, never write the DB, and never change
+// existing `update`/`status` behavior. All support `--format json`.
+// ===========================================================================
+
+use std::net::Ipv4Addr;
+
+use tirith_core::threatdb::{Confidence, Ecosystem, SourceTier};
+
+/// File name for the append-only snapshot history used by `threat-db diff`.
+const HISTORY_FILE: &str = "threatdb-history.jsonl";
+/// Hard cap on retained snapshot lines — keeps the file tiny and bounded.
+const HISTORY_MAX_LINES: usize = 64;
+
+// --- shared serializable shapes --------------------------------------------
+
+/// Per-category entry counts for a loaded DB. Mirrors the DB's five sections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CategoryCounts {
+    packages: u64,
+    hostnames: u64,
+    ips: u64,
+    typosquats: u64,
+    popular: u64,
+}
+
+impl CategoryCounts {
+    fn total(&self) -> u64 {
+        self.packages + self.hostnames + self.ips + self.typosquats + self.popular
+    }
+}
+
+/// One DB observation, appended to the history file. The history file is the
+/// only thing `diff` can compare against — the DB format itself retains no
+/// per-entry history.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DbSnapshot {
+    /// Unix epoch seconds when this snapshot was recorded.
+    recorded_at: u64,
+    /// DB build sequence (the monotonic "version").
+    build_sequence: u64,
+    /// DB build timestamp (Unix epoch seconds).
+    build_timestamp: u64,
+    /// Whether the DB's Ed25519 signature verified at observation time.
+    signature_valid: bool,
+    counts: CategoryCounts,
+    /// Per-source record counts, keyed by the stable `ThreatSource::as_str()`.
+    #[serde(default)]
+    sources: std::collections::BTreeMap<String, u64>,
+}
+
+/// Resolve the snapshot history file path under the state dir.
+fn history_path() -> Option<PathBuf> {
+    policy::state_dir().map(|d| d.join(HISTORY_FILE))
+}
+
+/// Build a snapshot of the currently-loaded DB, or `None` if no DB is loaded.
+fn current_snapshot() -> Option<DbSnapshot> {
+    let db = ThreatDb::cached()?;
+    let stats = db.stats();
+    let breakdown = db.source_breakdown();
+    let mut sources = std::collections::BTreeMap::new();
+    for (src, count) in &breakdown.per_source {
+        sources.insert(src.as_str().to_string(), *count);
+    }
+    Some(DbSnapshot {
+        recorded_at: unix_now(),
+        build_sequence: stats.build_sequence,
+        build_timestamp: stats.build_timestamp,
+        signature_valid: db.verify_signature().is_ok(),
+        counts: CategoryCounts {
+            packages: stats.package_count as u64,
+            hostnames: stats.hostname_count as u64,
+            ips: stats.ip_count as u64,
+            typosquats: stats.typosquat_count as u64,
+            popular: stats.popular_count as u64,
+        },
+        sources,
+    })
+}
+
+/// Load all retained snapshots, oldest first. Unparseable lines are skipped.
+fn load_history() -> Vec<DbSnapshot> {
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<DbSnapshot>(l).ok())
+        .collect()
+}
+
+/// Append `snapshot` to the history file if it records a build sequence not
+/// already present. Best-effort: any I/O error is silently ignored — the
+/// history is a convenience for `diff`, never load-bearing for analysis.
+///
+/// The file is truncated to the most recent [`HISTORY_MAX_LINES`] entries so
+/// it can never grow without bound.
+fn record_snapshot(snapshot: &DbSnapshot) {
+    let Some(path) = history_path() else {
+        return;
+    };
+    let mut history = load_history();
+    // Dedup on build_sequence: re-running `health` against an unchanged DB
+    // must not append a near-identical line every invocation.
+    if history
+        .iter()
+        .any(|s| s.build_sequence == snapshot.build_sequence)
+    {
+        return;
+    }
+    history.push(snapshot.clone());
+    if history.len() > HISTORY_MAX_LINES {
+        let drop = history.len() - HISTORY_MAX_LINES;
+        history.drain(0..drop);
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let mut body = String::new();
+    for s in &history {
+        if let Ok(line) = serde_json::to_string(s) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    let _ = atomic_write(&path, body.as_bytes());
+}
+
+/// Take a snapshot of the current DB and fold it into the history file.
+/// Called by the read-only transparency commands so `diff` accumulates a
+/// usable trail over time without any extra user action.
+fn snapshot_current_db() {
+    if let Some(snapshot) = current_snapshot() {
+        record_snapshot(&snapshot);
+    }
+}
+
+// --- threat-db explain -----------------------------------------------------
+
+/// What kind of indicator the user passed to `explain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum IndicatorKind {
+    Ip,
+    Package,
+    Domain,
+}
+
+/// A parsed `explain` argument.
+struct ParsedIndicator {
+    kind: IndicatorKind,
+    /// For packages: the ecosystem, if the caller used `eco:name` syntax.
+    ecosystem: Option<Ecosystem>,
+    /// For packages: the version, if the caller used `name@version` syntax.
+    version: Option<String>,
+    /// The bare indicator value (host, package name, or IP string).
+    value: String,
+}
+
+/// Classify the indicator string.
+///
+/// - A bare IPv4 literal → IP.
+/// - `eco:name` where `eco` is a known ecosystem (npm, pypi, …) → package.
+/// - `name@version` → package.
+/// - Anything containing a `.` and no `/` or space, not an IP → domain.
+/// - Otherwise → package (a bare name with no dots, e.g. `react`).
+fn parse_indicator(raw: &str) -> ParsedIndicator {
+    let trimmed = raw.trim();
+
+    if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+        return ParsedIndicator {
+            kind: IndicatorKind::Ip,
+            ecosystem: None,
+            version: None,
+            value: ip.to_string(),
+        };
+    }
+
+    // `eco:name` — only when the prefix is a recognized ecosystem, so a
+    // `host:port` style string is not misread as a package.
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        if let Some(eco) = Ecosystem::from_name(prefix) {
+            let (name, version) = split_name_version(rest);
+            return ParsedIndicator {
+                kind: IndicatorKind::Package,
+                ecosystem: Some(eco),
+                version,
+                value: name,
+            };
+        }
+    }
+
+    // `name@version` (npm-style) — treat as a package.
+    if let Some((name, version)) = split_at_version(trimmed) {
+        return ParsedIndicator {
+            kind: IndicatorKind::Package,
+            ecosystem: None,
+            version: Some(version),
+            value: name,
+        };
+    }
+
+    // A dotted, slash-free, space-free token that is not an IP → domain.
+    if trimmed.contains('.') && !trimmed.contains('/') && !trimmed.contains(char::is_whitespace) {
+        return ParsedIndicator {
+            kind: IndicatorKind::Domain,
+            ecosystem: None,
+            version: None,
+            value: trimmed.to_ascii_lowercase(),
+        };
+    }
+
+    // Fallback: a bare package name (e.g. `react`).
+    ParsedIndicator {
+        kind: IndicatorKind::Package,
+        ecosystem: None,
+        version: None,
+        value: trimmed.to_string(),
+    }
+}
+
+/// Split `name@version`, returning `None` when there is no `@` or it is a
+/// scoped npm package leading `@` (e.g. `@scope/pkg`).
+fn split_at_version(s: &str) -> Option<(String, String)> {
+    // A leading `@` is an npm scope, not a version separator.
+    let search_from = if s.starts_with('@') { 1 } else { 0 };
+    let idx = s[search_from..].find('@')? + search_from;
+    let name = &s[..idx];
+    let version = &s[idx + 1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+/// Split the `name` / `name@version` part after an `eco:` prefix.
+fn split_name_version(rest: &str) -> (String, Option<String>) {
+    match split_at_version(rest) {
+        Some((name, version)) => (name, Some(version)),
+        None => (rest.to_string(), None),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExplainResult {
+    indicator: String,
+    kind: IndicatorKind,
+    /// Ecosystem the package lookup used (packages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ecosystem: Option<String>,
+    /// Version the package lookup used (packages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// True when the threat DB has at least one finding for this indicator.
+    present: bool,
+    /// The DB is not installed — lookups cannot be performed.
+    db_missing: bool,
+    findings: Vec<ExplainFinding>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExplainFinding {
+    /// Which lookup matched: `malicious_package`, `typosquat`,
+    /// `popular_lookalike`, `malicious_hostname`, or `malicious_ip`.
+    classification: String,
+    /// Stable source identifier, when the matched record carries a source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// Human-readable source label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_label: Option<String>,
+    /// Match confidence, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<Confidence>,
+    /// Free-text explanation of what the DB knows.
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_url: Option<String>,
+}
+
+fn confidence_label(c: Confidence) -> &'static str {
+    match c {
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::Confirmed => "confirmed",
+    }
+}
+
+/// `tirith threat-db explain <indicator>`.
+pub fn explain(indicator: &str, json: bool) -> i32 {
+    let parsed = parse_indicator(indicator);
+    let db = ThreatDb::cached();
+
+    let mut findings: Vec<ExplainFinding> = Vec::new();
+    let db_missing = db.is_none();
+
+    if let Some(ref db) = db {
+        match parsed.kind {
+            IndicatorKind::Ip => {
+                if let Ok(ip) = parsed.value.parse::<Ipv4Addr>() {
+                    if let Some(m) = db.check_ip(ip) {
+                        findings.push(ExplainFinding {
+                            classification: "malicious_ip".to_string(),
+                            source: Some(m.source.as_str().to_string()),
+                            source_label: Some(m.source.label().to_string()),
+                            confidence: Some(m.confidence),
+                            detail: format!(
+                                "IP address is listed as malicious infrastructure by {}.",
+                                m.source.label()
+                            ),
+                            reference_url: m.reference_url,
+                        });
+                    }
+                }
+            }
+            IndicatorKind::Domain => {
+                if let Some(m) = db.check_hostname(&parsed.value) {
+                    findings.push(ExplainFinding {
+                        classification: "malicious_hostname".to_string(),
+                        source: Some(m.source.as_str().to_string()),
+                        source_label: Some(m.source.label().to_string()),
+                        confidence: Some(m.confidence),
+                        detail: format!(
+                            "Hostname is listed as malicious infrastructure by {}.",
+                            m.source.label()
+                        ),
+                        reference_url: m.reference_url,
+                    });
+                }
+            }
+            IndicatorKind::Package => {
+                // Ecosystems to probe: the caller's explicit one, or all of
+                // them when none was given.
+                let ecosystems: Vec<Ecosystem> = match parsed.ecosystem {
+                    Some(e) => vec![e],
+                    None => ALL_ECOSYSTEMS.to_vec(),
+                };
+                for eco in ecosystems {
+                    explain_package(
+                        db,
+                        eco,
+                        &parsed.value,
+                        parsed.version.as_deref(),
+                        &mut findings,
+                    );
+                }
+            }
+        }
+    }
+
+    let result = ExplainResult {
+        indicator: indicator.trim().to_string(),
+        kind: parsed.kind,
+        ecosystem: parsed.ecosystem.map(|e| e.to_string()),
+        version: parsed.version.clone(),
+        present: !findings.is_empty(),
+        db_missing,
+        findings,
+    };
+
+    // Record a snapshot opportunistically so `diff` accrues history.
+    snapshot_current_db();
+
+    if json {
+        print_json_value(&result);
+    } else {
+        print_explain_human(&result);
+    }
+    0
+}
+
+/// All package ecosystems, probed when `explain` gets a package name with no
+/// explicit ecosystem prefix.
+const ALL_ECOSYSTEMS: [Ecosystem; 8] = [
+    Ecosystem::Npm,
+    Ecosystem::PyPI,
+    Ecosystem::RubyGems,
+    Ecosystem::Crates,
+    Ecosystem::Go,
+    Ecosystem::Maven,
+    Ecosystem::NuGet,
+    Ecosystem::Packagist,
+];
+
+/// Probe one ecosystem for a package name: malicious-package, typosquat, and
+/// popular-lookalike checks. Appends any matches to `findings`.
+fn explain_package(
+    db: &ThreatDb,
+    eco: Ecosystem,
+    name: &str,
+    version: Option<&str>,
+    findings: &mut Vec<ExplainFinding>,
+) {
+    if let Some(m) = db.check_package(eco, name, version) {
+        let versions = if m.all_versions_malicious {
+            "all versions".to_string()
+        } else {
+            "specific affected versions".to_string()
+        };
+        findings.push(ExplainFinding {
+            classification: "malicious_package".to_string(),
+            source: Some(m.source.as_str().to_string()),
+            source_label: Some(m.source.label().to_string()),
+            confidence: Some(m.confidence),
+            detail: format!(
+                "{} package '{}' is listed as malicious by {} ({}).",
+                eco,
+                name,
+                m.source.label(),
+                versions
+            ),
+            reference_url: m.reference_url,
+        });
+    }
+
+    if let Some(ts) = db.check_typosquat(eco, name) {
+        findings.push(ExplainFinding {
+            classification: "typosquat".to_string(),
+            source: Some(ThreatSource::EcosystemsTyposquat.as_str().to_string()),
+            source_label: Some(ThreatSource::EcosystemsTyposquat.label().to_string()),
+            confidence: None,
+            detail: format!(
+                "{} package '{}' is a known typosquat of '{}'.",
+                eco, ts.malicious_name, ts.target_name
+            ),
+            reference_url: None,
+        });
+    }
+
+    if let Some((popular, distance)) = db.check_popular_distance(eco, name) {
+        findings.push(ExplainFinding {
+            classification: "popular_lookalike".to_string(),
+            source: None,
+            source_label: None,
+            confidence: None,
+            detail: format!(
+                "{} package '{}' is edit-distance {} from the popular package '{}' \
+                 — a possible slopsquat/typo. Not itself listed as malicious.",
+                eco, name, distance, popular
+            ),
+            reference_url: None,
+        });
+    }
+}
+
+fn print_explain_human(r: &ExplainResult) {
+    println!("threat-db explain: {}", r.indicator);
+    let kind_label = match r.kind {
+        IndicatorKind::Ip => "IPv4 address",
+        IndicatorKind::Package => "package",
+        IndicatorKind::Domain => "domain / hostname",
+    };
+    print!("  type:        {kind_label}");
+    if let Some(ref eco) = r.ecosystem {
+        print!(" ({eco})");
+    }
+    if let Some(ref v) = r.version {
+        print!(" @ {v}");
+    }
+    println!();
+
+    if r.db_missing {
+        println!("  result:      threat DB not installed");
+        println!("  Hint: run 'tirith threat-db update' to install the signed DB.");
+        return;
+    }
+
+    if !r.present {
+        println!("  result:      not present");
+        match r.kind {
+            IndicatorKind::Package => println!(
+                "  The threat DB has no malicious-package, typosquat, or \
+                 popular-lookalike record for this name."
+            ),
+            IndicatorKind::Domain => {
+                println!("  The threat DB has no malicious-hostname record for this domain.")
+            }
+            IndicatorKind::Ip => {
+                println!("  The threat DB has no malicious-infrastructure record for this IP.")
+            }
+        }
+        println!("  Absence is not a guarantee of safety — the DB only covers known threats.");
+        return;
+    }
+
+    println!("  result:      PRESENT — {} finding(s)", r.findings.len());
+    for (i, f) in r.findings.iter().enumerate() {
+        println!();
+        println!("  [{}] {}", i + 1, f.classification);
+        if let Some(ref label) = f.source_label {
+            println!("      source:     {label}");
+        }
+        if let Some(c) = f.confidence {
+            println!("      confidence: {}", confidence_label(c));
+        }
+        println!("      {}", f.detail);
+        if let Some(ref url) = f.reference_url {
+            println!("      reference:  {url}");
+        }
+    }
+}
+
+// --- threat-db sources -----------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+struct SourcesReport {
+    /// True when a DB is installed and the per-source counts are real.
+    db_installed: bool,
+    /// DB build sequence, when installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_sequence: Option<u64>,
+    /// DB build timestamp (Unix epoch seconds), when installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_timestamp: Option<u64>,
+    sources: Vec<SourceInfo>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceInfo {
+    /// Stable machine identifier.
+    id: String,
+    /// Human-readable name.
+    name: String,
+    /// `primary` (signed CI DB) or `supplemental` (user-local overlay).
+    tier: SourceTier,
+    upstream_url: String,
+    /// Live record count for this source, or `null` when no DB is installed.
+    /// Typosquat and popular-package records carry no source byte on disk, so
+    /// the typosquat feed's count is reported under `typosquats` instead.
+    record_count: Option<u64>,
+}
+
+/// `tirith threat-db sources`.
+pub fn sources(json: bool) -> i32 {
+    let db = ThreatDb::cached();
+    let breakdown = db.as_ref().map(|d| d.source_breakdown());
+    let stats = db.as_ref().map(|d| d.stats());
+
+    let mut source_infos = Vec::new();
+    for src in ThreatSource::ALL {
+        // EcosystemsTyposquat's records live in the typosquat section, which
+        // has no per-record source byte; report its count as the typosquat
+        // total so the number is honest rather than a misleading 0.
+        let record_count = breakdown.as_ref().map(|b| {
+            if src == ThreatSource::EcosystemsTyposquat {
+                b.typosquat_count
+            } else {
+                b.count_for(src)
+            }
+        });
+        source_infos.push(SourceInfo {
+            id: src.as_str().to_string(),
+            name: src.label().to_string(),
+            tier: src.tier(),
+            upstream_url: src.upstream_url().to_string(),
+            record_count,
+        });
+    }
+
+    let report = SourcesReport {
+        db_installed: db.is_some(),
+        build_sequence: stats.as_ref().map(|s| s.build_sequence),
+        build_timestamp: stats.as_ref().map(|s| s.build_timestamp),
+        sources: source_infos,
+    };
+
+    snapshot_current_db();
+
+    if json {
+        print_json_value(&report);
+    } else {
+        print_sources_human(&report, breakdown.as_ref().map(|b| b.popular_count));
+    }
+    0
+}
+
+fn print_sources_human(r: &SourcesReport, popular_count: Option<u64>) {
+    println!("threat-db sources");
+    if r.db_installed {
+        if let (Some(seq), Some(ts)) = (r.build_sequence, r.build_timestamp) {
+            println!("  DB version {seq}, built {}", format_epoch(ts));
+        }
+    } else {
+        println!("  threat DB not installed — counts unavailable");
+        println!("  (run 'tirith threat-db update' to install the signed DB)");
+    }
+
+    for tier in [SourceTier::Primary, SourceTier::Supplemental] {
+        let heading = match tier {
+            SourceTier::Primary => "Primary feeds (signed CI database)",
+            SourceTier::Supplemental => "Supplemental feeds (optional user-local overlay)",
+        };
+        println!();
+        println!("  {heading}");
+        for s in r.sources.iter().filter(|s| s.tier == tier) {
+            let count = match s.record_count {
+                Some(c) => format!("{c} records"),
+                None => "count unavailable".to_string(),
+            };
+            println!("    {:<26} {}", s.name, count);
+            println!("      {}", s.upstream_url);
+        }
+    }
+
+    if r.db_installed {
+        println!();
+        println!(
+            "  Note: typosquat counts are reported under the ecosyste.ms Typosquats feed; \
+             popular-package baselines ({} entries) are not a threat feed.",
+            popular_count.unwrap_or(0)
+        );
+    }
+}
+
+// --- threat-db health ------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+struct HealthReport {
+    /// DB file is present on disk.
+    installed: bool,
+    /// Filesystem path the DB is expected at.
+    path: Option<String>,
+    /// Ed25519 signature verified (`None` when not installed or load failed).
+    signature_valid: Option<bool>,
+    /// DB age in hours since its build timestamp.
+    age_hours: Option<f64>,
+    /// Configured refresh interval in hours (`auto_update_hours`, 0 = disabled).
+    refresh_interval_hours: u64,
+    /// DB is older than 2x the refresh interval (never true when refresh is disabled).
+    stale: bool,
+    /// DB build sequence (the version).
+    build_sequence: Option<u64>,
+    /// DB build timestamp (Unix epoch seconds).
+    build_timestamp: Option<u64>,
+    counts: Option<CategoryCounts>,
+    /// Status of the optional user-local supplemental overlay.
+    supplemental: SupplementalHealth,
+    /// Load/parse error, when the DB file exists but could not be read.
+    error: Option<String>,
+    /// Overall one-word health: `ok`, `stale`, `not_installed`, or `error`.
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SupplementalHealth {
+    /// A supplemental overlay file exists on disk.
+    present: bool,
+    path: Option<String>,
+}
+
+/// `tirith threat-db health`.
+pub fn health(json: bool) -> i32 {
+    let report = gather_health();
+    snapshot_current_db();
+
+    let exit = if report.error.is_some() { 1 } else { 0 };
+
+    if json {
+        print_json_value(&report);
+    } else {
+        print_health_human(&report);
+    }
+    exit
+}
+
+fn gather_health() -> HealthReport {
+    let db_path = ThreatDb::default_path();
+    let path_str = db_path.as_ref().map(|p| p.display().to_string());
+    let policy = policy::Policy::discover(None);
+    let refresh_interval_hours = policy.threat_intel.auto_update_hours;
+
+    let supplemental_path = ThreatDb::supplemental_path();
+    let supplemental = SupplementalHealth {
+        present: supplemental_path
+            .as_ref()
+            .map(|p| p.exists())
+            .unwrap_or(false),
+        path: supplemental_path.map(|p| p.display().to_string()),
+    };
+
+    let exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    if !exists {
+        return HealthReport {
+            installed: false,
+            path: path_str,
+            signature_valid: None,
+            age_hours: None,
+            refresh_interval_hours,
+            stale: false,
+            build_sequence: None,
+            build_timestamp: None,
+            counts: None,
+            supplemental,
+            error: None,
+            status: "not_installed".to_string(),
+        };
+    }
+
+    let db_path_ref = db_path.as_ref().expect("path exists when exists==true");
+    match ThreatDb::load_from_path(db_path_ref, 0) {
+        Ok(db) => {
+            let sig_valid = db.verify_signature().is_ok();
+            let stats = db.stats();
+            let age_secs = unix_now().saturating_sub(stats.build_timestamp);
+            let age_hours = age_secs as f64 / 3600.0;
+            // Stale = older than 2x the refresh interval; a disabled refresh
+            // (interval 0) means the DB is never considered stale.
+            let stale =
+                refresh_interval_hours != 0 && age_hours > (refresh_interval_hours as f64 * 2.0);
+            let counts = CategoryCounts {
+                packages: stats.package_count as u64,
+                hostnames: stats.hostname_count as u64,
+                ips: stats.ip_count as u64,
+                typosquats: stats.typosquat_count as u64,
+                popular: stats.popular_count as u64,
+            };
+            let status = if !sig_valid {
+                "error"
+            } else if stale {
+                "stale"
+            } else {
+                "ok"
+            };
+            HealthReport {
+                installed: true,
+                path: path_str,
+                signature_valid: Some(sig_valid),
+                age_hours: Some(age_hours),
+                refresh_interval_hours,
+                stale,
+                build_sequence: Some(stats.build_sequence),
+                build_timestamp: Some(stats.build_timestamp),
+                counts: Some(counts),
+                supplemental,
+                error: if sig_valid {
+                    None
+                } else {
+                    Some("Ed25519 signature verification failed".to_string())
+                },
+                status: status.to_string(),
+            }
+        }
+        Err(e) => HealthReport {
+            installed: true,
+            path: path_str,
+            signature_valid: None,
+            age_hours: None,
+            refresh_interval_hours,
+            stale: false,
+            build_sequence: None,
+            build_timestamp: None,
+            counts: None,
+            supplemental,
+            error: Some(format!("{e}")),
+            status: "error".to_string(),
+        },
+    }
+}
+
+fn print_health_human(r: &HealthReport) {
+    println!("threat-db health");
+
+    if !r.installed {
+        println!("  status:        NOT INSTALLED");
+        if let Some(ref p) = r.path {
+            println!("  expected at:   {p}");
+        }
+        println!("  Hint: run 'tirith threat-db update' to install the signed DB.");
+        print_supplemental_health(&r.supplemental);
+        return;
+    }
+
+    if let Some(ref err) = r.error {
+        println!("  status:        ERROR — {err}");
+        if let Some(ref p) = r.path {
+            println!("  path:          {p}");
+        }
+        println!("  Hint: re-download with 'tirith threat-db update --force'.");
+        print_supplemental_health(&r.supplemental);
+        return;
+    }
+
+    let status_label = match r.status.as_str() {
+        "ok" => "OK",
+        "stale" => "STALE",
+        other => other,
+    };
+    println!("  status:        {status_label}");
+    if let Some(ref p) = r.path {
+        println!("  path:          {p}");
+    }
+    match r.signature_valid {
+        Some(true) => println!("  signature:     valid (Ed25519)"),
+        Some(false) => println!("  signature:     INVALID"),
+        None => println!("  signature:     unknown"),
+    }
+    if let Some(seq) = r.build_sequence {
+        println!("  version:       {seq}");
+    }
+    if let Some(ts) = r.build_timestamp {
+        println!("  built:         {}", format_epoch(ts));
+    }
+    if let Some(age) = r.age_hours {
+        println!("  age:           {}", format_age(age));
+    }
+    if r.refresh_interval_hours == 0 {
+        println!("  refresh:       auto-update disabled (auto_update_hours = 0)");
+    } else {
+        println!(
+            "  refresh:       every {}h (stale after {}h)",
+            r.refresh_interval_hours,
+            r.refresh_interval_hours * 2
+        );
+        if r.stale {
+            println!("  -> DB is stale; run 'tirith threat-db update'.");
+        }
+    }
+    if let Some(ref c) = r.counts {
+        println!(
+            "  entries:       {} total — {} packages, {} hostnames, {} IPs, {} typosquats, {} popular",
+            c.total(),
+            c.packages,
+            c.hostnames,
+            c.ips,
+            c.typosquats,
+            c.popular
+        );
+    }
+    print_supplemental_health(&r.supplemental);
+}
+
+fn print_supplemental_health(s: &SupplementalHealth) {
+    if s.present {
+        println!("  supplemental:  present (user-local opt-in feed overlay)");
+    } else {
+        println!("  supplemental:  none (no opt-in feeds configured)");
+    }
+}
+
+// --- threat-db diff --------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+struct DiffReport {
+    /// The `--since` argument as the user supplied it.
+    since: String,
+    /// How `--since` was interpreted: `version` or `date`.
+    since_kind: String,
+    /// The baseline snapshot `diff` compared against, if one was found.
+    baseline: Option<SnapshotSummary>,
+    /// The current DB observation.
+    current: Option<SnapshotSummary>,
+    /// Per-category count deltas (current - baseline). Positive = added.
+    delta: Option<CountDelta>,
+    /// Per-source count deltas, keyed by stable source id.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    source_delta: std::collections::BTreeMap<String, i64>,
+    /// Honest statement of what this diff can and cannot show.
+    limitation: String,
+    /// Set when the diff could not be produced (no DB, no baseline, …).
+    note: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SnapshotSummary {
+    build_sequence: u64,
+    build_timestamp: u64,
+    recorded_at: u64,
+    counts: CategoryCounts,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CountDelta {
+    packages: i64,
+    hostnames: i64,
+    ips: i64,
+    typosquats: i64,
+    popular: i64,
+    total: i64,
+}
+
+fn delta_of(current: &CategoryCounts, baseline: &CategoryCounts) -> CountDelta {
+    let d = |c: u64, b: u64| c as i64 - b as i64;
+    CountDelta {
+        packages: d(current.packages, baseline.packages),
+        hostnames: d(current.hostnames, baseline.hostnames),
+        ips: d(current.ips, baseline.ips),
+        typosquats: d(current.typosquats, baseline.typosquats),
+        popular: d(current.popular, baseline.popular),
+        total: d(current.total(), baseline.total()),
+    }
+}
+
+/// Parse `--since` as either a build-sequence number or an ISO date.
+/// Returns `(kind, version, epoch)` where exactly one of version/epoch is set.
+fn parse_since(since: &str) -> Result<(String, Option<u64>, Option<u64>), String> {
+    let s = since.trim();
+    // A bare integer is a build sequence ("version").
+    if let Ok(version) = s.parse::<u64>() {
+        return Ok(("version".to_string(), Some(version), None));
+    }
+    // Otherwise interpret as a date (YYYY-MM-DD, optionally with time).
+    if let Some(epoch) = parse_iso_date(s) {
+        return Ok(("date".to_string(), None, Some(epoch)));
+    }
+    Err(format!(
+        "could not parse --since value '{since}' — expected a DB version number \
+         (e.g. 42) or an ISO date (e.g. 2026-01-15)"
+    ))
+}
+
+/// Parse a `YYYY-MM-DD` (or `YYYY-MM-DDTHH:MM:SS`) date to a Unix epoch.
+/// Deliberately small and dependency-free; only the date part is used.
+fn parse_iso_date(s: &str) -> Option<u64> {
+    let date_part = s.split(['T', ' ']).next().unwrap_or(s);
+    let mut it = date_part.split('-');
+    let year: i64 = it.next()?.parse().ok()?;
+    let month: i64 = it.next()?.parse().ok()?;
+    let day: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from 1970-01-01 to the start of `year`.
+    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for (m, md) in month_days.iter().enumerate() {
+        if (m as i64) + 1 >= month {
+            break;
+        }
+        days += md;
+        if (m as i64) + 1 == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+    Some((days * 86400) as u64)
+}
+
+/// `tirith threat-db diff --since <version-or-date>`.
+pub fn diff(since: &str, json: bool) -> i32 {
+    // Fold the current DB into the history first, so a brand-new install can
+    // still be a baseline for a later diff.
+    snapshot_current_db();
+
+    let limitation = "The threat DB format retains no per-entry history, so this diff reports \
+         category and per-source COUNT deltas between recorded snapshots — not the \
+         exact entries added or removed. Snapshots accrue each time a transparency \
+         command runs."
+        .to_string();
+
+    let (since_kind, want_version, want_epoch) = match parse_since(since) {
+        Ok(v) => v,
+        Err(e) => {
+            if json {
+                print_json_value(&DiffReport {
+                    since: since.to_string(),
+                    since_kind: "invalid".to_string(),
+                    baseline: None,
+                    current: None,
+                    delta: None,
+                    source_delta: Default::default(),
+                    limitation,
+                    note: Some(e.clone()),
+                });
+            } else {
+                eprintln!("tirith: {e}");
+            }
+            return 1;
+        }
+    };
+
+    let history = load_history();
+    let current = current_snapshot();
+
+    // Pick the baseline: the newest snapshot at or before the requested point.
+    //
+    // For a version, compare against the DB build sequence. For a date,
+    // compare against `recorded_at` (when tirith observed that DB) — the user
+    // asking "diff since <date>" wants the DB tirith held on that date, not a
+    // DB whose CI build timestamp happens to predate it.
+    let baseline = history
+        .iter()
+        .filter(|s| match (want_version, want_epoch) {
+            (Some(v), _) => s.build_sequence <= v,
+            (_, Some(e)) => s.recorded_at <= e,
+            _ => false,
+        })
+        .max_by_key(|s| (s.recorded_at, s.build_sequence))
+        .cloned();
+
+    let summarize = |s: &DbSnapshot| SnapshotSummary {
+        build_sequence: s.build_sequence,
+        build_timestamp: s.build_timestamp,
+        recorded_at: s.recorded_at,
+        counts: s.counts.clone(),
+    };
+
+    let (delta, source_delta, note) = match (&baseline, &current) {
+        (Some(b), Some(c)) => {
+            let d = delta_of(&c.counts, &b.counts);
+            let mut sd: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+            for (src, cur_count) in &c.sources {
+                let base_count = b.sources.get(src).copied().unwrap_or(0);
+                let diff = *cur_count as i64 - base_count as i64;
+                if diff != 0 {
+                    sd.insert(src.clone(), diff);
+                }
+            }
+            let note = if b.build_sequence == c.build_sequence {
+                Some(
+                    "Baseline and current snapshot are the same DB version — no \
+                     change since the requested point."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            (Some(d), sd, note)
+        }
+        (None, Some(_)) => (
+            None,
+            Default::default(),
+            Some(format!(
+                "No snapshot was recorded at or before '{since}'. tirith only began \
+                 retaining snapshots from the first transparency command after this \
+                 feature was installed; a diff needs at least one earlier snapshot. \
+                 Run 'tirith threat-db health' periodically to build up history."
+            )),
+        ),
+        (_, None) => (
+            None,
+            Default::default(),
+            Some(
+                "Threat DB is not installed — nothing to diff. Run \
+                 'tirith threat-db update' first."
+                    .to_string(),
+            ),
+        ),
+    };
+
+    let report = DiffReport {
+        since: since.to_string(),
+        since_kind,
+        baseline: baseline.as_ref().map(summarize),
+        current: current.as_ref().map(summarize),
+        delta,
+        source_delta,
+        limitation,
+        note,
+    };
+
+    if json {
+        print_json_value(&report);
+    } else {
+        print_diff_human(&report);
+    }
+    0
+}
+
+fn print_diff_human(r: &DiffReport) {
+    println!("threat-db diff (since {} = {})", r.since, r.since_kind);
+    println!("  note: {}", r.limitation);
+
+    if let (Some(b), Some(c)) = (&r.baseline, &r.current) {
+        println!();
+        println!(
+            "  baseline:  DB v{} built {} (snapshot recorded {})",
+            b.build_sequence,
+            format_epoch(b.build_timestamp),
+            format_epoch(b.recorded_at)
+        );
+        println!(
+            "  current:   DB v{} built {}",
+            c.build_sequence,
+            format_epoch(c.build_timestamp)
+        );
+        if let Some(ref d) = r.delta {
+            println!();
+            println!("  count change (current - baseline):");
+            print_delta_line("packages", d.packages);
+            print_delta_line("hostnames", d.hostnames);
+            print_delta_line("IPs", d.ips);
+            print_delta_line("typosquats", d.typosquats);
+            print_delta_line("popular", d.popular);
+            print_delta_line("TOTAL", d.total);
+        }
+        if !r.source_delta.is_empty() {
+            println!();
+            println!("  per-source count change:");
+            for (src, delta) in &r.source_delta {
+                print_delta_line(src, *delta);
+            }
+        }
+    }
+
+    if let Some(ref note) = r.note {
+        println!();
+        println!("  {note}");
+    }
+}
+
+fn print_delta_line(label: &str, delta: i64) {
+    let sign = if delta > 0 {
+        format!("+{delta}")
+    } else {
+        delta.to_string()
+    };
+    println!("    {label:<14} {sign}");
+}
+
+// --- shared output helpers -------------------------------------------------
+
+fn print_json_value(value: &impl serde::Serialize) {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("tirith: JSON serialization failed: {e}"),
+    }
+}
+
+/// Format a Unix epoch as a UTC `YYYY-MM-DD HH:MM:SS` string (dependency-free).
+fn format_epoch(epoch: u64) -> String {
+    let days = epoch / 86400;
+    let secs_of_day = epoch % 86400;
+    let (hh, mm, ss) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+
+    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mut year: i64 = 1970;
+    let mut remaining = days as i64;
+    loop {
+        let year_len = if is_leap(year) { 366 } else { 365 };
+        if remaining < year_len {
+            break;
+        }
+        remaining -= year_len;
+        year += 1;
+    }
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1;
+    for (m, md) in month_days.iter().enumerate() {
+        let mut len = *md;
+        if m == 1 && is_leap(year) {
+            len += 1;
+        }
+        if remaining < len {
+            break;
+        }
+        remaining -= len;
+        month += 1;
+    }
+    let day = remaining + 1;
+    format!("{year:04}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+/// Format an age in hours as a compact human string.
+fn format_age(hours: f64) -> String {
+    if hours < 1.0 {
+        format!("{:.0} minutes", hours * 60.0)
+    } else if hours < 48.0 {
+        format!("{hours:.0} hours")
+    } else {
+        format!("{:.1} days", hours / 24.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2172,5 +3356,296 @@ mod tests {
             !latch.load(Ordering::Relaxed),
             "an offline call must not consume the once-per-process latch"
         );
+    }
+
+    // --- threat-db transparency: indicator parsing -------------------------
+
+    #[test]
+    fn parse_indicator_recognizes_ipv4() {
+        let p = parse_indicator("203.0.113.50");
+        assert_eq!(p.kind, IndicatorKind::Ip);
+        assert_eq!(p.value, "203.0.113.50");
+        assert!(p.ecosystem.is_none());
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_ecosystem_prefix() {
+        let p = parse_indicator("npm:left-pad");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.ecosystem, Some(Ecosystem::Npm));
+        assert_eq!(p.value, "left-pad");
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_ecosystem_prefix_with_version() {
+        let p = parse_indicator("pypi:requests@2.0.0");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.ecosystem, Some(Ecosystem::PyPI));
+        assert_eq!(p.value, "requests");
+        assert_eq!(p.version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn parse_indicator_host_colon_port_is_not_a_package() {
+        // `example.com:8080` has a `:` but `example.com` is not an ecosystem,
+        // so it must fall through to the domain branch, not become a package.
+        let p = parse_indicator("example.com:8080");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_name_at_version() {
+        let p = parse_indicator("lodash@4.17.21");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert!(p.ecosystem.is_none());
+        assert_eq!(p.value, "lodash");
+        assert_eq!(p.version.as_deref(), Some("4.17.21"));
+    }
+
+    #[test]
+    fn parse_indicator_scoped_npm_package_is_not_split_on_leading_at() {
+        // A leading `@` is an npm scope, not a version separator.
+        let p = parse_indicator("@angular/core");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "@angular/core");
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_scoped_npm_package_with_version() {
+        let p = parse_indicator("@angular/core@17.0.0");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "@angular/core");
+        assert_eq!(p.version.as_deref(), Some("17.0.0"));
+    }
+
+    #[test]
+    fn parse_indicator_dotted_token_is_domain() {
+        let p = parse_indicator("evil.example.com");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+        assert_eq!(p.value, "evil.example.com");
+    }
+
+    #[test]
+    fn parse_indicator_domain_is_lowercased() {
+        let p = parse_indicator("EVIL.Example.COM");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+        assert_eq!(p.value, "evil.example.com");
+    }
+
+    #[test]
+    fn parse_indicator_bare_name_is_package() {
+        // No dot, no slash — a bare package name.
+        let p = parse_indicator("react");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "react");
+    }
+
+    #[test]
+    fn split_at_version_rejects_missing_parts() {
+        assert!(split_at_version("react").is_none());
+        assert!(split_at_version("react@").is_none());
+        assert!(split_at_version("@1.0.0").is_none());
+        assert_eq!(
+            split_at_version("react@1.0.0"),
+            Some(("react".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    // --- threat-db transparency: --since parsing ---------------------------
+
+    #[test]
+    fn parse_since_accepts_version_number() {
+        let (kind, version, epoch) = parse_since("42").unwrap();
+        assert_eq!(kind, "version");
+        assert_eq!(version, Some(42));
+        assert_eq!(epoch, None);
+    }
+
+    #[test]
+    fn parse_since_accepts_iso_date() {
+        let (kind, version, epoch) = parse_since("2026-01-15").unwrap();
+        assert_eq!(kind, "date");
+        assert_eq!(version, None);
+        // 2026-01-15 00:00:00 UTC = 1768435200.
+        assert_eq!(epoch, Some(1768435200));
+    }
+
+    #[test]
+    fn parse_since_rejects_garbage() {
+        assert!(parse_since("not-a-date").is_err());
+        assert!(parse_since("2026-13-01").is_err());
+        assert!(parse_since("2026-01-99").is_err());
+    }
+
+    #[test]
+    fn parse_iso_date_epoch_zero_is_unix_epoch() {
+        assert_eq!(parse_iso_date("1970-01-01"), Some(0));
+    }
+
+    #[test]
+    fn parse_iso_date_handles_leap_year() {
+        // 2024-02-29 is a valid leap day; 2024-03-01 is the day after.
+        let feb29 = parse_iso_date("2024-02-29").unwrap();
+        let mar01 = parse_iso_date("2024-03-01").unwrap();
+        assert_eq!(mar01 - feb29, 86400);
+    }
+
+    #[test]
+    fn parse_iso_date_accepts_datetime_suffix() {
+        // Only the date part is used; a time suffix is tolerated.
+        assert_eq!(
+            parse_iso_date("2026-01-15T12:30:00"),
+            parse_iso_date("2026-01-15")
+        );
+    }
+
+    #[test]
+    fn format_epoch_round_trips_with_parse_iso_date() {
+        // A date parsed to an epoch and formatted back must show the same date.
+        let epoch = parse_iso_date("2026-05-21").unwrap();
+        assert!(format_epoch(epoch).starts_with("2026-05-21 00:00:00"));
+    }
+
+    #[test]
+    fn format_epoch_known_timestamp() {
+        // 1700000000 = 2023-11-14 22:13:20 UTC (the fixture DB build time).
+        assert_eq!(format_epoch(1700000000), "2023-11-14 22:13:20 UTC");
+    }
+
+    // --- threat-db transparency: count delta -------------------------------
+
+    #[test]
+    fn delta_of_computes_signed_category_changes() {
+        let baseline = CategoryCounts {
+            packages: 10,
+            hostnames: 5,
+            ips: 3,
+            typosquats: 2,
+            popular: 100,
+        };
+        let current = CategoryCounts {
+            packages: 12,
+            hostnames: 5,
+            ips: 1,
+            typosquats: 4,
+            popular: 100,
+        };
+        let d = delta_of(&current, &baseline);
+        assert_eq!(d.packages, 2);
+        assert_eq!(d.hostnames, 0);
+        assert_eq!(d.ips, -2);
+        assert_eq!(d.typosquats, 2);
+        assert_eq!(d.popular, 0);
+        assert_eq!(d.total, 2);
+    }
+
+    #[test]
+    fn category_counts_total_sums_all_sections() {
+        let c = CategoryCounts {
+            packages: 1,
+            hostnames: 2,
+            ips: 4,
+            typosquats: 8,
+            popular: 16,
+        };
+        assert_eq!(c.total(), 31);
+    }
+
+    // --- threat-db transparency: snapshot history --------------------------
+
+    #[test]
+    fn record_snapshot_dedups_on_build_sequence() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let snap = |seq: u64, recorded: u64| DbSnapshot {
+            recorded_at: recorded,
+            build_sequence: seq,
+            build_timestamp: 1_700_000_000,
+            signature_valid: true,
+            counts: CategoryCounts::default(),
+            sources: Default::default(),
+        };
+
+        record_snapshot(&snap(42, 1000));
+        // Same build_sequence — must NOT append a second line.
+        record_snapshot(&snap(42, 2000));
+        record_snapshot(&snap(43, 3000));
+
+        let history = load_history();
+        assert_eq!(
+            history.len(),
+            2,
+            "duplicate build_sequence should be skipped"
+        );
+        assert_eq!(history[0].build_sequence, 42);
+        assert_eq!(history[1].build_sequence, 43);
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn record_snapshot_caps_history_length() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        for seq in 0..(HISTORY_MAX_LINES as u64 + 20) {
+            record_snapshot(&DbSnapshot {
+                recorded_at: 1000 + seq,
+                build_sequence: seq,
+                build_timestamp: 1_700_000_000,
+                signature_valid: true,
+                counts: CategoryCounts::default(),
+                sources: Default::default(),
+            });
+        }
+
+        let history = load_history();
+        assert_eq!(
+            history.len(),
+            HISTORY_MAX_LINES,
+            "history must be capped at HISTORY_MAX_LINES"
+        );
+        // The oldest entries are dropped; the newest must be retained.
+        assert_eq!(
+            history.last().unwrap().build_sequence,
+            HISTORY_MAX_LINES as u64 + 19
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn load_history_skips_corrupt_lines() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let state = tmp.path().join("tirith");
+        std::fs::create_dir_all(&state).unwrap();
+        let valid = r#"{"recorded_at":1000,"build_sequence":1,"build_timestamp":1700000000,"signature_valid":true,"counts":{"packages":0,"hostnames":0,"ips":0,"typosquats":0,"popular":0},"sources":{}}"#;
+        std::fs::write(
+            state.join(HISTORY_FILE),
+            format!("not json\n{valid}\n\nalso not json\n"),
+        )
+        .unwrap();
+
+        let history = load_history();
+        assert_eq!(history.len(), 1, "only the one valid line should parse");
+        assert_eq!(history[0].build_sequence, 1);
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn confidence_label_covers_all_levels() {
+        assert_eq!(confidence_label(Confidence::Low), "low");
+        assert_eq!(confidence_label(Confidence::Medium), "medium");
+        assert_eq!(confidence_label(Confidence::Confirmed), "confirmed");
     }
 }

@@ -2247,3 +2247,268 @@ fn doctor_compat_surfaces_tirith_status_for_non_bash_shell() {
          got:\n{stdout}"
     );
 }
+
+// ===========================================================================
+// Threat-DB transparency subcommands (roadmap M2 item 11):
+// `threat-db explain | sources | health | diff`.
+//
+// These exercise the real binary against the signed fixture DB at
+// `tests/fixtures/test-threatdb.dat`. Each test isolates `XDG_STATE_HOME` so
+// the snapshot-history file is written into a tempdir, never the real home.
+// ===========================================================================
+
+/// Path to the signed test threat DB fixture.
+fn test_threatdb_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/test-threatdb.dat")
+}
+
+/// Run `tirith threat-db <args>` with the fixture DB and an isolated state dir.
+/// Returns (stdout, stderr, exit_code).
+fn run_threatdb(args: &[&str], state: &std::path::Path) -> (String, String, i32) {
+    let fixture = test_threatdb_fixture();
+    let out = tirith()
+        .arg("threat-db")
+        .args(args)
+        .env("TIRITH_THREATDB_PATH", &fixture)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .output()
+        .expect("failed to run tirith threat-db");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn threatdb_explain_known_malicious_package() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(
+        &["explain", "npm:evil-package@1.0.0", "--format", "json"],
+        state.path(),
+    );
+    assert_eq!(code, 0, "explain should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["present"], true, "evil-package@1.0.0 must be present");
+    assert_eq!(v["kind"], "package");
+    assert_eq!(v["findings"][0]["classification"], "malicious_package");
+    assert_eq!(v["findings"][0]["source"], "ossf_malicious");
+}
+
+#[test]
+fn threatdb_explain_absent_indicator_says_so() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["explain", "definitely-not-in-db.example"], state.path());
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("not present"),
+        "an absent indicator must be reported plainly; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not a guarantee of safety"),
+        "explain must caveat that absence is not safety; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn threatdb_explain_typosquat_and_lookalike() {
+    // `reacct` is a known typosquat of `react` in the fixture, and is also
+    // edit-distance 1 from the popular package `react`.
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["explain", "reacct", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["present"], true);
+    let classes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["classification"].as_str().unwrap())
+        .collect();
+    assert!(classes.contains(&"typosquat"), "got {classes:?}");
+    assert!(classes.contains(&"popular_lookalike"), "got {classes:?}");
+}
+
+#[test]
+fn threatdb_explain_ip_indicator() {
+    // 203.0.113.50 is a Feodo Tracker IP in the fixture DB.
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(
+        &["explain", "203.0.113.50", "--format", "json"],
+        state.path(),
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["kind"], "ip");
+    assert_eq!(v["present"], true);
+    assert_eq!(v["findings"][0]["classification"], "malicious_ip");
+    assert_eq!(v["findings"][0]["source"], "feodo_tracker");
+}
+
+#[test]
+fn threatdb_sources_lists_all_feeds_with_counts() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["sources", "--format", "json"], state.path());
+    assert_eq!(code, 0, "sources should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("sources JSON");
+    assert_eq!(v["db_installed"], true);
+    let sources = v["sources"].as_array().expect("sources array");
+    // All 11 ThreatSource variants must be listed.
+    assert_eq!(sources.len(), 11, "every threat source must be listed");
+    // The fixture has 2 OSSF-malicious package records.
+    let ossf = sources
+        .iter()
+        .find(|s| s["id"] == "ossf_malicious")
+        .expect("ossf_malicious source");
+    assert_eq!(ossf["record_count"], 2);
+    assert_eq!(ossf["tier"], "primary");
+    // A supplemental source must be tagged supplemental and have 0 records
+    // (the fixture has no supplemental overlay).
+    let urlhaus = sources
+        .iter()
+        .find(|s| s["id"] == "urlhaus")
+        .expect("urlhaus source");
+    assert_eq!(urlhaus["tier"], "supplemental");
+    assert_eq!(urlhaus["record_count"], 0);
+}
+
+#[test]
+fn threatdb_sources_human_groups_by_tier() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["sources"], state.path());
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Primary feeds") && stdout.contains("Supplemental feeds"),
+        "sources must group feeds by tier; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn threatdb_health_reports_counts_and_signature() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["health", "--format", "json"], state.path());
+    assert_eq!(code, 0, "health on a loadable DB should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+    assert_eq!(v["installed"], true);
+    // The fixture DB is signed with the embedded key, so the signature verifies.
+    assert_eq!(v["signature_valid"], true);
+    // Fixture has 3 packages, 1 IP, 2 typosquats, 4 popular = 10 total.
+    assert_eq!(v["counts"]["packages"], 3);
+    assert_eq!(v["counts"]["ips"], 1);
+    assert_eq!(v["counts"]["typosquats"], 2);
+    assert_eq!(v["counts"]["popular"], 4);
+    // The fixture's build timestamp is far in the past, so it is stale.
+    assert_eq!(v["stale"], true);
+    assert_eq!(v["status"], "stale");
+}
+
+#[test]
+fn threatdb_health_not_installed_reports_cleanly() {
+    let state = tempfile::tempdir().unwrap();
+    // Point at a path that does not exist.
+    let out = tirith()
+        .args(["threat-db", "health", "--format", "json"])
+        .env("TIRITH_THREATDB_PATH", state.path().join("missing.dat"))
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("failed to run tirith threat-db health");
+    assert_eq!(out.status.code(), Some(0), "absent DB is not an error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("health JSON");
+    assert_eq!(v["installed"], false);
+    assert_eq!(v["status"], "not_installed");
+}
+
+#[test]
+fn threatdb_diff_without_baseline_states_limitation() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["diff", "--since", "1", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("diff JSON");
+    // The DB-format-has-no-history limitation must always be stated.
+    assert!(
+        v["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("no per-entry history"),
+        "diff must honestly state the no-history limitation"
+    );
+    // With no earlier snapshot, there is no delta and a note explains why.
+    assert!(v["delta"].is_null());
+    assert!(v["note"].as_str().unwrap().contains("No snapshot"));
+}
+
+#[test]
+fn threatdb_diff_rejects_unparseable_since() {
+    let state = tempfile::tempdir().unwrap();
+    let (_out, err, code) = run_threatdb(&["diff", "--since", "not-a-thing"], state.path());
+    assert_eq!(code, 1, "an unparseable --since must exit non-zero");
+    assert!(
+        err.contains("could not parse"),
+        "diff must report the parse failure on stderr; got:\n{err}"
+    );
+}
+
+#[test]
+fn threatdb_diff_computes_delta_against_seeded_snapshot() {
+    // Seed an older snapshot (DB version 40) directly into the history file,
+    // then `diff --since 40` against the current fixture DB (version 42).
+    let state = tempfile::tempdir().unwrap();
+    let tirith_state = state.path().join("tirith");
+    std::fs::create_dir_all(&tirith_state).unwrap();
+    let seeded = r#"{"recorded_at":1700000000,"build_sequence":40,"build_timestamp":1699000000,"signature_valid":true,"counts":{"packages":1,"hostnames":0,"ips":0,"typosquats":1,"popular":4},"sources":{"ossf_malicious":1}}"#;
+    std::fs::write(tirith_state.join("threatdb-history.jsonl"), seeded).unwrap();
+
+    let (stdout, _err, code) =
+        run_threatdb(&["diff", "--since", "40", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("diff JSON");
+    assert_eq!(v["baseline"]["build_sequence"], 40);
+    assert_eq!(v["current"]["build_sequence"], 42);
+    // Fixture has 3 packages vs seeded 1 → +2; 1 IP vs 0 → +1; 2 typo vs 1 → +1.
+    assert_eq!(v["delta"]["packages"], 2);
+    assert_eq!(v["delta"]["ips"], 1);
+    assert_eq!(v["delta"]["typosquats"], 1);
+    assert_eq!(v["delta"]["total"], 4);
+}
+
+#[test]
+fn threatdb_transparency_commands_write_snapshot_history() {
+    // Any transparency command run against an installed DB must fold a
+    // snapshot into the history file, so `diff` accrues a usable trail.
+    let state = tempfile::tempdir().unwrap();
+    let (_out, _err, code) = run_threatdb(&["health"], state.path());
+    assert_eq!(code, 0);
+    let history = state.path().join("tirith").join("threatdb-history.jsonl");
+    assert!(
+        history.exists(),
+        "a transparency command must record a DB snapshot"
+    );
+    let content = std::fs::read_to_string(&history).unwrap();
+    assert!(
+        content.contains("\"build_sequence\":42"),
+        "snapshot must capture the fixture DB version; got:\n{content}"
+    );
+}
+
+#[test]
+fn threatdb_alias_threatdb_still_works() {
+    // The canonical spelling is `threat-db`; `threatdb` must remain a working
+    // alias.
+    let out = tirith()
+        .args(["threatdb", "sources", "--format", "json"])
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env("XDG_STATE_HOME", tempfile::tempdir().unwrap().path())
+        .output()
+        .expect("failed to run tirith threatdb");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the `threatdb` alias must still work"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sources JSON via alias");
+    assert_eq!(v["sources"].as_array().unwrap().len(), 11);
+}

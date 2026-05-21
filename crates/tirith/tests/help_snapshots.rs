@@ -58,6 +58,10 @@ help_example_tests! {
     help_receipt    => (["receipt", "--help"], "tirith receipt");
     help_checkpoint => (["checkpoint", "--help"], "tirith checkpoint create");
     help_threat_db  => (["threat-db", "--help"], "tirith threat-db update");
+    help_threat_db_explain => (["threat-db", "explain", "--help"], "tirith threat-db explain react");
+    help_threat_db_sources => (["threat-db", "sources", "--help"], "tirith threat-db sources");
+    help_threat_db_health  => (["threat-db", "health", "--help"], "tirith threat-db health");
+    help_threat_db_diff    => (["threat-db", "diff", "--help"], "tirith threat-db diff --since");
     help_daemon     => (["daemon", "--help"], "tirith daemon start");
     help_gateway    => (["gateway", "--help"], "tirith gateway");
     help_license    => (["license", "--help"], "tirith license");
