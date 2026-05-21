@@ -168,11 +168,19 @@ impl IsolatedEnv {
         // Keep the spawned shell from inheriting a double-load guard or a
         // stale bash mode from the developer's own shell.
         env.insert("TERM".to_string(), "xterm-256color".to_string());
-        // Deterministic, isolated session id so tirith's per-session state
-        // never collides across tests.
+        // Unique session id per IsolatedEnv so tirith's per-session state never
+        // collides between concurrently-running tests. `process::id()` alone is
+        // identical for every test in one `cargo test` run (integration tests
+        // share a process); a per-call counter makes it genuinely unique.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
         env.insert(
             "TIRITH_SESSION_ID".to_string(),
-            format!("pty-conformance-{}", std::process::id()),
+            format!(
+                "pty-conformance-{}-{}",
+                std::process::id(),
+                SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
         );
         // Audit log off: tests assert on terminal behaviour, not the log.
         env.insert("TIRITH_LOG".to_string(), "0".to_string());

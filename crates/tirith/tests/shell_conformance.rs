@@ -167,11 +167,11 @@ fn bash_preexec_no_history_duplication() {
     let out = sess.wait_idle(QUIET, SETTLE_MAX);
     sess.close();
 
-    // `history` echoes the literal word once as a keystroke, then lists past
-    // commands. The probe command appears: once as the `history` keystroke
-    // line's neighbour is irrelevant — we count the *command text*. It shows
-    // up once when typed and once in the listing => 2. A duplicate-history
-    // bug pushes that to 3.
+    // `clear_buffer()` was called before `send_line("history")`, so `out` only
+    // holds output from the `history` command onward — the probe string's
+    // "typed" occurrence is no longer in it. The probe appears in `out` at most
+    // once, in the history listing itself: `n >= 1` asserts it was recorded,
+    // and `n <= 2` leaves headroom for a stray terminal-echo artefact.
     let n = count_occurrences(&out, "echo history_probe_5566");
     assert!(
         n <= 2,
@@ -551,7 +551,10 @@ fn fish_blocked_command_does_not_execute() {
         !marker.exists(),
         "fish: a blocked command must not execute (marker file exists)"
     );
-    // The block must also be communicated to the user.
+    // The block must also be communicated to the user. tirith's block output
+    // for a pipe-to-shell carries the verdict ("BLOCKED") plus a remediation
+    // hint — a "tirith run ..." suggestion and a vet pointer to getvet.sh; any
+    // one of those strings confirms the verdict surfaced.
     assert!(
         out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
