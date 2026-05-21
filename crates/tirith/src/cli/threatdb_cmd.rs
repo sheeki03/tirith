@@ -2066,16 +2066,28 @@ fn parse_iso_date(s: &str) -> Option<u64> {
     if it.next().is_some() {
         return None;
     }
-    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    // Reject a day out of range for the actual month — e.g. 2026-02-30 or
+    // 2026-04-31. Without this the arithmetic below would silently roll the
+    // date into the next month, and `diff --since` would select the wrong
+    // baseline instead of erroring on the malformed input.
+    let max_day = if month == 2 && is_leap(year) {
+        29
+    } else {
+        month_days[(month - 1) as usize]
+    };
+    if !(1..=max_day).contains(&day) {
         return None;
     }
     // Days from 1970-01-01 to the start of `year`.
-    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let mut days: i64 = 0;
     for y in 1970..year {
         days += if is_leap(y) { 366 } else { 365 };
     }
-    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     for (m, md) in month_days.iter().enumerate() {
         if (m as i64) + 1 >= month {
             break;
@@ -3491,6 +3503,25 @@ mod tests {
         let feb29 = parse_iso_date("2024-02-29").unwrap();
         let mar01 = parse_iso_date("2024-03-01").unwrap();
         assert_eq!(mar01 - feb29, 86400);
+    }
+
+    #[test]
+    fn parse_iso_date_rejects_day_past_month_length() {
+        // A day in 1..=31 but past the actual month length (2026-02-30,
+        // 2026-04-31) was previously accepted and silently rolled into the next
+        // month — `diff --since` then picked the wrong baseline. It must now be
+        // rejected outright.
+        assert_eq!(parse_iso_date("2026-02-30"), None);
+        assert_eq!(parse_iso_date("2026-04-31"), None);
+        assert_eq!(parse_iso_date("2026-06-31"), None);
+        // 2025 is not a leap year, so Feb 29 is invalid.
+        assert_eq!(parse_iso_date("2025-02-29"), None);
+        // Valid month-ends still parse.
+        assert!(parse_iso_date("2026-02-28").is_some());
+        assert!(parse_iso_date("2026-04-30").is_some());
+        assert!(parse_iso_date("2026-01-31").is_some());
+        // `parse_since` surfaces the rejection as an error, not a wrong baseline.
+        assert!(parse_since("2026-02-30").is_err());
     }
 
     #[test]
