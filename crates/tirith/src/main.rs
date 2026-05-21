@@ -462,15 +462,21 @@ Examples:
         detail: Option<String>,
     },
 
-    /// Manage trusted patterns (allowlist entries with TTL, scoping, and audit)
+    /// Manage trusted patterns (allowlist entries with scope, TTL, and audit)
     #[command(after_help = "\
+Trust is narrow and expiring by default: trust the most specific thing that
+works, and entries expire after 30d unless you pass --permanent. A broad
+pattern (whole domain, wildcard, bare TLD) requires --broad.
+
 Examples:
-  tirith trust add example.com
-  tirith trust add example.com --ttl 7d
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+  tirith trust add example.com --broad --ttl 7d
+  tirith trust add get.docker.com --broad --rule curl_pipe_shell --permanent
   tirith trust list --format json --expired
-  tirith trust remove example.com
-  tirith trust last
-  tirith trust gc")]
+  tirith trust explain example.com
+  tirith trust diff
+  tirith trust gc --expired
+  tirith trust remove example.com")]
     Trust {
         #[command(subcommand)]
         action: TrustAction,
@@ -891,27 +897,50 @@ Examples:
 
 #[derive(Subcommand)]
 enum TrustAction {
-    /// Add a trusted pattern
+    /// Add a trusted pattern (narrow scope and a 30d TTL by default)
     #[command(after_help = "\
+Trust the narrowest thing that works. A specific URL or path is accepted as-is;
+a whole domain, wildcard, or bare TLD is broad and requires --broad. Entries
+expire after 30d unless you pass --permanent or your own --ttl.
+
 Examples:
-  tirith trust add example.com
-  tirith trust add example.com --ttl 7d
-  tirith trust add example.com --rule pipe_to_interpreter")]
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+  tirith trust add example.com --broad --ttl 7d
+  tirith trust add example.com --broad --rule pipe_to_interpreter --permanent
+  tirith trust add example.com --broad --reason \"internal mirror, ticket OPS-42\"")]
     Add {
-        /// Pattern to trust (domain, URL fragment, etc.)
+        /// Pattern to trust (a specific URL/path, or a domain with --broad)
         pattern: String,
-        /// Scope trust to a specific rule ID
+        /// Scope trust to a specific rule ID (narrower than a global trust)
         #[arg(long)]
         rule: Option<String>,
-        /// TTL duration (e.g., 1h, 7d, 30d)
-        #[arg(long)]
+        /// TTL duration (e.g., 1h, 7d, 30d). Default: 30d. Conflicts with --permanent
+        #[arg(long, conflicts_with = "permanent")]
         ttl: Option<String>,
+        /// Never expire this entry (opt out of the default TTL)
+        #[arg(long)]
+        permanent: bool,
+        /// Accept a broad pattern (whole domain, wildcard, or bare TLD)
+        #[arg(long)]
+        broad: bool,
+        /// Free-text reason recorded with the entry (shown by `trust explain`)
+        #[arg(long)]
+        reason: Option<String>,
         /// Scope: user (default) or repo
         #[arg(long, default_value = "user")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
-    /// List trusted patterns from all sources
+    /// List trusted patterns from all sources, with scope visualization
     #[command(after_help = "\
+Each row shows the entry's scope class (exact / substring / domain / wildcard /
+bare-TLD); a '!' marks a dangerously broad entry.
+
 Examples:
   tirith trust list
   tirith trust list --format json --expired")]
@@ -932,6 +961,37 @@ Examples:
         #[arg(long, default_value = "all")]
         scope: String,
     },
+    /// Explain a trust entry: scope, coverage, expiry, and why it was added
+    #[command(after_help = "\
+Examples:
+  tirith trust explain example.com
+  tirith trust explain example.com --format json")]
+    Explain {
+        /// Pattern of the entry to explain
+        pattern: String,
+        /// Scope: user, repo, or all (default)
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show what changed in the trust set since the last snapshot
+    #[command(after_help = "\
+Examples:
+  tirith trust diff
+  tirith trust diff --format json")]
+    Diff {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// Remove a trusted pattern
     #[command(after_help = "\
 Examples:
@@ -951,14 +1011,24 @@ Examples:
 Examples:
   tirith trust last")]
     Last,
-    /// Remove expired entries from trust stores
+    /// Garbage-collect expired entries from trust stores
     #[command(after_help = "\
 Examples:
-  tirith trust gc")]
+  tirith trust gc --expired
+  tirith trust gc --expired --scope user")]
     Gc {
+        /// Collect expired entries (the default and only mode today)
+        #[arg(long)]
+        expired: bool,
         /// Scope: user, repo, or all (default)
         #[arg(long, default_value = "all")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -1400,8 +1470,25 @@ fn main() {
                 pattern,
                 rule,
                 ttl,
+                permanent,
+                broad,
+                reason,
                 scope,
-            } => cli::trust::add(&pattern, rule.as_deref(), ttl.as_deref(), &scope),
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::add(
+                    &pattern,
+                    rule.as_deref(),
+                    ttl.as_deref(),
+                    permanent,
+                    broad,
+                    reason.as_deref(),
+                    &scope,
+                    json,
+                )
+            }
             TrustAction::List {
                 rule,
                 format,
@@ -1410,7 +1497,21 @@ fn main() {
                 scope,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::snapshot_current_trust();
                 cli::trust::list(rule.as_deref(), json, expired, &scope)
+            }
+            TrustAction::Explain {
+                pattern,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::explain(&pattern, &scope, json)
+            }
+            TrustAction::Diff { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::diff(json)
             }
             TrustAction::Remove {
                 pattern,
@@ -1418,7 +1519,15 @@ fn main() {
                 scope,
             } => cli::trust::remove(&pattern, rule.as_deref(), &scope),
             TrustAction::Last => cli::trust::last(),
-            TrustAction::Gc { scope } => cli::trust::gc(&scope),
+            TrustAction::Gc {
+                expired,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::gc(expired, &scope, json)
+            }
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),

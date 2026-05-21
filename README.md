@@ -606,6 +606,7 @@ tirith daemon stop
 | `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
 | `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
 | `tirith warnings` | Show accumulated session warnings, suggest trust entries. `--summary` for shell exit hooks |
+| `tirith trust {add,list,explain,diff,remove,gc}` | Manage trusted patterns: narrow scope and a 30-day TTL by default, scope visualization, `trust explain`, `trust diff` |
 | `tirith audit {export,stats,report}` | Audit log management for compliance |
 | `tirith init` | Print the shell hook for your shell profile |
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
@@ -704,6 +705,34 @@ allowlist_rules:
     patterns:
       - "get.docker.com"
 ```
+
+### Managing trust from the CLI
+
+`tirith trust` manages trusted patterns without hand-editing policy YAML. Trust
+is **narrow and expiring by default**: trust the most specific thing that
+works, and entries expire after 30 days unless you opt out.
+
+```bash
+# Narrowest scope — a specific URL or path is accepted as-is, 30-day TTL.
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+
+# A whole domain / wildcard / bare TLD is broad — it must be opted into.
+tirith trust add get.docker.com --broad --rule curl_pipe_shell
+
+# Opt out of the default TTL, and record why the entry exists.
+tirith trust add example.com --broad --permanent --reason "internal mirror, OPS-42"
+
+tirith trust list                 # scope class per entry; '!' marks broad ones
+tirith trust explain example.com  # what it covers, when it expires, why added
+tirith trust diff                 # what changed in the trust set
+tirith trust gc --expired         # drop expired entries
+```
+
+Each entry's **scope** is classified as `exact`, `substring`, `domain`,
+`wildcard`, or `bare-TLD`. A broad scope (`domain` / `wildcard` / `bare-TLD`)
+requires `--broad`, so a sweeping allow is always a deliberate choice. All
+subcommands support `--format json`. Trust stores written by older versions of
+tirith keep working unchanged — an entry with no TTL is treated as permanent.
 
 ### Escalation and action overrides
 

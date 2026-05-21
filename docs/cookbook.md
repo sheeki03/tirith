@@ -182,3 +182,26 @@ allowlist:
   - "get.docker.com"
   - "raw.githubusercontent.com/org/repo"
 ```
+
+### CLI: manage trust without editing YAML
+
+`tirith trust` does the same thing from the command line, and steers you
+toward the narrowest scope that works. Trusting a specific path is accepted
+as-is; trusting a whole domain is broad and must be opted into with `--broad`.
+Entries expire after 30 days by default, so a temporary allow does not linger.
+
+```bash
+# Narrow: trust one exact resource. Expires in 30 days.
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+
+# Broad: trust a whole domain for one rule only. --broad is required.
+tirith trust add get.docker.com --broad --rule curl_pipe_shell
+
+tirith trust list                 # see every entry, its scope, and its TTL
+tirith trust explain get.docker.com
+tirith trust diff                 # what changed since last time
+tirith trust gc --expired         # remove entries whose TTL has passed
+```
+
+Use `--permanent` if an entry genuinely should never expire, and `--reason`
+to record why it was added — `tirith trust explain` shows it back to you.
