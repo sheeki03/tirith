@@ -70,10 +70,12 @@ the following:
 - **CLI deprecation policy** — flags and behaviors are removed only through a
   documented deprecation cycle, never abruptly.
 
-These criteria are applied **first** to the integration-critical commands —
-`check`, `scan`, `doctor`, and the MCP tools — because shell hooks, CI
-pipelines, and AI agents depend on them most directly. Other experimental
-commands graduate after the integration-critical surface is locked down.
+These criteria are prioritised for the **experimental** integration-critical
+surface — `scan`, `doctor`, and the MCP tools — because CI pipelines and AI
+agents depend on them most directly. (`check` is already Stable; the
+already-stable commands are held to these same guarantees as maintenance
+invariants.) Other experimental commands graduate after that surface is locked
+down.
 
 ## Exit Codes
 
