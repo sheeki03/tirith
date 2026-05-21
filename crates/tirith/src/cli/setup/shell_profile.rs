@@ -187,7 +187,29 @@ fn extract_managed_block(content: &str) -> Option<String> {
 /// Appends a managed block containing the appropriate init line for the
 /// detected shell. Idempotent: skips if block already exists with matching
 /// content (unless `force`). Reports drift when block content differs.
+///
+/// When the detected shell is bash and this is not a dry run, also runs the
+/// bash enter-mode delivery self-test (issue #111) and caches the verdict, so
+/// the hook can decide enter-vs-preexec correctly on the next shell. The probe
+/// is best-effort — a failure there never fails the setup.
 pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
+    let result = install_shell_hook_inner(tirith_bin, force, dry_run);
+
+    // Refresh the bash enter-mode capability cache after a successful install.
+    // `detect_shell_profile` is cheap and idempotent; calling it again here
+    // keeps the probe scoped to bash users without threading the shell name
+    // through every early return inside the inner function.
+    #[cfg(unix)]
+    if result.is_ok() && !dry_run {
+        if let Some(("bash", _)) = detect_shell_profile() {
+            let _ = crate::cli::bash_capability::run_and_cache();
+        }
+    }
+
+    result
+}
+
+fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
     let (shell, profile_path) = detect_shell_profile().ok_or_else(|| {
         "could not detect shell — add eval \"$(tirith init)\" to your shell profile manually"
             .to_string()

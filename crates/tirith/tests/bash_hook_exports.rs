@@ -40,12 +40,52 @@ fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>)
     (prelude, env_vars)
 }
 
+/// Seed the bash enter-mode capability cache under `state_dir/tirith` with
+/// `verdict` (`works` / `broken`), keyed to the `$BASH_VERSION` and `$BASH` a
+/// bare `Command::new("bash")` will report — both read in one invocation.
+fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
+    let (bash_version, bash_path) = {
+        let out = Command::new("bash")
+            .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
+            .output()
+            .expect("query bash identity");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        (
+            lines.next().unwrap_or_default().trim().to_string(),
+            lines.next().unwrap_or_default().trim().to_string(),
+        )
+    };
+    let cache_dir = state_dir.join("tirith");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA; tirith_version blank
+    // (the hook only enforces a version match when a sibling `.hooks-version`
+    // exists, and the hook is sourced from assets/ which has none).
+    std::fs::write(
+        cache_dir.join("bash-enter-capability"),
+        format!(
+            "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+             bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+        ),
+    )
+    .unwrap();
+}
+
 /// Source the hook inside a clean, interactive bash subshell with a fresh
 /// state dir and print the two exported vars in `key=value` form.
-fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
+///
+/// When `capability` is `Some`, the enter-mode capability cache is seeded with
+/// that verdict before the hook is sourced, so the hook's default-mode decision
+/// (issue #111) can be steered deterministically.
+fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &str)]) -> String {
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    if let Some(v) = capability {
+        seed_capability_cache(tmpdir.path(), v);
+    }
     let hook = hook_path();
     let (prelude, env_vars) = split_test_env(extra_env);
+    // `source` and the `printf` dump are one compound line, so the report is
+    // emitted even if enter mode installs a `bind -x` Enter override.
     let script = format!(
         "{prelude}source '{hook}' 2>/dev/null; \
          printf 'MODE=%s\\nPROT=%s\\n' \
@@ -73,26 +113,55 @@ fn source_hook_and_dump_exports(extra_env: &[(&str, &str)]) -> String {
 }
 
 #[test]
-fn hook_exports_enter_by_default_outside_ssh() {
-    // Skip the startup health gate: in a non-PTY `bash -i -c` — including on
-    // macOS's ancient /bin/bash 3.2, which CI runs — `bind -x` may not register,
-    // so the gate would degrade enter->preexec. This test verifies *mode
-    // resolution* (enter is the default outside SSH), independent of bind-x
-    // viability; the PTY conformance harness covers actual delivery.
-    let out = source_hook_and_dump_exports(&[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
+fn hook_exports_enter_when_capability_cache_proves_it() {
+    // Issue #111: enter mode is the default only when the capability self-test
+    // has proven `bind -x` delivery works for this bash. Seed a `works` verdict
+    // and the hook must resolve to enter mode.
+    //
+    // `_TIRITH_TEST_SKIP_HEALTH=1` skips the startup health gate: in a non-PTY
+    // `bash -i -c` — including macOS's ancient /bin/bash 3.2 on CI — `bind -x`
+    // may not register, so the gate would degrade enter->preexec. This test
+    // verifies *mode resolution*, not bind-x viability; the PTY conformance
+    // harness covers actual delivery.
+    let out = source_hook_and_dump_exports(Some("works"), &[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
     assert!(
         out.contains("MODE=enter"),
-        "expected MODE=enter, got:\n{out}"
+        "a `works` capability cache must resolve to enter mode, got:\n{out}"
     );
     assert!(
         out.contains("PROT=blocks"),
-        "expected PROT=blocks, got:\n{out}"
+        "enter mode must report blocks protection, got:\n{out}"
+    );
+}
+
+#[test]
+fn hook_exports_preexec_by_default_without_capability_proof() {
+    // Issue #111: with no capability cache, the hook must NOT default into
+    // enter mode — it falls back to the safe default, preexec (warn-only).
+    let out = source_hook_and_dump_exports(None, &[]);
+    assert!(
+        out.contains("MODE=preexec"),
+        "with no capability cache the hook must default to preexec, got:\n{out}"
+    );
+    assert!(
+        out.contains("PROT=warn-only"),
+        "the preexec fallback must report warn-only protection, got:\n{out}"
+    );
+}
+
+#[test]
+fn hook_exports_preexec_when_capability_cache_says_broken() {
+    // A `broken` verdict must also keep the hook in preexec.
+    let out = source_hook_and_dump_exports(Some("broken"), &[]);
+    assert!(
+        out.contains("MODE=preexec"),
+        "a `broken` capability cache must resolve to preexec, got:\n{out}"
     );
 }
 
 #[test]
 fn hook_exports_preexec_warn_only_when_mode_requested() {
-    let out = source_hook_and_dump_exports(&[("TIRITH_BASH_MODE", "preexec")]);
+    let out = source_hook_and_dump_exports(None, &[("TIRITH_BASH_MODE", "preexec")]);
     assert!(
         out.contains("MODE=preexec"),
         "expected MODE=preexec, got:\n{out}"
@@ -105,7 +174,9 @@ fn hook_exports_preexec_warn_only_when_mode_requested() {
 
 #[test]
 fn hook_exports_preexec_in_ssh_sessions() {
-    let out = source_hook_and_dump_exports(&[("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")]);
+    // SSH forces preexec even when the capability cache says enter `works`.
+    let out =
+        source_hook_and_dump_exports(Some("works"), &[("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")]);
     assert!(
         out.contains("MODE=preexec"),
         "SSH sessions should resolve to preexec, got:\n{out}"

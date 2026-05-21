@@ -108,6 +108,28 @@ pub fn bash_major_version(path: &Path) -> Option<u32> {
     rest.split('.').next()?.trim().parse::<u32>().ok()
 }
 
+/// Read the full `$BASH_VERSION` string of the bash binary at `path`.
+///
+/// The bash enter-mode capability cache is keyed on the exact `$BASH_VERSION`
+/// string, so a test that seeds a cache must use the same value the running
+/// shell reports — not the `bash --version` banner, which is formatted
+/// differently.
+pub fn bash_version_string(path: &Path) -> Option<String> {
+    let out = Command::new(path)
+        .args(["-c", "printf '%s' \"$BASH_VERSION\""])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// Locate a fish shell. Returns `None` when fish is not installed.
 pub fn fish_bin() -> Option<PathBuf> {
     let out = Command::new("sh")
@@ -214,6 +236,37 @@ impl IsolatedEnv {
     /// assert that a *visible* degrade also *persisted*.
     pub fn bash_safe_mode_flag(&self) -> PathBuf {
         self.state_home.join("tirith").join("bash-safe-mode")
+    }
+
+    /// Path to the bash enter-mode capability cache for this environment.
+    pub fn bash_enter_capability_file(&self) -> PathBuf {
+        self.state_home.join("tirith").join("bash-enter-capability")
+    }
+
+    /// Seed the bash enter-mode capability cache (issue #111) with a verdict.
+    ///
+    /// `verdict` is `works` / `broken` / `inconclusive`. The hook reads this
+    /// file at startup to decide enter-vs-preexec; seeding it lets a test pin
+    /// the decision deterministically. `bash_version` must match the exact
+    /// `$BASH_VERSION`, and `bash_path` the exact `$BASH`, of the shell the test
+    /// will spawn — or the hook treats the cache as stale (itself a useful
+    /// thing to test). The harness spawns bash by absolute path, so `$BASH` is
+    /// that path; pass the same path used for [`PtySession::spawn`].
+    pub fn seed_bash_enter_capability(&self, verdict: &str, bash_version: &str, bash_path: &Path) {
+        let path = self.bash_enter_capability_file();
+        std::fs::create_dir_all(path.parent().expect("capability cache parent"))
+            .expect("pty harness: create state dir");
+        // Schema 1 mirrors `cli::bash_capability::CACHE_SCHEMA`. tirith_version
+        // is left blank: the hook only enforces a tirith-version match when a
+        // sibling `.hooks-version` file exists, and the harness sources the
+        // hook directly (no `.hooks-version`), so the check is skipped.
+        let body = format!(
+            "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+             bash_path={}\nenter_capability={verdict}\n\
+             reason=seeded by pty conformance harness\n",
+            bash_path.display()
+        );
+        std::fs::write(&path, body).expect("pty harness: write capability cache");
     }
 }
 

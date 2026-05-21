@@ -97,33 +97,67 @@ cleanly** — never fails — when a prerequisite is missing:
 | bash — preexec (DEBUG-trap, warn-only) | a, b, c, e, g | Passing |
 | bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | d | Passing |
 | bash — enter (`bind -x` Enter override) | f | Passing |
-| bash — enter | a, b, c, d | `#[ignore]` — issue #111 |
+| bash — #111 capability gate | a, b, d | Passing |
 | fish | a, b, c, d, e, g | Passing |
 | zsh | — | Follow-up |
 | PowerShell | — | Follow-up |
 | nushell | — | Follow-up |
 
-### Known bug: bash enter mode (#111)
+### Issue #111 — bash enter-mode delivery, and the capability gate
 
-Bash *enter* mode rebinds Enter to a shell function with `bind -x`. In a
-standard PTY, `bind -x` on `\C-m` runs the bound function but **does not then
+Bash *enter* mode rebinds Enter to a shell function with `bind -x`. In many
+environments, `bind -x` on `\C-m` runs the bound function but **does not then
 accept the line** — so bash never returns to its command loop, `PROMPT_COMMAND`
 never fires, and the pending command (captured into `_TIRITH_PENDING_EVAL`) is
-never delivered. The next Enter sees the un-consumed pending command and the
-hook degrades to preexec. This is issue #111: a command is eaten, followed by a
-silent-feeling enter→preexec degrade.
+never delivered. The command is silently eaten. This is issue #111.
 
-The harness reproduces this precisely. Two consequences:
+Whether `bind -x` accepts the line is a *capability* of the specific
+bash/readline build, not a function of the bash version number — so tirith
+cannot decide enter-vs-preexec by a version gate. The fix is **capability-based**:
 
-- The enter-mode **delivery** tests
-  (`bash_enter_allowed_command_executes_exactly_once`,
-  `bash_enter_blocked_command_does_not_execute`) are written and `#[ignore]`d
-  with a `#111` reference. They are ready regression tests — remove the
-  `#[ignore]` when #111 is fixed — and keep `cargo test` green meanwhile.
-- The enter-mode **degradation** test
-  (`bash_enter_degradation_is_visible_not_silent`) is *active and passing*: a
-  buggy enter mode must still satisfy invariant (f) — fail loudly and persist
-  the safe-mode flag. It does.
+- `tirith setup` and `tirith doctor` (and the explicit
+  `tirith doctor --simulate-enter`) run a disposable-PTY **self-test**
+  (`crates/tirith/src/cli/bash_capability.rs`). It spawns a throwaway bash,
+  sources the real hook in enter mode, and verifies that an allowed command is
+  delivered exactly once **and** that a command tirith would block is actually
+  stopped.
+- The self-test writes a small `key=value` **cache file**
+  (`<state-dir>/bash-enter-capability`) recording the verdict, keyed by tirith
+  version + bash version.
+- `tirith init` is unchanged — it must stay fast because it is `eval`'d on
+  every interactive shell startup, and the self-test is far too heavy to run
+  there. The bash hook itself reads the cache file at startup (a single
+  small-file read, which *is* init-safe): it selects enter mode only when the
+  cache proves enter delivery works for the running bash, and otherwise falls
+  back to the safe default, preexec.
+
+The harness reproduces #111 precisely (its bare PTY is an environment where
+`bind -x` delivery is broken), so the capability-correct behaviour there is the
+fallback to preexec. The regression tests assert the **capability-gated system
+contract** rather than a literal enter-mode contract — a literal enter-mode
+"blocked command did not run" assertion under broken delivery would pass
+*vacuously*, because a swallowed allowed command and a swallowed blocked command
+are indistinguishable:
+
+- `bash_enter_allowed_command_executes_exactly_once` — with no proven enter
+  capability, the hook falls back to preexec and delivers an allowed command
+  exactly once (0 = the #111 swallow; 2 = double-delivery).
+- `bash_enter_blocked_command_does_not_execute` — with
+  `TIRITH_BASH_PREEXEC_ENFORCE=1` the preexec fallback *blocks*. The test first
+  runs an allowed command and asserts it executed (the **anti-vacuous guard**:
+  commands are being delivered, not eaten), then asserts the blocked
+  `curl … | bash` left no marker.
+- `bash_capability_cache_steers_default_mode` — a seeded `works` verdict makes
+  the hook choose enter; `broken` / stale verdicts make it choose preexec.
+- `bash_enter_degradation_is_visible_not_silent` — `TIRITH_BASH_MODE=enter` is
+  an explicit override that forces enter even when the gate would pick preexec;
+  a forced-but-broken enter mode must still degrade *visibly* and persist the
+  safe-mode flag (invariant f).
+
+The capability-cache reader's robustness against hostile bash history
+configuration (`HISTCONTROL`, `HISTIGNORE`, `set +o history`, a pre-set `IFS`,
+an already-enabled `extdebug`) is covered by the `capability_*` tests in
+`crates/tirith/tests/bash_preexec_enforce.rs`.
 
 ## Follow-up
 
@@ -136,5 +170,3 @@ The harness reproduces this precisely. Two consequences:
   check`, which may attempt a background threat-DB refresh. The conformance
   tests do not assert on network behaviour, but a dedicated `--offline`
   switch (roadmap M0.3) would let the harness pin this deterministically.
-- **Fixing #111.** Once bash enter-mode delivery is fixed, un-`#[ignore]` the
-  two enter-mode delivery tests.

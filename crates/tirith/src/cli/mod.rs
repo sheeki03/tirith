@@ -89,6 +89,8 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 }
 
 pub mod audit;
+#[cfg(unix)]
+pub mod bash_capability;
 pub mod check;
 pub mod checkpoint;
 pub mod completions;

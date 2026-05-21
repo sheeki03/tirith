@@ -1,13 +1,32 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub fn run(json: bool, reset_bash_safe_mode: bool, fix: bool, yes: bool) -> i32 {
+pub fn run(
+    json: bool,
+    reset_bash_safe_mode: bool,
+    fix: bool,
+    yes: bool,
+    simulate_enter: bool,
+) -> i32 {
     if reset_bash_safe_mode {
         return reset_safe_mode();
     }
 
+    if simulate_enter {
+        return run_simulate_enter();
+    }
+
     if fix {
         return run_fix(yes);
+    }
+
+    // A plain `tirith doctor` refreshes the bash enter-mode capability cache as
+    // a side effect: the PTY self-test is cheap, timeout-bound, and keeps the
+    // cache the hook reads at startup current. Skipped in JSON mode so machine
+    // consumers get a fast, side-effect-free report.
+    #[cfg(unix)]
+    if !json && crate::cli::init::detect_shell() == "bash" {
+        let _ = crate::cli::bash_capability::run_and_cache();
     }
 
     let info = gather_info();
@@ -578,6 +597,23 @@ struct DoctorInfo {
     /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
+    /// Cached bash enter-mode delivery capability verdict (`works` / `broken` /
+    /// `inconclusive`), as recorded by the last self-test. Absent when no
+    /// capability cache has been written yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability: Option<String>,
+    /// Whether the cached capability verdict is for the running bash — a
+    /// `false` here means the cache is stale (a different bash) and the hook
+    /// will ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_fresh: Option<bool>,
+    /// Human-readable reason recorded with the cached capability verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_reason: Option<String>,
+    /// The tirith version that wrote the cached capability verdict (diagnostic
+    /// only — not part of freshness; see `cli::bash_capability`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_tirith_version: Option<String>,
     policy_paths: Vec<String>,
     policy_root_env: Option<String>,
     data_dir: Option<String>,
@@ -669,6 +705,48 @@ fn gather_info() -> DoctorInfo {
     let detection_gaps = check_detection_gaps();
     let threat_db = gather_threat_db_info();
 
+    // Cached bash enter-mode delivery verdict (issue #111). Read-only here —
+    // the cache is written by the self-test in `--simulate-enter` and by a
+    // plain `tirith doctor` run; this just surfaces it.
+    let (
+        bash_enter_capability,
+        bash_enter_capability_fresh,
+        bash_enter_capability_reason,
+        bash_enter_capability_tirith_version,
+    ) = {
+        #[cfg(unix)]
+        {
+            match crate::cli::bash_capability::read_cache() {
+                Some(decision) => {
+                    let token = match decision.capability {
+                        crate::cli::bash_capability::EnterCapability::Works => "works",
+                        crate::cli::bash_capability::EnterCapability::Broken => "broken",
+                        crate::cli::bash_capability::EnterCapability::Inconclusive => {
+                            "inconclusive"
+                        }
+                    };
+                    let fresh = crate::cli::bash_capability::decision_is_fresh(&decision);
+                    let reason = if decision.reason.is_empty() {
+                        None
+                    } else {
+                        Some(decision.reason.clone())
+                    };
+                    let writer = if decision.tirith_version.is_empty() {
+                        None
+                    } else {
+                        Some(decision.tirith_version.clone())
+                    };
+                    (Some(token.to_string()), Some(fresh), reason, writer)
+                }
+                None => (None, None, None, None),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            (None, None, None, None)
+        }
+    };
+
     DoctorInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
@@ -684,6 +762,10 @@ fn gather_info() -> DoctorInfo {
         bash_requested_require_enter,
         bash_effective_mode,
         bash_effective_protection,
+        bash_enter_capability,
+        bash_enter_capability_fresh,
+        bash_enter_capability_reason,
+        bash_enter_capability_tirith_version,
         policy_paths,
         policy_root_env,
         data_dir: data_dir.map(|d| d.display().to_string()),
@@ -881,6 +963,34 @@ fn print_human(info: &DoctorInfo) {
             println!("                        Reset: tirith doctor --reset-bash-safe-mode");
         } else {
             println!("  safe mode:            off");
+        }
+
+        // Cached bash enter-mode delivery capability (issue #111). The hook
+        // selects enter mode (blocking) by default only when this verdict is
+        // `works` and fresh; otherwise it falls back to preexec (warn-only).
+        match info.bash_enter_capability.as_deref() {
+            Some(verdict) => {
+                let fresh = info.bash_enter_capability_fresh.unwrap_or(false);
+                let writer = info
+                    .bash_enter_capability_tirith_version
+                    .as_deref()
+                    .map(|v| format!(", tirith {v}"))
+                    .unwrap_or_default();
+                if fresh {
+                    println!("  enter capability:     {verdict} (self-test verdict{writer})");
+                } else {
+                    println!(
+                        "  enter capability:     {verdict} (STALE — measured on a different bash{writer})"
+                    );
+                    println!("                        Re-test: tirith doctor --simulate-enter");
+                }
+                if let Some(reason) = info.bash_enter_capability_reason.as_deref() {
+                    println!("                        {reason}");
+                }
+            }
+            None => {
+                println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
         }
         if safe_mode_overridden_by_env(info.bash_safe_mode, info.bash_requested_mode.as_deref()) {
             println!(
@@ -1161,6 +1271,58 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
 
     let primary = first_existing.or_else(|| profile_candidates.into_iter().next());
     (primary, false)
+}
+
+/// `tirith doctor --simulate-enter`: run the bash enter-mode delivery
+/// self-test, print a verdict, and cache the result for the hook to read.
+///
+/// The self-test spawns a disposable bash through a PTY, sources the real hook
+/// in enter mode, and verifies that an allowed command is delivered exactly
+/// once AND that a command tirith would block is actually stopped. Enter mode
+/// is the only bash mode that can truly block, but `bind -x` on Enter does not
+/// reliably accept the line in every environment (issue #111) — this proves
+/// whether it works *here* rather than guessing from the bash version.
+#[cfg(unix)]
+fn run_simulate_enter() -> i32 {
+    println!("tirith: running bash enter-mode delivery self-test...");
+    let outcome = crate::cli::bash_capability::run_and_cache();
+
+    if let Some(v) = &outcome.bash_version {
+        println!("  bash version:   {v}");
+    }
+    if let Some(p) = &outcome.bash_path {
+        println!("  bash binary:    {}", p.display());
+    }
+    println!("  enter delivery: {}", outcome.capability.describe());
+    println!("  detail:         {}", outcome.reason);
+
+    match &outcome.cache_path {
+        Some(path) => println!("  cached to:      {}", path.display()),
+        None => println!("  cache:          NOT written (hook keeps its safe default)"),
+    }
+
+    println!();
+    // Enter mode is only actually enabled for new shells when BOTH the verdict
+    // is `works` AND the cache was written — the hook reads the cache file, so
+    // a failed write means new shells still fall back to preexec.
+    if outcome.capability.enables_enter() && outcome.cache_path.is_some() {
+        println!("tirith: enter mode (blocking) is enabled for bash in new shells.");
+    } else if outcome.capability.enables_enter() {
+        println!("tirith: enter-mode delivery works here, but the capability cache could not");
+        println!("        be written — new shells will fall back to preexec until it can be.");
+    } else {
+        println!("tirith: bash will use preexec mode (warn-only). For blocking, set");
+        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1 in a clean-history shell, or run");
+        println!("        tirith on a shell where enter-mode delivery works.");
+    }
+    0
+}
+
+/// Non-Unix stub: enter mode and its `bind -x` machinery are Unix-only.
+#[cfg(not(unix))]
+fn run_simulate_enter() -> i32 {
+    println!("tirith: --simulate-enter is only meaningful on Unix (bash enter mode)");
+    0
 }
 
 fn reset_safe_mode() -> i32 {

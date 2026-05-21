@@ -44,13 +44,13 @@ ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 fs2 = { workspace = true }
+# Drives a disposable shell through a real pseudo-terminal. Used by the bash
+# enter-mode capability self-test (`cli::bash_capability`, run by `tirith
+# setup` / `tirith doctor`) and by the PTY conformance harness in tests.
+portable-pty = "0.9"
 
 [dev-dependencies]
 mockito = "1"
-# PTY conformance harness (tests/shell_conformance.rs): drives disposable
-# shells through a real pseudo-terminal so shell-hook tests need no external
-# `expect` Tcl tool.
-portable-pty = "0.9"
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"

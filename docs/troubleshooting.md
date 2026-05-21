@@ -49,10 +49,35 @@ hash -r
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:
-- **enter mode** (default outside SSH): Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
+- **enter mode**: Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
 - **preexec mode**: Uses `DEBUG` trap. Warn-only by default. Can be upgraded to real blocking via `shopt -s extdebug` + `return 1` from the DEBUG trap; opt in with `TIRITH_BASH_PREEXEC_ENFORCE=1`.
 
-Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec` (set before `tirith init` in your shell rc)
+### Which mode is used by default
+
+`bind -x` on Enter does not reliably accept the typed line in every bash /
+readline build — in some environments it runs the bound function but never
+returns to the command loop, so the command is silently eaten (issue #111).
+Because this is a property of the bash build, not the version number, tirith
+**proves it** rather than guessing:
+
+- `tirith setup` and `tirith doctor` run a quick disposable-PTY **self-test**
+  that checks whether enter-mode delivery and blocking actually work for your
+  bash, and cache the verdict. `tirith doctor --simulate-enter` runs it on
+  demand.
+- On every new interactive shell, the bash hook reads that cached verdict. It
+  uses enter mode **only when the self-test proved it works**; otherwise it
+  falls back to preexec (warn-only). Outside SSH and with no cached verdict
+  yet, the hook starts in preexec until the next `tirith setup` / `tirith
+  doctor` populates the cache.
+
+`tirith doctor` shows the cached verdict on the `enter capability:` line. If it
+reports `not tested`, run `tirith doctor --simulate-enter`.
+
+Set the mode explicitly with `export TIRITH_BASH_MODE=enter` or `export
+TIRITH_BASH_MODE=preexec` (before `tirith init` in your shell rc).
+`TIRITH_BASH_MODE=enter` is a deliberate override — it forces enter mode even
+when the self-test has not proven it works; the startup health gate and runtime
+self-healing still degrade visibly to preexec if delivery then fails.
 
 ### Preexec enforcement (`TIRITH_BASH_PREEXEC_ENFORCE`)
 
@@ -118,7 +143,14 @@ If you have your own `DEBUG` trap installed before sourcing the tirith hook, the
   bash mode:            preexec          ← live, exported by the hook
   effective protection: warn-only        ← live, exported by the hook
   safe mode:            off              ← persistent enter-mode-failure flag
+  enter capability:     broken           ← cached enter-mode self-test verdict
 ```
+
+The `enter capability:` line shows the cached verdict of the bash enter-mode
+delivery self-test (issue #111): `works` (enter mode is enabled for new
+shells), `broken` / `inconclusive` (preexec is used), `STALE` (the verdict is
+for a different bash or tirith version — run `tirith doctor --simulate-enter`),
+or `not tested`.
 
 If you see `bash hook: not loaded in this process`, the hook did not run in the shell that invoked `doctor` — typically because `doctor` was called from a non-interactive subshell. Source the hook in your `.bashrc` and open a new interactive shell.
 
@@ -128,10 +160,10 @@ On the first command it intercepts in an interactive bash session, the preexec h
 
 ```
 tirith: bash is in preexec mode (warn-only, does not block)
-  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)
+  Run 'tirith doctor' to test enter mode (blocking) for this shell
 ```
 
-This is intentional: preexec mode cannot stop a command once bash has committed to running it. The banner fires once per shell, on the first intercepted command.
+This is intentional: preexec mode cannot stop a command once bash has committed to running it. The banner fires once per shell, on the first intercepted command. Running `tirith doctor` (or `tirith doctor --simulate-enter`) runs the enter-mode self-test and, if delivery works for your bash, enables enter mode for new shells.
 
 ### Persistent safe mode
 

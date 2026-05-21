@@ -508,7 +508,8 @@ Examples:
 Examples:
   tirith doctor
   tirith doctor --fix
-  tirith doctor --fix --yes")]
+  tirith doctor --fix --yes
+  tirith doctor --simulate-enter")]
     Doctor {
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -531,6 +532,15 @@ Examples:
         /// Auto-approve all fixes (no prompting)
         #[arg(long, requires = "fix")]
         yes: bool,
+        /// Run the bash enter-mode delivery self-test and cache the result
+        #[arg(
+            long,
+            conflicts_with = "format",
+            conflicts_with = "json",
+            conflicts_with = "fix",
+            conflicts_with = "reset_bash_safe_mode"
+        )]
+        simulate_enter: bool,
     },
 
     /// Generate shell completions
@@ -1308,9 +1318,10 @@ fn main() {
             reset_bash_safe_mode,
             fix,
             yes,
+            simulate_enter,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::doctor::run(json, reset_bash_safe_mode, fix, yes)
+            cli::doctor::run(json, reset_bash_safe_mode, fix, yes, simulate_enter)
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),

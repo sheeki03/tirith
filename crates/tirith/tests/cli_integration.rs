@@ -722,7 +722,10 @@ fn paste_windows_crlf_allows() {
 
 #[cfg(unix)]
 #[test]
-fn bash_hook_enter_default_outside_ssh() {
+fn bash_hook_preexec_default_outside_ssh_without_capability_cache() {
+    // Issue #111: outside SSH with no proven enter-mode capability, the hook
+    // must fall back to the safe default — preexec — not silently default into
+    // an enter mode whose `bind -x` delivery is unverified.
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -740,8 +743,43 @@ fn bash_hook_enter_default_outside_ssh() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
+        stdout, "preexec",
+        "non-SSH sessions with no capability cache must default to preexec"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_hook_enter_default_outside_ssh_with_works_capability() {
+    // Issue #111: when the capability cache proves enter-mode delivery works
+    // for this bash, the default outside SSH is enter mode.
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let cache_dir = tmpdir.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
+
+    let hook = format!(
+        "{}/assets/shell/lib/bash-hook.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let script = format!(
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
+    );
+    let out = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
         stdout, "enter",
-        "non-SSH sessions should default to enter mode"
+        "a `works` capability cache must make enter the default outside SSH"
     );
 }
 
@@ -855,6 +893,29 @@ fn bash_major_version() -> Option<u32> {
     Some(major)
 }
 
+/// Body of a schema-1 bash enter-mode capability cache (issue #111) seeded with
+/// `verdict`, keyed to the `$BASH_VERSION` and `$BASH` a bare
+/// `Command::new("bash")` reports — the same bash these tests spawn. Reading
+/// both in one invocation guarantees the cache matches what the spawned hook
+/// will compare against. `tirith_version` is blank: the hook only enforces a
+/// version match when a sibling `.hooks-version` exists, and these tests source
+/// the hook from `assets/` which has none.
+#[cfg(unix)]
+fn capability_cache_body(verdict: &str) -> String {
+    let out = Command::new("bash")
+        .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
+        .output()
+        .expect("query bash identity");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let bash_version = lines.next().unwrap_or_default().trim();
+    let bash_path = lines.next().unwrap_or_default().trim();
+    format!(
+        "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+         bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn bash_hook_startup_gate_degrade_persists() {
@@ -864,6 +925,18 @@ fn bash_hook_startup_gate_degrade_persists() {
         "{}/assets/shell/lib/bash-hook.bash",
         env!("CARGO_MANIFEST_DIR")
     );
+
+    // Seed a `works` enter-mode capability verdict so the hook actually
+    // *enters* enter mode — otherwise the #111 capability gate would pick
+    // preexec directly and the startup health gate (the path under test here)
+    // would never run.
+    let cache_dir = tmpdir.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
 
     // `bash --norc --noprofile -i -c` is interactive enough for enter mode
     // to activate while skipping user config that might set
@@ -893,7 +966,8 @@ fn bash_hook_startup_gate_degrade_persists() {
         "safe-mode flag should be persisted after degrade"
     );
 
-    // Re-source in a fresh shell; the persisted flag forces preexec.
+    // Re-source in a fresh shell; the persisted safe-mode flag forces preexec
+    // even though the `works` capability cache is still present.
     let script2 = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
@@ -928,9 +1002,24 @@ fn bash_hook_runtime_delivery_failure_degrades_in_pty() {
         env!("CARGO_MANIFEST_DIR")
     );
 
+    // Seed a `works` enter-mode capability verdict so the hook enters enter
+    // mode (issue #111 — without a `works` cache the capability gate would pick
+    // preexec directly and the runtime _tirith_enter failure path under test
+    // would never run).
+    {
+        let cache_dir = tmpdir.path().join("tirith");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(
+            cache_dir.join("bash-enter-capability"),
+            capability_cache_body("works"),
+        )
+        .unwrap();
+    }
+
     // Drive the runtime _tirith_enter failure path in a real interactive
     // PTY:
-    //   1. start in enter mode (startup gate bypassed for this test),
+    //   1. start in enter mode (the `works` capability cache + a real PTY let
+    //      `bind -x` register, so the startup health gate passes),
     //   2. break PROMPT_COMMAND delivery by making it readonly without the
     //      tirith hook,
     //   3. press Enter on a command and assert the auto-degrade message
@@ -961,7 +1050,6 @@ expect eof
         .args(["-c", expect_script])
         .env("HOOK_PATH", &hook)
         .env("XDG_STATE_HOME", tmpdir.path())
-        .env("_TIRITH_TEST_SKIP_HEALTH", "1")
         .env_remove("TIRITH_BASH_MODE")
         .env_remove("SSH_CONNECTION")
         .env_remove("SSH_TTY")
@@ -1036,12 +1124,18 @@ fn bash_hook_noninteractive_no_debug_trap() {
 
 #[cfg(unix)]
 #[test]
-fn bash_hook_noninteractive_mode_is_enter() {
-    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+fn bash_hook_noninteractive_mode_resolution() {
+    // Non-interactive sourcing still *resolves* a mode into `_TIRITH_BASH_MODE`
+    // even though it installs nothing (invariant g; see the no-DEBUG-trap test
+    // above). With no capability cache the resolved default is preexec (issue
+    // #111); with a `works` cache it is enter. Either way, nothing is installed.
     let hook = format!(
         "{}/assets/shell/lib/bash-hook.bash",
         env!("CARGO_MANIFEST_DIR")
     );
+
+    // No cache → preexec.
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
@@ -1052,10 +1146,32 @@ fn bash_hook_noninteractive_mode_is_enter() {
         .output()
         .expect("failed to run bash");
     assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        stdout, "enter",
-        "non-interactive enter mode: variable is set but nothing installed"
+        String::from_utf8_lossy(&out.stdout),
+        "preexec",
+        "non-interactive sourcing with no capability cache resolves to preexec"
+    );
+
+    // `works` cache → enter (still nothing installed in a non-interactive shell).
+    let tmpdir2 = tempfile::tempdir().expect("failed to create tmpdir");
+    let cache_dir = tmpdir2.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
+    let out2 = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("XDG_STATE_HOME", tmpdir2.path())
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out2.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out2.stdout),
+        "enter",
+        "non-interactive sourcing with a `works` capability cache resolves to enter"
     );
 }
 

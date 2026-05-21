@@ -652,3 +652,365 @@ echo post_scan_target
         "post-degrade invocation missing --warn-only + BASH_COMMAND target; got: {invocations:#?}"
     );
 }
+
+// ===========================================================================
+// Enter-mode capability cache — mode-decision sharp edges (issue #111)
+//
+// The hook reads `bash-enter-capability` at startup to decide enter-vs-preexec.
+// `run_bash` here drives a non-PTY interactive bash, so a `works` verdict can
+// still be observed: the hook sets and exports `TIRITH_BASH_EFFECTIVE_MODE`
+// during sourcing — before any command runs — so reading that variable does
+// not depend on `bind -x` delivery working.
+//
+// These tests pin that the cache reader is robust against the bash history
+// configurations that historically perturbed the hook: HISTCONTROL,
+// HISTIGNORE, HISTTIMEFORMAT, a pre-set IFS, and an already-enabled extdebug.
+// None of those affect a file read, but the cache reader uses `wc` and an
+// `IFS='='` loop, so a regression test is cheap insurance.
+// ===========================================================================
+
+/// `($BASH_VERSION, $BASH)` for the bash a bare `Command::new("bash")` runs.
+///
+/// The hook's capability cache is keyed on both, so a seeded cache must record
+/// the exact values the test's spawned bash will report. Both are read in one
+/// invocation of the same `bash` the tests use.
+fn spawned_bash_identity() -> (String, String) {
+    let out = Command::new("bash")
+        .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
+        .output()
+        .expect("query bash identity");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let version = lines.next().unwrap_or_default().trim().to_string();
+    let path = lines.next().unwrap_or_default().trim().to_string();
+    (version, path)
+}
+
+/// Build a `bash-enter-capability` cache file under `state_dir/tirith` for the
+/// running bash, with the given verdict. `state_dir` must be the same path
+/// passed as `XDG_STATE_HOME` to the shell.
+fn seed_capability_cache(state_dir: &Path, verdict: &str) {
+    let (bash_version, bash_path) = spawned_bash_identity();
+    let cache_dir = state_dir.join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA. tirith_version blank:
+    // the hook only enforces a tirith-version match when a sibling
+    // `.hooks-version` exists, and the hook here is sourced from assets/ which
+    // has none.
+    let body = format!(
+        "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+         bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+    );
+    fs::write(cache_dir.join("bash-enter-capability"), body).unwrap();
+}
+
+/// Run the hook in a fresh interactive bash with `XDG_STATE_HOME` pointing at a
+/// temp dir, optionally seeding the capability cache first. Returns
+/// `(stdout, stderr)`.
+///
+/// The hook is sourced and the effective mode is reported on **one line**: in a
+/// piped-stdin interactive bash, once enter mode installs its `bind -x` Enter
+/// override, a *subsequent* stdin line would be intercepted (and, in this
+/// non-PTY context, swallowed). Keeping `source` and the `printf` on the same
+/// readline unit means the whole line was already accepted before `bind -x`
+/// existed, so the mode report always reaches stdout regardless of which mode
+/// the hook selected.
+fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) -> (String, String) {
+    // `TempDir` (not `.keep()`) so the directory is removed when this function
+    // returns — `.keep()` would leak it under `/tmp` across test runs.
+    let state = tempfile::tempdir().unwrap();
+    let state_path = state.path();
+    if let Some(v) = verdict {
+        seed_capability_cache(state_path, v);
+    }
+
+    let hook = hook_path();
+    let full_script =
+        format!("source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n");
+
+    let bin_dir = state_path.join("fakebin");
+    let log_path = state_path.join("tirith.log");
+    install_fake_tirith(&bin_dir, &log_path);
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["--norc", "--noprofile", "-i"])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_STATE_HOME", state_path)
+        .env_remove("TIRITH_BASH_MODE")
+        .env_remove("TIRITH_BASH_PREEXEC_ENFORCE")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
+        .env_remove("SSH_CLIENT")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(full_script.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn capability_works_cache_selects_enter_mode() {
+    // Baseline: a fresh `works` verdict for the running bash makes the hook
+    // pick enter mode.
+    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[]);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "a fresh `works` capability cache must select enter mode, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_broken_cache_falls_back_to_preexec() {
+    let (stdout, _stderr) = run_hook_with_capability(Some("broken"), &[]);
+    assert!(
+        stdout.contains("EFFMODE=<preexec>"),
+        "a `broken` capability cache must fall back to preexec, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_absent_cache_falls_back_to_preexec() {
+    let (stdout, _stderr) = run_hook_with_capability(None, &[]);
+    assert!(
+        stdout.contains("EFFMODE=<preexec>"),
+        "with no capability cache the hook must fall back to preexec, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_cache_read_survives_hostile_histcontrol() {
+    // HISTCONTROL=ignorespace is the classic hostile-history config. It gates
+    // preexec *enforcement*, but must not affect the capability cache read or
+    // the enter-vs-preexec decision: a `works` verdict still selects enter.
+    let (stdout, _stderr) =
+        run_hook_with_capability(Some("works"), &[("HISTCONTROL", "ignorespace")]);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "HISTCONTROL must not perturb the capability-cache mode decision, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_cache_read_survives_histignore() {
+    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[("HISTIGNORE", "ls:cd:pwd")]);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "HISTIGNORE must not perturb the capability-cache mode decision, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
+    // The reader uses an `IFS='='` loop and `wc`. A pre-set `IFS` in the
+    // environment, or a `HISTTIMEFORMAT`, must not break parsing — the reader
+    // sets `IFS` locally per-read.
+    let (stdout, _stderr) =
+        run_hook_with_capability(Some("works"), &[("HISTTIMEFORMAT", "%F %T "), ("IFS", ":")]);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "a pre-set IFS / HISTTIMEFORMAT must not break the cache reader, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_cache_decision_independent_of_preset_extdebug() {
+    // `extdebug` already enabled by the user must not change the capability
+    // decision: a `works` verdict still selects enter mode. (extdebug is set
+    // via `shopt`, not an env var; pass it through BASHOPTS, which bash applies
+    // at startup.)
+    let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[("BASHOPTS", "extdebug")]);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "a pre-enabled extdebug must not change the capability decision, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_cache_read_survives_set_plus_o_history() {
+    // `set +o history` disables history *before* the hook is sourced. The
+    // capability cache reader does not touch history, so a `works` verdict must
+    // still select enter mode. A regression here would mean the reader (its
+    // `wc` / `IFS='='` loop) accidentally depends on history being on.
+    //
+    // `TempDir` (not `.keep()`) so the directory is cleaned up on return.
+    let state = tempfile::tempdir().unwrap();
+    let state_path = state.path();
+    seed_capability_cache(state_path, "works");
+
+    let hook = hook_path();
+    // Disable history first, *then* source the hook and report the mode on one
+    // line (so enter mode's `bind -x`, if selected, cannot swallow the report).
+    let full_script = format!(
+        "set +o history\n\
+         source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n"
+    );
+
+    let bin_dir = state_path.join("fakebin");
+    let log_path = state_path.join("tirith.log");
+    install_fake_tirith(&bin_dir, &log_path);
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["--norc", "--noprofile", "-i"])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_STATE_HOME", state_path)
+        .env_remove("TIRITH_BASH_MODE")
+        .env_remove("TIRITH_BASH_PREEXEC_ENFORCE")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
+        .env_remove("SSH_CLIENT")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(full_script.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("EFFMODE=<enter>"),
+        "`set +o history` must not break the capability-cache mode decision, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn capability_broken_cache_with_preexec_enforce_still_blocks() {
+    // The #111 fallback contract: with no `works` cache the hook drops to
+    // preexec, and `TIRITH_BASH_PREEXEC_ENFORCE=1` makes that preexec *block*.
+    // A blocked command (BLOCK_TOKEN) must not run its sentinel.
+    let (_stdout, _stderr, _invocations, sentinel_dir) = run_with_sentinels(
+        "touch {sentinels}/should_not_exist_BLOCK_TOKEN\n",
+        &[("TIRITH_BASH_PREEXEC_ENFORCE", "1")],
+    );
+    // run_with_sentinels uses run_bash, which has no capability cache → the
+    // hook falls back to preexec, and enforcement turns that into a blocker.
+    let blocked = sentinel_path(&sentinel_dir, "should_not_exist_BLOCK_TOKEN");
+    assert!(
+        !blocked.exists(),
+        "with no `works` cache + enforce=1, a blocked command must not execute"
+    );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+#[test]
+fn capability_stale_cache_falls_back_and_installs_debug_trap() {
+    // When the capability gate yields preexec, the hook must still install its
+    // DEBUG trap. A stale `works` verdict (wrong bash version) forces the
+    // preexec fallback; the DEBUG trap must then be present.
+    //
+    // `TempDir` (not `.keep()`) so the directory is cleaned up on return.
+    let state = tempfile::tempdir().unwrap();
+    let state_path = state.path();
+    // Seed a `works` verdict for a bash version that is NOT the running one →
+    // the hook treats it as stale and falls back to preexec. `bash_path` is the
+    // running bash's real path, so the *version* is the only stale field.
+    let (_bash_version, bash_path) = spawned_bash_identity();
+    let cache_dir = state_path.join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        format!(
+            "schema=1\ntirith_version=\nshell=bash\nbash_version=0.0.0-stale\n\
+             bash_path={bash_path}\nenter_capability=works\nreason=stale\n"
+        ),
+    )
+    .unwrap();
+
+    let hook = hook_path();
+    // A stale verdict yields preexec (no `bind -x`), but keep `source` and the
+    // first report on one line anyway for consistency with the other helpers.
+    let full_script = format!(
+        "source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n\
+         trap -p DEBUG | grep -q _tirith_debug_trampoline && \
+           printf 'DEBUG_TRAP=installed\\n' || printf 'DEBUG_TRAP=missing\\n'\n"
+    );
+
+    let bin_dir = state_path.join("fakebin");
+    let log_path = state_path.join("tirith.log");
+    install_fake_tirith(&bin_dir, &log_path);
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["--norc", "--noprofile", "-i"])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_STATE_HOME", state_path)
+        .env_remove("TIRITH_BASH_MODE")
+        .env_remove("TIRITH_BASH_PREEXEC_ENFORCE")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
+        .env_remove("SSH_CLIENT")
+        .env_remove("_TIRITH_BASH_LOADED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(full_script.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("EFFMODE=<preexec>"),
+        "a stale `works` verdict (wrong bash version) must fall back to preexec, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("DEBUG_TRAP=installed"),
+        "the preexec fallback must install the DEBUG trap, stdout: {stdout}"
+    );
+}
