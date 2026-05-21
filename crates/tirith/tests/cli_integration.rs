@@ -738,6 +738,11 @@ fn policy_tune_no_audit_log_is_handled() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let out = tirith()
         .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
         .args(["policy", "tune", "--from-audit"])
         .output()
         .expect("failed to run tirith");
@@ -772,6 +777,11 @@ fn policy_tune_suggests_for_always_allowed_rule_without_writing_policy() {
 
     let out = tirith()
         .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
         .args(["policy", "tune", "--from-audit", "--format", "json"])
         .output()
         .expect("failed to run tirith");
@@ -817,6 +827,11 @@ fn policy_tune_does_not_suggest_downgrade_for_blocked_rule() {
 
     let out = tirith()
         .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
         .args(["policy", "tune", "--from-audit", "--format", "json"])
         .output()
         .expect("failed to run tirith");
@@ -852,6 +867,11 @@ fn policy_tune_thin_data_makes_no_suggestions() {
 
     let out = tirith()
         .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
         .args(["policy", "tune", "--from-audit", "--format", "json"])
         .output()
         .expect("failed to run tirith");
