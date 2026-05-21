@@ -65,8 +65,16 @@ pub const CACHE_FILENAME: &str = "bash-enter-capability";
 
 /// Hard cap on one PTY probe phase settling.
 const PHASE_TIMEOUT: Duration = Duration::from_secs(6);
-/// "Output settled" gap — no new bytes for this long means the shell finished.
-const QUIET_GAP: Duration = Duration::from_millis(600);
+/// Hard cap on waiting for a side-effect-only command's marker file to appear
+/// (or to be confirmed absent). A command like `printf >> marker` writes
+/// nothing to the terminal, and when tirith *allows* it the `tirith check`
+/// subprocess prints nothing either — so terminal silence is reached *before*
+/// the command runs. Completion must therefore be read from the filesystem
+/// side effect, not from terminal quiet. Generous for a loaded CI box, yet
+/// bounded so a genuinely swallowed command still fails fast.
+const MARKER_TIMEOUT: Duration = Duration::from_secs(8);
+/// Filesystem poll interval while waiting on a marker file.
+const MARKER_POLL: Duration = Duration::from_millis(50);
 
 /// Verdict of the enter-mode delivery self-test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,16 +333,11 @@ impl ProbeSession {
         }
     }
 
-    /// Wait until output has been quiet for `quiet`, bounded by `max`.
-    fn wait_idle(&mut self, quiet: Duration, max: Duration) {
-        let hard = Instant::now() + max;
-        loop {
-            let before = self.buf.len();
-            self.pump(quiet);
-            if self.buf.len() == before || Instant::now() >= hard {
-                return;
-            }
-        }
+    /// Drain whatever PTY output is currently queued, blocking at most `slice`
+    /// for the first chunk. Used to keep the reader channel from filling while
+    /// the probe waits on a filesystem marker rather than on terminal output.
+    fn drain(&mut self, slice: Duration) {
+        self.pump(slice);
     }
 
     /// Kill the child immediately. Used after a failed probe phase: the readline
@@ -365,6 +368,69 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
         rest = &rest[idx + needle.len()..];
     }
     count
+}
+
+/// Poll `marker` until its contents contain `needle`, or `timeout` elapses.
+/// Returns `true` once `needle` is seen, `false` if the deadline passes first.
+/// `sess` is drained each tick so the PTY reader channel cannot fill.
+///
+/// ## Why this exists — the no-output race
+///
+/// The probe types side-effect-only commands (`printf >> marker`,
+/// `printf 'true' | bash && touch marker`) into a disposable shell whose
+/// enter-mode hook shells out to `tirith check`. A `printf >> marker` command
+/// prints nothing to the terminal, and on an *allow* verdict `tirith check`
+/// prints nothing either — so the only terminal output is the keystroke echo.
+/// Keying completion on terminal silence (the old `wait_idle`) therefore
+/// returns *before* the hook has finished shelling out to `tirith` and
+/// delivered the command, and the marker is then read while still empty —
+/// caching a false `Broken` on a working bash, and (worse) letting
+/// `probe_blocking` read a not-yet-run command's absent marker as "blocked".
+/// macOS happens to win that race; a slower Linux CI box does not.
+///
+/// The fix mirrors `tests/pty_support::wait_for_marker` exactly: stop
+/// inferring completion from terminal quiet and poll the filesystem side
+/// effect — the marker file is the ground truth — with a generous bounded
+/// timeout instead of a fixed settle-then-kill.
+fn wait_for_marker(
+    sess: &mut ProbeSession,
+    marker: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        // Keep the PTY reader channel drained while we wait on the filesystem.
+        sess.drain(MARKER_POLL);
+    }
+}
+
+/// Wait `timeout` for `marker` to appear, draining the PTY meanwhile, then
+/// report whether it stayed **absent**. The mirror of [`wait_for_marker`] for
+/// an expected-absent side effect: an absence cannot be confirmed early, so it
+/// always waits the full bound to be sure the marker never shows up.
+fn marker_stays_absent(sess: &mut ProbeSession, marker: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if marker.exists() {
+            return false;
+        }
+        // The check above already established absence for this tick; if the
+        // deadline has now passed, the marker stayed absent for the full bound.
+        if Instant::now() >= deadline {
+            return true;
+        }
+        sess.drain(MARKER_POLL);
+    }
 }
 
 /// Environment for a hermetic probe session, isolated from the developer's real
@@ -413,9 +479,16 @@ impl ProbeEnv {
 
 /// Probe whether bash enter mode can *deliver* an allowed command exactly once.
 ///
-/// Returns `Ok(true)` when the marker file holds exactly one line after the
-/// command + Enter, `Ok(false)` when delivery failed (#111 reproduced), and
-/// `Err` when the probe could not run to a verdict.
+/// Returns `Ok(true)` when the marker file holds exactly one nonce line after
+/// the command + Enter, `Ok(false)` when delivery failed (#111 reproduced),
+/// and `Err` when the probe could not run to a verdict.
+///
+/// Completion is read from the marker *file*, not from terminal quiet: the
+/// probe command is side-effect-only and the hook shells out to `tirith
+/// check`, so terminal silence is reached before the command actually runs
+/// (the no-output race documented on [`wait_for_marker`]). The marker is
+/// polled with a bounded timeout — the same robustness the PTY conformance
+/// harness already adopted.
 fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
     let marker = env.work.join("deliver_marker");
     let nonce = "TIRITH_PROBE_DELIVER_NONCE";
@@ -435,15 +508,24 @@ fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         sess.kill();
         return Err("sourcing the hook did not return a prompt".into());
     }
-    sess.wait_idle(QUIET_GAP, PHASE_TIMEOUT);
 
     // An allowed, side-effect-only command: append one nonce line to a marker.
+    // Poll the marker file rather than wait for terminal quiet — a
+    // `printf >> marker` command (and `tirith check` on an allow verdict)
+    // print nothing, so terminal silence happens *before* delivery.
     sess.send_line(&format!("printf '{nonce}\\n' >> {}", posix_quote(&marker)));
-    sess.wait_idle(QUIET_GAP, PHASE_TIMEOUT);
+    let delivered = wait_for_marker(&mut sess, &marker, nonce, MARKER_TIMEOUT);
     // Tear the session down hard — never send a second Enter, which (in the
     // broken case) could flush a stale readline buffer and fake a success.
     sess.kill();
 
+    if !delivered {
+        // The marker never gained the nonce within the bound: the command was
+        // not delivered (#111 reproduced).
+        return Ok(false);
+    }
+    // Delivered. Re-read once to assert it ran *exactly* once — a hook that
+    // double-delivered would write the nonce twice and is just as broken.
     let body = std::fs::read_to_string(&marker).unwrap_or_default();
     Ok(count_occurrences(&body, nonce) == 1)
 }
@@ -479,10 +561,31 @@ fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
 /// probe environment is the correct, network-free way to assert "enter mode can
 /// block".
 ///
-/// Returns `Ok(true)` when the command was blocked (marker absent), `Ok(false)`
-/// when it executed anyway, and `Err` when the probe could not run.
+/// ## Why this phase has an anti-vacuous guard
+///
+/// A swallowed command trivially produces no marker — so "the blocked
+/// command's marker is absent" proves *blocking* only once it is also proven
+/// that this probe shell delivers commands at all. The old code killed the
+/// shell after terminal quiet and read marker-absent as "blocked": a command
+/// the hook never even ran (the #111 swallow, or a command killed before it
+/// executed) was indistinguishable from a correctly blocked one, and would
+/// falsely upgrade a broken hook to `works`.
+///
+/// This phase therefore first delivers an *allowed* side-effect-only command
+/// and polls its marker. Only if that marker appears — proving the probe shell
+/// is genuinely delivering commands — does it then send the blocked command
+/// and poll *its* marker as absent. If the allowed command never runs, the
+/// probe cannot conclude anything: it returns `Err` (which [`probe`] maps to
+/// [`EnterCapability::Inconclusive`]), never `Ok(true)`.
+///
+/// Returns `Ok(true)` when the allowed command ran *and* the blocked command
+/// did not (marker absent), `Ok(false)` when the blocked command executed
+/// anyway, and `Err` when the probe could not run to a verdict — including the
+/// anti-vacuous case where the allowed command itself was not delivered.
 fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
-    let marker = env.work.join("block_marker");
+    let allowed_marker = env.work.join("block_allowed_marker");
+    let blocked_marker = env.work.join("block_marker");
+    let allowed_nonce = "TIRITH_PROBE_BLOCK_ALLOWED_NONCE";
 
     let mut sess =
         ProbeSession::spawn(bash, &["--norc", "--noprofile", "-i"], &env.envs, &env.work)
@@ -498,21 +601,93 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         sess.kill();
         return Err("sourcing the hook did not return a prompt".into());
     }
-    sess.wait_idle(QUIET_GAP, PHASE_TIMEOUT);
+
+    // Anti-vacuous guard: an *allowed* side-effect-only command must actually
+    // run. If its marker never appears, this probe shell is swallowing
+    // commands — a marker-absent verdict on the blocked command below would
+    // then be meaningless, so bail to an inconclusive result rather than
+    // report a false `blocked`.
+    sess.send_line(&format!(
+        "printf '{allowed_nonce}\\n' >> {}",
+        posix_quote(&allowed_marker)
+    ));
+    if !wait_for_marker(&mut sess, &allowed_marker, allowed_nonce, MARKER_TIMEOUT) {
+        sess.kill();
+        return Err(
+            "anti-vacuous guard failed: the probe shell did not deliver an allowed \
+             command, so a blocked-command verdict cannot be trusted"
+                .into(),
+        );
+    }
 
     // A purely local pipe-to-interpreter — `printf 'true' | bash` — which
     // tirith blocks via the `pipe_to_interpreter` rule. The `&& touch` clause
     // runs only if the pipeline executed; tirith must block before that. Using
     // a local producer (not `curl`) keeps the verdict independent of network
-    // reachability — see the doc comment above.
+    // reachability — see the doc comment above. The marker is *expected to be
+    // absent*: poll for the full timeout to be sure it never appears, draining
+    // the PTY meanwhile.
     sess.send_line(&format!(
         "printf 'true' | bash && touch {}",
-        posix_quote(&marker)
+        posix_quote(&blocked_marker)
     ));
-    sess.wait_idle(QUIET_GAP, PHASE_TIMEOUT);
+    let blocked = !marker_stays_absent(&mut sess, &blocked_marker, MARKER_TIMEOUT);
     sess.kill();
 
-    Ok(!marker.exists())
+    // Guard passed (commands are delivered) and the blocked command's marker
+    // stayed absent ⇒ it was genuinely blocked.
+    Ok(!blocked)
+}
+
+/// Combine the two probe phases' results into the final verdict and reason.
+///
+/// Pulled out of [`probe`] as a pure function so the verdict logic is unit
+/// testable without spawning a PTY — the PTY phases are environment-dependent
+/// (whether `bind -x` accepts the line is a property of the bash/readline
+/// build), but the composition rule is fixed and must stay regression-safe:
+///
+/// * delivery `Ok(true)` + blocking `Ok(true)` ⇒ [`EnterCapability::Works`].
+/// * delivery `Ok(false)` (the #111 swallow) ⇒ [`EnterCapability::Broken`] —
+///   blocking is not even attempted.
+/// * delivery `Ok(true)` + blocking `Ok(false)` (delivered but did not block)
+///   ⇒ [`EnterCapability::Broken`].
+/// * either phase `Err` ⇒ [`EnterCapability::Inconclusive`] — the probe could
+///   not run to a confident verdict (including `probe_blocking`'s anti-vacuous
+///   guard failing). Fail closed: the hook treats this exactly like `Broken`.
+///
+/// `blocking` is `None` when delivery failed and blocking was skipped.
+fn classify_probe_results(
+    delivery: &Result<bool, String>,
+    blocking: Option<&Result<bool, String>>,
+) -> (EnterCapability, String) {
+    match delivery {
+        Ok(false) => (
+            EnterCapability::Broken,
+            "enter mode did not deliver an allowed command (issue #111)".into(),
+        ),
+        Err(e) => (
+            EnterCapability::Inconclusive,
+            format!("delivery probe could not run: {e}"),
+        ),
+        Ok(true) => match blocking {
+            Some(Ok(true)) => (
+                EnterCapability::Works,
+                "enter mode delivers an allowed command and blocks a blocked one".into(),
+            ),
+            Some(Ok(false)) => (
+                EnterCapability::Broken,
+                "enter mode delivered but failed to block a blocked command".into(),
+            ),
+            Some(Err(e)) => (
+                EnterCapability::Inconclusive,
+                format!("blocking probe could not run: {e}"),
+            ),
+            None => (
+                EnterCapability::Inconclusive,
+                "delivery succeeded but the blocking phase was not run".into(),
+            ),
+        },
+    }
 }
 
 /// Run the full enter-mode self-test against whatever bash is on `PATH`.
@@ -547,52 +722,19 @@ pub fn probe() -> ProbeOutcome {
     };
 
     // Phase 1 — delivery. If an allowed command is not delivered, this is #111.
-    match probe_delivery(&bash, &env) {
-        Ok(true) => {}
-        Ok(false) => {
-            return ProbeOutcome {
-                capability: EnterCapability::Broken,
-                bash_version,
-                bash_path: Some(bash),
-                reason: "enter mode did not deliver an allowed command (issue #111)".into(),
-                cache_path: None,
-            };
-        }
-        Err(e) => {
-            return ProbeOutcome {
-                capability: EnterCapability::Inconclusive,
-                bash_version,
-                bash_path: Some(bash),
-                reason: format!("delivery probe could not run: {e}"),
-                cache_path: None,
-            };
-        }
-    }
+    let delivery = probe_delivery(&bash, &env);
+    // Phase 2 — blocking runs only if delivery succeeded: delivery alone is not
+    // enough (enter mode must also stop a dangerous command), and a failed
+    // delivery already settles the verdict as `Broken`.
+    let blocking = matches!(delivery, Ok(true)).then(|| probe_blocking(&bash, &env));
 
-    // Phase 2 — blocking. Delivery alone is not enough: enter mode must also be
-    // able to stop a dangerous command.
-    match probe_blocking(&bash, &env) {
-        Ok(true) => ProbeOutcome {
-            capability: EnterCapability::Works,
-            bash_version,
-            bash_path: Some(bash),
-            reason: "enter mode delivers an allowed command and blocks a blocked one".into(),
-            cache_path: None,
-        },
-        Ok(false) => ProbeOutcome {
-            capability: EnterCapability::Broken,
-            bash_version,
-            bash_path: Some(bash),
-            reason: "enter mode delivered but failed to block a blocked command".into(),
-            cache_path: None,
-        },
-        Err(e) => ProbeOutcome {
-            capability: EnterCapability::Inconclusive,
-            bash_version,
-            bash_path: Some(bash),
-            reason: format!("blocking probe could not run: {e}"),
-            cache_path: None,
-        },
+    let (capability, reason) = classify_probe_results(&delivery, blocking.as_ref());
+    ProbeOutcome {
+        capability,
+        bash_version,
+        bash_path: Some(bash),
+        reason,
+        cache_path: None,
     }
 }
 
@@ -1003,5 +1145,266 @@ mod tests {
             read_cache().is_none(),
             "a schema-1 cache missing bash_path must be rejected"
         );
+    }
+
+    // --- Live probe tests (issue #111 / PR #116 probe-race fix) ------------
+    //
+    // These actually run the PTY self-test. They skip cleanly when the bash
+    // the probe would target (`discover_bash`) is missing or older than 5 —
+    // bash 3.2 (macOS `/bin/bash`) is not a supported enter-mode target, and
+    // `cargo test` must stay green where only an old bash exists.
+
+    /// Major version of the bash binary at `path`, parsed from `bash --version`.
+    fn bash_major(path: &Path) -> Option<u32> {
+        let out = std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let first = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let rest = &first[first.find("version ")? + "version ".len()..];
+        rest.split('.').next()?.trim().parse::<u32>().ok()
+    }
+
+    /// The bash the probe will actually target, *only* when it is modern
+    /// (>= 5). `None` ⇒ the caller should skip.
+    fn probe_target_if_modern() -> Option<PathBuf> {
+        let bash = discover_bash()?;
+        match bash_major(&bash) {
+            Some(major) if major >= 5 => Some(bash),
+            _ => None,
+        }
+    }
+
+    /// Deterministic, always-runs coverage of the verdict-composition rule —
+    /// the heart of what the PR #116 fix protects. `classify_probe_results` is
+    /// pure, so the `Works` classification is asserted here without depending
+    /// on any host's `bind -x` behaviour. The live-`probe()` test below adds
+    /// the integration angle; this nails the logic regression-safely.
+    #[test]
+    fn classify_probe_results_maps_phases_to_verdicts() {
+        let ok_true: Result<bool, String> = Ok(true);
+        let ok_false: Result<bool, String> = Ok(false);
+        let err: Result<bool, String> = Err("boom".into());
+
+        // delivery works + blocking works ⇒ Works.
+        let (cap, _) = classify_probe_results(&ok_true, Some(&ok_true));
+        assert_eq!(cap, EnterCapability::Works, "delivered + blocked ⇒ Works");
+        assert!(
+            cap.enables_enter(),
+            "only a Works verdict enables enter mode"
+        );
+
+        // delivery failed (#111 swallow) ⇒ Broken, blocking skipped (None).
+        let (cap, reason) = classify_probe_results(&ok_false, None);
+        assert_eq!(cap, EnterCapability::Broken, "no delivery ⇒ Broken");
+        assert!(
+            reason.contains("#111"),
+            "reason should cite the #111 swallow"
+        );
+
+        // delivered but did not block ⇒ Broken.
+        let (cap, _) = classify_probe_results(&ok_true, Some(&ok_false));
+        assert_eq!(
+            cap,
+            EnterCapability::Broken,
+            "delivered-but-not-blocked ⇒ Broken"
+        );
+
+        // delivery probe could not run ⇒ Inconclusive (fail closed).
+        let (cap, _) = classify_probe_results(&err, None);
+        assert_eq!(
+            cap,
+            EnterCapability::Inconclusive,
+            "delivery Err ⇒ Inconclusive"
+        );
+
+        // blocking's anti-vacuous guard failed (Err) ⇒ Inconclusive, never a
+        // false Works. This is the P1 anti-vacuous safety property.
+        let (cap, _) = classify_probe_results(&ok_true, Some(&err));
+        assert_eq!(
+            cap,
+            EnterCapability::Inconclusive,
+            "blocking Err (e.g. anti-vacuous guard failed) ⇒ Inconclusive, not Works"
+        );
+        assert!(
+            !cap.enables_enter(),
+            "an Inconclusive verdict must not enable enter mode — fail closed"
+        );
+    }
+
+    /// The integration regression test for the PR #116 probe-race fix: running
+    /// the real self-test against a modern bash must reach a **definite,
+    /// race-free verdict** — `Works` or `Broken`, never `Inconclusive`.
+    ///
+    /// Before the fix, `probe_delivery` / `probe_blocking` keyed completion on
+    /// terminal silence and killed the shell after a quiet gap. For a
+    /// no-terminal-output command whose hook shells out to `tirith check`,
+    /// that silence is reached *before* the command runs — so the probe read
+    /// an empty marker and could not tell "delivery genuinely failed" from
+    /// "delivery had not happened yet". After the fix the probe polls the
+    /// marker file, so the verdict reflects the bash build's *real* enter-mode
+    /// behaviour: a build whose `bind -x` accepts the line ⇒ `Works`, one that
+    /// does not ⇒ `Broken`. Either way it is definite; `Inconclusive` would
+    /// mean the probe could not even run, which must not happen for a healthy
+    /// modern bash.
+    ///
+    /// Whether *this* host's bash delivers in a PTY is build-dependent (the
+    /// `portable-pty` conformance harness documents builds where `bind -x`
+    /// does not accept the line — genuine #111), so the test does not hard-pin
+    /// `Works`. When the host's bash *does* deliver, the verdict is `Works` and
+    /// that is the full end-to-end proof; the deterministic `Works` coverage
+    /// lives in `classify_probe_results_maps_phases_to_verdicts` above.
+    #[test]
+    fn probe_reaches_definite_verdict_on_modern_bash() {
+        let Some(bash) = probe_target_if_modern() else {
+            eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
+            return;
+        };
+        let outcome = probe();
+        // The verdict must be definite: `Works` or `Broken`, never
+        // `Inconclusive`. An exhaustive match (not an `assert_ne!`) keeps this
+        // future-proof — a new `EnterCapability` variant becomes a compile
+        // error here, forcing a deliberate decision.
+        match outcome.capability {
+            EnterCapability::Works => assert!(
+                outcome.capability.enables_enter(),
+                "a Works verdict must enable enter mode"
+            ),
+            EnterCapability::Broken => {}
+            EnterCapability::Inconclusive => panic!(
+                "the PR #116 fix must let the probe reach a definite verdict for a \
+                 healthy modern bash ({}) — an Inconclusive here means the probe \
+                 could not run, not a real delivery failure; reason was {:?}",
+                bash.display(),
+                outcome.reason,
+            ),
+        }
+        // The probe must record the bash it measured, whatever the verdict.
+        assert!(
+            outcome.bash_version.is_some(),
+            "a completed probe must record the probed $BASH_VERSION"
+        );
+        assert_eq!(
+            outcome.bash_path.as_deref(),
+            Some(bash.as_path()),
+            "the probe must record the bash path it targeted"
+        );
+        eprintln!(
+            "probe verdict for {}: {:?} ({})",
+            bash.display(),
+            outcome.capability,
+            outcome.reason
+        );
+    }
+
+    /// `probe_delivery` against a modern bash must reach a **definite** verdict
+    /// (`Ok(true)` or `Ok(false)`), never `Err`. Before the fix it keyed on
+    /// terminal silence and could not distinguish "delivery had not happened
+    /// yet" from a real result; polling the marker file makes the outcome
+    /// reflect the build's real behaviour regardless of `tirith check`
+    /// latency. When this host's build *does* deliver, the result is
+    /// `Ok(true)` — printed for visibility.
+    #[test]
+    fn probe_delivery_reaches_definite_verdict_on_modern_bash() {
+        let Some(bash) = probe_target_if_modern() else {
+            eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
+            return;
+        };
+        let env = ProbeEnv::new().expect("stage probe environment");
+        match probe_delivery(&bash, &env) {
+            Ok(delivered) => eprintln!("probe_delivery for {}: Ok({delivered})", bash.display()),
+            Err(e) => panic!(
+                "probe_delivery on a healthy modern bash ({}) must reach a definite \
+                 Ok(_) verdict, not Err — Err means the probe could not run: {e}",
+                bash.display()
+            ),
+        }
+    }
+
+    /// `probe_blocking`'s anti-vacuous guard must never produce a false
+    /// `Ok(true)`: the only way it returns `Ok(true)` ("blocked") is *after*
+    /// an allowed command has been proven to run. So a swallowed-command shell
+    /// yields `Err` (→ `Inconclusive`), and `Ok(true)` is reachable only when
+    /// delivery genuinely works. This test asserts the guard holds — the
+    /// result is `Ok(true)`, `Ok(false)`, or `Err`, and an `Err` here is the
+    /// anti-vacuous guard correctly refusing to vouch for a non-delivering
+    /// shell rather than a crash.
+    #[test]
+    fn probe_blocking_anti_vacuous_guard_holds_on_modern_bash() {
+        let Some(bash) = probe_target_if_modern() else {
+            eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
+            return;
+        };
+        let env = ProbeEnv::new().expect("stage probe environment");
+        match probe_blocking(&bash, &env) {
+            Ok(true) => eprintln!(
+                "probe_blocking for {}: Ok(true) — delivery works and the blocked \
+                 command was stopped",
+                bash.display()
+            ),
+            Ok(false) => eprintln!(
+                "probe_blocking for {}: Ok(false) — delivered but did not block",
+                bash.display()
+            ),
+            Err(e) => {
+                // The anti-vacuous guard refusing to conclude is a *correct*
+                // outcome on a build where enter delivery does not work — it
+                // must surface as Err, never a false Ok(true).
+                assert!(
+                    e.contains("anti-vacuous") || e.contains("probe"),
+                    "an Err from probe_blocking must be a probe/guard failure, got: {e}"
+                );
+                eprintln!(
+                    "probe_blocking for {}: Err (anti-vacuous guard refused to vouch \
+                     for a non-delivering shell) — {e}",
+                    bash.display()
+                );
+            }
+        }
+    }
+
+    /// `marker_stays_absent` reports `true` only while the file never appears,
+    /// and flips to `false` the moment it does — the absence primitive the
+    /// blocking probe relies on.
+    #[test]
+    fn marker_stays_absent_detects_a_created_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("never");
+        let present = dir.path().join("created");
+
+        // A throwaway session just to satisfy the `&mut ProbeSession` drain
+        // argument; `drain` on a quiet PTY is a bounded no-op.
+        let Some(bash) = probe_target_if_modern() else {
+            eprintln!("skipping: no modern bash (>= 5) to host a drain-only session");
+            return;
+        };
+        let env = ProbeEnv::new().expect("stage probe environment");
+        let mut sess = ProbeSession::spawn(
+            &bash,
+            &["--norc", "--noprofile", "-i"],
+            &env.envs,
+            &env.work,
+        )
+        .expect("spawn probe session");
+
+        // A file that never appears stays absent for the whole (short) bound.
+        assert!(
+            marker_stays_absent(&mut sess, &absent, Duration::from_millis(200)),
+            "a file that is never created must be reported absent"
+        );
+        // A file that already exists is detected immediately as present.
+        std::fs::write(&present, "x").unwrap();
+        assert!(
+            !marker_stays_absent(&mut sess, &present, Duration::from_millis(200)),
+            "an existing file must be reported present"
+        );
+        sess.kill();
     }
 }
