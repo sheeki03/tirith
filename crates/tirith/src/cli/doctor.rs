@@ -358,6 +358,14 @@ fn env_is_truthy(s: &str) -> bool {
     )
 }
 
+/// True when a persisted bash safe-mode flag exists but `TIRITH_BASH_MODE=enter`
+/// overrides it, so the hook re-attempts enter mode on every new shell despite
+/// the recorded prior failure. Exact, case-sensitive match — mirrors the hook's
+/// `[[ "$_TIRITH_BASH_MODE" == "enter" ]]`.
+fn safe_mode_overridden_by_env(bash_safe_mode: bool, requested_mode: Option<&str>) -> bool {
+    bash_safe_mode && requested_mode == Some("enter")
+}
+
 /// Create a minimal starter policy at .tirith/policy.yaml in the repo root,
 /// or fall back to the user config dir.
 fn create_default_policy() -> Result<PathBuf, String> {
@@ -872,6 +880,18 @@ fn print_human(info: &DoctorInfo) {
             println!("                        Reset: tirith doctor --reset-bash-safe-mode");
         } else {
             println!("  safe mode:            off");
+        }
+        if safe_mode_overridden_by_env(info.bash_safe_mode, info.bash_requested_mode.as_deref()) {
+            println!(
+                "  warning:              TIRITH_BASH_MODE=enter overrides the safe-mode flag —"
+            );
+            println!(
+                "                        enter mode is re-attempted (and may keep failing) on"
+            );
+            println!(
+                "                        every new shell. Unset TIRITH_BASH_MODE to honor the"
+            );
+            println!("                        recorded failure and stay in preexec.");
         }
     } else if info.bash_safe_mode {
         // Non-bash shell but safe-mode flag exists: still surface it.
@@ -1458,5 +1478,14 @@ mod tests {
                 "no policy anywhere must yield an empty list",
             );
         });
+    }
+
+    #[test]
+    fn safe_mode_overridden_only_when_flag_and_enter() {
+        assert!(safe_mode_overridden_by_env(true, Some("enter")));
+        assert!(!safe_mode_overridden_by_env(false, Some("enter"))); // no flag
+        assert!(!safe_mode_overridden_by_env(true, Some("preexec"))); // not enter
+        assert!(!safe_mode_overridden_by_env(true, None)); // env unset
+        assert!(!safe_mode_overridden_by_env(true, Some("Enter"))); // case-sensitive
     }
 }

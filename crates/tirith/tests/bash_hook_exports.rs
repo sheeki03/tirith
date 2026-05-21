@@ -246,3 +246,56 @@ fn doctor_default_requested_mode_shown_when_env_unset() {
         "effective mode missing, got:\n{stdout}"
     );
 }
+
+/// Source the hook in an interactive subshell, run `body`, then dump the two
+/// effective-state exports. Like `source_hook_and_dump_exports`, but lets a
+/// test drive a state transition (e.g. a degrade) before the dump.
+fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let hook = hook_path();
+    let script = format!(
+        "source '{hook}' 2>/dev/null; {body}; \
+         printf 'MODE=%s\\nPROT=%s\\n' \
+           \"${{TIRITH_BASH_EFFECTIVE_MODE:-}}\" \
+           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
+    );
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("XDG_STATE_HOME", tmpdir.path());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run bash");
+    assert!(
+        out.status.success(),
+        "bash exited non-zero: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// #111: an enter->preexec auto-degrade must refresh the exported effective
+/// state, so a child `tirith doctor` after a degrade reports the truth instead
+/// of the stale `enter`/`blocks` values exported at shell startup.
+#[test]
+fn degrade_to_preexec_reexports_effective_state() {
+    // `_TIRITH_TEST_SKIP_HEALTH=1` keeps the hook in enter mode — it would
+    // otherwise auto-degrade at the startup health gate in a non-PTY shell, so
+    // the explicit degrade below would not be the transition under test.
+    let out = source_hook_run_and_dump(
+        &[("_TIRITH_TEST_SKIP_HEALTH", "1")],
+        "_tirith_degrade_to_preexec degrade-test",
+    );
+    assert!(
+        out.contains("MODE=preexec"),
+        "degrade must re-export TIRITH_BASH_EFFECTIVE_MODE=preexec, got:\n{out}"
+    );
+    assert!(
+        out.contains("PROT=warn-only"),
+        "degrade must re-export TIRITH_BASH_EFFECTIVE_PROTECTION=warn-only, got:\n{out}"
+    );
+}

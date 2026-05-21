@@ -438,6 +438,13 @@ _tirith_degrade_to_preexec() {
   _TIRITH_BASH_MODE="preexec"
   _tirith_persist_safe_mode
   if [[ $- == *i* ]]; then
+    # Re-export the effective-state contract so a child `tirith doctor` sees the
+    # post-degrade truth, not the stale enter/blocks values exported at startup.
+    # Hardcoded warn-only: a shell that degrades out of enter mode never had
+    # preexec enforcement enabled (enforcement is evaluated only at startup for
+    # shells that START in preexec).
+    export TIRITH_BASH_EFFECTIVE_MODE="preexec"
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
     _tirith_output "  Restart your shell for full custom keybindings to return."
   fi
 }

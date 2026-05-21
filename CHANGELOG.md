@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`tirith doctor` reported `policies: (none found)` for a policy created by `tirith policy init` (#112)** — `doctor` now resolves the active policy through the same local discovery the engine uses — `TIRITH_POLICY_ROOT`, walk-up from the cwd to the `.git` boundary, then the user config dir — via a new shared `discover_local_policy_path` resolver. `tirith policy validate` resolves through it too, so it now locates and reports on a present-but-corrupt policy instead of reporting "no policy file found"; and `doctor --fix` gained an existence guard so it never overwrites an existing policy file. Previously `doctor` only checked the user config dir and `TIRITH_POLICY_ROOT`, never walking up from the cwd.
+- **Bash enter-mode auto-degrade left `tirith doctor` reporting stale shell state (#111)** — when an interactive bash shell degrades from enter mode to preexec, `_tirith_degrade_to_preexec` now re-exports `TIRITH_BASH_EFFECTIVE_MODE=preexec` and `TIRITH_BASH_EFFECTIVE_PROTECTION=warn-only`, so a child `tirith doctor` reports the real post-degrade state instead of the stale `enter`/`blocks` values exported at shell startup. `tirith doctor` also now warns when a persisted bash safe-mode flag is being overridden by `TIRITH_BASH_MODE=enter`. The bash 5.3 enter-mode delivery regression that *triggers* the degrade is not addressed here — #111 remains open for it.
+
 ## [0.3.1] - 2026-05-08
 
 ### Fixed
