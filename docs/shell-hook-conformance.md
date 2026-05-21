@@ -33,7 +33,7 @@ invariants:
 | d | **A blocked command does not execute** | When the hook (in a blocking mode) blocks a command, the command's side effects never happen. |
 | e | **A warned command executes once** | A *warn* verdict is advisory: the command still runs, exactly once. |
 | f | **Degradation is visible, not silent** | If the hook cannot deliver on its protection guarantee, it must say so — and (where applicable) persist a safe-mode flag — never quietly drop to a weaker mode. |
-| g | **Non-interactive sourcing is a complete no-op** | Sourcing the hook in a non-interactive shell (a script, `bash -c`, `BASH_ENV`, `fish -c`) installs nothing: no traps, no key bindings, no state writes, no exported status vars. |
+| g | **Non-interactive shells carry no tirith status** | Sourcing the hook in a non-interactive shell (a script, `bash -c`, `BASH_ENV`, `fish -c`) installs nothing: no traps, no key bindings, no state writes. The `TIRITH_STATUS` prompt indicator is a non-exported shell variable, so a non-interactive *child* of a protected interactive shell never inherits it either — a process with no tirith protection must never appear to carry a tirith status. |
 
 Invariant (f) is the safety floor. A hook is allowed to *fail* — terminals are
 varied and hostile environments exist — but it is never allowed to fail
@@ -122,8 +122,12 @@ cannot decide enter-vs-preexec by a version gate. The fix is **capability-based*
   delivered exactly once **and** that a command tirith would block is actually
   stopped.
 - The self-test writes a small `key=value` **cache file**
-  (`<state-dir>/bash-enter-capability`) recording the verdict, keyed by tirith
-  version + bash version.
+  (`<state-dir>/bash-enter-capability`) recording the verdict. Freshness is
+  keyed on the bash identity — `$BASH_VERSION` and the bash binary path —
+  because `bind -x` line-acceptance is a property of that specific
+  bash/readline build, not of the tirith release. The cache `schema` number is
+  the cross-tirith-version invalidator (any change to the probe semantics or
+  cache format bumps it); the recorded `tirith_version` is diagnostic only.
 - `tirith init` is unchanged — it must stay fast because it is `eval`'d on
   every interactive shell startup, and the self-test is far too heavy to run
   there. The bash hook itself reads the cache file at startup (a single

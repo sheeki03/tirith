@@ -56,15 +56,15 @@ downgrade is **never silent**: the hook prints one consolidated message,
 tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details
 ```
 
-and updates the exported `TIRITH_STATUS` variable to `degraded`.
+and updates the `TIRITH_STATUS` shell variable to `degraded`.
 
 To see the current protection level at any time, run `tirith doctor` — a
 `protection:` line reports `blocks` / `warn-only` / `degraded` / `off`, and a
 `degraded` state gets an explicit callout. `tirith doctor --compat` shows a
 `protection status:` line in the same spirit.
 
-If you want the protection level visible in your shell prompt, the hook
-exports `TIRITH_STATUS` for exactly that — see
+If you want the protection level visible in your shell prompt, the hook sets a
+non-exported `TIRITH_STATUS` shell variable for exactly that — see
 [`docs/prompt-status.md`](prompt-status.md) for ready-to-paste prompt snippets
 for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
 output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
@@ -211,9 +211,13 @@ If you have your own `DEBUG` trap installed before sourcing the tirith hook, the
 
 The `enter capability:` line shows the cached verdict of the bash enter-mode
 delivery self-test (issue #111): `works` (enter mode is enabled for new
-shells), `broken` / `inconclusive` (preexec is used), `STALE` (the verdict is
-for a different bash or tirith version — run `tirith doctor --simulate-enter`),
-or `not tested`.
+shells), `broken` / `inconclusive` (preexec is used), `STALE` (the verdict was
+measured against a different bash — a different `$BASH_VERSION` or a different
+bash binary path — so it no longer applies; run `tirith doctor
+--simulate-enter` to re-measure), or `not tested`. Cache freshness tracks the
+bash identity only; a tirith upgrade does not by itself make the verdict stale
+(the cache `schema` number handles cross-version invalidation, and the
+recorded tirith version is diagnostic only).
 
 If you see `bash hook: not loaded in this process`, the hook did not run in the shell that invoked `doctor` — typically because `doctor` was called from a non-interactive subshell. Source the hook in your `.bashrc` and open a new interactive shell.
 
