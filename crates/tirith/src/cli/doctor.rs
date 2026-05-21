@@ -187,20 +187,54 @@ fn hooks_stale() -> bool {
     }
 }
 
-/// Check whether any policy file can be discovered.
+/// Check whether any policy file can be discovered, using the same local
+/// discovery the engine uses (TIRITH_POLICY_ROOT, walk-up to the `.git`
+/// boundary, then the user config dir). Existence-based: no network fetch.
 fn policy_missing() -> bool {
-    if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
-        let tirith_dir = PathBuf::from(&root).join(".tirith");
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    tirith_core::policy::discover_local_policy_path(cwd.as_deref()).is_none()
+}
+
+/// Build the de-duplicated list of policy paths `doctor` should display. The
+/// first entry (if any) is the policy the engine would actually load; the rest
+/// are present-but-shadowed policy files (user config dir, TIRITH_POLICY_ROOT).
+fn collect_policy_paths(cwd: Option<&str>) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+
+    if let Some(active) = tirith_core::policy::discover_local_policy_path(cwd) {
+        let s = active.display().to_string();
+        if !paths.contains(&s) {
+            paths.push(s);
+        }
+    }
+    if let Some(config) = tirith_core::policy::config_dir() {
         for ext in &["policy.yaml", "policy.yml"] {
-            if tirith_dir.join(ext).exists() {
-                return false;
+            let p = config.join(ext);
+            if p.exists() {
+                let s = p.display().to_string();
+                if !paths.contains(&s) {
+                    paths.push(s);
+                }
+                break;
             }
         }
     }
-
-    // discover_partial is local-only — doctor must not trigger a network fetch.
-    let policy = tirith_core::policy::Policy::discover_partial(None);
-    policy.path.is_none()
+    if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
+        let tirith_dir = PathBuf::from(&root).join(".tirith");
+        for ext in &["policy.yaml", "policy.yml"] {
+            let p = tirith_dir.join(ext);
+            if p.exists() {
+                let s = p.display().to_string();
+                if !paths.contains(&s) {
+                    paths.push(s);
+                }
+                break;
+            }
+        }
+    }
+    paths
 }
 
 /// One detected AI coding tool. `configured_scope` carries the scope at
@@ -342,6 +376,12 @@ blocklist: []
         let policy_dir = repo_root.join(".tirith");
         if std::fs::create_dir_all(&policy_dir).is_ok() {
             let path = policy_dir.join("policy.yaml");
+            if path.exists() {
+                return Err(format!(
+                    "policy already exists at {} — not overwriting",
+                    path.display()
+                ));
+            }
             return std::fs::write(&path, content)
                 .map(|()| path)
                 .map_err(|e| e.to_string());
@@ -352,6 +392,12 @@ blocklist: []
     if let Some(config) = tirith_core::policy::config_dir() {
         if std::fs::create_dir_all(&config).is_ok() {
             let path = config.join("policy.yaml");
+            if path.exists() {
+                return Err(format!(
+                    "policy already exists at {} — not overwriting",
+                    path.display()
+                ));
+            }
             return std::fs::write(&path, content)
                 .map(|()| path)
                 .map_err(|e| e.to_string());
@@ -604,27 +650,11 @@ fn gather_info() -> DoctorInfo {
     let log_path = data_dir.as_ref().map(|d| d.join("log.jsonl"));
     let last_trigger_path = data_dir.as_ref().map(|d| d.join("last_trigger.json"));
 
-    let mut policy_paths = Vec::new();
-    if let Some(config) = tirith_core::policy::config_dir() {
-        for ext in &["policy.yaml", "policy.yml"] {
-            let user_policy = config.join(ext);
-            if user_policy.exists() {
-                policy_paths.push(user_policy.display().to_string());
-                break;
-            }
-        }
-    }
+    let policy_cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy_paths = collect_policy_paths(policy_cwd.as_deref());
     let policy_root_env = std::env::var("TIRITH_POLICY_ROOT").ok();
-    if let Some(ref root) = policy_root_env {
-        let tirith_dir = PathBuf::from(root).join(".tirith");
-        for ext in &["policy.yaml", "policy.yml"] {
-            let p = tirith_dir.join(ext);
-            if p.exists() {
-                policy_paths.push(p.display().to_string());
-                break;
-            }
-        }
-    }
 
     let shadow_binaries = super::find_shadow_binaries();
     let detection_gaps = check_detection_gaps();
@@ -1144,7 +1174,7 @@ fn reset_safe_mode() -> i32 {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::with_fake_env;
+    use crate::cli::test_harness::{with_fake_env, EnvGuard};
 
     fn first_kiro(tools: &[DetectedTool]) -> Option<&DetectedTool> {
         tools.iter().find(|t| t.name == "kiro")
@@ -1324,6 +1354,109 @@ mod tests {
             let k = first_kiro(&tools).expect("kiro detected");
             assert_eq!(k.configured_scope, Some("user"));
             assert_eq!(count_named(&tools, "kiro"), 1);
+        });
+    }
+
+    // --- collect_policy_paths (#112) ---------------------------------------
+    //
+    // Every test isolates BOTH `TIRITH_POLICY_ROOT` and `XDG_CONFIG_HOME`:
+    // `with_fake_env` fakes `$HOME` but not those, and a machine-level
+    // `XDG_CONFIG_HOME`/`TIRITH_POLICY_ROOT` would otherwise leak into the
+    // assertions. cwd is passed explicitly so process cwd is never relied on.
+
+    #[test]
+    fn collect_policy_paths_finds_repo_root_policy() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+            std::fs::write(cwd.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
+            let expected = cwd.join(".tirith/policy.yaml").display().to_string();
+            assert_eq!(
+                collect_policy_paths(cwd.to_str()),
+                vec![expected],
+                "doctor must list the repo-root policy",
+            );
+        });
+    }
+
+    #[test]
+    fn collect_policy_paths_walks_up_from_subdir() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+            std::fs::write(cwd.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+            let subdir = cwd.join("src/inner");
+            std::fs::create_dir_all(&subdir).unwrap();
+
+            let expected = cwd.join(".tirith/policy.yaml").display().to_string();
+            assert_eq!(
+                collect_policy_paths(subdir.to_str()),
+                vec![expected],
+                "walk-up from a subdir must surface the repo-root policy",
+            );
+        });
+    }
+
+    #[test]
+    fn collect_policy_paths_finds_cwd_policy_without_git() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            // `tirith policy init` run outside a git repo (e.g. in $HOME) writes
+            // cwd/.tirith/policy.yaml with no .git boundary — the literal #112 repro.
+            std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+            std::fs::write(cwd.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
+            let expected = cwd.join(".tirith/policy.yaml").display().to_string();
+            assert_eq!(
+                collect_policy_paths(cwd.to_str()),
+                vec![expected],
+                "a cwd-local policy with no .git must still be listed (#112 repro)",
+            );
+        });
+    }
+
+    #[test]
+    fn collect_policy_paths_finds_user_config_policy_and_dedups() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            // Only the user config dir has a policy; cwd has none.
+            let config = home.join(".config/tirith");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("policy.yaml"), "fail_mode: open\n").unwrap();
+
+            let expected = config.join("policy.yaml").display().to_string();
+            let paths = collect_policy_paths(cwd.to_str());
+            assert_eq!(
+                paths.len(),
+                1,
+                "active policy == user config policy must dedup to one entry: {paths:?}",
+            );
+            assert_eq!(paths, vec![expected]);
+        });
+    }
+
+    #[test]
+    fn collect_policy_paths_empty_when_no_policy() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+            // Empty cwd tempdir, no .git, fake $HOME has no config policy.
+            assert!(
+                collect_policy_paths(cwd.to_str()).is_empty(),
+                "no policy anywhere must yield an empty list",
+            );
         });
     }
 }

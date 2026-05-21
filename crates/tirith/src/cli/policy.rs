@@ -465,6 +465,10 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    let policy = tirith_core::policy::Policy::discover(None);
-    policy.path.map(PathBuf::from)
+    // Existence-based local discovery — the same resolver the engine and
+    // `doctor` use. `Policy::discover` would parse the policy and, on a parse
+    // error, drop the path, so `validate` could not even locate a corrupt
+    // policy to report on; it would also resolve to an unreadable `remote:` URL
+    // when a remote policy server is configured.
+    tirith_core::policy::discover_local_policy_path(None)
 }

@@ -28,6 +28,13 @@ impl EnvGuard {
         unsafe { std::env::set_var(key, val) };
         Self { key, old }
     }
+
+    /// Remove `key` for the test's duration, restoring the prior value on Drop.
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let old = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        Self { key, old }
+    }
 }
 
 impl Drop for EnvGuard {

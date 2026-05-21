@@ -1857,3 +1857,38 @@ fn warn_only_json_output_matches_plain_when_timings_stripped() {
         "exit codes must match"
     );
 }
+
+/// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
+/// policy and report its error, rather than collapsing to "no policy file found"
+/// the way the old parse-aware discovery (`Policy::discover().path`) did.
+#[test]
+fn policy_validate_finds_present_but_corrupt_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tirith_dir = dir.path().join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith");
+    // Unparseable YAML: `Policy::discover` would parse this, fail, and drop the
+    // path — so the old resolver reported "no policy file found".
+    fs::write(tirith_dir.join("policy.yaml"), "{{invalid yaml\n").expect("write policy");
+
+    let out = tirith()
+        .args(["policy", "validate"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("no policy file found"),
+        "validate must locate the present policy, not claim none exists: {stderr}"
+    );
+    assert!(
+        stderr.contains("YAML parse error"),
+        "validate must report the corrupt policy's parse error: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a corrupt policy is an error-level issue (exit 1)"
+    );
+}

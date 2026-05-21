@@ -442,22 +442,9 @@ impl Policy {
 
     /// Discover local policy only (no remote fetch).
     fn discover_local(cwd: Option<&str>) -> Self {
-        if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
-            if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
-                return Self::load_from_path(&path);
-            }
-        }
-
-        match discover_policy_path(cwd) {
+        match discover_local_policy_path(cwd) {
             Some(path) => Self::load_from_path(&path),
-            None => {
-                if let Some(user_path) = user_policy_path() {
-                    if user_path.exists() {
-                        return Self::load_from_path(&user_path);
-                    }
-                }
-                Policy::default()
-            }
+            None => Policy::default(),
         }
     }
 
@@ -756,6 +743,25 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
     None
 }
 
+/// Resolve the path of the local policy that `discover_local` would load, without
+/// reading or parsing it. Mirrors `discover_local`'s resolution order exactly:
+/// `TIRITH_POLICY_ROOT/.tirith` -> walk-up from cwd to the `.git` boundary -> the
+/// user config dir. Returns `None` when no local policy file exists.
+///
+/// Existence-based: a present-but-unparseable policy file still yields its path
+/// here (callers that need a parsed policy use `Policy::discover`).
+pub fn discover_local_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
+        if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
+            return Some(path);
+        }
+    }
+    if let Some(path) = discover_policy_path(cwd) {
+        return Some(path);
+    }
+    user_policy_path()
+}
+
 /// Find the repository root (directory containing .git).
 pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
     let start = cwd
@@ -935,5 +941,105 @@ mod tests {
 
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+    }
+
+    /// Snapshot an env var on construction and restore it on `Drop`.
+    /// `TEST_ENV_LOCK` serializes env-mutating tests but does not restore
+    /// values; this guard does, so a test cannot leak into another.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn discover_local_policy_path_prefers_policy_root_over_walkup() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
+
+        // Both the TIRITH_POLICY_ROOT repo and the cwd carry their own policy.
+        let root_repo = tempfile::tempdir().unwrap();
+        let cwd_repo = tempfile::tempdir().unwrap();
+        for base in [root_repo.path(), cwd_repo.path()] {
+            std::fs::create_dir_all(base.join(".tirith")).unwrap();
+            std::fs::write(base.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+        }
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", root_repo.path());
+
+        assert_eq!(
+            discover_local_policy_path(Some(cwd_repo.path().to_str().unwrap())),
+            Some(root_repo.path().join(".tirith/policy.yaml")),
+            "TIRITH_POLICY_ROOT must win over cwd walk-up",
+        );
+    }
+
+    #[test]
+    fn discover_local_policy_path_walks_up_to_repo_root() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        std::fs::write(repo.path().join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+        let subdir = repo.path().join("a/b/c");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert_eq!(
+            discover_local_policy_path(Some(subdir.to_str().unwrap())),
+            Some(repo.path().join(".tirith/policy.yaml")),
+            "walk-up from a subdir must find the repo-root policy",
+        );
+    }
+
+    #[test]
+    fn discover_local_policy_path_finds_cwd_policy_without_git() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+
+        // Mimics `tirith policy init` run outside a git repo (e.g. in $HOME):
+        // it writes cwd/.tirith/policy.yaml with no .git boundary anywhere.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tirith")).unwrap();
+        std::fs::write(dir.path().join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
+        assert_eq!(
+            discover_local_policy_path(Some(dir.path().to_str().unwrap())),
+            Some(dir.path().join(".tirith/policy.yaml")),
+            "a cwd-local .tirith/policy.yaml must be found without a .git boundary",
+        );
     }
 }
