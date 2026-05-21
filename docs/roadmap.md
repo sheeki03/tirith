@@ -1,43 +1,69 @@
 # Roadmap
 
-## Phase 2 Backlog
+This roadmap tracks what has shipped, what is in progress, and what is planned.
+Priority and scope of unstarted work may change based on dogfooding feedback.
 
-These items are candidates for future development. Priority and scope may change based on dogfooding feedback.
+## Done
 
-### Interactive confirmation for strict_warn
-- Hook-mediated Y/N prompt for WARN-level findings in interactive mode
-- Allows users to acknowledge warnings without blocking
+Shipped and available in the current release line (see [CHANGELOG.md](../CHANGELOG.md)).
 
-### Socket/daemon mode
-- Persistent background process to avoid cold-start latency
-- Shell hooks connect via Unix socket instead of spawning a process
-- Target: <0.5ms hook latency
+- **Daemon mode (Unix)** — persistent background process for sub-millisecond
+  hook latency, with network-aware URL checks. `tirith daemon start/stop/status`.
+- **CI scanning with SARIF** — `tirith scan` exits non-zero in CI on a severity
+  threshold and emits SARIF for GitHub Code Scanning.
+- **GitHub Action** — `sheeki03/tirith@v1` wraps `tirith scan` for CI pipelines.
+- **Pre-commit hook** — `.pre-commit-hooks.yaml` entry for local scanning.
+- **`tirith policy init / validate / test`** — generate a starter policy,
+  validate YAML syntax and conflicts, and dry-run a command or file against the
+  active policy.
+- **`tirith explain --rule <id>`** — detailed per-rule documentation, including
+  examples and remediation, plus `--list` / `--category` filtering.
+- **`tirith scan` include/exclude/profile filters** — `--include`, `--exclude`,
+  and `--profile` (named profiles loaded from policy) for targeted scanning.
+- **Per-session warning accumulator** — `tirith warnings` CLI command and
+  shell exit summaries across all hooks.
+- **Strict-warn mode** — `strict_warn` policy key / `--strict-warn` flag, with a
+  dedicated `WarnAck` exit code (3) for the warn-ack hook protocol.
 
-### Network-aware checks
-- Resolve shortened URLs to final destination before analysis
-- Check certificate transparency logs for suspicious domains
-- DNS-based threat intelligence lookups
+## Now
 
-### `tirith scan` CI mode
-- Scan a file or directory for URLs and analyze them
-- Exit code reflects highest severity found
-- SARIF output for GitHub Code Scanning integration
+In progress — the current focus is shell-integration reliability and policy
+discovery consistency.
 
-### `tirith policy validate`
-- Validate policy YAML syntax and semantics
-- Check for conflicting allowlist/blocklist entries
-- Warn about deprecated or unknown fields
+- **Shell integration reliability** — fixing hook fragility across shells and
+  versions. Tracking [#111](https://github.com/sheeki03/tirith/issues/111)
+  (bash "previous command not delivered") and
+  [#103](https://github.com/sheeki03/tirith/issues/103)
+  (fish preexec/postexec functions not running).
+- **Policy discovery consistency** — `tirith policy init` writes a file that
+  `doctor` and `validate` then report as missing
+  ([#112](https://github.com/sheeki03/tirith/issues/112)); fix is in
+  [PR #113](https://github.com/sheeki03/tirith/pull/113).
+- **Doctor compatibility diagnostics** — surfacing shell/terminal compatibility
+  state more clearly in `tirith doctor`.
 
-### `tirith explain --rule <id>`
-- Show detailed rationale for a specific rule
-- Include examples of what it catches and why
-- Link to relevant threat documentation
+## Next
 
-### IDE integration
-- VS Code extension that analyzes terminal commands
-- Inline warnings for URLs in code and configuration files
+Planned, not yet started.
 
-### Custom rule authoring SDK
-- YAML or Lua-based rule definitions
-- User-defined patterns with custom severity and evidence
-- Rule testing framework
+- **`tirith doctor --compat`** — a dedicated compatibility report covering the
+  current shell, terminal, and prompt/history tooling.
+- **`tirith doctor --simulate-enter`** — dry-run the bash enter-mode enforcement
+  path to detect environments where blocking cannot work, before relying on it.
+- **Capability-based compatibility matrix** — classify each shell/terminal
+  combination by the capabilities tirith actually needs, rather than by name.
+- **Terminal / prompt / history-tool regression tests** — automated coverage
+  for the integrations that historically break hook delivery.
+- **Visible degraded-protection status indicator** — a clear, always-visible
+  signal when a session has downgraded from blocking to warn-only.
+
+## Later
+
+Longer-horizon ideas, not yet scheduled.
+
+- **IDE extension** — analyze terminal commands and inline URLs from inside an
+  editor.
+- **Custom rule SDK / DSL** — user-defined detection rules with custom severity
+  and evidence, plus a rule testing framework.
+- **Broader terminal-specific certification** — expanded, formalized
+  compatibility guarantees across the terminal ecosystem.
