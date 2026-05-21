@@ -20,10 +20,24 @@ if (-not $env:TIRITH_SESSION_ID) {
     $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 
+# Interactivity gate: the hook only intercepts commands typed at a prompt and
+# pasted text, so it must be a complete no-op in a non-interactive PowerShell
+# (`pwsh -c …`, `pwsh -File …`, a CI step). `[Environment]::UserInteractive`
+# is false there. A non-interactive child must inherit nothing from tirith.
+if (-not [Environment]::UserInteractive) {
+    return
+}
+
 # Check for PSReadLine
 $psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
 if (-not $psrlModule) {
     Write-Host "tirith: PSReadLine not found, hooks disabled. Install PSReadLine for shell protection." -ForegroundColor Yellow
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md). With
+    # no PSReadLine, no key handler is installed and tirith intercepts nothing,
+    # so the live protection level is `off`. Set as a session-scoped
+    # `$global:` variable — deliberately NOT `$env:`, which would export it to
+    # child processes that have no tirith protection of their own.
+    $global:TIRITH_STATUS = 'off'
     return
 }
 
@@ -315,3 +329,18 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
 }
+
+# TIRITH_STATUS: a small public contract a user can reference in their prompt
+# function to surface tirith's live protection level (see
+# docs/prompt-status.md). tirith prints NOTHING per-prompt — it only sets the
+# variable; wiring it into a prompt is opt-in. The PowerShell hook overrides
+# the Enter key handler, which can revert a blocked command, so its protection
+# level is `blocks`; there is no runtime-degrade path.
+#
+# Set as a session-scoped `$global:` variable, deliberately NOT `$env:`: a
+# `prompt` function runs in THIS interactive session and reads a `$global:`
+# variable fine, whereas an `$env:` variable is inherited by every child
+# process — and a non-interactive child has no tirith protection, so an
+# inherited status would misrepresent it. The hook above already returned
+# early for a non-interactive session, so this only runs interactively.
+$global:TIRITH_STATUS = 'blocks'

@@ -18,6 +18,7 @@ pub fn run(
     strict_warn: bool,
     no_daemon: bool,
     warn_only: bool,
+    offline: bool,
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
@@ -65,7 +66,9 @@ pub fn run(
 
     // Must run before any early return (--approval-check, daemon path, etc.)
     // so hooks calling `tirith check --approval-check` still trigger updates.
-    crate::cli::threatdb_cmd::maybe_background_update();
+    // `--offline` (or TIRITH_OFFLINE) makes this a guaranteed no-op — analysis
+    // then stays purely local with zero network attempts.
+    crate::cli::threatdb_cmd::maybe_background_update(offline);
 
     let session_id = tirith_core::session::resolve_session_id();
 

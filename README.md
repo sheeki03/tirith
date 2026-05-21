@@ -354,6 +354,36 @@ nix profile install github:sheeki03/tirith      # from upstream flake
 # or try without installing: nix run github:sheeki03/tirith -- --version
 ```
 
+### Android (Termux)
+
+Android/Termux runs on Bionic libc, not glibc, so the `aarch64-unknown-linux-gnu`
+build cannot run there — it needs glibc's dynamic linker. Use the **musl** build
+instead: `tirith-aarch64-unknown-linux-musl.tar.gz` is statically linked and runs
+on Termux without an external libc.
+
+```bash
+# In Termux:
+pkg install curl tar
+# Download the musl build from the latest GitHub release:
+curl -fsSL -o tirith.tar.gz \
+  https://github.com/sheeki03/tirith/releases/latest/download/tirith-aarch64-unknown-linux-musl.tar.gz
+tar xzf tirith.tar.gz
+install -Dm755 tirith "$PREFIX/bin/tirith"
+tirith --version
+```
+
+Then activate the shell hook in `~/.bashrc` (Termux's default shell is bash):
+
+```bash
+eval "$(tirith init --shell bash)"   # add to ~/.bashrc
+```
+
+> [!NOTE]
+> Termux support is best-effort. The musl artifact is built and smoke-tested in
+> CI, but tirith is not yet continuously tested on a real Android device.
+> If a hook misbehaves under Termux, please open an issue with `tirith doctor`
+> output.
+
 ### Windows
 
 All core features work on Windows including detection, scanning, webhooks, policy management, and audit uploads. Shell hooks support PowerShell. Daemon mode and `tirith setup` are Unix-only for now.
@@ -422,22 +452,22 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 | fish | fish_preexec event | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
-Bash uses enter mode by default with automatic fallback to preexec on failure. See [troubleshooting](docs/troubleshooting.md#unexpected-tirith-exit-codes) for details on error handling and SSH fallback behavior.
+Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. `tirith setup` / `tirith doctor` run the self-test; the shell hook reads its cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
 
 > [!WARNING]
-> Bash's default preexec mode warns but cannot block in-place. Set `TIRITH_BASH_PREEXEC_ENFORCE=1` for real blocking via `shopt -s extdebug`. Enforcement refuses to activate when `HISTCONTROL` contains `ignorespace` / `ignoredups` / `ignoreboth`, any `HISTIGNORE` is set, or `set +o history` is active — those make the block racy.
+> Bash's preexec mode warns but cannot block in-place. Set `TIRITH_BASH_PREEXEC_ENFORCE=1` for real blocking via `shopt -s extdebug`. Enforcement refuses to activate when `HISTCONTROL` contains `ignorespace` / `ignoredups` / `ignoreboth`, any `HISTIGNORE` is set, or `set +o history` is active — those make the block racy.
 
 #### Enforcement by shell
 
 | Shell | Behavior |
 |---|---|
-| bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. |
-| bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Uses `shopt -s extdebug`; blocks when bash's `history` can provide a trustworthy whole-line view. Downgrades to warn-only with a pointer at enter mode when history is filtered (`HISTCONTROL=ignorespace/ignoredups/ignoreboth`, any `HISTIGNORE`, or `set +o history`) or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`. |
-| bash **preexec** (default, no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. |
+| bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. Used by default only where a capability self-test (`tirith doctor --simulate-enter`) has proven `bind -x` delivery works for the running bash. |
+| bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Uses `shopt -s extdebug`; blocks when bash's `history` can provide a trustworthy whole-line view. Downgrades to warn-only when history is filtered (`HISTCONTROL=ignorespace/ignoredups/ignoreboth`, any `HISTIGNORE`, or `set +o history`) or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`. |
+| bash **preexec** (no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. The fallback when the enter-mode self-test has not proven delivery works. |
 | zsh, fish, powershell | Reliable blocking via native preexec hooks. |
 | nushell | Warn-only (does not currently support command interception). |
 
-If you need guaranteed line-level blocking on bash, use enter mode. Use preexec enforce for "blocks when possible; tells you honestly when it can't."
+For guaranteed line-level blocking on bash, run `tirith doctor --simulate-enter` — if delivery works, enter mode is enabled. Where it does not, use preexec enforce for "blocks when possible; tells you honestly when it can't."
 
 **Nix / Home-Manager:** tirith must be in your `$PATH` — the shell hooks call `tirith` by name at runtime. Adding it to `initContent` alone is not enough.
 
@@ -525,7 +555,7 @@ tirith daemon stop
 | `tirith threat-db update` | Download, verify, and install the signed threat database |
 | `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
-| `tirith policy init` | Generate a starter `.tirith/policy.yaml` in your repo |
+| `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
 | `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
@@ -535,6 +565,7 @@ tirith daemon stop
 | `tirith why` | Explain the last rule that triggered |
 | `tirith doctor` | Diagnose installation, hooks, and policy |
 | `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
+| `tirith doctor --compat` | Shell/terminal compatibility report (detected shell, bash mode, install checks, co-installed hook-interacting tools) |
 | `tirith daemon start` | Start background daemon for faster checks (Unix) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
@@ -553,13 +584,17 @@ tirith daemon stop
   network calls; all of their analysis is local. `tirith check` (including the
   `--approval-check` path that shell hooks use) also analyzes locally, but
   before analysis it triggers a *periodic background threat-DB refresh check*
-  (see below) — so `check` is not strictly offline.
+  (see below) — so `check` is not strictly offline. Pass `tirith check
+  --offline` (or set `TIRITH_OFFLINE=1`) to suppress that refresh and keep
+  `check` fully local.
 - **Periodic background threat-DB refresh** — `tirith check` and the shell hooks
   trigger a cheap background check, at most once every 24 hours by default
   (`threat_intel.auto_update_hours`), to keep the signed threat database fresh.
   The check is detached and does not block the command; set
-  `auto_update_hours: 0` in policy to disable it entirely. `tirith paste` does
-  **not** trigger this — it goes straight through the local engine.
+  `auto_update_hours: 0` in policy to disable it entirely, or pass
+  `tirith check --offline` / set `TIRITH_OFFLINE=1` to suppress it per
+  invocation. `tirith paste` does **not** trigger this — it goes straight
+  through the local engine.
 - **No command rewriting** — tirith never modifies what you typed.
 - **No telemetry** — no analytics, no crash reporting, no phone-home behavior.
 - **No long-lived background processes by default** — tirith is invoked
@@ -584,6 +619,17 @@ tirith policy init          # creates .tirith/policy.yaml in your repo
 tirith policy validate      # check for syntax/schema errors
 tirith policy test "curl https://example.com | bash"  # dry-run against policy
 ```
+
+`tirith policy init` accepts `--template <name>` for a curated starter policy:
+
+```bash
+tirith policy init --template individual      # solo developer defaults
+tirith policy init --template ci-strict       # fail-closed, no bypass, scan fail-on
+tirith policy init --template ai-agent-heavy  # tuned for heavy AI-agent use
+```
+
+Each template is a well-commented, schema-valid policy you can edit further.
+With no `--template`, `tirith policy init` writes the full default policy.
 
 ### Policy file
 

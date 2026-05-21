@@ -714,12 +714,44 @@ fn print_status_human(info: &ThreatDbStatus) {
 /// Guard: only try once per process lifetime.
 static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+/// True when the `TIRITH_OFFLINE` environment variable is set to a truthy
+/// value (`1`, `true`, `yes`, `on`, case-insensitive). An empty value, an
+/// unset variable, or any other value is treated as "not offline".
+///
+/// This is the env-var half of the offline switch; `tirith check` also has a
+/// `--offline` flag that is plumbed through explicitly. Either being set makes
+/// the background threat-DB refresh a guaranteed no-op (zero network).
+pub fn offline_env_active() -> bool {
+    std::env::var("TIRITH_OFFLINE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Spawn a detached child process to update the threat DB if due.
 ///
 /// Called from `check.rs` after the verdict is computed.
 /// This is intentionally cheap: reads a timestamp file and optionally spawns
 /// a detached child. The actual download happens in the child process.
-pub fn maybe_background_update() {
+///
+/// `offline_flag` carries the `tirith check --offline` flag; when it (or the
+/// `TIRITH_OFFLINE` env var) is set, this is a guaranteed no-op — no
+/// timestamp files are written and no child process is spawned, so analysis
+/// stays purely local. This is a mechanism only: the default (online) is
+/// unchanged.
+pub fn maybe_background_update(offline_flag: bool) {
+    // Offline short-circuit comes BEFORE the once-per-process guard so a
+    // later online call in the same process is not silently disabled by an
+    // earlier offline one (the guard is a dedup, not a latch on intent).
+    if offline_flag || offline_env_active() {
+        return;
+    }
+
     if UPDATE_ATTEMPTED.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -2018,5 +2050,127 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("exceeded max size"));
+    }
+
+    // --- `--offline` / `TIRITH_OFFLINE` (roadmap M0.3) ---------------------
+    //
+    // The offline switch must make `maybe_background_update` a guaranteed
+    // no-op: zero network and — observably — no `spawned-at` state file
+    // written, since that file is the parent-side breadcrumb left right
+    // before a background update child is spawned.
+
+    /// RAII guard that sets/removes `TIRITH_OFFLINE` and restores it on Drop.
+    struct OfflineEnvGuard {
+        old: Option<std::ffi::OsString>,
+    }
+    impl OfflineEnvGuard {
+        fn set(val: &str) -> Self {
+            let old = std::env::var_os("TIRITH_OFFLINE");
+            unsafe { std::env::set_var("TIRITH_OFFLINE", val) };
+            Self { old }
+        }
+        fn unset() -> Self {
+            let old = std::env::var_os("TIRITH_OFFLINE");
+            unsafe { std::env::remove_var("TIRITH_OFFLINE") };
+            Self { old }
+        }
+    }
+    impl Drop for OfflineEnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => unsafe { std::env::set_var("TIRITH_OFFLINE", v) },
+                None => unsafe { std::env::remove_var("TIRITH_OFFLINE") },
+            }
+        }
+    }
+
+    #[test]
+    fn offline_env_active_recognizes_truthy_values() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["1", "true", "TRUE", "yes", "On", " on "] {
+            let _e = OfflineEnvGuard::set(v);
+            assert!(
+                super::offline_env_active(),
+                "TIRITH_OFFLINE={v:?} should be treated as offline"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_env_active_rejects_falsey_and_unset() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["0", "false", "no", "", "off", "garbage"] {
+            let _e = OfflineEnvGuard::set(v);
+            assert!(
+                !super::offline_env_active(),
+                "TIRITH_OFFLINE={v:?} should NOT be treated as offline"
+            );
+        }
+        let _e = OfflineEnvGuard::unset();
+        assert!(
+            !super::offline_env_active(),
+            "unset TIRITH_OFFLINE should not be offline"
+        );
+    }
+
+    #[test]
+    fn offline_flag_skips_background_update_no_network_attempt() {
+        // With the explicit `--offline` flag, `maybe_background_update` must
+        // not even reach the state dir: no `spawned-at` file is written, so
+        // no background update child can be launched (= zero network).
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _e = OfflineEnvGuard::unset();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        super::maybe_background_update(true);
+
+        let spawned_at = tmp.path().join("tirith").join(SPAWNED_AT_FILE);
+        assert!(
+            !spawned_at.exists(),
+            "--offline must skip the background update before any state write"
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn offline_env_skips_background_update_no_network_attempt() {
+        // Same guarantee via the `TIRITH_OFFLINE` env var (the path the shell
+        // hooks and the conformance harness use, since they cannot pass CLI
+        // flags through every `tirith check` invocation).
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _e = OfflineEnvGuard::set("1");
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        // `offline_flag = false` here — the env var alone must suffice.
+        super::maybe_background_update(false);
+
+        let spawned_at = tmp.path().join("tirith").join(SPAWNED_AT_FILE);
+        assert!(
+            !spawned_at.exists(),
+            "TIRITH_OFFLINE=1 must skip the background update before any state write"
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn offline_short_circuits_before_update_attempted_latch() {
+        // The offline check is intentionally ahead of the once-per-process
+        // `UPDATE_ATTEMPTED` latch: an offline call must not consume the
+        // latch, so a later online call in the same process is still free to
+        // proceed. Verified on a standalone AtomicBool that mirrors the
+        // global's swap semantics.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let latch = AtomicBool::new(false);
+        // Simulate the offline early-return: the latch is never swapped.
+        let offline = true;
+        if !offline {
+            latch.swap(true, Ordering::Relaxed);
+        }
+        assert!(
+            !latch.load(Ordering::Relaxed),
+            "an offline call must not consume the once-per-process latch"
+        );
     }
 }

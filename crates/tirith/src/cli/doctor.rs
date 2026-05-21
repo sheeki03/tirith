@@ -1,13 +1,43 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub fn run(json: bool, reset_bash_safe_mode: bool, fix: bool, yes: bool) -> i32 {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    json: bool,
+    reset_bash_safe_mode: bool,
+    fix: bool,
+    yes: bool,
+    simulate_enter: bool,
+    compat: bool,
+    bundle: bool,
+) -> i32 {
     if reset_bash_safe_mode {
         return reset_safe_mode();
     }
 
+    if simulate_enter {
+        return run_simulate_enter();
+    }
+
     if fix {
         return run_fix(yes);
+    }
+
+    if compat {
+        return run_compat(json);
+    }
+
+    if bundle {
+        return run_bundle(json);
+    }
+
+    // A plain `tirith doctor` refreshes the bash enter-mode capability cache as
+    // a side effect: the PTY self-test is cheap, timeout-bound, and keeps the
+    // cache the hook reads at startup current. Skipped in JSON mode so machine
+    // consumers get a fast, side-effect-free report.
+    #[cfg(unix)]
+    if !json && crate::cli::init::detect_shell() == "bash" {
+        let _ = crate::cli::bash_capability::run_and_cache();
     }
 
     let info = gather_info();
@@ -578,6 +608,29 @@ struct DoctorInfo {
     /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
+    /// Live protection status exported by the hook as `TIRITH_STATUS`
+    /// (`blocks` / `warn-only` / `degraded` / `off`). `degraded` specifically
+    /// means protection was downgraded from a stronger level during this
+    /// session. Absent means no tirith hook was sourced in this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_status: Option<String>,
+    /// Cached bash enter-mode delivery capability verdict (`works` / `broken` /
+    /// `inconclusive`), as recorded by the last self-test. Absent when no
+    /// capability cache has been written yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability: Option<String>,
+    /// Whether the cached capability verdict is for the running bash — a
+    /// `false` here means the cache is stale (a different bash) and the hook
+    /// will ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_fresh: Option<bool>,
+    /// Human-readable reason recorded with the cached capability verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_reason: Option<String>,
+    /// The tirith version that wrote the cached capability verdict (diagnostic
+    /// only — not part of freshness; see `cli::bash_capability`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_tirith_version: Option<String>,
     policy_paths: Vec<String>,
     policy_root_env: Option<String>,
     data_dir: Option<String>,
@@ -655,6 +708,14 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // `TIRITH_STATUS` is the cross-shell live protection indicator exported by
+    // every tirith hook (bash, zsh, fish, PowerShell, nushell). Absence means
+    // no tirith hook ran in the process that invoked `doctor` — typically a
+    // non-interactive subshell.
+    let tirith_status = std::env::var("TIRITH_STATUS")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     let data_dir = tirith_core::policy::data_dir();
     let log_path = data_dir.as_ref().map(|d| d.join("log.jsonl"));
     let last_trigger_path = data_dir.as_ref().map(|d| d.join("last_trigger.json"));
@@ -668,6 +729,48 @@ fn gather_info() -> DoctorInfo {
     let shadow_binaries = super::find_shadow_binaries();
     let detection_gaps = check_detection_gaps();
     let threat_db = gather_threat_db_info();
+
+    // Cached bash enter-mode delivery verdict (issue #111). Read-only here —
+    // the cache is written by the self-test in `--simulate-enter` and by a
+    // plain `tirith doctor` run; this just surfaces it.
+    let (
+        bash_enter_capability,
+        bash_enter_capability_fresh,
+        bash_enter_capability_reason,
+        bash_enter_capability_tirith_version,
+    ) = {
+        #[cfg(unix)]
+        {
+            match crate::cli::bash_capability::read_cache() {
+                Some(decision) => {
+                    let token = match decision.capability {
+                        crate::cli::bash_capability::EnterCapability::Works => "works",
+                        crate::cli::bash_capability::EnterCapability::Broken => "broken",
+                        crate::cli::bash_capability::EnterCapability::Inconclusive => {
+                            "inconclusive"
+                        }
+                    };
+                    let fresh = crate::cli::bash_capability::decision_is_fresh(&decision);
+                    let reason = if decision.reason.is_empty() {
+                        None
+                    } else {
+                        Some(decision.reason.clone())
+                    };
+                    let writer = if decision.tirith_version.is_empty() {
+                        None
+                    } else {
+                        Some(decision.tirith_version.clone())
+                    };
+                    (Some(token.to_string()), Some(fresh), reason, writer)
+                }
+                None => (None, None, None, None),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            (None, None, None, None)
+        }
+    };
 
     DoctorInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -684,6 +787,11 @@ fn gather_info() -> DoctorInfo {
         bash_requested_require_enter,
         bash_effective_mode,
         bash_effective_protection,
+        tirith_status,
+        bash_enter_capability,
+        bash_enter_capability_fresh,
+        bash_enter_capability_reason,
+        bash_enter_capability_tirith_version,
         policy_paths,
         policy_root_env,
         data_dir: data_dir.map(|d| d.display().to_string()),
@@ -759,6 +867,855 @@ fn gather_threat_db_info() -> Option<ThreatDbDoctorInfo> {
     }
 }
 
+// --- Compatibility report (`tirith doctor --compat`) -----------------------
+//
+// A focused, static shell/terminal compatibility view. It reuses the existing
+// `gather_info()` machinery rather than re-deriving install state, and adds
+// best-effort detection of co-installed shell tools that historically interact
+// with shell hooks. It introspects NOTHING about the parent shell's live
+// state — a child process cannot — it only consumes what the hook exports.
+
+/// One co-installed shell tool that historically interacts with shell hooks.
+/// `on_path` and `in_profile` are independent best-effort signals; presence is
+/// reported honestly without claiming a definite conflict.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ShellToolPresence {
+    name: &'static str,
+    /// The tool's binary was found on `PATH`.
+    on_path: bool,
+    /// The tool's name appeared in the detected shell's profile file(s).
+    in_profile: bool,
+    /// Why this tool can interact with shell hooks (advisory, not a verdict).
+    note: &'static str,
+}
+
+/// Shell tools known to install their own preexec/precmd/keymap integrations,
+/// which can interleave with tirith's hook. `(binary, note)`.
+const KNOWN_SHELL_TOOLS: &[(&str, &str)] = &[
+    (
+        "atuin",
+        "rebinds Enter / Up and installs preexec hooks (history)",
+    ),
+    ("starship", "installs precmd/preexec prompt hooks"),
+    ("fzf", "installs key bindings and a completion widget"),
+    ("zoxide", "installs a chpwd/precmd hook (directory jumping)"),
+    ("direnv", "installs a precmd/chpwd hook (per-dir env)"),
+    ("mise", "installs a precmd/chpwd hook (runtime/env manager)"),
+    (
+        "asdf",
+        "sources shims and shell functions (version manager)",
+    ),
+];
+
+/// True when `binary` resolves on `PATH` via the shell's own lookup.
+fn tool_on_path(binary: &str) -> bool {
+    let lookup = {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
+                .status()
+        }
+        #[cfg(not(unix))]
+        {
+            std::process::Command::new("where.exe")
+                .arg(binary)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        }
+    };
+    lookup.map(|s| s.success()).unwrap_or(false)
+}
+
+/// True when `tool` is mentioned in any existing profile file for `shell`.
+/// Best-effort: a missing or unreadable profile simply yields `false`.
+fn tool_in_profile(tool: &str, profile: Option<&std::path::Path>) -> bool {
+    let profile = match profile {
+        Some(p) => p,
+        None => return false,
+    };
+    match std::fs::read_to_string(profile) {
+        Ok(contents) => contents.contains(tool),
+        Err(_) => false,
+    }
+}
+
+/// Detect co-installed shell tools that interact with hooks. Only tools with
+/// at least one positive signal (on PATH or in the profile) are returned.
+fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellToolPresence> {
+    KNOWN_SHELL_TOOLS
+        .iter()
+        .filter_map(|(name, note)| {
+            let on_path = tool_on_path(name);
+            let in_profile = tool_in_profile(name, profile);
+            if on_path || in_profile {
+                Some(ShellToolPresence {
+                    name,
+                    on_path,
+                    in_profile,
+                    note,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Machine-readable compatibility report for `tirith doctor --compat --format json`.
+#[derive(serde::Serialize)]
+struct CompatReport {
+    version: String,
+    binary_path: String,
+    detected_shell: String,
+    interactive: bool,
+    /// Requested bash mode (`TIRITH_BASH_MODE`); absent = default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_requested_mode: Option<String>,
+    /// Effective bash mode exported by the hook; absent = hook not sourced here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_mode: Option<String>,
+    /// Effective protection exported by the hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_effective_protection: Option<String>,
+    /// Live cross-shell protection status exported as `TIRITH_STATUS`
+    /// (`blocks` / `warn-only` / `degraded` / `off`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_status: Option<String>,
+    /// Cached bash enter-mode delivery capability verdict (issue #111).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability: Option<String>,
+    /// Whether the cached enter-capability verdict is for the running bash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bash_enter_capability_fresh: Option<bool>,
+    bash_safe_mode: bool,
+    hook_dir: Option<String>,
+    hooks_materialized: bool,
+    /// Materialized hook assets exist but are a stale version.
+    hooks_stale: bool,
+    shell_profile: Option<String>,
+    hook_configured: bool,
+    /// Other `tirith` binaries on PATH that may shadow this one.
+    shadow_binaries: Vec<String>,
+    policy_paths: Vec<String>,
+    /// Threat-DB status (reused verbatim from the standard doctor report).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threat_db: Option<ThreatDbDoctorInfo>,
+    /// Co-installed shell tools that historically interact with hooks.
+    shell_tools: Vec<ShellToolPresence>,
+}
+
+/// Build the compat report from the shared `gather_info()` state plus
+/// shell-tool conflict detection.
+fn gather_compat() -> CompatReport {
+    let info = gather_info();
+    let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
+    let shell_tools = detect_shell_tool_conflicts(profile.as_deref());
+
+    CompatReport {
+        version: info.version,
+        binary_path: info.binary_path,
+        detected_shell: info.detected_shell,
+        interactive: info.interactive,
+        bash_requested_mode: info.bash_requested_mode,
+        bash_effective_mode: info.bash_effective_mode,
+        bash_effective_protection: info.bash_effective_protection,
+        tirith_status: info.tirith_status,
+        bash_enter_capability: info.bash_enter_capability,
+        bash_enter_capability_fresh: info.bash_enter_capability_fresh,
+        bash_safe_mode: info.bash_safe_mode,
+        hook_dir: info.hook_dir,
+        hooks_materialized: info.hooks_materialized,
+        hooks_stale: hooks_stale(),
+        shell_profile: info.shell_profile,
+        hook_configured: info.hook_configured,
+        shadow_binaries: info.shadow_binaries,
+        policy_paths: info.policy_paths,
+        threat_db: info.threat_db,
+        shell_tools,
+    }
+}
+
+/// `tirith doctor --compat`: print a focused shell/terminal compatibility
+/// report. Human-readable by default; `--format json` emits `CompatReport`.
+fn run_compat(json: bool) -> i32 {
+    let report = gather_compat();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("tirith: JSON serialization failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        print_compat_human(&report);
+    }
+    0
+}
+
+// --- Diagnostic bundle (`tirith doctor --bundle`) --------------------------
+//
+// Roadmap item #25. Produces a single redacted text file a user can attach to
+// a bug report: doctor info, tirith + hook versions, shell / mode / effective
+// protection, hook-chain state, policy discovery, threat-DB status, and a
+// curated slice of the environment. `--redacted-report` and `--shell-trace`
+// are aliases for the same output.
+//
+// Redaction is the load-bearing safety property and is deliberately layered:
+//
+//   1. The environment section emits only a CURATED ALLOWLIST of variable
+//      names — never the whole environment — so an unrelated `AWS_SECRET…`
+//      or `OPENAI_API_KEY` is never even a candidate for inclusion.
+//   2. Every value that *is* emitted is still run through `redact_secrets`,
+//      which masks anything that looks like a token/secret. Defense in depth:
+//      even an allowlisted var (or a free-text field) cannot leak a secret.
+//   3. As the final pass over the fully-assembled text, the literal
+//      home-directory path is replaced with `~`, so absolute paths in the
+//      report do not reveal the account's username.
+
+/// Environment variables relevant to a tirith diagnostics bundle. ONLY these
+/// names are emitted — the bundle never dumps the full environment. Anything
+/// not on this list (cloud credentials, API keys, unrelated app secrets) is
+/// excluded by construction. Values are still scrubbed by `redact_secrets`.
+const BUNDLE_ENV_ALLOWLIST: &[&str] = &[
+    // Shell identity / interactivity.
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "COLORTERM",
+    // SSH presence affects bash mode selection (preexec under SSH).
+    "SSH_CONNECTION",
+    "SSH_TTY",
+    "SSH_CLIENT",
+    // tirith's own knobs and state contract.
+    "TIRITH_BASH_MODE",
+    "TIRITH_BASH_PREEXEC_ENFORCE",
+    "TIRITH_BASH_REQUIRE_ENTER",
+    "TIRITH_BASH_EFFECTIVE_MODE",
+    "TIRITH_BASH_EFFECTIVE_PROTECTION",
+    "TIRITH_STATUS",
+    "TIRITH_OFFLINE",
+    "TIRITH_OUTPUT",
+    "TIRITH_SHELL_DIR",
+    "TIRITH_POLICY_ROOT",
+    "TIRITH_LOG",
+    "TIRITH_SESSION_ID",
+    // XDG base dirs change where tirith looks for state/config/data.
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    // History config that gates preexec enforcement.
+    "HISTCONTROL",
+    "HISTIGNORE",
+];
+
+/// Mask the literal home-directory path wherever it appears in `text`,
+/// replacing it with `~`. The bundle is full of absolute paths (hook dir,
+/// policy paths, data dir); without this they would spell out the account
+/// username. Applied as the very last pass over the assembled report.
+///
+/// Returns the input unchanged when the home directory cannot be determined.
+fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
+    let home = match home {
+        Some(h) => h.to_string_lossy().into_owned(),
+        None => return text.to_string(),
+    };
+    // An empty or `/` home would turn the replacement into nonsense — skip.
+    if home.is_empty() || home == "/" {
+        return text.to_string();
+    }
+    // Strip one trailing separator so both `/Users/alice` and `/Users/alice/`
+    // forms collapse onto `~` consistently.
+    let trimmed = home.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return text.to_string();
+    }
+    text.replace(trimmed, "~")
+}
+
+/// Heuristically mask secret-looking values in a single line of bundle text.
+///
+/// This is the second redaction layer (after the env allowlist): it scrubs any
+/// `key=value` / `key: value` pair whose key OR value looks credential-bearing.
+/// Conservative by design — for a diagnostic bundle, a false-positive redaction
+/// is harmless, a missed secret is not.
+fn redact_secrets(line: &str) -> String {
+    // Split on the first `=` or `:` so we can inspect key and value separately.
+    let (key, sep, value) = if let Some(idx) = line.find('=') {
+        (&line[..idx], '=', &line[idx + 1..])
+    } else if let Some(idx) = line.find(": ") {
+        (&line[..idx], ':', &line[idx + 2..])
+    } else {
+        return line.to_string();
+    };
+
+    let key_l = key.to_ascii_lowercase();
+    let key_signals_secret = ["token", "secret", "password", "passwd", "api_key", "apikey"]
+        .iter()
+        .any(|m| key_l.contains(m))
+        // `*_key` / `*-key` but not the benign `keyboard`, `keymap`, etc.
+        || key_l.ends_with("key")
+        || key_l.ends_with("_key")
+        || key_l.ends_with("-key");
+
+    let trimmed_value = value.trim();
+    let value_signals_secret = looks_like_secret(trimmed_value);
+
+    if key_signals_secret || value_signals_secret {
+        // `key` carries any leading indentation already, so reuse it verbatim
+        // and only swap the value. The separator form is preserved.
+        if sep == ':' {
+            format!("{key}: <redacted>")
+        } else {
+            format!("{key}=<redacted>")
+        }
+    } else {
+        line.to_string()
+    }
+}
+
+/// True when `value` looks like a token / secret: a long unbroken run of
+/// base64/hex-ish characters, or a well-known credential prefix. Short or
+/// obviously non-secret values (paths, numbers, words) return false.
+fn looks_like_secret(value: &str) -> bool {
+    if value.is_empty() || value == "<redacted>" {
+        return false;
+    }
+    // Well-known credential prefixes — flag regardless of length.
+    const SECRET_PREFIXES: &[&str] = &[
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xox",
+        "AKIA",
+        "ASIA",
+        "AIza",
+        "ya29.",
+        "eyJ", // JWT
+    ];
+    if SECRET_PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    // A long unbroken high-entropy-looking run (no spaces, no path separators):
+    // 24+ chars drawn only from the base64url / hex alphabet.
+    if value.len() >= 24
+        && !value.contains([' ', '/', '\\'])
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '_' | '-' | '=' | '.'))
+        // …and it actually mixes character classes, so a long plain word or a
+        // long path-free filename does not trip it.
+        && value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    false
+}
+
+/// Assemble the full diagnostic bundle as a single redacted text blob.
+///
+/// `home` is threaded in (rather than read inside) so tests can drive the
+/// home-path redaction deterministically.
+fn build_bundle_text(home: Option<&std::path::Path>) -> String {
+    let info = gather_info();
+    let compat = gather_compat();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut out = String::new();
+    let mut line = |s: String| {
+        out.push_str(&s);
+        out.push('\n');
+    };
+
+    line("tirith diagnostic bundle".to_string());
+    line(format!("generated: {now}"));
+    line(
+        "This report is redacted: secrets, tokens, and your home-directory path \
+         have been masked."
+            .to_string(),
+    );
+    line("Safe to attach to a bug report. Review it before sharing if unsure.".to_string());
+    line(String::new());
+
+    line("== tirith ==".to_string());
+    line(format!("version:        {}", info.version));
+    line(format!("binary:         {}", info.binary_path));
+    line(format!("os:             {}", std::env::consts::OS));
+    line(format!("arch:           {}", std::env::consts::ARCH));
+    if info.shadow_binaries.is_empty() {
+        line("shadow binaries: none on PATH".to_string());
+    } else {
+        line(format!(
+            "shadow binaries: {} on PATH (may shadow this binary)",
+            info.shadow_binaries.len()
+        ));
+        for s in &info.shadow_binaries {
+            line(format!("  - {s}"));
+        }
+    }
+    line(String::new());
+
+    line("== shell & protection ==".to_string());
+    line(format!("detected shell: {}", info.detected_shell));
+    line(format!("interactive:    {}", info.interactive));
+    line(format!(
+        "live status:    {} (TIRITH_STATUS)",
+        info.tirith_status.as_deref().unwrap_or("(hook not loaded)")
+    ));
+    line(format!(
+        "requested mode: {}",
+        info.bash_requested_mode.as_deref().unwrap_or("(default)")
+    ));
+    line(format!(
+        "effective mode: {}",
+        info.bash_effective_mode
+            .as_deref()
+            .unwrap_or("(hook not loaded)")
+    ));
+    line(format!(
+        "protection:     {}",
+        info.bash_effective_protection
+            .as_deref()
+            .unwrap_or("(hook not loaded)")
+    ));
+    line(format!("bash safe mode: {}", info.bash_safe_mode));
+    line(format!(
+        "enter capability: {} (fresh: {})",
+        info.bash_enter_capability
+            .as_deref()
+            .unwrap_or("not tested"),
+        info.bash_enter_capability_fresh
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+    ));
+    if let Some(reason) = info.bash_enter_capability_reason.as_deref() {
+        line(format!("  capability reason: {reason}"));
+    }
+    line(String::new());
+
+    line("== hook chain ==".to_string());
+    line(format!(
+        "hook dir:       {}",
+        info.hook_dir.as_deref().unwrap_or("not found")
+    ));
+    line(format!("materialized:   {}", info.hooks_materialized));
+    line(format!("hooks stale:    {}", compat.hooks_stale));
+    line(format!(
+        "shell profile:  {}",
+        info.shell_profile.as_deref().unwrap_or("not found")
+    ));
+    line(format!("profile wired:  {}", info.hook_configured));
+    if compat.shell_tools.is_empty() {
+        line("co-installed hook tools: none detected".to_string());
+    } else {
+        line("co-installed hook tools (may interleave with tirith's hook):".to_string());
+        for t in &compat.shell_tools {
+            let signals = match (t.on_path, t.in_profile) {
+                (true, true) => "on PATH, in profile",
+                (true, false) => "on PATH",
+                (false, true) => "in profile",
+                (false, false) => "detected",
+            };
+            line(format!("  - {} ({})", t.name, signals));
+        }
+    }
+    line(String::new());
+
+    line("== policy ==".to_string());
+    if info.policy_paths.is_empty() {
+        line("policy discovery: no policy found (built-in defaults apply)".to_string());
+    } else {
+        line("policy discovery:".to_string());
+        for p in &info.policy_paths {
+            line(format!("  - {p}"));
+        }
+    }
+    if let Some(root) = info.policy_root_env.as_deref() {
+        line(format!("TIRITH_POLICY_ROOT: {root}"));
+    }
+    line(format!(
+        "data dir:       {}",
+        info.data_dir.as_deref().unwrap_or("not found")
+    ));
+    line(String::new());
+
+    line("== threat database ==".to_string());
+    match &info.threat_db {
+        None => line("threat DB:      not available on this platform".to_string()),
+        Some(tdb) if !tdb.installed => line("threat DB:      not installed".to_string()),
+        Some(tdb) => {
+            line(format!("installed:      {}", tdb.installed));
+            if let Some(age) = tdb.age_hours {
+                line(format!("age:            {age:.1}h"));
+            }
+            if let Some(total) = tdb.total_entries {
+                line(format!("entries:        {total}"));
+            }
+            line(format!(
+                "signature:      {}",
+                match tdb.signature_valid {
+                    Some(true) => "valid",
+                    Some(false) => "INVALID",
+                    None => "unknown",
+                }
+            ));
+            line(format!("stale:          {}", tdb.stale));
+            if let Some(err) = tdb.error.as_deref() {
+                line(format!("error:          {err}"));
+            }
+        }
+    }
+    line(String::new());
+
+    line("== environment (curated, redacted) ==".to_string());
+    line("Only tirith-relevant variables are listed; values are secret-scrubbed.".to_string());
+    let mut any_env = false;
+    for name in BUNDLE_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(name) {
+            if value.is_empty() {
+                continue;
+            }
+            any_env = true;
+            // `redact_secrets` scrubs the value if it (or the key) looks
+            // credential-bearing — a second layer behind the allowlist.
+            line(redact_secrets(&format!("{name}={value}")));
+        }
+    }
+    if !any_env {
+        line("(none of the curated variables are set)".to_string());
+    }
+    line(String::new());
+
+    line("== end of bundle ==".to_string());
+
+    // Final pass: mask the literal home-directory path everywhere it appears.
+    redact_home_path(&out, home)
+}
+
+/// Write `text` to a freshly-created, randomly-named bundle file in `dir` and
+/// return the path it landed at.
+///
+/// The filename is *random*, not a predictable `tirith-bundle-<timestamp>`:
+/// `tempfile::Builder` creates the file with `O_EXCL`, so an attacker cannot
+/// pre-create the path as a symlink and redirect the write, and two runs in the
+/// same second cannot collide or clobber. The `tirith-bundle-` prefix is purely
+/// cosmetic — the security comes entirely from the random suffix and the
+/// exclusive create. On Unix the file handle is chmod'd to `0600` *before* the
+/// content is written, so the redacted-but-still-diagnostic bundle is never
+/// even briefly world-readable. `keep()` persists the temp file at its existing
+/// random path (it is deliberately NOT `persist()`ed onto a predictable name —
+/// that would reintroduce the symlink/TOCTOU hole). Mirrors the safe-write
+/// style of `bash_capability::write_cache`.
+fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathBuf> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tirith-bundle-")
+        .suffix(".txt")
+        .tempfile_in(dir)?;
+    // Tighten permissions on the open handle before writing any content, so the
+    // bundle is never momentarily readable by other users.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    use std::io::Write;
+    tmp.write_all(text.as_bytes())?;
+    tmp.flush()?;
+    // `keep()` disarms the auto-delete and hands back the file's *current*
+    // (random) path — exactly what we print. No rename onto a guessable name.
+    let (_file, path) = tmp.keep().map_err(|e| e.error)?;
+    Ok(path)
+}
+
+/// `tirith doctor --bundle`: write the redacted diagnostic bundle to a file
+/// and print its path. With `--format json`, prints `{"bundle_path": "..."}`.
+fn run_bundle(json: bool) -> i32 {
+    let home = home::home_dir();
+    let text = build_bundle_text(home.as_deref());
+
+    // Write into the tirith state dir, which already exists for any configured
+    // install; fall back to the system temp dir if it cannot be determined.
+    let dir = tirith_core::policy::state_dir().unwrap_or_else(std::env::temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("tirith: could not create {}: {e}", dir.display());
+        return 1;
+    }
+
+    let path = match write_bundle_file(&dir, &text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("tirith: could not write bundle into {}: {e}", dir.display());
+            return 1;
+        }
+    };
+
+    if json {
+        // The path itself can contain the home dir; redact it the same way the
+        // bundle body is redacted so the JSON is as safe as the file.
+        let shown = redact_home_path(&path.display().to_string(), home.as_deref());
+        match serde_json::to_string_pretty(&serde_json::json!({ "bundle_path": shown })) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("tirith: JSON serialization failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        println!("tirith: diagnostic bundle written to:");
+        println!("  {}", path.display());
+        println!();
+        println!("The bundle is redacted (secrets, tokens, and your home-directory path");
+        println!("are masked) and safe to attach to a bug report. Review it before");
+        println!("sharing if you want to be sure.");
+    }
+    0
+}
+
+/// The `protection status:` line for `tirith doctor --compat`, derived from the
+/// hook-exported `TIRITH_STATUS` value. `None` when the line should be omitted.
+///
+/// `TIRITH_STATUS` is exported by *every* tirith shell hook — bash, zsh, fish,
+/// PowerShell, nushell — so this status MUST be surfaced regardless of the
+/// detected shell. It was previously printed only inside the bash-only branch,
+/// which silently dropped it for, e.g., a zsh session with
+/// `TIRITH_STATUS=degraded`. A `degraded` status gets an explicit callout; an
+/// unset variable yields `None` (the rest of the report still indicates the
+/// hook was not loaded).
+fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
+    match status {
+        Some("degraded") => Some(
+            "  protection status:    DEGRADED (downgraded to warn-only this session)".to_string(),
+        ),
+        Some(status) => Some(format!("  protection status:    {status}")),
+        None => None,
+    }
+}
+
+/// Render the full `tirith doctor --compat` human report into a string.
+///
+/// Returning a `String` (rather than printing directly) keeps the report
+/// unit-testable — in particular the F3 property that `TIRITH_STATUS` is
+/// surfaced for *non-bash* shells, which a stdout-only function could not be
+/// asserted on without process plumbing.
+fn format_compat_human(r: &CompatReport) -> String {
+    let mut out = String::new();
+    let mut line = |s: &str| {
+        out.push_str(s);
+        out.push('\n');
+    };
+
+    line("tirith compatibility report");
+    line("");
+    line(&format!("tirith {}", r.version));
+    line(&format!("  binary:        {}", r.binary_path));
+    line(&format!("  shell:         {}", r.detected_shell));
+    line(&format!("  interactive:   {}", r.interactive));
+    line("");
+
+    // Shell mode / protection. Bash is the only shell with a requested-vs-
+    // effective split today; for other shells we just report what (if
+    // anything) the hook exported into this process.
+    line("Shell hook mode");
+    // Live cross-shell protection status, from the hook-exported
+    // `TIRITH_STATUS`. Emitted unconditionally — every shell's hook exports it,
+    // so it must not be gated behind the bash-only branch below.
+    if let Some(status_line) = compat_protection_status_line(r.tirith_status.as_deref()) {
+        line(&status_line);
+    }
+    if r.detected_shell == "bash"
+        || r.bash_requested_mode.is_some()
+        || r.bash_effective_mode.is_some()
+    {
+        let requested = r.bash_requested_mode.as_deref().unwrap_or("(default)");
+        line(&format!("  requested bash mode:  {requested}"));
+        match (
+            r.bash_effective_mode.as_deref(),
+            r.bash_effective_protection.as_deref(),
+        ) {
+            (Some(mode), Some(protection)) => {
+                line(&format!("  effective bash mode:  {mode}"));
+                line(&format!("  effective protection: {protection}"));
+            }
+            _ => {
+                line("  effective bash mode:  hook not loaded in this process");
+            }
+        }
+        match r.bash_enter_capability.as_deref() {
+            Some(verdict) => {
+                let fresh = r.bash_enter_capability_fresh.unwrap_or(false);
+                if fresh {
+                    line(&format!(
+                        "  enter capability:     {verdict} (self-test verdict)"
+                    ));
+                } else {
+                    line(&format!(
+                        "  enter capability:     {verdict} (STALE — measured on a different bash)"
+                    ));
+                }
+            }
+            None => {
+                line("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
+        }
+        line(&format!(
+            "  bash safe mode:       {}",
+            if r.bash_safe_mode { "on" } else { "off" }
+        ));
+    } else {
+        line(&format!(
+            "  (no bash-specific mode state — detected shell is {})",
+            r.detected_shell
+        ));
+    }
+    line("");
+
+    // Install checks.
+    line("Install checks");
+    let shadow_status = if r.shadow_binaries.is_empty() {
+        "no shadowing tirith binaries on PATH".to_string()
+    } else {
+        format!(
+            "{} shadowing binary/binaries on PATH",
+            r.shadow_binaries.len()
+        )
+    };
+    line(&format!("  PATH shadowing:       {shadow_status}"));
+    for shadow in &r.shadow_binaries {
+        line(&format!("    - {shadow}"));
+    }
+    line(&format!(
+        "  shell profile:        {}",
+        r.shell_profile.as_deref().unwrap_or("not found")
+    ));
+    line(&format!(
+        "  profile wiring:       {}",
+        if r.hook_configured {
+            "tirith hook configured"
+        } else {
+            "NOT configured — commands are not intercepted"
+        }
+    ));
+    line(&format!(
+        "  hook dir:             {}",
+        r.hook_dir.as_deref().unwrap_or("not found")
+    ));
+    let hook_freshness = if !r.hooks_materialized {
+        "system/packaged hooks (not materialized)"
+    } else if r.hooks_stale {
+        "STALE — re-run tirith init (or tirith doctor --fix)"
+    } else {
+        "materialized, up to date"
+    };
+    line(&format!("  materialized hooks:   {hook_freshness}"));
+    if r.policy_paths.is_empty() {
+        line("  policy discovery:     no policy found (built-in defaults apply)");
+    } else {
+        for (i, p) in r.policy_paths.iter().enumerate() {
+            if i == 0 {
+                line(&format!("  policy discovery:     {p}"));
+            } else {
+                line(&format!("                        {p}"));
+            }
+        }
+    }
+    match &r.threat_db {
+        Some(tdb) if !tdb.installed => {
+            line("  threat DB:            not installed");
+        }
+        Some(tdb) if tdb.error.is_some() => {
+            line(&format!(
+                "  threat DB:            error: {}",
+                tdb.error.as_deref().unwrap_or("unknown")
+            ));
+        }
+        Some(tdb) if tdb.signature_valid == Some(false) => {
+            line("  threat DB:            invalid signature");
+        }
+        Some(tdb) if tdb.stale => {
+            line("  threat DB:            installed but stale");
+        }
+        Some(_) => {
+            line("  threat DB:            installed, current");
+        }
+        None => {
+            line("  threat DB:            not available");
+        }
+    }
+    line("");
+
+    // Conflict detection — honest about being best-effort.
+    line("Shell tool detection");
+    if r.shell_tools.is_empty() {
+        line("  no known hook-interacting shell tools detected");
+    } else {
+        line("  detected co-installed shell tools that interact with shell hooks.");
+        line("  presence does not necessarily mean a conflict — tirith's hooks are");
+        line("  designed to coexist. Listed for awareness:");
+        for tool in &r.shell_tools {
+            let signals = match (tool.on_path, tool.in_profile) {
+                (true, true) => "on PATH, in shell profile",
+                (true, false) => "on PATH",
+                (false, true) => "in shell profile",
+                (false, false) => "detected",
+            };
+            line(&format!("    - {} ({})", tool.name, signals));
+            line(&format!("        {}", tool.note));
+        }
+    }
+
+    out
+}
+
+fn print_compat_human(r: &CompatReport) {
+    print!("{}", format_compat_human(r));
+}
+
+/// Render the cross-shell `protection status:` line from the hook-exported
+/// `TIRITH_STATUS` value. A `degraded` status gets an explicit, unmistakable
+/// callout — the whole point of the indicator is that a downgrade is never
+/// something the reader has to infer.
+fn print_protection_status(status: Option<&str>) {
+    match status {
+        Some("blocks") => {
+            println!("  protection:   blocks (a dangerous command is stopped before it runs)");
+        }
+        Some("warn-only") => {
+            println!("  protection:   warn-only (commands are checked but NOT blocked)");
+        }
+        Some("degraded") => {
+            println!("  protection:   DEGRADED — downgraded to warn-only this session");
+            println!();
+            println!("  WARNING: tirith protection was downgraded mid-session.");
+            println!("  Commands are still checked, but a dangerous one is NO LONGER blocked.");
+            println!("  Restart your shell to recover full protection. See the bash section");
+            println!("  below (and 'tirith doctor --bundle' for a full diagnostic report).");
+            println!();
+        }
+        Some("off") => {
+            println!("  protection:   off (the tirith hook installed nothing in this shell)");
+        }
+        Some(other) => {
+            // Forward-compatible: an unrecognised value is shown verbatim
+            // rather than silently dropped.
+            println!("  protection:   {other}");
+        }
+        None => {
+            // No hook ran in the invoking process — usually a non-interactive
+            // subshell. The bash block below prints the fuller "not loaded"
+            // diagnostic; here we stay quiet to avoid a redundant line.
+        }
+    }
+}
+
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
     println!("  binary:       {}", info.binary_path);
@@ -827,6 +1784,10 @@ fn print_human(info: &DoctorInfo) {
         }
         println!();
     }
+    // Cross-shell live protection status, from the hook-exported
+    // `TIRITH_STATUS`. A degraded session is called out explicitly here so the
+    // reader never has to infer it from `effective protection: warn-only`.
+    print_protection_status(info.tirith_status.as_deref());
     // Bash-only block: show requested vs effective state so mid-session
     // degrades and env misconfigurations are legible. Also shown whenever any
     // bash-related env var is present, so users who source the hook from a
@@ -881,6 +1842,34 @@ fn print_human(info: &DoctorInfo) {
             println!("                        Reset: tirith doctor --reset-bash-safe-mode");
         } else {
             println!("  safe mode:            off");
+        }
+
+        // Cached bash enter-mode delivery capability (issue #111). The hook
+        // selects enter mode (blocking) by default only when this verdict is
+        // `works` and fresh; otherwise it falls back to preexec (warn-only).
+        match info.bash_enter_capability.as_deref() {
+            Some(verdict) => {
+                let fresh = info.bash_enter_capability_fresh.unwrap_or(false);
+                let writer = info
+                    .bash_enter_capability_tirith_version
+                    .as_deref()
+                    .map(|v| format!(", tirith {v}"))
+                    .unwrap_or_default();
+                if fresh {
+                    println!("  enter capability:     {verdict} (self-test verdict{writer})");
+                } else {
+                    println!(
+                        "  enter capability:     {verdict} (STALE — measured on a different bash{writer})"
+                    );
+                    println!("                        Re-test: tirith doctor --simulate-enter");
+                }
+                if let Some(reason) = info.bash_enter_capability_reason.as_deref() {
+                    println!("                        {reason}");
+                }
+            }
+            None => {
+                println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
         }
         if safe_mode_overridden_by_env(info.bash_safe_mode, info.bash_requested_mode.as_deref()) {
             println!(
@@ -1161,6 +2150,58 @@ fn check_shell_profile(shell: &str) -> (Option<PathBuf>, bool) {
 
     let primary = first_existing.or_else(|| profile_candidates.into_iter().next());
     (primary, false)
+}
+
+/// `tirith doctor --simulate-enter`: run the bash enter-mode delivery
+/// self-test, print a verdict, and cache the result for the hook to read.
+///
+/// The self-test spawns a disposable bash through a PTY, sources the real hook
+/// in enter mode, and verifies that an allowed command is delivered exactly
+/// once AND that a command tirith would block is actually stopped. Enter mode
+/// is the only bash mode that can truly block, but `bind -x` on Enter does not
+/// reliably accept the line in every environment (issue #111) — this proves
+/// whether it works *here* rather than guessing from the bash version.
+#[cfg(unix)]
+fn run_simulate_enter() -> i32 {
+    println!("tirith: running bash enter-mode delivery self-test...");
+    let outcome = crate::cli::bash_capability::run_and_cache();
+
+    if let Some(v) = &outcome.bash_version {
+        println!("  bash version:   {v}");
+    }
+    if let Some(p) = &outcome.bash_path {
+        println!("  bash binary:    {}", p.display());
+    }
+    println!("  enter delivery: {}", outcome.capability.describe());
+    println!("  detail:         {}", outcome.reason);
+
+    match &outcome.cache_path {
+        Some(path) => println!("  cached to:      {}", path.display()),
+        None => println!("  cache:          NOT written (hook keeps its safe default)"),
+    }
+
+    println!();
+    // Enter mode is only actually enabled for new shells when BOTH the verdict
+    // is `works` AND the cache was written — the hook reads the cache file, so
+    // a failed write means new shells still fall back to preexec.
+    if outcome.capability.enables_enter() && outcome.cache_path.is_some() {
+        println!("tirith: enter mode (blocking) is enabled for bash in new shells.");
+    } else if outcome.capability.enables_enter() {
+        println!("tirith: enter-mode delivery works here, but the capability cache could not");
+        println!("        be written — new shells will fall back to preexec until it can be.");
+    } else {
+        println!("tirith: bash will use preexec mode (warn-only). For blocking, set");
+        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1 in a clean-history shell, or run");
+        println!("        tirith on a shell where enter-mode delivery works.");
+    }
+    0
+}
+
+/// Non-Unix stub: enter mode and its `bind -x` machinery are Unix-only.
+#[cfg(not(unix))]
+fn run_simulate_enter() -> i32 {
+    println!("tirith: --simulate-enter is only meaningful on Unix (bash enter mode)");
+    0
 }
 
 fn reset_safe_mode() -> i32 {
@@ -1488,5 +2529,482 @@ mod tests {
         assert!(!safe_mode_overridden_by_env(true, Some("preexec"))); // not enter
         assert!(!safe_mode_overridden_by_env(true, None)); // env unset
         assert!(!safe_mode_overridden_by_env(true, Some("Enter"))); // case-sensitive
+    }
+
+    // --- compat report: shell-tool conflict detection ----------------------
+
+    #[test]
+    fn tool_in_profile_detects_mention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join(".zshrc");
+        std::fs::write(
+            &profile,
+            "eval \"$(tirith init --shell zsh)\"\neval \"$(starship init zsh)\"\n",
+        )
+        .unwrap();
+        assert!(
+            tool_in_profile("starship", Some(&profile)),
+            "starship init line must be detected in the profile"
+        );
+        assert!(
+            !tool_in_profile("atuin", Some(&profile)),
+            "atuin is absent from the profile and must not be detected"
+        );
+    }
+
+    #[test]
+    fn tool_in_profile_handles_missing_profile() {
+        // No profile path, and a non-existent path, both yield false rather
+        // than erroring — detection is best-effort.
+        assert!(!tool_in_profile("starship", None));
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(!tool_in_profile("starship", Some(&missing)));
+    }
+
+    #[test]
+    fn detect_shell_tool_conflicts_reports_only_profile_hits_when_offline_of_path() {
+        // A tool mentioned only in the profile (not on PATH) must still be
+        // surfaced, with `in_profile` true and `on_path` reflecting reality.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        std::fs::write(&profile, "eval \"$(zoxide init bash)\"\n").unwrap();
+
+        let found = detect_shell_tool_conflicts(Some(&profile));
+        let zoxide = found.iter().find(|t| t.name == "zoxide");
+        assert!(
+            zoxide.is_some(),
+            "zoxide mentioned in profile must be reported, got: {found:?}"
+        );
+        assert!(
+            zoxide.unwrap().in_profile,
+            "zoxide must be flagged as present in the profile"
+        );
+        // A tool that is neither on PATH nor in the profile must be absent.
+        assert!(
+            !found.iter().any(|t| t.name == "direnv" && !t.on_path),
+            "direnv with no signal at all must not appear"
+        );
+    }
+
+    #[test]
+    fn known_shell_tools_covers_the_documented_set() {
+        // The compat report promises detection of these specific tools; guard
+        // against an accidental removal from the table.
+        let names: Vec<&str> = KNOWN_SHELL_TOOLS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "atuin", "starship", "fzf", "zoxide", "direnv", "mise", "asdf",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} must be in the known shell-tool table"
+            );
+        }
+    }
+
+    // --- protection-status rendering --------------------------------------
+
+    #[test]
+    fn print_protection_status_does_not_panic_on_any_input() {
+        // Smoke: every variant (including an unknown value and None) renders
+        // without panicking. The content assertions live in the integration
+        // tests; this just guards the match arms.
+        for s in [
+            Some("blocks"),
+            Some("warn-only"),
+            Some("degraded"),
+            Some("off"),
+            Some("future-value"),
+            None,
+        ] {
+            print_protection_status(s);
+        }
+    }
+
+    // --- bundle redaction: home-directory path ----------------------------
+
+    #[test]
+    fn redact_home_path_masks_the_literal_home_dir() {
+        let home = std::path::Path::new("/Users/alice");
+        let text = "hook dir: /Users/alice/.local/share/tirith/shell\npolicy: /Users/alice/.tirith/policy.yaml";
+        let red = redact_home_path(text, Some(home));
+        assert!(
+            !red.contains("/Users/alice"),
+            "the literal home path must not survive redaction, got:\n{red}"
+        );
+        assert!(
+            red.contains("~/.local/share/tirith/shell"),
+            "paths under home must be rewritten to ~, got:\n{red}"
+        );
+    }
+
+    #[test]
+    fn redact_home_path_handles_trailing_slash_and_degenerate_homes() {
+        // A trailing separator on the home value must still collapse to `~`.
+        let red = redact_home_path("x /home/bob/y", Some(std::path::Path::new("/home/bob/")));
+        assert_eq!(red, "x ~/y");
+        // A `/` or empty home must be a no-op — never rewrite every `/`.
+        let untouched = "/usr/bin/tirith";
+        assert_eq!(
+            redact_home_path(untouched, Some(std::path::Path::new("/"))),
+            untouched
+        );
+        assert_eq!(redact_home_path(untouched, None), untouched);
+    }
+
+    // --- bundle redaction: secrets / tokens -------------------------------
+
+    #[test]
+    fn redact_secrets_masks_secret_named_keys() {
+        for line in [
+            "GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "MY_API_KEY=whatever-value-here",
+            "db_password=hunter2",
+            "Some Secret: still-masked",
+        ] {
+            let red = redact_secrets(line);
+            assert!(
+                red.contains("<redacted>"),
+                "a secret-named key must be masked: {line} -> {red}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_masks_token_shaped_values() {
+        // Even a benign-looking key must be scrubbed when the *value* looks
+        // like a credential.
+        for line in [
+            "TIRITH_SESSION_ID=ghp_0123456789abcdef0123456789abcdef0123",
+            "FOO=AKIAIOSFODNN7EXAMPLE",
+            "BAR=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefpracticallyajwt",
+            "BAZ=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+        ] {
+            let red = redact_secrets(line);
+            assert!(
+                red.contains("<redacted>"),
+                "a token-shaped value must be masked: {line} -> {red}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_leaves_benign_diagnostic_lines_intact() {
+        // The bundle is full of benign key=value lines — they must survive.
+        for line in [
+            "detected shell: bash",
+            "TIRITH_BASH_MODE=preexec",
+            "effective mode: enter",
+            "interactive:    true",
+            "TERM=xterm-256color",
+            "bash safe mode: false",
+        ] {
+            assert_eq!(
+                redact_secrets(line),
+                line,
+                "benign diagnostic line must not be redacted: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_secret_does_not_flag_ordinary_values() {
+        // Short values, words, numbers, and paths must NOT look like secrets.
+        for v in [
+            "preexec",
+            "bash",
+            "true",
+            "1",
+            "xterm-256color",
+            "/Users/alice/.local/state/tirith",
+            "warn-only",
+        ] {
+            assert!(
+                !looks_like_secret(v),
+                "{v:?} must not be classified as a secret"
+            );
+        }
+    }
+
+    // --- bundle assembly: end-to-end redaction ----------------------------
+
+    /// The load-bearing safety test: the assembled bundle must NOT contain a
+    /// secret-shaped value placed in an allowlisted env var, and must NOT
+    /// contain the literal home-directory path.
+    #[test]
+    fn build_bundle_text_redacts_secrets_and_home_path() {
+        with_fake_env(false, |home, _cwd| {
+            // `TIRITH_SESSION_ID` is on the env allowlist, so it WILL be
+            // emitted — but its value here is token-shaped, so the value
+            // layer must scrub it.
+            let secret = "ghp_DEADBEEFdeadbeef0123456789abcdef0123";
+            let _sid = EnvGuard::set("TIRITH_SESSION_ID", std::path::Path::new(secret));
+            // A genuinely secret-named var that is NOT on the allowlist must
+            // never appear at all (allowlist layer).
+            let _leak = EnvGuard::set(
+                "AWS_SECRET_ACCESS_KEY",
+                std::path::Path::new("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
+            );
+
+            let text = build_bundle_text(Some(home));
+
+            assert!(
+                !text.contains(secret),
+                "a token-shaped value in an allowlisted env var must be redacted, got:\n{text}"
+            );
+            assert!(
+                text.contains("TIRITH_SESSION_ID=<redacted>"),
+                "the scrubbed var must still be listed (with a redacted value), got:\n{text}"
+            );
+            assert!(
+                !text.contains("AWS_SECRET_ACCESS_KEY"),
+                "a non-allowlisted secret var must not appear in the bundle at all, got:\n{text}"
+            );
+            assert!(
+                !text.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
+                "a non-allowlisted secret value must never leak, got:\n{text}"
+            );
+            // The literal home-directory path must be masked everywhere.
+            let home_str = home.to_string_lossy();
+            assert!(
+                !text.contains(home_str.as_ref()),
+                "the literal home path {home_str} must not survive in the bundle, got:\n{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn build_bundle_text_has_the_documented_sections() {
+        with_fake_env(false, |home, _cwd| {
+            let text = build_bundle_text(Some(home));
+            for section in [
+                "tirith diagnostic bundle",
+                "== tirith ==",
+                "== shell & protection ==",
+                "== hook chain ==",
+                "== policy ==",
+                "== threat database ==",
+                "== environment (curated, redacted) ==",
+                "== end of bundle ==",
+            ] {
+                assert!(
+                    text.contains(section),
+                    "bundle missing section {section:?}, got:\n{text}"
+                );
+            }
+        });
+    }
+
+    /// True when `name` has the predictable `tirith-bundle-<UTC-timestamp>.txt`
+    /// shape the F2 fix eliminates — `tirith-bundle-` + `YYYYMMDDTHHMMSSZ` (8
+    /// digits, `T`, 6 digits, `Z`) + `.txt`. The new code must NOT produce a
+    /// name of this form; it uses a random `tempfile` suffix instead.
+    fn is_predictable_timestamp_bundle_name(name: &str) -> bool {
+        let Some(mid) = name
+            .strip_prefix("tirith-bundle-")
+            .and_then(|s| s.strip_suffix(".txt"))
+        else {
+            return false;
+        };
+        let bytes = mid.as_bytes();
+        // YYYYMMDD (8) + 'T' + HHMMSS (6) + 'Z' == 16 chars exactly.
+        bytes.len() == 16
+            && bytes[..8].iter().all(u8::is_ascii_digit)
+            && bytes[8] == b'T'
+            && bytes[9..15].iter().all(u8::is_ascii_digit)
+            && bytes[15] == b'Z'
+    }
+
+    #[test]
+    fn is_predictable_timestamp_bundle_name_recognises_the_old_format() {
+        // Sanity-check the matcher itself so the F2 test below cannot pass
+        // vacuously: the OLD predictable name must be recognised, a random one
+        // must not.
+        assert!(is_predictable_timestamp_bundle_name(
+            "tirith-bundle-20260522T143000Z.txt"
+        ));
+        assert!(!is_predictable_timestamp_bundle_name(
+            "tirith-bundle-a9Xk2Q.txt"
+        ));
+        assert!(!is_predictable_timestamp_bundle_name("tirith-bundle-.txt"));
+        assert!(!is_predictable_timestamp_bundle_name("unrelated.txt"));
+    }
+
+    /// F2: the diagnostic bundle must be written to a *random*, non-predictable
+    /// path (no symlink/TOCTOU hole) and the file must be mode `0600`.
+    #[test]
+    fn write_bundle_file_uses_a_random_name_and_tight_mode() {
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let body = "tirith diagnostic bundle\n== end of bundle ==\n";
+
+        let path = write_bundle_file(dir.path(), body).expect("bundle write");
+
+        // The file exists, is inside the requested dir, and round-trips.
+        assert!(path.exists(), "bundle file must exist after the write");
+        assert_eq!(
+            path.parent(),
+            Some(dir.path()),
+            "bundle must land in the requested directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read bundle"),
+            body,
+            "bundle content must round-trip"
+        );
+
+        // The filename must NOT be the predictable timestamp form — that
+        // predictable path is exactly the symlink/TOCTOU hole F2 closes.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("bundle file name");
+        assert!(
+            !is_predictable_timestamp_bundle_name(name),
+            "bundle filename {name:?} must not be the predictable \
+             tirith-bundle-<timestamp>.txt form"
+        );
+        // A random tempfile name keeps the cosmetic prefix + .txt suffix.
+        assert!(
+            name.starts_with("tirith-bundle-") && name.ends_with(".txt"),
+            "bundle name {name:?} should keep the tirith-bundle- prefix and .txt suffix"
+        );
+
+        // Two writes in the same dir must not collide — the random suffix and
+        // O_EXCL create guarantee distinct files.
+        let path2 = write_bundle_file(dir.path(), body).expect("second bundle write");
+        assert_ne!(
+            path, path2,
+            "consecutive bundle writes must produce distinct random paths"
+        );
+
+        // On Unix the file must be mode 0600 — the bundle is redacted but a
+        // diagnostic file still must not be group/world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("bundle metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "bundle file must be mode 0600, got {mode:o}");
+        }
+    }
+
+    /// Build a minimal `CompatReport` for the given shell and `TIRITH_STATUS`,
+    /// with every other field at a benign default. Used by the F3 tests.
+    fn compat_report_for(detected_shell: &str, tirith_status: Option<&str>) -> CompatReport {
+        CompatReport {
+            version: "0.0.0-test".to_string(),
+            binary_path: "/tmp/tirith".to_string(),
+            detected_shell: detected_shell.to_string(),
+            interactive: false,
+            bash_requested_mode: None,
+            bash_effective_mode: None,
+            bash_effective_protection: None,
+            tirith_status: tirith_status.map(str::to_string),
+            bash_enter_capability: None,
+            bash_enter_capability_fresh: None,
+            bash_safe_mode: false,
+            hook_dir: None,
+            hooks_materialized: false,
+            hooks_stale: false,
+            shell_profile: None,
+            hook_configured: false,
+            shadow_binaries: Vec::new(),
+            policy_paths: Vec::new(),
+            threat_db: None,
+            shell_tools: Vec::new(),
+        }
+    }
+
+    /// F3: `tirith doctor --compat` must surface `TIRITH_STATUS` for a
+    /// **non-bash** shell. The status line was previously printed only inside
+    /// the bash-only branch, so a `SHELL=/bin/zsh TIRITH_STATUS=degraded`
+    /// invocation silently dropped it. `TIRITH_STATUS` is exported by the zsh,
+    /// fish, and PowerShell hooks too, so the line must not be bash-gated.
+    #[test]
+    fn compat_human_surfaces_tirith_status_for_non_bash_shell() {
+        for shell in ["zsh", "fish", "powershell", "nushell"] {
+            let report = compat_report_for(shell, Some("degraded"));
+            let out = format_compat_human(&report);
+            assert!(
+                out.contains("protection status:    DEGRADED"),
+                "TIRITH_STATUS=degraded must be surfaced for a non-bash shell ({shell}); \
+                 got:\n{out}"
+            );
+            // The bash-only block must NOT have run for a non-bash shell with
+            // no bash env — the status line is the *only* protection signal.
+            assert!(
+                out.contains(&format!(
+                    "no bash-specific mode state — detected shell is {shell}"
+                )),
+                "a non-bash shell with no bash env must take the non-bash branch ({shell}); \
+                 got:\n{out}"
+            );
+        }
+    }
+
+    /// A plain (non-degraded) status is surfaced verbatim for a non-bash shell.
+    #[test]
+    fn compat_human_surfaces_plain_status_for_non_bash_shell() {
+        let report = compat_report_for("zsh", Some("warn-only"));
+        let out = format_compat_human(&report);
+        assert!(
+            out.contains("protection status:    warn-only"),
+            "a non-degraded TIRITH_STATUS must still be surfaced for zsh; got:\n{out}"
+        );
+    }
+
+    /// When `TIRITH_STATUS` is unset the compat report stays correct: no
+    /// `protection status:` line, and no panic / stray formatting.
+    #[test]
+    fn compat_human_omits_status_line_when_unset() {
+        let report = compat_report_for("zsh", None);
+        let out = format_compat_human(&report);
+        assert!(
+            !out.contains("protection status:"),
+            "no protection-status line should appear when TIRITH_STATUS is unset; got:\n{out}"
+        );
+        // The report is still well-formed and reaches the install-checks block.
+        assert!(
+            out.contains("Install checks"),
+            "report must be complete; got:\n{out}"
+        );
+    }
+
+    /// `compat_protection_status_line` is shell-independent by construction —
+    /// it never consults a shell. This pins the F3 fix at the unit level.
+    #[test]
+    fn compat_protection_status_line_is_shell_independent() {
+        assert_eq!(
+            compat_protection_status_line(Some("degraded")).as_deref(),
+            Some("  protection status:    DEGRADED (downgraded to warn-only this session)")
+        );
+        assert_eq!(
+            compat_protection_status_line(Some("blocks")).as_deref(),
+            Some("  protection status:    blocks")
+        );
+        assert_eq!(compat_protection_status_line(None), None);
+    }
+
+    #[test]
+    fn bundle_env_allowlist_excludes_known_secret_holders() {
+        // Defense-in-depth check: the curated allowlist must never name a
+        // variable that conventionally holds a credential.
+        for forbidden in [
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "NPM_TOKEN",
+        ] {
+            assert!(
+                !BUNDLE_ENV_ALLOWLIST.contains(&forbidden),
+                "{forbidden} must NOT be on the bundle env allowlist"
+            );
+        }
     }
 }

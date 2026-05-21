@@ -74,6 +74,12 @@ Examples:
         #[arg(long)]
         warn_only: bool,
 
+        /// Suppress all network activity on the hot path: skip the periodic
+        /// background threat-DB refresh so analysis runs purely locally.
+        /// Also honored via the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -508,7 +514,9 @@ Examples:
 Examples:
   tirith doctor
   tirith doctor --fix
-  tirith doctor --fix --yes")]
+  tirith doctor --fix --yes
+  tirith doctor --compat
+  tirith doctor --simulate-enter")]
     Doctor {
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -531,6 +539,43 @@ Examples:
         /// Auto-approve all fixes (no prompting)
         #[arg(long, requires = "fix")]
         yes: bool,
+        /// Run the bash enter-mode delivery self-test and cache the result
+        #[arg(
+            long,
+            conflicts_with = "format",
+            conflicts_with = "json",
+            conflicts_with = "fix",
+            conflicts_with = "reset_bash_safe_mode"
+        )]
+        simulate_enter: bool,
+        /// Print a focused shell/terminal compatibility report (supports
+        /// --format json). Mutually exclusive with --fix, --simulate-enter,
+        /// and --reset-bash-safe-mode.
+        #[arg(
+            long,
+            conflicts_with = "fix",
+            conflicts_with = "simulate_enter",
+            conflicts_with = "reset_bash_safe_mode"
+        )]
+        compat: bool,
+
+        /// Write a redacted diagnostic bundle to a file and print its path.
+        /// The bundle (doctor info, tirith + hook versions, shell/mode/effective
+        /// protection, hook-chain state, policy discovery, threat-DB status, and
+        /// relevant environment) is safe to attach to a bug report: secrets,
+        /// tokens, and the literal home-directory path are redacted. Accepts the
+        /// aliases --redacted-report and --shell-trace. Mutually exclusive with
+        /// --fix, --simulate-enter, --reset-bash-safe-mode, and --compat.
+        #[arg(
+            long,
+            visible_alias = "redacted-report",
+            visible_alias = "shell-trace",
+            conflicts_with = "fix",
+            conflicts_with = "simulate_enter",
+            conflicts_with = "reset_bash_safe_mode",
+            conflicts_with = "compat"
+        )]
+        bundle: bool,
     },
 
     /// Generate shell completions
@@ -771,14 +816,25 @@ enum PolicyAction {
     #[command(after_help = "\
 Examples:
   tirith policy init
-  tirith policy init --force")]
+  tirith policy init --force
+  tirith policy init --template individual
+  tirith policy init --template ci-strict
+  tirith policy init --template ai-agent-heavy
+
+Templates:
+  individual      sensible defaults for a single developer
+  ci-strict       strict CI settings (fail-closed, no bypass, scan fail-on)
+  ai-agent-heavy  tuned for environments where AI agents run many commands")]
     Init {
         /// Overwrite existing policy file
         #[arg(long)]
         force: bool,
         /// Generate minimal template (default: full)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "template")]
         minimal: bool,
+        /// Use a curated starter policy: individual, ci-strict, or ai-agent-heavy
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
     },
     /// Validate a policy file for errors
     #[command(after_help = "\
@@ -981,6 +1037,7 @@ fn main() {
             strict_warn,
             no_daemon,
             warn_only,
+            offline,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -994,6 +1051,7 @@ fn main() {
                 strict_warn,
                 no_daemon,
                 warn_only,
+                offline,
             )
         }
 
@@ -1113,7 +1171,11 @@ fn main() {
         ),
 
         Commands::Policy { action } => match action {
-            PolicyAction::Init { force, minimal } => cli::policy::init(force, minimal),
+            PolicyAction::Init {
+                force,
+                minimal,
+                template,
+            } => cli::policy::init(force, minimal, template.as_deref()),
             PolicyAction::Validate { path, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::validate(path.as_deref(), json)
@@ -1308,9 +1370,20 @@ fn main() {
             reset_bash_safe_mode,
             fix,
             yes,
+            simulate_enter,
+            compat,
+            bundle,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::doctor::run(json, reset_bash_safe_mode, fix, yes)
+            cli::doctor::run(
+                json,
+                reset_bash_safe_mode,
+                fix,
+                yes,
+                simulate_enter,
+                compat,
+                bundle,
+            )
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),

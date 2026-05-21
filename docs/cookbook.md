@@ -1,5 +1,31 @@
 # Policy Cookbook
 
+## 0. Start From a Template
+
+`tirith policy init --template <name>` writes a curated, well-commented,
+schema-valid starter policy. It is the fastest way to a sensible baseline you
+can then edit:
+
+```bash
+tirith policy init --template individual      # solo developer defaults
+tirith policy init --template ci-strict       # fail-closed CI, no bypass
+tirith policy init --template ai-agent-heavy  # heavy AI-agent environments
+```
+
+- **`individual`** — `fail_mode: open`, `paranoia: 1`, the noisy
+  `shortened_url` rule escalated, an empty `allowlist` ready to fill in.
+- **`ci-strict`** — `fail_mode: closed`, the `TIRITH=0` bypass disabled
+  (interactive and non-interactive), `strict_warn: true`, remote-execution
+  rules escalated to CRITICAL, and `scan.fail_on: high` so `tirith scan` fails
+  the build.
+- **`ai-agent-heavy`** — `fail_mode: open` (so an internal error cannot wedge
+  an agent), `paranoia: 3`, the non-interactive bypass disabled, `approval_rules`
+  for the highest-risk pipe-to-shell rules, and `escalation` rules that block
+  on repeated warnings.
+
+`tirith policy init` with no `--template` writes the full default policy.
+The recipes below show hand-tuned variations on these baselines.
+
 ## 1. Strict Organization (Fail Closed, No Bypass)
 
 ```yaml

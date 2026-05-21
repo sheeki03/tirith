@@ -4,10 +4,73 @@
 
 Run `tirith doctor` to see the hook directory being used and whether hooks were materialized from the embedded binary.
 
+For a focused, single-screen compatibility view — detected shell, requested-vs-effective bash mode, install checks (PATH shadowing, profile wiring, materialized-hook staleness, policy discovery, threat-DB status), and any co-installed shell tools that interact with hooks (Atuin, Starship, fzf, zoxide, direnv, mise, asdf) — run:
+
+```
+tirith doctor --compat
+```
+
+Add `--format json` for a machine-readable report. `--compat` is a static report; to (re)measure bash enter-mode delivery use `tirith doctor --simulate-enter`.
+
 If hooks are not found:
 1. Ensure `tirith` is in your PATH
 2. Run `eval "$(tirith init)"` and check for error messages (if you use multiple shells, prefer `tirith init --shell bash|zsh|fish`)
 3. Set `TIRITH_SHELL_DIR` to point to your shell hooks directory explicitly
+
+## Filing a bug report: `tirith doctor --bundle`
+
+To attach a complete, **redacted** diagnostic to a bug report, run:
+
+```
+tirith doctor --bundle
+```
+
+It writes a single text file (path printed on completion, under
+`~/.local/state/tirith/`) containing the doctor info, tirith and hook
+versions, shell / mode / effective protection, hook-chain state, policy
+discovery, threat-DB status, and a curated slice of the environment. The
+aliases `tirith doctor --redacted-report` and `tirith doctor --shell-trace`
+produce the same file.
+
+The bundle is **redacted by design**:
+
+- Only a curated allowlist of tirith-relevant environment variables is
+  included — unrelated cloud credentials and API keys are never even
+  candidates.
+- Any value that still looks like a token or secret is masked as
+  `<redacted>`.
+- The literal home-directory path is replaced with `~`, so absolute paths in
+  the report do not reveal your username.
+
+It is safe to attach to a public issue. Review it first if you want to be
+sure. Add `--format json` to get `{"bundle_path": "..."}` instead of the
+human summary.
+
+## Protection downgraded (`degraded` status)
+
+tirith can downgrade protection during a session — most commonly bash enter
+mode falling back to preexec warn-only when it detects a delivery failure. A
+downgrade is **never silent**: the hook prints one consolidated message,
+
+```
+tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details
+```
+
+and updates the `TIRITH_STATUS` shell variable to `degraded`.
+
+To see the current protection level at any time, run `tirith doctor` — a
+`protection:` line reports `blocks` / `warn-only` / `degraded` / `off`, and a
+`degraded` state gets an explicit callout. `tirith doctor --compat` shows a
+`protection status:` line in the same spirit.
+
+If you want the protection level visible in your shell prompt, the hook sets a
+non-exported `TIRITH_STATUS` shell variable for exactly that — see
+[`docs/prompt-status.md`](prompt-status.md) for ready-to-paste prompt snippets
+for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
+output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
+
+To recover full protection after a degrade, restart your shell (and see
+"Persistent safe mode" below if it keeps happening).
 
 ## Brew upgrade applied but behavior did not change
 
@@ -49,10 +112,35 @@ hash -r
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:
-- **enter mode** (default outside SSH): Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
+- **enter mode**: Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
 - **preexec mode**: Uses `DEBUG` trap. Warn-only by default. Can be upgraded to real blocking via `shopt -s extdebug` + `return 1` from the DEBUG trap; opt in with `TIRITH_BASH_PREEXEC_ENFORCE=1`.
 
-Set via: `export TIRITH_BASH_MODE=enter` or `export TIRITH_BASH_MODE=preexec` (set before `tirith init` in your shell rc)
+### Which mode is used by default
+
+`bind -x` on Enter does not reliably accept the typed line in every bash /
+readline build — in some environments it runs the bound function but never
+returns to the command loop, so the command is silently eaten (issue #111).
+Because this is a property of the bash build, not the version number, tirith
+**proves it** rather than guessing:
+
+- `tirith setup` and `tirith doctor` run a quick disposable-PTY **self-test**
+  that checks whether enter-mode delivery and blocking actually work for your
+  bash, and cache the verdict. `tirith doctor --simulate-enter` runs it on
+  demand.
+- On every new interactive shell, the bash hook reads that cached verdict. It
+  uses enter mode **only when the self-test proved it works**; otherwise it
+  falls back to preexec (warn-only). Outside SSH and with no cached verdict
+  yet, the hook starts in preexec until the next `tirith setup` / `tirith
+  doctor` populates the cache.
+
+`tirith doctor` shows the cached verdict on the `enter capability:` line. If it
+reports `not tested`, run `tirith doctor --simulate-enter`.
+
+Set the mode explicitly with `export TIRITH_BASH_MODE=enter` or `export
+TIRITH_BASH_MODE=preexec` (before `tirith init` in your shell rc).
+`TIRITH_BASH_MODE=enter` is a deliberate override — it forces enter mode even
+when the self-test has not proven it works; the startup health gate and runtime
+self-healing still degrade visibly to preexec if delivery then fails.
 
 ### Preexec enforcement (`TIRITH_BASH_PREEXEC_ENFORCE`)
 
@@ -118,7 +206,18 @@ If you have your own `DEBUG` trap installed before sourcing the tirith hook, the
   bash mode:            preexec          ← live, exported by the hook
   effective protection: warn-only        ← live, exported by the hook
   safe mode:            off              ← persistent enter-mode-failure flag
+  enter capability:     broken           ← cached enter-mode self-test verdict
 ```
+
+The `enter capability:` line shows the cached verdict of the bash enter-mode
+delivery self-test (issue #111): `works` (enter mode is enabled for new
+shells), `broken` / `inconclusive` (preexec is used), `STALE` (the verdict was
+measured against a different bash — a different `$BASH_VERSION` or a different
+bash binary path — so it no longer applies; run `tirith doctor
+--simulate-enter` to re-measure), or `not tested`. Cache freshness tracks the
+bash identity only; a tirith upgrade does not by itself make the verdict stale
+(the cache `schema` number handles cross-version invalidation, and the
+recorded tirith version is diagnostic only).
 
 If you see `bash hook: not loaded in this process`, the hook did not run in the shell that invoked `doctor` — typically because `doctor` was called from a non-interactive subshell. Source the hook in your `.bashrc` and open a new interactive shell.
 
@@ -128,10 +227,10 @@ On the first command it intercepts in an interactive bash session, the preexec h
 
 ```
 tirith: bash is in preexec mode (warn-only, does not block)
-  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)
+  Run 'tirith doctor' to test enter mode (blocking) for this shell
 ```
 
-This is intentional: preexec mode cannot stop a command once bash has committed to running it. The banner fires once per shell, on the first intercepted command.
+This is intentional: preexec mode cannot stop a command once bash has committed to running it. The banner fires once per shell, on the first intercepted command. Running `tirith doctor` (or `tirith doctor --simulate-enter`) runs the enter-mode self-test and, if delivery works for your bash, enables enter mode for new shells.
 
 ### Persistent safe mode
 

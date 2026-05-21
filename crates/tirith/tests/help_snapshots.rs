@@ -101,6 +101,25 @@ fn help_scan_shows_sarif_format() {
 }
 
 #[test]
+fn help_policy_init_documents_templates() {
+    let out = tirith()
+        .args(["policy", "init", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--template"),
+        "policy init --help should document --template: {stdout}"
+    );
+    for name in ["individual", "ci-strict", "ai-agent-heavy"] {
+        assert!(
+            stdout.contains(name),
+            "policy init --help should list the {name} template: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn conflict_json_and_format() {
     let out = tirith()
         .args(["check", "--json", "--format", "json", "--", "echo", "hi"])
@@ -148,6 +167,90 @@ fn conflict_doctor_reset_and_format() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn conflict_doctor_compat_and_fix() {
+    let out = tirith()
+        .args(["doctor", "--compat", "--fix"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "--compat must conflict with --fix");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn conflict_doctor_compat_and_simulate_enter() {
+    let out = tirith()
+        .args(["doctor", "--compat", "--simulate-enter"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--compat must conflict with --simulate-enter"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn conflict_doctor_compat_and_reset() {
+    let out = tirith()
+        .args(["doctor", "--compat", "--reset-bash-safe-mode"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--compat must conflict with --reset-bash-safe-mode"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn doctor_compat_allows_format_json() {
+    // --compat is explicitly compatible with --format json (machine-readable
+    // compatibility report). This must NOT be a conflict.
+    let out = tirith()
+        .args(["doctor", "--compat", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "doctor --compat --format json should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("doctor --compat --format json should produce valid JSON");
+    assert!(json["version"].is_string());
+    assert!(json["detected_shell"].is_string());
+    assert!(
+        json["shell_tools"].is_array(),
+        "compat JSON must carry a shell_tools array"
+    );
+    assert!(
+        json["shadow_binaries"].is_array(),
+        "compat JSON must carry a shadow_binaries array"
+    );
+}
+
+#[test]
+fn doctor_compat_human_has_expected_sections() {
+    let out = tirith().args(["doctor", "--compat"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for section in [
+        "tirith compatibility report",
+        "Shell hook mode",
+        "Install checks",
+        "Shell tool detection",
+    ] {
+        assert!(
+            stdout.contains(section),
+            "compat report missing section {section:?}, got:\n{stdout}"
+        );
+    }
 }
 
 #[test]

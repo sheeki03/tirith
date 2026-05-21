@@ -127,6 +127,85 @@ _tirith_persist_safe_mode() {
   fi
 }
 
+# --- Enter-mode capability cache (issue #111) -------------------------------
+#
+# `bind -x` on Enter runs the bound function but, in many environments, does
+# NOT then accept the line — bash never returns to its command loop, the
+# pending command is never delivered, and it is silently eaten. Whether this
+# happens is a property of the running bash/readline build, not the version
+# number, so it cannot be decided by a version gate.
+#
+# `tirith setup` / `tirith doctor` run a PTY self-test that PROVES whether
+# enter-mode delivery works, and write the verdict to a cache file. This hook
+# is sourced on every interactive shell, so it must not run that probe — it
+# only READS the cache (one small-file read, fast enough for startup). When the
+# cache proves enter mode works for the running bash, the default mode is
+# enter; otherwise the hook falls back to the safe default, preexec.
+#
+# Cache freshness is gated on (a) the schema number and (b) the bash identity
+# (version + path). The SCHEMA is the cross-tirith-version invalidator: any
+# change to the probe semantics or the cache format that could make an old
+# verdict wrong must bump `cli::bash_capability::CACHE_SCHEMA`, which a stale
+# cache then fails. Enter-mode delivery itself is a bash-build property — it
+# does not change with the tirith version — so the cache is keyed on bash, not
+# on tirith. (`tirith_version` is still recorded in the file for diagnostics.)
+_TIRITH_ENTER_CAP_SCHEMA=1
+_TIRITH_ENTER_CAP_FILE="$_TIRITH_STATE_DIR/bash-enter-capability"
+
+# Read the enter-mode capability cache and decide whether enter mode is proven
+# to work for THIS bash. Returns 0 only when the cache exists, parses, its
+# schema matches, its recorded bash version AND bash path match the running
+# shell, and the verdict is `works`. Any other state (missing, malformed,
+# stale, broken) returns non-zero so the caller falls back to the safe
+# default. Fails closed.
+_tirith_enter_capability_proven() {
+  [[ -r "$_TIRITH_ENTER_CAP_FILE" ]] || return 1
+
+  # Guard against a junk/oversized file masquerading as the cache. `wc -c`
+  # pads its count with leading whitespace on BSD/macOS, so strip everything
+  # but digits before the numeric check.
+  local size
+  size="$(wc -c < "$_TIRITH_ENTER_CAP_FILE" 2>/dev/null)" || return 1
+  size="${size//[^0-9]/}"
+  [[ -n "$size" ]] || return 1
+  (( size > 4096 )) && return 1
+
+  local schema="" cache_bash_version="" cache_bash_path="" capability=""
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      schema)           schema="$value" ;;
+      bash_version)     cache_bash_version="$value" ;;
+      bash_path)        cache_bash_path="$value" ;;
+      enter_capability) capability="$value" ;;
+    esac
+  done < "$_TIRITH_ENTER_CAP_FILE"
+
+  # Schema must match exactly — a format or probe-semantics change bumps it,
+  # invalidating caches written by a different tirith.
+  [[ "$schema" == "$_TIRITH_ENTER_CAP_SCHEMA" ]] || return 1
+
+  # The verdict must be an explicit `works`. `broken`, `inconclusive`, an empty
+  # value, or anything unrecognised all mean "do not use enter mode".
+  [[ "$capability" == "works" ]] || return 1
+
+  # The cache is bash-version specific: readline's bind-x behaviour can change
+  # across builds, so a verdict for a different bash must not be trusted.
+  [[ -n "$cache_bash_version" ]] || return 1
+  [[ "$cache_bash_version" == "$BASH_VERSION" ]] || return 1
+
+  # The verdict is also bound to the bash *binary* the self-test measured — the
+  # capability is a property of the build, not just the version string. The
+  # cache records `command -v bash`; require the running shell ($BASH) to be
+  # that same binary. A mismatch (a different bash now on PATH) is treated as
+  # stale and falls back to preexec — fail-safe.
+  [[ -n "$cache_bash_path" ]] || return 1
+  [[ "$cache_bash_path" == "${BASH:-}" ]] || return 1
+
+  return 0
+}
+# --- end enter-mode capability cache ----------------------------------------
+
 
 # Read the most recent history entry as "<index>|<cmd>" on stdout. Returns 1
 # with empty stdout when history is unavailable, disabled, or malformed.
@@ -269,6 +348,46 @@ _tirith_install_debug_trap() {
   trap '_tirith_debug_trampoline' DEBUG
 }
 
+# --- Protection-status indicator + one-shot degrade banner -----------------
+#
+# `TIRITH_STATUS` is a small public contract a user can reference in their PS1
+# to surface tirith's live protection level in their prompt. tirith itself
+# prints NOTHING per-prompt — it only sets the variable; wiring it into a
+# prompt is opt-in (see docs/prompt-status.md). Values:
+#   blocks     enter mode (or enforced preexec) — a blocked command is stopped
+#   warn-only  preexec warn-only — commands are observed but not blocked
+#   degraded   protection was DOWNGRADED mid-session from a stronger level
+#   off        the hook installed nothing
+#
+# `degraded` is deliberately distinct from `warn-only`: a shell that simply
+# *starts* in preexec warn-only is `warn-only`, but a shell that *loses* a
+# stronger guarantee at runtime is `degraded` — a state the user should notice.
+#
+# It is a plain shell variable, deliberately NOT exported: the prompt runs in
+# THIS interactive shell, which reads a non-exported variable fine (PS1 /
+# PROMPT_COMMAND), and a non-interactive child process has no tirith
+# protection — so it must not inherit a status that would misrepresent it.
+# (`TIRITH_BASH_EFFECTIVE_*` below are exported on purpose: `tirith doctor` is
+# a child process and can only see exported vars.) An assignment inside a
+# function with no matching `local` writes the global, so this is the shell's
+# session-global `TIRITH_STATUS`.
+_tirith_set_status() {
+  TIRITH_STATUS="$1"
+}
+
+# Emit the one-time degraded-protection warning. Fires at most once per shell
+# session (guarded by `_TIRITH_DEGRADE_WARNED`), is interactive-only, and is
+# deliberately terse — a single consolidated message, never naggy. The optional
+# `$1` is an extra detail line appended under the headline.
+_tirith_warn_degraded_once() {
+  [[ -n "${_TIRITH_DEGRADE_WARNED:-}" ]] && return 0
+  _TIRITH_DEGRADE_WARNED=1
+  [[ $- == *i* ]] || return 0
+  _tirith_output "tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details"
+  [[ -n "${1:-}" ]] && _tirith_output "  $1"
+  return 0
+}
+
 # Cache-then-degrade: flip the session to warn-only mode and re-export the
 # effective protection string so a subsequent `tirith doctor` sees the truth.
 # Callers that already know a history index should pin the cache BEFORE
@@ -280,9 +399,9 @@ _tirith_session_degrade_to_warn_only() {
   _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
   _TIRITH_PREEXEC_WARNED=1   # suppress the generic warn-only banner
   export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
-  if [[ $- == *i* ]]; then
-    _tirith_output "$reason"
-  fi
+  _tirith_set_status "degraded"
+  # One consolidated headline, then the path-specific reason as the detail line.
+  _tirith_warn_degraded_once "$reason"
 }
 
 
@@ -295,7 +414,7 @@ _tirith_preexec() {
      && [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" != "1" ]]; then
     _TIRITH_PREEXEC_WARNED=1
     _tirith_output "tirith: bash is in preexec mode (warn-only, does not block)"
-    _tirith_output "  For guaranteed blocking use enter mode (export TIRITH_BASH_MODE=enter)"
+    _tirith_output "  Run 'tirith doctor' to test enter mode (blocking) for this shell"
   fi
 
   local bash_cmd="$BASH_COMMAND"
@@ -417,11 +536,6 @@ _tirith_preexec() {
 
 _tirith_degrade_to_preexec() {
   local reason="${1:-unknown}"
-  # Only print warnings in interactive shells
-  if [[ $- == *i* ]]; then
-    _tirith_output "tirith: enter mode failed ($reason) — switching to preexec"
-    _tirith_output "  Persistent. Re-enable: TIRITH_BASH_MODE=enter"
-  fi
 
   # Safe deterministic degrade: set known-safe defaults for current session.
   # Custom bindings from .inputrc/.bashrc return on next shell (safe mode persisted,
@@ -445,8 +559,13 @@ _tirith_degrade_to_preexec() {
     # shells that START in preexec).
     export TIRITH_BASH_EFFECTIVE_MODE="preexec"
     export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
-    _tirith_output "  Restart your shell for full custom keybindings to return."
+    _tirith_set_status "degraded"
   fi
+  # One consolidated, one-shot degraded-protection banner — same wording as
+  # every other degrade path. The enter-mode specifics (what failed, how to
+  # re-enable) go on the detail line so the message stays a single clear shape.
+  _tirith_warn_degraded_once \
+    "enter mode failed ($reason); now warn-only. Persistent — restart your shell, or re-enable with TIRITH_BASH_MODE=enter."
 }
 
 
@@ -499,6 +618,10 @@ _tirith_ensure_prompt_hook() {
 
 
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
+  # Explicit user override always wins. A user who exports TIRITH_BASH_MODE has
+  # made a deliberate choice; if they force `enter` in an environment where
+  # delivery is broken, the startup health gate and the pending-not-consumed
+  # detection still degrade visibly (contract invariant f) — never silently.
   _TIRITH_BASH_MODE="$TIRITH_BASH_MODE"
 elif _tirith_check_safe_mode; then
   _TIRITH_BASH_MODE="preexec"
@@ -508,8 +631,17 @@ elif _tirith_check_safe_mode; then
 elif [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" ]]; then
   # SSH PTY environments are more reliable with DEBUG-trap preexec mode.
   _TIRITH_BASH_MODE="preexec"
-else
+elif _tirith_enter_capability_proven; then
+  # Default path: enter mode is used only when the capability self-test (run by
+  # `tirith setup` / `tirith doctor`) has PROVEN, for this exact bash, that
+  # enter-mode delivery works and blocking works. See issue #111.
   _TIRITH_BASH_MODE="enter"
+else
+  # No proof that enter mode works here (cache missing, stale, or recorded a
+  # failure). Fall back to the safe default rather than risk silently eating a
+  # command. `tirith doctor` (or `tirith doctor --simulate-enter`) runs the
+  # self-test and, when enter mode works, enables it for subsequent shells.
+  _TIRITH_BASH_MODE="preexec"
 fi
 
 #
@@ -524,8 +656,14 @@ if [[ $- == *i* ]]; then
   export TIRITH_BASH_EFFECTIVE_MODE="$_TIRITH_BASH_MODE"
   if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md), a
+    # non-exported shell variable. enter mode blocks; preexec without
+    # enforcement is warn-only. A later enforcement flip or a runtime degrade
+    # updates this in place.
+    _tirith_set_status "blocks"
   else
     export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+    _tirith_set_status "warn-only"
   fi
 fi
 
@@ -554,6 +692,9 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     _TIRITH_PREEXEC_ENFORCE=1
     _tirith_enable_extdebug
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+    # Enforcement engaged: preexec now blocks, so the prompt indicator is
+    # `blocks`, not the `warn-only` exported by the startup block above.
+    _tirith_set_status "blocks"
   else
     # Same hostile-history check that triggers a runtime drift downgrade —
     # so the warn-only scan target must also flip to BASH_COMMAND, not the
@@ -561,7 +702,13 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     # produce stale DETECTED banners scanned against whatever entry
     # `history 1` happens to surface.
     _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
-    _tirith_output "tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+    # The user asked for blocking (TIRITH_BASH_PREEXEC_ENFORCE) but a hostile
+    # history config prevents it — that is a downgrade from the requested
+    # protection level, so the prompt indicator is `degraded`. Routed through
+    # the one-shot banner so the headline matches every other degrade path.
+    _tirith_set_status "degraded"
+    _tirith_warn_degraded_once \
+      "preexec enforcement could not engage (HISTCONTROL/HISTIGNORE or disabled history prevents a trustworthy whole-line view). For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
   fi
 fi
 

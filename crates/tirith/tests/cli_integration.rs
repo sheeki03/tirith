@@ -722,7 +722,10 @@ fn paste_windows_crlf_allows() {
 
 #[cfg(unix)]
 #[test]
-fn bash_hook_enter_default_outside_ssh() {
+fn bash_hook_preexec_default_outside_ssh_without_capability_cache() {
+    // Issue #111: outside SSH with no proven enter-mode capability, the hook
+    // must fall back to the safe default — preexec — not silently default into
+    // an enter mode whose `bind -x` delivery is unverified.
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -740,8 +743,43 @@ fn bash_hook_enter_default_outside_ssh() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
+        stdout, "preexec",
+        "non-SSH sessions with no capability cache must default to preexec"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_hook_enter_default_outside_ssh_with_works_capability() {
+    // Issue #111: when the capability cache proves enter-mode delivery works
+    // for this bash, the default outside SSH is enter mode.
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let cache_dir = tmpdir.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
+
+    let hook = format!(
+        "{}/assets/shell/lib/bash-hook.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let script = format!(
+        "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
+    );
+    let out = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
         stdout, "enter",
-        "non-SSH sessions should default to enter mode"
+        "a `works` capability cache must make enter the default outside SSH"
     );
 }
 
@@ -855,6 +893,29 @@ fn bash_major_version() -> Option<u32> {
     Some(major)
 }
 
+/// Body of a schema-1 bash enter-mode capability cache (issue #111) seeded with
+/// `verdict`, keyed to the `$BASH_VERSION` and `$BASH` a bare
+/// `Command::new("bash")` reports — the same bash these tests spawn. Reading
+/// both in one invocation guarantees the cache matches what the spawned hook
+/// will compare against. `tirith_version` is blank: the hook only enforces a
+/// version match when a sibling `.hooks-version` exists, and these tests source
+/// the hook from `assets/` which has none.
+#[cfg(unix)]
+fn capability_cache_body(verdict: &str) -> String {
+    let out = Command::new("bash")
+        .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
+        .output()
+        .expect("query bash identity");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let bash_version = lines.next().unwrap_or_default().trim();
+    let bash_path = lines.next().unwrap_or_default().trim();
+    format!(
+        "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+         bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn bash_hook_startup_gate_degrade_persists() {
@@ -864,6 +925,18 @@ fn bash_hook_startup_gate_degrade_persists() {
         "{}/assets/shell/lib/bash-hook.bash",
         env!("CARGO_MANIFEST_DIR")
     );
+
+    // Seed a `works` enter-mode capability verdict so the hook actually
+    // *enters* enter mode — otherwise the #111 capability gate would pick
+    // preexec directly and the startup health gate (the path under test here)
+    // would never run.
+    let cache_dir = tmpdir.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
 
     // `bash --norc --noprofile -i -c` is interactive enough for enter mode
     // to activate while skipping user config that might set
@@ -893,7 +966,8 @@ fn bash_hook_startup_gate_degrade_persists() {
         "safe-mode flag should be persisted after degrade"
     );
 
-    // Re-source in a fresh shell; the persisted flag forces preexec.
+    // Re-source in a fresh shell; the persisted safe-mode flag forces preexec
+    // even though the `works` capability cache is still present.
     let script2 = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
@@ -928,9 +1002,24 @@ fn bash_hook_runtime_delivery_failure_degrades_in_pty() {
         env!("CARGO_MANIFEST_DIR")
     );
 
+    // Seed a `works` enter-mode capability verdict so the hook enters enter
+    // mode (issue #111 — without a `works` cache the capability gate would pick
+    // preexec directly and the runtime _tirith_enter failure path under test
+    // would never run).
+    {
+        let cache_dir = tmpdir.path().join("tirith");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(
+            cache_dir.join("bash-enter-capability"),
+            capability_cache_body("works"),
+        )
+        .unwrap();
+    }
+
     // Drive the runtime _tirith_enter failure path in a real interactive
     // PTY:
-    //   1. start in enter mode (startup gate bypassed for this test),
+    //   1. start in enter mode (the `works` capability cache + a real PTY let
+    //      `bind -x` register, so the startup health gate passes),
     //   2. break PROMPT_COMMAND delivery by making it readonly without the
     //      tirith hook,
     //   3. press Enter on a command and assert the auto-degrade message
@@ -948,7 +1037,7 @@ send -- "PROMPT_COMMAND=':'; readonly PROMPT_COMMAND\r"
 expect "PROMPT> "
 send -- "echo PTY_RUNTIME_CHECK\r"
 expect {
-  -re {switching to preexec} {}
+  -re {protection downgraded} {}
   timeout { exit 2 }
 }
 send -- "\r"
@@ -961,7 +1050,6 @@ expect eof
         .args(["-c", expect_script])
         .env("HOOK_PATH", &hook)
         .env("XDG_STATE_HOME", tmpdir.path())
-        .env("_TIRITH_TEST_SKIP_HEALTH", "1")
         .env_remove("TIRITH_BASH_MODE")
         .env_remove("SSH_CONNECTION")
         .env_remove("SSH_TTY")
@@ -1036,12 +1124,18 @@ fn bash_hook_noninteractive_no_debug_trap() {
 
 #[cfg(unix)]
 #[test]
-fn bash_hook_noninteractive_mode_is_enter() {
-    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+fn bash_hook_noninteractive_mode_resolution() {
+    // Non-interactive sourcing still *resolves* a mode into `_TIRITH_BASH_MODE`
+    // even though it installs nothing (invariant g; see the no-DEBUG-trap test
+    // above). With no capability cache the resolved default is preexec (issue
+    // #111); with a `works` cache it is enter. Either way, nothing is installed.
     let hook = format!(
         "{}/assets/shell/lib/bash-hook.bash",
         env!("CARGO_MANIFEST_DIR")
     );
+
+    // No cache → preexec.
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
@@ -1052,10 +1146,32 @@ fn bash_hook_noninteractive_mode_is_enter() {
         .output()
         .expect("failed to run bash");
     assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        stdout, "enter",
-        "non-interactive enter mode: variable is set but nothing installed"
+        String::from_utf8_lossy(&out.stdout),
+        "preexec",
+        "non-interactive sourcing with no capability cache resolves to preexec"
+    );
+
+    // `works` cache → enter (still nothing installed in a non-interactive shell).
+    let tmpdir2 = tempfile::tempdir().expect("failed to create tmpdir");
+    let cache_dir = tmpdir2.path().join("tirith");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("bash-enter-capability"),
+        capability_cache_body("works"),
+    )
+    .unwrap();
+    let out2 = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env("XDG_STATE_HOME", tmpdir2.path())
+        .env_remove("_TIRITH_BASH_LOADED")
+        .output()
+        .expect("failed to run bash");
+    assert_eq!(out2.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out2.stdout),
+        "enter",
+        "non-interactive sourcing with a `works` capability cache resolves to enter"
     );
 }
 
@@ -1500,7 +1616,7 @@ expect eof
     );
 
     assert!(
-        stdout.contains("unexpected exit code") || stdout.contains("switching to preexec"),
+        stdout.contains("unexpected exit code") || stdout.contains("protection downgraded"),
         "output should mention degrade reason, got:\n{stdout}"
     );
 
@@ -1858,6 +1974,219 @@ fn warn_only_json_output_matches_plain_when_timings_stripped() {
     );
 }
 
+// --- `--offline` / `TIRITH_OFFLINE` (roadmap M0.3) -------------------------
+//
+// The offline switch suppresses the periodic background threat-DB refresh
+// that `tirith check` triggers on the hot path. The observable proof that no
+// network attempt was made is the absence of the `threatdb-spawned-at`
+// breadcrumb file — `tirith check` writes it into the state dir immediately
+// before launching the background update child, so no breadcrumb means no
+// child and no network.
+
+/// Run `tirith check` against a clean command with an isolated state dir, and
+/// return whether the background-update `spawned-at` breadcrumb was written.
+#[cfg(unix)]
+fn check_left_background_breadcrumb(
+    extra_env: &[(&str, &str)],
+    extra_args: &[&str],
+) -> (bool, i32) {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let mut args: Vec<&str> = vec!["check", "--shell", "posix"];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&["--", "ls -la"]);
+
+    let mut cmd = tirith();
+    cmd.args(&args)
+        .env("XDG_STATE_HOME", state.path())
+        // A fresh state dir has no next-check-at file, so the online path is
+        // "due" and would write the breadcrumb. Empty HOME-derived dirs are
+        // fine; only the breadcrumb presence matters.
+        .env_remove("TIRITH_OFFLINE");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run tirith check");
+    let breadcrumb = state.path().join("tirith").join("threatdb-spawned-at");
+    (breadcrumb.exists(), out.status.code().unwrap_or(-1))
+}
+
+/// `tirith check --offline` must not trigger the background threat-DB refresh:
+/// no `spawned-at` breadcrumb, and the local verdict is still correct.
+#[cfg(unix)]
+#[test]
+fn check_offline_flag_suppresses_background_update() {
+    let (breadcrumb, code) = check_left_background_breadcrumb(&[], &["--offline"]);
+    assert!(
+        !breadcrumb,
+        "--offline must suppress the background threat-DB refresh (no breadcrumb)"
+    );
+    assert_eq!(
+        code, 0,
+        "offline check of a clean command must still produce a local Allow verdict"
+    );
+}
+
+/// `TIRITH_OFFLINE=1` must have the same effect as `--offline` — this is the
+/// path the shell hooks and the PTY conformance harness use.
+#[cfg(unix)]
+#[test]
+fn check_offline_env_suppresses_background_update() {
+    let (breadcrumb, code) = check_left_background_breadcrumb(&[("TIRITH_OFFLINE", "1")], &[]);
+    assert!(
+        !breadcrumb,
+        "TIRITH_OFFLINE=1 must suppress the background threat-DB refresh (no breadcrumb)"
+    );
+    assert_eq!(code, 0, "offline check must still produce a local verdict");
+}
+
+/// A falsey `TIRITH_OFFLINE` value must NOT activate offline mode — the env
+/// var is opt-in and only truthy values count.
+#[cfg(unix)]
+#[test]
+fn check_offline_env_falsey_does_not_suppress() {
+    // `TIRITH_OFFLINE=0` is explicitly not offline. We assert the verdict is
+    // unaffected; we deliberately do not assert breadcrumb presence here,
+    // since whether the online path is "due" depends on global dedup state.
+    let (_breadcrumb, code) = check_left_background_breadcrumb(&[("TIRITH_OFFLINE", "0")], &[]);
+    assert_eq!(
+        code, 0,
+        "TIRITH_OFFLINE=0 is not offline; a clean command still exits 0"
+    );
+}
+
+/// `--approval-check` is the hook-driven path; `--offline` must compose with
+/// it so shell hooks can run fully local. The approval temp-file path is
+/// still printed on stdout and the breadcrumb is still suppressed.
+#[cfg(unix)]
+#[test]
+fn check_offline_composes_with_approval_check() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--offline",
+            "--approval-check",
+            "--",
+            "ls -la",
+        ])
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("TIRITH_OFFLINE")
+        .output()
+        .expect("failed to run tirith check");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offline approval-check of a clean command should exit 0"
+    );
+    let breadcrumb = state.path().join("tirith").join("threatdb-spawned-at");
+    assert!(
+        !breadcrumb.exists(),
+        "--offline must suppress the background refresh even on the approval-check path"
+    );
+}
+
+/// Roadmap item 23: `tirith policy init --template <name>` must write a valid
+/// policy for each curated template, and `tirith policy validate` must then
+/// pass on it. Exercises the real binary end-to-end (init → validate).
+#[test]
+fn policy_init_templates_generate_and_validate() {
+    for template in ["individual", "ci-strict", "ai-agent-heavy"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let init = tirith()
+            .args(["policy", "init", "--template", template])
+            .current_dir(dir.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("failed to run tirith policy init");
+        assert_eq!(
+            init.status.code(),
+            Some(0),
+            "policy init --template {template} should exit 0: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let policy_path = dir.path().join(".tirith/policy.yaml");
+        assert!(
+            policy_path.exists(),
+            "policy init --template {template} should write {}",
+            policy_path.display()
+        );
+
+        let validate = tirith()
+            .args(["policy", "validate"])
+            .current_dir(dir.path())
+            .env_remove("TIRITH_POLICY_ROOT")
+            .output()
+            .expect("failed to run tirith policy validate");
+        let stderr = String::from_utf8_lossy(&validate.stderr);
+        assert_eq!(
+            validate.status.code(),
+            Some(0),
+            "policy validate must pass on the {template} template: {stderr}"
+        );
+        assert!(
+            stderr.contains("valid, no issues"),
+            "policy validate on {template} template should report no issues: {stderr}"
+        );
+    }
+}
+
+/// An unrecognized `--template` name must fail fast with exit 1 and list the
+/// valid template names. `fintech` / `windows-enterprise` are deliberately
+/// deferred and must be rejected.
+#[test]
+fn policy_init_rejects_unknown_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .args(["policy", "init", "--template", "fintech"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith policy init");
+    assert_eq!(out.status.code(), Some(1), "unknown template should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown template 'fintech'"),
+        "error should name the bad template: {stderr}"
+    );
+    assert!(
+        stderr.contains("individual")
+            && stderr.contains("ci-strict")
+            && stderr.contains("ai-agent-heavy"),
+        "error should list valid templates: {stderr}"
+    );
+    assert!(
+        !dir.path().join(".tirith/policy.yaml").exists(),
+        "a rejected template must not write a policy file"
+    );
+}
+
+/// `tirith policy init` with no `--template` must keep writing the default
+/// full template — the new option must not change default behavior.
+#[test]
+fn policy_init_default_unchanged_without_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .args(["policy", "init"])
+        .current_dir(dir.path())
+        .env_remove("TIRITH_POLICY_ROOT")
+        .output()
+        .expect("failed to run tirith policy init");
+    assert_eq!(out.status.code(), Some(0), "default init should exit 0");
+
+    let body = fs::read_to_string(dir.path().join(".tirith/policy.yaml"))
+        .expect("default init should write policy.yaml");
+    // The default (full) template carries the section comments the curated
+    // templates' headers do not — a cheap discriminator that it is unchanged.
+    assert!(
+        body.contains("# Tirith security policy") && body.contains("# Paranoia level (1-4)"),
+        "default init should still write the full template: {body}"
+    );
+}
+
 /// #112: `tirith policy validate` (no --file) must locate a present-but-corrupt
 /// policy and report its error, rather than collapsing to "no policy file found"
 /// the way the old parse-aware discovery (`Policy::discover().path`) did.
@@ -1890,5 +2219,31 @@ fn policy_validate_finds_present_but_corrupt_policy() {
         out.status.code(),
         Some(1),
         "a corrupt policy is an error-level issue (exit 1)"
+    );
+}
+
+/// F3 (end-to-end): `tirith doctor --compat` must surface `TIRITH_STATUS` even
+/// for a non-bash shell. Reproduces the exact reported case —
+/// `SHELL=/bin/zsh TIRITH_STATUS=degraded tirith doctor --compat` — and asserts
+/// the protection-status line is present in the human report. Before the fix
+/// that line was printed only inside the bash-only branch and was dropped here.
+#[test]
+fn doctor_compat_surfaces_tirith_status_for_non_bash_shell() {
+    let out = tirith()
+        .args(["doctor", "--compat"])
+        .env("SHELL", "/bin/zsh")
+        .env("TIRITH_STATUS", "degraded")
+        // Keep detection from latching onto a bash mode left in the ambient env.
+        .env_remove("TIRITH_BASH_MODE")
+        .env_remove("TIRITH_BASH_EFFECTIVE_MODE")
+        .output()
+        .expect("failed to run tirith doctor --compat");
+    assert_eq!(out.status.code(), Some(0), "doctor --compat should exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("protection status:    DEGRADED"),
+        "doctor --compat must surface TIRITH_STATUS=degraded regardless of shell; \
+         got:\n{stdout}"
     );
 }

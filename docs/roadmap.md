@@ -15,7 +15,9 @@ Shipped and available in the current release line (see [CHANGELOG.md](../CHANGEL
 - **Pre-commit hook** — `.pre-commit-hooks.yaml` entry for local scanning.
 - **`tirith policy init / validate / test`** — generate a starter policy,
   validate YAML syntax and conflicts, and dry-run a command or file against the
-  active policy.
+  active policy. `tirith policy init --template <name>` offers three curated
+  starter policies — `individual`, `ci-strict`, and `ai-agent-heavy` — each a
+  well-commented, schema-valid policy.
 - **`tirith explain --rule <id>`** — detailed per-rule documentation, including
   examples and remediation, plus `--list` / `--category` filtering.
 - **`tirith scan` include/exclude/profile filters** — `--include`, `--exclude`,
@@ -31,8 +33,12 @@ In progress — the current focus is shell-integration reliability and policy
 discovery consistency.
 
 - **Shell integration reliability** — fixing hook fragility across shells and
-  versions. Tracking [#111](https://github.com/sheeki03/tirith/issues/111)
-  (bash "previous command not delivered") and
+  versions. Bash "previous command not delivered"
+  ([#111](https://github.com/sheeki03/tirith/issues/111)) is fixed: a
+  capability self-test (run by `tirith setup` / `tirith doctor`) proves whether
+  `bind -x` enter-mode delivery works for the running bash and caches the
+  verdict; the hook reads the cache and uses enter mode only where proven, else
+  falls back to preexec. Still tracking
   [#103](https://github.com/sheeki03/tirith/issues/103)
   (fish preexec/postexec functions not running).
 - **Policy discovery consistency** — `tirith policy init` writes a file that
@@ -40,22 +46,43 @@ discovery consistency.
   ([#112](https://github.com/sheeki03/tirith/issues/112)); fix is in
   [PR #113](https://github.com/sheeki03/tirith/pull/113).
 - **Doctor compatibility diagnostics** — surfacing shell/terminal compatibility
-  state more clearly in `tirith doctor`.
+  state more clearly in `tirith doctor`. `tirith doctor --simulate-enter`
+  ships: it runs the bash enter-mode delivery self-test on demand and reports
+  the verdict. `tirith doctor --compat` ships: a dedicated, static
+  shell/terminal compatibility report (human + `--format json`) covering the
+  detected shell, requested-vs-effective bash mode, install checks, and
+  best-effort detection of co-installed hook-interacting shell tools.
+- **Offline mode for the hot path** — `tirith check --offline` and the
+  `TIRITH_OFFLINE` environment variable ship: an opt-in switch that suppresses
+  the periodic background threat-DB refresh so `check` runs purely locally.
+  This is a mechanism only; the online default is unchanged.
+- **Visible degraded-protection indicator** — ships. When a shell hook
+  downgrades protection (e.g. bash enter mode → preexec warn-only), the hook
+  emits one consolidated one-shot message and sets a non-exported
+  `TIRITH_STATUS` shell variable (`blocks` / `warn-only` / `degraded` / `off`)
+  that a user can wire into their prompt; `tirith doctor` calls out a degraded
+  session explicitly. tirith adds no per-prompt output of its own.
+- **`tirith doctor` troubleshooting bundle** — `tirith doctor --bundle`
+  (aliases `--redacted-report`, `--shell-trace`) ships: a redacted diagnostic
+  bundle — doctor info, versions, shell/mode/protection, hook chain, policy
+  discovery, threat-DB status, curated environment — safe to attach to a bug
+  report.
+- **Android / Termux support** — partially landed. Termux runs on Bionic
+  libc, so the `aarch64-unknown-linux-musl` static build is the supported
+  artifact; the release workflow builds it and smoke-tests it (static-linkage
+  check plus `--version` and a block check under QEMU user emulation). Install
+  docs are in the README. Still outstanding: continuous verification on a real
+  Android device, which needs device-backed CI.
 
 ## Next
 
 Planned, not yet started.
 
-- **`tirith doctor --compat`** — a dedicated compatibility report covering the
-  current shell, terminal, and prompt/history tooling.
-- **`tirith doctor --simulate-enter`** — dry-run the bash enter-mode enforcement
-  path to detect environments where blocking cannot work, before relying on it.
 - **Capability-based compatibility matrix** — classify each shell/terminal
   combination by the capabilities tirith actually needs, rather than by name.
+  The bash enter-mode capability cache (issue #111) is the first instance.
 - **Terminal / prompt / history-tool regression tests** — automated coverage
   for the integrations that historically break hook delivery.
-- **Visible degraded-protection status indicator** — a clear, always-visible
-  signal when a session has downgraded from blocking to warn-only.
 
 ## Later
 

@@ -66,6 +66,24 @@ pub fn tirith_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
 }
 
+/// Directory containing the freshly-built `tirith` binary.
+///
+/// The bash and fish hooks shell out to `tirith` by *name* (`command tirith
+/// check …`), so the spawned shell can only find it if its directory is on
+/// `PATH`. Cargo does not add `target/<profile>/` to `PATH` for integration
+/// tests — it only exposes `CARGO_BIN_EXE_tirith` — so the harness must put it
+/// there itself (see [`PtySession::spawn`]). Without this, the hook resolves
+/// whatever `tirith` happens to be on the developer's `PATH` (an arbitrary
+/// installed version) or, on a clean CI runner, nothing at all — and a missing
+/// `tirith` makes `command tirith check` exit 127, which the enforce path
+/// treats as an unexpected failure and *blocks the command*.
+pub fn tirith_bin_dir() -> PathBuf {
+    tirith_bin()
+        .parent()
+        .expect("CARGO_BIN_EXE_tirith must have a parent directory")
+        .to_path_buf()
+}
+
 /// Locate a modern bash (>= 5).
 ///
 /// macOS ships an ancient `/bin/bash` 3.2 that lacks features the hook's
@@ -106,6 +124,28 @@ pub fn bash_major_version(path: &Path) -> Option<u32> {
     let idx = first.find(marker)?;
     let rest = &first[idx + marker.len()..];
     rest.split('.').next()?.trim().parse::<u32>().ok()
+}
+
+/// Read the full `$BASH_VERSION` string of the bash binary at `path`.
+///
+/// The bash enter-mode capability cache is keyed on the exact `$BASH_VERSION`
+/// string, so a test that seeds a cache must use the same value the running
+/// shell reports — not the `bash --version` banner, which is formatted
+/// differently.
+pub fn bash_version_string(path: &Path) -> Option<String> {
+    let out = Command::new(path)
+        .args(["-c", "printf '%s' \"$BASH_VERSION\""])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// Locate a fish shell. Returns `None` when fish is not installed.
@@ -215,6 +255,37 @@ impl IsolatedEnv {
     pub fn bash_safe_mode_flag(&self) -> PathBuf {
         self.state_home.join("tirith").join("bash-safe-mode")
     }
+
+    /// Path to the bash enter-mode capability cache for this environment.
+    pub fn bash_enter_capability_file(&self) -> PathBuf {
+        self.state_home.join("tirith").join("bash-enter-capability")
+    }
+
+    /// Seed the bash enter-mode capability cache (issue #111) with a verdict.
+    ///
+    /// `verdict` is `works` / `broken` / `inconclusive`. The hook reads this
+    /// file at startup to decide enter-vs-preexec; seeding it lets a test pin
+    /// the decision deterministically. `bash_version` must match the exact
+    /// `$BASH_VERSION`, and `bash_path` the exact `$BASH`, of the shell the test
+    /// will spawn — or the hook treats the cache as stale (itself a useful
+    /// thing to test). The harness spawns bash by absolute path, so `$BASH` is
+    /// that path; pass the same path used for [`PtySession::spawn`].
+    pub fn seed_bash_enter_capability(&self, verdict: &str, bash_version: &str, bash_path: &Path) {
+        let path = self.bash_enter_capability_file();
+        std::fs::create_dir_all(path.parent().expect("capability cache parent"))
+            .expect("pty harness: create state dir");
+        // Schema 1 mirrors `cli::bash_capability::CACHE_SCHEMA`. tirith_version
+        // is left blank: the hook only enforces a tirith-version match when a
+        // sibling `.hooks-version` file exists, and the harness sources the
+        // hook directly (no `.hooks-version`), so the check is skipped.
+        let body = format!(
+            "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+             bash_path={}\nenter_capability={verdict}\n\
+             reason=seeded by pty conformance harness\n",
+            bash_path.display()
+        );
+        std::fs::write(&path, body).expect("pty harness: write capability cache");
+    }
 }
 
 impl Default for IsolatedEnv {
@@ -305,10 +376,23 @@ impl PtySession {
         // prevents the developer's exported `_TIRITH_*` vars, bash mode,
         // SSH_* markers, etc. from leaking into the disposable shell.
         cmd.env_clear();
-        // PATH must survive so the shell can find `tirith`, coreutils, etc.
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
+        // PATH must survive so the shell can find coreutils, the shells, etc.,
+        // and — critically — the freshly-built `tirith` under test. The hooks
+        // shell out via `command tirith check …`, resolving `tirith` by name;
+        // cargo does not put `target/<profile>/` on `PATH` for integration
+        // tests, so the harness prepends the binary's directory itself. Without
+        // it the hook would resolve an arbitrary installed `tirith` (or, on a
+        // clean CI runner, nothing — `command tirith` then exits 127, which the
+        // preexec-enforce path treats as a failure and blocks the command).
+        // Prepending — not appending — guarantees the binary under test wins
+        // over any stale globally-installed copy.
+        let parent_path = std::env::var("PATH").unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            tirith_bin_dir().display().to_string()
+        } else {
+            format!("{}:{}", tirith_bin_dir().display(), parent_path)
+        };
+        cmd.env("PATH", path);
         for (k, v) in &env.env {
             cmd.env(k, v);
         }
@@ -433,6 +517,35 @@ impl PtySession {
         }
     }
 
+    /// Block until *any* of `needles` appears in cumulative output, then return
+    /// the full captured output. On timeout (or the shell exiting first) it
+    /// returns whatever was captured **without panicking** — so the caller can
+    /// assert with a domain-specific message.
+    ///
+    /// Use this — not [`PtySession::wait_idle`] — when the thing being waited
+    /// for is produced by a command whose hook shells out to `tirith`. The
+    /// `tirith` subprocess has variable latency and emits nothing until it
+    /// returns; `wait_idle` keys on terminal silence and would return *during*
+    /// that subprocess (the no-output race documented on [`wait_for_marker`]),
+    /// capturing only the keystroke echo. `expect_any` polls patiently and is
+    /// therefore robust regardless of how slow that subprocess is — including a
+    /// debug-build `tirith` on a loaded CI box.
+    pub fn expect_any(&mut self, needles: &[&str], timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if needles.iter().any(|n| self.buf.contains(n)) {
+                return self.buf.clone();
+            }
+            if Instant::now() >= deadline {
+                return self.buf.clone();
+            }
+            if self.closed && self.rx.try_recv().is_err() {
+                return self.buf.clone();
+            }
+            self.pump(Duration::from_millis(100));
+        }
+    }
+
     /// Return `true` if `needle` appears anywhere in output within `timeout`,
     /// `false` otherwise. Never panics — use to assert a marker is *absent*.
     pub fn appears_within(&mut self, needle: &str, timeout: Duration) -> bool {
@@ -532,4 +645,37 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
         rest = &rest[idx + needle.len()..];
     }
     count
+}
+
+/// Poll `marker` until it contains `needle` at least once, or `timeout`
+/// elapses. Returns the file's final contents either way.
+///
+/// ## Why this exists — the no-output race
+///
+/// [`PtySession::wait_idle`] keys on *terminal output* going quiet. That is the
+/// right "command finished" signal for a command that prints — but a
+/// side-effect-only command like `printf 'RAN\n' >> marker` writes nothing to
+/// the terminal. Worse, when tirith *allows* such a command it shells out to
+/// `tirith check`, which on an allow verdict also prints nothing. So the only
+/// terminal output is the keystroke echo: `wait_idle` sees "quiet" and returns
+/// *before* the hook has finished shelling out to `tirith` and delivered the
+/// command. The marker is then read while still empty. macOS happens to win
+/// that race; a slower Linux CI box does not (issue surfaced in #116 CI).
+///
+/// The fix is to stop inferring completion from terminal silence and instead
+/// poll the filesystem side effect directly — the marker file is the ground
+/// truth the conformance contract already relies on. This is correct by
+/// construction on any machine speed: a generous timeout, not a fixed sleep.
+pub fn wait_for_marker(marker: &Path, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let body = std::fs::read_to_string(marker).unwrap_or_default();
+        if count_occurrences(&body, needle) >= 1 {
+            return body;
+        }
+        if Instant::now() >= deadline {
+            return body;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
