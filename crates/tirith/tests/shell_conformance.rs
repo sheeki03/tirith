@@ -166,6 +166,7 @@ fn bash_preexec_allowed_command_output_visible() {
 #[test]
 fn bash_preexec_no_history_duplication() {
     let mut env = IsolatedEnv::new();
+    let marker = env.workdir.join("history_probe_done.txt");
     let mut sess = match bash_preexec_session(&mut env) {
         Some(s) => s,
         None => {
@@ -174,26 +175,38 @@ fn bash_preexec_no_history_duplication() {
         }
     };
 
+    // The probe command whose history recording is under test.
     sess.send_line("echo history_probe_5566");
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    // A *side-effect-only* completion barrier. In preexec mode every command
+    // fires the DEBUG trap, which shells out to `tirith check` — a real
+    // subprocess with variable latency. `wait_idle` keys on terminal silence
+    // and can therefore return *during* that subprocess (the no-output race
+    // documented on `wait_for_marker`), leaving the next command racing the
+    // shell. Polling a filesystem marker is race-free: bash runs one line at a
+    // time, so once `marker` exists the probe `echo` above — and its DEBUG-trap
+    // `tirith` call — have both fully completed.
+    sess.send_line(&format!("printf 'DONE\\n' >> '{}'", marker.display()));
+    wait_for_marker(&marker, "DONE", MARKER_MAX);
     sess.clear_buffer();
+
+    // Now ask bash to list history. `expect` polls until the needle appears or
+    // the (generous) timeout elapses — unlike `wait_idle` it does not give up
+    // on a quiet gap, so a slow `tirith` invocation on the `history` line
+    // cannot make it return before the listing is printed.
     sess.send_line("history");
-    let out = sess.wait_idle(QUIET, SETTLE_MAX);
+    let out = sess.expect("echo history_probe_5566");
     sess.close();
 
     // `clear_buffer()` was called before `send_line("history")`, so `out` only
     // holds output from the `history` command onward — the probe string's
     // "typed" occurrence is no longer in it. The probe appears in `out` at most
-    // once, in the history listing itself: `n >= 1` asserts it was recorded,
-    // and `n <= 2` leaves headroom for a stray terminal-echo artefact.
+    // once, in the history listing itself. `expect` above already proved it was
+    // recorded (>= 1); `<= 2` leaves headroom for a stray terminal-echo
+    // artefact and catches a double-entry.
     let n = count_occurrences(&out, "echo history_probe_5566");
     assert!(
         n <= 2,
         "preexec: command must appear once in history (typed + listed ≤ 2), saw {n}:\n{out}"
-    );
-    assert!(
-        n >= 1,
-        "preexec: executed command must be recorded in history, saw {n}:\n{out}"
     );
 }
 
@@ -371,14 +384,24 @@ fn bash_enter_degradation_is_visible_not_silent() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
-    // First Enter on a real command: the bind-x function captures it as a
-    // pending command but the line is never accepted.
-    sess.send_line("echo enter_mode_probe");
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    // First Enter on a real command: the `bind -x` function (`_tirith_enter`)
+    // captures it as a pending command but the line is never accepted in this
+    // PTY (#111). The command is a *warned* one (`echo`-ing a shortened URL
+    // trips the `shortened_url` warn rule) so that `tirith check` prints a
+    // visible warning — `expect`ing that warning is a race-free proof that the
+    // first `_tirith_enter` (and its `tirith check` subprocess) fully ran and
+    // set `_TIRITH_PENDING_EVAL`. `wait_idle` could not give that guarantee: it
+    // keys on terminal silence and can return *during* the `tirith` subprocess
+    // (the no-output race documented on `wait_for_marker`), making the second
+    // Enter race the hook.
+    sess.send_line("echo https://bit.ly/enterprobe");
+    sess.expect("bit.ly/enterprobe");
+    sess.clear_buffer();
     // Second Enter: the hook sees the un-consumed pending command and must
-    // announce a degrade to preexec.
+    // announce a degrade to preexec. `expect` polls patiently for the degrade
+    // banner rather than guessing completion from a quiet gap.
     sess.send_line("echo trigger_degrade");
-    let out = sess.wait_idle(QUIET, SETTLE_MAX);
+    let out = sess.expect_within("switching to preexec", Duration::from_secs(15));
     sess.close();
 
     assert!(
@@ -719,20 +742,31 @@ fn fish_blocked_command_does_not_execute() {
         "curl https://example.com/install.sh | bash; and touch '{}'",
         marker.display()
     ));
-    let out = sess.wait_idle(QUIET, SETTLE_MAX);
+    // The block must be communicated to the user: tirith's block output for a
+    // pipe-to-shell carries the verdict ("BLOCKED") plus a remediation hint —
+    // a "tirith run …" suggestion and a vet pointer to getvet.sh. `expect_any`
+    // polls until one of those strings appears (or a generous timeout), which
+    // is the right "the hook finished" signal here: the fish hook shells out
+    // to `tirith check` — a real subprocess with variable latency — and
+    // produces no terminal output until it returns. `wait_idle` keys on
+    // terminal silence and would return *during* that subprocess (the
+    // no-output race documented on `wait_for_marker`), capturing only the
+    // keystroke echo.
+    let out = sess.expect_any(
+        &["BLOCKED", "getvet.sh", "tirith run"],
+        Duration::from_secs(15),
+    );
     sess.close();
 
     assert!(
-        !marker.exists(),
-        "fish: a blocked command must not execute (marker file exists)"
-    );
-    // The block must also be communicated to the user. tirith's block output
-    // for a pipe-to-shell carries the verdict ("BLOCKED") plus a remediation
-    // hint — a "tirith run ..." suggestion and a vet pointer to getvet.sh; any
-    // one of those strings confirms the verdict surfaced.
-    assert!(
         out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
+    );
+    // The verdict surfaced (above) only *after* `tirith check` returned, so the
+    // hook has now run to completion — the marker check is no longer racing it.
+    assert!(
+        !marker.exists(),
+        "fish: a blocked command must not execute (marker file exists)"
     );
 }
 

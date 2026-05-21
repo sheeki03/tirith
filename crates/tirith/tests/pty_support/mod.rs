@@ -66,6 +66,24 @@ pub fn tirith_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
 }
 
+/// Directory containing the freshly-built `tirith` binary.
+///
+/// The bash and fish hooks shell out to `tirith` by *name* (`command tirith
+/// check …`), so the spawned shell can only find it if its directory is on
+/// `PATH`. Cargo does not add `target/<profile>/` to `PATH` for integration
+/// tests — it only exposes `CARGO_BIN_EXE_tirith` — so the harness must put it
+/// there itself (see [`PtySession::spawn`]). Without this, the hook resolves
+/// whatever `tirith` happens to be on the developer's `PATH` (an arbitrary
+/// installed version) or, on a clean CI runner, nothing at all — and a missing
+/// `tirith` makes `command tirith check` exit 127, which the enforce path
+/// treats as an unexpected failure and *blocks the command*.
+pub fn tirith_bin_dir() -> PathBuf {
+    tirith_bin()
+        .parent()
+        .expect("CARGO_BIN_EXE_tirith must have a parent directory")
+        .to_path_buf()
+}
+
 /// Locate a modern bash (>= 5).
 ///
 /// macOS ships an ancient `/bin/bash` 3.2 that lacks features the hook's
@@ -358,10 +376,23 @@ impl PtySession {
         // prevents the developer's exported `_TIRITH_*` vars, bash mode,
         // SSH_* markers, etc. from leaking into the disposable shell.
         cmd.env_clear();
-        // PATH must survive so the shell can find `tirith`, coreutils, etc.
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
+        // PATH must survive so the shell can find coreutils, the shells, etc.,
+        // and — critically — the freshly-built `tirith` under test. The hooks
+        // shell out via `command tirith check …`, resolving `tirith` by name;
+        // cargo does not put `target/<profile>/` on `PATH` for integration
+        // tests, so the harness prepends the binary's directory itself. Without
+        // it the hook would resolve an arbitrary installed `tirith` (or, on a
+        // clean CI runner, nothing — `command tirith` then exits 127, which the
+        // preexec-enforce path treats as a failure and blocks the command).
+        // Prepending — not appending — guarantees the binary under test wins
+        // over any stale globally-installed copy.
+        let parent_path = std::env::var("PATH").unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            tirith_bin_dir().display().to_string()
+        } else {
+            format!("{}:{}", tirith_bin_dir().display(), parent_path)
+        };
+        cmd.env("PATH", path);
         for (k, v) in &env.env {
             cmd.env(k, v);
         }
@@ -481,6 +512,35 @@ impl PtySession {
                     needle,
                     self.buf.trim_end()
                 );
+            }
+            self.pump(Duration::from_millis(100));
+        }
+    }
+
+    /// Block until *any* of `needles` appears in cumulative output, then return
+    /// the full captured output. On timeout (or the shell exiting first) it
+    /// returns whatever was captured **without panicking** — so the caller can
+    /// assert with a domain-specific message.
+    ///
+    /// Use this — not [`PtySession::wait_idle`] — when the thing being waited
+    /// for is produced by a command whose hook shells out to `tirith`. The
+    /// `tirith` subprocess has variable latency and emits nothing until it
+    /// returns; `wait_idle` keys on terminal silence and would return *during*
+    /// that subprocess (the no-output race documented on [`wait_for_marker`]),
+    /// capturing only the keystroke echo. `expect_any` polls patiently and is
+    /// therefore robust regardless of how slow that subprocess is — including a
+    /// debug-build `tirith` on a loaded CI box.
+    pub fn expect_any(&mut self, needles: &[&str], timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if needles.iter().any(|n| self.buf.contains(n)) {
+                return self.buf.clone();
+            }
+            if Instant::now() >= deadline {
+                return self.buf.clone();
+            }
+            if self.closed && self.rx.try_recv().is_err() {
+                return self.buf.clone();
             }
             self.pump(Duration::from_millis(100));
         }
