@@ -74,6 +74,12 @@ Examples:
         #[arg(long)]
         warn_only: bool,
 
+        /// Suppress all network activity on the hot path: skip the periodic
+        /// background threat-DB refresh so analysis runs purely locally.
+        /// Also honored via the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -509,6 +515,7 @@ Examples:
   tirith doctor
   tirith doctor --fix
   tirith doctor --fix --yes
+  tirith doctor --compat
   tirith doctor --simulate-enter")]
     Doctor {
         /// Output format (default: human)
@@ -541,6 +548,16 @@ Examples:
             conflicts_with = "reset_bash_safe_mode"
         )]
         simulate_enter: bool,
+        /// Print a focused shell/terminal compatibility report (supports
+        /// --format json). Mutually exclusive with --fix, --simulate-enter,
+        /// and --reset-bash-safe-mode.
+        #[arg(
+            long,
+            conflicts_with = "fix",
+            conflicts_with = "simulate_enter",
+            conflicts_with = "reset_bash_safe_mode"
+        )]
+        compat: bool,
     },
 
     /// Generate shell completions
@@ -991,6 +1008,7 @@ fn main() {
             strict_warn,
             no_daemon,
             warn_only,
+            offline,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -1004,6 +1022,7 @@ fn main() {
                 strict_warn,
                 no_daemon,
                 warn_only,
+                offline,
             )
         }
 
@@ -1319,9 +1338,10 @@ fn main() {
             fix,
             yes,
             simulate_enter,
+            compat,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::doctor::run(json, reset_bash_safe_mode, fix, yes, simulate_enter)
+            cli::doctor::run(json, reset_bash_safe_mode, fix, yes, simulate_enter, compat)
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),
