@@ -80,6 +80,12 @@ Examples:
         #[arg(long)]
         offline: bool,
 
+        /// When the command is blocked or warned, also print a concrete safer
+        /// alternative (e.g. download-then-review instead of pipe-to-shell).
+        /// Advisory only — does not change the verdict or exit code.
+        #[arg(long)]
+        suggest_safe_command: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -180,6 +186,7 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith explain --rule pipe_to_interpreter
+  tirith explain --rule curl_pipe_shell --fix
   tirith explain --list --category terminal")]
     Explain {
         /// Rule ID to explain (e.g., pipe_to_interpreter)
@@ -193,6 +200,11 @@ Examples:
         /// Filter --list by category (hostname, path, transport, terminal, command, etc.)
         #[arg(long, requires = "list")]
         category: Option<String>,
+
+        /// Show only the rule's remediation ("what to do instead").
+        /// Requires --rule; not valid with --list.
+        #[arg(long, requires = "rule", conflicts_with = "list")]
+        fix: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -1104,6 +1116,7 @@ fn main() {
             no_daemon,
             warn_only,
             offline,
+            suggest_safe_command,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -1118,6 +1131,7 @@ fn main() {
                 no_daemon,
                 warn_only,
                 offline,
+                suggest_safe_command,
             )
         }
 
@@ -1159,11 +1173,12 @@ fn main() {
             rule,
             list,
             category,
+            fix,
             format,
             json,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::explain::run(rule.as_deref(), list, category.as_deref(), json)
+            cli::explain::run(rule.as_deref(), list, category.as_deref(), fix, json)
         }
 
         Commands::Why { format, json } => {

@@ -58,6 +58,203 @@ fn check_curl_pipe_bash_shows_remediation_hint() {
     );
 }
 
+// ── item 13: remediation — `explain --fix` and `check --suggest-safe-command` ──
+
+#[test]
+fn explain_fix_shows_only_remediation() {
+    let out = tirith()
+        .args(["explain", "--rule", "curl_pipe_shell", "--fix"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Remediation"),
+        "explain --fix must print the Remediation section: {stdout}"
+    );
+    // The focused view omits the full-explain sections.
+    assert!(
+        !stdout.contains("Examples (flagged)"),
+        "explain --fix must not print the full explanation: {stdout}"
+    );
+    assert!(
+        !stdout.contains("False positives"),
+        "explain --fix must not print the false-positives section: {stdout}"
+    );
+}
+
+#[test]
+fn explain_fix_json_is_compact() {
+    let out = tirith()
+        .args([
+            "explain",
+            "--rule",
+            "insecure_tls_flags",
+            "--fix",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("explain --fix --format json");
+    assert_eq!(v["id"], "insecure_tls_flags");
+    assert!(v["remediation"].as_str().is_some_and(|s| !s.is_empty()));
+    // Compact view: no description / examples keys.
+    assert!(v.get("description").is_none());
+    assert!(v.get("examples_bad").is_none());
+}
+
+#[test]
+fn explain_fix_requires_rule() {
+    // `--fix` without `--rule` must be rejected by clap (requires = "rule").
+    let out = tirith()
+        .args(["explain", "--list", "--fix"])
+        .output()
+        .expect("failed to run tirith");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "--fix without --rule must error"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_rewrites_pipe_to_shell() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("safer alternative"),
+        "expected safe-command block: {stderr}"
+    );
+    assert!(
+        stderr.contains("curl -fsSL -o /tmp/tirith-review.sh"),
+        "expected download-to-file rewrite: {stderr}"
+    );
+    assert!(
+        stderr.contains("bash /tmp/tirith-review.sh"),
+        "expected review-then-run step: {stderr}"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_drops_insecure_tls_flag() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "curl -k https://example.com/file",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("curl https://example.com/file"),
+        "expected the -k flag dropped from the suggestion: {stderr}"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_json_embeds_suggestions() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--format",
+            "json",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --suggest-safe-command --format json");
+    let suggestions = v["safe_suggestions"]
+        .as_array()
+        .expect("safe_suggestions array present");
+    assert!(!suggestions.is_empty(), "expected at least one suggestion");
+    let s = &suggestions[0];
+    assert_eq!(s["rule_id"], "curl_pipe_shell");
+    assert!(s["safe_command"]
+        .as_str()
+        .is_some_and(|c| c.contains("/tmp/tirith-review.sh")));
+    // Findings still carry per-rule remediation independently of the flag.
+    assert!(v["findings"][0]["remediation"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn check_without_suggest_flag_omits_suggestions_but_keeps_remediation() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--format",
+            "json",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check --format json");
+    // No flag → no safe_suggestions key.
+    assert!(v.get("safe_suggestions").is_none());
+    // But per-finding remediation is always present.
+    assert!(v["findings"][0]["remediation"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn check_suggest_safe_command_allow_emits_no_suggestions() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "ls -la",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("safer alternative"),
+        "an allowed command needs no safe alternative: {stderr}"
+    );
+}
+
 #[test]
 fn check_iwr_pipe_iex_no_tirith_run_hint() {
     let out = tirith()

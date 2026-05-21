@@ -26,6 +26,16 @@ pub fn explain(id: &str) -> Option<&'static RuleExplanation> {
     RULE_EXPLANATIONS.iter().find(|r| r.id == id)
 }
 
+/// Per-rule remediation advice keyed by [`crate::verdict::RuleId`].
+///
+/// Returns the canonical "what to do instead / how to make this safe" string.
+/// `remediation_for_rule` is the build-time-generated lookup; this re-export is
+/// the stable public name. An empty string means no remediation is available
+/// (no rule currently has an empty remediation, but callers must tolerate it).
+pub fn remediation(rule_id: crate::verdict::RuleId) -> &'static str {
+    remediation_for_rule(rule_id)
+}
+
 /// All explanations in TOML definition order.
 pub fn list_all() -> &'static [RuleExplanation] {
     RULE_EXPLANATIONS
@@ -105,6 +115,43 @@ mod tests {
                 parsed.is_ok(),
                 "explanation id '{}' does not match any RuleId variant",
                 entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_remediation_for_rule_matches_explanation() {
+        // remediation_for_rule must agree with the RuleExplanation entry for
+        // every rule — both are generated from the same TOML.
+        use crate::verdict::RuleId;
+        for entry in list_all() {
+            let rule_id: RuleId =
+                serde_json::from_value(serde_json::Value::String(entry.id.to_string()))
+                    .unwrap_or_else(|_| panic!("cannot parse rule id '{}'", entry.id));
+            assert_eq!(
+                remediation(rule_id),
+                entry.remediation,
+                "remediation mismatch for {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_remediation_for_known_rule_is_nonempty() {
+        use crate::verdict::RuleId;
+        // The pipe-to-shell rules have a clear safer path — remediation must
+        // be substantive, not empty.
+        for rule in [
+            RuleId::CurlPipeShell,
+            RuleId::WgetPipeShell,
+            RuleId::PipeToInterpreter,
+            RuleId::InsecureTlsFlags,
+            RuleId::PlainHttpToSink,
+        ] {
+            assert!(
+                !remediation(rule).is_empty(),
+                "{rule:?} must have remediation advice"
             );
         }
     }

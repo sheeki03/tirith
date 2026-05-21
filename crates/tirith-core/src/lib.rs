@@ -23,6 +23,7 @@ pub mod redact;
 pub mod rule_explanations;
 pub mod rule_metadata;
 pub mod rules;
+pub mod safe_command;
 pub mod sarif;
 pub mod scan;
 pub mod session;

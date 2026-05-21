@@ -1,12 +1,13 @@
 use tirith_core::rule_explanations::{self, RuleExplanation};
 
-pub fn run(rule: Option<&str>, list: bool, category: Option<&str>, json: bool) -> i32 {
+pub fn run(rule: Option<&str>, list: bool, category: Option<&str>, fix: bool, json: bool) -> i32 {
     if list {
+        // `--fix` requires `--rule` (enforced by clap), so it never reaches here.
         return run_list(category, json);
     }
 
     match rule {
-        Some(id) => run_single(id, json),
+        Some(id) => run_single(id, fix, json),
         None => {
             eprintln!("tirith: specify --rule <id> or --list");
             1
@@ -14,7 +15,15 @@ pub fn run(rule: Option<&str>, list: bool, category: Option<&str>, json: bool) -
     }
 }
 
-fn run_single(id: &str, json: bool) -> i32 {
+/// Compact `--fix` view: just the rule's remediation.
+#[derive(serde::Serialize)]
+struct FixView<'a> {
+    id: &'a str,
+    title: &'a str,
+    remediation: &'a str,
+}
+
+fn run_single(id: &str, fix: bool, json: bool) -> i32 {
     let Some(entry) = rule_explanations::explain(id) else {
         eprintln!("tirith: unknown rule: {id}");
         if let Some(suggestion) = suggest(id) {
@@ -23,12 +32,38 @@ fn run_single(id: &str, json: bool) -> i32 {
         return 1;
     };
 
+    if fix {
+        let view = FixView {
+            id: entry.id,
+            title: entry.title,
+            remediation: entry.remediation,
+        };
+        if json {
+            print_json(&view);
+        } else {
+            print_human_fix(entry);
+        }
+        return 0;
+    }
+
     if json {
         print_json(entry);
     } else {
         print_human_single(entry);
     }
     0
+}
+
+/// `--fix` human output: the rule's remediation only.
+fn print_human_fix(e: &RuleExplanation) {
+    println!("{} — {}  [{}]", e.id, e.title, e.category);
+    println!();
+    println!("Remediation");
+    if e.remediation.is_empty() {
+        println!("  (no remediation guidance available for this rule)");
+    } else {
+        println!("  {}", e.remediation);
+    }
 }
 
 fn run_list(category: Option<&str>, json: bool) -> i32 {
