@@ -1159,7 +1159,26 @@ Examples:
     },
 }
 
+/// Process entry point. tirith's real logic runs in [`run`], on a thread with
+/// an explicit 16 MiB stack: `clap` builds and parses tirith's large command
+/// tree at startup, which is stack-heavy, and Windows' ~1 MiB default
+/// main-thread stack overflows it once the CLI grows. A generous stack keeps
+/// startup safe on every platform regardless of how the command set expands.
 fn main() {
+    let handle = std::thread::Builder::new()
+        .name("tirith-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .expect("failed to spawn tirith main thread");
+    if handle.join().is_err() {
+        // `run` panicked; the panic hook already reported it. Exit with the
+        // conventional panic code rather than re-panicking (which would print
+        // a second, confusing panic message).
+        std::process::exit(101);
+    }
+}
+
+fn run() {
     // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
     #[cfg(unix)]
     unsafe {
