@@ -217,6 +217,37 @@ fn write_probe_hook(dir: &Path) -> std::io::Result<PathBuf> {
 // PTY probe
 // ---------------------------------------------------------------------------
 
+/// `PATH` for the probe's disposable shell, with the *running* tirith binary's
+/// directory prepended to the ambient `PATH`.
+///
+/// The probe sources the real bash hook, and the hook shells out via `command
+/// tirith check`, resolving `tirith` *by name* from the spawned shell's `PATH`.
+/// If the running tirith was invoked by an absolute path or as
+/// `target/debug/tirith` — a directory that is not on `PATH` — the spawned
+/// shell would otherwise resolve `tirith` to whatever stale copy happens to be
+/// installed, or to nothing at all (`command tirith` then exits 127, which the
+/// probe reads as a false `Broken`). Prepending the directory of
+/// [`std::env::current_exe()`] makes the hook's `command tirith` resolve to the
+/// tirith currently running this probe — the binary whose hook is being
+/// validated — and *prepending* (not appending) guarantees it wins over any
+/// stale globally-installed copy. This mirrors `tests/pty_support` exactly.
+///
+/// `std::env::current_exe()` is the right call here — `CARGO_BIN_EXE_tirith` is
+/// a cargo *test*-time variable and is absent from a shipped binary. If
+/// `current_exe()` errors, or it has no parent directory, fall back gracefully
+/// to the ambient `PATH` rather than panicking.
+fn probe_path() -> String {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    match exe_dir {
+        Some(dir) if ambient.is_empty() => dir.display().to_string(),
+        Some(dir) => format!("{}:{}", dir.display(), ambient),
+        None => ambient,
+    }
+}
+
 /// A minimal PTY-driven shell session, just enough for the two-phase probe.
 struct ProbeSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -247,9 +278,7 @@ impl ProbeSession {
             cmd.arg(a);
         }
         cmd.env_clear();
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
+        cmd.env("PATH", probe_path());
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -928,6 +957,46 @@ mod tests {
         );
         // Spaces are covered by the surrounding quotes.
         assert_eq!(posix_quote(Path::new("/a b/c")), "'/a b/c'");
+    }
+
+    #[test]
+    fn probe_path_prepends_running_exe_directory() {
+        // The probe's spawned shell resolves the hook's `command tirith` by
+        // name from this `PATH`. It MUST therefore lead with the directory of
+        // the *currently-running* tirith binary, so the hook finds the binary
+        // under test rather than a stale installed copy (or nothing). This is
+        // the F1 fix: a missing/wrong `tirith` on the ambient `PATH` would
+        // otherwise make `command tirith` exit 127 → a false `Broken`.
+        let path = probe_path();
+        let exe_dir = std::env::current_exe()
+            .expect("current_exe must resolve in the test runner")
+            .parent()
+            .expect("the test binary has a parent directory")
+            .display()
+            .to_string();
+
+        assert!(
+            path.starts_with(&exe_dir),
+            "probe PATH must START with the running exe's directory \
+             (so it wins over any stale installed tirith); exe_dir={exe_dir:?}, path={path:?}"
+        );
+        // The running exe's directory must be a PATH *entry*, not just a
+        // substring of some longer component.
+        assert!(
+            path.split(':').any(|seg| seg == exe_dir),
+            "the running exe's directory must be a discrete PATH entry; path={path:?}"
+        );
+        // The ambient PATH must still be present (the shell needs coreutils,
+        // bash, etc.) — prepended, never replaced.
+        if let Ok(ambient) = std::env::var("PATH") {
+            if !ambient.is_empty() {
+                assert!(
+                    path.ends_with(&ambient),
+                    "the ambient PATH must be preserved after the prepended dir; \
+                     ambient={ambient:?}, path={path:?}"
+                );
+            }
+        }
     }
 
     #[test]

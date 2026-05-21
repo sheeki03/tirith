@@ -2221,3 +2221,29 @@ fn policy_validate_finds_present_but_corrupt_policy() {
         "a corrupt policy is an error-level issue (exit 1)"
     );
 }
+
+/// F3 (end-to-end): `tirith doctor --compat` must surface `TIRITH_STATUS` even
+/// for a non-bash shell. Reproduces the exact reported case —
+/// `SHELL=/bin/zsh TIRITH_STATUS=degraded tirith doctor --compat` — and asserts
+/// the protection-status line is present in the human report. Before the fix
+/// that line was printed only inside the bash-only branch and was dropped here.
+#[test]
+fn doctor_compat_surfaces_tirith_status_for_non_bash_shell() {
+    let out = tirith()
+        .args(["doctor", "--compat"])
+        .env("SHELL", "/bin/zsh")
+        .env("TIRITH_STATUS", "degraded")
+        // Keep detection from latching onto a bash mode left in the ambient env.
+        .env_remove("TIRITH_BASH_MODE")
+        .env_remove("TIRITH_BASH_EFFECTIVE_MODE")
+        .output()
+        .expect("failed to run tirith doctor --compat");
+    assert_eq!(out.status.code(), Some(0), "doctor --compat should exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("protection status:    DEGRADED"),
+        "doctor --compat must surface TIRITH_STATUS=degraded regardless of shell; \
+         got:\n{stdout}"
+    );
+}

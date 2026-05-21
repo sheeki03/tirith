@@ -1400,6 +1400,42 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     redact_home_path(&out, home)
 }
 
+/// Write `text` to a freshly-created, randomly-named bundle file in `dir` and
+/// return the path it landed at.
+///
+/// The filename is *random*, not a predictable `tirith-bundle-<timestamp>`:
+/// `tempfile::Builder` creates the file with `O_EXCL`, so an attacker cannot
+/// pre-create the path as a symlink and redirect the write, and two runs in the
+/// same second cannot collide or clobber. The `tirith-bundle-` prefix is purely
+/// cosmetic — the security comes entirely from the random suffix and the
+/// exclusive create. On Unix the file handle is chmod'd to `0600` *before* the
+/// content is written, so the redacted-but-still-diagnostic bundle is never
+/// even briefly world-readable. `keep()` persists the temp file at its existing
+/// random path (it is deliberately NOT `persist()`ed onto a predictable name —
+/// that would reintroduce the symlink/TOCTOU hole). Mirrors the safe-write
+/// style of `bash_capability::write_cache`.
+fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathBuf> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tirith-bundle-")
+        .suffix(".txt")
+        .tempfile_in(dir)?;
+    // Tighten permissions on the open handle before writing any content, so the
+    // bundle is never momentarily readable by other users.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    use std::io::Write;
+    tmp.write_all(text.as_bytes())?;
+    tmp.flush()?;
+    // `keep()` disarms the auto-delete and hands back the file's *current*
+    // (random) path — exactly what we print. No rename onto a guessable name.
+    let (_file, path) = tmp.keep().map_err(|e| e.error)?;
+    Ok(path)
+}
+
 /// `tirith doctor --bundle`: write the redacted diagnostic bundle to a file
 /// and print its path. With `--format json`, prints `{"bundle_path": "..."}`.
 fn run_bundle(json: bool) -> i32 {
@@ -1413,20 +1449,14 @@ fn run_bundle(json: bool) -> i32 {
         eprintln!("tirith: could not create {}: {e}", dir.display());
         return 1;
     }
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let path = dir.join(format!("tirith-bundle-{stamp}.txt"));
 
-    if let Err(e) = std::fs::write(&path, &text) {
-        eprintln!("tirith: could not write bundle to {}: {e}", path.display());
-        return 1;
-    }
-    // Best-effort: tighten permissions on Unix — the bundle is redacted, but a
-    // diagnostic file still need not be world-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    let path = match write_bundle_file(&dir, &text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("tirith: could not write bundle into {}: {e}", dir.display());
+            return 1;
+        }
+    };
 
     if json {
         // The path itself can contain the home dir; redact it the same way the
@@ -1450,78 +1480,106 @@ fn run_bundle(json: bool) -> i32 {
     0
 }
 
-fn print_compat_human(r: &CompatReport) {
-    println!("tirith compatibility report");
-    println!();
-    println!("tirith {}", r.version);
-    println!("  binary:        {}", r.binary_path);
-    println!("  shell:         {}", r.detected_shell);
-    println!("  interactive:   {}", r.interactive);
-    println!();
+/// The `protection status:` line for `tirith doctor --compat`, derived from the
+/// hook-exported `TIRITH_STATUS` value. `None` when the line should be omitted.
+///
+/// `TIRITH_STATUS` is exported by *every* tirith shell hook — bash, zsh, fish,
+/// PowerShell, nushell — so this status MUST be surfaced regardless of the
+/// detected shell. It was previously printed only inside the bash-only branch,
+/// which silently dropped it for, e.g., a zsh session with
+/// `TIRITH_STATUS=degraded`. A `degraded` status gets an explicit callout; an
+/// unset variable yields `None` (the rest of the report still indicates the
+/// hook was not loaded).
+fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
+    match status {
+        Some("degraded") => Some(
+            "  protection status:    DEGRADED (downgraded to warn-only this session)".to_string(),
+        ),
+        Some(status) => Some(format!("  protection status:    {status}")),
+        None => None,
+    }
+}
+
+/// Render the full `tirith doctor --compat` human report into a string.
+///
+/// Returning a `String` (rather than printing directly) keeps the report
+/// unit-testable — in particular the F3 property that `TIRITH_STATUS` is
+/// surfaced for *non-bash* shells, which a stdout-only function could not be
+/// asserted on without process plumbing.
+fn format_compat_human(r: &CompatReport) -> String {
+    let mut out = String::new();
+    let mut line = |s: &str| {
+        out.push_str(s);
+        out.push('\n');
+    };
+
+    line("tirith compatibility report");
+    line("");
+    line(&format!("tirith {}", r.version));
+    line(&format!("  binary:        {}", r.binary_path));
+    line(&format!("  shell:         {}", r.detected_shell));
+    line(&format!("  interactive:   {}", r.interactive));
+    line("");
 
     // Shell mode / protection. Bash is the only shell with a requested-vs-
     // effective split today; for other shells we just report what (if
     // anything) the hook exported into this process.
-    println!("Shell hook mode");
+    line("Shell hook mode");
+    // Live cross-shell protection status, from the hook-exported
+    // `TIRITH_STATUS`. Emitted unconditionally — every shell's hook exports it,
+    // so it must not be gated behind the bash-only branch below.
+    if let Some(status_line) = compat_protection_status_line(r.tirith_status.as_deref()) {
+        line(&status_line);
+    }
     if r.detected_shell == "bash"
         || r.bash_requested_mode.is_some()
         || r.bash_effective_mode.is_some()
     {
         let requested = r.bash_requested_mode.as_deref().unwrap_or("(default)");
-        println!("  requested bash mode:  {requested}");
+        line(&format!("  requested bash mode:  {requested}"));
         match (
             r.bash_effective_mode.as_deref(),
             r.bash_effective_protection.as_deref(),
         ) {
             (Some(mode), Some(protection)) => {
-                println!("  effective bash mode:  {mode}");
-                println!("  effective protection: {protection}");
+                line(&format!("  effective bash mode:  {mode}"));
+                line(&format!("  effective protection: {protection}"));
             }
             _ => {
-                println!("  effective bash mode:  hook not loaded in this process");
+                line("  effective bash mode:  hook not loaded in this process");
             }
-        }
-        // Live cross-shell protection status. A degraded session is the one
-        // state worth shouting about — call it out, do not let the reader
-        // infer it from `effective protection: warn-only`.
-        match r.tirith_status.as_deref() {
-            Some("degraded") => {
-                println!("  protection status:    DEGRADED (downgraded to warn-only this session)");
-            }
-            Some(status) => {
-                println!("  protection status:    {status}");
-            }
-            None => {}
         }
         match r.bash_enter_capability.as_deref() {
             Some(verdict) => {
                 let fresh = r.bash_enter_capability_fresh.unwrap_or(false);
                 if fresh {
-                    println!("  enter capability:     {verdict} (self-test verdict)");
+                    line(&format!(
+                        "  enter capability:     {verdict} (self-test verdict)"
+                    ));
                 } else {
-                    println!(
+                    line(&format!(
                         "  enter capability:     {verdict} (STALE — measured on a different bash)"
-                    );
+                    ));
                 }
             }
             None => {
-                println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+                line("  enter capability:     not tested — run tirith doctor --simulate-enter");
             }
         }
-        println!(
+        line(&format!(
             "  bash safe mode:       {}",
             if r.bash_safe_mode { "on" } else { "off" }
-        );
+        ));
     } else {
-        println!(
+        line(&format!(
             "  (no bash-specific mode state — detected shell is {})",
             r.detected_shell
-        );
+        ));
     }
-    println!();
+    line("");
 
     // Install checks.
-    println!("Install checks");
+    line("Install checks");
     let shadow_status = if r.shadow_binaries.is_empty() {
         "no shadowing tirith binaries on PATH".to_string()
     } else {
@@ -1530,26 +1588,26 @@ fn print_compat_human(r: &CompatReport) {
             r.shadow_binaries.len()
         )
     };
-    println!("  PATH shadowing:       {shadow_status}");
+    line(&format!("  PATH shadowing:       {shadow_status}"));
     for shadow in &r.shadow_binaries {
-        println!("    - {shadow}");
+        line(&format!("    - {shadow}"));
     }
-    println!(
+    line(&format!(
         "  shell profile:        {}",
         r.shell_profile.as_deref().unwrap_or("not found")
-    );
-    println!(
+    ));
+    line(&format!(
         "  profile wiring:       {}",
         if r.hook_configured {
             "tirith hook configured"
         } else {
             "NOT configured — commands are not intercepted"
         }
-    );
-    println!(
+    ));
+    line(&format!(
         "  hook dir:             {}",
         r.hook_dir.as_deref().unwrap_or("not found")
-    );
+    ));
     let hook_freshness = if !r.hooks_materialized {
         "system/packaged hooks (not materialized)"
     } else if r.hooks_stale {
@@ -1557,51 +1615,51 @@ fn print_compat_human(r: &CompatReport) {
     } else {
         "materialized, up to date"
     };
-    println!("  materialized hooks:   {hook_freshness}");
+    line(&format!("  materialized hooks:   {hook_freshness}"));
     if r.policy_paths.is_empty() {
-        println!("  policy discovery:     no policy found (built-in defaults apply)");
+        line("  policy discovery:     no policy found (built-in defaults apply)");
     } else {
         for (i, p) in r.policy_paths.iter().enumerate() {
             if i == 0 {
-                println!("  policy discovery:     {p}");
+                line(&format!("  policy discovery:     {p}"));
             } else {
-                println!("                        {p}");
+                line(&format!("                        {p}"));
             }
         }
     }
     match &r.threat_db {
         Some(tdb) if !tdb.installed => {
-            println!("  threat DB:            not installed");
+            line("  threat DB:            not installed");
         }
         Some(tdb) if tdb.error.is_some() => {
-            println!(
+            line(&format!(
                 "  threat DB:            error: {}",
                 tdb.error.as_deref().unwrap_or("unknown")
-            );
+            ));
         }
         Some(tdb) if tdb.signature_valid == Some(false) => {
-            println!("  threat DB:            invalid signature");
+            line("  threat DB:            invalid signature");
         }
         Some(tdb) if tdb.stale => {
-            println!("  threat DB:            installed but stale");
+            line("  threat DB:            installed but stale");
         }
         Some(_) => {
-            println!("  threat DB:            installed, current");
+            line("  threat DB:            installed, current");
         }
         None => {
-            println!("  threat DB:            not available");
+            line("  threat DB:            not available");
         }
     }
-    println!();
+    line("");
 
     // Conflict detection — honest about being best-effort.
-    println!("Shell tool detection");
+    line("Shell tool detection");
     if r.shell_tools.is_empty() {
-        println!("  no known hook-interacting shell tools detected");
+        line("  no known hook-interacting shell tools detected");
     } else {
-        println!("  detected co-installed shell tools that interact with shell hooks.");
-        println!("  presence does not necessarily mean a conflict — tirith's hooks are");
-        println!("  designed to coexist. Listed for awareness:");
+        line("  detected co-installed shell tools that interact with shell hooks.");
+        line("  presence does not necessarily mean a conflict — tirith's hooks are");
+        line("  designed to coexist. Listed for awareness:");
         for tool in &r.shell_tools {
             let signals = match (tool.on_path, tool.in_profile) {
                 (true, true) => "on PATH, in shell profile",
@@ -1609,10 +1667,16 @@ fn print_compat_human(r: &CompatReport) {
                 (false, true) => "in shell profile",
                 (false, false) => "detected",
             };
-            println!("    - {} ({})", tool.name, signals);
-            println!("        {}", tool.note);
+            line(&format!("    - {} ({})", tool.name, signals));
+            line(&format!("        {}", tool.note));
         }
     }
+
+    out
+}
+
+fn print_compat_human(r: &CompatReport) {
+    print!("{}", format_compat_human(r));
 }
 
 /// Render the cross-shell `protection status:` line from the hook-exported
@@ -2729,6 +2793,199 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// True when `name` has the predictable `tirith-bundle-<UTC-timestamp>.txt`
+    /// shape the F2 fix eliminates — `tirith-bundle-` + `YYYYMMDDTHHMMSSZ` (8
+    /// digits, `T`, 6 digits, `Z`) + `.txt`. The new code must NOT produce a
+    /// name of this form; it uses a random `tempfile` suffix instead.
+    fn is_predictable_timestamp_bundle_name(name: &str) -> bool {
+        let Some(mid) = name
+            .strip_prefix("tirith-bundle-")
+            .and_then(|s| s.strip_suffix(".txt"))
+        else {
+            return false;
+        };
+        let bytes = mid.as_bytes();
+        // YYYYMMDD (8) + 'T' + HHMMSS (6) + 'Z' == 16 chars exactly.
+        bytes.len() == 16
+            && bytes[..8].iter().all(u8::is_ascii_digit)
+            && bytes[8] == b'T'
+            && bytes[9..15].iter().all(u8::is_ascii_digit)
+            && bytes[15] == b'Z'
+    }
+
+    #[test]
+    fn is_predictable_timestamp_bundle_name_recognises_the_old_format() {
+        // Sanity-check the matcher itself so the F2 test below cannot pass
+        // vacuously: the OLD predictable name must be recognised, a random one
+        // must not.
+        assert!(is_predictable_timestamp_bundle_name(
+            "tirith-bundle-20260522T143000Z.txt"
+        ));
+        assert!(!is_predictable_timestamp_bundle_name(
+            "tirith-bundle-a9Xk2Q.txt"
+        ));
+        assert!(!is_predictable_timestamp_bundle_name("tirith-bundle-.txt"));
+        assert!(!is_predictable_timestamp_bundle_name("unrelated.txt"));
+    }
+
+    /// F2: the diagnostic bundle must be written to a *random*, non-predictable
+    /// path (no symlink/TOCTOU hole) and the file must be mode `0600`.
+    #[test]
+    fn write_bundle_file_uses_a_random_name_and_tight_mode() {
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let body = "tirith diagnostic bundle\n== end of bundle ==\n";
+
+        let path = write_bundle_file(dir.path(), body).expect("bundle write");
+
+        // The file exists, is inside the requested dir, and round-trips.
+        assert!(path.exists(), "bundle file must exist after the write");
+        assert_eq!(
+            path.parent(),
+            Some(dir.path()),
+            "bundle must land in the requested directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read bundle"),
+            body,
+            "bundle content must round-trip"
+        );
+
+        // The filename must NOT be the predictable timestamp form — that
+        // predictable path is exactly the symlink/TOCTOU hole F2 closes.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("bundle file name");
+        assert!(
+            !is_predictable_timestamp_bundle_name(name),
+            "bundle filename {name:?} must not be the predictable \
+             tirith-bundle-<timestamp>.txt form"
+        );
+        // A random tempfile name keeps the cosmetic prefix + .txt suffix.
+        assert!(
+            name.starts_with("tirith-bundle-") && name.ends_with(".txt"),
+            "bundle name {name:?} should keep the tirith-bundle- prefix and .txt suffix"
+        );
+
+        // Two writes in the same dir must not collide — the random suffix and
+        // O_EXCL create guarantee distinct files.
+        let path2 = write_bundle_file(dir.path(), body).expect("second bundle write");
+        assert_ne!(
+            path, path2,
+            "consecutive bundle writes must produce distinct random paths"
+        );
+
+        // On Unix the file must be mode 0600 — the bundle is redacted but a
+        // diagnostic file still must not be group/world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("bundle metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "bundle file must be mode 0600, got {mode:o}");
+        }
+    }
+
+    /// Build a minimal `CompatReport` for the given shell and `TIRITH_STATUS`,
+    /// with every other field at a benign default. Used by the F3 tests.
+    fn compat_report_for(detected_shell: &str, tirith_status: Option<&str>) -> CompatReport {
+        CompatReport {
+            version: "0.0.0-test".to_string(),
+            binary_path: "/tmp/tirith".to_string(),
+            detected_shell: detected_shell.to_string(),
+            interactive: false,
+            bash_requested_mode: None,
+            bash_effective_mode: None,
+            bash_effective_protection: None,
+            tirith_status: tirith_status.map(str::to_string),
+            bash_enter_capability: None,
+            bash_enter_capability_fresh: None,
+            bash_safe_mode: false,
+            hook_dir: None,
+            hooks_materialized: false,
+            hooks_stale: false,
+            shell_profile: None,
+            hook_configured: false,
+            shadow_binaries: Vec::new(),
+            policy_paths: Vec::new(),
+            threat_db: None,
+            shell_tools: Vec::new(),
+        }
+    }
+
+    /// F3: `tirith doctor --compat` must surface `TIRITH_STATUS` for a
+    /// **non-bash** shell. The status line was previously printed only inside
+    /// the bash-only branch, so a `SHELL=/bin/zsh TIRITH_STATUS=degraded`
+    /// invocation silently dropped it. `TIRITH_STATUS` is exported by the zsh,
+    /// fish, and PowerShell hooks too, so the line must not be bash-gated.
+    #[test]
+    fn compat_human_surfaces_tirith_status_for_non_bash_shell() {
+        for shell in ["zsh", "fish", "powershell", "nushell"] {
+            let report = compat_report_for(shell, Some("degraded"));
+            let out = format_compat_human(&report);
+            assert!(
+                out.contains("protection status:    DEGRADED"),
+                "TIRITH_STATUS=degraded must be surfaced for a non-bash shell ({shell}); \
+                 got:\n{out}"
+            );
+            // The bash-only block must NOT have run for a non-bash shell with
+            // no bash env — the status line is the *only* protection signal.
+            assert!(
+                out.contains(&format!(
+                    "no bash-specific mode state — detected shell is {shell}"
+                )),
+                "a non-bash shell with no bash env must take the non-bash branch ({shell}); \
+                 got:\n{out}"
+            );
+        }
+    }
+
+    /// A plain (non-degraded) status is surfaced verbatim for a non-bash shell.
+    #[test]
+    fn compat_human_surfaces_plain_status_for_non_bash_shell() {
+        let report = compat_report_for("zsh", Some("warn-only"));
+        let out = format_compat_human(&report);
+        assert!(
+            out.contains("protection status:    warn-only"),
+            "a non-degraded TIRITH_STATUS must still be surfaced for zsh; got:\n{out}"
+        );
+    }
+
+    /// When `TIRITH_STATUS` is unset the compat report stays correct: no
+    /// `protection status:` line, and no panic / stray formatting.
+    #[test]
+    fn compat_human_omits_status_line_when_unset() {
+        let report = compat_report_for("zsh", None);
+        let out = format_compat_human(&report);
+        assert!(
+            !out.contains("protection status:"),
+            "no protection-status line should appear when TIRITH_STATUS is unset; got:\n{out}"
+        );
+        // The report is still well-formed and reaches the install-checks block.
+        assert!(
+            out.contains("Install checks"),
+            "report must be complete; got:\n{out}"
+        );
+    }
+
+    /// `compat_protection_status_line` is shell-independent by construction —
+    /// it never consults a shell. This pins the F3 fix at the unit level.
+    #[test]
+    fn compat_protection_status_line_is_shell_independent() {
+        assert_eq!(
+            compat_protection_status_line(Some("degraded")).as_deref(),
+            Some("  protection status:    DEGRADED (downgraded to warn-only this session)")
+        );
+        assert_eq!(
+            compat_protection_status_line(Some("blocks")).as_deref(),
+            Some("  protection status:    blocks")
+        );
+        assert_eq!(compat_protection_status_line(None), None);
     }
 
     #[test]
