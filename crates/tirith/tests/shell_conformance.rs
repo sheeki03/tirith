@@ -399,13 +399,14 @@ fn bash_enter_degradation_is_visible_not_silent() {
     sess.clear_buffer();
     // Second Enter: the hook sees the un-consumed pending command and must
     // announce a degrade to preexec. `expect` polls patiently for the degrade
-    // banner rather than guessing completion from a quiet gap.
+    // banner rather than guessing completion from a quiet gap. The banner is
+    // the consolidated one-shot "protection downgraded to warn-only" headline.
     sess.send_line("echo trigger_degrade");
-    let out = sess.expect_within("switching to preexec", Duration::from_secs(15));
+    let out = sess.expect_within("protection downgraded", Duration::from_secs(15));
     sess.close();
 
     assert!(
-        out.contains("switching to preexec") || out.contains("enter mode failed"),
+        out.contains("protection downgraded to warn-only") || out.contains("enter mode failed"),
         "enter mode losing delivery must print a visible degrade message, got:\n{out}"
     );
     // A visible degrade must also be a *persisted* one, so the next shell

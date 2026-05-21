@@ -6,6 +6,14 @@
 if not ('_TIRITH_NU_LOADED' in $env) {
     $env._TIRITH_NU_LOADED = true
 
+    # TIRITH_STATUS: a small public contract a user can reference in their
+    # prompt (PROMPT_COMMAND / PROMPT_COMMAND_RIGHT) to surface tirith's live
+    # protection level (see docs/prompt-status.md). tirith prints NOTHING
+    # per-prompt — it only exports the variable; wiring it in is opt-in.
+    # Nushell's pre_execution hook cannot abort a command, so the protection
+    # level is always `warn-only`.
+    $env.TIRITH_STATUS = "warn-only"
+
     # Defensively initialize pre_execution if absent/null (fresh configs may lack it)
     let existing = ($env.config.hooks.pre_execution? | default [])
 

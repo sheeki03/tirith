@@ -348,6 +348,37 @@ _tirith_install_debug_trap() {
   trap '_tirith_debug_trampoline' DEBUG
 }
 
+# --- Protection-status export + one-shot degrade banner --------------------
+#
+# `TIRITH_STATUS` is a small public contract a user can reference in their PS1
+# to surface tirith's live protection level in their prompt. tirith itself
+# prints NOTHING per-prompt — it only exports the variable; wiring it into a
+# prompt is opt-in (see docs/prompt-status.md). Values:
+#   blocks     enter mode (or enforced preexec) — a blocked command is stopped
+#   warn-only  preexec warn-only — commands are observed but not blocked
+#   degraded   protection was DOWNGRADED mid-session from a stronger level
+#   off        the hook installed nothing (non-interactive shells never export)
+#
+# `degraded` is deliberately distinct from `warn-only`: a shell that simply
+# *starts* in preexec warn-only is `warn-only`, but a shell that *loses* a
+# stronger guarantee at runtime is `degraded` — a state the user should notice.
+_tirith_export_status() {
+  export TIRITH_STATUS="$1"
+}
+
+# Emit the one-time degraded-protection warning. Fires at most once per shell
+# session (guarded by `_TIRITH_DEGRADE_WARNED`), is interactive-only, and is
+# deliberately terse — a single consolidated message, never naggy. The optional
+# `$1` is an extra detail line appended under the headline.
+_tirith_warn_degraded_once() {
+  [[ -n "${_TIRITH_DEGRADE_WARNED:-}" ]] && return 0
+  _TIRITH_DEGRADE_WARNED=1
+  [[ $- == *i* ]] || return 0
+  _tirith_output "tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details"
+  [[ -n "${1:-}" ]] && _tirith_output "  $1"
+  return 0
+}
+
 # Cache-then-degrade: flip the session to warn-only mode and re-export the
 # effective protection string so a subsequent `tirith doctor` sees the truth.
 # Callers that already know a history index should pin the cache BEFORE
@@ -359,9 +390,9 @@ _tirith_session_degrade_to_warn_only() {
   _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
   _TIRITH_PREEXEC_WARNED=1   # suppress the generic warn-only banner
   export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
-  if [[ $- == *i* ]]; then
-    _tirith_output "$reason"
-  fi
+  _tirith_export_status "degraded"
+  # One consolidated headline, then the path-specific reason as the detail line.
+  _tirith_warn_degraded_once "$reason"
 }
 
 
@@ -496,11 +527,6 @@ _tirith_preexec() {
 
 _tirith_degrade_to_preexec() {
   local reason="${1:-unknown}"
-  # Only print warnings in interactive shells
-  if [[ $- == *i* ]]; then
-    _tirith_output "tirith: enter mode failed ($reason) — switching to preexec"
-    _tirith_output "  Persistent. Re-enable: TIRITH_BASH_MODE=enter"
-  fi
 
   # Safe deterministic degrade: set known-safe defaults for current session.
   # Custom bindings from .inputrc/.bashrc return on next shell (safe mode persisted,
@@ -524,8 +550,13 @@ _tirith_degrade_to_preexec() {
     # shells that START in preexec).
     export TIRITH_BASH_EFFECTIVE_MODE="preexec"
     export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
-    _tirith_output "  Restart your shell for full custom keybindings to return."
+    _tirith_export_status "degraded"
   fi
+  # One consolidated, one-shot degraded-protection banner — same wording as
+  # every other degrade path. The enter-mode specifics (what failed, how to
+  # re-enable) go on the detail line so the message stays a single clear shape.
+  _tirith_warn_degraded_once \
+    "enter mode failed ($reason); now warn-only. Persistent — restart your shell, or re-enable with TIRITH_BASH_MODE=enter."
 }
 
 
@@ -616,8 +647,13 @@ if [[ $- == *i* ]]; then
   export TIRITH_BASH_EFFECTIVE_MODE="$_TIRITH_BASH_MODE"
   if [[ "$_TIRITH_BASH_MODE" == "enter" ]]; then
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md).
+    # enter mode blocks; preexec without enforcement is warn-only. A later
+    # enforcement flip or a runtime degrade re-exports this.
+    _tirith_export_status "blocks"
   else
     export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+    _tirith_export_status "warn-only"
   fi
 fi
 
@@ -646,6 +682,9 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     _TIRITH_PREEXEC_ENFORCE=1
     _tirith_enable_extdebug
     export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+    # Enforcement engaged: preexec now blocks, so the prompt indicator is
+    # `blocks`, not the `warn-only` exported by the startup block above.
+    _tirith_export_status "blocks"
   else
     # Same hostile-history check that triggers a runtime drift downgrade —
     # so the warn-only scan target must also flip to BASH_COMMAND, not the
@@ -653,7 +692,13 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     # produce stale DETECTED banners scanned against whatever entry
     # `history 1` happens to surface.
     _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
-    _tirith_output "tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+    # The user asked for blocking (TIRITH_BASH_PREEXEC_ENFORCE) but a hostile
+    # history config prevents it — that is a downgrade from the requested
+    # protection level, so the prompt indicator is `degraded`. Routed through
+    # the one-shot banner so the headline matches every other degrade path.
+    _tirith_export_status "degraded"
+    _tirith_warn_degraded_once \
+      "preexec enforcement could not engage (HISTCONTROL/HISTIGNORE or disabled history prevents a trustworthy whole-line view). For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
   fi
 fi
 

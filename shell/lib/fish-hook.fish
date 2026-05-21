@@ -327,3 +327,15 @@ function fish_user_key_bindings
     end
     _tirith_bind_enter
 end
+
+# TIRITH_STATUS: a small public contract a user can reference in their prompt
+# (fish_prompt / fish_right_prompt) to surface tirith's live protection level
+# (see docs/prompt-status.md). tirith prints NOTHING per-prompt — it only
+# exports the variable; wiring it into a prompt is opt-in. The fish hook binds
+# Enter to a check that can discard a blocked command, so its protection level
+# is always `blocks`; fish has no runtime-degrade path. Interactive-only, so a
+# non-interactive `source` (a script, `fish -c`) leaks no status var —
+# conformance invariant (g).
+if status is-interactive
+    set -gx TIRITH_STATUS blocks
+end

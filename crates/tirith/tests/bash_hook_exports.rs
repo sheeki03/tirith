@@ -88,9 +88,10 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
     // emitted even if enter mode installs a `bind -x` Enter override.
     let script = format!(
         "{prelude}source '{hook}' 2>/dev/null; \
-         printf 'MODE=%s\\nPROT=%s\\n' \
+         printf 'MODE=%s\\nPROT=%s\\nSTATUS=%s\\n' \
            \"${{TIRITH_BASH_EFFECTIVE_MODE:-}}\" \
-           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
+           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\" \
+           \"${{TIRITH_STATUS:-}}\""
     );
 
     // Start from a minimal env so user shell config cannot influence results.
@@ -196,9 +197,10 @@ fn hook_does_not_export_in_noninteractive_shell() {
     let hook = hook_path();
     let script = format!(
         "source '{hook}' 2>/dev/null; \
-         printf 'MODE=%s\\nPROT=%s\\n' \
+         printf 'MODE=%s\\nPROT=%s\\nSTATUS=%s\\n' \
            \"${{TIRITH_BASH_EFFECTIVE_MODE:-unset}}\" \
-           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-unset}}\""
+           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-unset}}\" \
+           \"${{TIRITH_STATUS:-unset}}\""
     );
 
     let out = Command::new("bash")
@@ -218,6 +220,59 @@ fn hook_does_not_export_in_noninteractive_shell() {
     assert!(
         stdout.contains("PROT=unset"),
         "non-interactive hook must not export PROT, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("STATUS=unset"),
+        "non-interactive hook must not export TIRITH_STATUS — invariant (g), got:\n{stdout}"
+    );
+}
+
+// --- TIRITH_STATUS: the opt-in prompt indicator ---------------------------
+
+#[test]
+fn hook_exports_status_blocks_in_enter_mode() {
+    // A proven-`works` capability cache resolves to enter mode, which blocks.
+    // `TIRITH_STATUS` is the prompt-facing contract and must read `blocks`.
+    let out = source_hook_and_dump_exports(Some("works"), &[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
+    assert!(
+        out.contains("STATUS=blocks"),
+        "enter mode must export TIRITH_STATUS=blocks, got:\n{out}"
+    );
+}
+
+#[test]
+fn hook_exports_status_warn_only_in_plain_preexec() {
+    // With no capability proof the hook falls back to preexec warn-only; the
+    // status is `warn-only`, NOT `degraded` — a shell that simply starts in
+    // warn-only has not been downgraded.
+    let out = source_hook_and_dump_exports(None, &[]);
+    assert!(
+        out.contains("STATUS=warn-only"),
+        "plain preexec must export TIRITH_STATUS=warn-only, got:\n{out}"
+    );
+    assert!(
+        !out.contains("STATUS=degraded"),
+        "a shell that starts in preexec is warn-only, not degraded, got:\n{out}"
+    );
+}
+
+// NOTE: the preexec-enforcement TIRITH_STATUS cases (enforcement engaging ->
+// `blocks`; a hostile history config refusing enforcement -> `degraded`) live
+// in `bash_preexec_enforce.rs`. Enforcement only engages when bash has a
+// working interactive history, which requires the stdin-fed harness there —
+// the `bash -i -c` subshell this file uses has no usable history.
+
+/// A runtime enter->preexec auto-degrade must flip `TIRITH_STATUS` to
+/// `degraded` so an opt-in prompt indicator reflects the downgrade.
+#[test]
+fn degrade_to_preexec_exports_status_degraded() {
+    let out = source_hook_run_and_dump(
+        &[("_TIRITH_TEST_SKIP_HEALTH", "1")],
+        "_tirith_degrade_to_preexec degrade-test",
+    );
+    assert!(
+        out.contains("STATUS=degraded"),
+        "a runtime degrade must export TIRITH_STATUS=degraded, got:\n{out}"
     );
 }
 
@@ -350,9 +405,10 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
     let (prelude, env_vars) = split_test_env(extra_env);
     let script = format!(
         "{prelude}source '{hook}' 2>/dev/null; {body}; \
-         printf 'MODE=%s\\nPROT=%s\\n' \
+         printf 'MODE=%s\\nPROT=%s\\nSTATUS=%s\\n' \
            \"${{TIRITH_BASH_EFFECTIVE_MODE:-}}\" \
-           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\""
+           \"${{TIRITH_BASH_EFFECTIVE_PROTECTION:-}}\" \
+           \"${{TIRITH_STATUS:-}}\""
     );
 
     let mut cmd = Command::new("bash");

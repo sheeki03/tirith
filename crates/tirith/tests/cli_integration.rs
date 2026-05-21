@@ -1037,7 +1037,7 @@ send -- "PROMPT_COMMAND=':'; readonly PROMPT_COMMAND\r"
 expect "PROMPT> "
 send -- "echo PTY_RUNTIME_CHECK\r"
 expect {
-  -re {switching to preexec} {}
+  -re {protection downgraded} {}
   timeout { exit 2 }
 }
 send -- "\r"
@@ -1616,7 +1616,7 @@ expect eof
     );
 
     assert!(
-        stdout.contains("unexpected exit code") || stdout.contains("switching to preexec"),
+        stdout.contains("unexpected exit code") || stdout.contains("protection downgraded"),
         "output should mention degrade reason, got:\n{stdout}"
     );
 

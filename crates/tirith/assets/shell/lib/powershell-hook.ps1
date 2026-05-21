@@ -24,6 +24,10 @@ if (-not $env:TIRITH_SESSION_ID) {
 $psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
 if (-not $psrlModule) {
     Write-Host "tirith: PSReadLine not found, hooks disabled. Install PSReadLine for shell protection." -ForegroundColor Yellow
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md). With
+    # no PSReadLine, no key handler is installed and tirith intercepts nothing,
+    # so the live protection level is `off`.
+    $env:TIRITH_STATUS = 'off'
     return
 }
 
@@ -315,3 +319,11 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
 }
+
+# TIRITH_STATUS: a small public contract a user can reference in their prompt
+# function to surface tirith's live protection level (see
+# docs/prompt-status.md). tirith prints NOTHING per-prompt — it only exports
+# the variable; wiring it into a prompt is opt-in. The PowerShell hook
+# overrides the Enter key handler, which can revert a blocked command, so its
+# protection level is `blocks`; there is no runtime-degrade path.
+$env:TIRITH_STATUS = 'blocks'

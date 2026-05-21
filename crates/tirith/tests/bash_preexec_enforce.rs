@@ -304,9 +304,15 @@ echo BLOCK_TOKEN-ignorespace && touch {sentinels}/ran_anyway
         sentinel_path(&sentinel_dir, "ran_anyway").exists(),
         "warn-only must allow the command to run even if tirith returns 1"
     );
+    // The consolidated one-shot degrade banner: a clear headline plus the
+    // hostile-history detail line. Both must be present.
     assert!(
-        stderr.contains("cannot enable preexec enforcement"),
-        "expected install-time refusal message, got: {stderr}"
+        stderr.contains("protection downgraded to warn-only"),
+        "expected the consolidated degrade headline, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("preexec enforcement could not engage"),
+        "expected the install-time refusal detail line, got: {stderr}"
     );
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
@@ -324,7 +330,8 @@ echo BLOCK_TOKEN-histignore && touch {sentinels}/ran_anyway
         ],
     );
     assert!(sentinel_path(&sentinel_dir, "ran_anyway").exists());
-    assert!(stderr.contains("cannot enable preexec enforcement"));
+    assert!(stderr.contains("protection downgraded to warn-only"));
+    assert!(stderr.contains("preexec enforcement could not engage"));
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
@@ -341,7 +348,8 @@ echo BLOCK_TOKEN-ignoredups && touch {sentinels}/ran_anyway
         ],
     );
     assert!(sentinel_path(&sentinel_dir, "ran_anyway").exists());
-    assert!(stderr.contains("cannot enable preexec enforcement"));
+    assert!(stderr.contains("protection downgraded to warn-only"));
+    assert!(stderr.contains("preexec enforcement could not engage"));
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
@@ -370,6 +378,7 @@ fn enforcement_exports_blocks_protection() {
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"
 printf 'PROT=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" >&2
+printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
@@ -380,6 +389,12 @@ printf 'PROT=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" >&2
         stderr.contains("PROT=blocks"),
         "expected PROT=blocks, got stderr: {stderr}"
     );
+    // The opt-in prompt indicator must also report `blocks` once enforcement
+    // engages — it starts `warn-only` and upgrades.
+    assert!(
+        stderr.contains("STATUS=blocks"),
+        "engaged enforcement must export TIRITH_STATUS=blocks, got stderr: {stderr}"
+    );
     let _ = fs::remove_dir_all(&_tmp);
 }
 
@@ -388,6 +403,7 @@ fn hostile_config_exports_warn_only() {
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"
 printf 'PROT=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" >&2
+printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
 "#,
         &[
             ("TIRITH_BASH_MODE", "preexec"),
@@ -398,6 +414,13 @@ printf 'PROT=%s\n' "$TIRITH_BASH_EFFECTIVE_PROTECTION" >&2
     assert!(
         stderr.contains("PROT=warn-only"),
         "hostile install-time config must export warn-only, got: {stderr}"
+    );
+    // The user asked for blocking but a hostile history config refused it —
+    // that downgrade from intent surfaces to the prompt indicator as
+    // `degraded`, distinct from a shell that simply starts in warn-only.
+    assert!(
+        stderr.contains("STATUS=degraded"),
+        "enforcement refused by hostile history must export TIRITH_STATUS=degraded, got: {stderr}"
     );
     let _ = fs::remove_dir_all(&_tmp);
 }
