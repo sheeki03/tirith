@@ -32,7 +32,7 @@ what an experimental command must satisfy to move to stable.
 | `gateway` | Experimental | MCP gateway proxy for AI-agent security. |
 | `setup` | Experimental | Configure tirith for AI coding tools. |
 | `policy` | Experimental | Policy `init` / `validate` / `test` / `tune`. |
-| `trust` | Experimental | Manage trusted patterns (allowlist entries with TTL and scoping). |
+| `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`. Narrow scope and a 30-day TTL by default; scope visualization, per-entry `explain`, and a `diff` trail. |
 | `warnings` | Experimental | Show accumulated session warnings. |
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `daemon` | Experimental | Background daemon (Unix only). |

@@ -577,7 +577,29 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
     let result = match tirith_core::audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("tirith policy tune: {e}");
+            // `read_log` only fails on an I/O error reading the file (malformed
+            // JSONL lines are skipped, not errored), so name the path and the
+            // likely cause. Re-probe the file to distinguish a permissions
+            // problem — the one a user can actually act on — from other I/O.
+            eprintln!(
+                "tirith policy tune: could not read the audit log at {}",
+                log_path.display()
+            );
+            match std::fs::File::open(&log_path) {
+                Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => {
+                    eprintln!(
+                        "  permission denied — check that you can read the file \
+                         (its directory may also need execute permission)."
+                    );
+                }
+                _ => {
+                    eprintln!("  {e}");
+                    eprintln!(
+                        "  the file may be unreadable or have been removed mid-read; \
+                         retry, or check the path's permissions."
+                    );
+                }
+            }
             return 1;
         }
     };

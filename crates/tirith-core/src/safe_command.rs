@@ -18,8 +18,8 @@
 //! Three transformations are supported, each provably safe:
 //!
 //! 1. **Pipe-to-shell** (`curl URL | bash`) → download to a file, review it,
-//!    then run it. Covers `curl`/`wget`/`http`/`https`/`xh` piped into a shell
-//!    interpreter.
+//!    then run it. Covers `curl`/`wget`/`http`/`https`/`xh`/`fetch` piped into
+//!    a shell interpreter.
 //! 2. **Insecure TLS flag** (`-k`, `--insecure`, `--no-check-certificate`) →
 //!    drop the flag so certificate verification is restored. The command still
 //!    works whenever the server presents a valid certificate.

@@ -1200,7 +1200,7 @@ fn current_snapshot() -> Option<DbSnapshot> {
     let stats = db.stats();
     let breakdown = db.source_breakdown();
     let mut sources = std::collections::BTreeMap::new();
-    for (src, count) in &breakdown.per_source {
+    for (src, count) in breakdown.per_source() {
         sources.insert(src.as_str().to_string(), *count);
     }
     Some(DbSnapshot {
@@ -1220,18 +1220,36 @@ fn current_snapshot() -> Option<DbSnapshot> {
 }
 
 /// Load all retained snapshots, oldest first. Unparseable lines are skipped.
-fn load_history() -> Vec<DbSnapshot> {
+///
+/// Returns `(snapshots, read_error)`. A missing history file is legitimate
+/// (no snapshots yet) and yields an empty list with no error. A history file
+/// that *exists* but cannot be read (permissions, I/O fault) yields an empty
+/// list **and** a `Some(message)` so callers can say "could not read history"
+/// rather than falsely reporting "first observation".
+fn load_history() -> (Vec<DbSnapshot>, Option<String>) {
     let Some(path) = history_path() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "could not read snapshot history at {} ({e}) — check file permissions; \
+                     the diff below cannot use any earlier snapshot",
+                    path.display()
+                )),
+            );
+        }
     };
-    content
+    let snapshots = content
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<DbSnapshot>(l).ok())
-        .collect()
+        .collect();
+    (snapshots, None)
 }
 
 /// Append `snapshot` to the history file if it records a build sequence not
@@ -1244,7 +1262,9 @@ fn record_snapshot(snapshot: &DbSnapshot) {
     let Some(path) = history_path() else {
         return;
     };
-    let mut history = load_history();
+    // The read-error note is irrelevant here: recording is best-effort and
+    // rewrites the whole file regardless.
+    let (mut history, _) = load_history();
     // Dedup on build_sequence: re-running `health` against an unchanged DB
     // must not append a near-identical line every invocation.
     if history
@@ -1425,14 +1445,6 @@ struct ExplainFinding {
     reference_url: Option<String>,
 }
 
-fn confidence_label(c: Confidence) -> &'static str {
-    match c {
-        Confidence::Low => "low",
-        Confidence::Medium => "medium",
-        Confidence::Confirmed => "confirmed",
-    }
-}
-
 /// `tirith threat-db explain <indicator>`.
 pub fn explain(indicator: &str, json: bool) -> i32 {
     let parsed = parse_indicator(indicator);
@@ -1509,10 +1521,9 @@ pub fn explain(indicator: &str, json: bool) -> i32 {
     snapshot_current_db();
 
     if json {
-        print_json_value(&result);
-    } else {
-        print_explain_human(&result);
+        return print_json_value(&result);
     }
+    print_explain_human(&result);
     0
 }
 
@@ -1638,7 +1649,7 @@ fn print_explain_human(r: &ExplainResult) {
             println!("      source:     {label}");
         }
         if let Some(c) = f.confidence {
-            println!("      confidence: {}", confidence_label(c));
+            println!("      confidence: {}", c.as_str());
         }
         println!("      {}", f.detail);
         if let Some(ref url) = f.reference_url {
@@ -1685,16 +1696,9 @@ pub fn sources(json: bool) -> i32 {
 
     let mut source_infos = Vec::new();
     for src in ThreatSource::ALL {
-        // EcosystemsTyposquat's records live in the typosquat section, which
-        // has no per-record source byte; report its count as the typosquat
-        // total so the number is honest rather than a misleading 0.
-        let record_count = breakdown.as_ref().map(|b| {
-            if src == ThreatSource::EcosystemsTyposquat {
-                b.typosquat_count
-            } else {
-                b.count_for(src)
-            }
-        });
+        // `count_for` now attributes the typosquat index count to
+        // `EcosystemsTyposquat`, so no per-source special-case is needed.
+        let record_count = breakdown.as_ref().map(|b| b.count_for(src));
         source_infos.push(SourceInfo {
             id: src.as_str().to_string(),
             name: src.label().to_string(),
@@ -1714,10 +1718,9 @@ pub fn sources(json: bool) -> i32 {
     snapshot_current_db();
 
     if json {
-        print_json_value(&report);
-    } else {
-        print_sources_human(&report, breakdown.as_ref().map(|b| b.popular_count));
+        return print_json_value(&report);
     }
+    print_sources_human(&report, breakdown.as_ref().map(|b| b.popular_count));
     0
 }
 
@@ -1803,10 +1806,10 @@ pub fn health(json: bool) -> i32 {
     let exit = if report.error.is_some() { 1 } else { 0 };
 
     if json {
-        print_json_value(&report);
-    } else {
-        print_health_human(&report);
+        // Propagate the worse of the health exit code and a JSON-write failure.
+        return print_json_value(&report).max(exit);
     }
+    print_health_human(&report);
     exit
 }
 
@@ -2055,6 +2058,15 @@ fn parse_since(since: &str) -> Result<(String, Option<u64>, Option<u64>), String
     ))
 }
 
+/// Days in each calendar month for a non-leap year (January first). February's
+/// leap-day is added separately via [`is_leap_year`].
+const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Proleptic Gregorian leap-year test, shared by the date parser and formatter.
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
 /// Parse a `YYYY-MM-DD` (or `YYYY-MM-DDTHH:MM:SS`) date to a Unix epoch.
 /// Deliberately small and dependency-free; only the date part is used.
 fn parse_iso_date(s: &str) -> Option<u64> {
@@ -2066,8 +2078,6 @@ fn parse_iso_date(s: &str) -> Option<u64> {
     if it.next().is_some() {
         return None;
     }
-    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
         return None;
     }
@@ -2075,10 +2085,10 @@ fn parse_iso_date(s: &str) -> Option<u64> {
     // 2026-04-31. Without this the arithmetic below would silently roll the
     // date into the next month, and `diff --since` would select the wrong
     // baseline instead of erroring on the malformed input.
-    let max_day = if month == 2 && is_leap(year) {
+    let max_day = if month == 2 && is_leap_year(year) {
         29
     } else {
-        month_days[(month - 1) as usize]
+        MONTH_DAYS[(month - 1) as usize]
     };
     if !(1..=max_day).contains(&day) {
         return None;
@@ -2086,14 +2096,14 @@ fn parse_iso_date(s: &str) -> Option<u64> {
     // Days from 1970-01-01 to the start of `year`.
     let mut days: i64 = 0;
     for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
+        days += if is_leap_year(y) { 366 } else { 365 };
     }
-    for (m, md) in month_days.iter().enumerate() {
+    for (m, md) in MONTH_DAYS.iter().enumerate() {
         if (m as i64) + 1 >= month {
             break;
         }
         days += md;
-        if (m as i64) + 1 == 2 && is_leap(year) {
+        if (m as i64) + 1 == 2 && is_leap_year(year) {
             days += 1;
         }
     }
@@ -2117,7 +2127,10 @@ pub fn diff(since: &str, json: bool) -> i32 {
         Ok(v) => v,
         Err(e) => {
             if json {
-                print_json_value(&DiffReport {
+                // The exit code is already 1 (invalid --since); a JSON-write
+                // failure here cannot make it any worse, so the result is
+                // intentionally discarded.
+                let _ = print_json_value(&DiffReport {
                     since: since.to_string(),
                     since_kind: "invalid".to_string(),
                     baseline: None,
@@ -2134,7 +2147,7 @@ pub fn diff(since: &str, json: bool) -> i32 {
         }
     };
 
-    let history = load_history();
+    let (history, history_read_error) = load_history();
     let current = current_snapshot();
 
     // Pick the baseline: the newest snapshot at or before the requested point.
@@ -2185,12 +2198,16 @@ pub fn diff(since: &str, json: bool) -> i32 {
         (None, Some(_)) => (
             None,
             Default::default(),
-            Some(format!(
-                "No snapshot was recorded at or before '{since}'. tirith only began \
-                 retaining snapshots from the first transparency command after this \
-                 feature was installed; a diff needs at least one earlier snapshot. \
-                 Run 'tirith threat-db health' periodically to build up history."
-            )),
+            // A history file that exists but could not be read must not be
+            // reported as "no snapshot recorded" — surface the read failure.
+            Some(history_read_error.clone().unwrap_or_else(|| {
+                format!(
+                    "No snapshot was recorded at or before '{since}'. tirith only began \
+                     retaining snapshots from the first transparency command after this \
+                     feature was installed; a diff needs at least one earlier snapshot. \
+                     Run 'tirith threat-db health' periodically to build up history."
+                )
+            })),
         ),
         (_, None) => (
             None,
@@ -2215,10 +2232,9 @@ pub fn diff(since: &str, json: bool) -> i32 {
     };
 
     if json {
-        print_json_value(&report);
-    } else {
-        print_diff_human(&report);
+        return print_json_value(&report);
     }
+    print_diff_human(&report);
     0
 }
 
@@ -2275,10 +2291,21 @@ fn print_delta_line(label: &str, delta: i64) {
 
 // --- shared output helpers -------------------------------------------------
 
-fn print_json_value(value: &impl serde::Serialize) {
+/// Serialize `value` as pretty JSON to stdout. Returns `0` on success and `1`
+/// on a serialization failure — a JSON consumer must be able to tell that the
+/// output it received is incomplete, so the caller propagates the non-zero
+/// code rather than exiting `0` with nothing (or partial output) printed.
+#[must_use]
+fn print_json_value(value: &impl serde::Serialize) -> i32 {
     match serde_json::to_string_pretty(value) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("tirith: JSON serialization failed: {e}"),
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("tirith: JSON serialization failed: {e}");
+            1
+        }
     }
 }
 
@@ -2292,22 +2319,20 @@ fn format_epoch(epoch: u64) -> String {
         secs_of_day % 60,
     );
 
-    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let mut year: i64 = 1970;
     let mut remaining = days as i64;
     loop {
-        let year_len = if is_leap(year) { 366 } else { 365 };
+        let year_len = if is_leap_year(year) { 366 } else { 365 };
         if remaining < year_len {
             break;
         }
         remaining -= year_len;
         year += 1;
     }
-    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1;
-    for (m, md) in month_days.iter().enumerate() {
+    for (m, md) in MONTH_DAYS.iter().enumerate() {
         let mut len = *md;
-        if m == 1 && is_leap(year) {
+        if m == 1 && is_leap_year(year) {
             len += 1;
         }
         if remaining < len {
@@ -3607,7 +3632,7 @@ mod tests {
         record_snapshot(&snap(42, 2000));
         record_snapshot(&snap(43, 3000));
 
-        let history = load_history();
+        let (history, _) = load_history();
         assert_eq!(
             history.len(),
             2,
@@ -3636,7 +3661,7 @@ mod tests {
             });
         }
 
-        let history = load_history();
+        let (history, _) = load_history();
         assert_eq!(
             history.len(),
             HISTORY_MAX_LINES,
@@ -3666,7 +3691,7 @@ mod tests {
         )
         .unwrap();
 
-        let history = load_history();
+        let (history, _) = load_history();
         assert_eq!(history.len(), 1, "only the one valid line should parse");
         assert_eq!(history[0].build_sequence, 1);
 
@@ -3674,9 +3699,55 @@ mod tests {
     }
 
     #[test]
-    fn confidence_label_covers_all_levels() {
-        assert_eq!(confidence_label(Confidence::Low), "low");
-        assert_eq!(confidence_label(Confidence::Medium), "medium");
-        assert_eq!(confidence_label(Confidence::Confirmed), "confirmed");
+    fn load_history_missing_file_is_not_an_error() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // Set the Windows env var alongside the XDG one so the state path is
+        // isolated on every platform.
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        unsafe { std::env::set_var("APPDATA", tmp.path()) };
+
+        // No history file exists at all — a legitimate "no snapshots yet".
+        let (history, read_error) = load_history();
+        assert!(history.is_empty());
+        assert!(
+            read_error.is_none(),
+            "a missing history file must not surface as a read error"
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    #[test]
+    fn load_history_unreadable_file_surfaces_a_read_error() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        unsafe { std::env::set_var("APPDATA", tmp.path()) };
+
+        // Create the history *path* as a directory: it exists, but reading it
+        // as a file fails with an error that is not NotFound — portably
+        // exercising the "exists but unreadable" branch.
+        let state = tmp.path().join("tirith");
+        std::fs::create_dir_all(state.join(HISTORY_FILE)).unwrap();
+
+        let (history, read_error) = load_history();
+        assert!(history.is_empty());
+        assert!(
+            read_error.is_some(),
+            "an existing-but-unreadable history file must surface a read error, \
+             not be silently treated as 'no snapshots'"
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    #[test]
+    fn confidence_as_str_covers_all_levels() {
+        assert_eq!(Confidence::Low.as_str(), "low");
+        assert_eq!(Confidence::Medium.as_str(), "medium");
+        assert_eq!(Confidence::Confirmed.as_str(), "confirmed");
     }
 }

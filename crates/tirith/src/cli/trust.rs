@@ -41,7 +41,10 @@ impl Default for TrustStore {
 
 /// How broad a trust pattern is. Ordered narrowest → broadest; a broader
 /// classification means the entry trusts more and is riskier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// The variants are declared narrowest-first, so the derived `PartialOrd`/`Ord`
+/// agree with that prose contract: `ScopeKind::Exact < ScopeKind::BareTld`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
     /// A specific URL, path, or checksum-like literal — trusts exactly one thing.
@@ -173,6 +176,24 @@ fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
             eprintln!("  try: tirith trust {subcmd} {pattern} --scope user");
         } else {
             eprintln!("  try: tirith trust {subcmd} --scope user");
+        }
+    }
+}
+
+/// Serialize `value` as pretty JSON to stdout. Returns `0` on success and `1`
+/// on a serialization failure. A JSON consumer must be able to tell that the
+/// output is incomplete, so a failure surfaces as a non-zero exit rather than
+/// a misleading exit-0 with a literal `{}`/`[]` printed in place of real data.
+#[must_use]
+fn print_json(value: &impl Serialize) -> i32 {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("tirith: JSON serialization failed: {e}");
+            1
         }
     }
 }
@@ -438,26 +459,22 @@ pub fn add(
             "permanent": permanent,
             "reason": reason,
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        let ttl_note = match &ttl_label {
-            Some(t) => format!(", ttl: {t}"),
-            None => ", permanent (no expiry)".to_string(),
-        };
+        return print_json(&out);
+    }
+    let ttl_note = match &ttl_label {
+        Some(t) => format!(", ttl: {t}"),
+        None => ", permanent (no expiry)".to_string(),
+    };
+    eprintln!(
+        "tirith: trusted '{pattern}' (scope: {scope}, {} pattern{ttl_note})",
+        scope_kind.label()
+    );
+    if scope_kind.is_dangerous() {
         eprintln!(
-            "tirith: trusted '{pattern}' (scope: {scope}, {} pattern{ttl_note})",
-            scope_kind.label()
+            "  warning: this is a {} entry — {}.",
+            scope_kind.label(),
+            scope_kind.coverage()
         );
-        if scope_kind.is_dangerous() {
-            eprintln!(
-                "  warning: this is a {} entry — {}.",
-                scope_kind.label(),
-                scope_kind.coverage()
-            );
-        }
     }
     0
 }
@@ -487,9 +504,9 @@ pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &s
     }
 
     if json {
-        let output = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
-        println!("{output}");
-    } else if rows.is_empty() {
+        return print_json(&rows);
+    }
+    if rows.is_empty() {
         eprintln!("tirith: no trust entries found");
     } else {
         let max_pat = rows
@@ -928,11 +945,9 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
                 .map(|(s, n)| serde_json::json!({ "scope": s, "removed": n }))
                 .collect::<Vec<_>>(),
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else if total_removed == 0 {
+        return print_json(&out);
+    }
+    if total_removed == 0 {
         eprintln!("tirith: gc: no expired entries found");
     }
 
@@ -1059,11 +1074,7 @@ pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
-        );
-        return 0;
+        return print_json(&report);
     }
 
     if !report.found {
@@ -1187,18 +1198,56 @@ fn current_trust_snapshot() -> TrustSnapshot {
 }
 
 /// Load all retained trust snapshots, oldest first. Unparseable lines skipped.
-fn load_trust_history() -> Vec<TrustSnapshot> {
+///
+/// Returns `(snapshots, read_error)`. A missing history file is legitimate
+/// (no snapshots yet) and yields an empty list with no error. A history file
+/// that *exists* but cannot be read (permissions, I/O fault) yields an empty
+/// list **and** a `Some(message)` so `diff` can say "could not read history"
+/// rather than falsely reporting "first observation".
+fn load_trust_history() -> (Vec<TrustSnapshot>, Option<String>) {
     let Some(path) = trust_history_path() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
-    let Ok(content) = fs::read_to_string(&path) else {
-        return Vec::new();
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "could not read trust snapshot history at {} ({e}) — check file \
+                     permissions; the diff below cannot use any earlier snapshot",
+                    path.display()
+                )),
+            );
+        }
     };
-    content
+    let snapshots = content
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<TrustSnapshot>(l).ok())
-        .collect()
+        .collect();
+    (snapshots, None)
+}
+
+/// Atomic write: write to a temp file in the same directory, then rename, so a
+/// torn write can never leave a partial snapshot history behind. Mirrors
+/// `threatdb_cmd::record_snapshot`'s atomic write of its sibling history file.
+fn atomic_write(dest: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| "cannot determine parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("failed to create directory: {e}"))?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("failed to create temp file: {e}"))?;
+    tmp.write_all(data)
+        .map_err(|e| format!("failed to write temp file: {e}"))?;
+    tmp.flush()
+        .map_err(|e| format!("failed to flush temp file: {e}"))?;
+    tmp.persist(dest)
+        .map_err(|e| format!("failed to rename temp file: {e}"))?;
+    Ok(())
 }
 
 /// Append `snapshot` to the trust history file if its entry set differs from
@@ -1208,7 +1257,9 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
     let Some(path) = trust_history_path() else {
         return;
     };
-    let mut history = load_trust_history();
+    // The read-error note is irrelevant here: recording is best-effort and
+    // rewrites the whole file regardless.
+    let (mut history, _) = load_trust_history();
     // Dedup on entry set: re-running `trust list` against an unchanged trust
     // set must not append a near-identical line every invocation.
     if history
@@ -1223,11 +1274,6 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
         let drop = history.len() - TRUST_HISTORY_MAX_LINES;
         history.drain(0..drop);
     }
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
     let mut body = String::new();
     for s in &history {
         if let Ok(line) = serde_json::to_string(s) {
@@ -1235,7 +1281,8 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
             body.push('\n');
         }
     }
-    let _ = fs::write(&path, body.as_bytes());
+    // Atomic write so a torn write can never lose the snapshot history.
+    let _ = atomic_write(&path, body.as_bytes());
 }
 
 /// Take a snapshot of the current trust set and fold it into the history file.
@@ -1281,7 +1328,7 @@ fn diff_entry_of(key: &str) -> DiffEntry {
 /// `tirith trust diff` — show what changed in the trust set since the previous
 /// recorded snapshot.
 pub fn diff(json: bool) -> i32 {
-    let history = load_trust_history();
+    let (history, history_read_error) = load_trust_history();
     let current = current_trust_snapshot();
 
     // The baseline is simply the most recent recorded snapshot. If it equals
@@ -1297,12 +1344,14 @@ pub fn diff(json: bool) -> i32 {
             added: Vec::new(),
             removed: Vec::new(),
             unchanged: true,
-            note: Some(
+            // A history file that exists but could not be read must not be
+            // reported as "first observation" — surface the read failure.
+            note: Some(history_read_error.clone().unwrap_or_else(|| {
                 "No earlier trust snapshot to compare against — this is the first \
                  observation. Run a 'tirith trust' command again later to build a \
                  diff trail."
-                    .to_string(),
-            ),
+                    .to_string()
+            })),
         },
         Some(base) => {
             let base_set: std::collections::BTreeSet<&String> = base.entries.iter().collect();
@@ -1332,11 +1381,7 @@ pub fn diff(json: bool) -> i32 {
     record_trust_snapshot(&current);
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
-        );
-        return 0;
+        return print_json(&report);
     }
 
     match &report.baseline_recorded_at {

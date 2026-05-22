@@ -45,8 +45,10 @@ pub struct JsonOutput<'a> {
     pub timings_ms: &'a crate::verdict::Timings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
-    /// Concrete safer-command suggestions — only present when the caller
-    /// passed `--suggest-safe-command` and the verdict is non-Allow.
+    /// Concrete safer-command suggestions. Present (as a JSON array, possibly
+    /// empty) whenever the caller passed `--suggest-safe-command`; omitted
+    /// entirely otherwise. The array is empty when no finding has a safe
+    /// mechanical rewrite — including on an Allow verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_suggestions: Option<&'a [SafeSuggestion]>,
 }

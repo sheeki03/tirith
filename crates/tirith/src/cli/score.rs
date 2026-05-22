@@ -101,25 +101,138 @@ fn print_human(
 /// each factor's contribution is printed, then the running total, then the
 /// final score with an explicit "sum of the above" note.
 fn print_breakdown_human(breakdown: &ScoreBreakdown) {
-    eprintln!();
-    eprintln!(
+    // Render to a locked stderr handle. The actual formatting lives in
+    // `write_breakdown_human` so it can be unit-tested against a buffer.
+    let _ = write_breakdown_human(breakdown, &mut std::io::stderr().lock());
+}
+
+/// Write the factor breakdown to `w`. Separated from [`print_breakdown_human`]
+/// purely so tests can capture the rendered text; the output is identical.
+fn write_breakdown_human(
+    breakdown: &ScoreBreakdown,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(
+        w,
         "  score breakdown (each factor is fixed and inspectable — no model, no learned weights):"
-    );
+    )?;
     let mut running: i32 = 0;
     for factor in &breakdown.factors {
         running += factor.points;
         // `+NN` for positive contributions, `-NN` for the clamp factor.
         let sign = if factor.points >= 0 { "+" } else { "" };
-        eprintln!(
+        writeln!(
+            w,
             "    {sign}{:<4} {}  (running total: {running})",
             factor.points, factor.label
-        );
-        eprintln!("           {}", factor.detail);
+        )?;
+        writeln!(w, "           {}", factor.detail)?;
     }
-    eprintln!(
+    writeln!(
+        w,
         "    = {} / {}  ({}) — sum of every factor above",
         breakdown.score,
         scoring::MAX_SCORE,
         breakdown.risk_level
-    );
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+
+    fn render(breakdown: &ScoreBreakdown) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_breakdown_human(breakdown, &mut buf).expect("write to Vec never fails");
+        String::from_utf8(buf).expect("breakdown output is valid UTF-8")
+    }
+
+    fn finding(rule_id: RuleId, severity: Severity) -> Finding {
+        Finding {
+            rule_id,
+            severity,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "t".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn breakdown_human_renders_clean_zero_finding_url() {
+        // `score --explain` on a URL with no findings: the breakdown still
+        // renders, every factor is +0, and the total line reads 0/100 (low).
+        let breakdown = scoring::score_findings(&[]);
+        assert_eq!(breakdown.score, 0);
+        let out = render(&breakdown);
+
+        assert!(
+            out.contains("score breakdown"),
+            "must print the breakdown header: {out}"
+        );
+        // Base severity factor: +0 for no findings.
+        assert!(
+            out.contains("+0"),
+            "a zero-finding breakdown must show a +0 factor: {out}"
+        );
+        // No factor should render with a negative sign on a clean URL.
+        assert!(
+            !out.contains("    -"),
+            "a clean URL has no negative (clamp) factor: {out}"
+        );
+        assert!(
+            out.contains("= 0 / 100"),
+            "total line must read 0/100 for a clean URL: {out}"
+        );
+        assert!(
+            out.contains("(low)"),
+            "a 0 score is the 'low' risk bucket: {out}"
+        );
+    }
+
+    #[test]
+    fn breakdown_human_renders_negative_clamp_factor() {
+        // 5 critical findings: 90 base + 4*5 = 110 raw → clamps to 100 with an
+        // explicit -10 clamp factor. The renderer must show that -10 without a
+        // leading '+', and the total line must read 100/100.
+        let findings: Vec<Finding> = (0..5)
+            .map(|_| finding(RuleId::CurlPipeShell, Severity::Critical))
+            .collect();
+        let breakdown = scoring::score_findings(&findings);
+        assert_eq!(breakdown.score, 100);
+        // Sanity: the clamp factor is present and negative.
+        let clamp = breakdown
+            .factors
+            .iter()
+            .find(|f| f.id == "clamp")
+            .expect("clamp factor must exist when the raw sum exceeds 100");
+        assert_eq!(clamp.points, -10);
+
+        let out = render(&breakdown);
+        // The clamp factor renders as `-10` (no '+' sign) at column start.
+        assert!(
+            out.contains("    -10 "),
+            "clamp factor must render as a bare -10: {out}"
+        );
+        assert!(
+            !out.contains("+-10"),
+            "the negative clamp factor must not get a '+' prefix: {out}"
+        );
+        assert!(
+            out.contains("= 100 / 100"),
+            "total line must read 100/100 after clamping: {out}"
+        );
+        assert!(
+            out.contains("(critical)"),
+            "a 100 score is the 'critical' risk bucket: {out}"
+        );
+    }
 }

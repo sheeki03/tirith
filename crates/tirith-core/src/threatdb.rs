@@ -312,6 +312,17 @@ impl Confidence {
             _ => None,
         }
     }
+
+    /// Stable machine-readable identifier (lowercase). Matches the
+    /// `#[serde(rename_all = "lowercase")]` representation, so the human
+    /// label and the JSON form never drift apart.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::Confirmed => "confirmed",
+        }
+    }
 }
 
 /// Result of a package, hostname, or IP lookup in the threat DB.
@@ -354,17 +365,27 @@ pub struct ThreatDbStats {
 /// Per-source record counts derived by walking a loaded DB's sections.
 ///
 /// `per_source` covers package, hostname, and IP records (the record types
-/// that carry a `ThreatSource` byte on disk). `typosquat_count` and
-/// `popular_count` are reported separately because the on-disk typosquat and
-/// popular-package records do not store a source.
+/// that carry a `ThreatSource` byte on disk) plus the typosquat index, whose
+/// records are all from `EcosystemsTyposquat`. `typosquat_count` and
+/// `popular_count` are also reported separately as categories.
+///
+/// `per_source` is private: `count_for` and `merge` rely on the invariant
+/// that it holds at most one entry per source. The [`per_source`](Self::per_source)
+/// accessor exposes the slice read-only so that invariant cannot be broken
+/// from outside.
 #[derive(Debug, Clone, Default)]
 pub struct SourceBreakdown {
-    pub per_source: Vec<(ThreatSource, u64)>,
+    per_source: Vec<(ThreatSource, u64)>,
     pub typosquat_count: u64,
     pub popular_count: u64,
 }
 
 impl SourceBreakdown {
+    /// Read-only view of the per-source counts, at most one entry per source.
+    pub fn per_source(&self) -> &[(ThreatSource, u64)] {
+        &self.per_source
+    }
+
     /// Add another breakdown's counts into this one (used to fold a
     /// supplemental overlay's counts into the primary's).
     fn merge(&mut self, other: SourceBreakdown) {
@@ -782,11 +803,25 @@ impl ThreatDb {
         SourceBreakdown {
             per_source: ThreatSource::ALL
                 .iter()
-                .map(|src| (*src, counts.get(&(*src as u8)).copied().unwrap_or(0)))
+                .map(|src| {
+                    // Typosquat records carry no per-record source byte on
+                    // disk, so the section walk above never bumps a count for
+                    // `EcosystemsTyposquat`. Every typosquat record is from
+                    // that one source, so attribute the whole typosquat index
+                    // count to it — otherwise `count_for(EcosystemsTyposquat)`
+                    // would always (and wrongly) return 0.
+                    let count = if *src == ThreatSource::EcosystemsTyposquat {
+                        self.typosquat_index_count as u64
+                    } else {
+                        counts.get(&(*src as u8)).copied().unwrap_or(0)
+                    };
+                    (*src, count)
+                })
                 .collect(),
-            // Typosquats and popular packages carry no per-record source byte
-            // in the on-disk format, so they are surfaced as their own
-            // categories rather than attributed to a source.
+            // Typosquats are also surfaced in `typosquat_count` as their own
+            // category (for callers that report categories, not sources).
+            // Popular packages carry no source byte and have no single source,
+            // so they remain a category only.
             typosquat_count: self.typosquat_index_count as u64,
             popular_count: self.popular_index_count as u64,
         }
@@ -2748,13 +2783,17 @@ mod tests {
         assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
         assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
         assert_eq!(bd.count_for(ThreatSource::CisaKev), 0);
+        // Typosquat records are all from EcosystemsTyposquat — count_for must
+        // attribute the typosquat index count to that source, not return 0.
+        assert_eq!(bd.count_for(ThreatSource::EcosystemsTyposquat), 1);
         assert_eq!(bd.typosquat_count, 1);
         assert_eq!(bd.popular_count, 1);
 
-        // Per-source counts cover pkg+host+ip records only (3 packages +
-        // 2 hostnames + 2 IPs = 7); typosquat/popular are reported separately.
-        let total: u64 = bd.per_source.iter().map(|(_, c)| c).sum();
-        assert_eq!(total, 7);
+        // Per-source counts cover pkg+host+ip records (3 packages + 2 hostnames
+        // + 2 IPs = 7) plus the 1 typosquat attributed to EcosystemsTyposquat,
+        // for a total of 8; popular packages remain a separate category.
+        let total: u64 = bd.per_source().iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 8);
     }
 
     #[test]
@@ -2786,7 +2825,7 @@ mod tests {
         let mut writer = ThreatDbWriter::new(1700000000, 1);
         let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
         let bd = db.source_breakdown();
-        for (_, count) in &bd.per_source {
+        for (_, count) in bd.per_source() {
             assert_eq!(*count, 0);
         }
         assert_eq!(bd.typosquat_count, 0);
