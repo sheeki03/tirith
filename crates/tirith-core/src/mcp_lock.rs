@@ -16,14 +16,19 @@
 //!    — serialize that inventory into a deterministic JSON lockfile
 //!    (`<repo_root>/.tirith/mcp.lock`): per server a canonical transport
 //!    descriptor, the tool list, and a content hash; plus a format version and
-//!    a hash over the whole inventory. Servers are sorted by name so the
-//!    lockfile is stable and diff-friendly — a future `mcp verify` / `mcp diff`
-//!    (chunk 2) can diff two lockfiles cleanly.
+//!    a hash over the whole inventory. [`McpLockfile::from_inventory`] sorts
+//!    servers by `(name, source_config)` **before** hashing, so the lockfile
+//!    and its `inventory_hash` are stable regardless of config-discovery
+//!    order — a future `mcp verify` / `mcp diff` (chunk 2) can diff two
+//!    lockfiles cleanly.
 //!
 //! **Repo-local only.** Discovery never walks into `~/.claude/` or any other
 //! user-level configuration directory — only files inside the given repo root
 //! are inventoried. This is the same scoping decision the policy system makes
-//! with org-level lists.
+//! with org-level lists. The guarantee is enforced, not merely structural: a
+//! config path that is a symlink (or sits under a symlinked directory), or
+//! whose canonicalized path escapes the repo root, is **rejected** — a
+//! symlinked `.mcp.json` pointing at a user-level config is not read.
 //!
 //! **Malformed input is never fatal.** A configuration file that is not valid
 //! JSON, or that does not carry an MCP-server object, contributes **no
@@ -37,7 +42,15 @@ use sha2::{Digest, Sha256};
 
 /// Lockfile format version. Bump only on a breaking schema change so a future
 /// `mcp verify` can refuse — or migrate — an older lockfile deliberately.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 1;
+///
+/// Version history:
+/// * `1` — initial schema: per-server name, transport (`url`, or stdio
+///   `command` + `args`), tools, source config, and content hash.
+/// * `2` — a stdio transport now also captures the server's `env` (the
+///   environment variables the config injects into the subprocess); `env` is
+///   part of the per-server content hash, so an `env` change registers as
+///   drift. A v1 lockfile is therefore not byte-comparable to a v2 one.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 2;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -58,6 +71,14 @@ pub enum McpTransport {
         /// Arguments passed to the executable, in declared order.
         #[serde(default)]
         args: Vec<String>,
+        /// Environment variables the config injects into the subprocess, as
+        /// `(name, value)` pairs sorted by name. Security-relevant: a change
+        /// to a server's `env` (a swapped credential, an added variable that
+        /// alters what the server does) must register as drift, so it is part
+        /// of the inventory, the lockfile schema, and the per-server hash.
+        /// An empty vec means the config declared no `env` object.
+        #[serde(default)]
+        env: Vec<(String, String)>,
     },
     /// The server object declared neither a `url` nor a `command`. Captured
     /// rather than dropped: an MCP entry with no transport is itself a
@@ -82,40 +103,63 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
-    /// A stable per-server content hash over name + transport + tools. Two
-    /// entries hash identically iff they declare the same server the same way,
-    /// so a future `mcp diff` can detect a changed server by hash alone.
+    /// A stable per-server content hash over name + transport (including a
+    /// stdio server's `env`) + tools. Two entries hash identically iff they
+    /// declare the same server the same way, so a future `mcp diff` can detect
+    /// a changed server by hash alone.
     ///
     /// `source_config` is deliberately **excluded**: moving an unchanged server
     /// definition between two config files must not register as drift.
+    ///
+    /// **Collision-free framing.** Every variable-length component (each arg,
+    /// each tool, each `env` name/value) is *length-prefixed* — its byte length
+    /// is written before its bytes via [`hash_field`] — rather than joined by a
+    /// `\0` separator. A separator-only scheme is ambiguous: `["a", "b"]` and
+    /// `["ab"]` would feed the hasher the same bytes, and a value that itself
+    /// contains a `\0` could forge a boundary. Length-prefixing makes the byte
+    /// stream an unambiguous encoding of the structure.
     pub fn content_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"mcp-server\0");
-        hasher.update(self.name.as_bytes());
-        hasher.update(b"\0");
+        hasher.update(b"mcp-server-v2\0");
+        hash_field(&mut hasher, self.name.as_bytes());
         match &self.transport {
             McpTransport::Url { url } => {
                 hasher.update(b"url\0");
-                hasher.update(url.as_bytes());
+                hash_field(&mut hasher, url.as_bytes());
             }
-            McpTransport::Stdio { command, args } => {
+            McpTransport::Stdio { command, args, env } => {
                 hasher.update(b"stdio\0");
-                hasher.update(command.as_bytes());
+                hash_field(&mut hasher, command.as_bytes());
+                hash_field(&mut hasher, &(args.len() as u64).to_le_bytes());
                 for arg in args {
-                    hasher.update(b"\0arg\0");
-                    hasher.update(arg.as_bytes());
+                    hash_field(&mut hasher, arg.as_bytes());
+                }
+                hash_field(&mut hasher, &(env.len() as u64).to_le_bytes());
+                for (key, value) in env {
+                    hash_field(&mut hasher, key.as_bytes());
+                    hash_field(&mut hasher, value.as_bytes());
                 }
             }
             McpTransport::Unknown => {
                 hasher.update(b"unknown\0");
             }
         }
+        hash_field(&mut hasher, &(self.tools.len() as u64).to_le_bytes());
         for tool in &self.tools {
-            hasher.update(b"\0tool\0");
-            hasher.update(tool.as_bytes());
+            hash_field(&mut hasher, tool.as_bytes());
         }
         hex_lower(&hasher.finalize())
     }
+}
+
+/// Feed one length-prefixed field into a hasher: the value's byte length as a
+/// little-endian `u64`, then the value's bytes. Length-prefixing every
+/// variable-length component makes the hash input an unambiguous encoding —
+/// no list of values can collide with a different list, and a `\0` (or any
+/// byte) inside a value can never be mistaken for a field boundary.
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// The structured inventory of every MCP server declared in a repository.
@@ -180,9 +224,17 @@ pub struct McpLockfile {
 
 impl McpLockfile {
     /// Build a lockfile from an inventory. Pure and deterministic: the same
-    /// inventory always yields the same lockfile.
+    /// inventory always yields the same lockfile — **regardless of the order
+    /// the inventory's servers happen to be in**.
+    ///
+    /// `build_inventory` already sorts, but `from_inventory` is a public entry
+    /// point that may be handed an inventory assembled by any means (a test, a
+    /// future caller, a different discovery order), so the sort is repeated
+    /// here and is the load-bearing one: servers are sorted by
+    /// `(name, source_config)` **before** the inventory hash is computed, so
+    /// both the lockfile and its `inventory_hash` are stable.
     pub fn from_inventory(inventory: &McpInventory) -> Self {
-        let servers: Vec<McpLockServer> = inventory
+        let mut servers: Vec<McpLockServer> = inventory
             .servers
             .iter()
             .map(|entry| McpLockServer {
@@ -193,6 +245,15 @@ impl McpLockfile {
                 hash: entry.content_hash(),
             })
             .collect();
+
+        // Deterministic ordering — independent of config-discovery order — so
+        // the lockfile and the inventory hash below are both stable. Must
+        // happen before `compute_inventory_hash`, which hashes server order.
+        servers.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.source_config.cmp(&b.source_config))
+        });
 
         let inventory_hash = compute_inventory_hash(&servers);
 
@@ -276,19 +337,88 @@ const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
 /// Discover the repo-local MCP config files that exist under `repo_root`.
 ///
 /// Returns `(absolute_path, repo_relative_path)` pairs, sorted by the relative
-/// path for determinism. Only regular files are returned. Discovery is strictly
-/// repo-local: every probed path is a fixed relative path joined onto
-/// `repo_root`, so it can never escape the repository.
+/// path for determinism. Only **regular files reachable without crossing a
+/// symlink, and resolving to a location inside `repo_root`**, are returned.
+///
+/// Discovery is strictly repo-local. Every probed path is a fixed relative
+/// path joined onto `repo_root`, so the *probed* path can never escape the
+/// repository — but a probed path could itself **be** a symlink (or sit under
+/// a symlinked parent directory) pointing outside the repo. Following that
+/// would break the "repo-local only" guarantee — a malicious or careless
+/// `.mcp.json -> ~/.claude/mcp.json` symlink would pull a user-level config
+/// into the inventory. So a config path is rejected when:
+///
+/// * it (or any ancestor up to `repo_root`) is itself a symlink — checked with
+///   `symlink_metadata`, which does **not** follow the final component, so the
+///   check is not subject to the TOCTOU window an `is_file()` probe has; or
+/// * its canonicalized (fully symlink-resolved) path does not stay inside the
+///   canonicalized `repo_root` — a defense-in-depth backstop.
 pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
+    // Canonicalize the repo root once for the containment check. If the root
+    // itself cannot be canonicalized (it does not exist), no config under it
+    // can be discovered anyway — return empty rather than guess.
+    let canonical_root = match repo_root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
     let mut found: Vec<(PathBuf, String)> = Vec::new();
     for rel in MCP_CONFIG_RELATIVE_PATHS {
         let abs = repo_root.join(rel);
-        if abs.is_file() {
-            found.push((abs, (*rel).to_string()));
+
+        // Reject if the final component, or any directory component between
+        // `repo_root` and it, is a symlink. `symlink_metadata` does not follow
+        // the path it is given, so each component is inspected as-is.
+        if path_crosses_symlink(repo_root, rel) {
+            continue;
         }
+
+        // The file must be a regular file (not a directory, FIFO, …). Use
+        // `symlink_metadata` so a symlink that slipped past the component walk
+        // is still not silently followed.
+        match std::fs::symlink_metadata(&abs) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            _ => continue,
+        }
+
+        // Defense in depth: the fully-resolved path must stay inside the
+        // resolved repo root. (With the symlink-component check above this is
+        // belt-and-braces, but it also catches an exotic mount/junction case.)
+        match abs.canonicalize() {
+            Ok(canonical) if canonical.starts_with(&canonical_root) => {}
+            _ => continue,
+        }
+
+        found.push((abs, (*rel).to_string()));
     }
     found.sort_by(|a, b| a.1.cmp(&b.1));
     found
+}
+
+/// `true` if any component of `rel` — joined onto `repo_root` — is a symlink.
+///
+/// Walks from `repo_root` outward one component at a time, calling
+/// `symlink_metadata` (which never follows the inspected path's last
+/// component) on each prefix. `repo_root` itself is intentionally **not**
+/// inspected: the caller chose it, and a repo legitimately reached through a
+/// symlinked checkout directory must still be scannable — only symlinks
+/// *inside* the repo, on the way to a config file, are rejected.
+fn path_crosses_symlink(repo_root: &Path, rel: &str) -> bool {
+    let mut current = repo_root.to_path_buf();
+    for component in Path::new(rel).components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            // A component that does not exist cannot be a symlink; let the
+            // caller's `symlink_metadata` on the full path handle "missing".
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Build the MCP inventory for a repository.
@@ -412,13 +542,47 @@ fn parse_transport(obj: &serde_json::Map<String, serde_json::Value>) -> McpTrans
                     .collect()
             })
             .unwrap_or_default();
+        let env = parse_env(obj);
         return McpTransport::Stdio {
             command: command.to_string(),
             args,
+            env,
         };
     }
 
     McpTransport::Unknown
+}
+
+/// Extract a stdio server's `env` object as `(name, value)` pairs, sorted by
+/// name so the hash is stable regardless of JSON key order. A non-string env
+/// value is captured by its JSON rendering (so a numeric or boolean env value
+/// — unusual but seen in real configs — is not silently dropped); a missing or
+/// non-object `env` field yields an empty vec.
+///
+/// `env` is **security-relevant**: it is what a config injects into the MCP
+/// subprocess. Capturing it means a swapped credential or an added variable
+/// shows up as drift in `mcp verify` / `mcp diff` rather than passing silently.
+fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = obj
+        .get("env")
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .map(|(k, v)| {
+                    // A string value is stored verbatim; any other JSON value
+                    // is stored as its compact JSON form so it is still part
+                    // of the hash and round-trips losslessly.
+                    let value = match v.as_str() {
+                        Some(s) => s.to_string(),
+                        None => v.to_string(),
+                    };
+                    (k.clone(), value)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    env.sort();
+    env
 }
 
 /// Extract the declared tool list from a server object, sorted and
@@ -466,6 +630,7 @@ mod tests {
                     "@modelcontextprotocol/server-filesystem".to_string(),
                     "/srv".to_string(),
                 ],
+                env: vec![],
             }
         );
         assert!(fs_entry.tools.is_empty());
@@ -494,6 +659,7 @@ mod tests {
             McpTransport::Stdio {
                 command: "node".to_string(),
                 args: vec!["s.js".to_string()],
+                env: vec![],
             }
         );
     }
@@ -583,6 +749,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec!["x".into()],
+                env: vec![],
             },
             tools: vec!["alpha".into(), "beta".into()],
             source_config: ".mcp.json".into(),
@@ -605,6 +772,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
+                env: vec![],
             },
             tools: vec![],
             source_config: ".mcp.json".into(),
@@ -627,6 +795,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
+                env: vec![],
             },
             tools: vec![],
             source_config: ".mcp.json".into(),
@@ -647,6 +816,7 @@ mod tests {
                     transport: McpTransport::Stdio {
                         command: "z".into(),
                         args: vec![],
+                        env: vec![],
                     },
                     tools: vec![],
                     source_config: ".mcp.json".into(),
@@ -690,6 +860,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "node".into(),
                     args: vec![],
+                    env: vec![],
                 },
                 tools: vec![],
                 source_config: ".mcp.json".into(),
@@ -806,5 +977,433 @@ mod tests {
         assert!(inventory.servers.is_empty());
         assert!(inventory.malformed_configs.is_empty());
         assert!(!inventory.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding A — `from_inventory` sorts servers before hashing, so a lockfile
+    // (and its inventory hash) is identical no matter what order discovery
+    // happened to produce.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_inventory_sorts_servers_regardless_of_input_order() {
+        let alpha = McpServerEntry {
+            name: "alpha".into(),
+            transport: McpTransport::Url {
+                url: "https://a.example".into(),
+            },
+            tools: vec!["t".into()],
+            source_config: ".mcp.json".into(),
+        };
+        let zeta = McpServerEntry {
+            name: "zeta".into(),
+            transport: McpTransport::Stdio {
+                command: "z".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec![],
+            source_config: ".vscode/mcp.json".into(),
+        };
+
+        // Same two servers, opposite inventory order.
+        let in_order = McpInventory {
+            servers: vec![alpha.clone(), zeta.clone()],
+            configs: vec![".mcp.json".into(), ".vscode/mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let reversed = McpInventory {
+            servers: vec![zeta, alpha],
+            configs: vec![".vscode/mcp.json".into(), ".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+
+        let lock_a = McpLockfile::from_inventory(&in_order);
+        let lock_b = McpLockfile::from_inventory(&reversed);
+
+        // Servers land in (name, source_config) order either way.
+        assert_eq!(lock_a.servers[0].name, "alpha");
+        assert_eq!(lock_a.servers[1].name, "zeta");
+        // The whole lockfile — including the order-sensitive inventory hash and
+        // the rendered bytes — is identical regardless of discovery order.
+        assert_eq!(lock_a, lock_b);
+        assert_eq!(lock_a.inventory_hash, lock_b.inventory_hash);
+        assert_eq!(lock_a.render(), lock_b.render());
+    }
+
+    #[test]
+    fn from_inventory_sorts_by_source_config_when_names_tie() {
+        // Two servers with the *same* name must order by source_config — and do
+        // so deterministically whichever way the inventory listed them.
+        let mk = |source: &str| McpServerEntry {
+            name: "dup".into(),
+            transport: McpTransport::Url {
+                url: "https://x.example".into(),
+            },
+            tools: vec![],
+            source_config: source.into(),
+        };
+        let forward = McpInventory {
+            servers: vec![mk(".mcp.json"), mk(".vscode/mcp.json")],
+            configs: vec![],
+            malformed_configs: vec![],
+        };
+        let backward = McpInventory {
+            servers: vec![mk(".vscode/mcp.json"), mk(".mcp.json")],
+            configs: vec![],
+            malformed_configs: vec![],
+        };
+        let lock_f = McpLockfile::from_inventory(&forward);
+        let lock_b = McpLockfile::from_inventory(&backward);
+        assert_eq!(lock_f.servers[0].source_config, ".mcp.json");
+        assert_eq!(lock_f.servers[1].source_config, ".vscode/mcp.json");
+        assert_eq!(lock_f, lock_b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding B — a symlinked config file (or one under a symlinked directory)
+    // is rejected: discovery is repo-local, and a symlink can point anywhere.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_rejects_symlinked_config_file() {
+        use std::os::unix::fs::symlink;
+
+        // A real config lives OUTSIDE the repo.
+        let outside = tempdir().unwrap();
+        let outside_config = outside.path().join("evil-mcp.json");
+        fs::write(
+            &outside_config,
+            r#"{ "mcpServers": { "evil": { "command": "node" } } }"#,
+        )
+        .unwrap();
+
+        // Inside the repo, `.mcp.json` is a *symlink* pointing at it.
+        let repo = tempdir().unwrap();
+        symlink(&outside_config, repo.path().join(".mcp.json")).unwrap();
+
+        // The symlinked config must NOT be discovered…
+        let found = discover_mcp_configs(repo.path());
+        assert!(
+            found.is_empty(),
+            "a symlinked .mcp.json must be rejected, not followed: {found:?}"
+        );
+
+        // …and the inventory must therefore be empty — the outside server is
+        // not pulled in.
+        let inventory = build_inventory(repo.path());
+        assert!(
+            inventory.servers.is_empty(),
+            "a symlinked config must contribute no servers"
+        );
+        assert!(inventory.configs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_rejects_config_under_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        // A real `.vscode/` directory with a config lives outside the repo.
+        let outside = tempdir().unwrap();
+        let outside_vscode = outside.path().join("vscode-real");
+        fs::create_dir_all(&outside_vscode).unwrap();
+        fs::write(
+            outside_vscode.join("mcp.json"),
+            r#"{ "servers": { "evil": { "command": "node" } } }"#,
+        )
+        .unwrap();
+
+        // Inside the repo, `.vscode` is a symlink to that outside directory.
+        let repo = tempdir().unwrap();
+        symlink(&outside_vscode, repo.path().join(".vscode")).unwrap();
+
+        // `.vscode/mcp.json` resolves outside the repo via the symlinked
+        // parent — it must be rejected.
+        let found = discover_mcp_configs(repo.path());
+        assert!(
+            found.is_empty(),
+            "a config reached through a symlinked directory must be rejected: {found:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_still_accepts_a_plain_regular_config() {
+        // Control: a plain (non-symlink) config file is still discovered — the
+        // symlink rejection must not break the normal case.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "ok": { "command": "node" } } }"#,
+        )
+        .unwrap();
+        let found = discover_mcp_configs(repo.path());
+        assert_eq!(found.len(), 1, "a plain regular config must still be found");
+        assert_eq!(found[0].1, ".mcp.json");
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding C — a stdio server's `env` is captured and an `env` change
+    // registers as drift (it is part of the per-server content hash).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_captures_stdio_env() {
+        let content = r#"{
+            "mcpServers": {
+                "s": {
+                    "command": "node",
+                    "args": ["server.js"],
+                    "env": { "API_TOKEN": "secret-1", "DEBUG": "1" }
+                }
+            }
+        }"#;
+        let entries = parse_mcp_config(content, ".mcp.json").expect("valid config");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].transport,
+            McpTransport::Stdio {
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                // env captured, sorted by name.
+                env: vec![
+                    ("API_TOKEN".to_string(), "secret-1".to_string()),
+                    ("DEBUG".to_string(), "1".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_env_is_sorted_and_handles_non_string_values() {
+        // Keys come back sorted regardless of JSON order; a non-string value is
+        // captured by its JSON rendering rather than dropped.
+        let content = r#"{
+            "mcpServers": {
+                "s": { "command": "n", "env": { "ZED": "z", "ABLE": 7 } }
+            }
+        }"#;
+        let entries = parse_mcp_config(content, ".mcp.json").unwrap();
+        match &entries[0].transport {
+            McpTransport::Stdio { env, .. } => {
+                assert_eq!(
+                    env,
+                    &vec![
+                        ("ABLE".to_string(), "7".to_string()),
+                        ("ZED".to_string(), "z".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_hash_changes_when_env_changes() {
+        // The headline of Finding C: an `env` change must register as drift.
+        let base = McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![("API_TOKEN".into(), "old".into())],
+            },
+            tools: vec![],
+            source_config: ".mcp.json".into(),
+        };
+        // Same server, the env value swapped (a rotated/exfiltrated credential).
+        let value_changed = McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![("API_TOKEN".into(), "new".into())],
+            },
+            ..base.clone()
+        };
+        // Same server, an extra env var added.
+        let var_added = McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![
+                    ("API_TOKEN".into(), "old".into()),
+                    ("EXTRA".into(), "x".into()),
+                ],
+            },
+            ..base.clone()
+        };
+        assert_ne!(
+            base.content_hash(),
+            value_changed.content_hash(),
+            "swapping an env value must change the content hash"
+        );
+        assert_ne!(
+            base.content_hash(),
+            var_added.content_hash(),
+            "adding an env var must change the content hash"
+        );
+
+        // And it flows through to the inventory hash / lockfile.
+        let inv_base = McpInventory {
+            servers: vec![base.clone()],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let inv_changed = McpInventory {
+            servers: vec![value_changed],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        assert_ne!(
+            McpLockfile::from_inventory(&inv_base).inventory_hash,
+            McpLockfile::from_inventory(&inv_changed).inventory_hash,
+            "an env change must surface as a different inventory hash"
+        );
+    }
+
+    #[test]
+    fn lockfile_format_version_is_2() {
+        // Finding C bumped the schema (the lockfile now carries `env`), so the
+        // format version is 2 — a future `mcp verify` can refuse a v1 file.
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 2);
+        let lock = McpLockfile::from_inventory(&McpInventory::default());
+        assert_eq!(lock.format_version, 2);
+    }
+
+    #[test]
+    fn lockfile_with_env_round_trips() {
+        // A lockfile carrying a server with `env` must serialize and parse back
+        // identically — the new schema field round-trips.
+        let inventory = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "s".into(),
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec!["server.js".into()],
+                    env: vec![("TOKEN".into(), "v".into())],
+                },
+                tools: vec![],
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let lock = McpLockfile::from_inventory(&inventory);
+        let parsed: McpLockfile =
+            serde_json::from_str(&lock.render()).expect("lockfile with env must round-trip");
+        assert_eq!(parsed, lock);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding D — the per-server hash is collision-free: a separator-delimited
+    // list scheme cannot distinguish `["a","b"]` from `["ab"]` or `["a\0b"]`;
+    // length-prefixing every component makes the hash input unambiguous.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_hash_distinguishes_ambiguous_arg_lists() {
+        // The three lists below would all feed the bytes `a` `b` to a
+        // `\0`-joined hasher in different framings — they must hash distinctly.
+        let mk = |args: Vec<&str>| McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: args.into_iter().map(String::from).collect(),
+                env: vec![],
+            },
+            tools: vec![],
+            source_config: ".mcp.json".into(),
+        };
+        let two = mk(vec!["a", "b"]);
+        let one_joined = mk(vec!["ab"]);
+        let one_with_nul = mk(vec!["a\0b"]);
+
+        assert_ne!(
+            two.content_hash(),
+            one_joined.content_hash(),
+            r#"["a","b"] must not hash the same as ["ab"]"#
+        );
+        assert_ne!(
+            two.content_hash(),
+            one_with_nul.content_hash(),
+            r#"["a","b"] must not hash the same as ["a\0b"]"#
+        );
+        assert_ne!(
+            one_joined.content_hash(),
+            one_with_nul.content_hash(),
+            r#"["ab"] must not hash the same as ["a\0b"]"#
+        );
+    }
+
+    #[test]
+    fn content_hash_distinguishes_ambiguous_tool_lists() {
+        // The same collision class for the `tools` list.
+        let mk = |tools: Vec<&str>| McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Url {
+                url: "https://x.example".into(),
+            },
+            tools: tools.into_iter().map(String::from).collect(),
+            source_config: ".mcp.json".into(),
+        };
+        let two = mk(vec!["a", "b"]);
+        let one_joined = mk(vec!["ab"]);
+        assert_ne!(
+            two.content_hash(),
+            one_joined.content_hash(),
+            r#"tools ["a","b"] must not hash the same as ["ab"]"#
+        );
+    }
+
+    #[test]
+    fn content_hash_distinguishes_ambiguous_env_pairs() {
+        // Length-prefixing also disambiguates env: a key/value boundary cannot
+        // be forged. {"AB": "c"} vs {"A": "Bc"} must hash distinctly.
+        let mk = |key: &str, value: &str| McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![(key.to_string(), value.to_string())],
+            },
+            tools: vec![],
+            source_config: ".mcp.json".into(),
+        };
+        assert_ne!(
+            mk("AB", "c").content_hash(),
+            mk("A", "Bc").content_hash(),
+            "env with key=AB value=c must not hash the same as key=A value=Bc"
+        );
+    }
+
+    #[test]
+    fn content_hash_arg_boundary_is_unambiguous_vs_command() {
+        // The command/args boundary must also be framed: `command="ab"` with no
+        // args must not collide with `command="a"` + args `["b"]`.
+        let cmd_only = McpServerEntry {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "ab".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec![],
+            source_config: ".mcp.json".into(),
+        };
+        let cmd_and_arg = McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "a".into(),
+                args: vec!["b".into()],
+                env: vec![],
+            },
+            ..cmd_only.clone()
+        };
+        assert_ne!(
+            cmd_only.content_hash(),
+            cmd_and_arg.content_hash(),
+            "the command/args boundary must be unambiguous"
+        );
     }
 }

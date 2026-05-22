@@ -201,15 +201,24 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
 }
 
 /// One-line description of a transport for the human summary.
+///
+/// A stdio server's `env` is named (the variable names only — values are not
+/// printed, since an `env` value is commonly a credential) so a reader of
+/// `mcp lock` output can see that the server runs with injected environment.
 fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
         mcp_lock::McpTransport::Url { url } => format!("url {url}"),
-        mcp_lock::McpTransport::Stdio { command, args } => {
-            if args.is_empty() {
+        mcp_lock::McpTransport::Stdio { command, args, env } => {
+            let mut desc = if args.is_empty() {
                 format!("stdio {command}")
             } else {
                 format!("stdio {} {}", command, args.join(" "))
+            };
+            if !env.is_empty() {
+                let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+                desc.push_str(&format!(" (env: {})", names.join(", ")));
             }
+            desc
         }
         mcp_lock::McpTransport::Unknown => "no transport declared".to_string(),
     }
@@ -256,6 +265,7 @@ mod tests {
             describe_transport(&McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
+                env: vec![],
             }),
             "stdio node"
         );
@@ -263,8 +273,21 @@ mod tests {
             describe_transport(&McpTransport::Stdio {
                 command: "npx".into(),
                 args: vec!["-y".into(), "server".into()],
+                env: vec![],
             }),
             "stdio npx -y server"
+        );
+        // A stdio server with env: the variable NAMES are shown, values are not.
+        assert_eq!(
+            describe_transport(&McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![
+                    ("API_TOKEN".into(), "secret".into()),
+                    ("DEBUG".into(), "1".into()),
+                ],
+            }),
+            "stdio node (env: API_TOKEN, DEBUG)"
         );
         assert_eq!(
             describe_transport(&McpTransport::Unknown),
