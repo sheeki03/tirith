@@ -338,13 +338,27 @@ fn check_workflow_dangerous_trigger(input: &str, findings: &mut Vec<Finding>) {
             Some((before, _)) => before.trim(),
             None => line,
         };
-        // `pull_request_target` appears as a YAML key — either `on:` mapping
-        // key (`pull_request_target:`) or a list item (`- pull_request_target`).
-        let is_trigger_key = code == "pull_request_target:"
+        // `pull_request_target` is dangerous in any of its YAML trigger forms:
+        //  * a block mapping key — `pull_request_target:` (under an `on:` map);
+        //  * a block sequence item — `- pull_request_target`;
+        //  * an inline `on:` value — the scalar `on: pull_request_target`, the
+        //    flow sequence `on: [pull_request_target, push]`, or the flow
+        //    mapping `on: {pull_request_target: …}`.
+        let is_block_form = code == "pull_request_target:"
             || code == "- pull_request_target"
             || code == "-pull_request_target"
             || code.starts_with("pull_request_target:");
-        if !is_trigger_key {
+        let is_inline_on_form = code.strip_prefix("on:").is_some_and(|rest| {
+            rest.trim()
+                .trim_start_matches(['[', '{'])
+                .trim_end_matches([']', '}'])
+                .split(',')
+                .any(|tok| {
+                    let tok = tok.trim();
+                    tok == "pull_request_target" || tok.starts_with("pull_request_target:")
+                })
+        });
+        if !is_block_form && !is_inline_on_form {
             continue;
         }
         findings.push(Finding {
@@ -1373,6 +1387,39 @@ mod tests {
     fn workflow_pull_request_target_in_comment_clean() {
         let wf =
             "on:\n  pull_request:  # not pull_request_target by design\n    branches: [main]\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowDangerousTrigger
+        ));
+    }
+
+    #[test]
+    fn workflow_pull_request_target_inline_list_form() {
+        // The compact flow-sequence `on:` form must fire.
+        let wf = "on: [pull_request_target, push]\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowDangerousTrigger
+        ));
+    }
+
+    #[test]
+    fn workflow_pull_request_target_inline_scalar_form() {
+        // The single-trigger scalar `on:` form must fire.
+        let wf = "on: pull_request_target\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowDangerousTrigger
+        ));
+    }
+
+    #[test]
+    fn workflow_inline_on_list_without_target_clean() {
+        // A compact `on:` list of only safe triggers must NOT fire.
+        let wf = "on: [push, pull_request]\n";
         assert!(!has(
             wf,
             ".github/workflows/ci.yml",
