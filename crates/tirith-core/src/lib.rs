@@ -22,6 +22,7 @@ pub mod policy_client;
 pub mod policy_validate;
 pub mod receipt;
 pub mod redact;
+pub mod registry_api;
 pub mod rule_explanations;
 pub mod rule_metadata;
 pub mod rules;

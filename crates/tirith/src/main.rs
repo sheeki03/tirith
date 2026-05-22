@@ -1207,13 +1207,21 @@ enum AuditReportFormat {
 
 #[derive(Subcommand)]
 enum PackageAction {
-    /// Score a package's provenance / maintainer risk (offline signals)
+    /// Score a package's provenance / maintainer risk
     #[command(after_help = "\
 Examples:
   tirith package risk npm react
   tirith package risk pypi reqeusts
   tirith package risk npm left-pad --path ./node_modules/left-pad
-  tirith package risk --format json npm express")]
+  tirith package risk --online npm express
+  tirith package risk --format json npm express
+
+Offline by default: name and local-content signals only, no network. Add
+--online to also consult the registry API (npm / PyPI / crates.io) for
+provenance signals — package age, ownership transfer, version spike, download
+counts, source-repo URL, yanked/deprecated status. --online is ignored when
+--offline or TIRITH_OFFLINE is set, and a registry failure degrades gracefully
+to the offline score.")]
     Risk {
         /// Package ecosystem: npm, pypi, rubygems, crates.io, go, maven, nuget, packagist
         ecosystem: String,
@@ -1225,6 +1233,16 @@ Examples:
         /// under node_modules / site-packages relative to the current dir.
         #[arg(long)]
         path: Option<String>,
+        /// Also consult the package's registry API (npm / PyPI / crates.io)
+        /// for provenance signals. Off by default — this is the only path on
+        /// which `package risk` reaches the network. Ignored when --offline
+        /// or TIRITH_OFFLINE is set; a registry failure degrades gracefully.
+        #[arg(long)]
+        online: bool,
+        /// Force offline scoring even if --online is passed. Also honored via
+        /// the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -1237,7 +1255,11 @@ Examples:
 Examples:
   tirith package explain npm express
   tirith package explain pypi reqeusts
-  tirith package explain --format json npm react")]
+  tirith package explain --online npm express
+  tirith package explain --format json npm react
+
+Offline by default. --online adds the registry-API provenance factors (see
+`tirith package risk --help`); --offline / TIRITH_OFFLINE forces offline.")]
     Explain {
         /// Package ecosystem: npm, pypi, rubygems, crates.io, go, maven, nuget, packagist
         ecosystem: String,
@@ -1247,6 +1269,14 @@ Examples:
         /// `package risk --path`). tirith never downloads the package.
         #[arg(long)]
         path: Option<String>,
+        /// Also consult the package's registry API for provenance signals
+        /// (see `tirith package risk --help`). Off by default.
+        #[arg(long)]
+        online: bool,
+        /// Force offline scoring even if --online is passed. Also honored via
+        /// the TIRITH_OFFLINE environment variable.
+        #[arg(long)]
+        offline: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -1771,21 +1801,25 @@ fn run() {
                 ecosystem,
                 name,
                 path,
+                online,
+                offline,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::package::risk(&ecosystem, &name, path.as_deref(), json)
+                cli::package::risk(&ecosystem, &name, path.as_deref(), online, offline, json)
             }
             PackageAction::Explain {
                 ecosystem,
                 name,
                 path,
+                online,
+                offline,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::package::explain(&ecosystem, &name, path.as_deref(), json)
+                cli::package::explain(&ecosystem, &name, path.as_deref(), online, offline, json)
             }
         },
 

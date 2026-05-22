@@ -251,9 +251,14 @@ tirith package risk npm react           # 0/100 — a known-popular package
 tirith package risk npm reqeusts        # high — one edit from a popular name
 tirith package explain pypi flask       # factor-by-factor derivation
 tirith package risk npm left-pad --path ./node_modules/left-pad
+tirith package risk --online npm react  # also consult the registry API
 ```
 
-This is the **offline-signals phase**: every signal is computed locally, with **no network or registry-API call**. The signals are (1) **name vs. popular packages** — whether the name is a known-popular package, an unknown name, or a one-edit near-miss of a popular one (the classic typosquat/slopsquat shape), from the local threat database's `popular` set; (2) **known malicious typosquat** — whether the threat DB's `typosquat` index lists the exact name; (3) **install / lifecycle scripts** and (4) **bundled binary blobs** — detected *only* when the package content is locally available (auto-discovered under `node_modules` / `site-packages`, or an explicit `--path`) — tirith **never downloads** the package. The score is advisory and standalone: `package risk` is not a detection rule and changes no verdict, exit code, or audit log. Registry-API-backed signals (download counts, package age, maintainer history, 2FA) are a separate later phase.
+**Offline by default.** With no flags, every signal is computed locally with **no network call**: (1) **name vs. popular packages** — whether the name is a known-popular package, an unknown name, or a one-edit near-miss of a popular one (the classic typosquat/slopsquat shape), from the local threat database's `popular` set; (2) **known malicious typosquat** — whether the threat DB's `typosquat` index lists the exact name; (3) **install / lifecycle scripts** and (4) **bundled binary blobs** — detected *only* when the package content is locally available (auto-discovered under `node_modules` / `site-packages`, or an explicit `--path`) — tirith **never downloads** the package.
+
+**`--online` adds registry-API provenance signals.** With `--online`, `package risk` additionally consults the package's registry API — the npm registry, the PyPI JSON API, or the crates.io API, selected by ecosystem — for six more factors, each an explicit named term in the *same* deterministic factor-sum model: package / version age, ownership transfer, an abnormal version-number spike, very low download counts, a missing source-repository URL, and yanked / deprecated status. `--online` is the **only** path on which `package risk` reaches the network — never the `check` hot path — and `--offline` / `TIRITH_OFFLINE` force offline even with `--online`. A network or registry failure degrades gracefully to the offline score with an honest `api signals: unavailable`, and successful responses are cached on disk with a TTL so repeated runs do not hammer the registries.
+
+The score is advisory and standalone: `package risk` is not a detection rule and changes no verdict, exit code, or audit log.
 
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
@@ -619,8 +624,8 @@ tirith daemon stop
 | `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
 | `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
 | `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
-| `tirith package risk <eco> <name>` | Score a package's provenance / maintainer risk from offline signals (`--path` inspects local package content; no network) |
-| `tirith package explain <eco> <name>` | Show the deterministic factor-by-factor derivation of a package's risk score |
+| `tirith package risk <eco> <name>` | Score a package's provenance / maintainer risk (offline by default; `--path` inspects local content; `--online` adds registry-API provenance signals) |
+| `tirith package explain <eco> <name>` | Show the deterministic factor-by-factor derivation of a package's risk score (`--online` adds the registry-API factors) |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule (`--fix` shows just the remediation) |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |

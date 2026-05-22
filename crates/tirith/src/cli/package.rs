@@ -1,17 +1,24 @@
 //! `tirith package risk` and `tirith package explain` — provenance /
-//! maintainer-risk scoring for a package, **offline-signals phase**.
+//! maintainer-risk scoring for a package.
 //!
 //! These commands score a package the way `tirith score` scores a URL: a
-//! deterministic, fully explainable sum of named offline signals. They make
-//! **no network or registry-API call** — name signals come from the local
-//! threat DB, and content signals only from a package directory the user
-//! already has on disk. Registry-API-backed signals are a later chunk.
+//! deterministic, fully explainable sum of named factors.
+//!
+//! **Offline by default.** Name signals come from the local threat DB, and
+//! content signals only from a package directory the user already has on
+//! disk — no network. `--online` additionally consults the package's
+//! registry API (npm / PyPI / crates.io) for provenance signals; that is the
+//! ONLY path on which these commands reach the network — never the `check`
+//! hot path. `--offline` / `TIRITH_OFFLINE` forces offline even with
+//! `--online`, and a registry failure degrades gracefully to the offline
+//! score with an honest `api signals: unavailable (reason)`.
 
 use std::path::{Path, PathBuf};
 
 use tirith_core::package_risk::{
-    self, ApiSignals, ContentSignals, NameVsPopular, PackageSignals, RiskBreakdown,
+    self, ApiProvenance, ApiSignals, ContentSignals, NameVsPopular, PackageSignals, RiskBreakdown,
 };
+use tirith_core::registry_api::{self, HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::{Ecosystem, ThreatDb};
 
 /// Run `tirith package risk <ecosystem> <name>`.
@@ -20,17 +27,62 @@ use tirith_core::threatdb::{Ecosystem, ThreatDb};
 /// points at locally-available package content to inspect for install-script
 /// and binary-blob signals; when omitted, tirith tries to auto-discover the
 /// package under `node_modules` / `site-packages` relative to the cwd.
-pub fn risk(ecosystem: &str, name: &str, path: Option<&str>, json: bool) -> i32 {
-    run(ecosystem, name, path, json, /* explain = */ false)
+///
+/// `online` opts into the registry-API provenance signals; `offline` (or the
+/// `TIRITH_OFFLINE` env var) forces offline scoring even when `online` is set.
+pub fn risk(
+    ecosystem: &str,
+    name: &str,
+    path: Option<&str>,
+    online: bool,
+    offline: bool,
+    json: bool,
+) -> i32 {
+    run(
+        ecosystem, name, path, online, offline, json, /* explain = */ false,
+    )
 }
 
 /// Run `tirith package explain <ecosystem> <name>` — the factor-by-factor
 /// derivation of the same score (mirrors `tirith score --explain`).
-pub fn explain(ecosystem: &str, name: &str, path: Option<&str>, json: bool) -> i32 {
-    run(ecosystem, name, path, json, /* explain = */ true)
+pub fn explain(
+    ecosystem: &str,
+    name: &str,
+    path: Option<&str>,
+    online: bool,
+    offline: bool,
+    json: bool,
+) -> i32 {
+    run(
+        ecosystem, name, path, online, offline, json, /* explain = */ true,
+    )
 }
 
-fn run(ecosystem: &str, name: &str, path: Option<&str>, json: bool, explain: bool) -> i32 {
+/// `true` when `TIRITH_OFFLINE` is set to a truthy value. Mirrors
+/// `threatdb_cmd::offline_env_active` so the offline switch is consistent
+/// across the CLI.
+fn offline_env_active() -> bool {
+    std::env::var("TIRITH_OFFLINE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    ecosystem: &str,
+    name: &str,
+    path: Option<&str>,
+    online: bool,
+    offline: bool,
+    json: bool,
+    explain: bool,
+) -> i32 {
     let Some(eco) = Ecosystem::from_name(ecosystem) else {
         eprintln!(
             "tirith package: unknown ecosystem '{ecosystem}'. \
@@ -59,6 +111,18 @@ fn run(ecosystem: &str, name: &str, path: Option<&str>, json: bool, explain: boo
     // never downloads the package to obtain these.
     let content_signals = gather_content_signals(eco, trimmed_name, path);
 
+    // Registry-API signals — ONLY when `--online` was passed and offline mode
+    // is not in force. The production client is the networked
+    // `HttpRegistryClient`; `gather_api` itself is offline-safe and degrades
+    // any failure to `ApiSignals::Unavailable`.
+    let api = if online {
+        let client = HttpRegistryClient::new();
+        gather_api(&client, eco, trimmed_name, offline)
+    } else {
+        // No `--online`: the default offline state.
+        ApiSignals::offline()
+    };
+
     let signals = PackageSignals {
         ecosystem: eco,
         name: trimmed_name.to_string(),
@@ -66,6 +130,7 @@ fn run(ecosystem: &str, name: &str, path: Option<&str>, json: bool, explain: boo
         name_vs_popular,
         malicious_typosquat_of,
         content_signals,
+        api,
     };
 
     let breakdown = package_risk::score_package(&signals);
@@ -83,6 +148,36 @@ fn run(ecosystem: &str, name: &str, path: Option<&str>, json: bool, explain: boo
         print_human(&breakdown, explain);
     }
     0
+}
+
+// --- registry-API signals (opt-in, networked) ------------------------------
+
+/// Gather registry-API provenance signals using `client`.
+///
+/// `offline_flag` carries the `--offline` flag; when it — or the
+/// `TIRITH_OFFLINE` env var — is set, this is a guaranteed no-op that returns
+/// [`ApiSignals::Unavailable`] WITHOUT making any network call, so an
+/// `--online --offline` invocation (or `--online` under `TIRITH_OFFLINE=1`)
+/// stays purely local. Otherwise it delegates to
+/// [`registry_api::gather_api_signals`], which itself degrades any registry
+/// failure gracefully — this function never panics, never hangs beyond the
+/// client's timeout, and never blocks the caller.
+///
+/// `client` is a trait object so tests inject a fixture-fed fake and never
+/// touch the real registries.
+fn gather_api(
+    client: &dyn RegistryClient,
+    eco: Ecosystem,
+    name: &str,
+    offline_flag: bool,
+) -> ApiSignals {
+    if offline_flag || offline_env_active() {
+        return ApiSignals::unavailable(
+            "offline mode is active (--offline / TIRITH_OFFLINE) — \
+             registry-API signals were skipped, scored with offline signals only",
+        );
+    }
+    registry_api::gather_api_signals(client, eco, name)
 }
 
 // --- content inspection (offline, filesystem-only) -------------------------
@@ -377,10 +472,17 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
         }
     }
 
-    // API-signal seam — always reported so the offline scope is explicit.
+    // API-signal seam — always reported so the offline/online scope is
+    // explicit and a degraded online run is honest about why.
     match &breakdown.api_signals {
         ApiSignals::NotComputed { reason } => {
             println!("  api signals: not computed — {reason}");
+        }
+        ApiSignals::Unavailable { reason } => {
+            println!("  api signals: unavailable — {reason}");
+        }
+        ApiSignals::Available { provenance } => {
+            print_api_provenance_human(provenance);
         }
     }
 
@@ -391,6 +493,48 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
             "  Run 'tirith package explain {} {}' for the factor-by-factor derivation.",
             breakdown.ecosystem, breakdown.name
         );
+    }
+}
+
+/// Render the gathered registry-API provenance for the human summary. Only the
+/// signals the registry actually reported are printed; an unknown datum is
+/// shown as `unknown` so the reader can see what the registry did not expose.
+fn print_api_provenance_human(p: &ApiProvenance) {
+    println!("  api signals: from the {} registry API", p.source);
+    match p.package_age_days {
+        Some(d) => println!("               - package age: {d} day(s) since first publish"),
+        None => println!("               - package age: unknown (not reported)"),
+    }
+    match (&p.latest_version, p.latest_version_age_days) {
+        (Some(v), Some(d)) => {
+            println!("               - latest version: {v} ({d} day(s) old)")
+        }
+        (Some(v), None) => println!("               - latest version: {v}"),
+        (None, _) => println!("               - latest version: unknown"),
+    }
+    match p.ownership_transferred {
+        Some(true) => println!("               - ownership: transferred recently"),
+        Some(false) => println!("               - ownership: stable"),
+        None => println!("               - ownership: unknown (no history)"),
+    }
+    match p.version_spike {
+        Some(true) => println!("               - version jump: abnormal (major-version spike)"),
+        Some(false) => println!("               - version jump: normal"),
+        None => println!("               - version jump: unknown (one version only)"),
+    }
+    match p.recent_downloads {
+        Some(dl) => println!("               - downloads: {dl} (recent window)"),
+        None => println!("               - downloads: unknown (not reported)"),
+    }
+    match p.has_source_repo {
+        Some(true) => println!("               - source repo: listed"),
+        Some(false) => println!("               - source repo: missing or unusable"),
+        None => println!("               - source repo: unknown (field not in API)"),
+    }
+    if p.yanked_or_deprecated {
+        println!("               - status: latest version yanked / deprecated");
+    } else {
+        println!("               - status: latest version current");
     }
 }
 
@@ -411,7 +555,7 @@ fn write_breakdown_human(
     writeln!(w)?;
     writeln!(
         w,
-        "  risk breakdown (each factor is fixed and inspectable — offline signals only, no model):"
+        "  risk breakdown (each factor is fixed and inspectable — no model):"
     )?;
     let mut running: i32 = 0;
     for factor in &breakdown.factors {
@@ -449,12 +593,15 @@ mod tests {
 
     #[test]
     fn unknown_ecosystem_is_rejected_with_exit_2() {
-        assert_eq!(risk("not-a-real-ecosystem", "react", None, false), 2);
+        assert_eq!(
+            risk("not-a-real-ecosystem", "react", None, false, false, false),
+            2
+        );
     }
 
     #[test]
     fn empty_name_is_rejected_with_exit_2() {
-        assert_eq!(risk("npm", "   ", None, false), 2);
+        assert_eq!(risk("npm", "   ", None, false, false, false), 2);
     }
 
     #[test]
@@ -582,6 +729,7 @@ mod tests {
             name_vs_popular: NameVsPopular::KnownPopular,
             malicious_typosquat_of: None,
             content_signals: ContentSignals::NotInspected,
+            api: ApiSignals::offline(),
         };
         let breakdown = package_risk::score_package(&signals);
         let out = render(&breakdown);
@@ -609,6 +757,7 @@ mod tests {
                 has_binary_blob: true,
                 binary_blob_detail: None,
             },
+            api: ApiSignals::offline(),
         };
         let breakdown = package_risk::score_package(&signals);
         assert_eq!(breakdown.score, 100);
@@ -624,5 +773,114 @@ mod tests {
             out.contains("(critical)"),
             "100 is the critical bucket: {out}"
         );
+    }
+
+    // --- registry-API path (no real network: fixture-fed fake client) ------
+
+    use tirith_core::registry_api::{FetchError, RegistryMetadata};
+
+    /// A fixture-fed [`RegistryClient`]. The `panic!` on `fetch` for the
+    /// offline-short-circuit tests proves no network call was attempted.
+    struct FakeClient {
+        result: Result<RegistryMetadata, FetchError>,
+    }
+    impl RegistryClient for FakeClient {
+        fn fetch(&self, _eco: Ecosystem, _name: &str) -> Result<RegistryMetadata, FetchError> {
+            self.result.clone()
+        }
+    }
+
+    /// A client whose `fetch` panics — used to prove the offline switch
+    /// short-circuits *before* any registry call is made.
+    struct ExplodingClient;
+    impl RegistryClient for ExplodingClient {
+        fn fetch(&self, _eco: Ecosystem, _name: &str) -> Result<RegistryMetadata, FetchError> {
+            panic!("fetch must not be called when offline mode is active");
+        }
+    }
+
+    #[test]
+    fn gather_api_offline_flag_skips_network() {
+        // The exploding client would panic if reached — the `--offline` flag
+        // must short-circuit to Unavailable without calling `fetch`.
+        let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", true);
+        match sig {
+            ApiSignals::Unavailable { reason } => {
+                assert!(reason.contains("offline"), "reason: {reason}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gather_api_success_returns_available() {
+        let meta = RegistryMetadata {
+            source: "npm".to_string(),
+            latest_version: Some("1.0.0".to_string()),
+            ..Default::default()
+        };
+        let client = FakeClient { result: Ok(meta) };
+        let sig = gather_api(&client, Ecosystem::Npm, "react", false);
+        assert!(matches!(sig, ApiSignals::Available { .. }));
+    }
+
+    #[test]
+    fn gather_api_failure_degrades_to_unavailable() {
+        let client = FakeClient {
+            result: Err(FetchError::Network("connection refused".to_string())),
+        };
+        let sig = gather_api(&client, Ecosystem::Npm, "react", false);
+        assert!(matches!(sig, ApiSignals::Unavailable { .. }));
+    }
+
+    #[test]
+    fn online_run_offline_flag_still_exits_zero_without_network() {
+        // `--online` together with `--offline` must score with offline
+        // signals and exit 0 — and make no network call (the offline flag
+        // short-circuits before any `HttpRegistryClient` request). This
+        // exercises the public `run` end-to-end with no real network.
+        let code = run(
+            "npm", "react", None, /* online = */ true, /* offline = */ true,
+            /* json = */ true, /* explain = */ false,
+        );
+        assert_eq!(code, 0, "an --online --offline run must exit 0 offline");
+    }
+
+    #[test]
+    fn available_provenance_drives_api_factors_and_human_output() {
+        let provenance = ApiProvenance {
+            source: "pypi".to_string(),
+            package_age_days: Some(2),
+            latest_version_age_days: Some(1),
+            ownership_transferred: Some(true),
+            version_spike: Some(true),
+            recent_downloads: Some(5),
+            has_source_repo: Some(false),
+            yanked_or_deprecated: true,
+            latest_version: Some("9.9.9".to_string()),
+        };
+        let s = PackageSignals {
+            ecosystem: Ecosystem::PyPI,
+            name: "p".to_string(),
+            threat_db_missing: true,
+            name_vs_popular: NameVsPopular::Unknown,
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::NotInspected,
+            api: ApiSignals::Available { provenance },
+        };
+        let breakdown = package_risk::score_package(&s);
+        // The breakdown carries the API factors; the score is non-zero.
+        assert!(breakdown.score > 0);
+        assert!(breakdown.factors.iter().any(|f| f.id.starts_with("api_")));
+        assert!(matches!(
+            breakdown.api_signals,
+            ApiSignals::Available { .. }
+        ));
+        // The human renderer prints a line for every API signal.
+        if let ApiSignals::Available { provenance } = &breakdown.api_signals {
+            // `print_api_provenance_human` writes to stdout; just confirm it
+            // does not panic on a fully-populated provenance.
+            print_api_provenance_human(provenance);
+        }
     }
 }
