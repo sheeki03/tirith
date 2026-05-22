@@ -273,27 +273,37 @@ fn serialize_ecosystem<S: serde::Serializer>(eco: &Ecosystem, s: S) -> Result<S:
 
 /// Parse a manifest's text into the dependencies it declares.
 ///
-/// Total and side-effect-free: a malformed manifest yields an empty list, not
-/// an error and not a panic — a scan over a partly-broken project still
-/// reports on the manifests it could read.
-pub fn parse_manifest(kind: ManifestKind, text: &str) -> Vec<DeclaredDependency> {
+/// Total and side-effect-free; never panics. The return distinguishes the two
+/// failure-shaped cases a scan note must tell apart:
+///
+/// * `Some(deps)` — the manifest *parsed*. `deps` may still be empty, which
+///   honestly means "this manifest declares no dependencies".
+/// * `None` — the manifest is **malformed** (a structured `package.json` /
+///   `Cargo.toml` / `pyproject.toml` whose JSON / TOML could not be parsed).
+///   A scan over a partly-broken project still reports the manifests it could
+///   read, and notes this one as un-parseable.
+///
+/// The line-based formats (`requirements.txt`, `go.mod`, `Gemfile`) have no
+/// "malformed" state — any text is a valid, possibly-empty line set — so they
+/// always return `Some`.
+pub fn parse_manifest(kind: ManifestKind, text: &str) -> Option<Vec<DeclaredDependency>> {
     match kind {
         ManifestKind::NpmPackageJson => parse_package_json(text),
         ManifestKind::NpmPackageLock => parse_package_lock(text),
-        ManifestKind::PyRequirementsTxt => parse_requirements_txt(text),
+        ManifestKind::PyRequirementsTxt => Some(parse_requirements_txt(text)),
         ManifestKind::PyPyprojectToml => parse_pyproject_toml(text),
         ManifestKind::CargoToml => parse_cargo_toml(text),
-        ManifestKind::GoMod => parse_go_mod(text),
-        ManifestKind::RubyGemfile => parse_gemfile(text),
+        ManifestKind::GoMod => Some(parse_go_mod(text)),
+        ManifestKind::RubyGemfile => Some(parse_gemfile(text)),
     }
 }
 
 /// npm `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`,
 /// `peerDependencies`. `devDependencies` are tagged `dev = true`.
-fn parse_package_json(text: &str) -> Vec<DeclaredDependency> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
+///
+/// `None` when the text is not valid JSON (a malformed manifest).
+fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
+    let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let mut out = Vec::new();
     for (field, dev) in [
         ("dependencies", false),
@@ -316,17 +326,15 @@ fn parse_package_json(text: &str) -> Vec<DeclaredDependency> {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// npm `package-lock.json`: the fully-resolved tree. lockfile v2/v3 keys the
 /// `packages` map by install path (`node_modules/<name>`); v1 keys the
 /// `dependencies` map directly by name. Both are read so the lock's
 /// *transitive* closure is covered.
-fn parse_package_lock(text: &str) -> Vec<DeclaredDependency> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
+fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
+    let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let mut seen: BTreeSet<(String, Option<String>)> = BTreeSet::new();
     let mut out = Vec::new();
 
@@ -358,7 +366,7 @@ fn parse_package_lock(text: &str) -> Vec<DeclaredDependency> {
         collect_lock_v1_deps(deps, &mut seen, &mut out);
     }
 
-    out
+    Some(out)
 }
 
 /// Extract the package name from a `package-lock.json` v2/v3 path key.
@@ -472,10 +480,8 @@ fn python_requirement_name(line: &str) -> Option<String> {
 /// Python `pyproject.toml`: PEP 621 `[project].dependencies` /
 /// `[project.optional-dependencies]`, plus Poetry's
 /// `[tool.poetry.dependencies]` / `[tool.poetry.group.*.dependencies]`.
-fn parse_pyproject_toml(text: &str) -> Vec<DeclaredDependency> {
-    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
-        return Vec::new();
-    };
+fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
+    let doc = toml::from_str::<toml::Value>(text).ok()?;
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
@@ -564,15 +570,13 @@ fn parse_pyproject_toml(text: &str) -> Vec<DeclaredDependency> {
         }
     }
 
-    out
+    Some(out)
 }
 
 /// Rust `Cargo.toml`: `[dependencies]`, `[build-dependencies]`,
 /// `[dev-dependencies]`, and the same three under any `[target.*]` table.
-fn parse_cargo_toml(text: &str) -> Vec<DeclaredDependency> {
-    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
-        return Vec::new();
-    };
+fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
+    let doc = toml::from_str::<toml::Value>(text).ok()?;
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
@@ -626,7 +630,7 @@ fn parse_cargo_toml(text: &str) -> Vec<DeclaredDependency> {
         }
     }
 
-    out
+    Some(out)
 }
 
 /// Go `go.mod`: `require` directives, both the single-line form
@@ -779,26 +783,65 @@ fn is_plausible_package_name(name: &str) -> bool {
 /// match — so it is deliberately conservative: it fires only when a name is
 /// unknown to the threat DB **and** looks AI-hallucinated **and** sits near a
 /// real popular name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SlopsquatAssessment {
-    /// `true` when the dependency is slopsquat-suspicious.
-    pub suspicious: bool,
-    /// The named, inspectable reasons the heuristic fired (empty when not
-    /// suspicious). Each is a plain-language clause a reader can verify.
-    pub reasons: Vec<String>,
-    /// The popular package the suspicious name sits near, when the heuristic
-    /// identified one (an edit-distance near-miss or a shared token).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub near_popular: Option<String>,
+///
+/// Modeled as an enum so the two valid states are the *only* representable
+/// states: a [`SlopsquatAssessment::Suspicious`] always carries both its
+/// reasons and the near-popular anchor it matched — there is no representable
+/// "suspicious but anchorless" state, which is why [`findings_for`] needs no
+/// fallback for a missing anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlopsquatAssessment {
+    /// The dependency is not slopsquat-suspicious.
+    Clear,
+    /// The dependency is slopsquat-suspicious.
+    Suspicious {
+        /// The named, inspectable reasons the heuristic fired. Each is a
+        /// plain-language clause a reader can verify; always non-empty.
+        reasons: Vec<String>,
+        /// The real popular package the suspicious name sits near — an
+        /// edit-distance near-miss or an embedded shared token. The heuristic
+        /// only ever fires *with* an anchor, so this is unconditionally
+        /// present.
+        near_popular: String,
+    },
 }
 
 impl SlopsquatAssessment {
     /// The not-suspicious verdict.
     fn clear() -> Self {
-        SlopsquatAssessment {
-            suspicious: false,
-            reasons: Vec::new(),
-            near_popular: None,
+        SlopsquatAssessment::Clear
+    }
+
+    /// `true` when the dependency is slopsquat-suspicious.
+    pub fn is_suspicious(&self) -> bool {
+        matches!(self, SlopsquatAssessment::Suspicious { .. })
+    }
+}
+
+// A hand-written `Serialize` that preserves the pre-enum `--format json`
+// shape exactly: `{"suspicious": bool, "reasons": [...], "near_popular": "…"}`,
+// with `near_popular` present only when suspicious. A consumer parsing the
+// `ecosystem scan --format json` report sees no change.
+impl Serialize for SlopsquatAssessment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            SlopsquatAssessment::Clear => {
+                let mut st = serializer.serialize_struct("SlopsquatAssessment", 2)?;
+                st.serialize_field("suspicious", &false)?;
+                st.serialize_field("reasons", &Vec::<String>::new())?;
+                st.end()
+            }
+            SlopsquatAssessment::Suspicious {
+                reasons,
+                near_popular,
+            } => {
+                let mut st = serializer.serialize_struct("SlopsquatAssessment", 3)?;
+                st.serialize_field("suspicious", &true)?;
+                st.serialize_field("reasons", reasons)?;
+                st.serialize_field("near_popular", near_popular)?;
+                st.end()
+            }
         }
     }
 }
@@ -934,15 +977,14 @@ pub fn slopsquat(
     // merely resembles a popular name, is not enough on its own — that keeps
     // the false-positive rate low (an honest `data-utils` with no popular
     // anchor does not fire; a near-miss with a normal name does not fire).
-    let suspicious = shape.is_some() && near_popular.is_some();
-    if !suspicious {
-        return SlopsquatAssessment::clear();
-    }
-
-    SlopsquatAssessment {
-        suspicious,
-        reasons,
-        near_popular,
+    // When both hold, `near_popular` is `Some` by construction, so the
+    // `Suspicious` variant can carry it unconditionally.
+    match (shape.is_some(), near_popular) {
+        (true, Some(near_popular)) => SlopsquatAssessment::Suspicious {
+            reasons,
+            near_popular,
+        },
+        _ => SlopsquatAssessment::Clear,
     }
 }
 
@@ -1114,19 +1156,20 @@ pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
     }
 
     // 2 — slopsquat-suspicious (AI-hallucinated name). Advisory: a name shaped
-    // like an LLM hallucination, near a real popular package.
-    if assessment.slopsquat.suspicious {
-        let near = assessment
-            .slopsquat
-            .near_popular
-            .as_deref()
-            .unwrap_or("a popular package");
+    // like an LLM hallucination, near a real popular package. The `Suspicious`
+    // variant carries the near-popular anchor and reasons directly — no
+    // fallback for a missing anchor, because the type cannot represent one.
+    if let SlopsquatAssessment::Suspicious {
+        reasons,
+        near_popular,
+    } = &assessment.slopsquat
+    {
         findings.push(Finding {
             rule_id: RuleId::ThreatSuspiciousPackage,
             severity: Severity::Medium,
             title: format!(
                 "Possible slopsquat dependency: {} (near '{}')",
-                dep.name, near
+                dep.name, near_popular
             ),
             description: format!(
                 "The {} dependency '{}' declared in {} is not a known-real package and its \
@@ -1136,18 +1179,18 @@ pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
                 dep.ecosystem,
                 dep.name,
                 manifest,
-                near,
-                assessment.slopsquat.reasons.join("; "),
+                near_popular,
+                reasons.join("; "),
                 assessment.risk.score,
                 assessment.risk.risk_level,
             ),
             evidence: vec![Evidence::Text {
                 detail: format!(
-                    "manifest={manifest} package={} ecosystem={} near_popular={near} \
+                    "manifest={manifest} package={} ecosystem={} near_popular={near_popular} \
                      reasons=[{}]",
                     dep.name,
                     dep.ecosystem,
-                    assessment.slopsquat.reasons.join(" | "),
+                    reasons.join(" | "),
                 ),
             }],
             human_view: None,
@@ -1315,17 +1358,31 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
                 continue;
             }
         };
-        let deps = parse_manifest(manifest.kind, &text);
-        if deps.is_empty() {
-            notes.push(ScanNote {
-                manifest: Some(rel.clone()),
-                note: "no dependencies parsed (the file may be empty, malformed, or \
-                       declare no dependencies)."
-                    .to_string(),
-            });
-        }
-        for dep in deps {
-            declared.push((dep, rel.clone()));
+        // A `None` means the manifest is malformed (un-parseable JSON / TOML);
+        // a `Some(empty)` means it parsed but declares nothing. The two get
+        // distinct notes so the report is honest about which it was.
+        match parse_manifest(manifest.kind, &text) {
+            None => {
+                notes.push(ScanNote {
+                    manifest: Some(rel.clone()),
+                    note: format!(
+                        "the {} manifest could not be parsed (malformed JSON / TOML) — \
+                         its dependencies were not assessed.",
+                        manifest.kind.label()
+                    ),
+                });
+            }
+            Some(deps) => {
+                if deps.is_empty() {
+                    notes.push(ScanNote {
+                        manifest: Some(rel.clone()),
+                        note: "the manifest parsed but declares no dependencies.".to_string(),
+                    });
+                }
+                for dep in deps {
+                    declared.push((dep, rel.clone()));
+                }
+            }
         }
     }
 
@@ -1352,6 +1409,44 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     for (dep, manifest) in declared {
         let assessment = assess_dependency(&dep, &manifest, request, &mut api_cache);
         assessments.push(assessment);
+    }
+
+    // On an `--online` scan, surface how many dependencies could not get their
+    // registry-API provenance — a fully-degraded online scan would otherwise
+    // be indistinguishable from a clean one. The per-dependency reason varies
+    // (offline, timeout, 404, ...); a representative one is carried so the note
+    // is actionable without one line per dependency.
+    if online {
+        let unavailable: Vec<&DependencyAssessment> = assessments
+            .iter()
+            .filter(|a| matches!(a.risk.api_signals, ApiSignals::Unavailable { .. }))
+            .collect();
+        if !unavailable.is_empty() {
+            let sample_reason = unavailable.iter().find_map(|a| match &a.risk.api_signals {
+                ApiSignals::Unavailable { reason } => Some(reason.clone()),
+                _ => None,
+            });
+            let note = match sample_reason {
+                Some(reason) => format!(
+                    "registry-API provenance was unavailable for {} of {} dependency/dependencies \
+                     — the --online half of the scan was degraded for them (e.g. {reason}). \
+                     Those packages were scored with offline signals only.",
+                    unavailable.len(),
+                    assessments.len(),
+                ),
+                None => format!(
+                    "registry-API provenance was unavailable for {} of {} dependency/dependencies \
+                     — the --online half of the scan was degraded for them; they were scored \
+                     with offline signals only.",
+                    unavailable.len(),
+                    assessments.len(),
+                ),
+            };
+            notes.push(ScanNote {
+                manifest: None,
+                note,
+            });
+        }
     }
 
     // Assemble the verdict: every finding from every assessment.
@@ -1501,7 +1596,7 @@ mod tests {
             "dependencies": { "react": "^18.0.0", "lodash": "4.17.21" },
             "devDependencies": { "jest": "^29.0.0" }
         }"#;
-        let deps = parse_package_json(text);
+        let deps = parse_package_json(text).expect("valid JSON parses");
         assert_eq!(deps.len(), 3);
         let react = deps.iter().find(|d| d.name == "react").unwrap();
         assert!(!react.dev);
@@ -1512,10 +1607,12 @@ mod tests {
 
     #[test]
     fn parse_package_json_handles_malformed() {
-        assert!(parse_package_json("{not json").is_empty());
-        assert!(parse_package_json("").is_empty());
-        // Valid JSON, no dependency fields.
-        assert!(parse_package_json(r#"{"name":"x"}"#).is_empty());
+        // Malformed JSON → `None` (the manifest could not be parsed).
+        assert!(parse_package_json("{not json").is_none());
+        assert!(parse_package_json("").is_none());
+        // Valid JSON with no dependency fields → `Some(empty)`: it parsed, it
+        // just declares nothing.
+        assert_eq!(parse_package_json(r#"{"name":"x"}"#), Some(Vec::new()));
     }
 
     // --- package-lock.json ------------------------------------------------
@@ -1531,7 +1628,7 @@ mod tests {
                 "node_modules/a/node_modules/@scope/b": { "version": "1.0.0" }
             }
         }"#;
-        let deps = parse_package_lock(text);
+        let deps = parse_package_lock(text).expect("valid lockfile JSON parses");
         assert!(deps.iter().any(|d| d.name == "lodash"));
         assert!(deps.iter().any(|d| d.name == "jest" && d.dev));
         // The deepest path key resolves to the scoped name after the last
@@ -1555,7 +1652,7 @@ mod tests {
                 }
             }
         }"#;
-        let deps = parse_package_lock(text);
+        let deps = parse_package_lock(text).expect("valid lockfile JSON parses");
         assert!(deps.iter().any(|d| d.name == "express"));
         assert!(
             deps.iter().any(|d| d.name == "accepts"),
@@ -1631,7 +1728,7 @@ dependencies = ["requests>=2.0", "click"]
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "black"]
 "#;
-        let deps = parse_pyproject_toml(text);
+        let deps = parse_pyproject_toml(text).expect("valid TOML parses");
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"requests"));
         assert!(names.contains(&"click"));
@@ -1649,7 +1746,7 @@ requests = "^2.28"
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
 "#;
-        let deps = parse_pyproject_toml(text);
+        let deps = parse_pyproject_toml(text).expect("valid TOML parses");
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"requests"));
         assert!(
@@ -1662,7 +1759,8 @@ pytest = "^7.0"
 
     #[test]
     fn parse_pyproject_handles_malformed() {
-        assert!(parse_pyproject_toml("[[[not toml").is_empty());
+        // Malformed TOML → `None` (the manifest could not be parsed).
+        assert!(parse_pyproject_toml("[[[not toml").is_none());
     }
 
     // --- Cargo.toml -------------------------------------------------------
@@ -1683,7 +1781,7 @@ criterion = "0.5"
 [build-dependencies]
 cc = "1.0"
 "#;
-        let deps = parse_cargo_toml(text);
+        let deps = parse_cargo_toml(text).expect("valid TOML parses");
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"serde"));
         assert!(names.contains(&"tokio"));
@@ -1700,7 +1798,7 @@ cc = "1.0"
 [dependencies]
 foo = { version = "1", package = "real-crate" }
 "#;
-        let deps = parse_cargo_toml(text);
+        let deps = parse_cargo_toml(text).expect("valid TOML parses");
         assert!(
             deps.iter().any(|d| d.name == "real-crate"),
             "the renamed-to crate must be scored: {deps:?}"
@@ -1714,7 +1812,7 @@ foo = { version = "1", package = "real-crate" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 "#;
-        let deps = parse_cargo_toml(text);
+        let deps = parse_cargo_toml(text).expect("valid TOML parses");
         assert!(deps.iter().any(|d| d.name == "libc"));
     }
 
@@ -1817,7 +1915,11 @@ end
     #[test]
     fn slopsquat_clear_for_known_popular() {
         let a = slopsquat("react", &NameVsPopular::KnownPopular, None, Ecosystem::Npm);
-        assert!(!a.suspicious, "a known-popular package is never slopsquat");
+        assert_eq!(
+            a,
+            SlopsquatAssessment::Clear,
+            "a known-popular package is never slopsquat"
+        );
     }
 
     #[test]
@@ -1830,7 +1932,7 @@ end
             Ecosystem::Npm,
         );
         assert!(
-            !a.suspicious,
+            !a.is_suspicious(),
             "an unknown name with no hallucinated shape and no anchor is not slopsquat"
         );
     }
@@ -1844,12 +1946,18 @@ end
             distance: 1,
         };
         let a = slopsquat("python-requests-helper", &near, None, Ecosystem::PyPI);
-        assert!(
-            a.suspicious,
-            "hallucinated shape + near-popular anchor must fire: {a:?}"
-        );
-        assert_eq!(a.near_popular.as_deref(), Some("requests"));
-        assert!(!a.reasons.is_empty());
+        match a {
+            SlopsquatAssessment::Suspicious {
+                reasons,
+                near_popular,
+            } => {
+                assert_eq!(near_popular, "requests");
+                assert!(!reasons.is_empty());
+            }
+            SlopsquatAssessment::Clear => {
+                panic!("hallucinated shape + near-popular anchor must fire")
+            }
+        }
     }
 
     #[test]
@@ -1863,7 +1971,7 @@ end
             Ecosystem::Npm,
         );
         assert!(
-            !a.suspicious,
+            !a.is_suspicious(),
             "a hallucinated shape with no popular anchor must not fire"
         );
     }
@@ -1878,7 +1986,7 @@ end
         };
         let a = slopsquat("lodahs", &near, None, Ecosystem::Npm);
         assert!(
-            !a.suspicious,
+            !a.is_suspicious(),
             "a near-miss with a normal name shape is similar_name, not slopsquat"
         );
     }
@@ -1953,10 +2061,9 @@ end
 
     #[test]
     fn findings_for_slopsquat_is_medium_suspicious_package() {
-        let slop = SlopsquatAssessment {
-            suspicious: true,
+        let slop = SlopsquatAssessment::Suspicious {
             reasons: vec!["test reason".to_string()],
-            near_popular: Some("requests".to_string()),
+            near_popular: "requests".to_string(),
         };
         let a = assessment_with(
             "python-requests-helper",
