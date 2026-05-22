@@ -202,9 +202,19 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
 
 /// One-line description of a transport for the human summary.
 ///
-/// A stdio server's `env` is named (the variable names only — values are not
-/// printed, since an `env` value is commonly a credential) so a reader of
-/// `mcp lock` output can see that the server runs with injected environment.
+/// A stdio server's `env` is named (the variable names only — raw values are
+/// never stored anywhere, much less printed; the lockfile carries only a
+/// salted hash) so a reader of `mcp lock` output can see that the server runs
+/// with injected environment.
+///
+/// **Env names are debug-escaped before printing.** A config can declare an
+/// env name containing ANSI escape sequences, newlines, or other terminal
+/// control bytes (a malicious or careless config, or one round-tripped from a
+/// hostile source). Printing the name verbatim would let those control bytes
+/// reach the user's terminal and inject color, repositioning, or
+/// line-erasure. Rust's `Debug` formatting on `&str` (`"{:?}"`) escapes every
+/// control byte as a `\xNN` / `\n` / `\r` / etc. and quotes the value — the
+/// simplest correct fix, applied at *every* env-name print site.
 fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
         mcp_lock::McpTransport::Url { url } => format!("url {url}"),
@@ -215,7 +225,11 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
                 format!("stdio {} {}", command, args.join(" "))
             };
             if !env.is_empty() {
-                let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+                // Debug-format each name so control bytes (ANSI escapes,
+                // newlines, …) are rendered as `\xNN` literals rather than
+                // reaching the terminal. Names appear quoted, which is fine
+                // for the human summary and the test snapshot.
+                let names: Vec<String> = env.iter().map(|e| format!("{:?}", e.name)).collect();
                 desc.push_str(&format!(" (env: {})", names.join(", ")));
             }
             desc
@@ -251,7 +265,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-    use tirith_core::mcp_lock::McpTransport;
+    use tirith_core::mcp_lock::{McpEnvEntry, McpTransport};
 
     #[test]
     fn describe_transport_renders_each_variant() {
@@ -277,22 +291,66 @@ mod tests {
             }),
             "stdio npx -y server"
         );
-        // A stdio server with env: the variable NAMES are shown, values are not.
+        // A stdio server with env: the variable NAMES are shown (debug-escaped
+        // so a control byte inside a name cannot reach the terminal); raw
+        // values are not stored anywhere, much less printed.
         assert_eq!(
             describe_transport(&McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
                 env: vec![
-                    ("API_TOKEN".into(), "secret".into()),
-                    ("DEBUG".into(), "1".into()),
+                    McpEnvEntry::from_raw("API_TOKEN", "secret"),
+                    McpEnvEntry::from_raw("DEBUG", "1"),
                 ],
             }),
-            "stdio node (env: API_TOKEN, DEBUG)"
+            r#"stdio node (env: "API_TOKEN", "DEBUG")"#
         );
         assert_eq!(
             describe_transport(&McpTransport::Unknown),
             "no transport declared"
         );
+    }
+
+    #[test]
+    fn describe_transport_escapes_control_bytes_in_env_names() {
+        // Finding F: a maliciously-crafted env name containing ANSI escapes /
+        // newlines / control bytes must NOT inject raw control bytes into the
+        // operator's terminal. Debug formatting renders them as `\u{1b}`,
+        // `\n`, etc.
+        let env = vec![
+            // ANSI red — would colourize subsequent terminal output if printed raw.
+            McpEnvEntry::from_raw("\x1b[31mREDNAME", "ignored"),
+            // Multiline name — a raw print would split the summary across lines.
+            McpEnvEntry::from_raw("MULTI\nLINE", "ignored"),
+            // Carriage return — terminals would overwrite the current line.
+            McpEnvEntry::from_raw("OVERWRITE\rATTACK", "ignored"),
+            // Backspace — would erase preceding characters in the rendering.
+            McpEnvEntry::from_raw("ERASE\x08", "ignored"),
+        ];
+        let out = describe_transport(&McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![],
+            env,
+        });
+
+        // No raw control byte may appear in the output. Iterating chars rather
+        // than bytes is fine — every control codepoint is one ASCII byte.
+        for ch in out.chars() {
+            assert!(
+                !ch.is_control(),
+                "raw control char {:?} (U+{:04X}) leaked into the env-name summary: {out:?}",
+                ch,
+                ch as u32,
+            );
+        }
+        // And the escaped forms ARE present — proving the names did reach the
+        // formatter, they just went through Debug escaping.
+        for needle in [r"\u{1b}", r"\n", r"\r", r"\u{8}"] {
+            assert!(
+                out.contains(needle),
+                "expected escaped form {needle} in env-name summary: {out:?}"
+            );
+        }
     }
 
     #[test]

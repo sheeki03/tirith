@@ -50,10 +50,68 @@ use sha2::{Digest, Sha256};
 ///   environment variables the config injects into the subprocess); `env` is
 ///   part of the per-server content hash, so an `env` change registers as
 ///   drift. A v1 lockfile is therefore not byte-comparable to a v2 one.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 2;
+/// * `3` — env entries no longer serialize a raw value: each entry is
+///   `{ name, value_hash }`, where `value_hash` is the lowercase-hex SHA-256
+///   of `name || ':' || value`. An env value is commonly a credential
+///   (`API_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `OPENAI_API_KEY`, …), and
+///   the lockfile is designed to be committed — persisting the value would
+///   leak it. Hashing with the name as a salt still makes any value change
+///   register as drift (the hash flips), so drift detection is unchanged in
+///   spirit; only the *value* leaves the process, the hash does, and even a
+///   low-entropy value (`1`, `true`) is not brute-forceable across servers
+///   because the per-key salt makes the digest unique to (name, value). A v2
+///   lockfile is therefore not byte-comparable to a v3 one.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 3;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
+
+/// One environment variable a stdio MCP server is launched with, as captured
+/// in the lockfile.
+///
+/// **The raw value is never stored.** An env value is commonly a credential
+/// (`API_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `OPENAI_API_KEY`, …) and the
+/// lockfile is designed to be committed — persisting plaintext values would
+/// leak secrets into version control. Instead, we record a fixed-output hash:
+/// `value_hash = sha256(name || ':' || value)`. The name is the per-entry salt
+/// — a low-entropy value (`1`, `true`, `production`) hashes differently under
+/// each name, so a digest cannot be brute-forced once and reused across
+/// servers / configs. Drift detection is unchanged in spirit: a swapped value
+/// still flips `value_hash`, which still flips the per-server content hash.
+///
+/// Computed exactly once in [`parse_env`]; the raw value never leaves that
+/// function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpEnvEntry {
+    /// The environment variable's name (the key in the config's `env` object).
+    pub name: String,
+    /// Lowercase-hex SHA-256 of `name || ':' || value`. The colon is a fixed
+    /// delimiter so an attacker cannot manufacture two `(name, value)` pairs
+    /// whose concatenations collide: e.g. `("AB", "c")` hashes `"AB:c"`, not
+    /// `"ABc"`, so it cannot collide with `("A", "Bc")` which hashes `"A:Bc"`.
+    pub value_hash: String,
+}
+
+impl McpEnvEntry {
+    /// Build an entry from a `(name, raw_value)` pair, hashing the value
+    /// immediately. This is the **only** legitimate way to construct an entry
+    /// from a real value, and the raw value is consumed and dropped before the
+    /// function returns — it never reaches a struct field, the serializer, or
+    /// the rest of the process.
+    pub fn from_raw(name: &str, raw_value: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(name.as_bytes());
+        // A fixed `:` delimiter — never legal inside an env variable name on
+        // POSIX or Windows — so `(name, value)` cannot be ambiguously framed.
+        hasher.update(b":");
+        hasher.update(raw_value.as_bytes());
+        let value_hash = hex_lower(&hasher.finalize());
+        McpEnvEntry {
+            name: name.to_string(),
+            value_hash,
+        }
+    }
+}
 
 /// How an MCP server is reached. A server declares **either** a remote URL
 /// (`url` transport) **or** a local subprocess (`command` + `args`); the two
@@ -72,13 +130,15 @@ pub enum McpTransport {
         #[serde(default)]
         args: Vec<String>,
         /// Environment variables the config injects into the subprocess, as
-        /// `(name, value)` pairs sorted by name. Security-relevant: a change
-        /// to a server's `env` (a swapped credential, an added variable that
-        /// alters what the server does) must register as drift, so it is part
-        /// of the inventory, the lockfile schema, and the per-server hash.
-        /// An empty vec means the config declared no `env` object.
+        /// `(name, value_hash)` entries sorted by name. Security-relevant: a
+        /// change to a server's `env` (a swapped credential, an added variable
+        /// that alters what the server does) must register as drift, so it is
+        /// part of the inventory, the lockfile schema, and the per-server
+        /// hash. **Raw values are never stored** — each entry carries only a
+        /// salted hash; see [`McpEnvEntry`]. An empty vec means the config
+        /// declared no `env` object.
         #[serde(default)]
-        env: Vec<(String, String)>,
+        env: Vec<McpEnvEntry>,
     },
     /// The server object declared neither a `url` nor a `command`. Captured
     /// rather than dropped: an MCP entry with no transport is itself a
@@ -135,9 +195,15 @@ impl McpServerEntry {
                     hash_field(&mut hasher, arg.as_bytes());
                 }
                 hash_field(&mut hasher, &(env.len() as u64).to_le_bytes());
-                for (key, value) in env {
-                    hash_field(&mut hasher, key.as_bytes());
-                    hash_field(&mut hasher, value.as_bytes());
+                for entry in env {
+                    // Each env entry feeds its name AND its value_hash into the
+                    // per-server hash. The `value_hash` already deterministically
+                    // depends on the raw value (via `name + ':' + value`), so any
+                    // value change still flips the per-server content hash —
+                    // drift detection is unchanged even though no raw value is
+                    // stored or hashed here.
+                    hash_field(&mut hasher, entry.name.as_bytes());
+                    hash_field(&mut hasher, entry.value_hash.as_bytes());
                 }
             }
             McpTransport::Unknown => {
@@ -553,35 +619,47 @@ fn parse_transport(obj: &serde_json::Map<String, serde_json::Value>) -> McpTrans
     McpTransport::Unknown
 }
 
-/// Extract a stdio server's `env` object as `(name, value)` pairs, sorted by
-/// name so the hash is stable regardless of JSON key order. A non-string env
-/// value is captured by its JSON rendering (so a numeric or boolean env value
-/// — unusual but seen in real configs — is not silently dropped); a missing or
-/// non-object `env` field yields an empty vec.
+/// Extract a stdio server's `env` object as `(name, value_hash)` entries,
+/// sorted by name so the hash is stable regardless of JSON key order. A
+/// non-string env value is hashed by its compact JSON rendering (so a numeric
+/// or boolean env value — unusual but seen in real configs — is not silently
+/// dropped); a missing or non-object `env` field yields an empty vec.
 ///
 /// `env` is **security-relevant**: it is what a config injects into the MCP
 /// subprocess. Capturing it means a swapped credential or an added variable
 /// shows up as drift in `mcp verify` / `mcp diff` rather than passing silently.
-fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = obj
+///
+/// **The raw value never leaves this function.** It is read out of the JSON
+/// map into a local `String`, immediately consumed by [`McpEnvEntry::from_raw`]
+/// to compute `sha256(name || ':' || value)`, and then dropped at the end of
+/// the iteration step. No struct field, log line, return value, or serialized
+/// output ever carries the plaintext value. This is the load-bearing security
+/// invariant of the v3 lockfile format: a committed `.tirith/mcp.lock` never
+/// contains a secret that was in the source `.mcp.json`.
+fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntry> {
+    let mut env: Vec<McpEnvEntry> = obj
         .get("env")
         .and_then(|v| v.as_object())
         .map(|map| {
             map.iter()
                 .map(|(k, v)| {
-                    // A string value is stored verbatim; any other JSON value
-                    // is stored as its compact JSON form so it is still part
-                    // of the hash and round-trips losslessly.
-                    let value = match v.as_str() {
+                    // A string value is hashed verbatim; any other JSON value
+                    // is hashed by its compact JSON form so it still contributes
+                    // a deterministic per-value digest. The raw value sits in a
+                    // local `String` only long enough for `from_raw` to consume
+                    // it — it never reaches a struct, the serializer, the
+                    // hasher's transport-level frame, or stdout.
+                    let raw_value: String = match v.as_str() {
                         Some(s) => s.to_string(),
                         None => v.to_string(),
                     };
-                    (k.clone(), value)
+                    McpEnvEntry::from_raw(k, &raw_value)
                 })
                 .collect()
         })
         .unwrap_or_default();
-    env.sort();
+    // Sort by name for a stable hash regardless of JSON key order.
+    env.sort_by(|a, b| a.name.cmp(&b.name));
     env
 }
 
@@ -1162,15 +1240,16 @@ mod tests {
         }"#;
         let entries = parse_mcp_config(content, ".mcp.json").expect("valid config");
         assert_eq!(entries.len(), 1);
+        // env entries are present, sorted by name, and carry hashes — not the
+        // raw values. The hashes match `sha256(name || ':' || value)`.
         assert_eq!(
             entries[0].transport,
             McpTransport::Stdio {
                 command: "node".to_string(),
                 args: vec!["server.js".to_string()],
-                // env captured, sorted by name.
                 env: vec![
-                    ("API_TOKEN".to_string(), "secret-1".to_string()),
-                    ("DEBUG".to_string(), "1".to_string()),
+                    McpEnvEntry::from_raw("API_TOKEN", "secret-1"),
+                    McpEnvEntry::from_raw("DEBUG", "1"),
                 ],
             }
         );
@@ -1179,7 +1258,7 @@ mod tests {
     #[test]
     fn parse_env_is_sorted_and_handles_non_string_values() {
         // Keys come back sorted regardless of JSON order; a non-string value is
-        // captured by its JSON rendering rather than dropped.
+        // captured by its JSON rendering and then hashed rather than dropped.
         let content = r#"{
             "mcpServers": {
                 "s": { "command": "n", "env": { "ZED": "z", "ABLE": 7 } }
@@ -1188,11 +1267,12 @@ mod tests {
         let entries = parse_mcp_config(content, ".mcp.json").unwrap();
         match &entries[0].transport {
             McpTransport::Stdio { env, .. } => {
+                // `7` becomes the compact JSON form `"7"` before hashing.
                 assert_eq!(
                     env,
                     &vec![
-                        ("ABLE".to_string(), "7".to_string()),
-                        ("ZED".to_string(), "z".to_string()),
+                        McpEnvEntry::from_raw("ABLE", "7"),
+                        McpEnvEntry::from_raw("ZED", "z"),
                     ]
                 );
             }
@@ -1208,7 +1288,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
-                env: vec![("API_TOKEN".into(), "old".into())],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "old")],
             },
             tools: vec![],
             source_config: ".mcp.json".into(),
@@ -1218,7 +1298,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
-                env: vec![("API_TOKEN".into(), "new".into())],
+                env: vec![McpEnvEntry::from_raw("API_TOKEN", "new")],
             },
             ..base.clone()
         };
@@ -1228,8 +1308,8 @@ mod tests {
                 command: "node".into(),
                 args: vec![],
                 env: vec![
-                    ("API_TOKEN".into(), "old".into()),
-                    ("EXTRA".into(), "x".into()),
+                    McpEnvEntry::from_raw("API_TOKEN", "old"),
+                    McpEnvEntry::from_raw("EXTRA", "x"),
                 ],
             },
             ..base.clone()
@@ -1264,12 +1344,12 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_format_version_is_2() {
-        // Finding C bumped the schema (the lockfile now carries `env`), so the
-        // format version is 2 — a future `mcp verify` can refuse a v1 file.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 2);
+    fn lockfile_format_version_is_3() {
+        // Finding E bumped the schema (env entries no longer serialize raw
+        // values — only `name` + `value_hash`), so the format version is 3.
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 3);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 2);
+        assert_eq!(lock.format_version, 3);
     }
 
     #[test]
@@ -1282,7 +1362,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "node".into(),
                     args: vec!["server.js".into()],
-                    env: vec![("TOKEN".into(), "v".into())],
+                    env: vec![McpEnvEntry::from_raw("TOKEN", "v")],
                 },
                 tools: vec![],
                 source_config: ".mcp.json".into(),
@@ -1294,6 +1374,174 @@ mod tests {
         let parsed: McpLockfile =
             serde_json::from_str(&lock.render()).expect("lockfile with env must round-trip");
         assert_eq!(parsed, lock);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding E — env raw values must not be persisted in the lockfile. They
+    // are commonly secrets (API tokens, credentials), and `.tirith/mcp.lock`
+    // is designed to be committed. The lockfile carries a salted hash only.
+    // -----------------------------------------------------------------------
+
+    /// A bag of credential-shaped (high-entropy, unique) env values we render
+    /// into the lockfile in the test below; **none** of these byte sequences
+    /// may appear in the rendered JSON. The values are deliberately distinctive
+    /// so a substring scan over the rendered JSON cannot trip on incidental
+    /// matches in field names, hashes, or other names — they are not strings
+    /// any other part of the lockfile could legitimately contain.
+    const ENV_LEAK_PROBES: &[(&str, &str)] = &[
+        ("API_TOKEN", "ghp_supersecret_TOKEN_value_42"),
+        (
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+        ("OPENAI_API_KEY", "sk-test-DO_NOT_LEAK_THIS_VALUE"),
+        ("DB_PASSWORD", "p4ssw0rd-shouldnt-leak-mY7q"),
+        ("WEBHOOK_SECRET", "whsec_xyz123_zyx789_NEVER_LEAK"),
+    ];
+
+    #[test]
+    fn env_raw_values_never_appear_in_rendered_lockfile() {
+        // Plant a server whose env carries values that look exactly like
+        // credentials — API tokens, GitHub PATs, OpenAI keys. After rendering,
+        // NONE of the raw value bytes may show up.
+        //
+        // Note: this test deliberately uses high-entropy, distinctive values
+        // (not "1" or "true"). A low-entropy value substring-matches incidental
+        // parts of the JSON — `"1"` appears inside hashes, `"true"` inside
+        // boolean-like keys — so probing for it would false-positive. The
+        // security invariant the lockfile guarantees is that a *secret-shaped*
+        // value is not persisted: that value, by construction, cannot collide
+        // with any other lockfile content.
+        let env: Vec<McpEnvEntry> = ENV_LEAK_PROBES
+            .iter()
+            .map(|(name, value)| McpEnvEntry::from_raw(name, value))
+            .collect();
+        let inventory = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "secrets".into(),
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec!["server.js".into()],
+                    env,
+                },
+                tools: vec![],
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+
+        for (name, raw_value) in ENV_LEAK_PROBES {
+            // The name is allowed to appear (it is what the human summary shows
+            // and the schema serializes), but the raw VALUE must not — its hash
+            // is recorded instead.
+            assert!(
+                rendered.contains(name),
+                "the env name {name:?} should appear in the lockfile"
+            );
+            assert!(
+                !rendered.contains(raw_value),
+                "env raw value {raw_value:?} (for {name}) leaked into the rendered lockfile:\n{rendered}"
+            );
+        }
+        // Every env entry exposes a `value_hash` field — the wire shape proof.
+        assert!(
+            rendered.contains("\"value_hash\""),
+            "rendered lockfile must serialize a value_hash per env entry"
+        );
+        // And it must NOT carry a `value` field — the proof we did not also
+        // write the raw value as a sibling of the hash. Use the exact JSON
+        // field-key form `"value":` so the substring cannot collide with
+        // `"value_hash":` (which contains the substring `"value"`).
+        assert!(
+            !rendered.contains("\"value\":"),
+            "rendered lockfile must NOT carry a plaintext `value` field"
+        );
+    }
+
+    #[test]
+    fn parse_env_does_not_persist_raw_values() {
+        // The same invariant via the JSON-config entry point (not direct struct
+        // construction): a config carrying a real-looking secret must produce a
+        // parsed inventory whose lockfile rendering does not contain that
+        // secret byte sequence anywhere.
+        let secret = "ghp_REAL_LOOKING_TOKEN_DO_NOT_LEAK";
+        let content = format!(
+            r#"{{
+                "mcpServers": {{
+                    "s": {{
+                        "command": "node",
+                        "env": {{ "GITHUB_PERSONAL_ACCESS_TOKEN": "{secret}" }}
+                    }}
+                }}
+            }}"#
+        );
+        let entries = parse_mcp_config(&content, ".mcp.json").expect("valid config");
+        assert_eq!(entries.len(), 1);
+
+        // The parsed env entry carries the SHA-256 hash, not the raw value.
+        let env = match &entries[0].transport {
+            McpTransport::Stdio { env, .. } => env,
+            other => panic!("expected stdio transport, got {other:?}"),
+        };
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "GITHUB_PERSONAL_ACCESS_TOKEN");
+        assert_eq!(
+            env[0].value_hash,
+            McpEnvEntry::from_raw("GITHUB_PERSONAL_ACCESS_TOKEN", secret).value_hash,
+            "the value hash must be sha256(name || ':' || value)"
+        );
+
+        // And the rendered lockfile that descends from this parse must not
+        // carry the raw secret bytes anywhere.
+        let inventory = McpInventory {
+            servers: entries,
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+        assert!(
+            !rendered.contains(secret),
+            "raw secret leaked from parse_mcp_config -> McpLockfile::render():\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn env_entry_value_hash_is_name_salted() {
+        // The hash binds the name to the value, so a low-entropy value cannot
+        // be brute-forced once and reused across servers: the same value `1`
+        // under two different names hashes to two different digests.
+        let a = McpEnvEntry::from_raw("DEBUG", "1");
+        let b = McpEnvEntry::from_raw("VERBOSE", "1");
+        assert_ne!(
+            a.value_hash, b.value_hash,
+            "the same raw value under different names must hash differently \
+             (the name acts as a per-key salt)"
+        );
+        // And the hash is exactly sha256(name || ':' || value) — a stable,
+        // documented, reproducible-by-hand scheme.
+        let expected_a = {
+            let mut h = Sha256::new();
+            h.update(b"DEBUG:1");
+            hex_lower(&h.finalize())
+        };
+        assert_eq!(a.value_hash, expected_a);
+    }
+
+    #[test]
+    fn env_entry_hash_is_unambiguous_against_name_value_concatenation() {
+        // The `:` delimiter inside `sha256(name || ':' || value)` means
+        // `("AB", "c")` hashes `"AB:c"`, never the same byte stream as
+        // `("A", "Bc")` (`"A:Bc"`). This is the property we get for free over
+        // a no-delimiter scheme and matters for any future caller that might
+        // confuse a `name+value` byte stream with our hash input.
+        let ab_c = McpEnvEntry::from_raw("AB", "c");
+        let a_bc = McpEnvEntry::from_raw("A", "Bc");
+        assert_ne!(
+            ab_c.value_hash, a_bc.value_hash,
+            "the `:` delimiter must prevent name/value boundary forgery"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1360,13 +1608,17 @@ mod tests {
     #[test]
     fn content_hash_distinguishes_ambiguous_env_pairs() {
         // Length-prefixing also disambiguates env: a key/value boundary cannot
-        // be forged. {"AB": "c"} vs {"A": "Bc"} must hash distinctly.
+        // be forged. {"AB": "c"} vs {"A": "Bc"} must hash distinctly. Note that
+        // both layers contribute here: the salted per-entry `value_hash` (via
+        // `name + ':' + value`) already differs, AND the framed encoding into
+        // the per-server hash adds length prefixes around `name` and
+        // `value_hash` themselves.
         let mk = |key: &str, value: &str| McpServerEntry {
             name: "s".into(),
             transport: McpTransport::Stdio {
                 command: "node".into(),
                 args: vec![],
-                env: vec![(key.to_string(), value.to_string())],
+                env: vec![McpEnvEntry::from_raw(key, value)],
             },
             tools: vec![],
             source_config: ".mcp.json".into(),
