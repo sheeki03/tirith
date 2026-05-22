@@ -614,18 +614,22 @@ Examples:
         hidden: bool,
     },
 
-    /// Score a package's provenance / maintainer risk (offline signals)
+    /// Score a package's provenance / maintainer risk
     #[command(after_help = "\
 Scores a package the way `tirith score` scores a URL: a deterministic,
-fully explainable sum of named OFFLINE signals — no model, no network, no
-registry-API call. Name signals come from the local threat database; content
-signals (install scripts, bundled binary blobs) only from a package directory
-you already have on disk. Registry-API-backed signals are a later addition.
+fully explainable sum of named factors — no model, no learned weights.
+
+Offline by default: name signals come from the local threat database, and
+content signals (install scripts, bundled binary blobs) only from a package
+directory you already have on disk. `--online` additionally consults the
+package's registry API (npm / PyPI / crates.io) for provenance signals;
+`--offline` / TIRITH_OFFLINE forces offline even with `--online`.
 
 Examples:
   tirith package risk npm react
   tirith package risk pypi reqeusts
   tirith package risk npm left-pad --path ./node_modules/left-pad
+  tirith package risk --online npm express
   tirith package explain npm express
   tirith package explain --format json pypi requests")]
     Package {

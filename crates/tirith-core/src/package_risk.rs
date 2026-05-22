@@ -60,10 +60,10 @@
 //! - **Bundled binary blobs** — additive, only when local content was
 //!   inspected.
 //! - **Registry-API provenance** — additive, only on an `--online` run: a
-//!   very new package or latest version, an ownership transfer, an abnormal
-//!   version jump, very low downloads, a missing/inconsistent source-repo URL,
-//!   and a yanked / deprecated latest version. Each is a separate named
-//!   factor; see [`api_factors`].
+//!   very new package or latest version, an established package the registry
+//!   lists with no owners, an abnormal version jump, very low downloads, a
+//!   missing/inconsistent source-repo URL, and a yanked / deprecated latest
+//!   version. Each is a separate named factor; see [`api_factors`].
 //!
 //! The final score is `min(100, sum)`. The clamp is reported as an explicit
 //! factor when it bites, so the breakdown always sums exactly to the score.
@@ -112,8 +112,8 @@ const PACKAGE_VERY_NEW_WEIGHT: u32 = 25;
 /// [`VERY_NEW_VERSION_DAYS`]) even though the package itself is older — a
 /// fresh release of an established package is a weaker, smaller signal.
 const LATEST_VERSION_VERY_NEW_WEIGHT: u32 = 8;
-/// The registry maintainer / owner set changed recently — an ownership
-/// transfer, a classic account-takeover / hijack precursor.
+/// The registry lists an established package with zero maintainers / owners —
+/// abandoned ownership, a classic account-takeover / hijack precursor.
 const OWNERSHIP_TRANSFER_WEIGHT: u32 = 20;
 /// The latest version number is an abnormal jump from the previous version
 /// (e.g. `1.2.3` → `9.0.0`) — a hijacked release is often shipped with an
@@ -164,11 +164,13 @@ pub struct RiskFactor {
 pub enum NameVsPopular {
     /// The name *is* a known-popular package in this ecosystem.
     KnownPopular,
-    /// The name is one Levenshtein edit from a known-popular package.
+    /// The name is a near-miss of a known-popular package — a small edit
+    /// distance away.
     NearPopular {
         /// The popular package the name resembles.
         popular_name: String,
-        /// Levenshtein edit distance (1 — `check_popular_distance` caps at 1).
+        /// Levenshtein edit distance from `popular_name` — a small value (the
+        /// near-miss classifier only reports close matches).
         distance: usize,
     },
     /// The name neither is, nor resembles, any known-popular package.
@@ -221,9 +223,13 @@ pub struct ApiProvenance {
     pub package_age_days: Option<u64>,
     /// Age of the *latest version*'s publication, in whole days, when known.
     pub latest_version_age_days: Option<u64>,
-    /// `true` when the registry maintainer / owner set changed within the
-    /// observation window (an ownership transfer). `None` when the registry
-    /// does not expose enough history to tell.
+    /// `true` when the registry lists this — an established (not brand-new)
+    /// package — with **zero** maintainers / owners: an established package
+    /// that has lost every listed owner, the detectable red flag a single
+    /// registry document can actually show (one document carries the *current*
+    /// owner set, not its history, so a literal transfer cannot be proven from
+    /// it). `None` when the registry's API carries no maintainer field at all,
+    /// so ownership is honestly unknown.
     pub ownership_transferred: Option<bool>,
     /// `true` when the latest version number is an abnormal jump from the
     /// previous one (a major-version spike). `None` when fewer than two
@@ -319,7 +325,10 @@ pub struct RiskBreakdown {
     pub malicious_typosquat_of: Option<String>,
     /// What local package content (if any) was inspected.
     pub content_signals: ContentSignals,
-    /// Registry-API signals — always [`ApiSignals::NotComputed`] in this phase.
+    /// State of the registry-API signals: [`ApiSignals::NotComputed`] on an
+    /// offline run (the default), [`ApiSignals::Available`] on an `--online`
+    /// run that reached the registry, or [`ApiSignals::Unavailable`] on an
+    /// `--online` run that degraded — all three are reachable.
     pub api_signals: ApiSignals,
     /// The factors that sum to `score`, in display order.
     pub factors: Vec<RiskFactor>,
@@ -367,7 +376,11 @@ pub struct PackageSignals {
 }
 
 /// Compute the deterministic risk score and full factor breakdown from
-/// already-gathered offline signals.
+/// already-gathered signals.
+///
+/// Folds in the always-on offline signals (name vs. popular, known typosquat,
+/// inspected local content) and, when the [`PackageSignals::api`] state is
+/// [`ApiSignals::Available`], the registry-API provenance factors.
 ///
 /// This is a pure, total function — the single source of truth for the
 /// `package risk` number. The breakdown it returns always satisfies
@@ -588,16 +601,18 @@ pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
         }
     }
 
-    // Ownership transfer — an account-takeover / hijack precursor.
+    // Abandoned ownership — an established package the registry lists with no
+    // owners at all, an account-takeover / hijack precursor.
     if p.ownership_transferred == Some(true) {
         factors.push(RiskFactor {
             id: "api_ownership_transfer",
-            label: "Registry: ownership transferred".to_string(),
+            label: "Registry: package has no listed owners".to_string(),
             points: OWNERSHIP_TRANSFER_WEIGHT as i32,
             detail: format!(
-                "The {} registry shows the maintainer / owner set changed recently — an \
-                 ownership transfer is a classic account-takeover precursor, contributing \
-                 {} points.",
+                "The {} registry lists this established package with zero maintainers / \
+                 owners — an established package that has lost every listed owner is the \
+                 detectable shape of an ownership transfer / account-takeover precursor, \
+                 contributing {} points.",
                 p.source, OWNERSHIP_TRANSFER_WEIGHT
             ),
         });

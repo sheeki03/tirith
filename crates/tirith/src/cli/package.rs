@@ -503,9 +503,11 @@ fn print_api_provenance_human(p: &ApiProvenance) {
         (None, _) => println!("               - latest version: unknown"),
     }
     match p.ownership_transferred {
-        Some(true) => println!("               - ownership: transferred recently"),
-        Some(false) => println!("               - ownership: stable"),
-        None => println!("               - ownership: unknown (no history)"),
+        Some(true) => {
+            println!("               - ownership: no listed owners (established package)")
+        }
+        Some(false) => println!("               - ownership: has listed owners"),
+        None => println!("               - ownership: unknown (registry exposes no owner field)"),
     }
     match p.version_spike {
         Some(true) => println!("               - version jump: abnormal (major-version spike)"),
