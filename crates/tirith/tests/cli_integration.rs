@@ -3409,6 +3409,33 @@ fn install_npm_clean_package_no_exec_exits_zero() {
 }
 
 #[test]
+fn install_no_exec_after_source_is_a_hard_error() {
+    // `--no-exec` is a tirith flag; placed AFTER <source> it lands in the
+    // package-manager args (trailing_var_arg) and the real install would still
+    // run. tirith must hard-error, not silently run it.
+    let out = tirith_install()
+        .args([
+            "install",
+            "npm",
+            "my-unique-internal-pkg-xyzzy",
+            "--no-exec",
+        ])
+        .output()
+        .expect("failed to run tirith install");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a misplaced --no-exec must be a usage error, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--no-exec") && stderr.contains("before"),
+        "must explain --no-exec belongs before <source>, got: {stderr}"
+    );
+}
+
+#[test]
 fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
     // The JSON envelope for an analyzed transaction must parse, identify
     // itself, and carry `sandboxed: false` — tirith never claims to sandbox.

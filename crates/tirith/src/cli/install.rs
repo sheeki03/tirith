@@ -120,6 +120,22 @@ pub fn run(
     no_exec: bool,
     sha256: Option<String>,
 ) -> i32 {
+    // A tirith-owned flag placed AFTER <source> lands in the package-manager
+    // args (trailing_var_arg), not parsed by tirith. For `--no-exec` that is a
+    // safety footgun: `tirith install npm pkg --no-exec` would forward
+    // `--no-exec` to npm and STILL run the real install, despite the user
+    // asking to analyze only. No package manager has a `--no-exec` install
+    // flag, so a `--no-exec` in the trailing args is unambiguously a misplaced
+    // tirith flag — a hard error, not a silent no-op.
+    if args.iter().any(|a| a == "--no-exec") {
+        eprintln!(
+            "tirith install: `--no-exec` is a tirith option and must come \
+             before the <source> argument (e.g. `tirith install --no-exec npm \
+             <package>`). After <source>, arguments go to the package manager \
+             — a misplaced `--no-exec` would not stop the install."
+        );
+        return 2;
+    }
     match source.package_manager() {
         Some(manager) => run_package_manager(manager, args, online, offline, json, yes, no_exec),
         None => run_url(args, online, offline, json, no_exec, sha256),
