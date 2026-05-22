@@ -1265,12 +1265,17 @@ fn record_snapshot(snapshot: &DbSnapshot) {
     // The read-error note is irrelevant here: recording is best-effort and
     // rewrites the whole file regardless.
     let (mut history, _) = load_history();
-    // Dedup on build_sequence: re-running `health` against an unchanged DB
-    // must not append a near-identical line every invocation.
-    if history
-        .iter()
-        .any(|s| s.build_sequence == snapshot.build_sequence)
-    {
+    // Dedup on the snapshot's content (everything but `recorded_at`):
+    // re-running a transparency command against an unchanged DB must not append
+    // a near-identical line, but a changed supplemental overlay — same primary
+    // build_sequence, different counts/sources — must still record a snapshot.
+    if history.iter().any(|s| {
+        s.build_sequence == snapshot.build_sequence
+            && s.build_timestamp == snapshot.build_timestamp
+            && s.signature_valid == snapshot.signature_valid
+            && s.counts == snapshot.counts
+            && s.sources == snapshot.sources
+    }) {
         return;
     }
     history.push(snapshot.clone());

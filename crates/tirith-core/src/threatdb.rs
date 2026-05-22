@@ -810,11 +810,15 @@ impl ThreatDb {
                     // that one source, so attribute the whole typosquat index
                     // count to it — otherwise `count_for(EcosystemsTyposquat)`
                     // would always (and wrongly) return 0.
-                    let count = if *src == ThreatSource::EcosystemsTyposquat {
-                        self.typosquat_index_count as u64
-                    } else {
-                        counts.get(&(*src as u8)).copied().unwrap_or(0)
-                    };
+                    // Start from the section-walk count, then add the
+                    // typosquat index for `EcosystemsTyposquat`. The walk never
+                    // bumps that source (typosquat records carry no source
+                    // byte), so the base is 0 today — but adding rather than
+                    // replacing stays correct if that ever changes.
+                    let mut count = counts.get(&(*src as u8)).copied().unwrap_or(0);
+                    if *src == ThreatSource::EcosystemsTyposquat {
+                        count += self.typosquat_index_count as u64;
+                    }
                     (*src, count)
                 })
                 .collect(),

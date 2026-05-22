@@ -1136,7 +1136,8 @@ Examples:
   tirith trust gc --expired
   tirith trust gc --expired --scope user")]
     Gc {
-        /// Collect expired entries (the default and only mode today)
+        /// Collect expired entries — currently the only collection mode, so
+        /// this flag is optional
         #[arg(long)]
         expired: bool,
         /// Scope: user, repo, or all (default)
