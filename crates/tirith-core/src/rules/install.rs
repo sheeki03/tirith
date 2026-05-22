@@ -311,7 +311,7 @@ fn check_repo_add_from_pipe(
         if !is_fetch_command(&upstream_base) {
             continue;
         }
-        push_repo_add(segments, i, shell, findings);
+        push_repo_add(segments, i, findings);
         return;
     }
 
@@ -348,19 +348,14 @@ fn check_repo_add_from_pipe(
     }
 }
 
-fn push_repo_add(
-    segments: &[tokenize::Segment],
-    tee_idx: usize,
-    shell: ShellType,
-    findings: &mut Vec<Finding>,
-) {
+fn push_repo_add(segments: &[tokenize::Segment], tee_idx: usize, findings: &mut Vec<Finding>) {
     let upstream = &segments[tee_idx - 1];
     let pipeline = format!("{} | {}", upstream.raw, segments[tee_idx].raw);
     let mut evidence = vec![Evidence::CommandPattern {
         pattern: "fetch | tee sources.list".to_string(),
         matched: redact::redact_shell_assignments(&pipeline),
     }];
-    for url in extract_remote_urls(&upstream.args, shell) {
+    for url in extract_remote_urls(&upstream.args) {
         evidence.push(Evidence::Url { raw: url });
     }
     findings.push(Finding {
@@ -652,7 +647,7 @@ fn check_kubectl_apply_remote(
             continue;
         }
 
-        for url in collect_flag_values(args, &["-f", "--filename"], shell) {
+        for url in collect_flag_values(args, &["-f", "--filename"]) {
             if !is_remote_url(&url) {
                 continue;
             }
@@ -773,7 +768,7 @@ fn check_helm_untrusted_repo(
         }
         // `--repo <url>` (separate token).
         if remote_url.is_none() {
-            for url in collect_flag_values(args, &["--repo", "--repository"], shell) {
+            for url in collect_flag_values(args, &["--repo", "--repository"]) {
                 if is_remote_url(&url) {
                     remote_url = Some(url);
                     break;
@@ -852,7 +847,7 @@ fn check_terraform_remote_module(
             continue;
         }
 
-        for source in collect_flag_values(args, &["-from-module", "--from-module"], shell) {
+        for source in collect_flag_values(args, &["-from-module", "--from-module"]) {
             // Local relative/absolute paths are fine.
             if !is_untrusted_module_source(&source) {
                 continue;
@@ -1027,7 +1022,7 @@ fn is_fetch_command(base: &str) -> bool {
 
 /// Collect the values of repeatable `-f file` / `--flag value` / `--flag=value`
 /// options from an arg list.
-fn collect_flag_values(args: &[String], flags: &[&str], _shell: ShellType) -> Vec<String> {
+fn collect_flag_values(args: &[String], flags: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1050,7 +1045,7 @@ fn collect_flag_values(args: &[String], flags: &[&str], _shell: ShellType) -> Ve
 
 /// Extract all remote `http(s)`/`ftp` URLs from an arg list (bare or
 /// `--flag=URL`).
-fn extract_remote_urls(args: &[String], _shell: ShellType) -> Vec<String> {
+fn extract_remote_urls(args: &[String]) -> Vec<String> {
     let mut urls = Vec::new();
     for arg in args {
         let v = strip_quotes(arg);
