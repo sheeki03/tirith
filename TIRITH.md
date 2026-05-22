@@ -612,34 +612,54 @@ Every warning comes with:
 
 Developers forgive warnings when they come with a clean fix.
 
-### 9. `tirith score` — URL trust score
+This remediation surface is now concrete: every finding carries a per-rule
+remediation (shown as a `Fix:` line and in `--format json`); `tirith explain
+--rule <id> --fix` prints a rule's remediation on its own; and `tirith check
+--suggest-safe-command` rewrites the actual command into a safer one wherever a
+transformation is genuinely correct (pipe-to-shell → download-review-run,
+insecure-TLS flag dropped, `http://` → `https://`). Where there is no safe
+mechanical rewrite, tirith says so plainly rather than inventing one.
+
+### 9. `tirith score` — URL risk score
 
 ```bash
-$ tirith score https://get.example-tool.sh
-
-  URL trust:     98/100
-    [ok] All ASCII hostname
-    [ok] No confusable characters
-    [ok] Domain age: 4 years
-    [ok] TLS cert: valid, issued by Cloudflare
-    [ok] IP: Cloudflare CDN (known provider)
-    [ok] On tirith known-safe list
-
-  Command risk:  HIGH (if piped to shell)
-    [!!] Serves executable script content
-
-  Content risk:  LOW (based on last receipt)
-    [ok] No obfuscation detected in script
-    [ok] No encoded payloads
-    [ok] All referenced domains match source
+$ tirith score https://install.example-tool.dev:8443/setup.sh
+tirith: https://install.example-tool.dev:8443/setup.sh — risk score: 40/100 (medium)
+  [MEDIUM] non_standard_port — Non-standard port on known domain
 ```
 
-Three separate dimensions (not combined into a single misleading number):
-- **URL trust** — domain and encoding characteristics (local checks + optional network checks at paranoia high)
-- **Command risk** — execution sinks present in the command context
-- **Content risk** — script analysis results (only available if previously run via `tirith run`)
+`tirith score` runs a URL through the same detection engine `tirith check`
+uses and turns the findings into a 0–100 risk score. The score is **fully
+deterministic and explainable** — there is no model, no learned weights, and no
+statistical classifier. It is a fixed sum of named factors, and `--explain`
+shows that sum so the number is reproducible by hand:
 
-A clean domain can still produce a "HIGH command risk" if piped to shell. These dimensions are independent.
+```bash
+$ tirith score --explain https://install.example-tool.dev:8443/setup.sh
+
+  score breakdown (each factor is fixed and inspectable — no model, no learned weights):
+    +40   Highest-severity finding  (running total: 40)
+           Highest-severity finding is MEDIUM; a MEDIUM finding contributes 40 base points.
+    +0    Additional findings  (running total: 40)
+           1 finding(s) — no additional-finding points (the first finding is already counted by base severity).
+    = 40 / 100  (medium) — sum of every factor above
+```
+
+The factors are:
+
+- **Highest-severity finding** — the single highest-severity finding sets the
+  base: `Critical` 90, `High` 70, `Medium` 40, `Low` 15, none 0.
+- **Additional findings** — each finding past the first adds a flat +5.
+- **Threat-intel corroboration** — if a finding came from the local
+  threat-intelligence database *and* there is at least one other finding, +5.
+  A threat-DB hit is an unambiguous external confirmation; this factor is
+  additive only and never fires on its own.
+
+The score is clamped to 100, and when the clamp bites it is shown as an
+explicit factor so the breakdown always sums exactly to the displayed number.
+`--format json` adds a `score_breakdown` object carrying the same factors. The
+score is advisory: it is derived from a verdict but never changes one —
+`tirith score` is an inspection command, not an enforcement path.
 
 ### 10. `tirith diff` — terminal diff view
 

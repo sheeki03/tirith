@@ -1,10 +1,15 @@
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
+use tirith_core::scoring::{self, ScoreBreakdown};
 use tirith_core::tokenize::ShellType;
-use tirith_core::verdict::Severity;
 
-pub fn run(url: &str, json: bool) -> i32 {
+/// Run `tirith score <url>`.
+///
+/// `explain` switches on the full deterministic factor breakdown — exactly how
+/// the risk score was derived, factor by factor, so a user can reproduce the
+/// number by hand.
+pub fn run(url: &str, json: bool, explain: bool) -> i32 {
     let ctx = AnalysisContext {
         input: url.to_string(),
         shell: ShellType::Posix,
@@ -21,69 +26,213 @@ pub fn run(url: &str, json: bool) -> i32 {
     };
 
     let verdict = engine::analyze(&ctx);
+    let breakdown = scoring::score_verdict(&verdict);
+    // Defence in depth: the breakdown is the public contract that the factors
+    // sum to the score. score_findings guarantees this; assert it in debug so a
+    // future factor that breaks the invariant is caught immediately.
+    debug_assert!(
+        breakdown.verify(),
+        "score breakdown factors must sum to the final score"
+    );
 
     if json {
-        #[derive(serde::Serialize)]
-        struct ScoreOutput<'a> {
-            url: &'a str,
-            score: u32,
-            risk_level: &'a str,
-            findings: &'a [tirith_core::verdict::Finding],
-        }
-
-        let max_severity = verdict
-            .findings
-            .iter()
-            .map(|f| f.severity)
-            .max()
-            .unwrap_or(Severity::Info);
-
-        let (score, level) = severity_to_score(max_severity, verdict.findings.len());
-
-        let out = ScoreOutput {
-            url,
-            score,
-            risk_level: level,
-            findings: &verdict.findings,
-        };
-        if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-            eprintln!("tirith: failed to write JSON output");
-        }
-        println!();
-    } else if verdict.findings.is_empty() {
-        eprintln!("tirith: {url} — no issues found (score: 0/100)");
+        print_json(url, &verdict, &breakdown, explain);
     } else {
-        let max_severity = verdict
-            .findings
-            .iter()
-            .map(|f| f.severity)
-            .max()
-            .unwrap_or(Severity::Info);
-        let (score, level) = severity_to_score(max_severity, verdict.findings.len());
-        eprintln!("tirith: {url} — risk score: {score}/100 ({level})");
-        if output::write_human_auto(&verdict, false).is_err() {
-            eprintln!("tirith: failed to write output");
-        }
+        print_human(url, &verdict, &breakdown, explain);
     }
 
     0
 }
 
-fn severity_to_score(max: Severity, count: usize) -> (u32, &'static str) {
-    let base = match max {
-        Severity::Critical => 90,
-        Severity::High => 70,
-        Severity::Medium => 40,
-        Severity::Low => 15,
-        Severity::Info => 0,
+fn print_json(
+    url: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    breakdown: &ScoreBreakdown,
+    explain: bool,
+) {
+    #[derive(serde::Serialize)]
+    struct ScoreOutput<'a> {
+        url: &'a str,
+        score: u32,
+        risk_level: &'a str,
+        findings: &'a [tirith_core::verdict::Finding],
+        /// Full factor breakdown — present only with `--explain`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score_breakdown: Option<&'a ScoreBreakdown>,
+    }
+
+    let out = ScoreOutput {
+        url,
+        score: breakdown.score,
+        risk_level: breakdown.risk_level,
+        findings: &verdict.findings,
+        score_breakdown: if explain { Some(breakdown) } else { None },
     };
-    let bonus = (count.saturating_sub(1) as u32) * 5;
-    let score = (base + bonus).min(100);
-    let level = match score {
-        0..=20 => "low",
-        21..=50 => "medium",
-        51..=75 => "high",
-        _ => "critical",
-    };
-    (score, level)
+    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
+        eprintln!("tirith: failed to write JSON output");
+    }
+    println!();
+}
+
+fn print_human(
+    url: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    breakdown: &ScoreBreakdown,
+    explain: bool,
+) {
+    if verdict.findings.is_empty() {
+        eprintln!("tirith: {url} — no issues found (score: 0/100)");
+    } else {
+        eprintln!(
+            "tirith: {url} — risk score: {}/100 ({})",
+            breakdown.score, breakdown.risk_level
+        );
+        if output::write_human_auto(verdict, false).is_err() {
+            eprintln!("tirith: failed to write output");
+        }
+    }
+
+    if explain {
+        print_breakdown_human(breakdown);
+    }
+}
+
+/// Render the factor breakdown so the reader can reproduce the score by hand:
+/// each factor's contribution is printed, then the running total, then the
+/// final score with an explicit "sum of the above" note.
+fn print_breakdown_human(breakdown: &ScoreBreakdown) {
+    // Render to a locked stderr handle. The actual formatting lives in
+    // `write_breakdown_human` so it can be unit-tested against a buffer.
+    let _ = write_breakdown_human(breakdown, &mut std::io::stderr().lock());
+}
+
+/// Write the factor breakdown to `w`. Separated from [`print_breakdown_human`]
+/// purely so tests can capture the rendered text; the output is identical.
+fn write_breakdown_human(
+    breakdown: &ScoreBreakdown,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  score breakdown (each factor is fixed and inspectable — no model, no learned weights):"
+    )?;
+    let mut running: i32 = 0;
+    for factor in &breakdown.factors {
+        running += factor.points;
+        // `+NN` for positive contributions, `-NN` for the clamp factor.
+        let sign = if factor.points >= 0 { "+" } else { "" };
+        writeln!(
+            w,
+            "    {sign}{:<4} {}  (running total: {running})",
+            factor.points, factor.label
+        )?;
+        writeln!(w, "           {}", factor.detail)?;
+    }
+    writeln!(
+        w,
+        "    = {} / {}  ({}) — sum of every factor above",
+        breakdown.score,
+        scoring::MAX_SCORE,
+        breakdown.risk_level
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+
+    fn render(breakdown: &ScoreBreakdown) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_breakdown_human(breakdown, &mut buf).expect("write to Vec never fails");
+        String::from_utf8(buf).expect("breakdown output is valid UTF-8")
+    }
+
+    fn finding(rule_id: RuleId, severity: Severity) -> Finding {
+        Finding {
+            rule_id,
+            severity,
+            title: "test".to_string(),
+            description: "test".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "t".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn breakdown_human_renders_clean_zero_finding_url() {
+        // `score --explain` on a URL with no findings: the breakdown still
+        // renders, every factor is +0, and the total line reads 0/100 (low).
+        let breakdown = scoring::score_findings(&[]);
+        assert_eq!(breakdown.score, 0);
+        let out = render(&breakdown);
+
+        assert!(
+            out.contains("score breakdown"),
+            "must print the breakdown header: {out}"
+        );
+        // Base severity factor: +0 for no findings.
+        assert!(
+            out.contains("+0"),
+            "a zero-finding breakdown must show a +0 factor: {out}"
+        );
+        // No factor should render with a negative sign on a clean URL.
+        assert!(
+            !out.contains("    -"),
+            "a clean URL has no negative (clamp) factor: {out}"
+        );
+        assert!(
+            out.contains("= 0 / 100"),
+            "total line must read 0/100 for a clean URL: {out}"
+        );
+        assert!(
+            out.contains("(low)"),
+            "a 0 score is the 'low' risk bucket: {out}"
+        );
+    }
+
+    #[test]
+    fn breakdown_human_renders_negative_clamp_factor() {
+        // 5 critical findings: 90 base + 4*5 = 110 raw → clamps to 100 with an
+        // explicit -10 clamp factor. The renderer must show that -10 without a
+        // leading '+', and the total line must read 100/100.
+        let findings: Vec<Finding> = (0..5)
+            .map(|_| finding(RuleId::CurlPipeShell, Severity::Critical))
+            .collect();
+        let breakdown = scoring::score_findings(&findings);
+        assert_eq!(breakdown.score, 100);
+        // Sanity: the clamp factor is present and negative.
+        let clamp = breakdown
+            .factors
+            .iter()
+            .find(|f| f.id == "clamp")
+            .expect("clamp factor must exist when the raw sum exceeds 100");
+        assert_eq!(clamp.points, -10);
+
+        let out = render(&breakdown);
+        // The clamp factor renders as `-10` (no '+' sign) at column start.
+        assert!(
+            out.contains("    -10 "),
+            "clamp factor must render as a bare -10: {out}"
+        );
+        assert!(
+            !out.contains("+-10"),
+            "the negative clamp factor must not get a '+' prefix: {out}"
+        );
+        assert!(
+            out.contains("= 100 / 100"),
+            "total line must read 100/100 after clamping: {out}"
+        );
+        assert!(
+            out.contains("(critical)"),
+            "a 100 score is the 'critical' risk bucket: {out}"
+        );
+    }
 }

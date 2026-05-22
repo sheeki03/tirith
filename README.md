@@ -229,11 +229,17 @@ Tirith ships a signed local threat database for package, hostname, and IP reputa
 - [Google Safe Browsing](https://safebrowsing.google.com/) URL reputation with your own API key
 
 ```bash
-tirith threat-db update           # download + verify the signed DB
-tirith threat-db status           # age, signature, version, entry counts
+tirith threat-db update              # download + verify the signed DB
+tirith threat-db status              # age, signature, version, entry counts
+tirith threat-db health              # install, signature, staleness, counts
+tirith threat-db sources             # list every feed the DB is built from
+tirith threat-db explain react       # what the DB knows about an indicator
+tirith threat-db diff --since 2026-01-01   # count changes since a version/date
 ```
 
 By default, shell hooks and `tirith check` trigger a cheap background refresh check every 24 hours. Daemon mode keeps the same enrichment path warm in the background.
+
+`threat-db explain` accepts a domain, a package name (`name`, `ecosystem:name`, or `name@version`), or an IPv4 address; `threat-db sources` groups feeds into the signed primary database and the optional user-local supplemental overlay. The threat-DB binary retains no per-entry history, so `threat-db diff` reports category and per-source count deltas between snapshots rather than the exact entries added or removed. Every `threat-db` command takes `--format json`; `threatdb` works as an alias for `threat-db`.
 
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
@@ -479,6 +485,23 @@ programs.zsh.initContent = ''
 '';
 ```
 
+### Updating and verifying tirith
+
+tirith can verify its own integrity and update itself. Both commands reach the network only when you run them.
+
+```bash
+tirith verify-self          # is this binary the genuine, unmodified release?
+tirith update               # update to the latest release
+tirith version --provenance # version, build info, install method, verification
+```
+
+**`tirith verify-self`** confirms the running binary is the genuine, unmodified binary from an official release. It re-downloads the release archive for your version and target, verifies it against the signed release `checksums.txt`, verifies the cosign signature over `checksums.txt` when [`cosign`](https://github.com/sigstore/cosign) is installed, and confirms the running binary is byte-identical to the official one. If full verification is not possible — a local dev build, no network, an install tirith cannot identify — it says so honestly rather than reporting a false "verified". With `cosign` absent the checksum is still verified (reported as `verified-checksum-only`); install `cosign` for full signature verification (`verified-signed`).
+
+**`tirith update`** is package-manager-aware:
+
+- **Package-manager installs** (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are never self-modified. tirith prints the exact command to run instead — e.g. `brew upgrade tirith`. Updating through the package manager keeps its database consistent.
+- **Self-managed installs** (the `install.sh` tarball, or a standalone binary) are updated in place: tirith downloads the latest release, verifies it, then atomically swaps the binary, keeping the previous one as a `tirith.tirith-previous` sidecar. `--verify` makes a verified cosign signature mandatory; a checksum mismatch always aborts. `tirith update --rollback` reverts to the previous binary; `--dry-run` shows what would happen without changing anything.
+
 ### Shell Integrations
 
 **Oh-My-Zsh:**
@@ -528,8 +551,32 @@ Scan supports `--include`, `--exclude`, `--profile` (loads named profiles from p
 
 ```bash
 tirith explain --rule pipe_to_interpreter   # severity, examples, remediation, MITRE ATT&CK
+tirith explain --rule curl_pipe_shell --fix # just the remediation ("what to do instead")
 tirith explain --list --category terminal   # all rules in a category
 ```
+
+### Remediation — "what to run instead"
+
+Every finding carries a per-rule remediation: a short, accurate "how to make
+this safe" line, shown under each finding (`Fix:`) and in `--format json`.
+`tirith explain --rule <id> --fix` prints that remediation on its own.
+
+When a command is blocked or warned, `tirith check --suggest-safe-command`
+additionally prints a concrete safer rewrite of the *actual* command — but only
+where a transformation is genuinely safer and correct:
+
+```bash
+tirith check --suggest-safe-command -- 'curl https://example-cli.dev/i.sh | bash'
+# → try: curl -fsSL -o /tmp/tirith-review.sh https://example-cli.dev/i.sh \
+#        && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+```
+
+It rewrites pipe-to-shell into download-review-run, drops insecure-TLS flags
+(`-k` / `--insecure` / `--no-check-certificate`), and switches plain `http://`
+to `https://`. For findings with no safe mechanical rewrite (homograph
+hostnames, archive-extract targets, …) it says so plainly and shows the
+remediation instead — it never emits a bogus suggestion. The flag is advisory:
+it changes neither the verdict nor the exit code.
 
 ### Daemon Mode (Unix)
 
@@ -549,29 +596,38 @@ tirith daemon stop
 
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it |
+| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest-safe-command` adds a concrete safer rewrite) |
 | `tirith paste` | Check pasted content (called automatically by shell hooks) |
 | `tirith scan [path]` | Scan files/directories with `--include`, `--exclude`, `--profile`, `--format sarif`, `--ci` |
 | `tirith threat-db update` | Download, verify, and install the signed threat database |
 | `tirith threat-db status` | Show DB age, signature status, version, and entry counts |
-| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule |
+| `tirith threat-db explain <indicator>` | Explain what the threat DB knows about a domain, package, or IP |
+| `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
+| `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
+| `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
+| `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule (`--fix` shows just the remediation) |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
+| `tirith policy tune --from-audit` | Suggest conservative policy adjustments from your audit log (suggest-only — never edits the policy) |
 | `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
-| `tirith score <url>` | Break down a URL's trust signals |
+| `tirith score <url>` | Break down a URL's trust signals (`--explain` shows the deterministic factor-by-factor score derivation) |
 | `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
 | `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) |
 | `tirith why` | Explain the last rule that triggered |
 | `tirith doctor` | Diagnose installation, hooks, and policy |
 | `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
 | `tirith doctor --compat` | Shell/terminal compatibility report (detected shell, bash mode, install checks, co-installed hook-interacting tools) |
+| `tirith verify-self` | Verify the running binary is the genuine, unmodified official release (checksum + cosign signature); reports honestly when it cannot |
+| `tirith update` | Update tirith to the latest release — defers to your package manager for PM installs, atomic verified self-replace for `install.sh`/standalone installs (`--verify`, `--rollback`, `--dry-run`) |
+| `tirith version --provenance` | Show version, build info, detected install method, and verification status |
 | `tirith daemon start` | Start background daemon for faster checks (Unix) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |
 | `tirith setup <tool>` | One-command setup for AI coding tools (see [AI Agent Integrations](#ai-agent-integrations)) |
 | `tirith gateway run` | MCP gateway proxy for intercepting AI agent shell tool calls |
 | `tirith warnings` | Show accumulated session warnings, suggest trust entries. `--summary` for shell exit hooks |
+| `tirith trust {add,list,explain,diff,remove,gc}` | Manage trusted patterns: narrow scope and a 30-day TTL by default, scope visualization, `trust explain`, `trust diff` |
 | `tirith audit {export,stats,report}` | Audit log management for compliance |
 | `tirith init` | Print the shell hook for your shell profile |
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
@@ -670,6 +726,34 @@ allowlist_rules:
     patterns:
       - "get.docker.com"
 ```
+
+### Managing trust from the CLI
+
+`tirith trust` manages trusted patterns without hand-editing policy YAML. Trust
+is **narrow and expiring by default**: trust the most specific thing that
+works, and entries expire after 30 days unless you opt out.
+
+```bash
+# Narrowest scope — a specific URL or path is accepted as-is, 30-day TTL.
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+
+# A whole domain / wildcard / bare TLD is broad — it must be opted into.
+tirith trust add get.docker.com --broad --rule curl_pipe_shell
+
+# Opt out of the default TTL, and record why the entry exists.
+tirith trust add example.com --broad --permanent --reason "internal mirror, OPS-42"
+
+tirith trust list                 # scope class per entry; '!' marks broad ones
+tirith trust explain example.com  # what it covers, when it expires, why added
+tirith trust diff                 # what changed in the trust set
+tirith trust gc --expired         # drop expired entries
+```
+
+Each entry's **scope** is classified as `exact`, `substring`, `domain`,
+`wildcard`, or `bare-TLD`. A broad scope (`domain` / `wildcard` / `bare-TLD`)
+requires `--broad`, so a sweeping allow is always a deliberate choice. All
+subcommands support `--format json`. Trust stores written by older versions of
+tirith keep working unchanged — an entry with no TTL is treated as permanent.
 
 ### Escalation and action overrides
 

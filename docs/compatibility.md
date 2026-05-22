@@ -19,7 +19,7 @@ what an experimental command must satisfy to move to stable.
 |---------|-----------|-------|
 | `check` | Stable | Analyze a command before execution. Integration-critical (shell hooks, MCP). |
 | `paste` | Stable | Analyze pasted content. |
-| `score` | Stable | Risk-score a URL. |
+| `score` | Stable | Risk-score a URL (`--explain` shows the deterministic factor breakdown). |
 | `diff` | Stable | Compare a URL against known-good patterns. |
 | `why` | Stable | Explain the last triggered rule. |
 | `receipt` | Stable | Manage execution receipts. |
@@ -31,10 +31,10 @@ what an experimental command must satisfy to move to stable.
 | `checkpoint` | Experimental | File checkpoint and rollback. |
 | `gateway` | Experimental | MCP gateway proxy for AI-agent security. |
 | `setup` | Experimental | Configure tirith for AI coding tools. |
-| `policy` | Experimental | Policy `init` / `validate` / `test`. |
-| `trust` | Experimental | Manage trusted patterns (allowlist entries with TTL and scoping). |
+| `policy` | Experimental | Policy `init` / `validate` / `test` / `tune`. |
+| `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`. Narrow scope and a 30-day TTL by default; scope visualization, per-entry `explain`, and a `diff` trail. |
 | `warnings` | Experimental | Show accumulated session warnings. |
-| `threat-db` | Experimental | Manage the threat intelligence database. |
+| `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `daemon` | Experimental | Background daemon (Unix only). |
 | `audit` | Experimental | Audit log export, stats, and compliance reports. |
 | `activate` | Experimental | License key activation. |

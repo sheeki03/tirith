@@ -58,6 +58,203 @@ fn check_curl_pipe_bash_shows_remediation_hint() {
     );
 }
 
+// ── item 13: remediation — `explain --fix` and `check --suggest-safe-command` ──
+
+#[test]
+fn explain_fix_shows_only_remediation() {
+    let out = tirith()
+        .args(["explain", "--rule", "curl_pipe_shell", "--fix"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Remediation"),
+        "explain --fix must print the Remediation section: {stdout}"
+    );
+    // The focused view omits the full-explain sections.
+    assert!(
+        !stdout.contains("Examples (flagged)"),
+        "explain --fix must not print the full explanation: {stdout}"
+    );
+    assert!(
+        !stdout.contains("False positives"),
+        "explain --fix must not print the false-positives section: {stdout}"
+    );
+}
+
+#[test]
+fn explain_fix_json_is_compact() {
+    let out = tirith()
+        .args([
+            "explain",
+            "--rule",
+            "insecure_tls_flags",
+            "--fix",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("explain --fix --format json");
+    assert_eq!(v["id"], "insecure_tls_flags");
+    assert!(v["remediation"].as_str().is_some_and(|s| !s.is_empty()));
+    // Compact view: no description / examples keys.
+    assert!(v.get("description").is_none());
+    assert!(v.get("examples_bad").is_none());
+}
+
+#[test]
+fn explain_fix_requires_rule() {
+    // `--fix` without `--rule` must be rejected by clap (requires = "rule").
+    let out = tirith()
+        .args(["explain", "--list", "--fix"])
+        .output()
+        .expect("failed to run tirith");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "--fix without --rule must error"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_rewrites_pipe_to_shell() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("safer alternative"),
+        "expected safe-command block: {stderr}"
+    );
+    assert!(
+        stderr.contains("curl -fsSL -o /tmp/tirith-review.sh"),
+        "expected download-to-file rewrite: {stderr}"
+    );
+    assert!(
+        stderr.contains("bash /tmp/tirith-review.sh"),
+        "expected review-then-run step: {stderr}"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_drops_insecure_tls_flag() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "curl -k https://example.com/file",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("curl https://example.com/file"),
+        "expected the -k flag dropped from the suggestion: {stderr}"
+    );
+}
+
+#[test]
+fn check_suggest_safe_command_json_embeds_suggestions() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--format",
+            "json",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --suggest-safe-command --format json");
+    let suggestions = v["safe_suggestions"]
+        .as_array()
+        .expect("safe_suggestions array present");
+    assert!(!suggestions.is_empty(), "expected at least one suggestion");
+    let s = &suggestions[0];
+    assert_eq!(s["rule_id"], "curl_pipe_shell");
+    assert!(s["safe_command"]
+        .as_str()
+        .is_some_and(|c| c.contains("/tmp/tirith-review.sh")));
+    // Findings still carry per-rule remediation independently of the flag.
+    assert!(v["findings"][0]["remediation"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn check_without_suggest_flag_omits_suggestions_but_keeps_remediation() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--format",
+            "json",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check --format json");
+    // No flag → no safe_suggestions key.
+    assert!(v.get("safe_suggestions").is_none());
+    // But per-finding remediation is always present.
+    assert!(v["findings"][0]["remediation"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn check_suggest_safe_command_allow_emits_no_suggestions() {
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--suggest-safe-command",
+            "--",
+            "ls -la",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("safer alternative"),
+        "an allowed command needs no safe alternative: {stderr}"
+    );
+}
+
 #[test]
 fn check_iwr_pipe_iex_no_tirith_run_hint() {
     let out = tirith()
@@ -383,6 +580,307 @@ fn why_no_trigger() {
     assert!(
         out.status.code() == Some(0) || out.status.code() == Some(1),
         "why should exit 0 or 1"
+    );
+}
+
+// ── item 21: scoring calibration — `score --explain` and `policy tune` ──
+
+/// `score --explain` must show a factor breakdown, and the breakdown's factor
+/// contributions must sum exactly to the displayed score — reproducible by hand.
+#[test]
+fn score_explain_human_breakdown_sums_to_score() {
+    let out = tirith()
+        .args(["score", "--explain", "https://bit.ly/abc123"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("score breakdown"),
+        "score --explain should print a breakdown: {stderr}"
+    );
+    assert!(
+        stderr.contains("Highest-severity finding"),
+        "breakdown should name the base-severity factor: {stderr}"
+    );
+    assert!(
+        stderr.contains("no model, no learned weights"),
+        "breakdown must state it is deterministic, not a model: {stderr}"
+    );
+}
+
+/// The JSON `score_breakdown.factors` array must sum to `score_breakdown.score`,
+/// which must equal the top-level `score`. This is the machine-checkable form
+/// of "reproducible by hand".
+#[test]
+fn score_explain_json_factors_sum_to_score() {
+    let out = tirith()
+        .args([
+            "score",
+            "--explain",
+            "--format",
+            "json",
+            "https://bit.ly/abc123",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("score --explain --format json must be valid JSON");
+
+    let score = json["score"].as_u64().expect("score must be a number");
+    let breakdown = &json["score_breakdown"];
+    assert!(
+        breakdown.is_object(),
+        "score --explain must include score_breakdown: {json}"
+    );
+    assert_eq!(
+        breakdown["score"].as_u64(),
+        Some(score),
+        "score_breakdown.score must equal top-level score"
+    );
+
+    let factors = breakdown["factors"]
+        .as_array()
+        .expect("score_breakdown.factors must be an array");
+    assert!(!factors.is_empty(), "there must be at least one factor");
+    let sum: i64 = factors
+        .iter()
+        .map(|f| {
+            f["points"]
+                .as_i64()
+                .expect("each factor needs integer points")
+        })
+        .sum();
+    assert_eq!(
+        sum, score as i64,
+        "factor points must sum exactly to the score (reproducible by hand)"
+    );
+}
+
+/// A multi-finding URL exercises the additional-findings factor: there must be
+/// a separate `additional_findings` factor with positive points, and the
+/// factors must still sum to the score.
+#[test]
+fn score_explain_multi_finding_has_additional_findings_factor() {
+    // A homograph "github" (Cyrillic U+0456 for the 'i') trips several
+    // independent hostname rules at once. The escape keeps the test source
+    // ASCII; the codepoint expands to the real Cyrillic character.
+    let homograph_url = "https://g\u{0456}thub.com/install.sh";
+    let out = tirith()
+        .args(["score", "--explain", "--format", "json", homograph_url])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert!(
+        findings.len() >= 2,
+        "homograph URL should produce multiple findings, got: {json}"
+    );
+    let factors = json["score_breakdown"]["factors"].as_array().unwrap();
+    let additional = factors
+        .iter()
+        .find(|f| f["id"] == "additional_findings")
+        .expect("additional_findings factor must exist");
+    assert!(
+        additional["points"].as_i64().unwrap() > 0,
+        "multi-finding URL must contribute additional-findings points: {json}"
+    );
+    // The reproducible-by-hand invariant must hold for multi-finding scores too.
+    let score = json["score"].as_i64().unwrap();
+    let sum: i64 = factors.iter().map(|f| f["points"].as_i64().unwrap()).sum();
+    assert_eq!(
+        sum, score,
+        "factors must sum to score for a multi-finding URL"
+    );
+}
+
+/// Without `--explain`, the JSON output must NOT carry `score_breakdown` — the
+/// breakdown is opt-in and the base output stays backward-compatible.
+#[test]
+fn score_without_explain_omits_breakdown() {
+    let out = tirith()
+        .args(["score", "--format", "json", "https://bit.ly/abc123"])
+        .output()
+        .expect("failed to run tirith");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json.get("score_breakdown").is_none(),
+        "score_breakdown must be absent without --explain"
+    );
+    // The pre-existing fields must still be there.
+    assert!(json["url"].is_string());
+    assert!(json["score"].is_number());
+    assert!(json["risk_level"].is_string());
+    assert!(json["findings"].is_array());
+}
+
+/// `policy tune` without `--from-audit` must error and point at the right flag.
+#[test]
+fn policy_tune_requires_from_audit() {
+    let out = tirith()
+        .args(["policy", "tune"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--from-audit"),
+        "policy tune should point at --from-audit: {stderr}"
+    );
+}
+
+/// `policy tune --from-audit` on an empty data dir (no audit log) must exit
+/// non-zero and say so plainly — never crash, never invent suggestions.
+#[test]
+fn policy_tune_no_audit_log_is_handled() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
+        .args(["policy", "tune", "--from-audit"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no audit log"),
+        "should report the missing audit log: {stderr}"
+    );
+}
+
+/// A synthesized audit log where one rule is always allowed (never blocked)
+/// must yield a `frequently_bypassed` suggestion — and `policy tune` must NOT
+/// modify the policy. Suggest-only is the hard contract.
+#[test]
+fn policy_tune_suggests_for_always_allowed_rule_without_writing_policy() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // 25 verdict records, shortened_url always Allow.
+    let mut log = String::new();
+    for i in 0..25 {
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:{:02}:00Z","session_id":"s1","action":"Allow","rule_ids":["shortened_url"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#,
+            i % 60
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["data_is_thin"], false);
+    let suggestions = json["suggestions"].as_array().unwrap();
+    let s = suggestions
+        .iter()
+        .find(|s| s["rule_id"] == "shortened_url")
+        .expect("expected a suggestion for the always-allowed rule");
+    assert_eq!(s["kind"], "frequently_bypassed");
+    assert_eq!(s["confidence"], "strong");
+
+    // The hard contract: tune must not have written or mutated any policy file.
+    assert!(
+        !data_dir.path().join(".tirith").exists(),
+        "policy tune must not create a policy directory"
+    );
+}
+
+/// A rule that is sometimes blocked must NEVER be suggested for a downgrade —
+/// the rule is doing its job. End-to-end check of the conservative behavior.
+#[test]
+fn policy_tune_does_not_suggest_downgrade_for_blocked_rule() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // 25 records: curl_pipe_shell — 20 Allow, 5 Block. Sometimes blocked.
+    let mut log = String::new();
+    for i in 0..25 {
+        let action = if i < 20 { "Allow" } else { "Block" };
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:{:02}:00Z","session_id":"s1","action":"{action}","rule_ids":["curl_pipe_shell"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#,
+            i % 60
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let suggestions = json["suggestions"].as_array().unwrap();
+    assert!(
+        suggestions
+            .iter()
+            .all(|s| s["rule_id"] != "curl_pipe_shell"),
+        "a sometimes-blocked rule must never be suggested for a downgrade: {json}"
+    );
+}
+
+/// A too-small audit log must report `data_is_thin` and make no suggestions —
+/// honest about insufficient data rather than guessing.
+#[test]
+fn policy_tune_thin_data_makes_no_suggestions() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let tirith_data = data_dir.path().join("tirith");
+    fs::create_dir_all(&tirith_data).expect("create data dir");
+    let log_path = tirith_data.join("log.jsonl");
+
+    // Only 5 records — well below the minimum-observations threshold.
+    let mut log = String::new();
+    for i in 0..5 {
+        log.push_str(&format!(
+            r#"{{"timestamp":"2026-05-20T10:0{i}:00Z","session_id":"s1","action":"Allow","rule_ids":["shortened_url"],"command_redacted":"cmd","bypass_requested":false,"bypass_honored":false,"interactive":true,"tier_reached":3,"entry_type":"verdict"}}"#
+        ));
+        log.push('\n');
+    }
+    fs::write(&log_path, &log).expect("write audit log");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", data_dir.path())
+        // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows
+        // (etcetera's Windows base strategy); set both so the audit-log path is
+        // isolated on every platform — without APPDATA the test reads the real
+        // Windows data dir. Mirrors the pattern in the check_last_trigger tests.
+        .env("APPDATA", data_dir.path())
+        .args(["policy", "tune", "--from-audit", "--format", "json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["data_is_thin"], true);
+    assert!(
+        json["suggestions"].as_array().unwrap().is_empty(),
+        "thin data must yield no suggestions: {json}"
     );
 }
 
@@ -2246,4 +2744,587 @@ fn doctor_compat_surfaces_tirith_status_for_non_bash_shell() {
         "doctor --compat must surface TIRITH_STATUS=degraded regardless of shell; \
          got:\n{stdout}"
     );
+}
+
+// ===========================================================================
+// Threat-DB transparency subcommands (roadmap M2 item 11):
+// `threat-db explain | sources | health | diff`.
+//
+// These exercise the real binary against the signed fixture DB at
+// `tests/fixtures/test-threatdb.dat`. Each test isolates `XDG_STATE_HOME` so
+// the snapshot-history file is written into a tempdir, never the real home.
+// ===========================================================================
+
+/// Path to the signed test threat DB fixture.
+fn test_threatdb_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/test-threatdb.dat")
+}
+
+/// Run `tirith threat-db <args>` with the fixture DB and an isolated state dir.
+/// Returns (stdout, stderr, exit_code).
+fn run_threatdb(args: &[&str], state: &std::path::Path) -> (String, String, i32) {
+    let fixture = test_threatdb_fixture();
+    let out = tirith()
+        .arg("threat-db")
+        .args(args)
+        .env("TIRITH_THREATDB_PATH", &fixture)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .output()
+        .expect("failed to run tirith threat-db");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn threatdb_explain_known_malicious_package() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(
+        &["explain", "npm:evil-package@1.0.0", "--format", "json"],
+        state.path(),
+    );
+    assert_eq!(code, 0, "explain should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["present"], true, "evil-package@1.0.0 must be present");
+    assert_eq!(v["kind"], "package");
+    assert_eq!(v["findings"][0]["classification"], "malicious_package");
+    assert_eq!(v["findings"][0]["source"], "ossf_malicious");
+}
+
+#[test]
+fn threatdb_explain_absent_indicator_says_so() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["explain", "definitely-not-in-db.example"], state.path());
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("not present"),
+        "an absent indicator must be reported plainly; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not a guarantee of safety"),
+        "explain must caveat that absence is not safety; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn threatdb_explain_typosquat_and_lookalike() {
+    // `reacct` is a known typosquat of `react` in the fixture, and is also
+    // edit-distance 1 from the popular package `react`.
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["explain", "reacct", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["present"], true);
+    let classes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["classification"].as_str().unwrap())
+        .collect();
+    assert!(classes.contains(&"typosquat"), "got {classes:?}");
+    assert!(classes.contains(&"popular_lookalike"), "got {classes:?}");
+}
+
+#[test]
+fn threatdb_explain_ip_indicator() {
+    // 203.0.113.50 is a Feodo Tracker IP in the fixture DB.
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(
+        &["explain", "203.0.113.50", "--format", "json"],
+        state.path(),
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("explain JSON");
+    assert_eq!(v["kind"], "ip");
+    assert_eq!(v["present"], true);
+    assert_eq!(v["findings"][0]["classification"], "malicious_ip");
+    assert_eq!(v["findings"][0]["source"], "feodo_tracker");
+}
+
+#[test]
+fn threatdb_sources_lists_all_feeds_with_counts() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["sources", "--format", "json"], state.path());
+    assert_eq!(code, 0, "sources should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("sources JSON");
+    assert_eq!(v["db_installed"], true);
+    let sources = v["sources"].as_array().expect("sources array");
+    // All 11 ThreatSource variants must be listed.
+    assert_eq!(sources.len(), 11, "every threat source must be listed");
+    // The fixture has 2 OSSF-malicious package records.
+    let ossf = sources
+        .iter()
+        .find(|s| s["id"] == "ossf_malicious")
+        .expect("ossf_malicious source");
+    assert_eq!(ossf["record_count"], 2);
+    assert_eq!(ossf["tier"], "primary");
+    // A supplemental source must be tagged supplemental and have 0 records
+    // (the fixture has no supplemental overlay).
+    let urlhaus = sources
+        .iter()
+        .find(|s| s["id"] == "urlhaus")
+        .expect("urlhaus source");
+    assert_eq!(urlhaus["tier"], "supplemental");
+    assert_eq!(urlhaus["record_count"], 0);
+}
+
+#[test]
+fn threatdb_sources_human_groups_by_tier() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["sources"], state.path());
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Primary feeds") && stdout.contains("Supplemental feeds"),
+        "sources must group feeds by tier; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn threatdb_health_reports_counts_and_signature() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) = run_threatdb(&["health", "--format", "json"], state.path());
+    assert_eq!(code, 0, "health on a loadable DB should exit 0");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+    assert_eq!(v["installed"], true);
+    // The fixture DB is signed with the embedded key, so the signature verifies.
+    assert_eq!(v["signature_valid"], true);
+    // Fixture has 3 packages, 1 IP, 2 typosquats, 4 popular = 10 total.
+    assert_eq!(v["counts"]["packages"], 3);
+    assert_eq!(v["counts"]["ips"], 1);
+    assert_eq!(v["counts"]["typosquats"], 2);
+    assert_eq!(v["counts"]["popular"], 4);
+    // The fixture's build timestamp is far in the past, so it is stale.
+    assert_eq!(v["stale"], true);
+    assert_eq!(v["status"], "stale");
+}
+
+#[test]
+fn threatdb_health_not_installed_reports_cleanly() {
+    let state = tempfile::tempdir().unwrap();
+    // Point at a path that does not exist.
+    let out = tirith()
+        .args(["threat-db", "health", "--format", "json"])
+        .env("TIRITH_THREATDB_PATH", state.path().join("missing.dat"))
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("failed to run tirith threat-db health");
+    assert_eq!(out.status.code(), Some(0), "absent DB is not an error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("health JSON");
+    assert_eq!(v["installed"], false);
+    assert_eq!(v["status"], "not_installed");
+}
+
+#[test]
+fn threatdb_diff_without_baseline_states_limitation() {
+    let state = tempfile::tempdir().unwrap();
+    let (stdout, _err, code) =
+        run_threatdb(&["diff", "--since", "1", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("diff JSON");
+    // The DB-format-has-no-history limitation must always be stated.
+    assert!(
+        v["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("no per-entry history"),
+        "diff must honestly state the no-history limitation"
+    );
+    // With no earlier snapshot, there is no delta and a note explains why.
+    assert!(v["delta"].is_null());
+    assert!(v["note"].as_str().unwrap().contains("No snapshot"));
+}
+
+#[test]
+fn threatdb_diff_rejects_unparseable_since() {
+    let state = tempfile::tempdir().unwrap();
+    let (_out, err, code) = run_threatdb(&["diff", "--since", "not-a-thing"], state.path());
+    assert_eq!(code, 1, "an unparseable --since must exit non-zero");
+    assert!(
+        err.contains("could not parse"),
+        "diff must report the parse failure on stderr; got:\n{err}"
+    );
+}
+
+#[test]
+fn threatdb_diff_computes_delta_against_seeded_snapshot() {
+    // Seed an older snapshot (DB version 40) directly into the history file,
+    // then `diff --since 40` against the current fixture DB (version 42).
+    let state = tempfile::tempdir().unwrap();
+    let tirith_state = state.path().join("tirith");
+    std::fs::create_dir_all(&tirith_state).unwrap();
+    let seeded = r#"{"recorded_at":1700000000,"build_sequence":40,"build_timestamp":1699000000,"signature_valid":true,"counts":{"packages":1,"hostnames":0,"ips":0,"typosquats":1,"popular":4},"sources":{"ossf_malicious":1}}"#;
+    std::fs::write(tirith_state.join("threatdb-history.jsonl"), seeded).unwrap();
+
+    let (stdout, _err, code) =
+        run_threatdb(&["diff", "--since", "40", "--format", "json"], state.path());
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("diff JSON");
+    assert_eq!(v["baseline"]["build_sequence"], 40);
+    assert_eq!(v["current"]["build_sequence"], 42);
+    // Fixture has 3 packages vs seeded 1 → +2; 1 IP vs 0 → +1; 2 typo vs 1 → +1.
+    assert_eq!(v["delta"]["packages"], 2);
+    assert_eq!(v["delta"]["ips"], 1);
+    assert_eq!(v["delta"]["typosquats"], 1);
+    assert_eq!(v["delta"]["total"], 4);
+}
+
+#[test]
+fn threatdb_transparency_commands_write_snapshot_history() {
+    // Any transparency command run against an installed DB must fold a
+    // snapshot into the history file, so `diff` accrues a usable trail.
+    let state = tempfile::tempdir().unwrap();
+    let (_out, _err, code) = run_threatdb(&["health"], state.path());
+    assert_eq!(code, 0);
+    let history = state.path().join("tirith").join("threatdb-history.jsonl");
+    assert!(
+        history.exists(),
+        "a transparency command must record a DB snapshot"
+    );
+    let content = std::fs::read_to_string(&history).unwrap();
+    assert!(
+        content.contains("\"build_sequence\":42"),
+        "snapshot must capture the fixture DB version; got:\n{content}"
+    );
+}
+
+#[test]
+fn threatdb_alias_threatdb_still_works() {
+    // The canonical spelling is `threat-db`; `threatdb` must remain a working
+    // alias.
+    let out = tirith()
+        .args(["threatdb", "sources", "--format", "json"])
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env("XDG_STATE_HOME", tempfile::tempdir().unwrap().path())
+        .output()
+        .expect("failed to run tirith threatdb");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the `threatdb` alias must still work"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sources JSON via alias");
+    assert_eq!(v["sources"].as_array().unwrap().len(), 11);
+}
+
+// ===========================================================================
+// verify-self / update / version --provenance  (M2 item 24)
+//
+// These tests run the CLI end-to-end. They MUST NOT touch the network: the
+// test binary is a debug build, so `verify-self` and `update` take the
+// dev-build short-circuit and never make an HTTP request. The rollback test
+// exercises only the local filesystem swap. No test replaces a real install.
+// ===========================================================================
+
+/// `tirith version` (no flags) prints the plain version line.
+#[test]
+fn version_plain_prints_version() {
+    let out = tirith()
+        .args(["version"])
+        .output()
+        .expect("failed to run tirith version");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("tirith "),
+        "version output should start with `tirith `, got: {stdout}"
+    );
+    assert!(
+        stdout.trim().chars().filter(|c| *c == '.').count() >= 2,
+        "version output should contain a semver-shaped version, got: {stdout}"
+    );
+}
+
+/// `tirith version --provenance` reports build info, install method, and an
+/// honest verification status — never a falsely-confident "verified".
+#[test]
+fn version_provenance_reports_install_method_and_honest_status() {
+    let out = tirith()
+        .args(["version", "--provenance"])
+        .output()
+        .expect("failed to run tirith version --provenance");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("install method:"), "got: {stdout}");
+    assert!(stdout.contains("verification:"), "got: {stdout}");
+    assert!(stdout.contains("build profile:"), "got: {stdout}");
+    // The test binary is a debug build; provenance must NOT claim "verified".
+    assert!(
+        !stdout.contains("verified (signed"),
+        "a dev build must never report a verified-signed status, got: {stdout}"
+    );
+}
+
+/// `tirith version --provenance --format json` emits a stable JSON object.
+#[test]
+fn version_provenance_json_shape() {
+    let out = tirith()
+        .args(["version", "--provenance", "--format", "json"])
+        .output()
+        .expect("failed to run tirith version --provenance --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("provenance JSON should parse");
+    assert!(v["version"].is_string());
+    assert!(v["install_method"].is_string());
+    assert!(v["verification_status"].is_string());
+    assert!(v["dev_build"].is_boolean());
+    // The test binary is a debug build → dev_build true, status not verified.
+    assert_eq!(v["dev_build"], serde_json::Value::Bool(true));
+    assert_eq!(v["verification_status"], "unverified");
+}
+
+/// `tirith verify-self` on a dev build reports UNVERIFIED honestly and exits 0
+/// (an honest "cannot verify" is not a failure). It must NOT hit the network.
+#[test]
+fn verify_self_dev_build_is_honestly_unverified() {
+    let out = tirith()
+        .args(["verify-self"])
+        .output()
+        .expect("failed to run tirith verify-self");
+    // Exit 0: unverified-for-a-benign-reason is not an error.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "verify-self on a dev build should exit 0 (honest unverified)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("UNVERIFIED"),
+        "verify-self should say UNVERIFIED for a dev build, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("VERIFIED (signed") && !stdout.contains("VERIFIED (checksum"),
+        "verify-self must never falsely claim a dev build is verified, got: {stdout}"
+    );
+}
+
+/// `tirith verify-self --format json` on a dev build: status unverified,
+/// integrity_ok false.
+#[test]
+fn verify_self_json_dev_build_not_integrity_ok() {
+    let out = tirith()
+        .args(["verify-self", "--format", "json"])
+        .output()
+        .expect("failed to run tirith verify-self --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("verify-self JSON should parse");
+    assert_eq!(v["verification_status"], "unverified");
+    assert_eq!(v["integrity_ok"], serde_json::Value::Bool(false));
+}
+
+/// `tirith update` on an install tirith cannot identify must NOT self-modify;
+/// it advises and exits 0.
+#[test]
+fn update_unknown_install_advises_and_does_not_modify() {
+    let out = tirith()
+        .args(["update"])
+        .output()
+        .expect("failed to run tirith update");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("could not determine how it was installed")
+            || stdout.contains("installed via"),
+        "update on an unknown install should advise, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("NOT self-modify") || stdout.contains("not self-modify"),
+        "update must state it will not self-modify, got: {stdout}"
+    );
+}
+
+/// `tirith update --format json` on an unknown install yields the
+/// use-package-manager action.
+#[test]
+fn update_unknown_install_json_action() {
+    let out = tirith()
+        .args(["update", "--format", "json"])
+        .output()
+        .expect("failed to run tirith update --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("update JSON should parse");
+    assert_eq!(v["action"], "use-package-manager");
+}
+
+/// `tirith update --rollback` on a non-self-managed install is refused with a
+/// clear message and a non-zero exit — rollback is self-managed-only.
+#[test]
+fn update_rollback_refused_for_non_self_managed() {
+    let out = tirith()
+        .args(["update", "--rollback"])
+        .output()
+        .expect("failed to run tirith update --rollback");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "rollback on a non-self-managed install should exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--rollback only applies to a self-managed"),
+        "rollback should explain the self-managed restriction, got: {stdout}"
+    );
+}
+
+/// `--verify` and `--rollback` are mutually exclusive (clap-enforced).
+#[test]
+fn update_verify_and_rollback_conflict() {
+    let out = tirith()
+        .args(["update", "--verify", "--rollback"])
+        .output()
+        .expect("failed to run tirith update --verify --rollback");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "--verify and --rollback together should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflict"),
+        "clap should report the --verify/--rollback conflict, got: {stderr}"
+    );
+}
+
+/// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith
+/// binary placed under a `.local/bin` path (so it self-detects as
+/// self-managed) plus a `.tirith-previous` backup is rolled back, and the
+/// live binary's bytes become the backup's bytes.
+///
+/// This exercises the real binary self-replacement path — the most
+/// security-critical mutation — without touching the network or any real
+/// install.
+#[cfg(unix)]
+#[test]
+fn update_rollback_self_managed_restores_previous_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    // `.local/bin/tirith` makes detect_install_method classify it self-managed.
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+
+    // The "live" binary is a real, runnable copy of the test tirith binary —
+    // it must be able to run `update --rollback` on itself.
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The rollback target: a `.tirith-previous` backup with sentinel content.
+    // (Its content need not be a real binary — rollback only swaps bytes.)
+    let backup = bin_dir.join("tirith.tirith-previous");
+    let sentinel = b"PREVIOUS-TIRITH-BINARY-SENTINEL";
+    fs::write(&backup, sentinel).unwrap();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--yes", "--format", "json"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "rollback of a self-managed install should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("rollback JSON should parse");
+    assert_eq!(v["action"], "rolled-back");
+
+    // The live binary now holds the previous binary's bytes. Compare lengths
+    // first (a mismatch would otherwise dump the whole binary on failure).
+    let live_after = fs::read(&live).unwrap();
+    assert_eq!(
+        live_after.len(),
+        sentinel.len(),
+        "rollback must replace the live binary with the (small) sentinel backup"
+    );
+    assert!(
+        live_after == sentinel,
+        "rollback must restore the previous binary's bytes onto the live path"
+    );
+    // The stale backup is consumed (it is no longer "the previous version").
+    assert!(
+        !backup.exists(),
+        "the consumed rollback backup should be removed after a successful rollback"
+    );
+}
+
+/// `tirith update --rollback` on a self-managed install with NO backup present
+/// fails cleanly (nothing to roll back to) without modifying anything.
+#[cfg(unix)]
+#[test]
+fn update_rollback_self_managed_without_backup_fails_cleanly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_len = fs::metadata(&live).unwrap().len();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--yes"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "rollback with no backup should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no previous binary to roll back to"),
+        "should explain there is no rollback point, got: {stdout}"
+    );
+    // The live binary must be untouched (it is still the full tirith binary).
+    assert_eq!(
+        fs::metadata(&live).unwrap().len(),
+        original_len,
+        "a failed rollback must not modify the live binary"
+    );
+}
+
+/// `tirith update --dry-run --rollback` on a self-managed install with a
+/// backup reports what it WOULD do and changes nothing.
+#[cfg(unix)]
+#[test]
+fn update_rollback_dry_run_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_len = fs::metadata(&live).unwrap().len();
+
+    let backup = bin_dir.join("tirith.tirith-previous");
+    fs::write(&backup, b"BACKUP-BYTES").unwrap();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--dry-run"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("dry run"), "got: {stdout}");
+    // Nothing changed: live binary and backup are both intact.
+    assert_eq!(fs::metadata(&live).unwrap().len(), original_len);
+    assert_eq!(fs::read(&backup).unwrap(), b"BACKUP-BYTES");
 }

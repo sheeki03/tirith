@@ -80,6 +80,12 @@ Examples:
         #[arg(long)]
         offline: bool,
 
+        /// When the command is blocked or warned, also print a concrete safer
+        /// alternative (e.g. download-then-review instead of pipe-to-shell).
+        /// Advisory only — does not change the verdict or exit code.
+        #[arg(long)]
+        suggest_safe_command: bool,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -146,10 +152,17 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith score https://get.example-tool.sh
+  tirith score --explain https://example.com
   tirith score --format json https://example.com")]
     Score {
         /// URL to score
         url: String,
+
+        /// Show the full factor-by-factor breakdown of how the score was
+        /// derived. Every factor is fixed and inspectable — the breakdown
+        /// sums exactly to the final score, reproducible by hand.
+        #[arg(long)]
+        explain: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -180,6 +193,7 @@ Examples:
     #[command(after_help = "\
 Examples:
   tirith explain --rule pipe_to_interpreter
+  tirith explain --rule curl_pipe_shell --fix
   tirith explain --list --category terminal")]
     Explain {
         /// Rule ID to explain (e.g., pipe_to_interpreter)
@@ -193,6 +207,11 @@ Examples:
         /// Filter --list by category (hostname, path, transport, terminal, command, etc.)
         #[arg(long, requires = "list")]
         category: Option<String>,
+
+        /// Show only the rule's remediation ("what to do instead").
+        /// Requires --rule; not valid with --list.
+        #[arg(long, requires = "rule", conflicts_with = "list")]
+        fix: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -387,7 +406,8 @@ Examples:
 Examples:
   tirith policy init
   tirith policy validate
-  tirith policy test 'curl https://example.com | bash'")]
+  tirith policy test 'curl https://example.com | bash'
+  tirith policy tune --from-audit")]
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
@@ -450,15 +470,21 @@ Examples:
         detail: Option<String>,
     },
 
-    /// Manage trusted patterns (allowlist entries with TTL, scoping, and audit)
+    /// Manage trusted patterns (allowlist entries with scope, TTL, and audit)
     #[command(after_help = "\
+Trust is narrow and expiring by default: trust the most specific thing that
+works, and entries expire after 30d unless you pass --permanent. A broad
+pattern (whole domain, wildcard, bare TLD) requires --broad.
+
 Examples:
-  tirith trust add example.com
-  tirith trust add example.com --ttl 7d
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+  tirith trust add example.com --broad --ttl 7d
+  tirith trust add get.docker.com --broad --rule curl_pipe_shell --permanent
   tirith trust list --format json --expired
-  tirith trust remove example.com
-  tirith trust last
-  tirith trust gc")]
+  tirith trust explain example.com
+  tirith trust diff
+  tirith trust gc --expired
+  tirith trust remove example.com")]
     Trust {
         #[command(subcommand)]
         action: TrustAction,
@@ -498,11 +524,15 @@ Examples:
     /// Manage the threat intelligence database
     #[command(
         name = "threat-db",
+        visible_alias = "threatdb",
         after_help = "\
 Examples:
   tirith threat-db update
-  tirith threat-db update --force
-  tirith threat-db status --format json"
+  tirith threat-db status --format json
+  tirith threat-db explain react
+  tirith threat-db sources
+  tirith threat-db health
+  tirith threat-db diff --since 2026-01-01"
     )]
     ThreatDb {
         #[command(subcommand)]
@@ -589,6 +619,96 @@ Examples:
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+
+    /// Verify the running tirith binary's integrity and provenance
+    #[command(after_help = "\
+Verifies that the tirith binary you are running is the genuine, unmodified
+binary from an official release. It re-downloads the release archive for this
+exact version, checks it against the signed release checksums.txt (and the
+cosign signature when cosign is installed), and confirms the running binary is
+byte-identical to the official one.
+
+If full verification is not possible — a local dev build, no network, an
+unknown install — it says so HONESTLY rather than reporting a false 'verified'.
+
+This command reaches the network; it does so only when you run it.
+
+Examples:
+  tirith verify-self
+  tirith verify-self --format json")]
+    VerifySelf {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Update tirith to the latest release (package-manager aware)
+    #[command(after_help = "\
+Updates tirith to the latest release. tirith detects how it was installed:
+
+  * Package-manager installs (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are
+    NEVER self-modified — tirith prints the exact command to run instead.
+  * A self-managed install (the install.sh tarball or a standalone binary) is
+    updated in place: tirith downloads the release, verifies it, then performs
+    an atomic swap, keeping the previous binary so --rollback can revert.
+
+This command reaches the network; it does so only when you run it.
+
+Examples:
+  tirith update
+  tirith update --verify
+  tirith update --rollback
+  tirith update --dry-run")]
+    Update {
+        /// Verify the new release's provenance (checksum + cosign signature)
+        /// before installing; verification failure aborts the update.
+        #[arg(long)]
+        verify: bool,
+
+        /// Revert to the previously-installed binary (self-managed installs
+        /// only). Conflicts with --verify.
+        #[arg(long, conflicts_with = "verify")]
+        rollback: bool,
+
+        /// Show what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the running binary's version and provenance
+    #[command(after_help = "\
+Examples:
+  tirith version
+  tirith version --provenance
+  tirith version --provenance --format json")]
+    Version {
+        /// Show full provenance: build info, detected install method, and the
+        /// (offline) verification status. Run `tirith verify-self` for full
+        /// networked verification.
+        #[arg(long)]
+        provenance: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -871,31 +991,75 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Suggest policy adjustments from the local audit log (suggest-only)
+    #[command(after_help = "\
+Analyzes your audit log and suggests concrete, conservative policy changes —
+e.g. a rule you allow or bypass every time may warrant an allowlist entry.
+It only SUGGESTS: it never edits your policy. Review each suggestion, then
+apply it yourself. When the log is too small it says so rather than guess.
+
+Examples:
+  tirith policy tune --from-audit
+  tirith policy tune --from-audit --format json")]
+    Tune {
+        /// Analyze the local audit log (currently the only source).
+        #[arg(long)]
+        from_audit: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum TrustAction {
-    /// Add a trusted pattern
+    /// Add a trusted pattern (narrow scope and a 30d TTL by default)
     #[command(after_help = "\
+Trust the narrowest thing that works. A specific URL or path is accepted as-is;
+a whole domain, wildcard, or bare TLD is broad and requires --broad. Entries
+expire after 30d unless you pass --permanent or your own --ttl.
+
 Examples:
-  tirith trust add example.com
-  tirith trust add example.com --ttl 7d
-  tirith trust add example.com --rule pipe_to_interpreter")]
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+  tirith trust add example.com --broad --ttl 7d
+  tirith trust add example.com --broad --rule pipe_to_interpreter --permanent
+  tirith trust add example.com --broad --reason \"internal mirror, ticket OPS-42\"")]
     Add {
-        /// Pattern to trust (domain, URL fragment, etc.)
+        /// Pattern to trust (a specific URL/path, or a domain with --broad)
         pattern: String,
-        /// Scope trust to a specific rule ID
+        /// Scope trust to a specific rule ID (narrower than a global trust)
         #[arg(long)]
         rule: Option<String>,
-        /// TTL duration (e.g., 1h, 7d, 30d)
-        #[arg(long)]
+        /// TTL duration (e.g., 1h, 7d, 30d). Default: 30d. Conflicts with --permanent
+        #[arg(long, conflicts_with = "permanent")]
         ttl: Option<String>,
+        /// Never expire this entry (opt out of the default TTL)
+        #[arg(long)]
+        permanent: bool,
+        /// Accept a broad pattern (whole domain, wildcard, or bare TLD)
+        #[arg(long)]
+        broad: bool,
+        /// Free-text reason recorded with the entry (shown by `trust explain`)
+        #[arg(long)]
+        reason: Option<String>,
         /// Scope: user (default) or repo
         #[arg(long, default_value = "user")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
-    /// List trusted patterns from all sources
+    /// List trusted patterns from all sources, with scope visualization
     #[command(after_help = "\
+Each row shows the entry's scope class (exact / substring / domain / wildcard /
+bare-TLD); a '!' marks a dangerously broad entry.
+
 Examples:
   tirith trust list
   tirith trust list --format json --expired")]
@@ -916,6 +1080,37 @@ Examples:
         #[arg(long, default_value = "all")]
         scope: String,
     },
+    /// Explain a trust entry: scope, coverage, expiry, and why it was added
+    #[command(after_help = "\
+Examples:
+  tirith trust explain example.com
+  tirith trust explain example.com --format json")]
+    Explain {
+        /// Pattern of the entry to explain
+        pattern: String,
+        /// Scope: user, repo, or all (default)
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show what changed in the trust set since the last snapshot
+    #[command(after_help = "\
+Examples:
+  tirith trust diff
+  tirith trust diff --format json")]
+    Diff {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// Remove a trusted pattern
     #[command(after_help = "\
 Examples:
@@ -935,14 +1130,25 @@ Examples:
 Examples:
   tirith trust last")]
     Last,
-    /// Remove expired entries from trust stores
+    /// Garbage-collect expired entries from trust stores
     #[command(after_help = "\
 Examples:
-  tirith trust gc")]
+  tirith trust gc --expired
+  tirith trust gc --expired --scope user")]
     Gc {
+        /// Collect expired entries — currently the only collection mode, so
+        /// this flag is optional
+        #[arg(long)]
+        expired: bool,
         /// Scope: user, repo, or all (default)
         #[arg(long, default_value = "all")]
         scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -1009,9 +1215,90 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Explain what the threat DB knows about a domain, package, or IP
+    #[command(after_help = "\
+Examples:
+  tirith threat-db explain react
+  tirith threat-db explain npm:left-pad
+  tirith threat-db explain example.com
+  tirith threat-db explain 203.0.113.50 --format json")]
+    Explain {
+        /// Indicator to look up: a domain, a package name (optionally
+        /// `ecosystem:name` or `name@version`), or an IPv4 address.
+        indicator: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// List the threat-intelligence sources the DB is built from
+    #[command(after_help = "\
+Examples:
+  tirith threat-db sources
+  tirith threat-db sources --format json")]
+    Sources {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Report threat DB health: install, signature, staleness, counts
+    #[command(after_help = "\
+Examples:
+  tirith threat-db health
+  tirith threat-db health --format json")]
+    Health {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Summarize what changed in the DB since a given version or date
+    #[command(after_help = "\
+Examples:
+  tirith threat-db diff --since 42
+  tirith threat-db diff --since 2026-01-15
+  tirith threat-db diff --since 2026-01-15 --format json")]
+    Diff {
+        /// Compare against this point: a DB version number (build sequence)
+        /// or an ISO date (YYYY-MM-DD).
+        #[arg(long)]
+        since: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
+/// Process entry point. tirith's real logic runs in [`run`], on a thread with
+/// an explicit 16 MiB stack: `clap` builds and parses tirith's large command
+/// tree at startup, which is stack-heavy, and Windows' ~1 MiB default
+/// main-thread stack overflows it once the CLI grows. A generous stack keeps
+/// startup safe on every platform regardless of how the command set expands.
 fn main() {
+    let handle = std::thread::Builder::new()
+        .name("tirith-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .expect("failed to spawn tirith main thread");
+    if handle.join().is_err() {
+        // `run` panicked; the panic hook already reported it. Exit with the
+        // conventional panic code rather than re-panicking (which would print
+        // a second, confusing panic message).
+        std::process::exit(101);
+    }
+}
+
+fn run() {
     // Reset SIGPIPE to default so piping to head/grep exits cleanly instead of panicking.
     #[cfg(unix)]
     unsafe {
@@ -1038,6 +1325,7 @@ fn main() {
             no_daemon,
             warn_only,
             offline,
+            suggest_safe_command,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -1052,6 +1340,7 @@ fn main() {
                 no_daemon,
                 warn_only,
                 offline,
+                suggest_safe_command,
             )
         }
 
@@ -1079,9 +1368,14 @@ fn main() {
             cli::run::run(&url, no_exec, json, sha256)
         }
 
-        Commands::Score { url, format, json } => {
+        Commands::Score {
+            url,
+            explain,
+            format,
+            json,
+        } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::score::run(&url, json)
+            cli::score::run(&url, json, explain)
         }
 
         Commands::Diff { url, format, json } => {
@@ -1093,11 +1387,12 @@ fn main() {
             rule,
             list,
             category,
+            fix,
             format,
             json,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::explain::run(rule.as_deref(), list, category.as_deref(), json)
+            cli::explain::run(rule.as_deref(), list, category.as_deref(), fix, json)
         }
 
         Commands::Why { format, json } => {
@@ -1188,6 +1483,14 @@ fn main() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::test(command.as_deref(), file.as_deref(), json)
+            }
+            PolicyAction::Tune {
+                from_audit,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::policy::tune(from_audit, json)
             }
         },
 
@@ -1319,8 +1622,25 @@ fn main() {
                 pattern,
                 rule,
                 ttl,
+                permanent,
+                broad,
+                reason,
                 scope,
-            } => cli::trust::add(&pattern, rule.as_deref(), ttl.as_deref(), &scope),
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::add(
+                    &pattern,
+                    rule.as_deref(),
+                    ttl.as_deref(),
+                    permanent,
+                    broad,
+                    reason.as_deref(),
+                    &scope,
+                    json,
+                )
+            }
             TrustAction::List {
                 rule,
                 format,
@@ -1329,7 +1649,21 @@ fn main() {
                 scope,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::snapshot_current_trust();
                 cli::trust::list(rule.as_deref(), json, expired, &scope)
+            }
+            TrustAction::Explain {
+                pattern,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::explain(&pattern, &scope, json)
+            }
+            TrustAction::Diff { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::diff(json)
             }
             TrustAction::Remove {
                 pattern,
@@ -1337,7 +1671,15 @@ fn main() {
                 scope,
             } => cli::trust::remove(&pattern, rule.as_deref(), &scope),
             TrustAction::Last => cli::trust::last(),
-            TrustAction::Gc { scope } => cli::trust::gc(&scope),
+            TrustAction::Gc {
+                expired,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::gc(expired, &scope, json)
+            }
         },
 
         Commands::Init { shell } => cli::init::run(shell.as_deref()),
@@ -1361,6 +1703,30 @@ fn main() {
             ThreatDbAction::Status { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::threatdb_cmd::status(json)
+            }
+            ThreatDbAction::Explain {
+                indicator,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::explain(&indicator, json)
+            }
+            ThreatDbAction::Sources { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::sources(json)
+            }
+            ThreatDbAction::Health { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::health(json)
+            }
+            ThreatDbAction::Diff {
+                since,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::threatdb_cmd::diff(&since, json)
             }
         },
 
@@ -1389,6 +1755,32 @@ fn main() {
         Commands::Completions { shell } => cli::completions::run(shell),
 
         Commands::Manpage => cli::manpage::run(),
+
+        Commands::VerifySelf { format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::verify_self(json)
+        }
+
+        Commands::Update {
+            verify,
+            rollback,
+            dry_run,
+            yes,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::update(verify, rollback, dry_run, yes, json)
+        }
+
+        Commands::Version {
+            provenance,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::version(provenance, json)
+        }
     };
 
     std::process::exit(exit_code);

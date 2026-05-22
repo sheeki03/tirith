@@ -19,6 +19,7 @@ pub fn run(
     no_daemon: bool,
     warn_only: bool,
     offline: bool,
+    suggest_safe_command: bool,
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
@@ -334,18 +335,39 @@ pub fn run(
         return effective.action.exit_code();
     }
 
+    // Safe-command suggestions are advisory only — computed solely when the
+    // user opted in AND the verdict actually flagged something (Allow needs no
+    // alternative). They never influence `effective.action` or the exit code.
+    let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
+        if suggest_safe_command && effective.action != Action::Allow {
+            tirith_core::safe_command::suggest(cmd, shell_type, &effective)
+        } else {
+            Vec::new()
+        };
+
     if json {
-        if output::write_json(
+        let suggestions_opt = if suggest_safe_command {
+            Some(safe_suggestions.as_slice())
+        } else {
+            None
+        };
+        if output::write_json_with_suggestions(
             &effective,
             &policy.dlp_custom_patterns,
+            suggestions_opt,
             std::io::stdout().lock(),
         )
         .is_err()
         {
             eprintln!("tirith: failed to write JSON output");
         }
-    } else if output::write_human_auto(&effective, warn_only).is_err() {
-        eprintln!("tirith: failed to write output");
+    } else {
+        if output::write_human_auto(&effective, warn_only).is_err() {
+            eprintln!("tirith: failed to write output");
+        }
+        if output::write_safe_suggestions(&safe_suggestions, std::io::stderr().lock()).is_err() {
+            eprintln!("tirith: failed to write safe-command suggestions");
+        }
     }
 
     // Mode A (direct CLI strict_warn): prompt interactively. In non-interactive

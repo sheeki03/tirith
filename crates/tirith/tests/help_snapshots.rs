@@ -42,6 +42,8 @@ help_example_tests! {
     #[cfg(unix)]
     help_run        => (["run", "--help"], "tirith run");
     help_score      => (["score", "--help"], "tirith score");
+    help_score_explain => (["score", "--help"], "tirith score --explain");
+    help_policy_tune => (["policy", "tune", "--help"], "tirith policy tune --from-audit");
     help_diff       => (["diff", "--help"], "tirith diff");
     help_explain    => (["explain", "--help"], "tirith explain --rule");
     help_why        => (["why", "--help"], "tirith why");
@@ -58,10 +60,18 @@ help_example_tests! {
     help_receipt    => (["receipt", "--help"], "tirith receipt");
     help_checkpoint => (["checkpoint", "--help"], "tirith checkpoint create");
     help_threat_db  => (["threat-db", "--help"], "tirith threat-db update");
+    help_threat_db_explain => (["threat-db", "explain", "--help"], "tirith threat-db explain react");
+    help_threat_db_sources => (["threat-db", "sources", "--help"], "tirith threat-db sources");
+    help_threat_db_health  => (["threat-db", "health", "--help"], "tirith threat-db health");
+    help_threat_db_diff    => (["threat-db", "diff", "--help"], "tirith threat-db diff --since");
     help_daemon     => (["daemon", "--help"], "tirith daemon start");
     help_gateway    => (["gateway", "--help"], "tirith gateway");
     help_license    => (["license", "--help"], "tirith license");
     help_mcp_server => (["mcp-server", "--help"], "tirith mcp-server");
+    help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
+    help_update     => (["update", "--help"], "tirith update --verify");
+    help_update_rollback => (["update", "--help"], "tirith update --rollback");
+    help_version    => (["version", "--help"], "tirith version --provenance");
 }
 
 #[test]
@@ -73,6 +83,9 @@ fn help_root_lists_subcommands() {
     assert!(stdout.contains("setup"));
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("mcp-server"));
+    assert!(stdout.contains("verify-self"));
+    assert!(stdout.contains("update"));
+    assert!(stdout.contains("version"));
     // hook-event is an internal subcommand and must not surface here.
     assert!(
         !stdout.contains("hook-event"),

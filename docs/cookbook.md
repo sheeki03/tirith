@@ -26,6 +26,25 @@ tirith policy init --template ai-agent-heavy  # heavy AI-agent environments
 `tirith policy init` with no `--template` writes the full default policy.
 The recipes below show hand-tuned variations on these baselines.
 
+## 0b. Tune From Your Audit Log
+
+Once tirith has some history, `tirith policy tune --from-audit` reads your
+audit log and *suggests* conservative policy adjustments:
+
+```bash
+tirith policy tune --from-audit
+tirith policy tune --from-audit --format json   # machine-readable
+```
+
+It is **suggest-only** — it never edits your policy. The headline suggestion
+is a rule you allowed or bypassed *every* time and *never* blocked: that rule
+is probably firing on something you trust, so an `allowlist` entry or a
+`severity_overrides` downgrade may be warranted. A rule you *sometimes* block
+on is never suggested for a downgrade — it is doing its job. Every suggestion
+is a plain count from the log, not an inference; when the log is too small to
+be meaningful, `policy tune` says so rather than guessing. Review each
+suggestion, then apply it by hand to `.tirith/policy.yaml`.
+
 ## 1. Strict Organization (Fail Closed, No Bypass)
 
 ```yaml
@@ -121,6 +140,25 @@ vet_not_configured
 
 When tirith blocks a `curl | bash` pattern, the safest alternatives are:
 
+### Ask tirith for the rewrite
+
+`tirith check --suggest-safe-command` prints a concrete safer version of the
+exact command you ran:
+
+```bash
+tirith check --suggest-safe-command -- 'curl https://example.com/install.sh | bash'
+# tirith: safer alternative
+#   curl_pipe_shell
+#     try: curl -fsSL -o /tmp/tirith-review.sh https://example.com/install.sh \
+#          && less /tmp/tirith-review.sh && bash /tmp/tirith-review.sh
+```
+
+It also drops insecure-TLS flags and upgrades `http://` to `https://`. For
+findings with no safe mechanical rewrite it says so plainly instead of guessing.
+The flag is advisory — it never changes the verdict or exit code. Use
+`tirith explain --rule curl_pipe_shell --fix` to see a rule's remediation on its
+own.
+
 ### Using tirith run (built-in, Unix only)
 
 `tirith run` downloads, inspects, and prompts before executing:
@@ -163,3 +201,26 @@ allowlist:
   - "get.docker.com"
   - "raw.githubusercontent.com/org/repo"
 ```
+
+### CLI: manage trust without editing YAML
+
+`tirith trust` does the same thing from the command line, and steers you
+toward the narrowest scope that works. Trusting a specific path is accepted
+as-is; trusting a whole domain is broad and must be opted into with `--broad`.
+Entries expire after 30 days by default, so a temporary allow does not linger.
+
+```bash
+# Narrow: trust one exact resource. Expires in 30 days.
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+
+# Broad: trust a whole domain for one rule only. --broad is required.
+tirith trust add get.docker.com --broad --rule curl_pipe_shell
+
+tirith trust list                 # see every entry, its scope, and its TTL
+tirith trust explain get.docker.com
+tirith trust diff                 # what changed since last time
+tirith trust gc --expired         # remove entries whose TTL has passed
+```
+
+Use `--permanent` if an entry genuinely should never expire, and `--reason`
+to record why it was added — `tirith trust explain` shows it back to you.

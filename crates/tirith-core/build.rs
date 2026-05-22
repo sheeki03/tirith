@@ -1001,6 +1001,32 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     }
     code.push_str("        _ => None,\n    }\n}\n");
 
+    // Per-rule remediation lookup — single source of truth for `RuleId`-keyed
+    // "what to do instead" advice. Exhaustive: every RuleId has a remediation
+    // entry in the TOML (build.rs panics above if any are missing), so no
+    // wildcard arm is needed and the match cannot drift out of sync.
+    code.push_str(
+        "\n/// Per-rule remediation lookup generated from rule_explanations.toml.\n\
+         ///\n\
+         /// Returns the canonical \"what to do instead / how to make this safe\"\n\
+         /// string for a `RuleId`. Exhaustive over every variant. Some rules have\n\
+         /// no mechanical fix — their remediation is honest guidance rather than a\n\
+         /// rewrite. An empty string means no remediation advice is available.\n\
+         pub fn remediation_for_rule(rule_id: crate::verdict::RuleId) -> &'static str {\n\
+         \x20   use crate::verdict::RuleId;\n\
+         \x20   match rule_id {\n",
+    );
+    for entry in &file.rule {
+        let pascal = expected
+            .get(entry.id.as_str())
+            .unwrap_or_else(|| panic!("no PascalCase for '{}'", entry.id));
+        code.push_str(&format!(
+            "        RuleId::{pascal} => \"{}\",\n",
+            esc(&entry.remediation)
+        ));
+    }
+    code.push_str("    }\n}\n");
+
     let out_path = Path::new(out_dir).join("rule_explanations_gen.rs");
     fs::write(&out_path, code).unwrap();
 }
