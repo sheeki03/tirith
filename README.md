@@ -485,6 +485,23 @@ programs.zsh.initContent = ''
 '';
 ```
 
+### Updating and verifying tirith
+
+tirith can verify its own integrity and update itself. Both commands reach the network only when you run them.
+
+```bash
+tirith verify-self          # is this binary the genuine, unmodified release?
+tirith update               # update to the latest release
+tirith version --provenance # version, build info, install method, verification
+```
+
+**`tirith verify-self`** confirms the running binary is the genuine, unmodified binary from an official release. It re-downloads the release archive for your version and target, verifies it against the signed release `checksums.txt`, verifies the cosign signature over `checksums.txt` when [`cosign`](https://github.com/sigstore/cosign) is installed, and confirms the running binary is byte-identical to the official one. If full verification is not possible — a local dev build, no network, an install tirith cannot identify — it says so honestly rather than reporting a false "verified". With `cosign` absent the checksum is still verified (reported as `verified-checksum-only`); install `cosign` for full signature verification (`verified-signed`).
+
+**`tirith update`** is package-manager-aware:
+
+- **Package-manager installs** (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are never self-modified. tirith prints the exact command to run instead — e.g. `brew upgrade tirith`. Updating through the package manager keeps its database consistent.
+- **Self-managed installs** (the `install.sh` tarball, or a standalone binary) are updated in place: tirith downloads the latest release, verifies it, then atomically swaps the binary, keeping the previous one as a `tirith.tirith-previous` sidecar. `--verify` makes a verified cosign signature mandatory; a checksum mismatch always aborts. `tirith update --rollback` reverts to the previous binary; `--dry-run` shows what would happen without changing anything.
+
 ### Shell Integrations
 
 **Oh-My-Zsh:**
@@ -601,6 +618,9 @@ tirith daemon stop
 | `tirith doctor` | Diagnose installation, hooks, and policy |
 | `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |
 | `tirith doctor --compat` | Shell/terminal compatibility report (detected shell, bash mode, install checks, co-installed hook-interacting tools) |
+| `tirith verify-self` | Verify the running binary is the genuine, unmodified official release (checksum + cosign signature); reports honestly when it cannot |
+| `tirith update` | Update tirith to the latest release — defers to your package manager for PM installs, atomic verified self-replace for `install.sh`/standalone installs (`--verify`, `--rollback`, `--dry-run`) |
+| `tirith version --provenance` | Show version, build info, detected install method, and verification status |
 | `tirith daemon start` | Start background daemon for faster checks (Unix) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith checkpoint {create,restore,diff}` | Snapshot files before risky operations, roll back if needed |

@@ -68,6 +68,10 @@ help_example_tests! {
     help_gateway    => (["gateway", "--help"], "tirith gateway");
     help_license    => (["license", "--help"], "tirith license");
     help_mcp_server => (["mcp-server", "--help"], "tirith mcp-server");
+    help_verify_self => (["verify-self", "--help"], "tirith verify-self --format json");
+    help_update     => (["update", "--help"], "tirith update --verify");
+    help_update_rollback => (["update", "--help"], "tirith update --rollback");
+    help_version    => (["version", "--help"], "tirith version --provenance");
 }
 
 #[test]
@@ -79,6 +83,9 @@ fn help_root_lists_subcommands() {
     assert!(stdout.contains("setup"));
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("mcp-server"));
+    assert!(stdout.contains("verify-self"));
+    assert!(stdout.contains("update"));
+    assert!(stdout.contains("version"));
     // hook-event is an internal subcommand and must not surface here.
     assert!(
         !stdout.contains("hook-event"),

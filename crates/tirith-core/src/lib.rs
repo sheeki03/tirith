@@ -28,6 +28,7 @@ pub mod safe_command;
 pub mod sarif;
 pub mod scan;
 pub mod scoring;
+pub mod selfupdate;
 pub mod session;
 pub mod session_warnings;
 pub mod style;

@@ -110,6 +110,7 @@ pub mod policy;
 pub mod receipt;
 pub mod scan;
 pub mod score;
+pub mod selfupdate;
 pub mod threatdb_cmd;
 pub mod trust;
 pub mod warnings;

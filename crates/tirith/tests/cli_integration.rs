@@ -3010,3 +3010,321 @@ fn threatdb_alias_threatdb_still_works() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("sources JSON via alias");
     assert_eq!(v["sources"].as_array().unwrap().len(), 11);
 }
+
+// ===========================================================================
+// verify-self / update / version --provenance  (M2 item 24)
+//
+// These tests run the CLI end-to-end. They MUST NOT touch the network: the
+// test binary is a debug build, so `verify-self` and `update` take the
+// dev-build short-circuit and never make an HTTP request. The rollback test
+// exercises only the local filesystem swap. No test replaces a real install.
+// ===========================================================================
+
+/// `tirith version` (no flags) prints the plain version line.
+#[test]
+fn version_plain_prints_version() {
+    let out = tirith()
+        .args(["version"])
+        .output()
+        .expect("failed to run tirith version");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("tirith "),
+        "version output should start with `tirith `, got: {stdout}"
+    );
+    assert!(
+        stdout.trim().chars().filter(|c| *c == '.').count() >= 2,
+        "version output should contain a semver-shaped version, got: {stdout}"
+    );
+}
+
+/// `tirith version --provenance` reports build info, install method, and an
+/// honest verification status — never a falsely-confident "verified".
+#[test]
+fn version_provenance_reports_install_method_and_honest_status() {
+    let out = tirith()
+        .args(["version", "--provenance"])
+        .output()
+        .expect("failed to run tirith version --provenance");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("install method:"), "got: {stdout}");
+    assert!(stdout.contains("verification:"), "got: {stdout}");
+    assert!(stdout.contains("build profile:"), "got: {stdout}");
+    // The test binary is a debug build; provenance must NOT claim "verified".
+    assert!(
+        !stdout.contains("verified (signed"),
+        "a dev build must never report a verified-signed status, got: {stdout}"
+    );
+}
+
+/// `tirith version --provenance --format json` emits a stable JSON object.
+#[test]
+fn version_provenance_json_shape() {
+    let out = tirith()
+        .args(["version", "--provenance", "--format", "json"])
+        .output()
+        .expect("failed to run tirith version --provenance --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("provenance JSON should parse");
+    assert!(v["version"].is_string());
+    assert!(v["install_method"].is_string());
+    assert!(v["verification_status"].is_string());
+    assert!(v["dev_build"].is_boolean());
+    // The test binary is a debug build → dev_build true, status not verified.
+    assert_eq!(v["dev_build"], serde_json::Value::Bool(true));
+    assert_eq!(v["verification_status"], "unverified");
+}
+
+/// `tirith verify-self` on a dev build reports UNVERIFIED honestly and exits 0
+/// (an honest "cannot verify" is not a failure). It must NOT hit the network.
+#[test]
+fn verify_self_dev_build_is_honestly_unverified() {
+    let out = tirith()
+        .args(["verify-self"])
+        .output()
+        .expect("failed to run tirith verify-self");
+    // Exit 0: unverified-for-a-benign-reason is not an error.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "verify-self on a dev build should exit 0 (honest unverified)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("UNVERIFIED"),
+        "verify-self should say UNVERIFIED for a dev build, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("VERIFIED (signed") && !stdout.contains("VERIFIED (checksum"),
+        "verify-self must never falsely claim a dev build is verified, got: {stdout}"
+    );
+}
+
+/// `tirith verify-self --format json` on a dev build: status unverified,
+/// integrity_ok false.
+#[test]
+fn verify_self_json_dev_build_not_integrity_ok() {
+    let out = tirith()
+        .args(["verify-self", "--format", "json"])
+        .output()
+        .expect("failed to run tirith verify-self --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("verify-self JSON should parse");
+    assert_eq!(v["verification_status"], "unverified");
+    assert_eq!(v["integrity_ok"], serde_json::Value::Bool(false));
+}
+
+/// `tirith update` on an install tirith cannot identify must NOT self-modify;
+/// it advises and exits 0.
+#[test]
+fn update_unknown_install_advises_and_does_not_modify() {
+    let out = tirith()
+        .args(["update"])
+        .output()
+        .expect("failed to run tirith update");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("could not determine how it was installed")
+            || stdout.contains("installed via"),
+        "update on an unknown install should advise, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("NOT self-modify") || stdout.contains("not self-modify"),
+        "update must state it will not self-modify, got: {stdout}"
+    );
+}
+
+/// `tirith update --format json` on an unknown install yields the
+/// use-package-manager action.
+#[test]
+fn update_unknown_install_json_action() {
+    let out = tirith()
+        .args(["update", "--format", "json"])
+        .output()
+        .expect("failed to run tirith update --format json");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("update JSON should parse");
+    assert_eq!(v["action"], "use-package-manager");
+}
+
+/// `tirith update --rollback` on a non-self-managed install is refused with a
+/// clear message and a non-zero exit — rollback is self-managed-only.
+#[test]
+fn update_rollback_refused_for_non_self_managed() {
+    let out = tirith()
+        .args(["update", "--rollback"])
+        .output()
+        .expect("failed to run tirith update --rollback");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "rollback on a non-self-managed install should exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--rollback only applies to a self-managed"),
+        "rollback should explain the self-managed restriction, got: {stdout}"
+    );
+}
+
+/// `--verify` and `--rollback` are mutually exclusive (clap-enforced).
+#[test]
+fn update_verify_and_rollback_conflict() {
+    let out = tirith()
+        .args(["update", "--verify", "--rollback"])
+        .output()
+        .expect("failed to run tirith update --verify --rollback");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "--verify and --rollback together should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflict"),
+        "clap should report the --verify/--rollback conflict, got: {stderr}"
+    );
+}
+
+/// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith
+/// binary placed under a `.local/bin` path (so it self-detects as
+/// self-managed) plus a `.tirith-previous` backup is rolled back, and the
+/// live binary's bytes become the backup's bytes.
+///
+/// This exercises the real binary self-replacement path — the most
+/// security-critical mutation — without touching the network or any real
+/// install.
+#[cfg(unix)]
+#[test]
+fn update_rollback_self_managed_restores_previous_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    // `.local/bin/tirith` makes detect_install_method classify it self-managed.
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+
+    // The "live" binary is a real, runnable copy of the test tirith binary —
+    // it must be able to run `update --rollback` on itself.
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The rollback target: a `.tirith-previous` backup with sentinel content.
+    // (Its content need not be a real binary — rollback only swaps bytes.)
+    let backup = bin_dir.join("tirith.tirith-previous");
+    let sentinel = b"PREVIOUS-TIRITH-BINARY-SENTINEL";
+    fs::write(&backup, sentinel).unwrap();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--yes", "--format", "json"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "rollback of a self-managed install should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("rollback JSON should parse");
+    assert_eq!(v["action"], "rolled-back");
+
+    // The live binary now holds the previous binary's bytes. Compare lengths
+    // first (a mismatch would otherwise dump the whole binary on failure).
+    let live_after = fs::read(&live).unwrap();
+    assert_eq!(
+        live_after.len(),
+        sentinel.len(),
+        "rollback must replace the live binary with the (small) sentinel backup"
+    );
+    assert!(
+        live_after == sentinel,
+        "rollback must restore the previous binary's bytes onto the live path"
+    );
+    // The stale backup is consumed (it is no longer "the previous version").
+    assert!(
+        !backup.exists(),
+        "the consumed rollback backup should be removed after a successful rollback"
+    );
+}
+
+/// `tirith update --rollback` on a self-managed install with NO backup present
+/// fails cleanly (nothing to roll back to) without modifying anything.
+#[cfg(unix)]
+#[test]
+fn update_rollback_self_managed_without_backup_fails_cleanly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_len = fs::metadata(&live).unwrap().len();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--yes"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "rollback with no backup should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no previous binary to roll back to"),
+        "should explain there is no rollback point, got: {stdout}"
+    );
+    // The live binary must be untouched (it is still the full tirith binary).
+    assert_eq!(
+        fs::metadata(&live).unwrap().len(),
+        original_len,
+        "a failed rollback must not modify the live binary"
+    );
+}
+
+/// `tirith update --dry-run --rollback` on a self-managed install with a
+/// backup reports what it WOULD do and changes nothing.
+#[cfg(unix)]
+#[test]
+fn update_rollback_dry_run_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin_dir = home.path().join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_len = fs::metadata(&live).unwrap().len();
+
+    let backup = bin_dir.join("tirith.tirith-previous");
+    fs::write(&backup, b"BACKUP-BYTES").unwrap();
+
+    let out = Command::new(&live)
+        .args(["update", "--rollback", "--dry-run"])
+        .env_remove("TIRITH")
+        .output()
+        .expect("failed to run the staged tirith binary");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("dry run"), "got: {stdout}");
+    // Nothing changed: live binary and backup are both intact.
+    assert_eq!(fs::metadata(&live).unwrap().len(), original_len);
+    assert_eq!(fs::read(&backup).unwrap(), b"BACKUP-BYTES");
+}

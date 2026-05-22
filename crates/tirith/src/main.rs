@@ -619,6 +619,96 @@ Examples:
     /// Generate man page
     #[command(hide = true)]
     Manpage,
+
+    /// Verify the running tirith binary's integrity and provenance
+    #[command(after_help = "\
+Verifies that the tirith binary you are running is the genuine, unmodified
+binary from an official release. It re-downloads the release archive for this
+exact version, checks it against the signed release checksums.txt (and the
+cosign signature when cosign is installed), and confirms the running binary is
+byte-identical to the official one.
+
+If full verification is not possible — a local dev build, no network, an
+unknown install — it says so HONESTLY rather than reporting a false 'verified'.
+
+This command reaches the network; it does so only when you run it.
+
+Examples:
+  tirith verify-self
+  tirith verify-self --format json")]
+    VerifySelf {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Update tirith to the latest release (package-manager aware)
+    #[command(after_help = "\
+Updates tirith to the latest release. tirith detects how it was installed:
+
+  * Package-manager installs (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are
+    NEVER self-modified — tirith prints the exact command to run instead.
+  * A self-managed install (the install.sh tarball or a standalone binary) is
+    updated in place: tirith downloads the release, verifies it, then performs
+    an atomic swap, keeping the previous binary so --rollback can revert.
+
+This command reaches the network; it does so only when you run it.
+
+Examples:
+  tirith update
+  tirith update --verify
+  tirith update --rollback
+  tirith update --dry-run")]
+    Update {
+        /// Verify the new release's provenance (checksum + cosign signature)
+        /// before installing; verification failure aborts the update.
+        #[arg(long)]
+        verify: bool,
+
+        /// Revert to the previously-installed binary (self-managed installs
+        /// only). Conflicts with --verify.
+        #[arg(long, conflicts_with = "verify")]
+        rollback: bool,
+
+        /// Show what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the running binary's version and provenance
+    #[command(after_help = "\
+Examples:
+  tirith version
+  tirith version --provenance
+  tirith version --provenance --format json")]
+    Version {
+        /// Show full provenance: build info, detected install method, and the
+        /// (offline) verification status. Run `tirith verify-self` for full
+        /// networked verification.
+        #[arg(long)]
+        provenance: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1664,6 +1754,32 @@ fn run() {
         Commands::Completions { shell } => cli::completions::run(shell),
 
         Commands::Manpage => cli::manpage::run(),
+
+        Commands::VerifySelf { format, json } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::verify_self(json)
+        }
+
+        Commands::Update {
+            verify,
+            rollback,
+            dry_run,
+            yes,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::update(verify, rollback, dry_run, yes, json)
+        }
+
+        Commands::Version {
+            provenance,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::selfupdate::version(provenance, json)
+        }
     };
 
     std::process::exit(exit_code);
