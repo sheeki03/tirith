@@ -61,7 +61,21 @@ use sha2::{Digest, Sha256};
 ///   low-entropy value (`1`, `true`) is not brute-forceable across servers
 ///   because the per-key salt makes the digest unique to (name, value). A v2
 ///   lockfile is therefore not byte-comparable to a v3 one.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 3;
+/// * `4` — the same `name`+salted-SHA-256 redaction scheme is applied to the
+///   `url` transport's userinfo. A URL declared as `https://user:token@host/`
+///   is now stored as `https://host/` and the captured userinfo (the literal
+///   `user[:password]` substring) is hashed into a `userinfo_hash` of
+///   `sha256(server_name || ':' || userinfo)`, salted by the MCP server's
+///   name. The hash is folded into the per-server content hash, so a userinfo
+///   change registers as drift exactly like an env-value change does; a URL
+///   that carried no userinfo serializes with `userinfo_hash` **omitted** (not
+///   set to a sentinel value), so "no credential present" is structurally
+///   distinct on the wire from "credential present". HTTP Basic Auth tokens
+///   in a URL are credentials in exactly the same threat model that motivated
+///   v3, and `.tirith/mcp.lock` is designed to be committed — so the raw
+///   userinfo never lands in the file. A v3 lockfile is not byte-comparable
+///   to a v4 one.
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 4;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -119,9 +133,35 @@ impl McpEnvEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpTransport {
-    /// A network-reachable MCP server (HTTP / SSE / streamable-HTTP). The `url`
-    /// is stored verbatim — canonicalization (if any) is the diff layer's job.
-    Url { url: String },
+    /// A network-reachable MCP server (HTTP / SSE / streamable-HTTP).
+    ///
+    /// **The URL is stored with any userinfo stripped.** A URL declared as
+    /// `https://user:token@host:port/path` is recorded here as
+    /// `https://host:port/path`; the `user:token` substring is HTTP Basic
+    /// Auth and is a credential. `.tirith/mcp.lock` is designed to be
+    /// committed, so persisting the raw userinfo would leak the credential
+    /// into version control — the same threat model that motivated the v3
+    /// env-value redaction.
+    ///
+    /// When the source URL carried a userinfo component, `userinfo_hash` is
+    /// `Some(sha256(server_name || ':' || userinfo))` — the same name-salted
+    /// SHA-256 scheme `McpEnvEntry` uses, with the **MCP server's name** as
+    /// the per-entry salt. Folded into the per-server content hash, so a
+    /// userinfo change registers as drift exactly like an env-value change
+    /// does. When the source URL had no userinfo, `userinfo_hash` is `None`
+    /// and is **omitted** from the serialized lockfile (not written as
+    /// `null`), so "no credential" is structurally distinct on the wire from
+    /// "credential present".
+    ///
+    /// A URL that does not parse cleanly (so userinfo cannot be safely
+    /// identified) is stored verbatim with `userinfo_hash = None`. This is
+    /// the correct conservative behavior: stripping bytes from a string we
+    /// cannot parse could itself mangle the input.
+    Url {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        userinfo_hash: Option<String>,
+    },
     /// A local MCP server spawned as a subprocess.
     Stdio {
         /// The executable to run.
@@ -183,9 +223,27 @@ impl McpServerEntry {
         hasher.update(b"mcp-server-v2\0");
         hash_field(&mut hasher, self.name.as_bytes());
         match &self.transport {
-            McpTransport::Url { url } => {
+            McpTransport::Url { url, userinfo_hash } => {
                 hasher.update(b"url\0");
                 hash_field(&mut hasher, url.as_bytes());
+                // Fold `userinfo_hash` in so a userinfo change registers as
+                // drift (just like an env-value change does for stdio). The
+                // presence/absence of the hash is itself framed: a leading
+                // 0/1 byte distinguishes `None` from `Some("")`, so a future
+                // empty-hash sentinel cannot collide with a no-userinfo URL.
+                // The hash itself is already deterministically derived from
+                // (server_name, raw userinfo), so any userinfo change flips
+                // the per-server content hash even though no raw value is
+                // stored or hashed at this layer.
+                match userinfo_hash {
+                    Some(h) => {
+                        hasher.update(b"\x01");
+                        hash_field(&mut hasher, h.as_bytes());
+                    }
+                    None => {
+                        hasher.update(b"\x00");
+                    }
+                }
             }
             McpTransport::Stdio { command, args, env } => {
                 hasher.update(b"stdio\0");
@@ -573,7 +631,7 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
             None => continue,
         };
 
-        let transport = parse_transport(obj);
+        let transport = parse_transport(name, obj);
         let tools = parse_tools(obj);
 
         entries.push(McpServerEntry {
@@ -591,10 +649,19 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
 ///
 /// `url` wins over `command` if a (malformed) config declares both — a remote
 /// URL is the higher-risk surface, so it is the one recorded.
-fn parse_transport(obj: &serde_json::Map<String, serde_json::Value>) -> McpTransport {
+///
+/// `server_name` is the MCP server's declared name (the key in the config's
+/// `mcpServers` / `servers` object). It is used as the per-entry salt for the
+/// URL transport's `userinfo_hash` (see [`redact_url_userinfo`]).
+fn parse_transport(
+    server_name: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> McpTransport {
     if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+        let (redacted_url, userinfo_hash) = redact_url_userinfo(server_name, url);
         return McpTransport::Url {
-            url: url.to_string(),
+            url: redacted_url,
+            userinfo_hash,
         };
     }
 
@@ -617,6 +684,116 @@ fn parse_transport(obj: &serde_json::Map<String, serde_json::Value>) -> McpTrans
     }
 
     McpTransport::Unknown
+}
+
+/// Strip any HTTP Basic Auth userinfo (`user[:password]`) from a URL declared
+/// in an MCP config, returning the redacted URL and a salted hash of the
+/// captured userinfo.
+///
+/// **Security invariant.** A URL declared as `https://user:token@host:port/`
+/// in `.mcp.json` is recorded as `https://host:port/` in the lockfile, and
+/// the captured `user:token` substring is hashed with the MCP server's name
+/// as the salt (`sha256(server_name || ':' || userinfo)`) — exactly the
+/// scheme [`McpEnvEntry::from_raw`] uses for env values. The raw userinfo is
+/// consumed inside this function and dropped before the function returns;
+/// it never reaches a struct field, the serializer, or the rest of the
+/// process. This is the load-bearing security invariant of the v4 lockfile
+/// format for the URL transport: a committed `.tirith/mcp.lock` never
+/// contains a Basic Auth credential that was in the source `.mcp.json`.
+///
+/// **Behavior.**
+/// * The URL parses cleanly with a non-empty userinfo → return the URL with
+///   `set_username("")` and `set_password(None)`, plus
+///   `Some(sha256(server_name || ':' || userinfo))`. `userinfo` is the
+///   exact `username[:password]` substring as parsed — percent-encoded
+///   bytes are hashed as-is, because that is what the original config
+///   declared and any byte-level difference must register as drift.
+/// * The URL parses cleanly with no userinfo (the common case) → return the
+///   URL unchanged and `None`. An "all-zero userinfo" form like
+///   `https://:@host/` or `https://@host/` is normalized by `url::Url` to
+///   the no-userinfo form during parsing, so it is treated as the
+///   no-userinfo case — the user supplied nothing.
+/// * The URL does not parse → return the URL verbatim and `None`. Without a
+///   safe parser we cannot identify the userinfo boundary, so we refuse to
+///   modify the string. (A malformed URL is captured anyway: it is itself a
+///   finding-worthy oddity a later `mcp verify` should see.)
+///
+/// Returns `(redacted_url, userinfo_hash)`. The raw userinfo lives only as
+/// the local `userinfo` String for the duration of the hash computation and
+/// is dropped on function exit; it is never returned.
+fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>) {
+    let parsed = match url::Url::parse(url) {
+        Ok(p) => p,
+        // Unparseable URL: store verbatim, no userinfo to hash. This is the
+        // conservative choice — stripping bytes from a string we cannot
+        // structurally parse could mangle the input.
+        Err(_) => return (url.to_string(), None),
+    };
+
+    let username = parsed.username();
+    let password = parsed.password();
+
+    // Reconstruct the literal userinfo substring as it appears between the
+    // scheme separator and the host: `user`, `user:password`, or `:password`.
+    // The `url` crate normalizes the all-empty `:@` and `@` forms (no user,
+    // no password) away during parsing, so `None`/`""` here genuinely means
+    // the source URL declared no userinfo and there is nothing to redact.
+    let userinfo: Option<String> = match (username, password) {
+        ("", None) => None,
+        (u, None) => Some(u.to_string()),
+        (u, Some(p)) => Some(format!("{u}:{p}")),
+    };
+
+    // Fast path: no userinfo at all → return the URL **verbatim**. We
+    // deliberately do NOT round-trip the bytes through `url::Url::as_str()`
+    // here, because `url` performs minor canonicalization (e.g. appending a
+    // trailing `/` to a bare-host URL) that the historic v1–v3 lockfile did
+    // not perform. The doc on this variant promised "the `url` is stored
+    // verbatim — canonicalization (if any) is the diff layer's job", and a
+    // URL with no userinfo is the case where there is nothing to redact, so
+    // we keep that promise.
+    let Some(raw_userinfo) = userinfo else {
+        return (url.to_string(), None);
+    };
+
+    // Same name-salted SHA-256 scheme as `McpEnvEntry::from_raw`: the server
+    // name is the per-entry salt so the same Basic Auth token under two
+    // different servers hashes to two different digests, and a literal `:`
+    // delimiter prevents server/userinfo boundary forgery (`("AB", "c")`
+    // hashes `"AB:c"`, never the bytes of `("A", "Bc")`).
+    let userinfo_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(server_name.as_bytes());
+        hasher.update(b":");
+        hasher.update(raw_userinfo.as_bytes());
+        Some(hex_lower(&hasher.finalize()))
+    };
+
+    // Strip userinfo from the URL we will store. `set_username("")` /
+    // `set_password(None)` only fail for URLs that cannot have an authority
+    // (e.g. `data:`, `mailto:`), and a URL of that shape cannot carry
+    // userinfo in the first place — so since we just observed a userinfo
+    // present, both `set_*` calls must succeed.
+    let mut parsed = parsed;
+    let strip_ok = parsed.set_password(None).is_ok() && parsed.set_username("").is_ok();
+
+    // Hard safety net: if the strip silently failed, refuse to return a URL
+    // whose bytes still contain the userinfo. This is paranoid (the `set_*`
+    // calls cannot fail for a URL we just parsed successfully *with* a
+    // userinfo), but the cost is one branch and the consequence of being
+    // wrong is a credential in the committed lockfile. Build a host-only
+    // string from the parsed components so the lockfile is never
+    // credential-bearing even in this defensive branch.
+    if !strip_ok {
+        let scheme = parsed.scheme();
+        let host = parsed.host_str().unwrap_or("");
+        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = parsed.path();
+        let redacted = format!("{scheme}://{host}{port}{path}");
+        return (redacted, userinfo_hash);
+    }
+
+    (parsed.as_str().to_string(), userinfo_hash)
 }
 
 /// Extract a stdio server's `env` object as `(name, value_hash)` entries,
@@ -719,6 +896,7 @@ mod tests {
             remote.transport,
             McpTransport::Url {
                 url: "https://mcp.example.com/sse".to_string(),
+                userinfo_hash: None,
             }
         );
         // tools sorted.
@@ -764,6 +942,7 @@ mod tests {
             entries[0].transport,
             McpTransport::Url {
                 url: "https://x.example".to_string(),
+                userinfo_hash: None,
             }
         );
     }
@@ -858,6 +1037,7 @@ mod tests {
         let changed = McpServerEntry {
             transport: McpTransport::Url {
                 url: "https://x.example".into(),
+                userinfo_hash: None,
             },
             ..base.clone()
         };
@@ -903,6 +1083,7 @@ mod tests {
                     name: "alpha".into(),
                     transport: McpTransport::Url {
                         url: "https://a.example".into(),
+                        userinfo_hash: None,
                     },
                     tools: vec!["t".into()],
                     source_config: ".mcp.json".into(),
@@ -951,6 +1132,7 @@ mod tests {
         // Mutate the single server's transport.
         inventory.servers[0].transport = McpTransport::Url {
             url: "https://new.example".into(),
+            userinfo_hash: None,
         };
         let hash_after = McpLockfile::from_inventory(&inventory).inventory_hash;
 
@@ -1069,6 +1251,7 @@ mod tests {
             name: "alpha".into(),
             transport: McpTransport::Url {
                 url: "https://a.example".into(),
+                userinfo_hash: None,
             },
             tools: vec!["t".into()],
             source_config: ".mcp.json".into(),
@@ -1117,6 +1300,7 @@ mod tests {
             name: "dup".into(),
             transport: McpTransport::Url {
                 url: "https://x.example".into(),
+                userinfo_hash: None,
             },
             tools: vec![],
             source_config: source.into(),
@@ -1344,12 +1528,14 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_format_version_is_3() {
-        // Finding E bumped the schema (env entries no longer serialize raw
-        // values — only `name` + `value_hash`), so the format version is 3.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 3);
+    fn lockfile_format_version_is_4() {
+        // v4 extends the salted-hash redaction to the URL transport's
+        // userinfo (`https://user:token@host/` is stored as `https://host/`
+        // with a `userinfo_hash` of `sha256(server_name || ':' || userinfo)`).
+        // A URL with no userinfo serializes with `userinfo_hash` omitted.
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 4);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 3);
+        assert_eq!(lock.format_version, 4);
     }
 
     #[test]
@@ -1592,6 +1778,7 @@ mod tests {
             name: "s".into(),
             transport: McpTransport::Url {
                 url: "https://x.example".into(),
+                userinfo_hash: None,
             },
             tools: tools.into_iter().map(String::from).collect(),
             source_config: ".mcp.json".into(),
@@ -1657,5 +1844,416 @@ mod tests {
             cmd_and_arg.content_hash(),
             "the command/args boundary must be unambiguous"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding G — a URL transport's userinfo (HTTP Basic Auth) must not be
+    // persisted in the lockfile. A URL declared as `https://user:token@host/`
+    // is recorded as `https://host/` plus a salted `userinfo_hash` (same
+    // scheme as `McpEnvEntry`). A URL with no userinfo serializes with
+    // `userinfo_hash` omitted, so absence is structurally distinct from
+    // presence. Folded into the per-server content hash, so a userinfo
+    // change registers as drift.
+    // -----------------------------------------------------------------------
+
+    /// Credential-shaped (high-entropy, unique) URL userinfo probes. None of
+    /// these byte sequences may appear in the rendered lockfile. They are
+    /// distinctive on purpose so a substring scan over the rendered JSON
+    /// cannot trip on incidental matches elsewhere (hashes, names, etc.).
+    const URL_USERINFO_LEAK_PROBES: &[(&str, &str)] = &[
+        // (declared URL, expected raw-credential substring)
+        (
+            "https://admin:ghp_supersecret_PAT_token_42@mcp.example.com/sse",
+            "admin:ghp_supersecret_PAT_token_42",
+        ),
+        (
+            "https://svc-account:DO_NOT_LEAK_xY7q@api.example.com:8443/v1/mcp",
+            "svc-account:DO_NOT_LEAK_xY7q",
+        ),
+        (
+            "https://bearer-only:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@host.example/sse",
+            "bearer-only:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+    ];
+
+    #[test]
+    fn url_raw_userinfo_never_appears_in_rendered_lockfile() {
+        // Plant servers whose URLs carry credential-shaped userinfo
+        // (Basic Auth username:password). After rendering, NONE of the raw
+        // userinfo byte sequences may show up. The salted hash is what is
+        // persisted.
+        let servers: Vec<McpServerEntry> = URL_USERINFO_LEAK_PROBES
+            .iter()
+            .enumerate()
+            .map(|(i, (url, _))| {
+                let server_name = format!("svc-{i}");
+                let (redacted, hash) = redact_url_userinfo(&server_name, url);
+                McpServerEntry {
+                    name: server_name,
+                    transport: McpTransport::Url {
+                        url: redacted,
+                        userinfo_hash: hash,
+                    },
+                    tools: vec![],
+                    source_config: ".mcp.json".into(),
+                }
+            })
+            .collect();
+        let inventory = McpInventory {
+            servers,
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+
+        for (declared_url, raw_credential) in URL_USERINFO_LEAK_PROBES {
+            assert!(
+                !rendered.contains(raw_credential),
+                "raw userinfo {raw_credential:?} (from {declared_url:?}) leaked into the \
+                 rendered lockfile:\n{rendered}"
+            );
+            // And the literal `@` userinfo boundary cannot appear inside an
+            // https URL — every captured URL must have been redacted.
+            assert!(
+                !rendered.contains("@mcp.example.com"),
+                "userinfo `@` boundary leaked into the rendered lockfile:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("@api.example.com"),
+                "userinfo `@` boundary leaked into the rendered lockfile:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("@host.example"),
+                "userinfo `@` boundary leaked into the rendered lockfile:\n{rendered}"
+            );
+        }
+        // Every redacted URL exposes a `userinfo_hash` field — the wire
+        // shape proof of the redaction.
+        assert!(
+            rendered.contains("\"userinfo_hash\""),
+            "rendered lockfile must serialize a userinfo_hash per URL with credentials"
+        );
+    }
+
+    #[test]
+    fn url_with_userinfo_redacted_url_stored_in_lockfile() {
+        // The redacted URL stored in the lockfile is exactly the source URL
+        // with `user[:password]` stripped — host, port, path, and query all
+        // preserved. Verify byte-for-byte against url::Url's normalized form
+        // of the same userinfo-free URL.
+        let (redacted, hash) = redact_url_userinfo(
+            "svc",
+            "https://user:token@host.example:8443/path/to/mcp?x=1",
+        );
+        assert_eq!(redacted, "https://host.example:8443/path/to/mcp?x=1");
+        assert!(hash.is_some(), "userinfo present → hash is Some");
+
+        // Username-only (no password) is still userinfo and is still redacted.
+        let (redacted, hash) = redact_url_userinfo("svc", "https://only-user@host.example/path");
+        assert_eq!(redacted, "https://host.example/path");
+        assert!(hash.is_some());
+
+        // Password-only (`:token@`) is also userinfo and is still redacted.
+        let (redacted, hash) = redact_url_userinfo("svc", "https://:token-only@host.example/p");
+        assert_eq!(redacted, "https://host.example/p");
+        assert!(hash.is_some());
+    }
+
+    #[test]
+    fn url_without_userinfo_stored_verbatim_with_no_hash() {
+        // The headline backward-compatibility property: a URL that carried
+        // no userinfo is stored byte-identical to the source string, and
+        // `userinfo_hash` is None (so it is omitted on serialization, not
+        // serialized as null). This is what keeps a v3-or-earlier lockfile
+        // bytewise-stable for the common case where no MCP URL has a
+        // credential.
+        for input in [
+            "https://x.example",
+            "https://mcp.example.com/sse",
+            "https://host:8443/path/to/mcp?x=1&y=2",
+            // `url::Url` normalizes `:@` and `@` away on parse — both of
+            // these declared no user-supplied userinfo and must round-trip
+            // verbatim.
+            "https://host.example/",
+            // A non-special / non-parseable string is held verbatim too —
+            // we refuse to mangle a URL we cannot parse.
+            "not a real url at all",
+        ] {
+            let (redacted, hash) = redact_url_userinfo("svc", input);
+            assert_eq!(
+                redacted, input,
+                "a no-userinfo URL must be stored byte-identical: {input}"
+            );
+            assert!(
+                hash.is_none(),
+                "a no-userinfo URL must have userinfo_hash = None: {input}"
+            );
+        }
+
+        // And on serialization, `userinfo_hash` is OMITTED — not written as
+        // `"userinfo_hash": null` — for a no-userinfo URL.
+        let inventory = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "s".into(),
+                transport: McpTransport::Url {
+                    url: "https://mcp.example.com/sse".into(),
+                    userinfo_hash: None,
+                },
+                tools: vec![],
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+        assert!(
+            !rendered.contains("userinfo_hash"),
+            "userinfo_hash must be omitted (not serialized as null) when no userinfo \
+             is present:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn url_normalized_empty_userinfo_treated_as_no_userinfo() {
+        // `url::Url` parses `https://:@host/` and `https://@host/` by
+        // discarding the empty userinfo. Our redaction observes
+        // `username() == ""` and `password() == None`, treats it as the
+        // no-userinfo case, and stores the URL verbatim with no hash.
+        for input in ["https://:@host.example/", "https://@host.example/"] {
+            let (redacted, hash) = redact_url_userinfo("svc", input);
+            assert_eq!(redacted, input);
+            assert!(
+                hash.is_none(),
+                "an all-empty `:@` / `@` userinfo is normalized away by url::Url \
+                 and must be treated as no-userinfo: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_userinfo_change_flips_per_server_hash() {
+        // The drift property: same server name, same host/path, but a
+        // different userinfo → the per-server content hash and therefore
+        // the inventory hash must change. This is the same drift behavior
+        // that an env-value change has for stdio.
+        let mk = |declared_url: &str| {
+            let (redacted, hash) = redact_url_userinfo("svc", declared_url);
+            McpServerEntry {
+                name: "svc".into(),
+                transport: McpTransport::Url {
+                    url: redacted,
+                    userinfo_hash: hash,
+                },
+                tools: vec![],
+                source_config: ".mcp.json".into(),
+            }
+        };
+        let with_token_a = mk("https://user:tokenA@host.example/sse");
+        let with_token_b = mk("https://user:tokenB@host.example/sse");
+        let no_token = mk("https://host.example/sse");
+
+        // Token swap flips the content hash.
+        assert_ne!(
+            with_token_a.content_hash(),
+            with_token_b.content_hash(),
+            "swapping the userinfo must flip the per-server content hash (drift)"
+        );
+        // Adding/removing the credential entirely also flips it.
+        assert_ne!(
+            with_token_a.content_hash(),
+            no_token.content_hash(),
+            "adding/removing a credential must flip the per-server content hash"
+        );
+
+        // And it propagates to the inventory hash.
+        let inv_a = McpInventory {
+            servers: vec![with_token_a],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let inv_b = McpInventory {
+            servers: vec![with_token_b],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        assert_ne!(
+            McpLockfile::from_inventory(&inv_a).inventory_hash,
+            McpLockfile::from_inventory(&inv_b).inventory_hash,
+            "a userinfo change must surface as a different inventory hash"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_hash_is_name_salted() {
+        // The hash binds the MCP server's name to the userinfo, so the same
+        // Basic Auth token under two different servers hashes differently —
+        // a low-entropy userinfo (`u:p`) is not brute-forceable across
+        // servers. Same scheme `McpEnvEntry::from_raw` uses, with the
+        // server's name as the per-entry salt.
+        let (_, a) = redact_url_userinfo("svc-a", "https://u:p@host.example/");
+        let (_, b) = redact_url_userinfo("svc-b", "https://u:p@host.example/");
+        assert_ne!(
+            a, b,
+            "the same userinfo under different server names must hash differently \
+             (the server name acts as a per-entry salt)"
+        );
+
+        // And the hash is exactly sha256(server_name || ':' || userinfo).
+        let expected_a = {
+            let mut h = Sha256::new();
+            h.update(b"svc-a:u:p");
+            hex_lower(&h.finalize())
+        };
+        assert_eq!(a.as_deref(), Some(expected_a.as_str()));
+
+        // Two different userinfo strings under the SAME server name also
+        // hash differently — the natural inner-collision-free property.
+        let (_, c) = redact_url_userinfo("svc-a", "https://u:p2@host.example/");
+        assert_ne!(
+            a, c,
+            "two different userinfos under the same server name must hash differently"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_hash_delimiter_prevents_boundary_forgery() {
+        // The `:` delimiter inside `sha256(server_name || ':' || userinfo)`
+        // means `("AB", "c")` hashes `"AB:c"`, never the same byte stream
+        // as `("A", "Bc")` (`"A:Bc"`). This is the same property that
+        // motivates the `:` delimiter inside `McpEnvEntry::from_raw`.
+        let (_, a) = redact_url_userinfo("AB", "https://c@host.example/");
+        let (_, b) = redact_url_userinfo("A", "https://Bc@host.example/");
+        assert_ne!(
+            a, b,
+            "the `:` delimiter must prevent server/userinfo boundary forgery"
+        );
+    }
+
+    #[test]
+    fn parse_mcp_config_url_with_userinfo_is_redacted() {
+        // End-to-end through the JSON parser: a config that declares a URL
+        // with Basic Auth produces a parsed entry whose `url` field has the
+        // userinfo stripped, whose `userinfo_hash` is the expected
+        // name-salted SHA-256, AND whose rendered lockfile does not contain
+        // the raw userinfo bytes anywhere.
+        let secret = "admin:ghp_PARSED_LEAK_PROBE_DONOTLEAK";
+        let content = format!(
+            r#"{{
+                "mcpServers": {{
+                    "github": {{
+                        "url": "https://{secret}@mcp.example.com/sse",
+                        "tools": ["search"]
+                    }}
+                }}
+            }}"#
+        );
+        let entries = parse_mcp_config(&content, ".mcp.json").expect("valid config");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "github");
+        match &entries[0].transport {
+            McpTransport::Url { url, userinfo_hash } => {
+                assert_eq!(
+                    url, "https://mcp.example.com/sse",
+                    "the stored URL must have the userinfo stripped"
+                );
+                let expected = {
+                    let mut h = Sha256::new();
+                    h.update(b"github:");
+                    h.update(secret.as_bytes());
+                    hex_lower(&h.finalize())
+                };
+                assert_eq!(
+                    userinfo_hash.as_deref(),
+                    Some(expected.as_str()),
+                    "userinfo_hash must be sha256(server_name || ':' || userinfo)"
+                );
+            }
+            other => panic!("expected Url transport, got {other:?}"),
+        }
+
+        // The rendered lockfile descending from this parse must not carry
+        // the raw userinfo bytes anywhere.
+        let inventory = McpInventory {
+            servers: entries,
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let rendered = McpLockfile::from_inventory(&inventory).render();
+        assert!(
+            !rendered.contains(secret),
+            "raw userinfo leaked from parse_mcp_config -> McpLockfile::render():\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn parse_mcp_config_url_no_userinfo_is_unchanged() {
+        // The backward-compat path: a URL declared with NO userinfo is
+        // stored verbatim in the parsed entry, and `userinfo_hash` is None
+        // (and therefore omitted from the serialized lockfile).
+        let content = r#"{
+            "mcpServers": {
+                "remote": {
+                    "url": "https://mcp.example.com/sse",
+                    "tools": ["search"]
+                }
+            }
+        }"#;
+        let entries = parse_mcp_config(content, ".mcp.json").expect("valid config");
+        match &entries[0].transport {
+            McpTransport::Url { url, userinfo_hash } => {
+                assert_eq!(url, "https://mcp.example.com/sse");
+                assert!(userinfo_hash.is_none());
+            }
+            other => panic!("expected Url transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_config_url_unparseable_is_held_verbatim() {
+        // A non-URL-shaped string is not safely parseable — we refuse to
+        // mangle it (we cannot identify the userinfo boundary), so it is
+        // stored verbatim and `userinfo_hash` is None. The captured URL
+        // still flows through the lockfile (so a later `mcp verify` can
+        // see the oddity).
+        let content = r#"{ "mcpServers": { "weird": { "url": "not://a real url" } } }"#;
+        let entries = parse_mcp_config(content, ".mcp.json").expect("valid JSON");
+        match &entries[0].transport {
+            McpTransport::Url { url, userinfo_hash } => {
+                // The string is held verbatim — including the `not://`
+                // scheme, since `url::Url` may or may not accept it across
+                // versions. The important property is "we did not panic
+                // and we did not invent a hash for an unparseable URL".
+                assert_eq!(url, "not://a real url");
+                assert!(userinfo_hash.is_none());
+            }
+            other => panic!("expected Url transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lockfile_with_userinfo_round_trips() {
+        // A lockfile carrying a URL transport with `userinfo_hash` must
+        // serialize and parse back identically — the new schema field
+        // round-trips. The `userinfo_hash` is preserved across the
+        // serialize/deserialize cycle (same byte-for-byte hex string).
+        let inventory = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "s".into(),
+                transport: McpTransport::Url {
+                    url: "https://host.example/sse".into(),
+                    userinfo_hash: Some(
+                        "abc123def456abc123def456abc123def456abc123def456abc123def456abc1".into(),
+                    ),
+                },
+                tools: vec![],
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+        };
+        let lock = McpLockfile::from_inventory(&inventory);
+        let parsed: McpLockfile = serde_json::from_str(&lock.render())
+            .expect("lockfile with userinfo_hash must round-trip");
+        assert_eq!(parsed, lock);
     }
 }

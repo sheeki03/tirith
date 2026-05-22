@@ -215,9 +215,27 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
 /// line-erasure. Rust's `Debug` formatting on `&str` (`"{:?}"`) escapes every
 /// control byte as a `\xNN` / `\n` / `\r` / etc. and quotes the value — the
 /// simplest correct fix, applied at *every* env-name print site.
+///
+/// **A URL's userinfo is never printed.** The stored URL is already the
+/// redacted form (`https://host/...` — the `user:token@` segment has been
+/// stripped during parsing). When the source config declared a userinfo, the
+/// summary prints a separate `(credentials in source URL)` annotation so the
+/// reader can see that the redaction fired without revealing the credential
+/// itself.
 fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
-        mcp_lock::McpTransport::Url { url } => format!("url {url}"),
+        mcp_lock::McpTransport::Url { url, userinfo_hash } => {
+            // The stored `url` is already userinfo-stripped (a credential, if
+            // any, has been replaced with a salted hash); print it verbatim.
+            // When `userinfo_hash` is Some, append a fixed phrase so the
+            // operator can see that the source declared a credential —
+            // never the credential itself.
+            if userinfo_hash.is_some() {
+                format!("url {url} (credentials in source URL)")
+            } else {
+                format!("url {url}")
+            }
+        }
         mcp_lock::McpTransport::Stdio { command, args, env } => {
             let mut desc = if args.is_empty() {
                 format!("stdio {command}")
@@ -271,7 +289,8 @@ mod tests {
     fn describe_transport_renders_each_variant() {
         assert_eq!(
             describe_transport(&McpTransport::Url {
-                url: "https://x.example".into()
+                url: "https://x.example".into(),
+                userinfo_hash: None,
             }),
             "url https://x.example"
         );
@@ -308,6 +327,36 @@ mod tests {
         assert_eq!(
             describe_transport(&McpTransport::Unknown),
             "no transport declared"
+        );
+    }
+
+    #[test]
+    fn describe_transport_annotates_url_with_userinfo() {
+        // A redacted URL whose source declared credentials prints with a
+        // fixed `(credentials in source URL)` annotation so the operator
+        // can see the redaction fired — without revealing the credential
+        // itself (which has been stripped from `url` and only a salted
+        // hash remains).
+        assert_eq!(
+            describe_transport(&McpTransport::Url {
+                url: "https://mcp.example.com/sse".into(),
+                userinfo_hash: Some("deadbeef".into()),
+            }),
+            "url https://mcp.example.com/sse (credentials in source URL)"
+        );
+        // The annotation MUST NOT contain the hash itself — the print
+        // surface is for the human, the hash is a wire-format detail.
+        let printed = describe_transport(&McpTransport::Url {
+            url: "https://mcp.example.com/sse".into(),
+            userinfo_hash: Some("supersecrethashvalue".into()),
+        });
+        assert!(
+            !printed.contains("supersecrethashvalue"),
+            "the userinfo_hash must not be printed to the operator: {printed}"
+        );
+        assert!(
+            !printed.contains('@'),
+            "the printed URL must contain no `@` (credentials would precede it): {printed}"
         );
     }
 

@@ -4060,9 +4060,10 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     // The lockfile records both servers, deterministically sorted by name.
     let contents = fs::read_to_string(&lock_path).unwrap();
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
-    // format_version 3 — env entries no longer serialize a raw value; each
-    // entry carries `{ name, value_hash }` (sha256 of `name || ':' || value`).
-    assert_eq!(lock["format_version"], 3);
+    // format_version 4 — the URL transport now strips userinfo and stores a
+    // `userinfo_hash` (sha256 of `server_name || ':' || userinfo`); env
+    // entries continued from v3 still carry `{ name, value_hash }`.
+    assert_eq!(lock["format_version"], 4);
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -4176,6 +4177,100 @@ fn mcp_lock_malformed_config_is_recorded_not_fatal() {
     let malformed = v["malformed_configs"].as_array().unwrap();
     assert_eq!(malformed.len(), 1);
     assert_eq!(malformed[0], "mcp.json");
+}
+
+#[test]
+fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
+    // End-to-end leakage check (Greptile P1, round 3): a .mcp.json whose URL
+    // carries HTTP Basic Auth in the `user:token@` userinfo position must
+    // produce a lockfile whose bytes do NOT contain that credential anywhere.
+    // Tirith's threat model assumes `.tirith/mcp.lock` is committed, so
+    // persisting the raw userinfo would push a credential into git — the
+    // symmetric leak class to the env-value leak fixed in round 2.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let secret = "admin:ghp_URL_INTEGRATION_DO_NOT_LEAK";
+    let config = format!(
+        r#"{{
+            "mcpServers": {{
+                "github": {{
+                    "url": "https://{secret}@mcp.example.com:8443/sse",
+                    "tools": ["search"]
+                }}
+            }}
+        }}"#
+    );
+    fs::write(repo.path().join(".mcp.json"), &config).unwrap();
+
+    let (_stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0, "mcp lock should succeed");
+
+    // The lockfile is written to .tirith/mcp.lock — read it back and verify
+    // the raw userinfo bytes do not appear anywhere.
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let lock_bytes = fs::read(&lock_path).expect("read mcp.lock");
+    let lock_text = std::str::from_utf8(&lock_bytes).expect("mcp.lock must be valid UTF-8 JSON");
+    assert!(
+        !lock_text.contains(secret),
+        "the raw URL userinfo {secret:?} leaked into the committed mcp.lock:\n{lock_text}"
+    );
+    // The userinfo boundary `@mcp.example.com` must not appear either — the
+    // redaction strips the `user:token@` prefix in front of the host.
+    assert!(
+        !lock_text.contains("@mcp.example.com"),
+        "the userinfo `@` boundary leaked into the committed mcp.lock:\n{lock_text}"
+    );
+    // The schema bumped to format_version 4 for this fix.
+    let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
+    assert_eq!(lock["format_version"], 4);
+
+    // The URL transport stores the redacted URL and carries the
+    // `userinfo_hash` field; it does NOT carry a plaintext userinfo /
+    // credential / token field.
+    let transport = &lock["servers"][0]["transport"];
+    assert_eq!(transport["kind"], "url");
+    assert_eq!(transport["url"], "https://mcp.example.com:8443/sse");
+    assert!(
+        transport.get("userinfo_hash").is_some(),
+        "the URL transport must carry a userinfo_hash field when the source URL had \
+         credentials: {transport}"
+    );
+    for forbidden in ["userinfo", "credential", "credentials", "token", "password"] {
+        assert!(
+            transport.get(forbidden).is_none(),
+            "the URL transport must not carry a plaintext `{forbidden}` field: {transport}"
+        );
+    }
+}
+
+#[test]
+fn mcp_lock_url_without_userinfo_omits_userinfo_hash_field() {
+    // The structural-distinctness property: when a URL has no userinfo,
+    // `userinfo_hash` is OMITTED from the serialized lockfile (not written
+    // as null) — so a downstream reader can distinguish "no credential"
+    // from "credential present" by the field's presence.
+    let repo = tempfile::tempdir().unwrap();
+    let iso = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "remote": { "url": "https://mcp.example.com/sse" } } }"#,
+    )
+    .unwrap();
+
+    let (_stdout, _err, code) = run_mcp_lock(repo.path(), iso.path(), &[]);
+    assert_eq!(code, 0);
+    let lock_path = repo.path().join(".tirith").join("mcp.lock");
+    let lock_text = fs::read_to_string(&lock_path).expect("read mcp.lock");
+    assert!(
+        !lock_text.contains("userinfo_hash"),
+        "userinfo_hash must be omitted (not serialized as null) when the source URL has \
+         no credentials:\n{lock_text}"
+    );
+    let lock: serde_json::Value = serde_json::from_str(&lock_text).unwrap();
+    let transport = &lock["servers"][0]["transport"];
+    assert_eq!(transport["url"], "https://mcp.example.com/sse");
 }
 
 #[test]
