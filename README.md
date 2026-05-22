@@ -242,6 +242,19 @@ By default, shell hooks and `tirith check` trigger a cheap background refresh ch
 
 `threat-db explain` accepts a domain, a package name (`name`, `ecosystem:name`, or `name@version`), or an IPv4 address; `threat-db sources` groups feeds into the signed primary database and the optional user-local supplemental overlay. The threat-DB binary retains no per-entry history, so `threat-db diff` reports category and per-source count deltas between snapshots rather than the exact entries added or removed. Every `threat-db` command takes `--format json`; `threatdb` works as an alias for `threat-db`.
 
+### Package risk scoring
+
+`tirith package risk <ecosystem> <name>` scores a package's supply-chain / maintainer risk the way `tirith score` scores a URL — a **deterministic, fully explainable sum of named factors**, no model and no learned weights. `tirith package explain <ecosystem> <name>` adds the factor-by-factor derivation; both take `--format json`.
+
+```bash
+tirith package risk npm react           # 0/100 — a known-popular package
+tirith package risk npm reqeusts        # high — one edit from a popular name
+tirith package explain pypi flask       # factor-by-factor derivation
+tirith package risk npm left-pad --path ./node_modules/left-pad
+```
+
+This is the **offline-signals phase**: every signal is computed locally, with **no network or registry-API call**. The signals are (1) **name vs. popular packages** — whether the name is a known-popular package, an unknown name, or a one-edit near-miss of a popular one (the classic typosquat/slopsquat shape), from the local threat database's `popular` set; (2) **known malicious typosquat** — whether the threat DB's `typosquat` index lists the exact name; (3) **install / lifecycle scripts** and (4) **bundled binary blobs** — detected *only* when the package content is locally available (auto-discovered under `node_modules` / `site-packages`, or an explicit `--path`) — tirith **never downloads** the package. The score is advisory and standalone: `package risk` is not a detection rule and changes no verdict, exit code, or audit log. Registry-API-backed signals (download counts, package age, maintainer history, 2FA) are a separate later phase.
+
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
 **Attack families tirith is built for** (illustrative, not a caught-by-current-code claim):
@@ -606,6 +619,8 @@ tirith daemon stop
 | `tirith threat-db sources` | List the threat-intelligence sources the DB is built from |
 | `tirith threat-db health` | Report threat DB health: install, signature, staleness, entry counts |
 | `tirith threat-db diff --since <ver\|date>` | Summarize threat-DB count changes since a version or date |
+| `tirith package risk <eco> <name>` | Score a package's provenance / maintainer risk from offline signals (`--path` inspects local package content; no network) |
+| `tirith package explain <eco> <name>` | Show the deterministic factor-by-factor derivation of a package's risk score |
 | `tirith explain --rule <id>` | Show documentation, examples, and remediation for any detection rule (`--fix` shows just the remediation) |
 | `tirith policy init` | Generate a starter `.tirith/policy.yaml` (`--template individual\|ci-strict\|ai-agent-heavy` for curated presets) |
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |

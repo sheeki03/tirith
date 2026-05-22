@@ -105,6 +105,7 @@ pub mod last_trigger;
 pub mod license_cmd;
 pub mod manpage;
 pub mod mcp_server;
+pub mod package;
 pub mod paste;
 pub mod policy;
 pub mod receipt;

@@ -521,6 +521,25 @@ Examples:
         hidden: bool,
     },
 
+    /// Score a package's provenance / maintainer risk (offline signals)
+    #[command(after_help = "\
+Scores a package the way `tirith score` scores a URL: a deterministic,
+fully explainable sum of named OFFLINE signals — no model, no network, no
+registry-API call. Name signals come from the local threat database; content
+signals (install scripts, bundled binary blobs) only from a package directory
+you already have on disk. Registry-API-backed signals are a later addition.
+
+Examples:
+  tirith package risk npm react
+  tirith package risk pypi reqeusts
+  tirith package risk npm left-pad --path ./node_modules/left-pad
+  tirith package explain npm express
+  tirith package explain --format json pypi requests")]
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
+    },
+
     /// Manage the threat intelligence database
     #[command(
         name = "threat-db",
@@ -1187,6 +1206,57 @@ enum AuditReportFormat {
 }
 
 #[derive(Subcommand)]
+enum PackageAction {
+    /// Score a package's provenance / maintainer risk (offline signals)
+    #[command(after_help = "\
+Examples:
+  tirith package risk npm react
+  tirith package risk pypi reqeusts
+  tirith package risk npm left-pad --path ./node_modules/left-pad
+  tirith package risk --format json npm express")]
+    Risk {
+        /// Package ecosystem: npm, pypi, rubygems, crates.io, go, maven, nuget, packagist
+        ecosystem: String,
+        /// Package name
+        name: String,
+        /// Inspect locally-available package content at this directory for
+        /// install-script and binary-blob signals. tirith never downloads the
+        /// package; without this flag it tries to auto-discover the package
+        /// under node_modules / site-packages relative to the current dir.
+        #[arg(long)]
+        path: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show the factor-by-factor derivation of a package's risk score
+    #[command(after_help = "\
+Examples:
+  tirith package explain npm express
+  tirith package explain pypi reqeusts
+  tirith package explain --format json npm react")]
+    Explain {
+        /// Package ecosystem: npm, pypi, rubygems, crates.io, go, maven, nuget, packagist
+        ecosystem: String,
+        /// Package name
+        name: String,
+        /// Inspect locally-available package content at this directory (see
+        /// `package risk --path`). tirith never downloads the package.
+        #[arg(long)]
+        path: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ThreatDbAction {
     /// Download or update the threat intelligence database
     #[command(after_help = "\
@@ -1695,6 +1765,29 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::warnings::run(clear, session.as_deref(), json, summary, hidden)
         }
+
+        Commands::Package { action } => match action {
+            PackageAction::Risk {
+                ecosystem,
+                name,
+                path,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::package::risk(&ecosystem, &name, path.as_deref(), json)
+            }
+            PackageAction::Explain {
+                ecosystem,
+                name,
+                path,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::package::explain(&ecosystem, &name, path.as_deref(), json)
+            }
+        },
 
         Commands::ThreatDb { action } => match action {
             ThreatDbAction::Update { force, background } => {

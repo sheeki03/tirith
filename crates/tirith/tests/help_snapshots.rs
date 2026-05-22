@@ -64,6 +64,9 @@ help_example_tests! {
     help_threat_db_sources => (["threat-db", "sources", "--help"], "tirith threat-db sources");
     help_threat_db_health  => (["threat-db", "health", "--help"], "tirith threat-db health");
     help_threat_db_diff    => (["threat-db", "diff", "--help"], "tirith threat-db diff --since");
+    help_package          => (["package", "--help"], "tirith package risk npm react");
+    help_package_risk     => (["package", "risk", "--help"], "tirith package risk pypi reqeusts");
+    help_package_explain  => (["package", "explain", "--help"], "tirith package explain npm express");
     help_daemon     => (["daemon", "--help"], "tirith daemon start");
     help_gateway    => (["gateway", "--help"], "tirith gateway");
     help_license    => (["license", "--help"], "tirith license");
@@ -86,6 +89,7 @@ fn help_root_lists_subcommands() {
     assert!(stdout.contains("verify-self"));
     assert!(stdout.contains("update"));
     assert!(stdout.contains("version"));
+    assert!(stdout.contains("package"));
     // hook-event is an internal subcommand and must not surface here.
     assert!(
         !stdout.contains("hook-event"),
