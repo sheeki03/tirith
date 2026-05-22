@@ -34,11 +34,11 @@
 //! `ecosystem scan` produces a [`Verdict`] of [`Finding`]s, exactly like the
 //! detection engine — so the result is explainable, audit-loggable, and
 //! policy-aware (an allowlisted package is suppressed). It reuses the existing
-//! package-supply-chain [`RuleId`]s ([`RuleId::ThreatMaliciousPackage`],
-//! [`RuleId::ThreatPackageTyposquat`], [`RuleId::ThreatPackageSimilarName`],
-//! [`RuleId::ThreatSuspiciousPackage`]) rather than inventing new ones: a
-//! manifest scan is not a new *kind* of supply-chain risk, it is the same
-//! risks found by walking a project instead of one `install` command.
+//! package-supply-chain [`RuleId`]s ([`RuleId::ThreatPackageTyposquat`],
+//! [`RuleId::ThreatPackageSimilarName`], [`RuleId::ThreatSuspiciousPackage`])
+//! rather than inventing new ones: a manifest scan is not a new *kind* of
+//! supply-chain risk, it is the same risks found by walking a project instead
+//! of one `install` command.
 //!
 //! ## Determinism
 //!

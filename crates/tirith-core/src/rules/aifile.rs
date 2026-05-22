@@ -563,20 +563,16 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
         }
     };
 
-    // Active / hidden content inside a saved `text/html` output.
+    // Active / hidden content inside a saved `text/html` output. The
+    // active-content reasons (`<script>` / event handler / `javascript:`) come
+    // from the shared `active_html_reasons` helper; this path reports the first
+    // one. CSS-hiding is a notebook-output-only fallback, checked after.
     let html_hit = if !html.is_empty() {
         let lower = html.to_ascii_lowercase();
-        if lower.contains("<script") {
-            Some("an embedded <script> element")
-        } else if has_inline_event_handler(&lower) {
-            Some("an inline event-handler attribute")
-        } else if lower.contains("javascript:") {
-            Some("a javascript: URI")
-        } else if html_has_css_hiding(&lower) {
-            Some("content hidden via CSS (display:none / visibility:hidden / opacity:0)")
-        } else {
-            None
-        }
+        active_html_reasons(&lower).into_iter().next().or_else(|| {
+            html_has_css_hiding(&lower)
+                .then_some("content hidden via CSS (display:none / visibility:hidden / opacity:0)")
+        })
     } else {
         None
     };
@@ -807,38 +803,41 @@ fn check_svg(input: &str, findings: &mut Vec<Finding>) {
 /// renderer; it is the SVG-as-attack-vector shape (stored XSS via an uploaded
 /// "image").
 fn check_svg_active_content(input: &str, lower: &str, findings: &mut Vec<Finding>) {
-    let mut reasons: Vec<&'static str> = Vec::new();
-    let mut evidence: Vec<Evidence> = Vec::new();
-
-    if lower.contains("<script") {
-        reasons.push("an embedded <script> element");
-        if let Some(snippet) = first_match_snippet(input, lower, "<script") {
-            evidence.push(Evidence::Text {
-                detail: format!("script element: {}", truncate(&snippet, 120)),
-            });
-        }
-    }
-
-    if has_inline_event_handler(lower) {
-        reasons.push("an inline event-handler attribute (on*)");
-        if let Some(handler) = first_event_handler(input) {
-            evidence.push(Evidence::Text {
-                detail: format!("event handler: {}", truncate(&handler, 120)),
-            });
-        }
-    }
-
-    if lower.contains("javascript:") {
-        reasons.push("a javascript: URI");
-        if let Some(snippet) = first_match_snippet(input, lower, "javascript:") {
-            evidence.push(Evidence::Text {
-                detail: format!("javascript URI: {}", truncate(&snippet, 120)),
-            });
-        }
-    }
-
+    // The active-content reasons are classified by the shared
+    // `active_html_reasons` helper (also used by the notebook-output path);
+    // this path reports the whole list and attaches a per-reason evidence
+    // snippet, so the snippet extraction stays here.
+    let reasons = active_html_reasons(lower);
     if reasons.is_empty() {
         return;
+    }
+
+    let mut evidence: Vec<Evidence> = Vec::new();
+    for reason in &reasons {
+        match *reason {
+            "an embedded <script> element" => {
+                if let Some(snippet) = first_match_snippet(input, lower, "<script") {
+                    evidence.push(Evidence::Text {
+                        detail: format!("script element: {}", truncate(&snippet, 120)),
+                    });
+                }
+            }
+            "an inline event-handler attribute (on*)" => {
+                if let Some(handler) = first_event_handler(input) {
+                    evidence.push(Evidence::Text {
+                        detail: format!("event handler: {}", truncate(&handler, 120)),
+                    });
+                }
+            }
+            "a javascript: URI" => {
+                if let Some(snippet) = first_match_snippet(input, lower, "javascript:") {
+                    evidence.push(Evidence::Text {
+                        detail: format!("javascript URI: {}", truncate(&snippet, 120)),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
     if evidence.is_empty() {
         evidence.push(Evidence::Text {
@@ -943,6 +942,34 @@ fn check_svg_external_reference(input: &str, lower: &str, findings: &mut Vec<Fin
 // ===========================================================================
 // small text helpers shared by the notebook / agent / SVG checks
 // ===========================================================================
+
+/// The reasons an HTML string carries *active* content — a `<script>` element,
+/// an inline `on*` event handler, or a `javascript:` URI. Shared by the
+/// notebook-output check and the SVG check (the two callers that look for
+/// active HTML); each had its own copy of these three tests before.
+///
+/// `lower` must already be lowercased. The returned reasons are ordered
+/// `<script>` → event handler → `javascript:`. A caller that wants a single
+/// reason (the notebook path) takes the first; a caller that reports them all
+/// (the SVG path) uses the whole list. Per-caller evidence-snippet extraction
+/// stays with each caller — only the reason classification is shared.
+///
+/// CSS-hiding (`display:none` / …) is deliberately *not* folded in here: it is
+/// a notebook-output-only check ([`html_has_css_hiding`]); the SVG active-
+/// content rule does not look for it, and this helper must not silently add it.
+fn active_html_reasons(lower: &str) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if lower.contains("<script") {
+        reasons.push("an embedded <script> element");
+    }
+    if has_inline_event_handler(lower) {
+        reasons.push("an inline event-handler attribute (on*)");
+    }
+    if lower.contains("javascript:") {
+        reasons.push("a javascript: URI");
+    }
+    reasons
+}
 
 /// Whether `lower` (an already-lowercased string) contains an inline HTML
 /// event-handler attribute — `onload=`, `onclick=`, `onerror=`, etc.
