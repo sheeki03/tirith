@@ -42,10 +42,17 @@ pub fn gather_provenance() -> Provenance {
     // Resolve through symlinks / npm wrapper / Scoop shim, the same way the
     // shadow-binary detector does, so the install-method classifier sees the
     // real on-disk binary.
-    let binary_path = raw_exe
+    let resolved = raw_exe
         .as_deref()
-        .and_then(crate::cli::resolve_effective_tirith_target)
-        .or(raw_exe);
+        .and_then(crate::cli::resolve_effective_tirith_target);
+    // When resolution failed but we DO have a raw `current_exe()` path, we fall
+    // back to that unresolved path. The fallback keeps `version --provenance`
+    // useful, but the install-method classifier is then run on a path that may
+    // still be a symlink / wrapper — record that so consumers can lower their
+    // confidence (an unresolved path could otherwise misdetect the install
+    // method, including toward the self-replaceable `SelfManaged`).
+    let path_resolution_failed = resolved.is_none() && raw_exe.is_some();
+    let binary_path = resolved.or(raw_exe);
 
     let binary_sha256 = binary_path.as_deref().and_then(hash_file_opt);
 
@@ -68,6 +75,7 @@ pub fn gather_provenance() -> Provenance {
         target: selfupdate::release_target_triple().map(|s| s.to_string()),
         install_method,
         dev_build,
+        path_resolution_failed,
     }
 }
 
@@ -99,6 +107,7 @@ pub fn version(provenance: bool, json: bool) -> i32 {
             "binary_sha256": prov.binary_sha256,
             "target": prov.target,
             "install_method": prov.install_method.as_str(),
+            "install_method_resolved": !prov.path_resolution_failed,
             "dev_build": prov.dev_build,
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "verification_status": local_status.token(),
@@ -136,6 +145,12 @@ pub fn version(provenance: bool, json: bool) -> i32 {
             println!("  sha256:          {sha}");
         }
         println!("  install method:  {}", prov.install_method.as_str());
+        if prov.path_resolution_failed {
+            println!(
+                "  note:            the binary path could not be fully resolved; the install \
+                 method above is a lower-confidence guess"
+            );
+        }
         println!("  verification:    {}", describe_status(&local_status));
         if prov.dev_build {
             println!(
@@ -218,6 +233,50 @@ fn local_verification_status(prov: &Provenance) -> VerificationStatus {
 // verify-self
 // ===========================================================================
 
+/// Outcome of `run_verify_self`: the verification status plus whether the run
+/// hit an *operational* error (something went wrong locally that prevented
+/// verification — e.g. tirith could not read its own binary's bytes). An
+/// operational error is distinct from an honest [`VerificationStatus::Unverified`]
+/// (offline / dev build / unpublished platform): the latter is a benign
+/// "cannot verify", the former is a real failure that must exit non-zero so a
+/// scripted `verify-self && deploy` does not proceed.
+struct VerifySelfOutcome {
+    status: VerificationStatus,
+    operational_error: bool,
+    /// When set, the precise `verification_detail` string to report instead of
+    /// the generic [`status_detail`] for this status. Used to surface *why*
+    /// the cosign signature was not checked (absent vs present-but-broken) on
+    /// an otherwise checksum-only verification.
+    detail_override: Option<String>,
+}
+
+impl VerifySelfOutcome {
+    /// An honest verification verdict (no operational error).
+    fn verdict(status: VerificationStatus) -> Self {
+        VerifySelfOutcome {
+            status,
+            operational_error: false,
+            detail_override: None,
+        }
+    }
+
+    /// An operational error: surfaced as `Unverified` to the user (we genuinely
+    /// could not verify) but flagged so `verify-self` exits non-zero.
+    fn operational(reason: String) -> Self {
+        VerifySelfOutcome {
+            status: VerificationStatus::Unverified { reason },
+            operational_error: true,
+            detail_override: None,
+        }
+    }
+
+    /// Attach a precise `verification_detail` override to this outcome.
+    fn with_detail(mut self, detail: Option<String>) -> Self {
+        self.detail_override = detail;
+        self
+    }
+}
+
 /// `tirith verify-self`. Verify the running binary against its known-good
 /// release checksum and signature, where possible. Exit code:
 ///   * `0` — verification succeeded (signed or checksum-only) OR could only be
@@ -225,59 +284,82 @@ fn local_verification_status(prov: &Provenance) -> VerificationStatus {
 ///     offline, unpublished platform). An honest "cannot verify" is not an
 ///     error.
 ///   * `1` — verification was attempted and FAILED (mismatch / bad signature),
-///     or an unexpected operational error occurred.
+///     an operational error prevented verification (e.g. tirith could not read
+///     its own binary), or the JSON output could not be serialized.
 pub fn verify_self(json: bool) -> i32 {
     let prov = gather_provenance();
-    let status = run_verify_self(&prov);
-    emit_verify_self(&prov, &status, json);
-    match status {
+    let outcome = run_verify_self(&prov);
+    let emit_rc = emit_verify_self(
+        &prov,
+        &outcome.status,
+        outcome.detail_override.as_deref(),
+        json,
+    );
+    let verdict_rc = match outcome.status {
         VerificationStatus::Failed { .. } => 1,
+        // An operational error is surfaced as `Unverified` but is NOT a benign
+        // "cannot verify" — it must fail the command so a scripted
+        // `verify-self && deploy` does not silently proceed.
+        _ if outcome.operational_error => 1,
         _ => 0,
-    }
+    };
+    verdict_rc.max(emit_rc)
 }
 
 /// Core of `verify-self`: do the networked verification of the running binary.
 /// Kept separate so the emit/exit logic is trivially correct.
-fn run_verify_self(prov: &Provenance) -> VerificationStatus {
+fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     // 1. A dev build can never be matched against a release.
     if prov.dev_build {
-        return VerificationStatus::Unverified {
+        return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
             reason: "this is a local/dev build (compiled from source, not installed from a \
                      release) — there is no release checksum to verify it against"
                 .to_string(),
-        };
+        });
     }
 
-    // 2. Need a published target and a parseable version.
+    // 2. Need a published target and a parseable version. Both of these are
+    //    honest "cannot verify" conditions, not operational errors.
     let target = match &prov.target {
         Some(t) => t.clone(),
         None => {
-            return VerificationStatus::Unverified {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
                 reason: "this platform has no published tirith release artifact to verify \
                          against"
                     .to_string(),
-            }
+            })
         }
     };
     let version = match SemVer::parse(&prov.version) {
         Some(v) => v,
         None => {
-            return VerificationStatus::Unverified {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
                 reason: format!(
                     "running version `{}` is not a parseable release version",
                     prov.version
                 ),
-            }
+            })
         }
     };
 
-    // 3. Need the running binary's own bytes.
+    // 3. Need the running binary's own bytes. Failure here is an OPERATIONAL
+    //    error — tirith has a path but could not read/hash the file (I/O,
+    //    permissions, or the binary was replaced out from under us). That is
+    //    not a benign "cannot verify": `verify-self` must exit non-zero so a
+    //    scripted `verify-self && deploy` does not proceed.
     let (binary_path, binary_sha) = match (&prov.binary_path, &prov.binary_sha256) {
         (Some(p), Some(s)) => (p.clone(), s.clone()),
-        _ => {
-            return VerificationStatus::Unverified {
-                reason: "could not read the running binary's own bytes".to_string(),
-            }
+        (Some(p), None) => {
+            return VerifySelfOutcome::operational(format!(
+                "could not read the running binary's own bytes at {} (I/O or permission error, \
+                 or the binary was replaced) — cannot verify",
+                p.display()
+            ))
+        }
+        (None, _) => {
+            return VerifySelfOutcome::operational(
+                "could not determine the running binary's own path — cannot verify".to_string(),
+            )
         }
     };
 
@@ -287,41 +369,48 @@ fn run_verify_self(prov: &Provenance) -> VerificationStatus {
     let workdir = match tempfile::Builder::new().prefix("tirith-verify-").tempdir() {
         Ok(d) => d,
         Err(e) => {
-            return VerificationStatus::Unverified {
-                reason: format!("could not create a working directory: {e}"),
-            }
+            // Could not create a temp working directory: an operational error
+            // — verification could not even be started.
+            return VerifySelfOutcome::operational(format!(
+                "could not create a working directory: {e}"
+            ));
         }
     };
 
     let release = match download_release_set(&tag, &archive_name, workdir.path()) {
         Ok(r) => r,
         Err(DownloadError::Offline(msg)) => {
-            return VerificationStatus::Unverified {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
                 reason: format!("could not reach the release server ({msg}) — re-run online"),
-            }
+            })
         }
         Err(DownloadError::NotFound(msg)) => {
-            return VerificationStatus::Unverified {
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
                 reason: format!(
                     "no release artifact found for {tag} ({msg}) — this binary may predate \
                      the release-checksum scheme, or be a custom build"
                 ),
-            }
+            })
         }
         Err(DownloadError::Other(msg)) => {
-            return VerificationStatus::Failed {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed {
                 reason: format!("release download failed: {msg}"),
-            }
+            })
         }
     };
 
     // 5. Verify the archive bytes against the (possibly signed) checksums.
     let verdict = verify_archive_against_checksums(&release, &archive_name);
-    let checksum_status = match verdict {
-        ArchiveVerdict::Ok { signed } => signed,
-        ArchiveVerdict::Failed(reason) => return VerificationStatus::Failed { reason },
+    let (checksum_status, cosign_note) = match verdict {
+        ArchiveVerdict::Ok {
+            signed,
+            cosign_note,
+        } => (signed, cosign_note),
+        ArchiveVerdict::Failed(reason) => {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason })
+        }
         ArchiveVerdict::ChecksumMissing(reason) => {
-            return VerificationStatus::Unverified { reason }
+            return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason })
         }
     };
 
@@ -331,24 +420,24 @@ fn run_verify_self(prov: &Provenance) -> VerificationStatus {
     let extracted = match extract_tirith_binary(&release.archive_path, &target, workdir.path()) {
         Ok(p) => p,
         Err(e) => {
-            return VerificationStatus::Failed {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed {
                 reason: format!(
                     "could not extract the tirith binary from the verified release archive: {e}"
                 ),
-            }
+            })
         }
     };
     let extracted_sha = match hash_file_opt(&extracted) {
         Some(s) => s,
         None => {
-            return VerificationStatus::Failed {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed {
                 reason: "could not hash the binary extracted from the release archive".to_string(),
-            }
+            })
         }
     };
 
     if !selfupdate::digest_eq(&extracted_sha, &binary_sha) {
-        return VerificationStatus::Failed {
+        return VerifySelfOutcome::verdict(VerificationStatus::Failed {
             reason: format!(
                 "the running binary at {} (sha256 {}) does NOT match the official {} release \
                  binary (sha256 {}) — it has been modified or replaced",
@@ -357,35 +446,61 @@ fn run_verify_self(prov: &Provenance) -> VerificationStatus {
                 tag,
                 short(&extracted_sha),
             ),
-        };
+        });
     }
 
     // Running binary == official release binary. The strength of the verdict
-    // is whatever the archive-vs-checksums step achieved.
+    // is whatever the archive-vs-checksums step achieved. For a checksum-only
+    // result, carry the cosign note (absent vs broken) into the detail so a
+    // `--format json` consumer sees *why* the signature went unchecked.
     match checksum_status {
-        ChecksumStrength::Signed => VerificationStatus::VerifiedSigned,
-        ChecksumStrength::ChecksumOnly => VerificationStatus::VerifiedChecksumOnly,
+        ChecksumStrength::Signed => VerifySelfOutcome::verdict(VerificationStatus::VerifiedSigned),
+        ChecksumStrength::ChecksumOnly => {
+            VerifySelfOutcome::verdict(VerificationStatus::VerifiedChecksumOnly)
+                .with_detail(cosign_note)
+        }
     }
 }
 
-fn emit_verify_self(prov: &Provenance, status: &VerificationStatus, json: bool) {
+/// Print the `verify-self` result. Returns `1` if (and only if) JSON output
+/// was requested but could not be serialized — the caller folds that into the
+/// exit code so a JSON consumer never receives nothing on stdout AND a `0`
+/// exit. Returns `0` otherwise (the verdict-based exit code is the caller's).
+///
+/// `detail_override`, when `Some`, is a more precise `verification_detail`
+/// string than the generic [`status_detail`] (e.g. the reason a cosign
+/// signature was not checked).
+fn emit_verify_self(
+    prov: &Provenance,
+    status: &VerificationStatus,
+    detail_override: Option<&str>,
+    json: bool,
+) -> i32 {
+    // Prefer a precise per-outcome detail when one was supplied.
+    let detail = detail_override.map_or_else(|| status_detail(status), |d| d.to_string());
     if json {
         let v = serde_json::json!({
             "version": prov.version,
             "binary_path": prov.binary_path.as_ref().map(|p| p.display().to_string()),
             "binary_sha256": prov.binary_sha256,
             "install_method": prov.install_method.as_str(),
+            "install_method_resolved": !prov.path_resolution_failed,
             "target": prov.target,
             "dev_build": prov.dev_build,
             "verification_status": status.token(),
-            "verification_detail": status_detail(status),
+            "verification_detail": detail,
             "integrity_ok": status.is_integrity_ok(),
         });
         match serde_json::to_string_pretty(&v) {
-            Ok(s) => println!("{s}"),
-            Err(e) => eprintln!("tirith: JSON serialization failed: {e}"),
+            Ok(s) => {
+                println!("{s}");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("tirith: JSON serialization failed: {e}");
+                return 1;
+            }
         }
-        return;
     }
 
     println!("tirith verify-self");
@@ -398,6 +513,12 @@ fn emit_verify_self(prov: &Provenance, status: &VerificationStatus, json: bool) 
             .unwrap_or_else(|| "unknown".to_string())
     );
     println!("  install method: {}", prov.install_method.as_str());
+    if prov.path_resolution_failed {
+        println!(
+            "  note:           the binary path could not be fully resolved; the install method \
+             above is a lower-confidence guess"
+        );
+    }
     println!();
     match status {
         VerificationStatus::VerifiedSigned => {
@@ -413,10 +534,17 @@ fn emit_verify_self(prov: &Provenance, status: &VerificationStatus, json: bool) 
                 "  The running binary matches the SHA-256 published in the release \
                  checksums.txt."
             );
-            println!(
-                "  The cosign signature was NOT checked (cosign is not installed). Install \
-                 cosign and re-run for full signature verification."
-            );
+            // Report *why* the signature went unchecked. With a precise
+            // `detail` (cosign absent vs cosign broken vs no signature
+            // published) print that; otherwise fall back to the common case.
+            if detail_override.is_some() {
+                println!("  The cosign signature was NOT checked: {detail}");
+            } else {
+                println!(
+                    "  The cosign signature was NOT checked (cosign is not installed). Install \
+                     cosign and re-run for full signature verification."
+                );
+            }
         }
         VerificationStatus::Unverified { reason } => {
             println!("  UNVERIFIED (could not verify — this is not a failure)");
@@ -432,6 +560,9 @@ fn emit_verify_self(prov: &Provenance, status: &VerificationStatus, json: bool) 
             );
         }
     }
+    // Human output never fails to "serialize"; the verdict-based exit code is
+    // the caller's responsibility.
+    0
 }
 
 // ===========================================================================
@@ -606,7 +737,7 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             );
             return 1;
         }
-        ArchiveVerdict::Ok { signed } => {
+        ArchiveVerdict::Ok { signed, .. } => {
             if verify && *signed == ChecksumStrength::ChecksumOnly {
                 emit_update_error(
                     json,
@@ -649,8 +780,8 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             "binary_path": binary_path.display().to_string(),
             "previous_binary_kept_at": swap.previous_backup.display().to_string(),
             "verification": match &archive_verdict {
-                ArchiveVerdict::Ok { signed: ChecksumStrength::Signed } => "verified-signed",
-                ArchiveVerdict::Ok { signed: ChecksumStrength::ChecksumOnly } => {
+                ArchiveVerdict::Ok { signed: ChecksumStrength::Signed, .. } => "verified-signed",
+                ArchiveVerdict::Ok { signed: ChecksumStrength::ChecksumOnly, .. } => {
                     "verified-checksum-only"
                 }
                 _ => "unverified",
@@ -666,9 +797,11 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             match &archive_verdict {
                 ArchiveVerdict::Ok {
                     signed: ChecksumStrength::Signed,
+                    ..
                 } => "signed release (checksum + cosign signature)",
                 ArchiveVerdict::Ok {
                     signed: ChecksumStrength::ChecksumOnly,
+                    ..
                 } => "checksum-verified (cosign not installed — signature unchecked)",
                 _ => "unverified",
             }
@@ -823,8 +956,18 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
     match atomic_restore_from(&binary_path, &backup) {
         Ok(()) => {
             // The backup's bytes are now the live binary. Remove the now-stale
-            // backup file: it is no longer "the previous version".
-            let _ = std::fs::remove_file(&backup);
+            // backup file: it is no longer "the previous version". If the
+            // removal fails, warn — a leftover `.tirith-previous` whose bytes
+            // are now identical to the live binary means a *later* `--rollback`
+            // would "restore" the same version and look like a no-op.
+            if let Err(e) = std::fs::remove_file(&backup) {
+                eprintln!(
+                    "tirith: warning: rolled back successfully but could not remove the now-stale \
+                     backup {} ({e}); delete it manually — a future `--rollback` would otherwise \
+                     restore these same (no-longer-previous) bytes",
+                    backup.display()
+                );
+            }
             if json {
                 let v = serde_json::json!({
                     "action": "rolled-back",
@@ -1060,7 +1203,14 @@ enum ChecksumStrength {
 /// Outcome of verifying a downloaded archive against its checksums file.
 enum ArchiveVerdict {
     /// The archive's SHA-256 matched the entry in `checksums.txt`.
-    Ok { signed: ChecksumStrength },
+    Ok {
+        signed: ChecksumStrength,
+        /// When the signature was NOT checked, why. `None` for a fully signed
+        /// verification; for `ChecksumOnly` this distinguishes "cosign is not
+        /// installed" from "cosign IS installed but could not be executed" —
+        /// a distinction an `eprintln!` alone would lose under `--format json`.
+        cosign_note: Option<String>,
+    },
     /// Verification was attempted and FAILED (mismatch / bad signature).
     Failed(String),
     /// `checksums.txt` had no entry for this archive — cannot verify.
@@ -1102,12 +1252,51 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
     match verify_cosign_signature(release) {
         CosignOutcomeInternal::Verified => ArchiveVerdict::Ok {
             signed: ChecksumStrength::Signed,
+            cosign_note: None,
         },
-        CosignOutcomeInternal::Unavailable => ArchiveVerdict::Ok {
+        CosignOutcomeInternal::Unavailable(reason) => ArchiveVerdict::Ok {
             signed: ChecksumStrength::ChecksumOnly,
+            cosign_note: Some(reason.detail()),
         },
         CosignOutcomeInternal::Failed(reason) => {
             ArchiveVerdict::Failed(format!("cosign signature verification FAILED: {reason}"))
+        }
+    }
+}
+
+/// Why a cosign signature check could not be performed. This is NOT a
+/// verification failure — it is an honest "signature not checked" — but the
+/// two cases differ operationally and the distinction must reach JSON output.
+enum CosignUnavailable {
+    /// The release did not publish a `.sig`/`.pem` pair at all.
+    NoSignaturePublished,
+    /// No `cosign` binary is resolvable on `PATH`.
+    NotInstalled,
+    /// A `cosign` binary IS on `PATH`, but it could not be executed (e.g. it
+    /// is not actually runnable, or spawning it failed). The string is the
+    /// spawn error. Distinct from `NotInstalled`: the user installed cosign,
+    /// so "install cosign" is the wrong advice — something is broken.
+    ExecFailed(String),
+}
+
+impl CosignUnavailable {
+    /// One-line, JSON-safe explanation of why the signature was not checked.
+    fn detail(&self) -> String {
+        match self {
+            CosignUnavailable::NoSignaturePublished => {
+                "this release did not publish a cosign signature, so only the checksum was \
+                 verified"
+                    .to_string()
+            }
+            CosignUnavailable::NotInstalled => {
+                "cosign is not installed, so the signature was not checked — install cosign and \
+                 re-run for full signature verification"
+                    .to_string()
+            }
+            CosignUnavailable::ExecFailed(err) => format!(
+                "cosign is installed but could not be executed ({err}), so the signature was \
+                 not checked — verify the cosign installation"
+            ),
         }
     }
 }
@@ -1116,9 +1305,9 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
 enum CosignOutcomeInternal {
     /// The signature verified against the expected Sigstore identity.
     Verified,
-    /// Verification could not be attempted (no `cosign`, or the release did
-    /// not publish a `.sig`/`.pem`). NOT a failure.
-    Unavailable,
+    /// Verification could not be attempted. NOT a failure — see
+    /// [`CosignUnavailable`] for which sub-case.
+    Unavailable(CosignUnavailable),
     /// `cosign` ran and the signature did NOT verify.
     Failed(String),
 }
@@ -1128,16 +1317,19 @@ enum CosignOutcomeInternal {
 /// tirith has no in-process Sigstore implementation — keyless verification
 /// needs to talk to Rekor/Fulcio — so this shells out to the `cosign` binary,
 /// exactly as `scripts/install.sh` does, with the SAME pinned identity and
-/// OIDC issuer. If `cosign` is not on `PATH`, or the release shipped no
-/// signature, verification is `Unavailable` (honest), never a false pass.
+/// OIDC issuer. If `cosign` is not on `PATH`, cannot be executed, or the
+/// release shipped no signature, verification is `Unavailable` (honest), never
+/// a false pass — but the three cases are reported distinctly so a
+/// `--format json` consumer can tell "cosign absent" from "cosign broken".
 fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
     let (sig, cert) = match (&release.sig_path, &release.cert_path) {
         (Some(s), Some(c)) => (s, c),
-        _ => return CosignOutcomeInternal::Unavailable, // release shipped no signature
+        // release shipped no signature
+        _ => return CosignOutcomeInternal::Unavailable(CosignUnavailable::NoSignaturePublished),
     };
 
     if !cosign_available() {
-        return CosignOutcomeInternal::Unavailable;
+        return CosignOutcomeInternal::Unavailable(CosignUnavailable::NotInstalled);
     }
 
     let output = std::process::Command::new("cosign")
@@ -1166,10 +1358,14 @@ fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
             )
         }
         Err(e) => {
-            // cosign was on PATH a moment ago but could not be executed; treat
-            // as unavailable rather than a verification failure.
+            // `cosign_available()` saw a `cosign` on PATH a moment ago, but it
+            // could not actually be executed. Treat as unavailable rather than
+            // a verification failure — but distinctly from "not installed", so
+            // the JSON detail does not falsely advise "install cosign". The
+            // eprintln! is kept for the human path; JSON consumers get the
+            // distinction via `cosign_note` on the verdict.
             eprintln!("tirith: warning: could not run cosign ({e}); skipping signature check");
-            CosignOutcomeInternal::Unavailable
+            CosignOutcomeInternal::Unavailable(CosignUnavailable::ExecFailed(e.to_string()))
         }
     }
 }
@@ -1204,6 +1400,23 @@ fn cosign_available() -> bool {
 /// shell out to `tar` / `unzip` (or PowerShell `Expand-Archive`) rather than
 /// pulling in an archive crate. The extracted binary file name is `tirith`
 /// (`tirith.exe` on Windows).
+///
+/// ## Path-traversal containment (defense-in-depth)
+///
+/// The archive being extracted has ALREADY been checksum- (and where possible
+/// cosign-) verified against the signed release before this function runs, so
+/// a path-traversal payload would have to come from a release that itself
+/// verified — outside tirith's strict trust model. Even so, extraction is the
+/// single most security-critical step, and the containment check below is
+/// cheap, so it is done unconditionally:
+///
+///   * `tar` is run with `--no-same-owner` so an extracted file can never be
+///     chowned to an unexpected uid/gid.
+///   * After extraction the produced binary path is canonicalized and asserted
+///     to lie *inside* `extract_dir`. A malicious archive member that is a
+///     symlink escaping the extraction directory (e.g. a `tirith` symlink
+///     pointing at `/etc/...` or `../../../`) is therefore rejected here
+///     instead of being hashed / installed.
 fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result<PathBuf, String> {
     let extract_dir = workdir.join("extracted");
     std::fs::create_dir_all(&extract_dir).map_err(|e| format!("create extract dir: {e}"))?;
@@ -1229,9 +1442,12 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
             return Err("Expand-Archive failed to extract the release zip".to_string());
         }
     } else {
-        // `.tar.gz` — use `tar`.
+        // `.tar.gz` — use `tar`. `--no-same-owner` keeps an extracted file
+        // owned by the current user regardless of the uid/gid recorded in the
+        // archive (relevant when extraction runs as root).
         let status = std::process::Command::new("tar")
-            .arg("xzf")
+            .arg("--no-same-owner")
+            .arg("-xzf")
             .arg(archive)
             .arg("-C")
             .arg(&extract_dir)
@@ -1248,7 +1464,29 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
             "release archive did not contain a `{binary_name}` binary"
         ));
     }
-    Ok(binary)
+
+    // Containment check: the extracted binary must resolve to a real path
+    // INSIDE `extract_dir`. Canonicalize both sides so a symlink (or `..`
+    // component) that escapes the extraction directory is caught — the
+    // canonical form of an escaping symlink will not be prefixed by the
+    // canonical `extract_dir`.
+    let canonical_extract_dir = extract_dir
+        .canonicalize()
+        .map_err(|e| format!("could not canonicalize the extraction directory: {e}"))?;
+    let canonical_binary = binary
+        .canonicalize()
+        .map_err(|e| format!("could not canonicalize the extracted `{binary_name}` path: {e}"))?;
+    if !canonical_binary.starts_with(&canonical_extract_dir) {
+        return Err(format!(
+            "the extracted `{binary_name}` resolves to {} which is OUTSIDE the extraction \
+             directory {} — refusing to use it (the release archive may contain a \
+             path-traversal payload)",
+            canonical_binary.display(),
+            canonical_extract_dir.display(),
+        ));
+    }
+
+    Ok(canonical_binary)
 }
 
 // ===========================================================================
@@ -1661,8 +1899,18 @@ mod tests {
         let verdict =
             verify_archive_against_checksums(&release, "tirith-x86_64-unknown-linux-gnu.tar.gz");
         match verdict {
-            ArchiveVerdict::Ok { signed } => {
+            ArchiveVerdict::Ok {
+                signed,
+                cosign_note,
+            } => {
                 assert_eq!(signed, ChecksumStrength::ChecksumOnly);
+                // No `.sig`/`.pem` was published — the note must say so, NOT
+                // (mis)advise the user to install cosign.
+                let note = cosign_note.expect("checksum-only must carry a cosign note");
+                assert!(
+                    note.contains("did not publish"),
+                    "note should explain no signature was published, got: {note}"
+                );
             }
             _ => panic!("expected Ok(ChecksumOnly), got a different verdict"),
         }
@@ -1702,6 +1950,7 @@ mod tests {
             install_method: InstallMethod::Unknown,
             target: Some("x86_64-unknown-linux-gnu".to_string()),
             dev_build: true,
+            path_resolution_failed: false,
         };
         let status = local_verification_status(&prov);
         assert_eq!(status.token(), "unverified");
@@ -1709,7 +1958,8 @@ mod tests {
     }
 
     /// `run_verify_self` for a dev build short-circuits to Unverified WITHOUT
-    /// any network access — the honest-failure path the spec calls out.
+    /// any network access — the honest-failure path the spec calls out. It is
+    /// an HONEST unverified, NOT an operational error: exit 0 must be kept.
     #[test]
     fn verify_self_dev_build_short_circuits_offline() {
         let prov = Provenance {
@@ -1719,15 +1969,23 @@ mod tests {
             install_method: InstallMethod::SelfManaged,
             target: Some("x86_64-unknown-linux-gnu".to_string()),
             dev_build: true,
+            path_resolution_failed: false,
         };
         // No network is touched because dev_build is checked first.
-        let status = run_verify_self(&prov);
-        assert!(matches!(status, VerificationStatus::Unverified { .. }));
-        assert_eq!(status.token(), "unverified");
+        let outcome = run_verify_self(&prov);
+        assert!(matches!(
+            outcome.status,
+            VerificationStatus::Unverified { .. }
+        ));
+        assert_eq!(outcome.status.token(), "unverified");
+        assert!(
+            !outcome.operational_error,
+            "a dev build is an honest unverified, not an operational error"
+        );
     }
 
     /// `run_verify_self` for an unpublished platform short-circuits to
-    /// Unverified, again without network.
+    /// Unverified, again without network — and again NOT an operational error.
     #[test]
     fn verify_self_unpublished_platform_short_circuits() {
         let prov = Provenance {
@@ -1737,9 +1995,69 @@ mod tests {
             install_method: InstallMethod::Unknown,
             target: None, // unpublished platform
             dev_build: false,
+            path_resolution_failed: false,
         };
-        let status = run_verify_self(&prov);
-        assert!(matches!(status, VerificationStatus::Unverified { .. }));
+        let outcome = run_verify_self(&prov);
+        assert!(matches!(
+            outcome.status,
+            VerificationStatus::Unverified { .. }
+        ));
+        assert!(
+            !outcome.operational_error,
+            "an unpublished platform is an honest unverified, not an operational error"
+        );
+    }
+
+    /// F2: when tirith has a binary PATH but could not read/hash its own bytes
+    /// (`binary_sha256 == None`), `run_verify_self` reports an OPERATIONAL
+    /// error. The status is surfaced as `Unverified` (we genuinely could not
+    /// verify) but `operational_error` is set so `verify-self` exits non-zero —
+    /// a scripted `verify-self && deploy` must not silently proceed.
+    #[test]
+    fn verify_self_unreadable_own_binary_is_operational_error() {
+        let prov = Provenance {
+            version: "0.3.1".to_string(),
+            binary_path: Some(PathBuf::from("/usr/local/bin/tirith")),
+            binary_sha256: None, // could not read / hash the running binary
+            install_method: InstallMethod::SelfManaged,
+            target: Some("x86_64-unknown-linux-gnu".to_string()),
+            dev_build: false,
+            path_resolution_failed: false,
+        };
+        let outcome = run_verify_self(&prov);
+        assert!(
+            outcome.operational_error,
+            "an unreadable own-binary is an operational error, not a benign unverified"
+        );
+        // Still surfaced honestly as `Unverified`, never a false `Failed`.
+        assert!(matches!(
+            outcome.status,
+            VerificationStatus::Unverified { .. }
+        ));
+    }
+
+    /// F2: when tirith cannot even determine its own binary path
+    /// (`binary_path == None`) that, too, is an operational error.
+    #[test]
+    fn verify_self_unknown_own_path_is_operational_error() {
+        let prov = Provenance {
+            version: "0.3.1".to_string(),
+            binary_path: None,
+            binary_sha256: None,
+            install_method: InstallMethod::SelfManaged,
+            target: Some("x86_64-unknown-linux-gnu".to_string()),
+            dev_build: false,
+            path_resolution_failed: false,
+        };
+        let outcome = run_verify_self(&prov);
+        assert!(
+            outcome.operational_error,
+            "an unknown own-binary path is an operational error"
+        );
+        assert!(matches!(
+            outcome.status,
+            VerificationStatus::Unverified { .. }
+        ));
     }
 
     /// `extract_tirith_binary` round-trips a real tar.gz on Unix: it must find
@@ -1791,6 +2109,222 @@ mod tests {
 
         let r = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", dir.path());
         assert!(r.is_err());
+    }
+
+    /// F21 / F1: extraction containment. A release archive whose `tirith`
+    /// member is a SYMLINK escaping the extraction directory must be REJECTED
+    /// — `extract_tirith_binary` canonicalizes the produced path and refuses
+    /// anything resolving outside `extract_dir`, so the escaping symlink is
+    /// never hashed or installed.
+    #[cfg(unix)]
+    #[test]
+    fn extract_tirith_binary_rejects_symlink_escaping_extract_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A sensitive file OUTSIDE the extraction dir that the payload tries
+        // to make `tirith` point at.
+        let outside_secret = dir.path().join("outside-secret");
+        std::fs::write(&outside_secret, b"SENSITIVE-BYTES-OUTSIDE").unwrap();
+
+        // Stage an archive whose `tirith` member is a symlink to `../`-escape.
+        // `workdir` passed to extract_tirith_binary is `dir.path()/work`, so
+        // extraction lands in `dir.path()/work/extracted`; a `../../` symlink
+        // target from there reaches `dir.path()`.
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::os::unix::fs::symlink("../../outside-secret", stage.join("tirith")).unwrap();
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        let ok = std::process::Command::new("tar")
+            // Without -h, tar archives the symlink AS a symlink (the attack).
+            .arg("czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .arg("tirith")
+            .status()
+            .expect("tar should run")
+            .success();
+        assert!(ok, "tar czf should succeed");
+
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let r = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
+        assert!(
+            r.is_err(),
+            "an escaping-symlink `tirith` member must be rejected, got: {r:?}"
+        );
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("OUTSIDE") || err.contains("path-traversal"),
+            "rejection should name the containment violation, got: {err}"
+        );
+        // The outside file is untouched — extraction never wrote through the
+        // escaping link.
+        assert_eq!(
+            std::fs::read(&outside_secret).unwrap(),
+            b"SENSITIVE-BYTES-OUTSIDE"
+        );
+    }
+
+    /// F21 / F1: a `../`-prefixed archive MEMBER must not cause a write outside
+    /// the extraction directory. `tar` strips a leading `../` itself (printing
+    /// a warning), so the escaping member never lands; the `tirith` binary is
+    /// then simply absent and extraction fails cleanly — nothing is written to
+    /// the parent directory.
+    #[cfg(unix)]
+    #[test]
+    fn extract_tirith_binary_dotdot_member_writes_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("tirith"), b"PAYLOAD").unwrap();
+        // Archive the member under a `../escaped-tirith` name.
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .arg("--transform")
+            .arg("s,^tirith,../escaped-tirith,")
+            .arg("tirith")
+            .status();
+        // GNU tar supports --transform; if it is unavailable (bsdtar) skip the
+        // member-rename and just confirm a clean archive still does not leak.
+        let renamed = ok.map(|s| s.success()).unwrap_or(false);
+
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let leak = workdir.join("escaped-tirith");
+        let _ = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
+
+        if renamed {
+            // The `../`-prefixed member must NOT have escaped `extracted/` into
+            // `work/`.
+            assert!(
+                !leak.exists(),
+                "a `../`-prefixed archive member must not be written outside the extract dir"
+            );
+        }
+    }
+
+    /// F21 / F1: a PRE-EXISTING `extracted/tirith` regular file (not from the
+    /// archive) is inside `extract_dir`, so it passes containment — the
+    /// containment check rejects ESCAPES, not in-directory files. This pins
+    /// that the check does not over-reject a legitimate in-bounds path.
+    #[cfg(unix)]
+    #[test]
+    fn extract_tirith_binary_preexisting_in_bounds_file_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("tirith"), b"ARCHIVE-BINARY").unwrap();
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .arg("tirith")
+            .status()
+            .unwrap();
+
+        let workdir = dir.path().join("work");
+        // Pre-create `work/extracted/tirith` before extraction runs.
+        let pre = workdir.join("extracted");
+        std::fs::create_dir_all(&pre).unwrap();
+        std::fs::write(pre.join("tirith"), b"PRE-EXISTING").unwrap();
+
+        let extracted =
+            extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir).unwrap();
+        // The returned path is canonical and inside the extraction directory.
+        assert!(extracted.starts_with(pre.canonicalize().unwrap()));
+    }
+
+    /// F19: when a `cosign` binary IS on `PATH` but EXITS NON-ZERO, the
+    /// signature does not verify and `verify_archive_against_checksums` must
+    /// return `ArchiveVerdict::Failed` — cosign saying "no" is a hard failure,
+    /// never folded into a checksum-only pass.
+    ///
+    /// `verify_cosign_signature` resolves `cosign` from the process `PATH`, so
+    /// this test mutates `PATH`. It therefore holds the crate-wide `ENV_LOCK`
+    /// (the same lock `cli::test_harness::with_fake_env` uses) for the whole
+    /// PATH mutation, so it cannot race any other env-mutating test, and
+    /// restores `PATH` via an `EnvGuard` (panic-safe).
+    #[cfg(unix)]
+    #[test]
+    fn cosign_failure_makes_archive_verdict_failed() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A fake `cosign` that always exits 1 (signature does not verify).
+        // It MUST be executable or PATH resolution would skip it.
+        let fake_bin_dir = dir.path().join("fakebin");
+        std::fs::create_dir_all(&fake_bin_dir).unwrap();
+        let fake_cosign = fake_bin_dir.join("cosign");
+        std::fs::write(
+            &fake_cosign,
+            "#!/bin/sh\necho 'fake cosign: signature did not verify' 1>&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A real archive whose bytes match checksums.txt, so verification
+        // reaches the cosign step. The release ships a (dummy) .sig and .pem.
+        let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
+        let body = b"REAL ARCHIVE BYTES FOR COSIGN TEST";
+        std::fs::write(&archive, body).unwrap();
+        let real_digest = hex_sha256(body);
+        let txt = format!("{real_digest}  tirith-x86_64-unknown-linux-gnu.tar.gz\n");
+        let checksums = dir.path().join("checksums.txt");
+        std::fs::write(&checksums, &txt).unwrap();
+        let sig = dir.path().join("checksums.txt.sig");
+        std::fs::write(&sig, b"dummy-signature").unwrap();
+        let cert = dir.path().join("checksums.txt.pem");
+        std::fs::write(&cert, b"dummy-certificate").unwrap();
+
+        let release = ReleaseSet {
+            archive_path: archive,
+            checksums_txt: txt,
+            sig_path: Some(sig),
+            cert_path: Some(cert),
+            checksums_path: checksums,
+        };
+
+        let verdict = {
+            // Serialize against every other env-mutating test in the crate.
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // Prepend the fake-cosign dir to PATH (prepending, not replacing,
+            // keeps `sh` and friends resolvable). `EnvGuard` restores PATH on
+            // Drop even if the call below panics.
+            let mut entries = vec![fake_bin_dir.clone()];
+            if let Some(p) = std::env::var_os("PATH") {
+                entries.extend(std::env::split_paths(&p));
+            }
+            let joined = std::env::join_paths(entries).expect("join PATH");
+            let _path_guard = EnvGuard::set("PATH", std::path::Path::new(&joined));
+
+            verify_archive_against_checksums(&release, "tirith-x86_64-unknown-linux-gnu.tar.gz")
+        };
+
+        match verdict {
+            ArchiveVerdict::Failed(reason) => {
+                assert!(
+                    reason.contains("cosign"),
+                    "the failure reason should mention cosign, got: {reason}"
+                );
+            }
+            other => panic!(
+                "a non-zero cosign exit must yield ArchiveVerdict::Failed, got a different verdict ({})",
+                match other {
+                    ArchiveVerdict::Ok { .. } => "Ok",
+                    ArchiveVerdict::ChecksumMissing(_) => "ChecksumMissing",
+                    ArchiveVerdict::Failed(_) => unreachable!(),
+                }
+            ),
+        }
     }
 
     #[test]

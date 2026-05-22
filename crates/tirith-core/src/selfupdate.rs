@@ -4,8 +4,8 @@
 //! This module holds the *effect-free, testable* core: install-method
 //! detection, version parsing, and the data types describing what tirith was
 //! able to verify about its own binary. The networked / filesystem-mutating
-//! parts (download, atomic swap, rollback) live in `crate::selfupdate_io` and
-//! the CLI surface lives in `tirith::cli::selfupdate`.
+//! parts (download, atomic swap, rollback) and the entire CLI surface live in
+//! `tirith::cli::selfupdate`.
 //!
 //! ## What the release pipeline actually produces
 //!
@@ -370,6 +370,13 @@ pub struct Provenance {
     /// `true` when this looks like a local dev/debug build rather than a
     /// release binary (see [`looks_like_dev_build`]).
     pub dev_build: bool,
+    /// `true` when the running binary's path could NOT be fully resolved
+    /// (symlink / npm-wrapper / shim canonicalization failed) and the
+    /// unresolved path was used as a fallback. The install-method
+    /// classification — and therefore any "is this a self-managed install"
+    /// decision — is then made from a possibly-wrong path, so consumers
+    /// (`version --provenance`, `verify-self`) should note lower confidence.
+    pub path_resolution_failed: bool,
 }
 
 /// Heuristic: does the running binary look like a local dev build rather than
@@ -385,17 +392,50 @@ pub fn looks_like_dev_build(binary_path: Option<&Path>, debug_assertions: bool) 
     }
     // A release-profile binary sitting inside a Cargo `target/` directory is
     // a `cargo build --release` artifact from a checkout, not an install.
+    //
+    // The Cargo layout is `target/release/tirith` or, with `--target`,
+    // `target/<triple>/release/tirith`. In BOTH layouts the `target`
+    // component is immediately followed by either `release`/`debug` (the
+    // profile dir) or the target triple. Matching a bare `target` component
+    // anywhere AND a bare `release`/`debug` component anywhere — independently
+    // — is too loose: a perfectly normal install under, say,
+    // `…/target/bin/release/tirith` would misclassify as a dev build. Require
+    // the `target` component to be IMMEDIATELY followed by `release` or
+    // `debug` (covering `target/release/...`) — the cross-compiled
+    // `target/<triple>/release/...` is handled by also accepting a triple
+    // component between them.
     if let Some(p) = binary_path {
-        let in_target = p.components().any(
-            |c| matches!(c, std::path::Component::Normal(s) if s == std::ffi::OsStr::new("target")),
-        );
-        // `target/release/tirith` or `target/<triple>/release/tirith`.
-        let under_release = p.components().any(|c| {
-            matches!(c, std::path::Component::Normal(s)
-                if s == std::ffi::OsStr::new("release") || s == std::ffi::OsStr::new("debug"))
-        });
-        if in_target && under_release {
-            return true;
+        let comps: Vec<&std::ffi::OsStr> = p
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let is_profile = |s: &std::ffi::OsStr| {
+            s == std::ffi::OsStr::new("release") || s == std::ffi::OsStr::new("debug")
+        };
+        let looks_like_triple = |s: &std::ffi::OsStr| {
+            // A Rust target triple (`x86_64-unknown-linux-gnu`,
+            // `aarch64-apple-darwin`, …): contains `-`, no path-ish chars.
+            s.to_str()
+                .map(|t| t.contains('-') && !t.contains(' ') && !t.contains('.'))
+                .unwrap_or(false)
+        };
+        for (i, c) in comps.iter().enumerate() {
+            if *c != std::ffi::OsStr::new("target") {
+                continue;
+            }
+            // `target/release` or `target/debug`.
+            if comps.get(i + 1).is_some_and(|n| is_profile(n)) {
+                return true;
+            }
+            // `target/<triple>/release` or `target/<triple>/debug`.
+            if comps.get(i + 1).is_some_and(|n| looks_like_triple(n))
+                && comps.get(i + 2).is_some_and(|n| is_profile(n))
+            {
+                return true;
+            }
         }
     }
     false
@@ -463,14 +503,16 @@ fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Constant-time-ish equality for two hex digests. SHA-256 comparison is not a
-/// secret-dependent operation here (the digests are public), but comparing
-/// case-folded and via a single fold avoids accidental early-return surprises
-/// and is the obviously-correct thing to read.
+/// Case-insensitive, whitespace-tolerant equality for two hex digests.
+///
+/// This is NOT a constant-time comparison: it trims, lowercases, and uses a
+/// plain `String` equality that short-circuits. That is fine here — the
+/// digests being compared (a SHA-256 of a release archive against the digest
+/// in a public `checksums.txt`) are public values, so comparison timing leaks
+/// nothing. The trim/lowercase normalization just makes a digest copied with
+/// stray whitespace or mixed case still compare equal.
 pub fn digest_eq(a: &str, b: &str) -> bool {
-    let a = a.trim().to_lowercase();
-    let b = b.trim().to_lowercase();
-    a.len() == b.len() && a == b
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 #[cfg(test)]
@@ -698,6 +740,40 @@ mod tests {
         assert!(!looks_like_dev_build(Some(&p), false));
         let p2 = PathBuf::from("/opt/homebrew/Cellar/tirith/0.3.1/bin/tirith");
         assert!(!looks_like_dev_build(Some(&p2), false));
+    }
+
+    #[test]
+    fn dev_build_false_when_target_and_release_are_not_adjacent() {
+        // F24: a real install whose path merely happens to contain a `target`
+        // component AND, separately, a `release` component must NOT be
+        // misclassified as a dev build. Here `target` is followed by `bin`,
+        // not by `release`/`debug`, so the Cargo `target/release` layout does
+        // not actually appear.
+        let p = PathBuf::from("/opt/target/bin/release/tirith");
+        assert!(
+            !looks_like_dev_build(Some(&p), false),
+            "non-adjacent target/release components must not be a dev build"
+        );
+        // A user literally installing into `~/.local/share/target/release`
+        // would be unusual, but the marker is the Cargo layout, not the words.
+        let p2 = PathBuf::from("/home/bob/target-archive/old/release-notes/tirith");
+        assert!(!looks_like_dev_build(Some(&p2), false));
+        // A home dir named with a leading `target` segment, binary in bin/.
+        let p3 = PathBuf::from("/home/target/release-team/tirith/bin/tirith");
+        assert!(!looks_like_dev_build(Some(&p3), false));
+    }
+
+    #[test]
+    fn dev_build_true_only_for_adjacent_cargo_layout() {
+        // F24: the two genuine Cargo layouts — `target/release` and the
+        // cross-compiled `target/<triple>/release` — must still be detected.
+        let plain = PathBuf::from("/home/alice/src/tirith/target/release/tirith");
+        assert!(looks_like_dev_build(Some(&plain), false));
+        let plain_debug = PathBuf::from("/home/alice/src/tirith/target/debug/tirith");
+        assert!(looks_like_dev_build(Some(&plain_debug), false));
+        let triple =
+            PathBuf::from("/home/alice/src/tirith/target/aarch64-apple-darwin/release/tirith");
+        assert!(looks_like_dev_build(Some(&triple), false));
     }
 
     // --- checksums.txt parsing --------------------------------------------
