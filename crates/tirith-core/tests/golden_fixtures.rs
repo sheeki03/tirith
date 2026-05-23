@@ -1174,3 +1174,133 @@ fn test_tier1_matches_all_interpreters() {
         "Tier-1 scan must match uppercase interpreter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lab corpus safeguard (M5 / Chunk 3)
+//
+// The `tirith lab` corpus at tests/fixtures/lab_corpus.toml doubles as a
+// fixture set: every non-allow scenario must produce at least one finding
+// (i.e. tier-3 rules actually ran). This catches the same class of bug as
+// `test_tier1_does_not_gate_findings` but for the lab corpus, ensuring future
+// corpus expansion does not silently lose detection coverage.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct LabCorpusFile {
+    #[serde(rename = "scenario")]
+    scenarios: Vec<LabScenario>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LabScenario {
+    name: String,
+    description: String,
+    input: String,
+    context: String,
+    #[serde(default = "default_lab_shell")]
+    shell: String,
+    expected_action: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    raw_bytes: Vec<u8>,
+}
+
+fn default_lab_shell() -> String {
+    "posix".to_string()
+}
+
+#[test]
+fn test_lab_corpus_reaches_tier3() {
+    let path = fixtures_dir().join("lab_corpus.toml");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
+    let file: LabCorpusFile = toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path.display(), e));
+
+    assert!(
+        !file.scenarios.is_empty(),
+        "lab_corpus.toml must define at least one scenario"
+    );
+
+    for scenario in &file.scenarios {
+        let shell = match scenario.shell.as_str() {
+            "posix" => ShellType::Posix,
+            "powershell" => ShellType::PowerShell,
+            other => panic!(
+                "Lab scenario '{}': unknown shell '{}'",
+                scenario.name, other
+            ),
+        };
+
+        let scan_context = match scenario.context.as_str() {
+            "exec" => ScanContext::Exec,
+            "paste" => ScanContext::Paste,
+            other => panic!(
+                "Lab scenario '{}': unknown context '{}'",
+                scenario.name, other
+            ),
+        };
+
+        let raw_bytes = if !scenario.raw_bytes.is_empty() {
+            Some(scenario.raw_bytes.clone())
+        } else if scan_context == ScanContext::Paste {
+            Some(scenario.input.as_bytes().to_vec())
+        } else {
+            None
+        };
+
+        let ctx = AnalysisContext {
+            input: scenario.input.clone(),
+            shell,
+            scan_context,
+            raw_bytes,
+            interactive: true,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+        };
+
+        let verdict = engine::analyze(&ctx);
+
+        let expected = match scenario.expected_action.as_str() {
+            "allow" => Action::Allow,
+            "warn" => Action::Warn,
+            "block" => Action::Block,
+            other => panic!(
+                "Lab scenario '{}': unknown expected_action '{}'",
+                scenario.name, other
+            ),
+        };
+
+        // Bucket Warn/WarnAck together — both are user-visible warnings.
+        let action_bucket = |a: Action| match a {
+            Action::Warn | Action::WarnAck => Action::Warn,
+            other => other,
+        };
+        assert_eq!(
+            action_bucket(verdict.action),
+            expected,
+            "Lab scenario '{}': expected {:?} but engine returned {:?} ({} findings)",
+            scenario.name,
+            expected,
+            verdict.action,
+            verdict.findings.len()
+        );
+
+        // The core safeguard: any scenario that isn't an allow must reach
+        // tier-3 and produce at least one finding. If a future refactor
+        // accidentally gates a rule out of the hot path, this fires.
+        if expected != Action::Allow {
+            assert!(
+                !verdict.findings.is_empty(),
+                "Lab scenario '{}' (expected {:?}): tier-3 produced no findings — corpus has lost detection coverage",
+                scenario.name,
+                expected
+            );
+        }
+    }
+}

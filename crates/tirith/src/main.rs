@@ -217,6 +217,30 @@ Examples:
         sha256: Option<String>,
     },
 
+    /// Run adversarial training scenarios (experimental)
+    #[command(after_help = "\
+Examples:
+  tirith lab
+  tirith lab --filter powershell
+  tirith lab --non-interactive
+  tirith lab --format json")]
+    Lab {
+        /// Filter scenarios by tag (e.g. 'powershell', 'pipe-to-shell')
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Non-interactive: run all scenarios without prompting
+        #[arg(long)]
+        non_interactive: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
     /// Score a URL for security risk
     #[command(after_help = "\
 Examples:
@@ -2018,6 +2042,18 @@ fn run() {
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::install::run(source, &args, online, offline, json, yes, no_exec, sha256)
+        }
+
+        Commands::Lab {
+            filter,
+            non_interactive,
+            format,
+            json,
+        } => {
+            let (_, want_json) = HumanJsonFormat::resolve(format, json);
+            let interactive =
+                !non_interactive && !want_json && is_terminal::is_terminal(std::io::stdout());
+            cli::lab::run(interactive, filter.as_deref(), want_json)
         }
 
         Commands::Score {

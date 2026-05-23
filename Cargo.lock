@@ -2818,6 +2818,7 @@ dependencies = [
  "tempfile",
  "tirith-core",
  "tokio",
+ "toml",
  "url",
  "uuid",
  "walkdir",

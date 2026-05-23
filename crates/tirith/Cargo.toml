@@ -48,6 +48,8 @@ fs2 = { workspace = true }
 # enter-mode capability self-test (`cli::bash_capability`, run by `tirith
 # setup` / `tirith doctor`) and by the PTY conformance harness in tests.
 portable-pty = "0.9"
+# Parses the embedded `tirith lab` corpus (tests/fixtures/lab_corpus.toml).
+toml = "0.8"
 
 [dev-dependencies]
 mockito = "1"
