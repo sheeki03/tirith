@@ -115,8 +115,13 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
     // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
     // verdict already wins and `apply_agent_rules` must NOT silently
-    // re-Block. Pinned by
-    // `ecosystem_agent_rules_deny_skipped_under_tirith_bypass_today`.
+    // re-Block. The CLI-side guard is defensive future-proofing for
+    // ecosystem-scan (the engine bypass branch does NOT fire on this
+    // path today; ecosystem-scan never routes through `engine::analyze`),
+    // pinned by `ecosystem_tirith_bypass_not_wired_so_deny_enforces_today`
+    // (renamed in fix-7 from `..._deny_skipped_under_tirith_bypass_today`
+    // to match the assertions — bypass-skip never fires today, so deny
+    // enforces).
     if !report.verdict.bypass_honored {
         tirith_core::escalation::apply_agent_rules(&mut report.verdict, &policy);
     }

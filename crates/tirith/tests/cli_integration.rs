@@ -5699,9 +5699,17 @@ fn install_agent_rules_deny_skipped_under_tirith_bypass_today() {
     );
 }
 
+// M4 PR #120 fix-7 (CodeRabbit Low-Value Nit) — renamed from
+// `ecosystem_agent_rules_deny_skipped_under_tirith_bypass_today`. The
+// previous name was patterned on the check/paste/install bypass-skip
+// mirror tests but did NOT match the assertions: ecosystem-scan does
+// not today route through the engine's bypass branch, so the
+// bypass-skip CLI guard never fires and deny enforces (bypass_honored
+// stays false, `agent_denied_by_policy` lands in audit, exit 1). The
+// new name reflects what the test actually pins.
 #[cfg(unix)]
 #[test]
-fn ecosystem_agent_rules_deny_skipped_under_tirith_bypass_today() {
+fn ecosystem_tirith_bypass_not_wired_so_deny_enforces_today() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
