@@ -5292,3 +5292,220 @@ fn ecosystem_scan_audit_entry_with_agent_rules_deny_forces_block() {
         "agent_denied_by_policy must be in audit entry rule_ids: {entry}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M4 PR #120 wave-end finding F — E2E `tirith check` against
+// `agent_rules.deny`.
+//
+// `tirith check` is the canonical operator surface and the hot path that
+// already routes through `post_process_verdict`. The unit tests in
+// `escalation.rs` pin `apply_agent_rules` exhaustively, and the
+// integration tests above pin deny→Block on `paste`, `install`, and
+// `ecosystem scan` (the analysis-then-audit paths that previously did NOT
+// route through `post_process_verdict`). This test fills the gap: it
+// walks `tirith check` end-to-end with a `.tirith/policy.yaml` containing
+// `agent_rules.deny` and asserts the verdict is Block, the JSON output
+// carries the `agent_denied_by_policy` rule id, and the audit log records
+// the deny.
+//
+// Unix-gated to match the rest of this block — audit-log location
+// resolves through `data_dir()` which differs by platform; set
+// XDG_DATA_HOME and APPDATA together to isolate either way.
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn check_audit_entry_with_agent_rules_deny_forces_block() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    seed_agent_deny_policy(&policy_root, "claude-code-check-deny-test");
+
+    // A clean command — `ls -la` would normally be Allow. With the deny
+    // matcher it MUST flip to Block (exit 1), with AgentDeniedByPolicy in
+    // the findings.
+    let out = tirith()
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-check-deny-test")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--format",
+            "json",
+            "--",
+            "ls -la",
+        ])
+        .output()
+        .expect("failed to run tirith check");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "agent_rules.deny must flip a clean `tirith check` to BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The JSON output on stdout must carry the AgentDeniedByPolicy finding.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("`tirith check --format json` must produce valid JSON");
+    let findings = v["findings"]
+        .as_array()
+        .expect("findings array must be present in `tirith check --format json` output");
+    let has_deny_finding = findings
+        .iter()
+        .any(|f| f["rule_id"] == "agent_denied_by_policy");
+    assert!(
+        has_deny_finding,
+        "agent_denied_by_policy must be in `tirith check --format json` findings: {v}"
+    );
+
+    // And the audit log records the deny as well.
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+    assert_eq!(
+        entry["action"], "Block",
+        "audit entry must record Block: {entry}"
+    );
+    let audit_has_deny = entry["rule_ids"]
+        .as_array()
+        .expect("rule_ids must be an array")
+        .iter()
+        .any(|r| r == "agent_denied_by_policy");
+    assert!(
+        audit_has_deny,
+        "agent_denied_by_policy must be in audit entry rule_ids: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4 PR #120 wave-end finding A — regression pin for the
+// `TIRITH=0`-bypass-vs-`agent_rules.deny` gap.
+//
+// Three-agent cross-corroboration (silent-failure-hunter C1, pr-test
+// sev-8 #3, code-reviewer Important #2): all three sites that DO call
+// `post_process_verdict` (cli/check.rs, cli/gateway.rs, mcp/tools.rs)
+// have an `if raw_verdict.bypass_honored { /* skip */ }` early-return
+// branch. The bypass branch audits the raw verdict directly and never
+// reaches `apply_agent_rules`. So `TIRITH=0 tirith check ...` defeats
+// `agent_rules.deny` today.
+//
+// We are NOT changing this behavior in PR #120 — operators may
+// reasonably expect deny to be more authoritative than the user's
+// interactive bypass, but the bypass-overrides-everything pattern is the
+// existing contract and deserves operator feedback before flipping.
+// This test PINS the current behavior so any future change is visible
+// in a test diff.
+//
+// TODO(M5 / agent-governance-v2): Revisit. If we flip deny to be above
+// the env-bypass, the bypass branches in cli/check.rs (~line 181),
+// cli/gateway.rs (~line 648 and ~line 870), and mcp/tools.rs (~line 221)
+// must all also run `apply_agent_rules`; the integration test
+// `bypass_path_records_single_audit_entry_with_agent_origin` is the
+// existing bypass contract pin and will need updating too.
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn agent_rules_deny_skipped_under_tirith_bypass_today() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Seed both `agent_rules.deny` (matching the test integration name)
+    // AND the env-bypass allowlist (`allow_bypass_env: true` plus
+    // `allow_bypass_env_noninteractive: true` so the bypass works when
+    // `cargo test` spawns a non-interactive child). If `agent_rules.deny`
+    // were honored, the verdict would be Block (exit 1) and an
+    // `agent_denied_by_policy` rule id would land in the audit. The pin
+    // is that NEITHER happens: the bypass branch wins.
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    let policy = "allow_bypass_env: true\n\
+         allow_bypass_env_noninteractive: true\n\
+         agent_rules:\n  \
+           deny:\n    \
+             - kind: agent\n      \
+               name: claude-code-bypass-deny-test\n";
+    fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
+
+    // A command that would normally be Block (the curl|bash heuristic
+    // would fire) — but the bypass overrides EVERYTHING including the
+    // detection rule. We pick this command so the test would still fail
+    // loudly if either (a) the bypass stopped being honored, or (b) the
+    // deny branch started running and produced a Block via
+    // `agent_denied_by_policy`. The PIN is: exit 0, AND no
+    // `agent_denied_by_policy` rule id in the audit entry.
+    let out = tirith()
+        .env("TIRITH", "0")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-bypass-deny-test")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith check");
+
+    // Pin (1) — exit 0. The bypass branch wins; `agent_rules.deny` does
+    // not run. If this flips to 1, the TIRITH=0 bypass stopped honoring
+    // OR deny started running under bypass; either case is the M5
+    // behavior change we want surfaced in a test diff.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "TIRITH=0 bypass must currently override `agent_rules.deny` (M5 may flip this — \
+         see TODO above); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Pin (2) — the audit record does NOT carry `agent_denied_by_policy`.
+    // The bypass branch audits the raw verdict (which never ran
+    // `apply_agent_rules`).
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+
+    // Bypass branch was taken — sanity-check the contract.
+    assert_eq!(
+        entry["bypass_honored"], true,
+        "expected bypass_honored=true on the audit entry: {entry}"
+    );
+
+    let audit_carries_deny = entry["rule_ids"]
+        .as_array()
+        .map(|arr| arr.iter().any(|r| r == "agent_denied_by_policy"))
+        .unwrap_or(false);
+    assert!(
+        !audit_carries_deny,
+        "agent_denied_by_policy MUST NOT be in audit rule_ids today \
+         (the bypass branch skips `apply_agent_rules`; see TODO above): {entry}"
+    );
+}

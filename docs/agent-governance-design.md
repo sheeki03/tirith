@@ -502,6 +502,29 @@ safeguard tests do not cover this invariant — see the integration tests
 pins the gateway's serialized `agent_origin: gateway` field) for the
 per-site pins.
 
+#### Known limitation: `TIRITH=0` bypass overrides `agent_rules.deny`
+
+When the env-bypass policy (`allow_bypass_env` /
+`allow_bypass_env_noninteractive`) honors a `TIRITH=0` invocation, the
+bypass branch in `cli/check.rs`, `cli/gateway.rs`, and
+`mcp/tools.rs::call_check_command` audits the raw verdict and skips
+`post_process_verdict` — which means `apply_agent_rules` does not run,
+and `agent_rules.deny` does not enforce. The bypass is consistent with
+how `TIRITH=0` overrides every other detection, but operators writing
+`agent_rules.deny` may reasonably expect `deny` to be more authoritative
+than the user's interactive bypass. Surfaced as PR #120 wave-end review
+finding A (silent-failure-hunter C1, pr-test-analyzer sev-8,
+code-reviewer Important #2 — three-agent cross-corroboration).
+
+Pinned by the regression test
+`agent_rules_deny_skipped_under_tirith_bypass_today` in
+`crates/tirith/tests/cli_integration.rs`. Revisit in M5 after operator
+feedback — flipping the contract means running `apply_agent_rules` even
+on the bypass branch at all three sites (`cli/check.rs`,
+`cli/gateway.rs`, `mcp/tools.rs::call_check_command`) and updating the
+existing bypass-contract pin
+`bypass_path_records_single_audit_entry_with_agent_origin`.
+
 ## 6. Out of scope
 
 ### For chunk 1 (observation scaffolding)
