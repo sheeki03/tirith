@@ -682,11 +682,11 @@ tirith daemon stop
 | `tirith policy validate` | Validate policy YAML for syntax, schema, and conflicts |
 | `tirith policy test <cmd>` | Dry-run a command or file against your policy with match trace |
 | `tirith policy tune --from-audit` | Suggest conservative policy adjustments from your audit log (suggest-only — never edits the policy) |
-| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes |
+| `tirith run <url>` | Safe `curl \| bash` replacement. Downloads, analyzes, reviews, then executes (Unix only) |
 | `tirith install <npm\|pip\|cargo\|url> <args>` | Recorded install transaction: analyzes a package install's supply-chain risk, presents the verdict, checkpoints + audit-logs the transaction, then runs the real install after your go-ahead. Pre-execution risk analysis — not a sandbox. (`--online`, `--no-exec`, `--yes`) |
 | `tirith score <url>` | Break down a URL's trust signals (`--explain` shows the deterministic factor-by-factor score derivation) |
 | `tirith diff <url>` | Byte-level comparison showing where suspicious characters hide |
-| `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) |
+| `tirith fetch <url>` | Detect server-side cloaking (different content for bots vs browsers) (Unix only) |
 | `tirith why` | Explain the last rule that triggered |
 | `tirith doctor` | Diagnose installation, hooks, and policy |
 | `tirith doctor --fix` | Auto-fix detected issues (hooks, policy, AI tool setup) |

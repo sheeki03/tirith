@@ -40,6 +40,7 @@ what an experimental command must satisfy to move to stable.
 | `activate` | Experimental | License key activation. |
 | `license` | Experimental | License status and management. |
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
+| `lab` | Experimental | Adversarial training corpus runner. Offline. Subject to corpus expansion. |
 | `completions` | Experimental | Shell completion generation (hidden). |
 | `manpage` | Experimental | Man page generation (hidden). |
 
@@ -113,3 +114,24 @@ normally see exit code 3.
 - Both `policy.yaml` and `policy.yml` extensions are accepted (`.yaml` preferred)
 - Policy format is additive: new keys may appear
 - Existing keys will not change semantics within a major version
+
+## PowerShell parity
+
+The following detection rules apply when `--shell powershell` is passed to
+`tirith check` or when the shell hook detects a PowerShell session:
+
+| Rule ID | Behavior detected |
+|---------|-------------------|
+| `base64_decode_execute` | `powershell -EncodedCommand <base64>` and `-enc` / `-ec` aliases |
+| `pipe_to_interpreter` | `iwr url \| iex`, `irm url \| iex`, and full `Invoke-WebRequest` / `Invoke-RestMethod` forms |
+| `ps_set_execution_policy_bypass` | `Set-ExecutionPolicy Bypass`, `powershell -ExecutionPolicy Bypass`, and the `-ep` short alias |
+| `ps_defender_exclusion` | `Add-MpPreference -ExclusionPath`, `-ExclusionProcess`, or `-ExclusionExtension` |
+| `ps_inline_download_execute` | `iex (iwr https://…)` — inline download-execute form where `iex` is the leading command |
+
+`tirith run` and `tirith fetch` are Unix-only and do not apply to PowerShell
+workflows. `tirith check`, `tirith paste`, `tirith score`, and the shell hook
+work on Windows with `pwsh`.
+
+`tirith doctor --compat` reports PowerShell hook health when `pwsh` is found
+on PATH: PSReadLine availability and the current `TIRITH_STATUS` value
+exported by the hook.

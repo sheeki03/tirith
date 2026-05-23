@@ -963,6 +963,33 @@ fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellTo
         .collect()
 }
 
+/// PowerShell hook compatibility information for `tirith doctor --compat`.
+///
+/// Reported when `pwsh` is available on PATH; absent on hosts without
+/// PowerShell installed. This is a diagnostic surface only — the
+/// shell-hook health gate in `tirith init` is authoritative for actual
+/// hook behavior.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+struct PsCompatInfo {
+    /// `pwsh` binary found on PATH.
+    pwsh_available: bool,
+    /// Value of `TIRITH_STATUS` in the current environment (set by the hook).
+    /// `None` means the hook has not run in this shell session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tirith_status: Option<String>,
+    /// PSReadLine module available to pwsh (required for the key binding).
+    /// `None` if `pwsh` was not found OR the probe timed out / errored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psreadline_available: Option<bool>,
+    /// Hook version embedded in the binary matches the materialized hook
+    /// file on disk. `None` for now — the PowerShell hook file has no
+    /// machine-parseable version tag yet (TODO: add a `# tirith-hook-version: x.y.z`
+    /// comment to `shell/lib/powershell-hook.ps1` so this field can become
+    /// meaningful; deferred from M5 because it touches all hooks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_version_match: Option<bool>,
+}
+
 /// Machine-readable compatibility report for `tirith doctor --compat --format json`.
 #[derive(serde::Serialize)]
 struct CompatReport {
@@ -1004,6 +1031,9 @@ struct CompatReport {
     threat_db: Option<ThreatDbDoctorInfo>,
     /// Co-installed shell tools that historically interact with hooks.
     shell_tools: Vec<ShellToolPresence>,
+    /// PowerShell hook health. Absent on hosts without `pwsh` on PATH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    powershell_compat: Option<PsCompatInfo>,
 }
 
 /// Build the compat report from the shared `gather_info()` state plus
@@ -1012,6 +1042,7 @@ fn gather_compat() -> CompatReport {
     let info = gather_info();
     let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
     let shell_tools = detect_shell_tool_conflicts(profile.as_deref());
+    let powershell_compat = gather_ps_compat();
 
     CompatReport {
         version: info.version,
@@ -1034,6 +1065,117 @@ fn gather_compat() -> CompatReport {
         policy_paths: info.policy_paths,
         threat_db: info.threat_db,
         shell_tools,
+        powershell_compat,
+    }
+}
+
+/// Detect PowerShell hook compatibility for the `tirith doctor --compat` report.
+///
+/// Returns `None` on hosts where `pwsh` is not on PATH so that JSON consumers
+/// see no `powershell_compat` key (the field is `skip_serializing_if = "Option::is_none"`).
+/// When `pwsh` IS on PATH, returns `Some(PsCompatInfo { ... })` with:
+///   - `tirith_status` from the current process env (set by the hook on session start),
+///   - `psreadline_available` from a 3s-budget probe of `Get-Module -ListAvailable PSReadLine`,
+///   - `hook_version_match` always `None` for now (see field doc).
+///
+/// Timeout pattern: we spawn `pwsh` via `std::process::Command::spawn`, then
+/// a worker thread calls `wait_with_output()` and pushes the result through a
+/// `std::sync::mpsc` channel. The main thread waits with `recv_timeout(3s)`;
+/// on timeout we `child.kill()` and treat the probe as failed. This avoids
+/// pulling in a new dependency for a single 3s budget.
+fn gather_ps_compat() -> Option<PsCompatInfo> {
+    let pwsh_available = probe_pwsh_available();
+    if !pwsh_available {
+        return None;
+    }
+    let tirith_status = std::env::var("TIRITH_STATUS").ok();
+    let psreadline_available = Some(probe_psreadline_available());
+    Some(PsCompatInfo {
+        pwsh_available,
+        tirith_status,
+        psreadline_available,
+        // hook_version_match: intentionally None until all shell hook files
+        // carry a machine-parseable `# tirith-hook-version:` tag. See the
+        // field doc on `PsCompatInfo::hook_version_match`.
+        hook_version_match: None,
+    })
+}
+
+/// `pwsh --version` with a 3-second budget. Used to decide whether to emit
+/// a `powershell_compat` section at all.
+fn probe_pwsh_available() -> bool {
+    run_with_timeout(
+        std::process::Command::new("pwsh").arg("--version"),
+        std::time::Duration::from_secs(3),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+/// Probe whether PSReadLine is available. Required for the Enter / Ctrl+V
+/// key bindings in `shell/lib/powershell-hook.ps1`. We deliberately ask
+/// pwsh to print a literal `yes` / `no` rather than relying on exit code,
+/// so a non-zero exit (e.g. PSReadLine missing AND `Get-Module` erroring on
+/// some hosts) is distinguishable from a clean negative.
+fn probe_psreadline_available() -> bool {
+    let mut cmd = std::process::Command::new("pwsh");
+    cmd.arg("-NonInteractive")
+        .arg("-Command")
+        .arg("if (Get-Module -ListAvailable PSReadLine) { 'yes' } else { 'no' }");
+    match run_with_timeout(&mut cmd, std::time::Duration::from_secs(3)) {
+        Some(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.trim().eq_ignore_ascii_case("yes")
+        }
+        None => false,
+    }
+}
+
+/// Spawn `cmd`, wait up to `timeout` for output, kill on timeout.
+/// Returns `None` if spawn fails, the child cannot be waited on, or the
+/// timeout fires before output arrives.
+fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::sync::mpsc;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    let child = cmd.spawn().ok()?;
+    // Worker thread reads the child to completion. If the parent times out
+    // first, it kills the child by id; the worker's `wait_with_output()`
+    // then returns and the channel send is best-effort (rx may be dropped).
+    let child_id = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            // Timeout fired. Best-effort kill by pid; if the child has
+            // already exited the kill is a no-op. We do not block for the
+            // worker thread; it will reap on its own.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child_id as libc::pid_t, libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            {
+                // Windows fallback: spawn `taskkill /F /PID <id>`. We don't
+                // wait for it; this is a best-effort cleanup on a diagnostic
+                // path.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &child_id.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+            None
+        }
     }
 }
 
@@ -1670,6 +1812,25 @@ fn format_compat_human(r: &CompatReport) -> String {
             line(&format!("    - {} ({})", tool.name, signals));
             line(&format!("        {}", tool.note));
         }
+    }
+
+    // PowerShell hook health — only emitted when `pwsh` is on PATH. Same
+    // gating as the JSON field: hosts without PowerShell get no section.
+    if let Some(ps) = &r.powershell_compat {
+        line("");
+        line("--- PowerShell compat ---");
+        line(&format!("  pwsh available:        {}", ps.pwsh_available));
+        match ps.tirith_status.as_deref() {
+            Some(status) => line(&format!("  TIRITH_STATUS:         {status}")),
+            None => line("  TIRITH_STATUS:         (not set)"),
+        }
+        match ps.psreadline_available {
+            Some(true) => line("  PSReadLine module:     yes"),
+            Some(false) => line("  PSReadLine module:     no (key binding will not work)"),
+            None => line("  PSReadLine module:     unknown (probe failed or timed out)"),
+        }
+        // `hook_version_match` is intentionally None for now; do not print
+        // until shell hook files carry a `# tirith-hook-version:` tag.
     }
 
     out
@@ -2915,6 +3076,7 @@ mod tests {
             policy_paths: Vec::new(),
             threat_db: None,
             shell_tools: Vec::new(),
+            powershell_compat: None,
         }
     }
 
