@@ -117,13 +117,24 @@ struct FindingSummary {
 
 /// Validate an `expected_action` corpus string and return the typed [`Action`].
 ///
-/// Thin wrapper around `Action::from_str` kept as a named helper so unit tests
-/// can pin the CLI-side parse contract (corpus authors only write the three
-/// lowercase tokens "allow"/"warn"/"block"). Centralising it here means a
-/// future expansion (e.g. accepting `warn_ack` for stricter scenarios) is one
-/// edit, not two.
+/// The lab corpus is intentionally restricted to the three observable verdict
+/// actions: "allow", "warn", "block". `Action::from_str` also accepts
+/// "warn_ack" (a strict-warn variant), but `action_to_str` collapses
+/// `Action::WarnAck → "warn"` for comparison — so accepting `warn_ack` here
+/// would let a scenario parse as `Action::WarnAck` and then never match any
+/// produced verdict, silently always-FAILing. Reject `warn_ack` explicitly to
+/// make the contract honest. (Greptile P1 on the M5 wave-end review.)
+///
+/// Future expansion that wants to distinguish strict-warn-ack at the corpus
+/// level should also remove the `WarnAck → "warn"` collapse in `action_to_str`,
+/// not just relax this parser.
 fn parse_expected_action(s: &str) -> Result<Action, String> {
-    s.parse::<Action>()
+    match s {
+        "allow" | "warn" | "block" => s.parse::<Action>(),
+        other => Err(format!(
+            "unknown expected_action '{other}' (must be one of: allow, warn, block)"
+        )),
+    }
 }
 
 /// Public entry point for the `tirith lab` subcommand.
@@ -492,5 +503,9 @@ mod tests {
         assert!(parse_expected_action("").is_err());
         assert!(parse_expected_action("warning").is_err());
         assert!(parse_expected_action("deny").is_err());
+        // warn_ack would parse as Action::WarnAck but action_to_str collapses
+        // WarnAck → "warn", so accepting it here would silently always-FAIL.
+        // Greptile P1 on the M5 wave-end review.
+        assert!(parse_expected_action("warn_ack").is_err());
     }
 }
