@@ -154,11 +154,15 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool) -> i32 {
             "posix" => ShellType::Posix,
             "powershell" => ShellType::PowerShell,
             other => {
+                // Mirror the unknown-context handling: hard-fail rather than
+                // coerce. A typo like `shell = "powershel"` (missing l) would
+                // silently route a PS scenario through POSIX tokenization and
+                // mask a real corpus regression.
                 eprintln!(
-                    "tirith lab: scenario '{}' has unknown shell '{}', defaulting to posix",
+                    "tirith lab: scenario '{}' has unknown shell '{}' — corpus error",
                     scenario.name, other
                 );
-                ShellType::Posix
+                return 1;
             }
         };
 
