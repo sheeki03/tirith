@@ -94,17 +94,27 @@ pub fn is_mcp_lockfile(path: Option<&Path>) -> bool {
 ///    working-tree marker; submodules and `git worktree` checkouts use
 ///    a `.git` *file* pointing back at the parent's `.git/` (a regular
 ///    file, hence the explicit `is_file()` admit);
-/// 3. `.tirith/` is a directory — operator-placed tirith artifacts are
-///    deliberate; if it exists, this is a repo the operator wants
-///    governed;
-/// 4. at least one of the known MCP discovery probes
+/// 3. at least one of the known MCP discovery probes
 ///    ([`mcp_lock::MCP_CONFIG_RELATIVE_PATHS`]) resolves to a regular
 ///    file — a working MCP config alone is enough to call this a real
 ///    target (a `.mcp.json` outside any other repo marker is still
 ///    something the operator deliberately wrote).
 ///
+/// **No `.tirith/` admit arm.** A previous version of this gate accepted
+/// the root when `<repo_root>/.tirith/` existed, on the rationale that a
+/// tirith-managed directory was a deliberate operator artifact. But this
+/// rule self-selects on `is_mcp_lockfile(file_path)` — the scanned path
+/// is `<X>/.tirith/mcp.lock`, so on any real scan path (where the scanner
+/// physically read the file off disk), `<X>/.tirith/` is *guaranteed* to
+/// exist. The `.tirith/` arm therefore always passed, defeating the gate's
+/// own purpose: a stray `.tirith/mcp.lock` under `/tmp/random/` would
+/// still produce the very finding-storm F9 was designed to suppress. The
+/// remaining arms ((1) relative-path carve-out, (2) `.git/` marker, (3)
+/// an actual MCP config) are each independent and *not* derivable from
+/// the lockfile's own presence, so they remain meaningful signals.
+///
 /// The case explicitly rejected: an *absolute* path under a directory
-/// that has none of (2)–(4). That's the F9 "stray `/tmp/random/.tirith/
+/// that has none of (2)–(3). That's the F9 "stray `/tmp/random/.tirith/
 /// mcp.lock`" failure mode.
 fn looks_like_repo_root(repo_root: &Path) -> bool {
     // Admit-by-construction case 1: a relative root with no parent
@@ -118,13 +128,6 @@ fn looks_like_repo_root(repo_root: &Path) -> bool {
     let git_path = repo_root.join(".git");
     if let Ok(meta) = std::fs::metadata(&git_path) {
         if meta.is_dir() || meta.is_file() {
-            return true;
-        }
-    }
-
-    let tirith_dir = repo_root.join(".tirith");
-    if let Ok(meta) = std::fs::metadata(&tirith_dir) {
-        if meta.is_dir() {
             return true;
         }
     }
@@ -209,12 +212,13 @@ pub fn check(
     // Require any one of:
     //   1. a `.git/` directory or file (the `.git` file form is how
     //      `git worktree` and submodule checkouts mark a working tree);
-    //   2. a `.tirith/` directory (a tirith-managed directory that the
-    //      operator clearly placed deliberately, even if no `.git` exists —
-    //      e.g. a bare scan target with policy artifacts);
-    //   3. at least one of the known MCP discovery probes physically
-    //      present (so a repo without a `.git`/`.tirith` but with a real
+    //   2. at least one of the known MCP discovery probes physically
+    //      present (so a repo without a `.git` but with a real
     //      `.mcp.json` is still gateable).
+    // The previous version also admitted on a bare `.tirith/` directory,
+    // but that arm was tautological for any real scan path (the lockfile we
+    // are scanning lives *inside* `.tirith/`, so the directory necessarily
+    // exists); see the rationale in `looks_like_repo_root`'s doc-comment.
     // If none of those are present, the scan target is not a repository in
     // any sense this rule understands; treat absence as silence, not
     // a finding storm.
@@ -1610,20 +1614,30 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn check_admits_when_tirith_directory_present() {
-        // Regression guard for F9: `.tirith/` itself is one of the
-        // accepted repo markers, by design — the operator placed it
-        // deliberately. A lockfile whose grandparent has ONLY `.tirith/`
-        // (no `.git`, no MCP probes) still admits and drift fires
-        // normally. This is the in-context F9 contract: the validation
-        // does NOT incorrectly fail-closed on a repo whose operator
-        // chose to use tirith without git.
+    fn check_returns_empty_when_only_tirith_directory_present() {
+        // Regression guard for CodeRabbit cid 3292118206: a previous
+        // version of `looks_like_repo_root` admitted on `<repo>/.tirith/`,
+        // which is *tautological* for any real scan path. The rule self-
+        // selects on `is_mcp_lockfile(file_path)`, meaning the scanned
+        // path is `<X>/.tirith/mcp.lock`; on any scan path that actually
+        // read the lockfile off disk, `<X>/.tirith/` is *guaranteed* to
+        // exist. That arm therefore always passed, defeating F9's whole
+        // point — a stray `.tirith/mcp.lock` outside any repo still
+        // produced the every-server-removed finding storm.
+        //
+        // After the fix, a derived repo root whose ONLY signal is the
+        // `.tirith/` directory (no `.git`, no MCP discovery probe) must
+        // NOT admit. The rule returns no findings — silence, not noise.
         let repo = tempdir().unwrap();
-        // Build the lockfile path: <repo>/.tirith/mcp.lock.
+        // Build the lockfile path: <repo>/.tirith/mcp.lock. Creating
+        // <repo>/.tirith/ here is the deliberate setup for this test —
+        // it is the *only* signal under the repo root.
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
+        // No `.git`, no `.mcp.json`, no other MCP discovery probe.
         // The lockfile records one server that the (empty) current
-        // inventory does not.
+        // inventory does not — so if the gate were still tautological,
+        // a drift finding would fire.
         let inv = McpInventory {
             servers: vec![McpServerEntry {
                 name: "a".into(),
@@ -1645,9 +1659,11 @@ mod tests {
 
         let findings = check(&body, Some(&lock_path), &[], &HashMap::new());
         assert!(
-            !findings.is_empty(),
-            "`.tirith/` is an admit signal; the genuinely-empty current inventory \
-             must surface drift normally: {findings:?}",
+            findings.is_empty(),
+            "`.tirith/` alone is no longer a repo-root admit signal — its presence \
+             on every real scan path made the gate tautological. With `.tirith/` as \
+             the only marker (no `.git`, no MCP probe), the rule must produce zero \
+             findings: {findings:?}",
         );
     }
 

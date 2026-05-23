@@ -246,18 +246,49 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
              unintentionally blocked:",
             inventory.rejected_configs.len(),
         );
-        for rejected in &inventory.rejected_configs {
-            eprintln!(
-                "    - {} ({})",
-                rejected.path,
-                describe_rejection_reason(&rejected.reason),
-            );
+        for line in format_rejected_config_lines(&inventory.rejected_configs) {
+            eprintln!("{line}");
         }
     }
 
     eprintln!();
     eprintln!("  wrote {}", lock_path.display());
     println!("{}", lock_path.display());
+}
+
+/// Render each [`mcp_lock::RejectedConfig`] as the human-summary line printed
+/// under `tirith mcp lock`'s `note:` block.
+///
+/// **The `path` is debug-escaped (`{:?}`).** The `rejected.path` carries a
+/// repo-relative filename that — although today's source is the static
+/// [`mcp_lock::MCP_CONFIG_RELATIVE_PATHS`] table — must be treated as
+/// potentially attacker-shaped at every print site. The same convention
+/// the env-name / server-name / tool-name printers (`escape_name`,
+/// `describe_transport`) already apply: a name carrying `\x1b` / `\r` /
+/// `\n` / any control byte would otherwise reach the operator's terminal
+/// raw and could rewrite the rendering (colour injection, line erasure,
+/// cursor repositioning). Debug formatting renders every control byte as
+/// `\u{NN}` / `\n` / `\r` / etc. and quotes the value — costless for
+/// today's static paths (they Debug back to themselves with quotes) and
+/// the principled default for any future code path that introduces an
+/// attacker-controlled rejection source.
+///
+/// The JSON surface (`print_json` and the structured `RejectedConfig`
+/// serialization that flows through it) does **not** need this escape:
+/// `serde_json` natively escapes every C0 control byte as a `\u00NN`
+/// JSON-string escape, so a hostile path cannot inject through the JSON
+/// envelope. This helper is the human-stderr render only.
+fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<String> {
+    rejected
+        .iter()
+        .map(|r| {
+            format!(
+                "    - {:?} ({})",
+                r.path,
+                describe_rejection_reason(&r.reason),
+            )
+        })
+        .collect()
 }
 
 /// One-line human description of a [`mcp_lock::RejectedReason`].
@@ -1358,6 +1389,82 @@ mod tests {
             assert!(
                 out.contains(needle),
                 "expected escaped form {needle} in env-name summary: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_rejected_config_lines_escapes_control_bytes_in_path() {
+        // CodeRabbit cid 3292118208: a hostile `RejectedConfig::path`
+        // carrying ANSI escapes / newlines / control bytes must NOT inject
+        // raw bytes into the operator's terminal when `tirith mcp lock`
+        // renders the human-readable "rejected configs" note. Same
+        // convention the env-name printer (`describe_transport`) and the
+        // server/tool-name printer (`escape_name`) already apply: Debug
+        // formatting renders every control byte as `\u{NN}` / `\n` / `\r` /
+        // etc. and quotes the value, so no raw byte reaches stderr.
+        let rejected = vec![
+            // ANSI red — would colourize subsequent terminal output if
+            // printed raw.
+            mcp_lock::RejectedConfig {
+                path: "\x1b[31mhostile-red.json".to_string(),
+                reason: mcp_lock::RejectedReason::Symlink,
+            },
+            // Multiline path — a raw print would split the summary across
+            // lines and let the second line masquerade as a different
+            // diagnostic.
+            mcp_lock::RejectedConfig {
+                path: "multi\nline.json".to_string(),
+                reason: mcp_lock::RejectedReason::NotRegularFile,
+            },
+            // Carriage return — terminals would overwrite the current line.
+            mcp_lock::RejectedConfig {
+                path: "overwrite\rattack.json".to_string(),
+                reason: mcp_lock::RejectedReason::OutsideRepo,
+            },
+            // Backspace — would erase preceding characters in the
+            // rendering.
+            mcp_lock::RejectedConfig {
+                path: "erase\x08.json".to_string(),
+                reason: mcp_lock::RejectedReason::Unreadable {
+                    permission_denied: false,
+                },
+            },
+        ];
+
+        let lines = format_rejected_config_lines(&rejected);
+        assert_eq!(
+            lines.len(),
+            rejected.len(),
+            "every rejected entry must produce exactly one rendered line: \
+             {lines:?}",
+        );
+
+        // No raw control byte may appear in any rendered line. Iterating
+        // chars is fine — every control codepoint is one ASCII byte and a
+        // valid char.
+        for line in &lines {
+            for ch in line.chars() {
+                assert!(
+                    !ch.is_control(),
+                    "raw control char {:?} (U+{:04X}) leaked into a \
+                     rejected-config line: {line:?}",
+                    ch,
+                    ch as u32,
+                );
+            }
+        }
+
+        // And the escaped forms ARE present — proving the path did reach
+        // the formatter, it just went through Debug escaping. (The form
+        // `r"\u{1b}"` is the literal four-char sequence Rust's Debug
+        // produces for `\x1b`; same convention as the env-name test.)
+        let joined = lines.join("\n");
+        for needle in [r"\u{1b}", r"\n", r"\r", r"\u{8}"] {
+            assert!(
+                joined.contains(needle),
+                "expected escaped form {needle} in rejected-config lines: \
+                 {lines:?}"
             );
         }
     }
