@@ -384,10 +384,14 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "ps_set_execution_policy",
         tier1_exec_fragments: &[
             r"(?i:Set-ExecutionPolicy)\b",
-            r"-(?i:ExecutionPolicy)\b",
+            // -ExecutionPolicy and its documented short alias -ep. The PS
+            // parser also accepts any unambiguous prefix (-Exec, -Execu, …)
+            // but those are uncommon in attacker payloads; the two forms
+            // above cover the published-malware-sample lookup.
+            r"-(?i:ExecutionPolicy|ep)\b",
         ],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy flag form",
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep flag form",
     },
     PatternEntry {
         id: "ps_defender_exclusion",

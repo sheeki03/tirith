@@ -1504,6 +1504,15 @@ expected_action = "block"
 expected_rules = ["ps_set_execution_policy_bypass"]
 
 [[fixture]]
+name = "ps_set_execution_policy_bypass_ep_short_alias"
+min_milestone = 5
+input = "powershell -ep Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
 name = "ps_defender_exclusion_path"
 min_milestone = 5
 input = "Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData"
