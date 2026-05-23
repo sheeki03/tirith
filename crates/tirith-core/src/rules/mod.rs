@@ -12,6 +12,7 @@ pub mod hostname;
 pub mod install;
 pub mod mcpdrift;
 pub mod path;
+pub mod powershell;
 pub mod rendered;
 pub mod shared;
 pub mod terminal;

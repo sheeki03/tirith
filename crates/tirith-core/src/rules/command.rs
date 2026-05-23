@@ -72,7 +72,7 @@ fn parse_numeric_escape(
 ///
 /// Handles: single quotes, double quotes, ANSI-C quoting (`$'...'`), backslash
 /// escaping (POSIX) and backtick escaping (PowerShell).
-fn normalize_shell_token(input: &str, shell: ShellType) -> String {
+pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
     #[derive(PartialEq)]
     enum QState {
         Normal,
@@ -274,7 +274,7 @@ fn normalize_shell_token(input: &str, shell: ShellType) -> String {
 /// Extract the effective command base name from a raw token.
 ///
 /// Normalize → path basename → first word → lowercase → strip .exe
-fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
+pub(crate) fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
     let normalized = normalize_shell_token(raw.trim(), shell);
     basename_from_normalized(&normalized, shell)
 }

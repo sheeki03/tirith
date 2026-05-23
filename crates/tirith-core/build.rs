@@ -381,6 +381,24 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "PowerShell Invoke-Expression (iex) full name",
     },
     PatternEntry {
+        id: "ps_set_execution_policy",
+        tier1_exec_fragments: &[r"(?i:Set-ExecutionPolicy|sep)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Set-ExecutionPolicy Bypass — disables script signing enforcement",
+    },
+    PatternEntry {
+        id: "ps_defender_exclusion",
+        tier1_exec_fragments: &[r"(?i:Add-MpPreference)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Add-MpPreference -ExclusionPath — Defender exclusion",
+    },
+    PatternEntry {
+        id: "ps_iex_inline",
+        tier1_exec_fragments: &[r"(?i:iex)\s"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell iex as leading command (inline download-execute form)",
+    },
+    PatternEntry {
         id: "curl",
         tier1_exec_fragments: &[r"curl\s"],
         tier1_paste_only_fragments: &[],
@@ -767,6 +785,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("credential_file_sweep", "CredentialFileSweep"),
     ("base64_decode_execute", "Base64DecodeExecute"),
     ("data_exfiltration", "DataExfiltration"),
+    (
+        "ps_set_execution_policy_bypass",
+        "PsSetExecutionPolicyBypass",
+    ),
+    ("ps_defender_exclusion", "PsDefenderExclusion"),
+    ("ps_inline_download_execute", "PsInlineDownloadExecute"),
     // Code file scan
     ("dynamic_code_execution", "DynamicCodeExecution"),
     ("obfuscated_payload", "ObfuscatedPayload"),

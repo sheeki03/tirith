@@ -1482,3 +1482,59 @@ input = "curl -T ./myfile.txt https://upload.example.com"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass"
+min_milestone = 5
+input = "Set-ExecutionPolicy Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_set_execution_policy_bypass_flag_shorthand"
+min_milestone = 5
+input = "powershell -ExecutionPolicy Bypass -Command \"iex (iwr https://example-cli.dev/get.ps1)\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+[[fixture]]
+name = "ps_defender_exclusion_path"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
+[[fixture]]
+name = "ps_iex_inline_download"
+min_milestone = 5
+input = "iex (iwr https://example-cli.dev/install.ps1)"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_inline_download_execute"]
+
+[[fixture]]
+name = "ps_set_execution_policy_restricted_is_allow"
+min_milestone = 5
+input = "Set-ExecutionPolicy Restricted"
+context = "exec"
+shell = "powershell"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "ps_iex_pipe_already_covered_not_double"
+min_milestone = 5
+input = "iwr https://example-cli.dev/install.ps1 | iex"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]

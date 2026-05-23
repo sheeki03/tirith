@@ -725,6 +725,15 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         );
         findings.extend(command_findings);
 
+        // PowerShell-specific rules (M5 item 16): only run for PowerShell
+        // input. POSIX shells never reach this block. See
+        // `rules::powershell` module docstring for scope and boundary
+        // with `pipe_to_interpreter`.
+        if ctx.shell == ShellType::PowerShell {
+            let ps_findings = crate::rules::powershell::check(&ctx.input, ctx.shell);
+            findings.extend(ps_findings);
+        }
+
         // Install-command rules: package-manager / infrastructure install
         // patterns (unsigned repos, disabled GPG checks, remote manifests).
         // Pure pattern detection — same exec/paste applicability as command

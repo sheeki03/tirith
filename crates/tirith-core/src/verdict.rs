@@ -54,6 +54,18 @@ pub enum RuleId {
     CredentialFileSweep,
     Base64DecodeExecute,
     DataExfiltration,
+    /// M5 item 16 — PowerShell `Set-ExecutionPolicy Bypass` (cmdlet or
+    /// `powershell -ExecutionPolicy Bypass` flag form). Disables script
+    /// signing enforcement so subsequent downloaded scripts run unsigned.
+    PsSetExecutionPolicyBypass,
+    /// M5 item 16 — PowerShell `Add-MpPreference -ExclusionPath` or
+    /// `-ExclusionProcess`. Adds a Windows Defender exclusion to hide
+    /// malicious payloads from scanning.
+    PsDefenderExclusion,
+    /// M5 item 16 — PowerShell `iex (iwr https://...)` inline form where
+    /// `iex` / `invoke-expression` is the leading command. The pipe form
+    /// (`iwr url | iex`) is handled by `pipe_to_interpreter`.
+    PsInlineDownloadExecute,
 
     // Code file scan rules
     DynamicCodeExecution,

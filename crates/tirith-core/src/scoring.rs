@@ -120,6 +120,9 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        | RuleId::PsSetExecutionPolicyBypass
+        | RuleId::PsDefenderExclusion
+        | RuleId::PsInlineDownloadExecute
         | RuleId::DynamicCodeExecution
         | RuleId::ObfuscatedPayload
         | RuleId::SuspiciousCodeExfiltration

