@@ -242,12 +242,12 @@ fn check_defender_exclusion(
 /// double-firing we skip segments whose `preceding_separator` is a pipe
 /// (`|` or `|&`).
 ///
-/// Non-pipe separators that the PS tokenizer actually emits (`;`, `\n`,
-/// `-and`, `-or`) DO produce independent commands that are *not* covered by
+/// Non-pipe separators that the PS tokenizer emits (`;`, `\n`, `-and`,
+/// `-or`, and the PowerShell 7+ pipeline-chain operators `&&` / `||`) DO
+/// produce independent commands that are *not* covered by
 /// `pipe_to_interpreter`, so this rule must still fire for
-/// `true; iex (iwr url)` and `cmd1 -and iex (iwr url)`. PowerShell 7+ `&&` /
-/// `||` chain operators are a tokenizer gap (task #44 follow-up) and are not
-/// yet emitted as separators today.
+/// `true; iex (iwr url)`, `cmd1 -and iex (iwr url)`, and
+/// `cmd1 && iex (iwr url)` / `cmd1 || iex (iwr url)`.
 fn check_inline_download_execute(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -255,10 +255,9 @@ fn check_inline_download_execute(
 ) {
     for seg in segments {
         // Pipe RHS is already covered by pipe_to_interpreter — skip it.
-        // Non-pipe separators the PS tokenizer actually emits (`;`, `\n`,
-        // `-and`, `-or`) start fresh commands that pipe_to_interpreter does
-        // NOT match, so we must keep checking. (PowerShell 7+ `&&` / `||` are
-        // a tokenizer gap — task #44 follow-up — not emitted today.)
+        // Non-pipe separators the PS tokenizer emits (`;`, `\n`, `-and`,
+        // `-or`, `&&`, `||`) start fresh commands that pipe_to_interpreter
+        // does NOT match, so we must keep checking.
         if let Some(sep) = seg.preceding_separator.as_deref() {
             if is_pipe_separator(sep) {
                 continue;

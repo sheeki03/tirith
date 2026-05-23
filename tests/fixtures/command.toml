@@ -1651,6 +1651,10 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_inline_download_execute"]
+# Pin that `&&` is NOT tokenized as a pipe variant: a regression in the
+# tokenizer that collapsed `&&` into pipe-form would re-route this to
+# pipe_to_interpreter and silently pass the positive-rules check above.
+forbidden_rules = ["pipe_to_interpreter"]
 
 [[fixture]]
 name = "ps_iex_inline_after_or_chained"
@@ -1660,3 +1664,7 @@ context = "exec"
 shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_inline_download_execute"]
+# Pin that `||` is NOT tokenized as a pipe variant — symmetric guard
+# to the `&&` fixture above. Catches the specific precedence bug class
+# where `||` is consumed as two single `|` pipes.
+forbidden_rules = ["pipe_to_interpreter"]
