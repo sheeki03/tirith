@@ -4946,13 +4946,23 @@ fn install_audit_entry_carries_agent_origin() {
     // `install_block_is_audited_with_the_block_verdict` — guaranteed BLOCK.
     // Stamping TIRITH_INTEGRATION drives the origin into the `Agent` variant
     // so the assertion is on a non-default value.
+    //
+    // M4 item 8 chunk 3 follow-up — also seed a policy file whose
+    // `agent_rules.deny` matches our integration name. The verdict is
+    // already Block from the malicious-package finding; the additional
+    // assertion below pins that the deny matcher *also* fired (so
+    // enforcement is exercised, not just origin-stamping).
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    seed_agent_deny_policy(&policy_root, "claude-code-install-test");
+
     let out = tirith()
         .env("TIRITH_OFFLINE", "1")
         .env("TIRITH_LOG", "1")
         .env("TIRITH_INTEGRATION", "claude-code-install-test")
         .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
         .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
-        .env_remove("TIRITH_POLICY_ROOT")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
         .env("XDG_DATA_HOME", &data_dir)
         .env("APPDATA", &data_dir)
         .args(["install", "--no-exec", "npm", "evil-package@1.0.0"])
@@ -4987,6 +4997,21 @@ fn install_audit_entry_carries_agent_origin() {
     assert_eq!(
         origin["tool"], "claude-code-install-test",
         "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
+    );
+
+    // M4 PR #120 finding B fix — the seeded `agent_rules.deny` matcher
+    // must also have fired (`apply_agent_rules` now runs on the install
+    // path). Pre-fix this rule_id would be absent because the deny check
+    // was never invoked.
+    let has_deny_finding = entry["rule_ids"]
+        .as_array()
+        .expect("rule_ids must be an array")
+        .iter()
+        .any(|r| r == "agent_denied_by_policy");
+    assert!(
+        has_deny_finding,
+        "agent_denied_by_policy must be in audit entry rule_ids \
+         (agent_rules.deny was seeded and the install path must enforce it): {entry}"
     );
 }
 
@@ -5047,5 +5072,223 @@ fn ecosystem_scan_audit_entry_carries_agent_origin() {
     assert_eq!(
         origin["tool"], "claude-code-ecosystem-test",
         "the tool field should carry the sanitized TIRITH_INTEGRATION value: {origin}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4 item 8 chunk 3 follow-up — `agent_rules.deny` enforcement on the
+// analysis-then-audit paths that do NOT route through
+// `post_process_verdict`. Finding B in the M4 PR #120 wave-end review:
+// `paste`, `install` (pkg + URL), and `ecosystem scan` previously stamped
+// `agent_origin` for audit but never invoked `apply_agent_rules`, so an
+// operator who wrote a `deny` matcher to block an untrusted agent would
+// see deny enforce on `tirith check` but silently fail on these surfaces.
+// Each test seeds a `.tirith/policy.yaml` with `agent_rules.deny`
+// matching the test's `TIRITH_INTEGRATION` origin and asserts the verdict
+// is BLOCK and the AgentDeniedByPolicy finding is present.
+//
+// Unix-gated to match `install_audit_entry_carries_agent_origin` (the
+// invariant is OS-independent; audit log location resolves through
+// `data_dir()` which differs by platform — set both env vars to isolate).
+// ---------------------------------------------------------------------------
+
+/// Seed a `.tirith/policy.yaml` under `dir` whose `agent_rules.deny` matches
+/// a `kind: agent` origin with the given `tool` name. Returns the writable
+/// `dir` path; the caller is expected to keep the tempdir alive.
+#[cfg(unix)]
+fn seed_agent_deny_policy(dir: &std::path::Path, tool: &str) {
+    let tirith_dir = dir.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    let policy = format!("agent_rules:\n  deny:\n    - kind: agent\n      name: {tool}\n");
+    fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
+}
+
+#[cfg(unix)]
+#[test]
+fn paste_audit_entry_with_agent_rules_deny_forces_block() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Seed a policy that denies our test integration name. Use
+    // TIRITH_POLICY_ROOT to pin discovery so the test cannot accidentally
+    // pick up the repo's real policy.
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    seed_agent_deny_policy(&policy_root, "claude-code-paste-deny-test");
+
+    // Clean paste content — would normally be Allow. With the deny matcher
+    // it MUST flip to Block.
+    let mut child = tirith()
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-paste-deny-test")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["paste", "--shell", "posix", "--non-interactive"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello world")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait on tirith paste");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "agent_rules.deny must flip a clean paste to BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The audit entry must record the AgentDeniedByPolicy finding.
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+    assert_eq!(
+        entry["action"], "Block",
+        "audit entry must record Block: {entry}"
+    );
+    let has_deny_finding = entry["rule_ids"]
+        .as_array()
+        .expect("rule_ids must be an array")
+        .iter()
+        .any(|r| r == "agent_denied_by_policy");
+    assert!(
+        has_deny_finding,
+        "agent_denied_by_policy must be in audit entry rule_ids: {entry}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_audit_entry_with_agent_rules_deny_forces_block() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    seed_agent_deny_policy(&policy_root, "claude-code-install-deny-test");
+
+    // Clean package name → would normally be Allow. With the deny matcher
+    // it MUST flip to Block (exit 1), with AgentDeniedByPolicy in the
+    // findings.
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-install-deny-test")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["install", "--no-exec", "npm", "my-internal-pkg-xyzzy"])
+        .output()
+        .expect("failed to run tirith install");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "agent_rules.deny must flip a clean install to BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+    assert_eq!(
+        entry["action"], "Block",
+        "audit entry must record Block: {entry}"
+    );
+    let has_deny_finding = entry["rule_ids"]
+        .as_array()
+        .expect("rule_ids must be an array")
+        .iter()
+        .any(|r| r == "agent_denied_by_policy");
+    assert!(
+        has_deny_finding,
+        "agent_denied_by_policy must be in audit entry rule_ids: {entry}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ecosystem_scan_audit_entry_with_agent_rules_deny_forces_block() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let policy_root = tmp.path().join("repo");
+    fs::create_dir_all(&policy_root).unwrap();
+    seed_agent_deny_policy(&policy_root, "claude-code-ecosystem-deny-test");
+
+    // A clean project — would normally exit 0. With the deny matcher it
+    // MUST flip to Block (exit 1).
+    let proj = tempfile::tempdir().expect("project tempdir");
+    fs::write(
+        proj.path().join("Cargo.toml"),
+        "[dependencies]\nmy-unique-internal-crate-xyzzy = \"1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+
+    let out = tirith()
+        .env("TIRITH_OFFLINE", "1")
+        .env("TIRITH_LOG", "1")
+        .env("TIRITH_INTEGRATION", "claude-code-ecosystem-deny-test")
+        .env("TIRITH_THREATDB_PATH", test_threatdb_fixture())
+        .env_remove("TIRITH_THREATDB_SUPPLEMENTAL_PATH")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_DATA_HOME", &data_dir)
+        .env("APPDATA", &data_dir)
+        .args(["ecosystem", "scan", proj.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "agent_rules.deny must flip a clean ecosystem scan to BLOCK, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_path = data_dir.join("tirith").join("log.jsonl");
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("audit log {} not written: {e}", log_path.display()));
+    let entry: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["entry_type"] == "verdict")
+        .expect("a verdict audit entry must exist");
+    assert_eq!(
+        entry["action"], "Block",
+        "audit entry must record Block: {entry}"
+    );
+    let has_deny_finding = entry["rule_ids"]
+        .as_array()
+        .expect("rule_ids must be an array")
+        .iter()
+        .any(|r| r == "agent_denied_by_policy");
+    assert!(
+        has_deny_finding,
+        "agent_denied_by_policy must be in audit entry rule_ids: {entry}"
     );
 }

@@ -293,9 +293,20 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         crate::approval::apply_approval(&mut verdict, &meta);
     }
 
-    // M4 item 8 chunk 1 — observation-only. Even diagnostic tools that don't
-    // go through post_process_verdict still record their MCP caller.
+    // M4 item 8 chunk 3 follow-up — stamp the MCP client origin so the
+    // verdict carries the caller's identity for both observation and
+    // enforcement.
     verdict.agent_origin = super::origin::current();
+
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on this
+    // diagnostic MCP tool. `call_check_url` does not route through
+    // `post_process_verdict` (it intentionally skips escalation /
+    // session bookkeeping), so without this call an operator who writes
+    // a `deny` matcher to block an untrusted MCP client would see deny
+    // enforce on `tirith_check_command` but silently fail on
+    // `tirith_check_url`. The helper is a no-op on
+    // `Allowed`/`Unspecified`.
+    crate::escalation::apply_agent_rules(&mut verdict, &policy);
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
@@ -343,9 +354,17 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         crate::approval::apply_approval(&mut verdict, &meta);
     }
 
-    // M4 item 8 chunk 1 — observation-only. Stamp the MCP caller origin on
-    // the paste-diagnostic verdict the same way `check_command` does.
+    // M4 item 8 chunk 3 follow-up — stamp the MCP caller origin on the
+    // paste-diagnostic verdict the same way `check_command` does.
     verdict.agent_origin = super::origin::current();
+
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on this
+    // diagnostic MCP tool. `call_check_paste` does not route through
+    // `post_process_verdict` (it intentionally skips escalation /
+    // session bookkeeping), so without this call deny would stamp but
+    // not enforce on the MCP-side clipboard-poisoning surface. The
+    // helper is a no-op on `Allowed`/`Unspecified`.
+    crate::escalation::apply_agent_rules(&mut verdict, &policy);
 
     crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
     let structured = serde_json::to_value(&verdict)
@@ -778,6 +797,130 @@ mod tests {
         assert!(
             diff_text.contains("[REDACTED:custom]"),
             "should contain custom redaction marker: {diff_text}"
+        );
+    }
+
+    /// Snapshot an env var on construction and restore on `Drop` — same shape
+    /// as the `EnvVarGuard` in `policy.rs::tests` (cannot import directly
+    /// because that one is `mod tests`-scoped).
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Seed a `.tirith/policy.yaml` under `root` whose `agent_rules.deny`
+    /// matches an MCP client named `client`. Returns the temp dir handle so
+    /// the caller can hold it for the lifetime of the test.
+    fn seed_mcp_deny_policy(client: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+        let policy = format!("agent_rules:\n  deny:\n    - kind: mcp\n      name: {client}\n");
+        std::fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
+        dir
+    }
+
+    /// M4 item 8 chunk 3 follow-up — finding B in the M4 PR #120 wave-end
+    /// review. `tirith_check_url` is a diagnostic MCP tool that does not
+    /// route through `post_process_verdict`. Before this fix the path
+    /// stamped `agent_origin` for audit but never invoked
+    /// `apply_agent_rules`, so an operator who wrote a `deny` matcher to
+    /// block a hostile MCP client would see deny enforce on
+    /// `tirith_check_command` but silently fail on `tirith_check_url`.
+    /// The fix calls `apply_agent_rules` directly between the origin
+    /// stamp and the response build.
+    #[test]
+    fn mcp_check_url_with_agent_rules_deny_forces_block() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _origin_guard = super::super::origin::reset_for_test();
+
+        // Seed the MCP origin to a name our deny matcher will catch.
+        super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
+            name: "hostile-mcp-client".to_string(),
+            version: None,
+        }));
+
+        // Seed a policy that denies this client. Discovery walks
+        // `TIRITH_POLICY_ROOT/.tirith` first.
+        let policy_dir = seed_mcp_deny_policy("hostile-mcp-client");
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+
+        // A clean URL — would otherwise be Allow.
+        let resp = call_check_url(&json!({"url": "https://example.com/"}));
+        assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
+        let structured = resp
+            .structured_content
+            .expect("structured_content must be present");
+        assert_eq!(
+            structured["action"], "block",
+            "deny matcher must flip the verdict to Block: {structured}"
+        );
+        let has_deny_finding = structured["findings"]
+            .as_array()
+            .expect("findings must be an array")
+            .iter()
+            .any(|f| f["rule_id"] == "agent_denied_by_policy");
+        assert!(
+            has_deny_finding,
+            "AgentDeniedByPolicy finding must be present: {structured}"
+        );
+    }
+
+    /// M4 item 8 chunk 3 follow-up — paired with `mcp_check_url_*` above.
+    /// `tirith_check_paste` had the same enforcement gap as
+    /// `tirith_check_url`; this test pins the fix for the paste handler.
+    #[test]
+    fn mcp_check_paste_with_agent_rules_deny_forces_block() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _origin_guard = super::super::origin::reset_for_test();
+
+        super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
+            name: "hostile-mcp-client".to_string(),
+            version: None,
+        }));
+
+        let policy_dir = seed_mcp_deny_policy("hostile-mcp-client");
+        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+
+        // Clean paste content — would otherwise be Allow.
+        let resp = call_check_paste(&json!({"content": "hello world"}));
+        assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
+        let structured = resp
+            .structured_content
+            .expect("structured_content must be present");
+        assert_eq!(
+            structured["action"], "block",
+            "deny matcher must flip the paste verdict to Block: {structured}"
+        );
+        let has_deny_finding = structured["findings"]
+            .as_array()
+            .expect("findings must be an array")
+            .iter()
+            .any(|f| f["rule_id"] == "agent_denied_by_policy");
+        assert!(
+            has_deny_finding,
+            "AgentDeniedByPolicy finding must be present: {structured}"
         );
     }
 }

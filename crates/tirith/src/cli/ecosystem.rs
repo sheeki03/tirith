@@ -106,6 +106,13 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     let interactive = is_terminal::is_terminal(std::io::stderr());
     report.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the
+    // ecosystem-scan path. `tirith ecosystem scan` does not route through
+    // `post_process_verdict`, so without this call deny would stamp but
+    // not enforce on the directory-level supply-chain surface. The
+    // helper is a no-op on `Allowed`/`Unspecified`.
+    tirith_core::escalation::apply_agent_rules(&mut report.verdict, &policy);
+
     // Audit-log the verdict, exactly as the other analysis commands do. The
     // "command" string identifies this as an ecosystem scan of the root. A
     // failed audit write does not abort the scan, but it must not be silent —

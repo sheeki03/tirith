@@ -81,14 +81,19 @@ pub fn run(
     // M4 item 8: best-effort origin attribution for the paste path. The CLI
     // is the only place that knows whether the caller looked like a human,
     // an agent (via TIRITH_INTEGRATION), or a CI runner. The audit entry
-    // below picks the origin up automatically. Known scope gap: `paste`
-    // does NOT route through `post_process_verdict`, so
-    // `agent_rules.deny` is currently stamped but not enforced on this
-    // path — a follow-up commit on this PR adds a direct
-    // `apply_agent_rules` call before the audit write.
+    // below picks the origin up automatically.
     verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
     let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` here. The
+    // paste path does NOT route through `post_process_verdict` (the engine
+    // is the only consumer of escalation/session bookkeeping). Without
+    // this call, an operator who writes a `deny` matcher to block an
+    // untrusted agent would see deny enforce on `tirith check` but
+    // silently fail on `tirith paste` (a clipboard-poisoning hostile
+    // surface). The helper is a no-op on `Allowed`/`Unspecified`.
+    tirith_core::escalation::apply_agent_rules(&mut verdict, &policy);
 
     // Audit must capture full detection BEFORE paranoia filtering (ADR-13:
     // engine always detects everything; paranoia is an output-layer filter).

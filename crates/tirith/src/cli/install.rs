@@ -218,6 +218,15 @@ fn run_package_manager(
     // `tirith agent sessions` "unknown" bucket.
     plan.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the
+    // install path. `tirith install` does not route through
+    // `post_process_verdict`, so without this call an operator who writes
+    // a `deny` matcher to block an untrusted agent would see deny enforce
+    // on `tirith check` but silently fail on `tirith install npm
+    // evil-pkg` (a package-management hostile surface). The helper is a
+    // no-op on `Allowed`/`Unspecified`.
+    tirith_core::escalation::apply_agent_rules(&mut plan.verdict, &policy);
+
     // --- INFORM ---------------------------------------------------------
     if json {
         // A JSON-write failure means the consumer never received the analysis
@@ -530,6 +539,17 @@ fn run_url(
     // CLI does. Without this stamp, `tirith install url` audit lines would
     // land in the `tirith agent sessions` "unknown" bucket.
     preflight.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
+
+    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the URL
+    // install path. `tirith install url` does not route through
+    // `post_process_verdict`, so without this call deny would stamp but
+    // not enforce on the URL-download hostile surface. The helper is a
+    // no-op on `Allowed`/`Unspecified`. Runs BEFORE the bypass-decision
+    // block below so a deny-forced Block can still be bypassed by
+    // `TIRITH=0` (consistent with how the regular pipeline behaves —
+    // finding A in the M4 PR #120 wave-end review tracks the
+    // bypass-skips-agent-rules gap).
+    tirith_core::escalation::apply_agent_rules(&mut preflight, &policy);
 
     if json {
         // A JSON-write failure means the consumer never received the preflight
