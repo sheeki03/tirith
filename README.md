@@ -324,7 +324,7 @@ Run `tirith mcp-server` or use `tirith setup <tool> --with-mcp` to register tiri
 
 `tirith mcp lock` captures every MCP server a repository declares — across `.mcp.json` / `mcp.json` / `mcp_settings.json` and the IDE config variants (`.vscode/`, `.cursor/`, `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`) — into a deterministic lockfile at `.tirith/mcp.lock`. Each server is recorded with its transport (a remote URL, or a local command + args), declared tools, and a content hash; servers are sorted by name so the lockfile is diff-friendly. Discovery is repo-local only and touches no network. (`tirith mcp` is a separate command group from `tirith mcp-server`, which runs tirith *as* an MCP server.)
 
-`tirith mcp verify` is the gating companion: it loads the committed lockfile, rebuilds the current inventory, and exits 1 when the two differ (0 when they match, 2 on a usage error such as a missing lockfile). `tirith mcp diff` shows the same drift informationally — always exits 0. Drift is also surfaced through `tirith scan` as the `mcp_server_drift` rule (Severity Medium), so a pre-commit hook or CI integration catches an MCP-surface change the same way it catches an un-pinned action. Env values and URL userinfos are never printed by `verify` / `diff` — only the names of the variables / credentials that changed.
+`tirith mcp verify` is the gating companion: it loads the committed lockfile, rebuilds the current inventory, and exits 1 when the two differ (0 when they match, 2 on a usage error such as a missing lockfile). `tirith mcp diff` shows the same drift informationally — it exits 0 whether or not drift is present (drift is reported, not enforced), but a usage error (missing lockfile, unreadable lockfile, unresolvable repo root) still exits 2 so a piped consumer can distinguish "no drift" from "I could not check". Drift is also surfaced through `tirith scan` as the `mcp_server_drift` rule (Severity Medium), so a pre-commit hook or CI integration catches an MCP-surface change the same way it catches an un-pinned action. Env values and URL userinfos are never printed by `verify` / `diff` — only the names of the variables / credentials that changed.
 
 Two policy fields govern which servers and tools are accepted: `scan.trusted_mcp_servers` lists server names whose per-server MCP config findings are suppressed and whose drift is silenced, and `scan.mcp_allowed_tools` declares, per server, the exact tools the server may expose — a tool that lands in the lockfile outside that set surfaces a High-severity `mcp_server_drift` finding, and drift that adds a tool outside the set upgrades from Medium to High. `tirith mcp policy init` scaffolds a starter version of both blocks from the current lockfile into `.tirith/mcp-policy.yaml.example`, with every entry commented out so importing the example never silently widens trust.
 
@@ -706,7 +706,7 @@ tirith daemon stop
 | `tirith mcp-server` | Run as MCP server over JSON-RPC stdio |
 | `tirith mcp lock` | Inventory the repo's MCP servers into a deterministic `.tirith/mcp.lock` lockfile |
 | `tirith mcp verify` | Gate on MCP drift — exit 1 when the current inventory no longer matches `.tirith/mcp.lock` |
-| `tirith mcp diff` | Show the drift between the current MCP inventory and `.tirith/mcp.lock` (informational, always exits 0) |
+| `tirith mcp diff` | Show the drift between the current MCP inventory and `.tirith/mcp.lock` (informational — exits 0 with or without drift; a usage error such as a missing lockfile still exits 2) |
 
 ---
 

@@ -80,10 +80,34 @@ pub fn lock(json: bool) -> i32 {
 
 /// Resolve the repository root for `mcp lock`.
 ///
-/// Honors `TIRITH_POLICY_ROOT` first (so a test, or a deliberate override, can
-/// pin the root without a `.git`), then falls back to the `.git`-boundary
-/// walk-up from the current directory — the exact resolution `tirith policy`
-/// and `.tirith/trust.json` use, so `mcp.lock` lands beside `policy.yaml`.
+/// Honors `TIRITH_POLICY_ROOT` first (treated as the repo root directly — so
+/// a test or deliberate override can pin the root without needing a `.git/`
+/// at the override path), then falls back to the `.git`-boundary walk-up from
+/// the current directory via `policy::find_repo_root`.
+///
+/// **Not identical to the other two resolvers in the codebase — three
+/// different mechanisms exist, deliberately.** A maintainer who needs to
+/// touch one of these should read all three before assuming they share a
+/// helper:
+///
+/// * `policy::find_repo_root` (used by `.tirith/trust.json` via
+///   `Policy::load_trust_entries`) — raw `.git`-walk only; ignores
+///   `TIRITH_POLICY_ROOT` entirely.
+/// * `policy::discover_local_policy_path` (used by `tirith policy`) —
+///   joins `.tirith/` onto `TIRITH_POLICY_ROOT` (so the env var points
+///   at a *repo root*, and the policy file is located inside the
+///   `.tirith/` subdirectory of it), then falls through to a walk-up.
+/// * This function — takes `TIRITH_POLICY_ROOT` as the repo root
+///   directly (so the `.tirith/` subpath is appended later when the
+///   lockfile path is built); falls through to a walk-up.
+///
+/// The shapes line up *in the common case* — `TIRITH_POLICY_ROOT=/repo`
+/// puts `mcp.lock` at `/repo/.tirith/mcp.lock` and the policy at
+/// `/repo/.tirith/policy.yaml`, so the lockfile and policy land beside each
+/// other in practice. They diverge under the trust resolver (which never
+/// sees the env var), so a maintainer expecting strict equivalence will be
+/// wrong. Unifying the three resolvers behind a single helper is a worthwhile
+/// follow-up but a behavior change requiring its own PR.
 fn resolve_repo_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         if !root.trim().is_empty() {
@@ -284,8 +308,10 @@ fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
 /// hostile source). Printing the name verbatim would let those control bytes
 /// reach the user's terminal and inject color, repositioning, or
 /// line-erasure. Rust's `Debug` formatting on `&str` (`"{:?}"`) escapes every
-/// control byte as a `\xNN` / `\n` / `\r` / etc. and quotes the value — the
-/// simplest correct fix, applied at *every* env-name print site.
+/// control byte as a `\u{NN}` / `\n` / `\r` / etc. and quotes the value (the
+/// dedicated test `describe_transport_escapes_control_bytes_in_env_names`
+/// probes for the `\u{1b}` escape form to pin this contract) — the simplest
+/// correct fix, applied at *every* env-name print site.
 ///
 /// **A URL's userinfo is never printed.** The stored URL is already the
 /// redacted form (`https://host/...` — the `user:token@` segment has been
@@ -315,9 +341,10 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
             };
             if !env.is_empty() {
                 // Debug-format each name so control bytes (ANSI escapes,
-                // newlines, …) are rendered as `\xNN` literals rather than
-                // reaching the terminal. Names appear quoted, which is fine
-                // for the human summary and the test snapshot.
+                // newlines, …) are rendered as `\u{NN}` literals (e.g. ESC →
+                // `\u{1b}`) rather than reaching the terminal. Names appear
+                // quoted, which is fine for the human summary and the test
+                // snapshot.
                 let names: Vec<String> = env.iter().map(|e| format!("{:?}", e.name)).collect();
                 desc.push_str(&format!(" (env: {})", names.join(", ")));
             }
@@ -1851,5 +1878,179 @@ mod tests {
         let s = format!("a{}b", 0x7f as char);
         let out = yaml_safe_scalar(&s);
         assert!(out.starts_with('"'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F13 (PRT CG-2) — the YAML scaffold output is never
+    // parsed back in the existing tests, so a render-side bug that produced
+    // structurally-broken YAML for a hostile name would be invisible. Pin
+    // the contract: a scaffold rendered for a hostile name parses cleanly
+    // through `serde_yaml`, and `yaml_safe_scalar`'s output for every YAML
+    // special character round-trips byte-for-byte through a real YAML parser.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn policy_init_scaffold_yaml_parses_after_uncomment() {
+        // A scaffold rendered for a server name carrying ANSI escapes /
+        // newlines / control bytes (a hostile-but-legal name a config might
+        // declare or a round-trip from an attacker-controlled source) must
+        // produce structurally-valid YAML even after the operator uncomments
+        // the `trusted_mcp_servers` block. `yaml_safe_scalar` is what
+        // guarantees this — every special character is quoted-and-escaped —
+        // and this test pins the contract by actually parsing the rendered
+        // bytes back through `serde_yaml`.
+        let hostile = "ev\u{1b}[31mil\nname";
+
+        let scaffold = PolicyScaffold {
+            lockfile_present: true,
+            servers: vec![PolicyScaffoldServer {
+                name: hostile.to_string(),
+                source_config: ".mcp.json".to_string(),
+                tools: vec!["read".to_string()],
+            }],
+        };
+        let body = render_policy_scaffold_yaml(&scaffold);
+
+        // Programmatically uncomment the `trusted_mcp_servers:` header and
+        // its single list entry. The block looks like:
+        //
+        //   # trusted_mcp_servers:
+        //   #   - "ev\u{1b}[31mil\nname"    # from .mcp.json
+        //
+        // We turn `\n  # trusted_mcp_servers:` into `\n  trusted_mcp_servers:`
+        // (matching the render's two-space indent and the leading newline so
+        // we only ever match the canonical site), then uncomment each list
+        // entry directly underneath.
+        let uncommented_header =
+            body.replace("\n  # trusted_mcp_servers:", "\n  trusted_mcp_servers:");
+        // The list-entry lines start with `  #   - ` (two-space indent +
+        // `#   - ` per render). Strip the `#   ` prefix so the entry is
+        // a real list item under the now-uncommented key.
+        let uncommented: String = uncommented_header
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("  #   - ") {
+                    format!("    - {rest}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+
+        // The uncommented YAML must parse.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&uncommented).unwrap_or_else(|e| {
+            panic!(
+                "scaffold YAML must parse cleanly after uncommenting:\nerror: {e}\nbody:\n{uncommented}"
+            )
+        });
+
+        // And the loaded server name must byte-equal the hostile input — no
+        // characters lost, no escapes leaking through as literal `\u{1b}`
+        // text instead of the real ESC byte.
+        let names = parsed
+            .get("scan")
+            .and_then(|s| s.get("trusted_mcp_servers"))
+            .and_then(|v| v.as_sequence())
+            .expect("scan.trusted_mcp_servers must be a sequence after uncomment");
+        assert_eq!(names.len(), 1, "exactly one server in the list");
+        let recovered = names[0]
+            .as_str()
+            .expect("the entry must be a string scalar");
+        assert_eq!(
+            recovered, hostile,
+            "the round-tripped name must byte-equal the hostile input",
+        );
+    }
+
+    #[test]
+    fn yaml_safe_scalar_round_trips_through_yaml_parser() {
+        // Table-driven: every YAML special character, every control-byte
+        // class that round-trips through a YAML parser, plus multi-byte
+        // UTF-8 and the empty string. For each input, feed
+        // `yaml_safe_scalar`'s output into a one-key YAML document, parse
+        // it, and assert the parser recovers the exact input byte-for-byte.
+        //
+        // **Known gap (production):** `yaml_safe_scalar` calls
+        // `serde_json::to_string`, which does NOT escape DEL (`\x7f`) —
+        // JSON treats it as printable, but YAML 1.2 §5.7 disallows it
+        // inside a double-quoted scalar. The dedicated
+        // `yaml_safe_scalar_does_not_round_trip_del_documents_known_gap`
+        // test below pins that asymmetry so a future production-code fix
+        // (escape DEL alongside the < 0x20 control bytes) has a regression
+        // test ready to flip green.
+        let cases: &[&str] = &[
+            // YAML reserved indicators (the set centralized in
+            // `YAML_NEEDS_QUOTING_BYTES`).
+            ":", "#", "-", "?", ",", "[", "]", "{", "}", "&", "*", "!", "|", ">", "'", "\"", "%",
+            "@", "`", // Whitespace.
+            " ", "\t", // Line breakers.
+            "\n", "\r",
+            // Control bytes that DO round-trip (serde_json emits
+            // `\u00XX`-style escapes for every byte < 0x20).
+            "\0", "\x1b", // ESC
+            // Multi-byte UTF-8 (Greek small letter alpha, a CJK character,
+            // and an emoji).
+            "α", "中", "🦀", // Empty string.
+            "",   // A combination that exercises several rules at once.
+            "a: # b\n",
+        ];
+
+        for input in cases {
+            let scalar = yaml_safe_scalar(input);
+            // Build a one-key document. The KEY is a plain ASCII identifier
+            // (so we don't accidentally test the key-quoting path here);
+            // only the VALUE is the rendered scalar.
+            let doc = format!("k: {scalar}\n");
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&doc).unwrap_or_else(|e| {
+                panic!(
+                    "yaml_safe_scalar({input:?}) → {scalar:?} must parse as YAML:\nerror: {e}\ndoc:\n{doc}"
+                )
+            });
+            let recovered = parsed
+                .get("k")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "yaml_safe_scalar({input:?}) → {scalar:?} did not load as a string scalar.\ndoc:\n{doc}\nparsed: {parsed:?}"
+                    )
+                });
+            assert_eq!(
+                recovered, *input,
+                "yaml_safe_scalar must round-trip byte-for-byte. input: {input:?} → scalar: {scalar:?} → recovered: {recovered:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_safe_scalar_does_not_round_trip_del_documents_known_gap() {
+        // Documents the production-code gap surfaced while landing F13:
+        // `yaml_safe_scalar` uses `serde_json::to_string`, which (per the
+        // JSON spec) emits DEL (`\x7f`) as the raw byte rather than a
+        // `` escape. YAML 1.2 §5.7 disallows DEL inside a
+        // double-quoted scalar, so the round-trip fails. The output is
+        // still quoted (the `quotes_control_bytes` test pins that) — it
+        // just isn't parseable.
+        //
+        // The fix is a one-line change in `yaml_safe_scalar` (post-process
+        // the JSON output to escape DEL as `` before returning), but
+        // it's behavior outside the scope of batch B (tests-only). When a
+        // future production-code fix lands, this test should flip green
+        // (the parse should succeed and recover DEL) — `assert!(parsed.is_err())`
+        // is what makes that pivot explicit.
+        let scalar = yaml_safe_scalar("\x7f");
+        // The output is still quoted (forces quoting via the control-byte
+        // check), proving the safety-quoting rule fires — the gap is only
+        // about the escape, not the quoting.
+        assert!(
+            scalar.starts_with('"') && scalar.ends_with('"'),
+            "DEL must still be quoted (forces quoting): {scalar:?}",
+        );
+        let doc = format!("k: {scalar}\n");
+        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(&doc);
+        assert!(
+            parsed.is_err(),
+            "DEL currently does NOT round-trip through serde_yaml — fixing yaml_safe_scalar to \
+             escape DEL as `\\u007F` should flip this assertion. doc: {doc:?}",
+        );
     }
 }

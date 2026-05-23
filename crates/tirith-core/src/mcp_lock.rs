@@ -572,10 +572,28 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Repo-root-relative MCP config locations to probe.
 ///
-/// Mirrors `configfile::is_mcp_config_file` exactly — the bare-root JSON files
-/// plus the IDE host-directory variants. Kept as an explicit list (rather than
-/// a filesystem walk) so discovery is bounded, fast, and never strays outside
-/// the known MCP config surface.
+/// **Intentionally broader than `configfile::is_mcp_config_file`'s `mcp_dirs`.**
+/// The configfile rule that flags an `.mcp.json` as a known MCP config file
+/// in the general file-scan path checks the bare-root names
+/// (`mcp.json` / `.mcp.json` / `mcp_settings.json`) plus a four-entry
+/// `mcp_dirs` list of IDE host directories: `.vscode`, `.cursor`, `.windsurf`,
+/// `.cline`. This discovery list deliberately also covers `.amazonq/`,
+/// `.continue/`, and `.kiro/settings/` — three additional IDE / agent surfaces
+/// the lockfile pipeline must inventory even though the general file-scan
+/// rule does not classify them as MCP config files (yet). The asymmetry is
+/// intentional: the lockfile is the gating baseline for the MCP surface and
+/// must capture every host directory tirith knows about; the file-scan
+/// classifier is a separate detection-tier concern with its own cadence for
+/// expanding the list.
+///
+/// **Maintainer note.** A maintainer adding a new IDE host directory must
+/// decide independently whether to extend this list (the lockfile inventory),
+/// `configfile::is_mcp_config_file`'s `mcp_dirs` (the file-scan classifier),
+/// or both — the two lists are deliberately decoupled rather than mirrors of
+/// each other.
+///
+/// Kept as an explicit list (rather than a filesystem walk) so discovery is
+/// bounded, fast, and never strays outside the known MCP config surface.
 pub(crate) const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
     // Bare repo-root MCP configs.
     "mcp.json",
@@ -3642,6 +3660,109 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Wave-end finding F24 (PRT II-10) — when a transport flips kind
+    // (stdio ↔ url, or either ↔ unknown), `compute_changed_entry` records
+    // ONLY a `KindChanged` entry and intentionally drops the per-variable
+    // env detail (the diff doesn't make sense across the kind boundary —
+    // a URL server doesn't HAVE env vars). Tools diff, however, still runs
+    // unconditionally across the kind boundary. Pin both behaviours
+    // explicitly so a future refactor doesn't silently start emitting
+    // misleading `EnvChanged` / per-variable `Removed` entries across the
+    // boundary, or silently stop diff'ing tools.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drift_kind_change_stdio_to_url_drops_env_detail_but_keeps_tools_diff() {
+        // Prev: a stdio server carrying TWO env vars and tools [a, b].
+        let prev = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![
+                    McpEnvEntry::from_raw("API_KEY", "secret"),
+                    McpEnvEntry::from_raw("DEBUG", "1"),
+                ],
+            },
+            tools: vec!["a".into(), "b".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        // Cur: same name "s", but now a URL transport (no env at all) and
+        // a different tool set [b, c] — so the tools diff has both an
+        // addition ("c") and a removal ("a"), proving the diff ran.
+        let cur = mk_inventory(vec![McpServerEntry {
+            transport: McpTransport::Url {
+                url: "https://x.example".into(),
+                userinfo_hash: None,
+            },
+            tools: vec!["b".into(), "c".into()],
+            ..stdio_server("s", "node")
+        }]);
+
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(
+            drifts.len(),
+            1,
+            "exactly one drift entry across the kind flip: got {drifts:?}",
+        );
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                // transport_changes carries EXACTLY one `KindChanged`
+                // entry — no extra `EnvChanged` / `UrlChanged` / etc.
+                // The other variants are kind-specific and intentionally
+                // do not fire across the boundary.
+                assert_eq!(
+                    entry.transport_changes.len(),
+                    1,
+                    "kind flip must record exactly one transport_change \
+                     (just KindChanged): {entry:?}",
+                );
+                match &entry.transport_changes[0] {
+                    McpTransportChange::KindChanged { previous, current } => {
+                        assert_eq!(previous, "stdio", "previous kind: {entry:?}");
+                        assert_eq!(current, "url", "current kind: {entry:?}");
+                    }
+                    other => panic!("expected KindChanged, got {other:?}"),
+                }
+
+                // env_changes is EMPTY — the two stdio env vars that the
+                // lockfile recorded are NOT surfaced as per-variable
+                // `Removed` entries across the kind boundary. A URL
+                // transport has no concept of env, so per-variable diff
+                // would be misleading.
+                assert!(
+                    entry.env_changes.is_empty(),
+                    "env_changes must be empty across a kind flip — \
+                     per-variable diff is undefined when the transport \
+                     kind itself changed: {entry:?}",
+                );
+
+                // tools_added / tools_removed STILL reflect the diff
+                // across the boundary. Tools are part of the server-level
+                // (kind-independent) surface, so the diff runs.
+                assert_eq!(
+                    entry.tools_change,
+                    Some(McpToolsChangeKind::Set),
+                    "tools differ both ways (added c, removed a) so the \
+                     kind is Set: {entry:?}",
+                );
+                assert_eq!(
+                    entry.tools_added,
+                    vec!["c".to_string()],
+                    "tools_added must reflect the diff: {entry:?}",
+                );
+                assert_eq!(
+                    entry.tools_removed,
+                    vec!["a".to_string()],
+                    "tools_removed must reflect the diff: {entry:?}",
+                );
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn drift_detects_command_change() {
         let prev = mk_inventory(vec![stdio_server("s", "node")]);
@@ -3860,6 +3981,81 @@ mod tests {
                 assert_eq!(entry.tools_change, Some(McpToolsChangeKind::Removed));
                 assert!(entry.tools_added.is_empty());
                 assert_eq!(entry.tools_removed, vec!["b".to_string()]);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F21 (PRT II-1) — `McpToolsChangeKind::Reordered` is
+    // documented as a "defensive variant" that fires when the two tool
+    // lists carry the same set in a different order. `parse_mcp_config`
+    // sorts tools on parse, so a same-set-different-order case can only
+    // arise from a hand-built inventory (e.g. a future caller, a test
+    // fixture). Without a test, both the variant and its `"reordered"`
+    // serde tag are dead — a future refactor could silently drop them.
+    // Pin both.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drift_tools_change_kind_reordered_fires_when_tool_lists_differ_only_in_order() {
+        // Hand-construct two `McpServerEntry` with the same tool set in a
+        // different order. We feed these directly to `compute_drift` (NOT
+        // through `parse_mcp_config`, which would sort on parse and
+        // collapse the difference). The framing of `content_hash` hashes
+        // tools in their declared order, so the per-server hashes differ
+        // and drift is computed; `diff_tools` then notices the *set* is
+        // identical and emits `Reordered` rather than a spurious
+        // `Added` + `Removed`.
+        let prev = mk_inventory(vec![McpServerEntry {
+            tools: vec!["a".into(), "b".into(), "c".into()],
+            ..stdio_server("s", "node")
+        }]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        // Same three tools, different declaration order. `from_inventory`
+        // does NOT sort tools — it clones them as declared — so the order
+        // survives into the lockfile snapshot of the current inventory
+        // that `compute_drift` builds internally.
+        let cur = mk_inventory(vec![McpServerEntry {
+            tools: vec!["c".into(), "a".into(), "b".into()],
+            ..stdio_server("s", "node")
+        }]);
+
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(
+            drifts.len(),
+            1,
+            "exactly one drift entry for the single reordered server: got {drifts:?}",
+        );
+        match &drifts[0] {
+            McpDrift::Changed(entry) => {
+                assert_eq!(
+                    entry.tools_change,
+                    Some(McpToolsChangeKind::Reordered),
+                    "same set in a different order must fire Reordered: {entry:?}",
+                );
+                // The merge-walk emits NO added / removed when the set is
+                // identical — Reordered is the *only* signal.
+                assert!(
+                    entry.tools_added.is_empty(),
+                    "Reordered must NOT also report tools_added: {entry:?}",
+                );
+                assert!(
+                    entry.tools_removed.is_empty(),
+                    "Reordered must NOT also report tools_removed: {entry:?}",
+                );
+
+                // Pin the serialized JSON tag. `McpToolsChangeKind` is
+                // serialized with `#[serde(rename_all = "snake_case")]`, so
+                // `Reordered` must emit `"reordered"` — a future variant
+                // rename would silently break consumers of the JSON drift
+                // envelope without this assertion.
+                let json = serde_json::to_string(&entry.tools_change).unwrap();
+                assert_eq!(
+                    json, r#""reordered""#,
+                    "tools_change must serialize as the literal tag \"reordered\": got {json}",
+                );
             }
             other => panic!("expected Changed, got {other:?}"),
         }

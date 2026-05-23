@@ -1815,4 +1815,181 @@ mod tests {
             "untrusted server's offending tool must appear: {serialized}",
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F22 (PRT II-5) — the `mcp_allowed_tools` severity
+    // ladder only applies to NEW exposure (Added / Changed arms, via
+    // `any_added_tool_out_of_allowed`). A `Removed` drift is lost exposure,
+    // not new exposure, so it must NOT trigger the High-severity upgrade
+    // even when the (now-gone) server's lockfile record carries a tool
+    // outside its allowed set. Pin the contract.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn removed_server_with_disallowed_tools_in_lockfile_stays_medium() {
+        // Step 1: a repo declares server "s" with a tool "evil" that is
+        // NOT in its `mcp_allowed_tools` allowed-set; the lockfile records
+        // this state.
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node",
+                "tools": ["evil"] } } }"#,
+        );
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        // Step 2: the user removes server "s" from .mcp.json entirely.
+        // The current inventory now has no servers; against the lockfile,
+        // this produces exactly one `McpDrift::Removed` entry for "s".
+        write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
+
+        // Policy: server "s" is allowed only "read" (so "evil" is outside
+        // the allowed set). The Changed/Added arm would upgrade to High
+        // for the same shape; the Removed arm must NOT.
+        let mut allowed = HashMap::new();
+        allowed.insert("s".to_string(), vec!["read".to_string()]);
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+
+        // The drift finding (the one whose description contains "1 removed")
+        // must be present and must stay at the default Medium severity.
+        let drift_finding = findings
+            .iter()
+            .find(|f| f.description.contains("1 removed"))
+            .expect("expected a drift finding for the removed server");
+        assert_eq!(
+            drift_finding.severity,
+            Severity::Medium,
+            "a Removed drift must NOT upgrade severity from the \
+             `mcp_allowed_tools` ladder — the ladder is about NEW exposure, \
+             never lost exposure: {drift_finding:?}",
+        );
+
+        // The lockfile-side disallowed-tool finding fires too — the
+        // lockfile still records "s" with the offending tool. That finding
+        // is independent of the drift severity ladder (different code path,
+        // own High severity). Pin its presence so the test reflects the
+        // full per-scan output and a future refactor that accidentally
+        // suppresses one of the two findings is caught.
+        let lockfile_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.title.contains("records tools outside"))
+            .collect();
+        assert_eq!(
+            lockfile_findings.len(),
+            1,
+            "the lockfile-side disallowed-tool finding must still fire for \
+             a Removed server whose lockfile record carries a disallowed \
+             tool — its code path is independent of the drift ladder: \
+             {findings:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F23 (PRT II-6) — two findings from one scan:
+    // `check` can emit BOTH the lockfile-side disallowed-tool finding
+    // (`finding_for_disallowed_lockfile_tools`) AND the drift finding
+    // (`finding_for_drift`) in the same call, when both conditions hold.
+    // Existing tests cover each path in isolation but never the cohabitation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_emits_two_findings_when_lockfile_records_disallowed_tools_and_drift_present() {
+        // Setup: a repo declares server "s" with tool "read" (in the
+        // allowed set) — the lockfile records this state.
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "s": { "command": "node",
+                "tools": ["read"] } } }"#,
+        );
+        let old_inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &old_inv);
+
+        // Now manually rewrite the lockfile so it ALSO records a
+        // disallowed tool "evil" for "s" — simulating the failure mode
+        // of "a tool was snuck past `tirith mcp lock`" the lockfile-side
+        // check is designed to catch.
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let lockfile_doctored = r#"{
+            "format_version": 4,
+            "inventory_hash": "x",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": { "kind": "stdio", "command": "node", "args": [], "env": [] },
+                    "tools": ["evil", "read"],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        fs::write(&lock_path, lockfile_doctored).unwrap();
+
+        // Then mutate the config: add a brand-new server "new" so a
+        // drift fires alongside the lockfile-side check.
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": {
+                "s":   { "command": "node", "tools": ["read"] },
+                "new": { "command": "node", "tools": ["read"] }
+            } }"#,
+        );
+
+        // Policy: "s" allows only "read" (so the doctored "evil" tool is
+        // outside the allowed set, firing the lockfile-side finding).
+        let mut allowed = HashMap::new();
+        allowed.insert("s".to_string(), vec!["read".to_string()]);
+
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &[], &allowed);
+
+        assert_eq!(
+            findings.len(),
+            2,
+            "exactly two findings: the lockfile-side disallowed-tool finding \
+             AND the drift finding for the brand-new server. got: {findings:?}",
+        );
+        // Both must be `McpServerDrift` — no new `RuleId` is introduced
+        // by the dual-firing case.
+        for f in &findings {
+            assert_eq!(
+                f.rule_id,
+                RuleId::McpServerDrift,
+                "both findings must use the McpServerDrift rule id: {f:?}",
+            );
+        }
+        // Their titles must be distinct so a reader can tell them apart at
+        // a glance — the lockfile-side title names policy, the drift title
+        // names drift.
+        let titles: std::collections::HashSet<&str> =
+            findings.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles.len(),
+            2,
+            "the two findings must have distinct titles so they are \
+             distinguishable in human / JSON output: titles={titles:?}",
+        );
+        // Pin the actual title content — the lockfile-side finding's
+        // title references the allow-list (the canonical phrase
+        // `records tools outside`), and the drift-side finding's title
+        // references drift.
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("records tools outside")),
+            "one of the two findings must be the lockfile-side disallowed-tool finding: {findings:?}",
+        );
+        assert!(
+            findings.iter().any(|f| f.title.contains("drift")),
+            "one of the two findings must be the drift finding: {findings:?}",
+        );
+    }
 }
