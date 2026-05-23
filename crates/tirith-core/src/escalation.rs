@@ -336,11 +336,12 @@ pub enum CallerContext {
 ///   [`Action::Block`] (no downgrade — Block is the strictest action so
 ///   this is also a no-op when the verdict is already blocked). A fresh
 ///   [`Finding`] with [`RuleId::AgentDeniedByPolicy`] (severity
-///   [`Severity::High`]) is appended naming the matched origin/matcher
-///   (debug-escaped so a hostile caller-claimed string cannot smuggle
-///   control bytes into the operator's terminal when they `cat` the audit
-///   log) and the policy file path. Existing detection findings are
-///   preserved — `agent_rules` is layered on top, not a replacement.
+///   [`Severity::High`]) is appended naming the matched origin AND the
+///   matched matcher (kind + optional name payload, debug-escaped so a
+///   hostile caller-claimed string cannot smuggle control bytes into the
+///   operator's terminal when they `cat` the audit log) plus the policy
+///   file path. Existing detection findings are preserved — `agent_rules`
+///   is layered on top, not a replacement.
 /// * [`crate::policy::AgentDecision::Allowed`] — no behavior change.
 ///   `allow` is not a bypass: a verdict the engine already blocked stays
 ///   blocked even if the caller is on the allow-list. (Chunk 3+ may
@@ -363,7 +364,7 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
         .unwrap_or(crate::policy::AgentDecision::Unspecified);
 
     match decision {
-        crate::policy::AgentDecision::Denied => {
+        crate::policy::AgentDecision::Denied { matcher } => {
             // Debug-escape the origin and policy path so a hostile
             // caller-claimed `TIRITH_INTEGRATION` value (or an MCP
             // `clientInfo.name`) cannot smuggle control bytes through to
@@ -380,8 +381,18 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
                 .as_deref()
                 .map(|p| format!("{p:?}"))
                 .unwrap_or_else(|| "<unloaded>".to_string());
+            // Render the matched matcher cleanly using its closed `kind`
+            // plus the optional `name` payload (debug-escaped — same
+            // control-byte hygiene as origin_repr). Chunk-3 Finding D
+            // restored this payload to `AgentDecision::Denied` so the
+            // description no longer has to fall back to the policy path
+            // alone to identify the rule.
+            let matcher_repr = match matcher.name.as_deref() {
+                Some(payload) => format!("kind: {} name: {:?}", matcher.kind.as_str(), payload),
+                None => format!("kind: {}", matcher.kind.as_str()),
+            };
             let description = format!(
-                "Caller origin {origin_repr} matched a `deny` entry in `agent_rules` (policy: {policy_path_repr}). The verdict is blocked regardless of detection findings. Use `tirith agent allow` to scaffold an allow matcher, or edit `agent_rules.deny` in your policy."
+                "Caller origin {origin_repr} matched a `deny` entry in `agent_rules` ({matcher_repr}; policy: {policy_path_repr}). The verdict is blocked regardless of detection findings. Use `tirith agent allow` to scaffold an allow matcher, or edit `agent_rules.deny` in your policy."
             );
             verdict.findings.push(Finding {
                 rule_id: RuleId::AgentDeniedByPolicy,
@@ -389,7 +400,9 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
                 title: "Caller denied by agent_rules".to_string(),
                 description,
                 evidence: vec![Evidence::Text {
-                    detail: format!("agent_origin={origin_repr}; policy={policy_path_repr}"),
+                    detail: format!(
+                        "agent_origin={origin_repr}; matcher={matcher_repr}; policy={policy_path_repr}"
+                    ),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -399,7 +412,8 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
             verdict.action = Action::Block;
             true
         }
-        crate::policy::AgentDecision::Allowed | crate::policy::AgentDecision::Unspecified => false,
+        crate::policy::AgentDecision::Allowed { .. }
+        | crate::policy::AgentDecision::Unspecified => false,
     }
 }
 
@@ -1119,7 +1133,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Human,
-                    tool: None,
+                    name: None,
                 }],
             },
             ..Default::default()
@@ -1131,7 +1145,7 @@ mod tests {
             agent_rules: crate::policy::AgentRules {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Human,
-                    tool: None,
+                    name: None,
                 }],
                 deny: vec![],
             },
@@ -1168,12 +1182,17 @@ mod tests {
         );
         assert_eq!(result.findings[0].rule_id, RuleId::AgentDeniedByPolicy);
         assert_eq!(result.findings[0].severity, Severity::High);
-        // The description must name the matched origin (debug-escaped) and
-        // the policy file path so the operator can trace the decision.
+        // The description must name the matched origin (debug-escaped),
+        // the matched matcher (kind), and the policy file path so the
+        // operator can trace the decision. Chunk-3 Finding D restored
+        // the matcher payload to `AgentDecision::Denied`, so the kind
+        // string is now first-class in the description rather than
+        // recovered via `{:?}` on the policy path.
         assert!(
             result.findings[0].description.contains("Human")
-                && result.findings[0].description.contains("policy.yaml"),
-            "finding description must name origin + policy: {}",
+                && result.findings[0].description.contains("policy.yaml")
+                && result.findings[0].description.contains("kind: human"),
+            "finding description must name origin + matcher kind + policy: {}",
             result.findings[0].description,
         );
     }
@@ -1285,7 +1304,7 @@ mod tests {
             agent_rules: crate::policy::AgentRules {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
-                    tool: Some("claude-code".to_string()),
+                    name: Some("claude-code".to_string()),
                 }],
                 deny: vec![],
             },
@@ -1380,7 +1399,7 @@ mod tests {
             agent_rules: crate::policy::AgentRules {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
-                    tool: Some("nobody".to_string()),
+                    name: Some("nobody".to_string()),
                 }],
                 deny: vec![],
             },
@@ -1421,7 +1440,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
-                    tool: Some("claude-code".to_string()),
+                    name: Some("claude-code".to_string()),
                 }],
             },
             ..Default::default()

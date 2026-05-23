@@ -201,12 +201,18 @@ pub struct AgentRules {
 /// A single matcher in [`AgentRules`].
 ///
 /// Shape per Q1 of `docs/agent-governance-design.md`: a closed `kind` (the
-/// [`AgentOriginKind`] discriminator) plus an optional `tool` payload
+/// [`AgentOriginKind`] discriminator) plus an optional `name` payload
 /// string that, when present, must equal the variant's caller-claimed
 /// payload. The kinds-and-payloads structure mirrors [`AgentOrigin`]
 /// itself: the operator declares which **category** of caller they care
 /// about (closed enum, no smuggling), and optionally pins the specific
 /// caller-claimed name (free-form, as the design doc recommends).
+///
+/// The field is `name` rather than `tool` because the payload string
+/// means different things by kind: for `kind: agent` it's an upstream
+/// hook tool, for `kind: mcp` it's the client name, for `kind: ci` it's
+/// the provider, and for `kind: ide` it's the editor name. `name` is
+/// neutral across the closed enum.
 ///
 /// String matching is **case-sensitive exact** — `claude-code` does not
 /// match `Claude Code`. The design doc records (Q2) that normalization
@@ -218,11 +224,11 @@ pub struct AgentMatcher {
     pub kind: AgentOriginKind,
     /// Optional caller-claimed payload — the `tool` slot on `Agent`, the
     /// `client_name` on `Mcp`, the `provider` on `Ci`, or the `name` on
-    /// `Ide`. `Human` and `Gateway` have no payload; a `tool` value with
+    /// `Ide`. `Human` and `Gateway` have no payload; a `name` value with
     /// those kinds matches nothing (caught by validation, see
     /// `policy_validate.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Closed enum mirroring the [`AgentOrigin`] discriminator.
@@ -281,13 +287,21 @@ impl AgentOriginKind {
 /// [`crate::verdict::Action::Block`] and appends a
 /// [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding; `Allowed` and
 /// `Unspecified` leave the verdict unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Allowed` / `Denied` carry the [`AgentMatcher`] that triggered the
+/// decision — the first match wins (deny walked before allow), so the
+/// payload is unambiguous. `apply_agent_rules` reads this matcher to
+/// name the rule in the injected finding without falling back to
+/// `{:?}` formatting on the policy path.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDecision {
     /// The origin matched an `allow` matcher and no `deny` matcher (or
-    /// `deny` is empty).
-    Allowed,
+    /// `deny` is empty). The carried matcher is the first allow entry
+    /// that matched.
+    Allowed { matcher: AgentMatcher },
     /// The origin matched a `deny` matcher. Beats any `allow` match.
-    Denied,
+    /// The carried matcher is the first deny entry that matched.
+    Denied { matcher: AgentMatcher },
     /// No matcher in either list applied — the caller falls through.
     Unspecified,
 }
@@ -303,12 +317,12 @@ pub enum AgentDecision {
 ///
 /// Matching rules per matcher:
 /// * `kind` must equal `origin.kind()`.
-/// * If `tool` is `Some(s)`, the matcher's payload must byte-equal the
+/// * If `name` is `Some(s)`, the matcher's payload must byte-equal the
 ///   origin's caller-claimed payload (`Agent::tool`, `Mcp::client_name`,
-///   `Ci::provider`, or `Ide::name`). A `tool` value applied to
+///   `Ci::provider`, or `Ide::name`). A `name` value applied to
 ///   `kind: human` or `kind: gateway` is harmless — it simply matches
 ///   nothing, because those variants carry no caller-claimed payload.
-/// * If `tool` is `None`, the matcher matches every origin of that
+/// * If `name` is `None`, the matcher matches every origin of that
 ///   `kind` regardless of payload.
 ///
 /// **Caller-trust caveat.** The strings being compared are
@@ -319,33 +333,37 @@ pub enum AgentDecision {
 /// observability; layer real authentication elsewhere if the decision
 /// must withstand a hostile environment.
 pub fn agent_decision(policy: &Policy, origin: &AgentOrigin) -> AgentDecision {
-    if policy
+    if let Some(matcher) = policy
         .agent_rules
         .deny
         .iter()
-        .any(|m| matcher_matches(m, origin))
+        .find(|m| matcher_matches(m, origin))
     {
-        return AgentDecision::Denied;
+        return AgentDecision::Denied {
+            matcher: matcher.clone(),
+        };
     }
-    if policy
+    if let Some(matcher) = policy
         .agent_rules
         .allow
         .iter()
-        .any(|m| matcher_matches(m, origin))
+        .find(|m| matcher_matches(m, origin))
     {
-        return AgentDecision::Allowed;
+        return AgentDecision::Allowed {
+            matcher: matcher.clone(),
+        };
     }
     AgentDecision::Unspecified
 }
 
 /// True iff the matcher's `kind` equals the origin's kind AND (the
-/// matcher has no `tool` filter OR the filter byte-equals the origin's
+/// matcher has no `name` filter OR the filter byte-equals the origin's
 /// caller-claimed payload).
 fn matcher_matches(matcher: &AgentMatcher, origin: &AgentOrigin) -> bool {
     if matcher.kind.as_str() != origin.kind() {
         return false;
     }
-    let Some(expected) = matcher.tool.as_deref() else {
+    let Some(expected) = matcher.name.as_deref() else {
         return true;
     };
     match (matcher.kind, origin) {
@@ -355,7 +373,7 @@ fn matcher_matches(matcher: &AgentMatcher, origin: &AgentOrigin) -> bool {
             provider.as_deref() == Some(expected)
         }
         (AgentOriginKind::Ide, AgentOrigin::Ide { name }) => name == expected,
-        // Human / Gateway carry no payload — a `tool` filter cannot match.
+        // Human / Gateway carry no payload — a `name` filter cannot match.
         _ => false,
     }
 }
@@ -1354,16 +1372,16 @@ mod tests {
                 allow: vec![
                     AgentMatcher {
                         kind: AgentOriginKind::Agent,
-                        tool: Some("claude-code".to_string()),
+                        name: Some("claude-code".to_string()),
                     },
                     AgentMatcher {
                         kind: AgentOriginKind::Human,
-                        tool: None,
+                        name: None,
                     },
                 ],
                 deny: vec![AgentMatcher {
                     kind: AgentOriginKind::Mcp,
-                    tool: Some("untrusted-client".to_string()),
+                    name: Some("untrusted-client".to_string()),
                 }],
             },
             ..Default::default()
@@ -1376,17 +1394,17 @@ mod tests {
         assert!(yaml.contains("allow"));
         assert!(yaml.contains("deny"));
         assert!(yaml.contains("claude-code"));
-        // `tool: None` must NOT serialize as `tool: null` — skip_serializing_if
+        // `name: None` must NOT serialize as `name: null` — skip_serializing_if
         // keeps it omitted, mirroring chunk-1's AgentOrigin serialization.
         let human_count = yaml.matches("kind: human").count();
-        let null_tool_count = yaml.matches("tool: null").count();
+        let null_name_count = yaml.matches("name: null").count();
         assert!(
             human_count >= 1,
             "expected at least one kind: human entry in {yaml}",
         );
         assert_eq!(
-            null_tool_count, 0,
-            "tool: null leaked into YAML — must be omitted: {yaml}",
+            null_name_count, 0,
+            "name: null leaked into YAML — must be omitted: {yaml}",
         );
     }
 
@@ -1419,13 +1437,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_decision_allowed_on_kind_match_without_tool_filter() {
+    fn agent_decision_allowed_on_kind_match_without_name_filter() {
+        let allow_matcher = AgentMatcher {
+            kind: AgentOriginKind::Agent,
+            name: None,
+        };
         let policy = Policy {
             agent_rules: AgentRules {
-                allow: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: None,
-                }],
+                allow: vec![allow_matcher.clone()],
                 deny: vec![],
             },
             ..Default::default()
@@ -1433,29 +1452,45 @@ mod tests {
         // Any Agent origin matches.
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
         let cursor = AgentOrigin::agent("cursor", None).unwrap();
-        assert_eq!(agent_decision(&policy, &claude), AgentDecision::Allowed);
-        assert_eq!(agent_decision(&policy, &cursor), AgentDecision::Allowed);
+        assert_eq!(
+            agent_decision(&policy, &claude),
+            AgentDecision::Allowed {
+                matcher: allow_matcher.clone()
+            },
+        );
+        assert_eq!(
+            agent_decision(&policy, &cursor),
+            AgentDecision::Allowed {
+                matcher: allow_matcher
+            },
+        );
         // A different kind still falls through.
         let human = AgentOrigin::human(true);
         assert_eq!(agent_decision(&policy, &human), AgentDecision::Unspecified);
     }
 
     #[test]
-    fn agent_decision_allowed_on_kind_and_tool_exact_match() {
+    fn agent_decision_allowed_on_kind_and_name_exact_match() {
+        let allow_matcher = AgentMatcher {
+            kind: AgentOriginKind::Agent,
+            name: Some("claude-code".to_string()),
+        };
         let policy = Policy {
             agent_rules: AgentRules {
-                allow: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: Some("claude-code".to_string()),
-                }],
+                allow: vec![allow_matcher.clone()],
                 deny: vec![],
             },
             ..Default::default()
         };
         let claude = AgentOrigin::agent("claude-code", Some("1.2.3")).unwrap();
         // Same kind + exact-payload-match → Allowed (the version slot is
-        // ignored by the matcher — only `tool` participates).
-        assert_eq!(agent_decision(&policy, &claude), AgentDecision::Allowed);
+        // ignored by the matcher — only `name` participates).
+        assert_eq!(
+            agent_decision(&policy, &claude),
+            AgentDecision::Allowed {
+                matcher: allow_matcher
+            },
+        );
 
         // Different payload → falls through.
         let cursor = AgentOrigin::agent("cursor", None).unwrap();
@@ -1469,29 +1504,43 @@ mod tests {
     #[test]
     fn agent_decision_deny_beats_allow() {
         // A deny entry wins over any allow entry — chunk-2 ordering contract.
+        let allow_matcher = AgentMatcher {
+            kind: AgentOriginKind::Agent,
+            name: None,
+        };
+        let deny_matcher = AgentMatcher {
+            kind: AgentOriginKind::Agent,
+            name: Some("bad-actor".to_string()),
+        };
         let policy = Policy {
             agent_rules: AgentRules {
-                allow: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: None,
-                }],
-                deny: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: Some("bad-actor".to_string()),
-                }],
+                allow: vec![allow_matcher.clone()],
+                deny: vec![deny_matcher.clone()],
             },
             ..Default::default()
         };
         let bad = AgentOrigin::agent("bad-actor", None).unwrap();
-        assert_eq!(agent_decision(&policy, &bad), AgentDecision::Denied);
+        // The decision must carry the deny matcher payload — chunk 3 Finding D
+        // restored it so `apply_agent_rules` can name the matched rule cleanly.
+        assert_eq!(
+            agent_decision(&policy, &bad),
+            AgentDecision::Denied {
+                matcher: deny_matcher
+            },
+        );
         // But a good actor still gets the broad allow.
         let good = AgentOrigin::agent("claude-code", None).unwrap();
-        assert_eq!(agent_decision(&policy, &good), AgentDecision::Allowed);
+        assert_eq!(
+            agent_decision(&policy, &good),
+            AgentDecision::Allowed {
+                matcher: allow_matcher
+            },
+        );
     }
 
     #[test]
     fn agent_decision_payload_filter_on_payloadless_kind_matches_nothing() {
-        // Filtering by `tool` on Human / Gateway has no payload to match, so
+        // Filtering by `name` on Human / Gateway has no payload to match, so
         // the matcher matches nothing. (Validation flags this as a warning;
         // the decision helper must still behave deterministically.)
         let policy = Policy {
@@ -1499,21 +1548,23 @@ mod tests {
                 allow: vec![
                     AgentMatcher {
                         kind: AgentOriginKind::Human,
-                        tool: Some("xyz".to_string()),
+                        name: Some("xyz".to_string()),
                     },
                     AgentMatcher {
                         kind: AgentOriginKind::Gateway,
-                        tool: Some("xyz".to_string()),
+                        name: Some("xyz".to_string()),
                     },
                 ],
                 deny: vec![],
             },
             ..Default::default()
         };
+        // No matcher payload is asserted here — the contract is that NONE of
+        // them match, so the variant is Unspecified (no payload to carry).
         assert_eq!(
             agent_decision(&policy, &AgentOrigin::human(true)),
             AgentDecision::Unspecified,
-            "tool filter on payloadless kind must not match",
+            "name filter on payloadless kind must not match",
         );
         assert_eq!(
             agent_decision(&policy, &AgentOrigin::Gateway),
@@ -1523,22 +1574,21 @@ mod tests {
 
     #[test]
     fn agent_decision_for_mcp_ci_ide_payloads() {
+        let mcp_matcher = AgentMatcher {
+            kind: AgentOriginKind::Mcp,
+            name: Some("Cursor".to_string()),
+        };
+        let ci_matcher = AgentMatcher {
+            kind: AgentOriginKind::Ci,
+            name: Some("github-actions".to_string()),
+        };
+        let ide_matcher = AgentMatcher {
+            kind: AgentOriginKind::Ide,
+            name: Some("vscode".to_string()),
+        };
         let policy = Policy {
             agent_rules: AgentRules {
-                allow: vec![
-                    AgentMatcher {
-                        kind: AgentOriginKind::Mcp,
-                        tool: Some("Cursor".to_string()),
-                    },
-                    AgentMatcher {
-                        kind: AgentOriginKind::Ci,
-                        tool: Some("github-actions".to_string()),
-                    },
-                    AgentMatcher {
-                        kind: AgentOriginKind::Ide,
-                        tool: Some("vscode".to_string()),
-                    },
-                ],
+                allow: vec![mcp_matcher.clone(), ci_matcher.clone(), ide_matcher.clone()],
                 deny: vec![],
             },
             ..Default::default()
@@ -1546,9 +1596,24 @@ mod tests {
         let cursor = AgentOrigin::mcp("Cursor", None).unwrap();
         let gha = AgentOrigin::ci(Some("github-actions"));
         let vsc = AgentOrigin::ide("vscode").unwrap();
-        assert_eq!(agent_decision(&policy, &cursor), AgentDecision::Allowed);
-        assert_eq!(agent_decision(&policy, &gha), AgentDecision::Allowed);
-        assert_eq!(agent_decision(&policy, &vsc), AgentDecision::Allowed);
+        assert_eq!(
+            agent_decision(&policy, &cursor),
+            AgentDecision::Allowed {
+                matcher: mcp_matcher
+            },
+        );
+        assert_eq!(
+            agent_decision(&policy, &gha),
+            AgentDecision::Allowed {
+                matcher: ci_matcher
+            },
+        );
+        assert_eq!(
+            agent_decision(&policy, &vsc),
+            AgentDecision::Allowed {
+                matcher: ide_matcher
+            },
+        );
 
         // A generic CI (provider: None) does NOT match a payload filter.
         let generic_ci = AgentOrigin::ci(None);
@@ -1657,15 +1722,16 @@ mod tests {
     #[test]
     fn agent_rules_chunk2_observation_only_invariant() {
         let base = Policy::default();
+        let allow_matcher = AgentMatcher {
+            kind: AgentOriginKind::Agent,
+            name: Some("claude-code".to_string()),
+        };
         let with_rules = Policy {
             agent_rules: AgentRules {
-                allow: vec![AgentMatcher {
-                    kind: AgentOriginKind::Agent,
-                    tool: Some("claude-code".to_string()),
-                }],
+                allow: vec![allow_matcher.clone()],
                 deny: vec![AgentMatcher {
                     kind: AgentOriginKind::Mcp,
-                    tool: None,
+                    name: None,
                 }],
             },
             ..Default::default()
@@ -1687,7 +1753,12 @@ mod tests {
         // The decision helper produces sensible answers — and chunk 3 wires
         // these through `post_process_verdict` (see `escalation.rs` tests).
         let origin = AgentOrigin::agent("claude-code", None).unwrap();
-        assert_eq!(agent_decision(&with_rules, &origin), AgentDecision::Allowed);
+        assert_eq!(
+            agent_decision(&with_rules, &origin),
+            AgentDecision::Allowed {
+                matcher: allow_matcher
+            },
+        );
         assert_eq!(agent_decision(&base, &origin), AgentDecision::Unspecified);
     }
 }

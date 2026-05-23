@@ -370,14 +370,26 @@ pub fn sanitize_caller_version(raw: &str) -> String {
 
 /// True for codepoints we never want to round-trip through the agent-origin
 /// payload: bidi controls, zero-width characters, Unicode tags, variation
-/// selectors, surrogates, and other format-class characters. Mirrors the byte
-/// classes tirith already flags in command input — re-emitting them via the
-/// origin label would be self-defeating.
+/// selectors, surrogates, C1 controls (CSI/OSC/APC/DCS), and other
+/// format-class characters. Mirrors the byte classes tirith already flags
+/// in command input — re-emitting them via the origin label would be
+/// self-defeating.
+///
+/// **C1 controls (U+0080..U+009F)** are included because the C0 control
+/// drop in [`sanitize_caller_label`] catches `< 0x20` only — a hostile
+/// caller could otherwise route an ANSI control sequence introducer
+/// (U+009B = CSI) or operating-system-command introducer (U+009D = OSC)
+/// past sanitization and into the operator's terminal at
+/// `tirith agent explain` time.
 fn is_invisible_or_format(ch: char) -> bool {
     matches!(
         ch as u32,
+        // C1 controls (U+0080..U+009F) — includes CSI (0x9B), OSC (0x9D),
+        // DCS (0x90), APC (0x9F), and the rest of the C1 family. Not
+        // covered by the C0 (`< 0x20`) check in `sanitize_caller_label`.
+        0x80..=0x9F
         // Bidirectional controls (U+202A..U+202E, U+2066..U+2069)
-        0x202A..=0x202E
+        | 0x202A..=0x202E
         | 0x2066..=0x2069
         // Zero-width characters (ZWSP, ZWNJ, ZWJ, WJ)
         | 0x200B..=0x200D
@@ -475,6 +487,31 @@ mod tests {
         assert!(!clean.contains('\u{E0041}'));
         assert!(clean.contains("claude"));
         assert!(clean.contains("code"));
+    }
+
+    #[test]
+    fn sanitize_label_drops_c1_controls() {
+        // C1 controls (U+0080..U+009F) include CSI (U+009B), OSC (U+009D),
+        // DCS (U+0090), APC (U+009F) — these are *not* `< 0x20` so the C0
+        // drop in sanitize_caller_label doesn't catch them. They have to
+        // be filtered via is_invisible_or_format, otherwise a hostile
+        // caller could ship an 8-bit CSI past sanitization and into the
+        // operator's terminal at `tirith agent explain` time. This is the
+        // ingest-side belt-and-braces; the human-output path also uses
+        // `{:?}` (Finding G part 1).
+        let hostile = "cur\u{009B}sor\u{009D}name\u{0090}\u{009F}";
+        let clean = sanitize_caller_label(hostile);
+        for c1 in ['\u{0080}', '\u{0090}', '\u{009B}', '\u{009D}', '\u{009F}'] {
+            assert!(
+                !clean.contains(c1),
+                "C1 control U+{:04X} survived sanitizer: {clean:?}",
+                c1 as u32,
+            );
+        }
+        assert!(
+            clean.starts_with("cur"),
+            "ASCII prefix must survive: {clean:?}"
+        );
     }
 
     #[test]

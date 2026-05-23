@@ -376,12 +376,14 @@ operator reviews and uncomments what they intend to declare.
 
 ### `tirith agent allow --kind <kind> [--tool <name>]`
 
-Validates an `(kind, tool?)` matcher and **prints the YAML snippet**
+Validates an `(kind, name?)` matcher and **prints the YAML snippet**
 the operator pastes under `agent_rules.allow:`. **Does NOT mutate any
 policy file** — the operator integrates the snippet themselves so an
 honest review precedes any widening of trust (mirrors `tirith mcp
 policy init`). The snippet is pasted into `.tirith/policy.yaml` (or
-`.tirith/agent-policy.yaml.example`).
+`.tirith/agent-policy.yaml.example`). The CLI flag is `--tool` (the
+historical name); the YAML field it populates is `name` (the
+post-chunk-3 schema field — neutral across the closed `kind` enum).
 
 ```text
 $ tirith agent allow --kind agent --tool claude-code
@@ -389,7 +391,7 @@ tirith agent allow: valid matcher — paste the snippet below under `agent_rules
   (NOTE: `allow` is not a bypass — a verdict the engine already blocked stays blocked even when the caller is on the allow list. `deny` beats `allow`.)
 
     - kind: agent
-      tool: claude-code
+      name: claude-code
 ```
 
 Validation rules:
@@ -409,26 +411,31 @@ Chunk 2 added the schema; **chunk 3 consumes it in
 agent_rules:
   allow:
     - kind: agent
-      tool: claude-code
+      name: claude-code
     - kind: human
   deny:
     - kind: agent
-      tool: untrusted-tool
+      name: untrusted-tool
 ```
 
 * `kind` is the [`AgentOriginKind`] discriminator (`human` / `agent`
   / `mcp` / `gateway` / `ci` / `ide`).
-* `tool` is the optional caller-claimed payload — the `tool` slot on
+* `name` is the optional caller-claimed payload — the `tool` slot on
   `Agent`, the `client_name` on `Mcp`, the `provider` on `Ci`, or the
-  `name` on `Ide`. Case-sensitive exact match. A `tool` filter on
-  `human` / `gateway` is structurally meaningless: it is flagged by
-  `tirith policy validate` as a warning (a slightly stale policy still
-  loads — `policy validate` exits `0` unless a hard error fires) and
-  rejected by `tirith agent allow` as a hard error (exit `1`) so the
-  operator catches the mistake at scaffolding time.
+  `name` on `Ide`. The field is called `name` rather than `tool`
+  because the payload means different things by kind; `name` is
+  neutral across the closed enum. Case-sensitive exact match. A
+  `name` filter on `human` / `gateway` is structurally meaningless:
+  it is flagged by `tirith policy validate` as a warning (a slightly
+  stale policy still loads — `policy validate` exits `0` unless a
+  hard error fires) and rejected by `tirith agent allow` as a hard
+  error (exit `1`) so the operator catches the mistake at scaffolding
+  time.
 * The pure helper `policy::agent_decision(&policy, &origin) ->
-  AgentDecision` walks `deny` first (first match → `Denied`) then
-  `allow` (first match → `Allowed`); no match → `Unspecified`.
+  AgentDecision` walks `deny` first (first match → `Denied { matcher }`)
+  then `allow` (first match → `Allowed { matcher }`); no match →
+  `Unspecified`. The matcher payload is what `apply_agent_rules` uses
+  to name the matched rule in the injected finding.
 
 #### Chunk-3 enforcement semantics
 
@@ -437,7 +444,7 @@ agent_rules:
 
 | `agent_decision` returns | Effect on the verdict |
 |---|---|
-| `Denied { matcher }` | `action = Block`; a fresh `Finding { rule_id: RuleId::AgentDeniedByPolicy, severity: High, … }` is appended naming the matched origin (Debug-escaped) and the policy file path. Existing detection findings are preserved. |
+| `Denied { matcher }` | `action = Block`; a fresh `Finding { rule_id: RuleId::AgentDeniedByPolicy, severity: High, … }` is appended naming the matched origin (Debug-escaped), the matched matcher (kind + optional name payload, also Debug-escaped), and the policy file path. Existing detection findings are preserved. |
 | `Allowed { matcher }` | No behavior change. `allow` is **not** a bypass — a verdict the engine already blocked stays blocked. |
 | `Unspecified` | No behavior change. |
 | (`verdict.agent_origin == None`) | Treated as `Unspecified` — an engine path that never set an origin has nothing to match against. |

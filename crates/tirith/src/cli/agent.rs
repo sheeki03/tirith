@@ -296,30 +296,39 @@ fn print_sessions_human(log_path: &Path, groups: &[SessionGroup], skipped: usize
     );
     eprintln!();
     for g in groups {
-        let key = OriginGroupKey {
-            kind: g.kind.clone(),
-            payload: g.payload.clone(),
-            interactive_flag: g.interactive,
-        };
-        let allow = g.actions.get("Allow").copied().unwrap_or(0);
-        let warn = g.actions.get("Warn").copied().unwrap_or(0)
-            + g.actions.get("WarnAck").copied().unwrap_or(0);
-        let block = g.actions.get("Block").copied().unwrap_or(0);
-        let last = if g.last_seen.is_empty() {
-            "-".to_string()
-        } else {
-            g.last_seen.clone()
-        };
-        eprintln!(
-            "  {label:<40}  count={count}  allow={allow}  warn={warn}  block={block}  last={last}",
-            label = key.label(),
-            count = g.count,
-        );
+        eprint!("{}", format_session_group(g));
     }
     if skipped > 0 {
         eprintln!();
         eprintln!("  ({skipped} malformed audit line(s) were skipped during read.)");
     }
+}
+
+/// Render a single `SessionGroup` as the human-output row.
+/// Split out from [`print_sessions_human`] so the formatter is
+/// unit-testable without redirecting stderr. `key.label()` already
+/// debug-escapes its caller-claimed payload via `{:?}` (see
+/// [`OriginGroupKey::label`]); `last_seen` is operator-trust input
+/// (loaded from the audit log JSONL) and is also debug-printed at this
+/// site so a stray control byte from a tampered or older-tirith log row
+/// renders as `\u{...}` rather than reaching the terminal raw.
+/// (Finding G — defense-in-depth.)
+fn format_session_group(g: &SessionGroup) -> String {
+    let key = OriginGroupKey {
+        kind: g.kind.clone(),
+        payload: g.payload.clone(),
+        interactive_flag: g.interactive,
+    };
+    let allow = g.actions.get("Allow").copied().unwrap_or(0);
+    let warn = g.actions.get("Warn").copied().unwrap_or(0)
+        + g.actions.get("WarnAck").copied().unwrap_or(0);
+    let block = g.actions.get("Block").copied().unwrap_or(0);
+    format!(
+        "  {label:<40}  count={count}  allow={allow}  warn={warn}  block={block}  last={last:?}\n",
+        label = key.label(),
+        count = g.count,
+        last = g.last_seen,
+    )
 }
 
 // ===========================================================================
@@ -495,38 +504,54 @@ fn print_explain_human(log_path: &Path, query: &str, matches: &[ExplainMatch], t
     }
     eprintln!();
     for m in matches {
-        let origin = m
-            .agent_origin
-            .as_ref()
-            .map(label_origin)
-            .unwrap_or_else(|| "unknown".to_string());
-        let rules = if m.rule_ids.is_empty() {
-            "-".to_string()
-        } else {
-            m.rule_ids.join(",")
-        };
-        // Command is already DLP-redacted by the audit writer; debug-print
-        // it so any control bytes that survived redaction are escaped
-        // (defensive — the redact path strips them, but printing through
-        // `{:?}` makes the contract explicit at this print site).
-        eprintln!(
-            "  {ts}  session={sid}  origin={origin}  action={action}  rules={rules}",
-            ts = m.timestamp,
-            sid = m.session_id,
-            action = m.action,
-        );
-        eprintln!("      command: {:?}", m.command_redacted);
-        if m.bypass_requested {
-            eprintln!(
-                "      bypass: requested={}  honored={}",
-                m.bypass_requested, m.bypass_honored
-            );
-        }
-        if let Some(p) = m.policy_path.as_deref() {
-            eprintln!("      policy: {p}");
-        }
-        eprintln!();
+        eprint!("{}", format_explain_match(m));
     }
+}
+
+/// Render a single `ExplainMatch` as the multi-line human-output block.
+/// Split out from [`print_explain_human`] so the formatter is unit-testable
+/// without redirecting stderr. **Every caller-controlled string is
+/// debug-printed (`{:?}`)** — `timestamp`, `session_id`, `action`,
+/// `rule_ids`, `command_redacted`, and `policy_path` are all loaded from
+/// the JSONL audit log and are operator-trust input. Sanitization at
+/// ingest drops the worst bytes (C0 + C1 controls + Unicode
+/// invisible/format), but an operator reading a log file written by an
+/// older tirith may still encounter a row a previous sanitizer let
+/// through. Debug-printing at this site is belt-and-braces so a surviving
+/// control byte renders as `\u{...}` rather than reaching the terminal
+/// raw. (Finding G — silent-failure-hunter H1.) `label_origin` already
+/// applies the same discipline to the embedded caller-claimed payload.
+fn format_explain_match(m: &ExplainMatch) -> String {
+    let origin = m
+        .agent_origin
+        .as_ref()
+        .map(label_origin)
+        .unwrap_or_else(|| "unknown".to_string());
+    let rules_joined = if m.rule_ids.is_empty() {
+        "-".to_string()
+    } else {
+        m.rule_ids.join(",")
+    };
+    let mut s = String::new();
+    s.push_str(&format!(
+        "  {ts:?}  session={sid:?}  origin={origin}  action={action:?}  rules={rules:?}\n",
+        ts = m.timestamp,
+        sid = m.session_id,
+        action = m.action,
+        rules = rules_joined,
+    ));
+    s.push_str(&format!("      command: {:?}\n", m.command_redacted));
+    if m.bypass_requested {
+        s.push_str(&format!(
+            "      bypass: requested={}  honored={}\n",
+            m.bypass_requested, m.bypass_honored,
+        ));
+    }
+    if let Some(p) = m.policy_path.as_deref() {
+        s.push_str(&format!("      policy: {p:?}\n"));
+    }
+    s.push('\n');
+    s
 }
 
 // ===========================================================================
@@ -713,12 +738,12 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
         s.push_str("# agent_rules:\n");
         s.push_str("#   allow:\n");
         s.push_str("#     - kind: agent\n");
-        s.push_str("#       tool: claude-code\n");
+        s.push_str("#       name: claude-code\n");
         s.push_str("#     - kind: mcp\n");
-        s.push_str("#       tool: Cursor\n");
+        s.push_str("#       name: Cursor\n");
         s.push_str("#   deny:\n");
         s.push_str("#     - kind: agent\n");
-        s.push_str("#       tool: untrusted-tool\n");
+        s.push_str("#       name: untrusted-tool\n");
         return s;
     }
 
@@ -751,7 +776,7 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
             }
             (kind, Some(payload)) => {
                 s.push_str(&format!(
-                    "  #   - kind: {kind}\n  #     tool: {}    # {} entries\n",
+                    "  #   - kind: {kind}\n  #     name: {}    # {} entries\n",
                     yaml_safe_scalar(payload),
                     o.count,
                 ));
@@ -767,7 +792,7 @@ fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
     s.push_str("  # allowlist elsewhere in this policy). Example:\n");
     s.push_str("  # deny:\n");
     s.push_str("  #   - kind: agent\n");
-    s.push_str("  #     tool: untrusted-tool\n");
+    s.push_str("  #     name: untrusted-tool\n");
     s
 }
 
@@ -865,7 +890,7 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
 
     let matcher = AgentMatcher {
         kind,
-        tool: tool.map(|s| s.to_string()),
+        name: tool.map(|s| s.to_string()),
     };
 
     let snippet = render_allow_snippet(&matcher);
@@ -904,8 +929,8 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
 fn render_allow_snippet(m: &AgentMatcher) -> String {
     let mut s = String::new();
     s.push_str(&format!("    - kind: {}\n", m.kind.as_str()));
-    if let Some(t) = m.tool.as_deref() {
-        s.push_str(&format!("      tool: {}\n", yaml_safe_scalar(t)));
+    if let Some(t) = m.name.as_deref() {
+        s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
     }
     s
 }
@@ -1299,6 +1324,120 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // human-output ANSI/CSI defense (Finding G)
+    // -----------------------------------------------------------------------
+    //
+    // `print_explain_human` / `print_sessions_human` render strings loaded
+    // from the JSONL audit log. Sanitization at ingest drops the worst
+    // bytes (`agent_origin::sanitize_caller_label` now drops C0 + C1
+    // controls + Unicode invisible/format), but an operator reading a log
+    // file written by an older tirith may still encounter a row a previous
+    // sanitizer let through. The formatter helpers route every
+    // caller-controlled string through `{:?}` (Debug) as defense-in-depth.
+    // These tests construct hostile-looking inputs and assert the rendered
+    // bytes are printable-only — every escape sequence introducer / NUL /
+    // newline must appear as `\u{...}` or `\n`, never as the raw byte.
+
+    /// Returns `true` if every byte is printable ASCII, a tab, or part of a
+    /// well-formed UTF-8 sequence. We disallow ESC (0x1B), CSI (0x9B-as-byte
+    /// is part of UTF-8 lead, so it cannot appear bare in &str), NUL, and
+    /// any bare C0 / C1 byte that would reach the terminal as-is. The
+    /// formatter helpers use `{:?}` so all these arrive escaped; this
+    /// helper makes the assertion explicit at the bytes level.
+    fn is_printable_only(bytes: &[u8]) -> bool {
+        for &b in bytes {
+            // Allowed: printable ASCII (0x20..=0x7E), tab (0x09), newline
+            // (0x0A — emitted intentionally by the formatter between
+            // entries), or any byte >= 0x80 (UTF-8 continuation/lead — the
+            // string we received is &str so high bytes are well-formed and
+            // the Debug-printed escape already neutralized any C1 controls).
+            let ok = (0x20..=0x7E).contains(&b) || b == b'\t' || b == b'\n' || b >= 0x80;
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn format_explain_match_debug_escapes_hostile_caller_strings() {
+        // Construct an ExplainMatch with hostile bytes in EVERY
+        // caller-controlled string slot. These would never survive
+        // `sanitize_caller_label` at ingest today (after the C1 extension
+        // in this commit), but an older tirith may have logged them. The
+        // formatter is the defense-in-depth layer.
+        let hostile_origin = AgentOrigin::Mcp {
+            // `Mcp` constructor sanitizes its inputs, so we build the
+            // variant directly to skip that path and simulate "a log file
+            // written by older tirith". The literal here is well-formed
+            // UTF-8; `{:?}` will escape it as `\u{1b}` etc.
+            client_name: "evil\x1b[31mtool".to_string(),
+            client_version: None,
+        };
+        let m = ExplainMatch {
+            timestamp: "2026-05-22T\x1b[2J10:00:00".to_string(),
+            session_id: "sess\x1b[31mabc".to_string(),
+            action: "Bl\x1bock".to_string(),
+            rule_ids: vec!["rule\x1b1".to_string(), "rule\x002".to_string()],
+            command_redacted: "rm -rf\x1b[31m /".to_string(),
+            bypass_requested: false,
+            bypass_honored: false,
+            agent_origin: Some(hostile_origin),
+            policy_path: Some("/tmp/\x1b[31mevil.yaml".to_string()),
+        };
+        let rendered = format_explain_match(&m);
+        assert!(
+            !rendered.contains('\x1b'),
+            "raw ESC must not reach the operator's terminal: {rendered:?}",
+        );
+        assert!(
+            !rendered.contains('\x00'),
+            "raw NUL must not reach the operator's terminal: {rendered:?}",
+        );
+        assert!(
+            is_printable_only(rendered.as_bytes()),
+            "format_explain_match must emit printable-only bytes: {rendered:?}",
+        );
+        // Cross-check that the operator can still see the *content* of the
+        // hostile strings, escaped — `{:?}` renders ESC as `\u{1b}`.
+        assert!(
+            rendered.contains("\\u{1b}"),
+            "Debug-escaped ESC must surface as `\\u{{1b}}`: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn format_session_group_debug_escapes_hostile_last_seen() {
+        use std::collections::BTreeMap;
+        let mut actions = BTreeMap::new();
+        actions.insert("Allow".to_string(), 1);
+        let g = SessionGroup {
+            kind: "mcp".to_string(),
+            // The label embeds this payload through `{:?}` already
+            // (`OriginGroupKey::label`); the test still confirms the
+            // assembled bytes are clean.
+            payload: Some("ev\x1b[31mil".to_string()),
+            interactive: None,
+            count: 1,
+            last_seen: "2026\x1b[2J-05-22".to_string(),
+            actions,
+        };
+        let rendered = format_session_group(&g);
+        assert!(
+            !rendered.contains('\x1b'),
+            "raw ESC must not reach the operator's terminal: {rendered:?}",
+        );
+        assert!(
+            is_printable_only(rendered.as_bytes()),
+            "format_session_group must emit printable-only bytes: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("\\u{1b}"),
+            "Debug-escaped ESC must surface as `\\u{{1b}}`: {rendered:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // policy_init
     // -----------------------------------------------------------------------
 
@@ -1556,7 +1695,7 @@ mod tests {
         // pasting, and a broken render would break that.
         let snippet = render_allow_snippet(&AgentMatcher {
             kind: AgentOriginKind::Agent,
-            tool: Some("claude-code".to_string()),
+            name: Some("claude-code".to_string()),
         });
         let yaml = format!("agent_rules:\n  allow:\n{snippet}");
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("snippet parses");
@@ -1575,7 +1714,7 @@ mod tests {
         // Hostile payload — ANSI escape, newline. Must be quoted-and-escaped.
         let snippet = render_allow_snippet(&AgentMatcher {
             kind: AgentOriginKind::Agent,
-            tool: Some("ev\x1b[31mil".to_string()),
+            name: Some("ev\x1b[31mil".to_string()),
         });
         assert!(!snippet.contains('\x1b'));
         let yaml = format!("agent_rules:\n  allow:\n{snippet}");

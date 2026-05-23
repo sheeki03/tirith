@@ -104,11 +104,11 @@ scan:
 # agent_rules:
 #   allow:
 #     - kind: agent
-#       tool: claude-code
+#       name: claude-code
 #     - kind: human
 #   deny:
 #     - kind: agent
-#       tool: untrusted-tool
+#       name: untrusted-tool
 "#;
 
 const MINIMAL_TEMPLATE: &str = r#"fail_mode: open
@@ -186,7 +186,7 @@ scan:
 # agent_rules:
 #   allow:
 #     - kind: agent
-#       tool: claude-code
+#       name: claude-code
 "#;
 
 /// `ci-strict` — locked-down settings for an automated CI environment.
@@ -263,7 +263,7 @@ scan:
 # agent_rules:
 #   allow:
 #     - kind: ci
-#       tool: github-actions
+#       name: github-actions
 "#;
 
 /// `ai-agent-heavy` — tuned for environments where AI agents run many
@@ -366,12 +366,12 @@ scan:
 # agent_rules:
 #   allow:
 #     - kind: agent
-#       tool: claude-code
+#       name: claude-code
 #     - kind: agent
-#       tool: cursor
+#       name: cursor
 #   deny:
 #     - kind: agent
-#       tool: untrusted-agent
+#       name: untrusted-agent
 "#;
 
 /// A curated starter policy selected via `tirith policy init --template`.

@@ -386,15 +386,15 @@ fn validate_escalation_rules(policy: &crate::policy::Policy, issues: &mut Vec<Po
 /// **schema validation only** — the engine consumes `agent_rules` at
 /// runtime via [`crate::escalation::apply_agent_rules`], but the
 /// validator's job is limited to flagging matchers shaped wrong
-/// (e.g. a `tool` filter on a payloadless kind), not predicting whether
+/// (e.g. a `name` filter on a payloadless kind), not predicting whether
 /// a matcher will ever fire in practice.
 ///
 /// Diagnostics:
-/// * A `tool` filter on a payloadless kind (`human`, `gateway`) is a
+/// * A `name` filter on a payloadless kind (`human`, `gateway`) is a
 ///   warning — it matches nothing by construction. The decision helper
 ///   in `policy.rs` is deterministic about that, but the operator most
-///   likely meant a different `kind` or no `tool` filter at all.
-/// * An empty `tool` string (`tool: ""`) is a warning — a zero-length
+///   likely meant a different `kind` or no `name` filter at all.
+/// * An empty `name` string (`name: ""`) is a warning — a zero-length
 ///   match accepts only a payload that itself sanitized to empty, which
 ///   the `AgentOrigin` constructors reject up-front.
 fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
@@ -404,7 +404,7 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
     ] {
         for (i, matcher) in list.iter().enumerate() {
             // Payload filter on a payloadless kind.
-            if matcher.tool.is_some()
+            if matcher.name.is_some()
                 && matches!(
                     matcher.kind,
                     crate::policy::AgentOriginKind::Human | crate::policy::AgentOriginKind::Gateway
@@ -413,23 +413,23 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
                 issues.push(PolicyIssue {
                     level: IssueLevel::Warning,
                     message: format!(
-                        "{list_name}[{i}]: a `tool` filter on `kind: {}` matches nothing — \
+                        "{list_name}[{i}]: a `name` filter on `kind: {}` matches nothing — \
                          that variant carries no caller-claimed payload",
                         matcher.kind.as_str()
                     ),
-                    field: Some(format!("{list_name}[{i}].tool")),
+                    field: Some(format!("{list_name}[{i}].name")),
                 });
             }
 
             // Empty payload string.
-            if matches!(matcher.tool.as_deref(), Some("")) {
+            if matches!(matcher.name.as_deref(), Some("")) {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Warning,
                     message: format!(
-                        "{list_name}[{i}]: `tool: \"\"` matches nothing — the AgentOrigin \
+                        "{list_name}[{i}]: `name: \"\"` matches nothing — the AgentOrigin \
                          constructors reject an empty caller-claimed payload"
                     ),
-                    field: Some(format!("{list_name}[{i}].tool")),
+                    field: Some(format!("{list_name}[{i}].name")),
                 });
             }
         }
@@ -644,7 +644,7 @@ custom_rules:
 
     #[test]
     fn test_agent_rules_valid_kinds_no_warnings() {
-        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      tool: claude-code\n    - kind: mcp\n  deny:\n    - kind: ci\n      tool: github-actions\n";
+        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      name: claude-code\n    - kind: mcp\n  deny:\n    - kind: ci\n      name: github-actions\n";
         let issues = validate(yaml);
         assert!(
             issues.iter().all(|i| i.level != IssueLevel::Error),
@@ -653,36 +653,36 @@ custom_rules:
     }
 
     #[test]
-    fn test_agent_rules_tool_filter_on_human_warns() {
-        let yaml = "agent_rules:\n  allow:\n    - kind: human\n      tool: xyz\n";
+    fn test_agent_rules_name_filter_on_human_warns() {
+        let yaml = "agent_rules:\n  allow:\n    - kind: human\n      name: xyz\n";
         let issues = validate(yaml);
         assert!(
             issues
                 .iter()
                 .any(|i| i.message.contains("matches nothing") && i.message.contains("human")),
-            "tool filter on `kind: human` must warn: {issues:?}"
+            "name filter on `kind: human` must warn: {issues:?}"
         );
     }
 
     #[test]
-    fn test_agent_rules_tool_filter_on_gateway_warns() {
-        let yaml = "agent_rules:\n  deny:\n    - kind: gateway\n      tool: anywhere\n";
+    fn test_agent_rules_name_filter_on_gateway_warns() {
+        let yaml = "agent_rules:\n  deny:\n    - kind: gateway\n      name: anywhere\n";
         let issues = validate(yaml);
         assert!(
             issues
                 .iter()
                 .any(|i| i.message.contains("matches nothing") && i.message.contains("gateway")),
-            "tool filter on `kind: gateway` must warn: {issues:?}"
+            "name filter on `kind: gateway` must warn: {issues:?}"
         );
     }
 
     #[test]
-    fn test_agent_rules_empty_tool_string_warns() {
-        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      tool: \"\"\n";
+    fn test_agent_rules_empty_name_string_warns() {
+        let yaml = "agent_rules:\n  allow:\n    - kind: agent\n      name: \"\"\n";
         let issues = validate(yaml);
         assert!(
-            issues.iter().any(|i| i.message.contains("`tool: \"\"`")),
-            "empty tool string must warn: {issues:?}"
+            issues.iter().any(|i| i.message.contains("`name: \"\"`")),
+            "empty name string must warn: {issues:?}"
         );
     }
 
