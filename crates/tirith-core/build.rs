@@ -382,9 +382,12 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     },
     PatternEntry {
         id: "ps_set_execution_policy",
-        tier1_exec_fragments: &[r"(?i:Set-ExecutionPolicy|sep)\b"],
+        tier1_exec_fragments: &[
+            r"(?i:Set-ExecutionPolicy)\b",
+            r"-(?i:ExecutionPolicy)\b",
+        ],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Set-ExecutionPolicy Bypass — disables script signing enforcement",
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy flag form",
     },
     PatternEntry {
         id: "ps_defender_exclusion",

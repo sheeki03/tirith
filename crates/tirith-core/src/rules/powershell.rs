@@ -18,9 +18,23 @@
 //! interpreters). Double-firing would noise up the verdict and confuse
 //! downstream policy.
 //!
+//! Only the *pipe* separators (`|`, `|&`) are skipped — non-pipe separators
+//! like `;`, `&&`, and `||` start fresh commands that `pipe_to_interpreter`
+//! does NOT match, so `check_inline_download_execute` still fires on them
+//! (e.g. `true; iex (iwr url)`).
+//!
+//! Note: PowerShell pre-7 does not tokenize `&&`/`||` as pipeline chain
+//! operators (PowerShell 7+ does). The PS tokenizer in `tokenize.rs`
+//! currently splits on `|`, `;`, `-and`, `-or`, and newline only. The
+//! `is_pipe_separator` guard is written to be correct for *any* future
+//! tokenizer addition: as long as the new separator string is anything
+//! other than `"|"` or `"|&"`, the rule will fire as intended.
+//!
 //! The negative fixture `ps_iex_pipe_already_covered_not_double` in
-//! `tests/fixtures/command.toml` pins this boundary — its `preceding_separator`
-//! is `Some("|")`, so `check_inline_download_execute` correctly skips it.
+//! `tests/fixtures/command.toml` pins the pipe boundary — its
+//! `preceding_separator` is `Some("|")`, so `check_inline_download_execute`
+//! correctly skips it. The fixture `ps_iex_inline_after_semicolon_chained`
+//! pins the chained-`;` case (the immediate bug fix).
 //!
 //! ## Engine wiring
 //!
@@ -53,8 +67,13 @@ pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
 
 /// Detect both shapes of `Set-ExecutionPolicy Bypass`:
 ///
-/// 1. Cmdlet form — leading command `set-executionpolicy` (or alias `sep`)
-///    with `bypass` somewhere in the args (case-insensitive after normalize).
+/// 1. Cmdlet form — leading command `set-executionpolicy` with `bypass`
+///    somewhere in the args (case-insensitive after normalize).
+///    Note: `sep` is *not* a default PowerShell alias for
+///    `Set-ExecutionPolicy` (`Get-Alias sep` returns nothing on a clean
+///    install). It is intentionally not matched here — including it
+///    triggered tier-1 false-positives for benign inputs that happen to
+///    contain the bare token `sep` (e.g. `$sep = ","`).
 /// 2. Flag form — leading command `powershell` (or `pwsh`) with both
 ///    `-executionpolicy` and `bypass` in the args.
 fn check_set_execution_policy(
@@ -66,7 +85,7 @@ fn check_set_execution_policy(
         let Some(ref cmd) = seg.command else { continue };
         let cmd_base = normalize_cmd_base(cmd, shell);
 
-        let cmdlet_path = matches!(cmd_base.as_str(), "set-executionpolicy" | "sep");
+        let cmdlet_path = cmd_base.as_str() == "set-executionpolicy";
         let flag_path = matches!(cmd_base.as_str(), "powershell" | "pwsh");
         if !cmdlet_path && !flag_path {
             continue;
@@ -159,9 +178,10 @@ fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
     false
 }
 
-/// Detect `Add-MpPreference -ExclusionPath <path>` or
-/// `Add-MpPreference -ExclusionProcess <process>`. Both shapes whitelist
-/// the target from Defender real-time scanning, a documented evasion step.
+/// Detect `Add-MpPreference -ExclusionPath <path>`,
+/// `Add-MpPreference -ExclusionProcess <process>`, or
+/// `Add-MpPreference -ExclusionExtension <ext>`. All three whitelist the
+/// target from Defender real-time scanning, a documented evasion step.
 fn check_defender_exclusion(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -179,8 +199,10 @@ fn check_defender_exclusion(
             // Match both bare flag and joined `-flag=value` (PowerShell allows both).
             n == "-exclusionpath"
                 || n == "-exclusionprocess"
+                || n == "-exclusionextension"
                 || n.starts_with("-exclusionpath=")
                 || n.starts_with("-exclusionprocess=")
+                || n.starts_with("-exclusionextension=")
         });
         if !mentions_exclusion {
             continue;
@@ -190,10 +212,10 @@ fn check_defender_exclusion(
             rule_id: RuleId::PsDefenderExclusion,
             severity: Severity::High,
             title: "Windows Defender exclusion added via Add-MpPreference".to_string(),
-            description: "Add-MpPreference -ExclusionPath/-ExclusionProcess disables \
-                          Defender real-time scanning for the target. Malware uses \
+            description: "Add-MpPreference -ExclusionPath/-ExclusionProcess/-ExclusionExtension \
+                          disables Defender real-time scanning for the target. Malware uses \
                           this to persist undetected — investigate any payload that \
-                          will appear in the excluded path."
+                          will appear in the excluded path / process / file type."
                 .to_string(),
             evidence: vec![Evidence::CommandPattern {
                 pattern: "Add-MpPreference exclusion".to_string(),
@@ -213,8 +235,13 @@ fn check_defender_exclusion(
 ///
 /// **Boundary with `pipe_to_interpreter`:** the pipe form
 /// `iwr https://… | iex` already fires `pipe_to_interpreter`. To avoid
-/// double-firing we require `seg.preceding_separator.is_none()` — i.e. this
-/// segment is the *start* of a sequence, not the RHS of a `|`.
+/// double-firing we skip segments whose `preceding_separator` is a pipe
+/// (`|` or `|&`).
+///
+/// Non-pipe separators (`;`, `&&`, `||`, `\n`, `&`) DO produce independent
+/// commands that are *not* covered by `pipe_to_interpreter`, so this rule
+/// must still fire for `true; iex (iwr url)`,
+/// `echo start && iex (iwr url)`, and `cmd1 || iex (iwr url)`.
 fn check_inline_download_execute(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -222,8 +249,12 @@ fn check_inline_download_execute(
 ) {
     for seg in segments {
         // Pipe RHS is already covered by pipe_to_interpreter — skip it.
-        if seg.preceding_separator.is_some() {
-            continue;
+        // Non-pipe separators (`;`, `&&`, `||`, etc.) start fresh commands
+        // that pipe_to_interpreter does NOT match, so we must keep checking.
+        if let Some(sep) = seg.preceding_separator.as_deref() {
+            if is_pipe_separator(sep) {
+                continue;
+            }
         }
 
         let Some(ref cmd) = seg.command else { continue };
@@ -259,4 +290,17 @@ fn check_inline_download_execute(
             custom_rule_id: None,
         });
     }
+}
+
+/// True if `sep` (a value from `Segment::preceding_separator`) is one of
+/// the pipe separators that `pipe_to_interpreter` already handles.
+///
+/// `tokenize.rs` encodes pipe shapes as the literal strings `"|"` (single
+/// pipe) and `"|&"` (POSIX pipe-with-stderr). PowerShell's tokenizer only
+/// emits `"|"` for pipes. All other separators (`";"`, `"&&"`, `"||"`,
+/// `"&"`, `"\n"`, PowerShell's `"-and"`/`"-or"`) start fresh commands that
+/// are *not* covered by `pipe_to_interpreter`, so this rule must still run
+/// on them.
+fn is_pipe_separator(sep: &str) -> bool {
+    sep == "|" || sep == "|&"
 }
