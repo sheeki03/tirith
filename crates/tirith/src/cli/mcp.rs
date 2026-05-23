@@ -120,6 +120,15 @@ fn print_json(
         lock_path: String,
         configs_found: usize,
         malformed_configs: &'a [String],
+        /// Physically-present MCP config paths that were skipped during
+        /// discovery / inventory build, with the reason for each. A
+        /// silent skip would hide a misconfigured `.mcp.json` (symlinked,
+        /// oversized, unreadable, …) behind an "empty lockfile" result;
+        /// surfacing this list makes the skip visible.
+        ///
+        /// Additive on the result envelope only — the lockfile's own
+        /// `format_version` is unchanged (still 4).
+        rejected_configs: &'a [mcp_lock::RejectedConfig],
         servers_locked: usize,
         /// The lockfile document that was written.
         lockfile: &'a McpLockfile,
@@ -131,6 +140,7 @@ fn print_json(
         lock_path: lock_path.display().to_string(),
         configs_found: inventory.configs.len(),
         malformed_configs: &inventory.malformed_configs,
+        rejected_configs: &inventory.rejected_configs,
         servers_locked: lockfile.servers.len(),
         lockfile,
     };
@@ -204,9 +214,61 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
         );
     }
 
+    if !inventory.rejected_configs.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  note: {} config path(s) were skipped during discovery and contributed no \
+             servers — review these in case a legitimately-present config was \
+             unintentionally blocked:",
+            inventory.rejected_configs.len(),
+        );
+        for rejected in &inventory.rejected_configs {
+            eprintln!(
+                "    - {} ({})",
+                rejected.path,
+                describe_rejection_reason(&rejected.reason),
+            );
+        }
+    }
+
     eprintln!();
     eprintln!("  wrote {}", lock_path.display());
     println!("{}", lock_path.display());
+}
+
+/// One-line human description of a [`mcp_lock::RejectedReason`].
+///
+/// Used only by [`print_human`]; the structured variant is what the JSON
+/// surface and any programmatic consumer reads. The description names the
+/// failure category plainly without echoing arbitrary bytes (the
+/// `size_bytes`/`permission_denied` fields are integers/booleans, safe to
+/// interpolate).
+fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
+    match reason {
+        mcp_lock::RejectedReason::Symlink => {
+            "symlinked — discovery is repo-local, so the path is not followed".to_string()
+        }
+        mcp_lock::RejectedReason::NotRegularFile => {
+            "not a regular file — only regular files are inventoried".to_string()
+        }
+        mcp_lock::RejectedReason::OutsideRepo => {
+            "canonical path is outside the repository — discovery is repo-local".to_string()
+        }
+        mcp_lock::RejectedReason::Oversize { size_bytes } => {
+            format!(
+                "file too large ({size_bytes} bytes; cap is {} bytes) — refusing to read \
+                 an unbounded JSON document",
+                mcp_lock::MCP_CONFIG_MAX_SIZE,
+            )
+        }
+        mcp_lock::RejectedReason::Unreadable { permission_denied } => {
+            if *permission_denied {
+                "could not read (permission denied)".to_string()
+            } else {
+                "could not read (other io error)".to_string()
+            }
+        }
+    }
 }
 
 /// One-line description of a transport for the human summary.
@@ -363,23 +425,42 @@ pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
     let drifts = mcp_lock::compute_drift(&inventory, &lockfile);
 
     if json {
-        if !print_drift_json(
+        let write_ok = print_drift_json(
             "tirith mcp verify",
             repo_root,
             &lock_path,
             &lockfile,
             &drifts,
-        ) {
-            return 2;
-        }
-    } else {
-        print_verify_human(&lock_path, &drifts);
+        );
+        return verify_exit_code(drifts.is_empty(), write_ok);
     }
+    print_verify_human(&lock_path, &drifts);
+    verify_exit_code(drifts.is_empty(), true)
+}
 
-    if drifts.is_empty() {
-        0
-    } else {
-        1
+/// Decide `tirith mcp verify`'s exit code from `(in_sync, json_write_ok)`.
+///
+/// Pure function so the F2 contract — a JSON-write failure must NOT
+/// collapse "drift was detected, exit 1" into "usage error, exit 2" — can
+/// be pinned by a unit test without simulating a broken stdout pipe.
+///
+/// Contract:
+/// * `in_sync == true, json_write_ok == true` → 0 (no drift).
+/// * `in_sync == true, json_write_ok == false` → 2: there's no drift to
+///   preserve, and the consumer's only signal (the JSON payload) is
+///   broken — surface it as a usage-class failure so a pipeline notices.
+/// * `in_sync == false, json_write_ok == true` → 1 (drift detected).
+/// * `in_sync == false, json_write_ok == false` → 1: the JSON write
+///   failed, but drift IS the dominant signal — preserve it. The
+///   privacy / pipe-truncation contract (a consumer never sees
+///   truncated JSON paired with a success code) is satisfied by the
+///   stderr write inside `write_json_stdout`; we don't need exit 2 to
+///   convey it.
+pub(crate) fn verify_exit_code(in_sync: bool, json_write_ok: bool) -> i32 {
+    match (in_sync, json_write_ok) {
+        (true, true) => 0,
+        (true, false) => 2,
+        (false, _) => 1,
     }
 }
 
@@ -998,6 +1079,25 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
     s
 }
 
+/// Bytes that force a YAML scalar to be quoted rather than emitted as a
+/// bare plain scalar.
+///
+/// The list is the union of:
+/// * YAML's reserved indicator set (`:` would split a key, `#` would
+///   start a comment, `-` could start a sequence, `?`/`,`/`[`/`]`/`{`/`}`
+///   are flow-style structure, `&`/`*` are anchors/aliases, `!` is a
+///   tag, `|`/`>` are block-scalar indicators, `'`/`"` are quote
+///   markers, `%` is a directive, `@`/`` ` `` are reserved for future
+///   use);
+/// * whitespace (`space`, `\t`) — leading or embedded whitespace can
+///   confuse plain-scalar parsing rules.
+///
+/// **Control bytes** (`b < 0x20` and `0x7f` DEL) are checked separately
+/// in [`yaml_safe_scalar`] — they too force quoting, and at the same
+/// time prevent terminal-injection when the operator `cat`s the
+/// example file.
+const YAML_NEEDS_QUOTING_BYTES: &[u8] = b":#-?,[]{}&*!|>'\"%@` \t";
+
 /// Render a scalar (server name / tool name) for inclusion in a YAML
 /// document. Returns the input unmodified when it is safe as a bare
 /// scalar; quotes (`"..."`) and JSON-escapes when it contains a YAML
@@ -1017,34 +1117,12 @@ fn yaml_safe_scalar(s: &str) -> String {
     }
     // A string is safe as a bare scalar iff every byte is a printable
     // ASCII non-special character. The set of "special" YAML indicators
-    // is conservative on purpose — we'd rather quote a safe string than
-    // emit ambiguous YAML.
-    let needs_quoting = s.bytes().any(|b| {
-        // Any byte that could break YAML structure or terminal output.
-        b == b':'
-            || b == b'#'
-            || b == b'-'
-            || b == b'?'
-            || b == b','
-            || b == b'['
-            || b == b']'
-            || b == b'{'
-            || b == b'}'
-            || b == b'&'
-            || b == b'*'
-            || b == b'!'
-            || b == b'|'
-            || b == b'>'
-            || b == b'\''
-            || b == b'"'
-            || b == b'%'
-            || b == b'@'
-            || b == b'`'
-            || b == b' '
-            || b == b'\t'
-            || b < 0x20
-            || b == 0x7f
-    });
+    // is centralized in `YAML_NEEDS_QUOTING_BYTES`; control bytes are
+    // checked separately so a future indicator change does not have to
+    // remember to keep the `< 0x20` / `== 0x7f` guards too.
+    let needs_quoting = s
+        .bytes()
+        .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f);
     if !needs_quoting {
         return s.to_string();
     }
@@ -1618,6 +1696,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let lockfile = McpLockfile::from_inventory(&inv);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
@@ -1687,5 +1766,90 @@ mod tests {
         // And the mcp_allowed_tools block lists the UNION of tools across both entries.
         assert!(yaml.contains("- a"));
         assert!(yaml.contains("- b"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F2 — `verify`'s JSON-write failure must NOT collapse
+    // the drift exit code (1) into a usage error (2). Pin the truth table
+    // for `verify_exit_code`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_exit_code_drift_with_json_write_failure_preserves_drift() {
+        // The bug fix: drift detected AND json write failed → 1, not 2.
+        assert_eq!(
+            verify_exit_code(false, false),
+            1,
+            "drift must remain exit 1 even when JSON write failed",
+        );
+    }
+
+    #[test]
+    fn verify_exit_code_no_drift_with_json_write_failure_is_usage_error() {
+        // Without drift, the only signal the consumer would see is the
+        // JSON payload, which is broken. Surface as usage-class failure.
+        assert_eq!(
+            verify_exit_code(true, false),
+            2,
+            "no drift + JSON write failure → usage error (the only signal is broken)",
+        );
+    }
+
+    #[test]
+    fn verify_exit_code_happy_paths() {
+        assert_eq!(verify_exit_code(true, true), 0, "no drift, write OK → 0");
+        assert_eq!(verify_exit_code(false, true), 1, "drift, write OK → 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F17 — `yaml_safe_scalar` is byte-identical after
+    // collapsing the indicator-set check into a constant. Spot-check the
+    // boundaries: every indicator byte forces quoting, every safe byte
+    // does not.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn yaml_safe_scalar_quotes_every_indicator_byte() {
+        // Every byte in the centralized indicator list must force quoting
+        // (the scalar comes back as a `"..."` quoted form, not bare).
+        for &b in YAML_NEEDS_QUOTING_BYTES {
+            let s = format!("a{}b", b as char);
+            let out = yaml_safe_scalar(&s);
+            assert!(
+                out.starts_with('"') && out.ends_with('"'),
+                "byte 0x{b:02x} ({:?}) must force quoting: got {out:?}",
+                b as char,
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_safe_scalar_does_not_quote_safe_strings() {
+        // Plain ASCII identifiers: must come back unmodified.
+        for safe in &["abc", "myserver", "TOOL_NAME", "v1_2_3", "a.b.c", "fooBar"] {
+            assert_eq!(
+                yaml_safe_scalar(safe),
+                *safe,
+                "safe string {safe:?} must NOT be quoted",
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_safe_scalar_quotes_control_bytes() {
+        // Control bytes are NOT in YAML_NEEDS_QUOTING_BYTES (they're
+        // checked separately) — but they still force quoting.
+        for b in 0u8..0x20 {
+            let s = format!("a{}b", b as char);
+            let out = yaml_safe_scalar(&s);
+            assert!(
+                out.starts_with('"') && out.ends_with('"'),
+                "control byte 0x{b:02x} must force quoting: got {out:?}",
+            );
+        }
+        // DEL too.
+        let s = format!("a{}b", 0x7f as char);
+        let out = yaml_safe_scalar(&s);
+        assert!(out.starts_with('"'));
     }
 }

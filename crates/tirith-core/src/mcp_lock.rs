@@ -43,6 +43,16 @@ use sha2::{Digest, Sha256};
 /// Lockfile format version. Bump only on a breaking schema change so a future
 /// `mcp verify` can refuse — or migrate — an older lockfile deliberately.
 ///
+/// **Enforced at load.** [`parse_lockfile`] rejects any lockfile whose
+/// `format_version` is not equal to this constant with a dedicated
+/// [`McpLockLoadError::UnsupportedVersion`] variant — so a v999 lockfile
+/// written by a future tirith does not parse silently, and a legacy-shape
+/// lockfile (v3 or earlier, before `userinfo_hash` and the env redaction)
+/// is also rejected. The CLI and `mcpdrift` rule both distinguish this from
+/// "the JSON is corrupt", so the operator sees "this lockfile was written by
+/// tirith schema vN, re-run `tirith mcp lock` to refresh / upgrade tirith"
+/// rather than a generic parse-error message.
+///
 /// Version history:
 /// * `1` — initial schema: per-server name, transport (`url`, or stdio
 ///   `command` + `args`), tools, source config, and content hash.
@@ -99,10 +109,20 @@ pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
 pub struct McpEnvEntry {
     /// The environment variable's name (the key in the config's `env` object).
     pub name: String,
-    /// Lowercase-hex SHA-256 of `name || ':' || value`. The colon is a fixed
-    /// delimiter so an attacker cannot manufacture two `(name, value)` pairs
-    /// whose concatenations collide: e.g. `("AB", "c")` hashes `"AB:c"`, not
-    /// `"ABc"`, so it cannot collide with `("A", "Bc")` which hashes `"A:Bc"`.
+    /// Lowercase-hex SHA-256 of `name || ':' || value`. The `:` delimiter is
+    /// per-entry **entropy**, not the load-bearing collision protection: the
+    /// unambiguity of an `McpEnvEntry` inside the per-server content hash is
+    /// established by the **outer length-prefixed framing** in
+    /// [`McpServerEntry::content_hash`] (each `name` and `value_hash` is fed
+    /// through [`hash_field`], which writes the length first). POSIX env-var
+    /// names may legally contain `:` (only `=` is forbidden by `execve(2)`),
+    /// so the inner `:` itself is not a guaranteed boundary marker — but
+    /// outer length-prefixing makes the framing total over any byte content,
+    /// regardless. The inner `name`-salted hash still defends against a
+    /// cross-server precomputed-rainbow-table attack: a low-entropy value
+    /// (`1`, `true`, `production`) hashes differently under each `name`, so
+    /// a digest cannot be brute-forced once and reused across servers /
+    /// configs.
     pub value_hash: String,
 }
 
@@ -113,13 +133,11 @@ impl McpEnvEntry {
     /// function returns — it never reaches a struct field, the serializer, or
     /// the rest of the process.
     pub fn from_raw(name: &str, raw_value: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(name.as_bytes());
-        // A fixed `:` delimiter — never legal inside an env variable name on
-        // POSIX or Windows — so `(name, value)` cannot be ambiguously framed.
-        hasher.update(b":");
-        hasher.update(raw_value.as_bytes());
-        let value_hash = hex_lower(&hasher.finalize());
+        // `:`-salted SHA-256 — see [`salted_sha256_hex`] for the shape and
+        // [`McpEnvEntry::value_hash`] for why the outer length-prefixed
+        // framing is the load-bearing collision protection (the inner `:`
+        // is for cross-server entropy, not boundary unambiguity).
+        let value_hash = salted_sha256_hex(name, raw_value);
         McpEnvEntry {
             name: name.to_string(),
             value_hash,
@@ -294,6 +312,94 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// Lowercase-hex SHA-256 of `salt || ':' || value` — the redaction primitive
+/// used by both [`McpEnvEntry::from_raw`] (where `salt` is the env var's
+/// `name` and `value` is the raw env value) and [`redact_url_userinfo`]
+/// (where `salt` is the MCP server's `name` and `value` is the raw URL
+/// userinfo substring).
+///
+/// **The `:` is per-entry entropy, not the load-bearing collision protection.**
+/// In both callers the resulting hash is fed into a length-prefixed outer
+/// framing (`hash_field` in [`McpServerEntry::content_hash`]), and it's that
+/// outer framing that makes the encoding unambiguous over any byte content.
+/// The inner `salt`-salted hash exists so a low-entropy `value` (`1`,
+/// `true`, `production`, a stock auth token) hashes differently under each
+/// `salt` — a precomputed rainbow table built against one server's hashes
+/// cannot be reused against another's.
+pub(crate) fn salted_sha256_hex(salt: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(b":");
+    hasher.update(value.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
+/// Why a physically-present MCP config path was skipped during
+/// discovery / inventory build, instead of contributing servers.
+///
+/// Every reason here corresponds to a path that the discovery walk
+/// found on disk but deliberately refused — a silent skip would let
+/// an attacker (or a careless misconfiguration) replace a real
+/// `.mcp.json` with a symlink-out-of-repo, an oversized file, or an
+/// unreadable file, and the lockfile would silently lose every
+/// server that file used to contribute. Surfacing the rejection in
+/// [`McpInventory::rejected_configs`] turns the silent skip into a
+/// visible diagnostic the CLI and any consumer can show.
+///
+/// Wire shape (when serialized in CLI JSON output): the `kind`
+/// field names the variant in `snake_case`. Variants that carry
+/// additional context (`Oversize`, `Unreadable`) include extra
+/// fields after the `kind`. Field values are `usize`/`u64`/`bool`
+/// only — no file content or arbitrary error strings — so the
+/// diagnostic surface cannot echo a redacted-but-still-sensitive
+/// lockfile body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RejectedReason {
+    /// The path itself, or some directory between `repo_root` and it,
+    /// is a symbolic link. Discovery is repo-local by design; a symlink
+    /// could point at a user-level config (`~/.claude/`) or any
+    /// arbitrary path, so we refuse to follow it.
+    Symlink,
+    /// The path exists but is not a regular file (it is a directory,
+    /// a FIFO, a socket, a block device, …). Only regular files
+    /// contribute to the inventory.
+    NotRegularFile,
+    /// The path's canonical (fully symlink-resolved) form does not
+    /// stay inside the canonicalized repository root — a defense-in-
+    /// depth backstop on top of the per-component symlink check.
+    OutsideRepo,
+    /// The path is a regular file but its size exceeds the
+    /// per-config limit (`MCP_CONFIG_MAX_SIZE`). Reading an
+    /// unbounded JSON document would let a hostile or careless config
+    /// turn `tirith mcp lock` into a memory-pressure / DoS surface.
+    Oversize {
+        /// The file's size in bytes, as returned by `fs::metadata().len()`.
+        size_bytes: u64,
+    },
+    /// The path is a regular file under the size cap but could not be
+    /// read.
+    Unreadable {
+        /// `true` when the underlying io error was
+        /// `std::io::ErrorKind::PermissionDenied` — the most common
+        /// operator-actionable cause (a config file mode-locked by the
+        /// IDE). Other io errors fold into `false` (the inner error
+        /// string is deliberately not surfaced; see the
+        /// `unreadable file` rationale in `mcpdrift.rs`).
+        permission_denied: bool,
+    },
+}
+
+/// One rejected config path with the reason it was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedConfig {
+    /// Repo-relative path of the rejected config file (the same shape
+    /// `configs` / `malformed_configs` carry).
+    pub path: String,
+    /// Why the path was rejected.
+    pub reason: RejectedReason,
+}
+
 /// The structured inventory of every MCP server declared in a repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpInventory {
@@ -307,12 +413,31 @@ pub struct McpInventory {
     /// be parsed (not valid JSON, or no MCP-server object). Informational —
     /// these are NOT an error; they simply contribute no entries.
     pub malformed_configs: Vec<String>,
+    /// Physically-present MCP config paths that the discovery walk
+    /// **refused** (symlinked, not a regular file, escaped the repo root
+    /// by canonicalization, oversized, or unreadable). Each entry carries
+    /// the repo-relative path and the structured reason. Distinct from
+    /// `malformed_configs`: a "malformed" config was read but did not
+    /// parse; a "rejected" config was discovered but never read at all.
+    ///
+    /// **Additive field, not a lockfile schema bump.** This field rides
+    /// on `McpInventory`, which is the in-process discovery structure —
+    /// it is NOT part of the on-disk `McpLockfile` shape. The lockfile's
+    /// `format_version` is unchanged (still 4). Consumers that want to
+    /// surface the rejections (the `mcp lock` CLI summary, an
+    /// integration ingesting the JSON output) read it directly from
+    /// `McpInventory::rejected_configs`.
+    pub rejected_configs: Vec<RejectedConfig>,
 }
 
 impl McpInventory {
     /// `true` when no MCP configuration was found at all. Distinct from "found
     /// configs but they declared zero servers" — the caller words its honest
-    /// output differently for the two.
+    /// output differently for the two. `rejected_configs` does NOT count
+    /// against emptiness: a repo whose only config was rejected (symlinked,
+    /// oversized, …) still counts as "no configs found" because no servers
+    /// could be inventoried — but the rejection list is the operator-visible
+    /// signal that the apparent emptiness has a cause.
     pub fn is_empty(&self) -> bool {
         self.configs.is_empty()
     }
@@ -451,7 +576,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// plus the IDE host-directory variants. Kept as an explicit list (rather than
 /// a filesystem walk) so discovery is bounded, fast, and never strays outside
 /// the known MCP config surface.
-const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
+pub(crate) const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
     // Bare repo-root MCP configs.
     "mcp.json",
     ".mcp.json",
@@ -485,23 +610,57 @@ const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
 ///   check is not subject to the TOCTOU window an `is_file()` probe has; or
 /// * its canonicalized (fully symlink-resolved) path does not stay inside the
 ///   canonicalized `repo_root` — a defense-in-depth backstop.
+///
+/// **Discovery-time rejections are dropped on this signature.** Callers that
+/// want the structured list of rejected paths use
+/// [`discover_mcp_configs_full`]. This thin wrapper drops the rejection list
+/// for callers that only need the accepted pairs (existing tests, programmatic
+/// consumers of the simpler shape).
 pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
+    discover_mcp_configs_full(repo_root).0
+}
+
+/// Like [`discover_mcp_configs`] but also returns the structured rejection
+/// list. Each rejected path carries the repo-relative path and a
+/// [`RejectedReason`] describing why it was refused. Used by
+/// [`build_inventory`] so the rejection list flows through to
+/// [`McpInventory::rejected_configs`] and into the CLI's `mcp lock`
+/// human / JSON summary.
+///
+/// Pure path-level rejections only — file-content rejections (oversize,
+/// permission denied) happen in [`build_inventory`] when the file is
+/// actually read.
+pub(crate) fn discover_mcp_configs_full(
+    repo_root: &Path,
+) -> (Vec<(PathBuf, String)>, Vec<RejectedConfig>) {
     // Canonicalize the repo root once for the containment check. If the root
     // itself cannot be canonicalized (it does not exist), no config under it
-    // can be discovered anyway — return empty rather than guess.
+    // can be discovered anyway — return empty rather than guess. There's
+    // nothing to "reject" in that case because no candidate is physically
+    // present either.
     let canonical_root = match repo_root.canonicalize() {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
 
     let mut found: Vec<(PathBuf, String)> = Vec::new();
+    let mut rejected: Vec<RejectedConfig> = Vec::new();
+
     for rel in MCP_CONFIG_RELATIVE_PATHS {
         let abs = repo_root.join(rel);
 
         // Reject if the final component, or any directory component between
         // `repo_root` and it, is a symlink. `symlink_metadata` does not follow
         // the path it is given, so each component is inspected as-is.
+        //
+        // Only record the rejection when the path is *physically present*
+        // (a non-existent path under a normal repo is not "rejected", it
+        // just isn't there).
         if path_crosses_symlink(repo_root, rel) {
+            rejected.push(RejectedConfig {
+                path: (*rel).to_string(),
+                reason: RejectedReason::Symlink,
+            });
             continue;
         }
 
@@ -510,7 +669,32 @@ pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
         // is still not silently followed.
         match std::fs::symlink_metadata(&abs) {
             Ok(meta) if meta.file_type().is_file() => {}
-            _ => continue,
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // A leaf-position symlink that the per-component walk did not
+                // observe (the parent components were all not-symlinks; the
+                // probed leaf itself is). Same rejection class as a directory
+                // symlink on the path — record it explicitly.
+                rejected.push(RejectedConfig {
+                    path: (*rel).to_string(),
+                    reason: RejectedReason::Symlink,
+                });
+                continue;
+            }
+            Ok(_) => {
+                // The path exists but isn't a regular file — directory,
+                // FIFO, socket, …. Surface it so an operator notices.
+                rejected.push(RejectedConfig {
+                    path: (*rel).to_string(),
+                    reason: RejectedReason::NotRegularFile,
+                });
+                continue;
+            }
+            Err(_) => {
+                // The path doesn't exist; this is the common case for any
+                // probe that doesn't apply to this repo. Not "rejected"
+                // — there's nothing here.
+                continue;
+            }
         }
 
         // Defense in depth: the fully-resolved path must stay inside the
@@ -518,13 +702,20 @@ pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
         // belt-and-braces, but it also catches an exotic mount/junction case.)
         match abs.canonicalize() {
             Ok(canonical) if canonical.starts_with(&canonical_root) => {}
-            _ => continue,
+            _ => {
+                rejected.push(RejectedConfig {
+                    path: (*rel).to_string(),
+                    reason: RejectedReason::OutsideRepo,
+                });
+                continue;
+            }
         }
 
         found.push((abs, (*rel).to_string()));
     }
     found.sort_by(|a, b| a.1.cmp(&b.1));
-    found
+    rejected.sort_by(|a, b| a.path.cmp(&b.path));
+    (found, rejected)
 }
 
 /// `true` if any component of `rel` — joined onto `repo_root` — is a symlink.
@@ -553,26 +744,135 @@ fn path_crosses_symlink(repo_root: &Path, rel: &str) -> bool {
     false
 }
 
+/// Per-file size cap for an MCP config. A `.mcp.json` realistically lives in
+/// the tens of KiB at most (a few servers, a handful of args / env / tool
+/// entries each); 1 MiB is roughly 1000× that. Above the cap the file is
+/// rejected without reading — `tirith mcp lock` should not be a memory-
+/// pressure / DoS surface against a hostile or careless config.
+///
+/// Distinct from `scan_single_file`'s 10 MiB cap on the tier-1/2/3 hot path:
+/// MCP configs are a much narrower file class with a much smaller realistic
+/// size envelope, so a tighter cap is appropriate here.
+pub const MCP_CONFIG_MAX_SIZE: u64 = 1_048_576;
+
 /// Build the MCP inventory for a repository.
 ///
 /// Discovers every repo-local MCP config under `repo_root`, parses each, and
 /// returns the structured [`McpInventory`]. A config that cannot be parsed is
 /// recorded in [`McpInventory::malformed_configs`] and contributes no servers —
 /// it is never an error and never a panic.
+///
+/// **Path-level rejections** (symlinks, non-regular files, paths whose
+/// canonical form escapes the repo) flow through from
+/// [`discover_mcp_configs_full`] into [`McpInventory::rejected_configs`].
+/// **File-level rejections** (oversize, permission denied) are detected
+/// here and recorded in the same list — the goal is one operator-visible
+/// list of "physically present but skipped" paths regardless of which
+/// gate the path tripped.
+///
+/// **Size cap.** Each config's `fs::metadata().len()` is checked against
+/// [`MCP_CONFIG_MAX_SIZE`] before any read. An oversized file contributes
+/// no servers and appears in `rejected_configs` with reason
+/// [`RejectedReason::Oversize`]. This is the file-class-specific cap; the
+/// tier-1/2/3 hot-path 10 MiB cap is unrelated and applies to a different
+/// surface.
+///
+/// **IO-error categorization.** A read failure is no longer collapsed into
+/// the malformed-config bucket: `std::io::ErrorKind::PermissionDenied`
+/// becomes [`RejectedReason::Unreadable`] with `permission_denied: true`;
+/// `NotFound` is silent (the path was probed but vanished between the
+/// discovery `symlink_metadata` and the read, which is normal during a
+/// concurrent edit); `InvalidData` (non-UTF-8 content) keeps the legacy
+/// "malformed" path; anything else folds into `Unreadable` with
+/// `permission_denied: false`.
 pub fn build_inventory(repo_root: &Path) -> McpInventory {
-    let configs = discover_mcp_configs(repo_root);
+    let (configs, rejected_from_discovery) = discover_mcp_configs_full(repo_root);
 
-    let mut inventory = McpInventory::default();
+    let mut inventory = McpInventory {
+        rejected_configs: rejected_from_discovery,
+        ..McpInventory::default()
+    };
 
     for (abs_path, rel_path) in configs {
+        // Size pre-check. Use `fs::metadata` (which follows symlinks); the
+        // discovery walk already rejected symlinked candidates, so the
+        // probed file is a real regular file at this point. A metadata
+        // failure here folds into the unreadable category (rare: the file
+        // was present a moment ago).
+        let size_bytes = match std::fs::metadata(&abs_path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                inventory.rejected_configs.push(RejectedConfig {
+                    path: rel_path.clone(),
+                    reason: RejectedReason::Unreadable {
+                        permission_denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+                    },
+                });
+                continue;
+            }
+        };
+
+        if size_bytes > MCP_CONFIG_MAX_SIZE {
+            inventory.rejected_configs.push(RejectedConfig {
+                path: rel_path.clone(),
+                reason: RejectedReason::Oversize { size_bytes },
+            });
+            // Oversized files do NOT count as a discovered config (they
+            // are rejected at the gate, never reach the parser, and
+            // contribute no servers).
+            continue;
+        }
+
+        // The file is admitted: it counts as a discovered config from
+        // here on, even if it later fails to read or parse.
         inventory.configs.push(rel_path.clone());
 
         let content = match std::fs::read_to_string(&abs_path) {
             Ok(c) => c,
-            Err(_) => {
-                // Unreadable (permissions, vanished mid-walk): treat like a
-                // malformed config — recorded, no entries, no panic.
-                inventory.malformed_configs.push(rel_path);
+            Err(e) => {
+                // Categorize the io error so the operator can tell
+                // "I can't read this file" from "this file is not UTF-8".
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        // The file vanished between the discovery
+                        // `symlink_metadata` and this read — a concurrent
+                        // edit, a temp file being swapped, etc. Drop the
+                        // candidate silently: this is operationally
+                        // normal and there's nothing here to surface.
+                        // Pop the rel_path off `configs` since we have
+                        // no real file to attribute servers to (and the
+                        // policy summary should not claim a config
+                        // exists that does not).
+                        inventory.configs.pop();
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        inventory.rejected_configs.push(RejectedConfig {
+                            path: rel_path.clone(),
+                            reason: RejectedReason::Unreadable {
+                                permission_denied: true,
+                            },
+                        });
+                        // Pop: the file was "discovered" structurally but
+                        // we couldn't actually read it. The rejection list
+                        // is the place that names it now.
+                        inventory.configs.pop();
+                    }
+                    std::io::ErrorKind::InvalidData => {
+                        // Non-UTF-8 content. Keep the legacy "malformed"
+                        // path: the file is present, attributable, and
+                        // the right shape — its bytes just aren't text.
+                        inventory.malformed_configs.push(rel_path.clone());
+                    }
+                    _ => {
+                        inventory.rejected_configs.push(RejectedConfig {
+                            path: rel_path.clone(),
+                            reason: RejectedReason::Unreadable {
+                                permission_denied: false,
+                            },
+                        });
+                        inventory.configs.pop();
+                    }
+                }
                 continue;
             }
         };
@@ -604,6 +904,10 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
     inventory.configs.dedup();
     inventory.malformed_configs.sort();
     inventory.malformed_configs.dedup();
+    inventory
+        .rejected_configs
+        .sort_by(|a, b| a.path.cmp(&b.path));
+    inventory.rejected_configs.dedup();
 
     inventory
 }
@@ -701,13 +1005,17 @@ fn parse_transport(
 /// **Security invariant.** A URL declared as `https://user:token@host:port/`
 /// in `.mcp.json` is recorded as `https://host:port/` in the lockfile, and
 /// the captured `user:token` substring is hashed with the MCP server's name
-/// as the salt (`sha256(server_name || ':' || userinfo)`) — exactly the
-/// scheme [`McpEnvEntry::from_raw`] uses for env values. The raw userinfo is
-/// consumed inside this function and dropped before the function returns;
-/// it never reaches a struct field, the serializer, or the rest of the
-/// process. This is the load-bearing security invariant of the v4 lockfile
-/// format for the URL transport: a committed `.tirith/mcp.lock` never
-/// contains a Basic Auth credential that was in the source `.mcp.json`.
+/// as the salt (the shared [`salted_sha256_hex`] helper, the same scheme
+/// [`McpEnvEntry::from_raw`] uses for env values; see that helper's docs for
+/// why the inner `:` is per-entry entropy rather than the load-bearing
+/// collision protection — the outer length-prefixed framing in
+/// [`McpServerEntry::content_hash`] is what makes the encoding unambiguous).
+/// The raw userinfo is consumed inside this function and dropped before the
+/// function returns; it never reaches a struct field, the serializer, or
+/// the rest of the process. This is the load-bearing security invariant of
+/// the v4 lockfile format for the URL transport: a committed
+/// `.tirith/mcp.lock` never contains a Basic Auth credential that was in
+/// the source `.mcp.json`.
 ///
 /// **Behavior.**
 /// * The URL parses cleanly with a non-empty userinfo → return the URL with
@@ -779,40 +1087,35 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
 
     // Same name-salted SHA-256 scheme as `McpEnvEntry::from_raw`: the server
     // name is the per-entry salt so the same Basic Auth token under two
-    // different servers hashes to two different digests, and a literal `:`
-    // delimiter prevents server/userinfo boundary forgery (`("AB", "c")`
-    // hashes `"AB:c"`, never the bytes of `("A", "Bc")`).
-    let userinfo_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(server_name.as_bytes());
-        hasher.update(b":");
-        hasher.update(raw_userinfo.as_bytes());
-        Some(hex_lower(&hasher.finalize()))
-    };
+    // different servers hashes to two different digests. As documented on
+    // `salted_sha256_hex`, the inner `:` provides cross-server entropy
+    // rather than boundary unambiguity — the load-bearing collision
+    // protection at the parent level is the length-prefixed outer framing
+    // in `McpServerEntry::content_hash`, which feeds this hash through
+    // `hash_field` along with every other variable-length component.
+    let userinfo_hash = Some(salted_sha256_hex(server_name, &raw_userinfo));
 
     // Strip userinfo from the URL we will store. `set_username("")` /
     // `set_password(None)` only fail for URLs that cannot have an authority
     // (e.g. `data:`, `mailto:`), and a URL of that shape cannot carry
     // userinfo in the first place — so since we just observed a userinfo
-    // present, both `set_*` calls must succeed.
+    // present, both `set_*` calls must succeed. Panic if `url::Url` ever
+    // violates this invariant: a silent fallback (rebuilding the URL from
+    // `parsed`'s components) silently drops `parsed.query()` and
+    // `parsed.fragment()`, which would produce a permanent spurious
+    // `UrlChanged` drift every time `mcp verify` runs on this lockfile.
+    // The cost of a panic here is a clear bug report; the cost of silent
+    // data loss is years of mysterious drift on a working baseline.
     let mut parsed = parsed;
     let strip_ok = parsed.set_password(None).is_ok() && parsed.set_username("").is_ok();
-
-    // Hard safety net: if the strip silently failed, refuse to return a URL
-    // whose bytes still contain the userinfo. This is paranoid (the `set_*`
-    // calls cannot fail for a URL we just parsed successfully *with* a
-    // userinfo), but the cost is one branch and the consequence of being
-    // wrong is a credential in the committed lockfile. Build a host-only
-    // string from the parsed components so the lockfile is never
-    // credential-bearing even in this defensive branch.
-    if !strip_ok {
-        let scheme = parsed.scheme();
-        let host = parsed.host_str().unwrap_or("");
-        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-        let path = parsed.path();
-        let redacted = format!("{scheme}://{host}{port}{path}");
-        return (redacted, userinfo_hash);
-    }
+    assert!(
+        strip_ok,
+        "url::Url invariant violated: set_username/set_password failed on a parsed URL with \
+         userinfo. This branch is documented unreachable for any URL whose authority can carry \
+         credentials (every authority-bearing scheme accepts set_username(\"\") / \
+         set_password(None)); please file a bug against tirith with the offending URL scheme \
+         (the URL itself is sensitive — do NOT include it)."
+    );
 
     (parsed.as_str().to_string(), userinfo_hash)
 }
@@ -1419,7 +1722,14 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(McpLockLoadError::NotFound);
         }
-        Err(e) => return Err(McpLockLoadError::Io(e.to_string())),
+        Err(e) => {
+            // Suppress the inner `io::Error`'s `Display` and capture only
+            // the category-level kind. See the doc on
+            // [`McpLockLoadError::Io`] for the privacy rationale.
+            return Err(McpLockLoadError::Io {
+                kind: McpLockIoKind::from_io_kind(e.kind()),
+            });
+        }
     };
     parse_lockfile(&content)
 }
@@ -1442,6 +1752,21 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// lockfile is still recognized as unparseable, the same
 /// `McpServerDrift` finding still fires; only the diagnostic tightens.
 ///
+/// **Schema version validation.** After the JSON parses, the
+/// `format_version` field is checked against [`MCP_LOCK_FORMAT_VERSION`].
+/// A mismatch — either an older lockfile produced by a previous tirith
+/// release, or a newer lockfile produced by a future one — yields
+/// [`McpLockLoadError::UnsupportedVersion`], distinct from
+/// [`McpLockLoadError::Parse`] so the CLI and `mcpdrift` rule can offer
+/// the operator a precise message ("this lockfile was written by tirith
+/// schema vN, re-run `tirith mcp lock` to refresh / upgrade tirith")
+/// rather than a generic parse-error. This is the schema-evolution gate
+/// the [`MCP_LOCK_FORMAT_VERSION`] doc-comment promises: a legacy v3-shape
+/// lockfile (no `userinfo_hash`, raw env values) deserializes into a v4
+/// `McpLockfile` shape because the missing fields default — but the
+/// `format_version: 3` field is preserved and the check fires here, so
+/// the operator is never silently confused by a half-migrated baseline.
+///
 /// **Server ordering.** A parsed lockfile's `servers` list is sorted by
 /// `(name, source_config)` here — the same ordering
 /// [`McpLockfile::from_inventory`] establishes — so every
@@ -1456,7 +1781,24 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// for every caller (the rule, `mcp verify`, `mcp diff`, future
 /// programmatic consumers) without re-sorting at each call site.
 pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
-    let mut lock: McpLockfile = serde_json::from_str(content).map_err(|e| {
+    // Two-pass parse. The first pass extracts ONLY `format_version` via a
+    // minimal helper struct, so a legacy-shape lockfile (e.g. a v3 file
+    // whose `env` entries carry a raw `value` instead of the v4-shape
+    // `value_hash`) is surfaced as `UnsupportedVersion` rather than the
+    // misleading `Parse` it would otherwise produce — serde's full
+    // deserializer would fail on the missing field before it ever
+    // observed `format_version`. The two-pass cost is one extra
+    // `serde_json::from_str` over a tiny shape; cheap and necessary
+    // for the schema-version-mismatch error to be precise.
+    #[derive(serde::Deserialize)]
+    struct FormatProbe {
+        format_version: u32,
+    }
+
+    // First pass: probe the version. If this fails, the JSON is either
+    // not valid JSON at all, or it is JSON but does not even carry a
+    // `format_version` field — both are real `Parse` failures.
+    let probe: FormatProbe = serde_json::from_str(content).map_err(|e| {
         // Capture only the safe structural metadata. The error's
         // Display message is deliberately dropped — it can contain
         // the offending JSON content.
@@ -1465,6 +1807,32 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             column: e.column(),
         }
     })?;
+
+    // Schema-version gate. A mismatched `format_version` — either an
+    // older lockfile (pre-redaction shape) or a newer one (future
+    // schema we cannot model) — is surfaced as a distinct variant so
+    // the CLI and rule can name the failure precisely. See the
+    // function-level docs for the contract this enforces. We do this
+    // BEFORE the full deserialize so that a legacy-shape file (v3
+    // raw env values, missing `value_hash`) does not produce a
+    // misleading `Parse` failure when its underlying issue is a
+    // schema-version mismatch.
+    if probe.format_version != MCP_LOCK_FORMAT_VERSION {
+        return Err(McpLockLoadError::UnsupportedVersion {
+            found: probe.format_version,
+            supported: MCP_LOCK_FORMAT_VERSION,
+        });
+    }
+
+    // Second pass: full deserialize. This time the version is the
+    // current one, so any failure here is a genuine corruption /
+    // schema-mismatch within the current schema (a malformed entry,
+    // a non-string where a string was required, …) — `Parse`.
+    let mut lock: McpLockfile =
+        serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
+            line: e.line(),
+            column: e.column(),
+        })?;
     // Defensive sort: `compute_drift`'s slow-path merge walk requires
     // `lock.servers` to be sorted by `(name, source_config)`. The
     // lockfile we wrote is always sorted (see `from_inventory`), but a
@@ -1480,13 +1848,54 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
     Ok(lock)
 }
 
+/// Coarse-grained category of a lockfile io failure. Carrying the
+/// `std::io::ErrorKind` directly here would couple this public enum to a
+/// non-exhaustive upstream type, so the cases tirith needs to distinguish
+/// are encoded explicitly. The `Display` impl on
+/// [`McpLockLoadError::Io`] uses these to produce a category-only message,
+/// never the inner io-error string — same privacy invariant as the
+/// `serde_json::Error` suppression in [`McpLockLoadError::Parse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpLockIoKind {
+    /// Underlying `std::io::ErrorKind::PermissionDenied` — the file mode
+    /// did not permit a read. The most operator-actionable case (a mode
+    /// bit on the lockfile, or a containing-directory permission).
+    PermissionDenied,
+    /// Any other io-error category (e.g. an OS-level transient failure).
+    /// Folded in here rather than spelled out individually so adding a new
+    /// io-error variant in std is not a backwards-incompatible break for
+    /// downstream consumers.
+    Other,
+}
+
+impl McpLockIoKind {
+    /// Map an `std::io::Error` to its tirith-side category.
+    fn from_io_kind(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Why a lockfile could not be loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpLockLoadError {
     /// The file does not exist (caller decides whether this is fatal).
     NotFound,
-    /// The file exists but cannot be read (permission, encoding, …).
-    Io(String),
+    /// The file exists but cannot be read.
+    ///
+    /// **Carries only a kind.** The original `std::io::Error`'s message
+    /// string is intentionally **not** captured — exactly the same
+    /// privacy invariant `Parse` enforces for `serde_json::Error`.
+    /// `std::io::Error`'s `Display` typically does not echo file
+    /// contents, but it CAN include user-visible path fragments (e.g.
+    /// `permission denied (os error 13): /home/.../lockfile`), and the
+    /// CLI's existing interpolation patterns would surface those.
+    /// Folding the inner string out at the boundary removes the class
+    /// of future diagnostic-leak regressions and matches the symmetric
+    /// pattern already applied to `mcpdrift`'s finding rendering.
+    Io { kind: McpLockIoKind },
     /// The file exists and was read but does not parse as a lockfile.
     ///
     /// **Carries only line/column.** The original `serde_json::Error`
@@ -1496,18 +1905,51 @@ pub enum McpLockLoadError {
     /// `Display` into a CLI message and into a `McpServerDrift`
     /// finding's description.
     Parse { line: usize, column: usize },
+    /// The file parsed as JSON and matched the lockfile schema shape,
+    /// but its `format_version` is not [`MCP_LOCK_FORMAT_VERSION`].
+    ///
+    /// Distinct from [`Self::Parse`] so the CLI and the `mcpdrift`
+    /// rule can offer a precise message ("this lockfile was written
+    /// by tirith schema v{found}, re-run `tirith mcp lock` to refresh
+    /// or upgrade tirith") rather than a generic parse error. Both
+    /// fields are `u32`, neither can echo file content, so this
+    /// variant is safe to `Display` and to interpolate into a
+    /// finding's description.
+    UnsupportedVersion {
+        /// The `format_version` value the lockfile carried.
+        found: u32,
+        /// The version this build of tirith supports
+        /// ([`MCP_LOCK_FORMAT_VERSION`]).
+        supported: u32,
+    },
 }
 
 impl std::fmt::Display for McpLockLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McpLockLoadError::NotFound => write!(f, "lockfile not found"),
-            McpLockLoadError::Io(e) => write!(f, "could not read lockfile: {e}"),
+            // Category-only — the inner `io::Error`'s message is
+            // deliberately not surfaced (see the `McpLockLoadError::Io`
+            // doc for the privacy rationale). Two cases the operator
+            // can act on: PermissionDenied (the most common; file mode /
+            // directory mode wrong) and Other.
+            McpLockLoadError::Io { kind } => match kind {
+                McpLockIoKind::PermissionDenied => {
+                    write!(f, "could not read lockfile (permission denied)")
+                }
+                McpLockIoKind::Other => write!(f, "could not read lockfile (other io error)"),
+            },
             // Line/column only — never the parser's message string.
             // See `parse_lockfile` for the privacy rationale.
             McpLockLoadError::Parse { line, column } => {
                 write!(f, "could not parse lockfile (line {line}, column {column})")
             }
+            McpLockLoadError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "lockfile schema version {found} is not supported by this build of tirith \
+                 (supported: {supported}); re-run `tirith mcp lock` to refresh the lockfile, \
+                 or upgrade tirith to a build that understands version {found}"
+            ),
         }
     }
 }
@@ -1750,6 +2192,7 @@ mod tests {
             ],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let lock1 = McpLockfile::from_inventory(&inventory);
         let lock2 = McpLockfile::from_inventory(&inventory);
@@ -1785,6 +2228,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let hash_before = McpLockfile::from_inventory(&inventory).inventory_hash;
 
@@ -1931,11 +2375,13 @@ mod tests {
             servers: vec![alpha.clone(), zeta.clone()],
             configs: vec![".mcp.json".into(), ".vscode/mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let reversed = McpInventory {
             servers: vec![zeta, alpha],
             configs: vec![".vscode/mcp.json".into(), ".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
 
         let lock_a = McpLockfile::from_inventory(&in_order);
@@ -1968,11 +2414,13 @@ mod tests {
             servers: vec![mk(".mcp.json"), mk(".vscode/mcp.json")],
             configs: vec![],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let backward = McpInventory {
             servers: vec![mk(".vscode/mcp.json"), mk(".mcp.json")],
             configs: vec![],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let lock_f = McpLockfile::from_inventory(&forward);
         let lock_b = McpLockfile::from_inventory(&backward);
@@ -2173,11 +2621,13 @@ mod tests {
             servers: vec![base.clone()],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let inv_changed = McpInventory {
             servers: vec![value_changed],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         assert_ne!(
             McpLockfile::from_inventory(&inv_base).inventory_hash,
@@ -2214,6 +2664,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let lock = McpLockfile::from_inventory(&inventory);
         let parsed: McpLockfile =
@@ -2274,6 +2725,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let rendered = McpLockfile::from_inventory(&inventory).render();
 
@@ -2344,6 +2796,7 @@ mod tests {
             servers: entries,
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let rendered = McpLockfile::from_inventory(&inventory).render();
         assert!(
@@ -2562,6 +3015,7 @@ mod tests {
             servers,
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let rendered = McpLockfile::from_inventory(&inventory).render();
 
@@ -2675,6 +3129,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let rendered = McpLockfile::from_inventory(&inventory).render();
         assert!(
@@ -2768,11 +3223,13 @@ mod tests {
             servers: vec![with_token_a],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let inv_b = McpInventory {
             servers: vec![with_token_b],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         assert_ne!(
             McpLockfile::from_inventory(&inv_a).inventory_hash,
@@ -2875,6 +3332,7 @@ mod tests {
             servers: entries,
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let rendered = McpLockfile::from_inventory(&inventory).render();
         assert!(
@@ -2949,6 +3407,7 @@ mod tests {
             }],
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         };
         let lock = McpLockfile::from_inventory(&inventory);
         let parsed: McpLockfile = serde_json::from_str(&lock.render())
@@ -2972,6 +3431,7 @@ mod tests {
             servers,
             configs: vec![".mcp.json".into()],
             malformed_configs: vec![],
+            rejected_configs: vec![],
         }
     }
 
@@ -3779,5 +4239,321 @@ mod tests {
         fs::write(&path, lock.render()).unwrap();
         let loaded = load_lockfile(&path).expect("round-trip must succeed");
         assert_eq!(loaded, lock);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F1 — `format_version` is validated on load. A lockfile
+    // whose `format_version` is not `MCP_LOCK_FORMAT_VERSION` (a future
+    // schema like v999, or a legacy v3-shape pre-redaction file that still
+    // happens to deserialize because its v4-only fields are optional) is
+    // rejected with `McpLockLoadError::UnsupportedVersion { found, supported }`
+    // — distinct from `Parse` so the CLI / `mcpdrift` rule can offer a
+    // precise diagnostic instead of "the JSON is corrupt".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_lockfile_rejects_future_version_999_distinctly() {
+        // A perfectly well-formed lockfile that just happens to declare
+        // schema version 999. Must surface as `UnsupportedVersion`, NOT
+        // `Parse` (the JSON is valid; the schema number is the failure).
+        let body = r#"{
+            "format_version": 999,
+            "inventory_hash": "deadbeef",
+            "configs": [],
+            "servers": []
+        }"#;
+        match parse_lockfile(body) {
+            Err(McpLockLoadError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 999, "found must echo the lockfile's version");
+                assert_eq!(
+                    supported, MCP_LOCK_FORMAT_VERSION,
+                    "supported must report this build's version"
+                );
+            }
+            other => panic!("expected UnsupportedVersion variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lockfile_rejects_legacy_v3_shape_distinctly() {
+        // A v3-shape lockfile (no `userinfo_hash` on URL transports;
+        // env serialized as `{name, value_hash}` — which v3 introduced —
+        // but without v4's userinfo redaction). The shape happens to
+        // deserialize cleanly into the v4 struct (the URL has no
+        // userinfo so `userinfo_hash` is omitted both before and after
+        // the schema bump). The version check must still fire.
+        let body = r#"{
+            "format_version": 3,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        match parse_lockfile(body) {
+            Err(McpLockLoadError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 3, "the legacy v3 file's version is what surfaces");
+                assert_eq!(supported, MCP_LOCK_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion for v3 shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lockfile_rejects_legacy_v2_shape_with_raw_env_value() {
+        // A v2-shape lockfile: env entries carry raw `value` strings
+        // (the pre-redaction shape) instead of v4's `value_hash`. The
+        // full v4 deserializer would fail with `missing field
+        // value_hash`, producing a misleading `Parse` error — but the
+        // root cause is a schema-version mismatch. The two-pass parse
+        // catches the version first.
+        let body = r#"{
+            "format_version": 2,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {
+                        "kind": "stdio",
+                        "command": "node",
+                        "args": [],
+                        "env": [{ "name": "API_TOKEN", "value": "secret-raw-value" }]
+                    },
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        match parse_lockfile(body) {
+            Err(McpLockLoadError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 2);
+                assert_eq!(supported, MCP_LOCK_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion for v2 raw-env shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lockfile_genuinely_missing_format_version_is_parse_error() {
+        // A document with NO `format_version` field at all is not a
+        // version mismatch — it's a `Parse` failure. The probe-pass
+        // must surface this as `Parse`, not `UnsupportedVersion`.
+        let body = r#"{ "inventory_hash": "x", "configs": [], "servers": [] }"#;
+        match parse_lockfile(body) {
+            Err(McpLockLoadError::Parse { .. }) => { /* expected */ }
+            other => panic!("expected Parse for missing format_version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lockfile_accepts_current_version() {
+        // Control: a lockfile whose `format_version` equals the constant
+        // parses normally. This is the regression guard — the version
+        // check must NOT reject the version we actually support.
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let lock = McpLockfile::from_inventory(&inv);
+        let body = lock.render();
+        let loaded = parse_lockfile(&body).expect("current version must parse");
+        assert_eq!(loaded.format_version, MCP_LOCK_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn unsupported_version_display_is_informative_and_safe() {
+        // The `Display` output for the new variant must:
+        // 1. Name both `found` and `supported` so the operator can act;
+        // 2. Tell them what to do (`tirith mcp lock`);
+        // 3. Carry no file-content fragments (only the two `u32`s).
+        let err = McpLockLoadError::UnsupportedVersion {
+            found: 999,
+            supported: 4,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("999"), "missing `found` version: {msg}");
+        assert!(msg.contains("4"), "missing `supported` version: {msg}");
+        assert!(
+            msg.contains("tirith mcp lock") || msg.contains("upgrade tirith"),
+            "missing operator remediation guidance: {msg}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F3 / F4 — `build_inventory` surfaces the structured
+    // rejection list on `McpInventory::rejected_configs`. Discovery-time
+    // rejections (symlinked, non-regular, canonical-not-under-root) and
+    // file-content rejections (oversize, permission denied) both flow into
+    // the same list.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn build_inventory_records_symlink_rejection() {
+        // A symlinked `.mcp.json` is rejected during discovery; the
+        // rejection must surface in `rejected_configs` with reason
+        // `Symlink`, not be silently dropped.
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().unwrap();
+        let outside_config = outside.path().join("evil-mcp.json");
+        fs::write(
+            &outside_config,
+            r#"{ "mcpServers": { "evil": { "command": "node" } } }"#,
+        )
+        .unwrap();
+
+        let repo = tempdir().unwrap();
+        symlink(&outside_config, repo.path().join(".mcp.json")).unwrap();
+
+        let inventory = build_inventory(repo.path());
+        assert!(inventory.servers.is_empty());
+        assert!(inventory.configs.is_empty());
+        // The rejection is recorded with the right shape.
+        let found = inventory
+            .rejected_configs
+            .iter()
+            .find(|r| r.path == ".mcp.json")
+            .expect("symlinked config must appear in rejected_configs");
+        assert!(
+            matches!(found.reason, RejectedReason::Symlink),
+            "symlink rejection reason: got {:?}",
+            found.reason,
+        );
+    }
+
+    #[test]
+    fn build_inventory_records_oversize_rejection() {
+        // A 2 MiB `.mcp.json` (above the 1 MiB cap) is rejected without
+        // being read. `rejected_configs` records the size; `configs`
+        // and `servers` are unaffected (no servers contributed).
+        let repo = tempdir().unwrap();
+        // ~2 MiB of JSON-ish content. The exact content doesn't matter —
+        // we never read past the size check.
+        let big = "x".repeat((MCP_CONFIG_MAX_SIZE * 2) as usize);
+        fs::write(repo.path().join(".mcp.json"), big).unwrap();
+
+        let inventory = build_inventory(repo.path());
+        assert!(
+            inventory.servers.is_empty(),
+            "oversized file must contribute no servers",
+        );
+        assert!(
+            inventory.configs.is_empty(),
+            "oversized file is rejected before it counts as a discovered config: {:?}",
+            inventory.configs,
+        );
+        let found = inventory
+            .rejected_configs
+            .iter()
+            .find(|r| r.path == ".mcp.json")
+            .expect("oversize rejection must surface");
+        match found.reason {
+            RejectedReason::Oversize { size_bytes } => {
+                assert!(
+                    size_bytes > MCP_CONFIG_MAX_SIZE,
+                    "size_bytes {size_bytes} must exceed cap {MCP_CONFIG_MAX_SIZE}",
+                );
+            }
+            ref other => panic!("expected Oversize, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_inventory_records_permission_denied_rejection() {
+        // An unreadable file (mode 000) surfaces as
+        // `Unreadable { permission_denied: true }`. Skipped on Windows
+        // (the test relies on POSIX file modes).
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempdir().unwrap();
+        let cfg = repo.path().join(".mcp.json");
+        fs::write(&cfg, r#"{ "mcpServers": {} }"#).unwrap();
+        let mut perms = fs::metadata(&cfg).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&cfg, perms).unwrap();
+
+        let inventory = build_inventory(repo.path());
+
+        // Cleanup so the tempdir can be removed.
+        let mut perms = fs::metadata(&cfg).unwrap().permissions();
+        perms.set_mode(0o600);
+        let _ = fs::set_permissions(&cfg, perms);
+
+        // The file may be readable by root (CI runs as root frequently),
+        // in which case there's no permission denial to test — the
+        // inventory will simply parse the file. Skip the assertion in
+        // that scenario rather than fail the test.
+        if !inventory.rejected_configs.is_empty() {
+            let found = &inventory.rejected_configs[0];
+            assert_eq!(found.path, ".mcp.json");
+            assert!(
+                matches!(
+                    found.reason,
+                    RejectedReason::Unreadable {
+                        permission_denied: true
+                    }
+                ),
+                "expected Unreadable{{ permission_denied: true }}, got {:?}",
+                found.reason,
+            );
+        }
+    }
+
+    #[test]
+    fn build_inventory_silently_skips_not_found_io() {
+        // A path that doesn't physically exist must be silent — discovery
+        // probes a fixed set of paths and the common case is most of
+        // those don't exist. The rejection list must NOT carry a
+        // NotFound-style entry.
+        let repo = tempdir().unwrap();
+        let inventory = build_inventory(repo.path());
+        assert!(inventory.rejected_configs.is_empty());
+        assert!(inventory.servers.is_empty());
+        assert!(inventory.configs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-end finding F8 — `redact_url_userinfo` preserves query string and
+    // fragment through the redaction. The previous defensive-fallback path
+    // would drop them; the documented-unreachable branch now panics with a
+    // clear message, but the normal redaction must already round-trip every
+    // structural URL component.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_url_userinfo_preserves_query_and_fragment() {
+        // A URL with userinfo AND a query AND a fragment must come back
+        // userinfo-stripped, with the query and fragment intact and the
+        // host/port/path correct.
+        let (redacted, hash) = redact_url_userinfo(
+            "server",
+            "https://user:tok@host.example:8443/api?x=1&y=2#frag",
+        );
+        assert_eq!(
+            redacted, "https://host.example:8443/api?x=1&y=2#frag",
+            "redacted URL must retain query and fragment: {redacted}",
+        );
+        assert!(hash.is_some(), "userinfo hash must be set");
+        let hash = hash.unwrap();
+        // The hash must be deterministic for these inputs (server-name salted).
+        assert_eq!(
+            hash,
+            salted_sha256_hex("server", "user:tok"),
+            "userinfo hash must use the documented salt scheme: got {hash}",
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_no_userinfo_canonicalizes_path_default() {
+        // A bare-host URL with no userinfo is canonicalized through
+        // `url::Url`, so the trailing `/` shows up. The hash is None.
+        let (redacted, hash) = redact_url_userinfo("server", "https://host.example");
+        assert_eq!(redacted, "https://host.example/");
+        assert_eq!(hash, None);
     }
 }
