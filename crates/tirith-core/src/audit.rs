@@ -413,6 +413,13 @@ fn default_log_path() -> Option<PathBuf> {
     crate::policy::data_dir().map(|d| d.join("log.jsonl"))
 }
 
+/// Public accessor for the audit log path so out-of-crate readers
+/// (e.g. `tirith trust audit`, M6 ch3) can locate it without hard-coding
+/// `data_dir()/log.jsonl`.
+pub fn audit_log_path() -> Option<PathBuf> {
+    default_log_path()
+}
+
 fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
     let dlp_redacted = crate::redact::redact_with_custom(cmd, custom_patterns);
     let prefix = crate::util::truncate_bytes(&dlp_redacted, 80);

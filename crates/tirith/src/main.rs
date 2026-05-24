@@ -83,7 +83,11 @@ Examples:
         /// When the command is blocked or warned, also print a concrete safer
         /// alternative (e.g. download-then-review instead of pipe-to-shell).
         /// Advisory only — does not change the verdict or exit code.
-        #[arg(long)]
+        ///
+        /// The canonical spelling is `--suggest`; `--suggest-safe-command` is
+        /// kept as a visible (non-hidden) deprecated alias for backward
+        /// compatibility. Both spellings resolve to the same internal flag.
+        #[arg(long = "suggest", visible_alias = "suggest-safe-command")]
         suggest_safe_command: bool,
 
         /// The command to check
@@ -1380,6 +1384,50 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Prune expired trust entries (alias for `gc`).
+    ///
+    /// `prune` is the spec-named CLI surface for the M6 garbage-collection
+    /// flow; `gc` is the shipping name kept as the canonical short form.
+    /// Both invoke the same backing function in `cli::trust::gc`.
+    #[command(after_help = "\
+Examples:
+  tirith trust prune --expired
+  tirith trust prune --expired --scope user")]
+    Prune {
+        /// Collect expired entries — currently the only collection mode.
+        #[arg(long)]
+        expired: bool,
+        /// Scope: user, repo, or all (default)
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show the audit log of trust-store mutations (add / remove / gc / prune).
+    ///
+    /// Reads audit-log JSONL entries with `entry_type == "trust_change"`,
+    /// optionally filtered by a relative time window (`--since 7d`).
+    #[command(after_help = "\
+Examples:
+  tirith trust audit
+  tirith trust audit --since 7d
+  tirith trust audit --format json --since 30d")]
+    Audit {
+        /// Show mutations within the last N days/hours/minutes (e.g. `7d`,
+        /// `24h`, `15m`). Without this flag, the full audit history is shown.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2441,6 +2489,23 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::trust::gc(expired, &scope, json)
+            }
+            TrustAction::Prune {
+                expired,
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::prune(expired, &scope, json)
+            }
+            TrustAction::Audit {
+                since,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust::audit(since.as_deref(), json)
             }
         },
 

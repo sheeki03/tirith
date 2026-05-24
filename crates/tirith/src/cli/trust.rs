@@ -880,8 +880,22 @@ pub fn last() -> i32 {
 /// `--expired` is the default and only collection mode today; it is accepted
 /// explicitly so the command reads clearly and leaves room for future modes.
 pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
+    gc_with_action("gc", expired, scope, json)
+}
+
+/// `tirith trust prune` — spec-named alias for `gc` (M6 ch3). Both
+/// invoke the same backing implementation; only the audit `trust_action`
+/// field differs so an operator can tell which command the user actually
+/// typed.
+pub fn prune(expired: bool, scope: &str, json: bool) -> i32 {
+    gc_with_action("prune", expired, scope, json)
+}
+
+fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) -> i32 {
     if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!("tirith: trust gc: unknown scope '{scope}' (use 'user', 'repo', or 'all')");
+        eprintln!(
+            "tirith: trust {action_label}: unknown scope '{scope}' (use 'user', 'repo', or 'all')",
+        );
         return 1;
     }
     // `--expired` is currently the only mode; if a caller explicitly passes
@@ -901,7 +915,7 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
             Ok(p) => p,
             Err(e) => {
                 if scope != "all" {
-                    print_trust_error("gc", &e, None);
+                    print_trust_error(action_label, &e, None);
                     return 1;
                 }
                 continue;
@@ -915,21 +929,41 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
         let mut store = match load_store(&path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("tirith: trust gc: {e}");
+                eprintln!("tirith: trust {action_label}: {e}");
                 return 1;
             }
         };
         let before = store.entries.len();
+        // Capture the entries we are about to remove so each one lands in
+        // the audit log under the right `trust_action` (M6 ch3). Without
+        // this, gc/prune sweeps were invisible in `tirith trust audit`.
+        let expired_entries: Vec<TrustEntry> = store
+            .entries
+            .iter()
+            .filter(|entry| is_expired(entry))
+            .cloned()
+            .collect();
         store.entries.retain(|entry| !is_expired(entry));
         let removed = before - store.entries.len();
 
         if removed > 0 {
             if let Err(e) = write_store(&path, &store) {
-                eprintln!("tirith: trust gc: {e}");
+                eprintln!("tirith: trust {action_label}: {e}");
                 return 1;
             }
+            for entry in &expired_entries {
+                tirith_core::audit::log_trust_change(
+                    &entry.pattern,
+                    entry.rule_id.as_deref(),
+                    action_label,
+                    entry.ttl_expires.as_deref(),
+                    s,
+                );
+            }
             if !json {
-                eprintln!("tirith: gc: removed {removed} expired entries from {s} scope");
+                eprintln!(
+                    "tirith: {action_label}: removed {removed} expired entries from {s} scope",
+                );
             }
         }
 
@@ -948,7 +982,7 @@ pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
         return print_json(&out);
     }
     if total_removed == 0 {
-        eprintln!("tirith: gc: no expired entries found");
+        eprintln!("tirith: {action_label}: no expired entries found");
     }
 
     0
@@ -1323,6 +1357,138 @@ fn diff_entry_of(key: &str) -> DiffEntry {
         rule_id,
         scope_kind,
     }
+}
+
+/// `tirith trust audit` — show recorded trust-store mutations (M6 ch3).
+///
+/// Walks the audit-log JSONL and filters entries with
+/// `entry_type == "trust_change"`. Optionally trims the window with
+/// `--since <duration>` (e.g. `7d`, `24h`, `15m`).
+pub fn audit(since: Option<&str>, json: bool) -> i32 {
+    let cutoff = match since {
+        Some(s) => match parse_relative_duration(s) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("tirith: trust audit: invalid --since value: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
+    let Some(log_path) = tirith_core::audit::audit_log_path() else {
+        eprintln!("tirith: trust audit: cannot resolve audit log path (no data dir)");
+        return 1;
+    };
+
+    if !log_path.exists() {
+        if json {
+            let _ = print_json(&serde_json::json!({"entries": []}));
+        } else {
+            eprintln!(
+                "tirith: trust audit: no audit log yet at {}",
+                log_path.display()
+            );
+        }
+        return 0;
+    }
+
+    // Reuse the shipping superset reader so missing fields on older entries
+    // (no agent_origin, no trust_action, etc.) parse cleanly.
+    let result = match tirith_core::audit_aggregator::read_log(&log_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "tirith: trust audit: cannot read audit log at {}: {e}",
+                log_path.display(),
+            );
+            return 1;
+        }
+    };
+
+    #[derive(Serialize)]
+    struct TrustAuditRow {
+        timestamp: String,
+        action: String,
+        scope: String,
+        pattern: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl_expires: Option<String>,
+    }
+
+    let mut rows: Vec<TrustAuditRow> = Vec::new();
+    for entry in result.records {
+        if entry.entry_type != "trust_change" {
+            continue;
+        }
+        if let Some(cutoff_ts) = cutoff {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
+                if ts.to_utc() < cutoff_ts {
+                    continue;
+                }
+            }
+        }
+        rows.push(TrustAuditRow {
+            timestamp: entry.timestamp,
+            action: entry.trust_action.unwrap_or_else(|| "?".to_string()),
+            scope: entry.trust_scope.unwrap_or_else(|| "?".to_string()),
+            pattern: entry.trust_pattern.unwrap_or_default(),
+            rule_id: entry.trust_rule_id,
+            ttl_expires: entry.trust_ttl_expires,
+        });
+    }
+
+    if json {
+        return print_json(&serde_json::json!({"entries": rows}));
+    }
+
+    if rows.is_empty() {
+        eprintln!("tirith: trust audit: no trust-store mutations recorded");
+        return 0;
+    }
+    println!("{:<26} {:<8} {:<6} pattern", "timestamp", "action", "scope");
+    for r in &rows {
+        let rule_suffix = match &r.rule_id {
+            Some(rid) => format!("  [rule: {rid}]"),
+            None => String::new(),
+        };
+        println!(
+            "{:<26} {:<8} {:<6} {}{}",
+            r.timestamp, r.action, r.scope, r.pattern, rule_suffix
+        );
+    }
+    0
+}
+
+/// Parse a relative-duration string (`7d`, `24h`, `15m`) into the UTC
+/// timestamp that the duration is "ago from now".
+fn parse_relative_duration(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".into());
+    }
+    let (num_str, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("missing unit suffix (use e.g. '7d', '24h', '15m'): {s}"))?,
+    );
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("not a number: {num_str:?}"))?;
+    let seconds = match unit {
+        "d" => n.checked_mul(86_400),
+        "h" => n.checked_mul(3_600),
+        "m" => n.checked_mul(60),
+        "s" => Some(n),
+        other => {
+            return Err(format!(
+                "unknown duration unit {other:?} (use 'd', 'h', 'm', or 's')",
+            ))
+        }
+    }
+    .ok_or_else(|| format!("duration overflow: {s}"))?;
+    Ok(chrono::Utc::now() - chrono::Duration::seconds(seconds))
 }
 
 /// `tirith trust diff` — show what changed in the trust set since the previous
