@@ -64,7 +64,16 @@ pub fn scan(path: Option<&str>, online: bool, offline: bool, json: bool) -> i32 
     let db = ThreatDb::cached();
 
     // Policy — drives the allowlist (suppress findings for trusted packages).
-    let policy = Policy::discover(None);
+    //
+    // PR #121 fix-list item 14 — discover policy from the SCAN TARGET, not the
+    // operator's cwd. Previously `Policy::discover(None)` fell back to
+    // `std::env::current_dir()`, so `tirith ecosystem scan /path/to/repo` from
+    // `~/elsewhere` ignored the repo's `.tirith/policy.yaml` (allowlist,
+    // severity overrides) entirely. The scan target IS the project whose
+    // policy must apply — passing `scan_root` is the same shape the per-file
+    // analysis paths already use (`engine::analyze` discovers policy from the
+    // analyzed file's directory, not the caller's cwd).
+    let policy = Policy::discover(scan_root.to_str());
 
     // Build the allowlist predicate. A policy allowlist entry suppresses a
     // dependency when it matches the bare package name or the `ecosystem:name`
@@ -464,5 +473,73 @@ mod tests {
         .unwrap();
         let code = scan(dir.path().to_str(), false, false, true);
         assert_eq!(code, 0, "a project with no flagged deps must exit 0");
+    }
+
+    #[test]
+    fn scan_discovers_policy_from_scan_target_not_cwd() {
+        // PR #121 fix-list item 14 regression pin — `Policy::discover` must be
+        // anchored at the SCAN TARGET, not the operator's cwd. We write a
+        // `.tirith/policy.yaml` to the scan target that allowlists the only
+        // declared dependency; if discovery is anchored at the scan target the
+        // allowlist suppresses findings (verdict ALLOW, exit 0). If discovery
+        // falls back to cwd (the old bug), the allowlist never loads and the
+        // dependency goes unsuppressed.
+        //
+        // This is a discovery-anchoring test, not an end-to-end finding test —
+        // the temp project's only dep is unknown to the (absent) threat DB, so
+        // a clean baseline scan would already exit 0. We exercise discovery
+        // through `Policy::discover(scan_root.to_str())` directly to assert
+        // the resolved policy carries the allowlist entry.
+        let target = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+
+        // Mark both temp dirs as repo roots so policy-discovery's walk-up does
+        // not climb out of the tempdir into a parent project. Without this
+        // marker, `discover_policy_path` walks past the temp dir looking for
+        // an ancestor with `.tirith/`; on a developer box the workspace root's
+        // `.tirith/` could win.
+        fs::create_dir_all(target.path().join(".git")).unwrap();
+        fs::create_dir_all(cwd.path().join(".git")).unwrap();
+
+        fs::create_dir_all(target.path().join(".tirith")).unwrap();
+        fs::write(
+            target.path().join(".tirith").join("policy.yaml"),
+            "allowlist:\n  - my-internal-pkg\n",
+        )
+        .unwrap();
+        fs::write(
+            target.path().join("Cargo.toml"),
+            "[dependencies]\nmy-internal-pkg = \"1.0\"\n",
+        )
+        .unwrap();
+
+        // The discovered policy from the scan target must carry the allowlist
+        // entry. Anchored at the cwd (no `.tirith/`) it would not.
+        let from_target = Policy::discover(target.path().to_str());
+        assert!(
+            from_target.allowlist.iter().any(|e| e == "my-internal-pkg"),
+            "policy discovered from the scan target must carry its allowlist: \
+             {:?}",
+            from_target.allowlist,
+        );
+        let from_cwd = Policy::discover(cwd.path().to_str());
+        assert!(
+            !from_cwd.allowlist.iter().any(|e| e == "my-internal-pkg"),
+            "policy discovered from an unrelated cwd must NOT carry the scan \
+             target's allowlist: {:?}",
+            from_cwd.allowlist,
+        );
+
+        // The exported `scan` entry point is what wires discovery — invoke it
+        // and assert no panic and a clean ALLOW (the scan finds the dep,
+        // allowlist suppresses it). The threat DB is absent here so a clean
+        // baseline already exits 0 regardless; this is a smoke that the new
+        // wiring does not regress the happy path.
+        let code = scan(target.path().to_str(), false, false, true);
+        assert_eq!(
+            code, 0,
+            "ecosystem scan with allowlisted dep must exit 0 (policy discovery \
+             from scan target)"
+        );
     }
 }

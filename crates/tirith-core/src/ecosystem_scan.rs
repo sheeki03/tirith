@@ -1245,6 +1245,80 @@ pub fn findings_for(assessment: &DependencyAssessment) -> Vec<Finding> {
             mitre_id: None,
             custom_rule_id: None,
         });
+        return findings;
+    }
+
+    // 4 — provenance-only risk. PR #121 fix-list item 2: when none of the
+    // name-shape signals above fire BUT the deterministic risk score reaches
+    // High or Critical purely from provenance signals (brand-new package,
+    // sole maintainer, no downloads, ownership transfer, no source repo,
+    // yanked / deprecated), the package is risky on registry data alone.
+    // Previously `findings_for` returned after the similar-name block and a
+    // package scoring 76+/100 from provenance alone produced ZERO findings —
+    // the whole point of `--online` registry signals went unreported. The
+    // factor breakdown is the explainable evidence; we name the contributing
+    // factors so the operator knows *why* the score is what it is.
+    //
+    // Mirrors the same shape that `install_txn::risk_findings_for` already
+    // uses for the install-time aggregate-score finding (constants
+    // `AGGREGATE_WARN_SCORE = 51` / `AGGREGATE_BLOCK_SCORE = 76`) — the
+    // ecosystem scan now closes the parallel gap.
+    let risk_level = assessment.risk.risk_level;
+    if matches!(risk_level, "high" | "critical") {
+        let severity = if risk_level == "critical" {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        // Name the *named* contributing factors, in display order, so the
+        // description points at evidence the reader can verify by hand —
+        // exactly the discipline `package_risk` is built on. The factors
+        // vector is the breakdown's `verify()`-checked invariant.
+        let factor_labels: Vec<&str> = assessment
+            .risk
+            .factors
+            .iter()
+            .filter(|f| f.points > 0)
+            .map(|f| f.label.as_str())
+            .collect();
+        let factor_summary = if factor_labels.is_empty() {
+            "registry-API provenance signals".to_string()
+        } else {
+            factor_labels.join(", ")
+        };
+        findings.push(Finding {
+            rule_id: RuleId::ThreatSuspiciousPackage,
+            severity,
+            title: format!(
+                "High-risk provenance for {} dependency: {} ({}/100, {})",
+                dep.ecosystem, dep.name, assessment.risk.score, risk_level,
+            ),
+            description: format!(
+                "The {} dependency '{}' declared in {} has elevated provenance risk \
+                 (score {}/100, {}) driven by registry signals rather than a known-bad \
+                 name: {}. Review the factor breakdown — run `tirith package explain \
+                 {} {}` — and verify the package is intentional before installing.",
+                dep.ecosystem,
+                dep.name,
+                manifest,
+                assessment.risk.score,
+                risk_level,
+                factor_summary,
+                dep.ecosystem,
+                dep.name,
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "manifest={manifest} package={} ecosystem={} risk_score={} \
+                     risk_level={} factors=[{}]",
+                    dep.name, dep.ecosystem, assessment.risk.score, risk_level, factor_summary,
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
 
     findings
@@ -2137,6 +2211,121 @@ gem 'toplevelgem'
             false,
         );
         assert!(findings_for(&a).is_empty());
+    }
+
+    #[test]
+    fn findings_for_provenance_only_high_risk_emits_finding() {
+        // PR #121 fix-list item 2 regression pin — a dependency with no
+        // name-shape risk (no typosquat / no slopsquat / no similar-name) but
+        // a HIGH-or-CRITICAL deterministic risk score from registry-API
+        // provenance signals MUST emit a finding. Previously `findings_for`
+        // returned after the similar-name block, so a provenance-only High
+        // produced zero findings — the registry path was decorative.
+        //
+        // We build a fully-loaded `ApiProvenance` so the api_factors stack
+        // enough points to cross the High threshold (>= 51). The package name
+        // is unknown to the (absent) threat DB, so name signals fire nothing.
+        let provenance = package_risk::ApiProvenance {
+            source: "npm".to_string(),
+            package_age_days: Some(1),
+            latest_version_age_days: Some(0),
+            ownership_transferred: Some(true),
+            version_spike: Some(true),
+            recent_downloads: Some(3),
+            has_source_repo: Some(false),
+            yanked_or_deprecated: true,
+            latest_version: Some("9.9.9".to_string()),
+        };
+        let signals = PackageSignals {
+            ecosystem: Ecosystem::Npm,
+            name: "totally-unknown-pkg".to_string(),
+            threat_db_missing: false,
+            name_vs_popular: NameVsPopular::Unknown,
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::NotInspected,
+            api: ApiSignals::Available { provenance },
+        };
+        let breakdown = package_risk::score_package(&signals);
+        assert!(
+            matches!(breakdown.risk_level, "high" | "critical"),
+            "test fixture must produce a High/Critical score for the \
+             provenance-only path to exercise: score={} level={}",
+            breakdown.score,
+            breakdown.risk_level,
+        );
+        let assessment = DependencyAssessment {
+            dependency: DeclaredDependency {
+                name: "totally-unknown-pkg".to_string(),
+                ecosystem: Ecosystem::Npm,
+                version: None,
+                dev: false,
+            },
+            manifest: "package.json".to_string(),
+            risk: breakdown,
+            slopsquat: SlopsquatAssessment::clear(),
+            allowlisted: false,
+        };
+        let findings = findings_for(&assessment);
+        assert!(
+            !findings.is_empty(),
+            "provenance-only High/Critical risk MUST emit a finding"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ThreatSuspiciousPackage),
+            "expected a ThreatSuspiciousPackage finding, got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>(),
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.severity, Severity::High | Severity::Critical)),
+            "provenance-only finding must be High or Critical, got {:?}",
+            findings.iter().map(|f| f.severity).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn findings_for_low_or_medium_risk_with_no_name_shape_emits_nothing() {
+        // The provenance-only fall-through MUST only fire on High/Critical —
+        // a Low/Medium score with no name-shape signals stays clean (the
+        // current behavior for the clean dependency test). This pin keeps
+        // the threshold conservative; flipping it to Medium would flood the
+        // verdict with low-confidence provenance noise.
+        let signals = PackageSignals {
+            ecosystem: Ecosystem::Npm,
+            name: "ordinary-pkg".to_string(),
+            threat_db_missing: false,
+            name_vs_popular: NameVsPopular::Unknown,
+            malicious_typosquat_of: None,
+            content_signals: ContentSignals::NotInspected,
+            api: ApiSignals::offline(), // offline → no api factors
+        };
+        let breakdown = package_risk::score_package(&signals);
+        assert!(
+            matches!(breakdown.risk_level, "low" | "medium"),
+            "offline + unknown name must score Low/Medium: score={} level={}",
+            breakdown.score,
+            breakdown.risk_level,
+        );
+        let assessment = DependencyAssessment {
+            dependency: DeclaredDependency {
+                name: "ordinary-pkg".to_string(),
+                ecosystem: Ecosystem::Npm,
+                version: None,
+                dev: false,
+            },
+            manifest: "package.json".to_string(),
+            risk: breakdown,
+            slopsquat: SlopsquatAssessment::clear(),
+            allowlisted: false,
+        };
+        assert!(
+            findings_for(&assessment).is_empty(),
+            "Low/Medium provenance-only score with no name-shape signal must \
+             not emit a finding"
+        );
     }
 
     // --- end-to-end scan over a temp project ------------------------------

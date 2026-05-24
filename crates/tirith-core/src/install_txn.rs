@@ -31,7 +31,7 @@
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
 use crate::package_risk::{self, ApiSignals, ContentSignals, PackageSignals, RiskBreakdown};
-use crate::policy::Policy;
+use crate::policy::{FailMode, Policy};
 use crate::rules::threatintel::{self, PackageRef};
 use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::tokenize::{self, ShellType};
@@ -297,6 +297,87 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
              score; run `tirith ecosystem scan` to assess a project's manifests.",
             manager.label()
         ));
+
+        // PR #121 fix-list item 1 — close the manifest-form install bypass.
+        // Previously, when `planned.is_empty()` AND the user invoked a
+        // manifest-driven form (`pip install -r requirements.txt`,
+        // `npm install` with no args, `cargo install --path .`, ...), the
+        // analysis was complete with ZERO package-risk scoring contribution
+        // and frequently exited ALLOW. Operators saw "verdict: ALLOW — no
+        // supply-chain risks found" and believed tirith had analyzed their
+        // manifest. It had not — `extract_packages` cannot extract names from
+        // a manifest path; the manifest body would have to be parsed.
+        //
+        // The fix: when a manifest flag is present, emit a finding so the
+        // operator sees the unanalyzed surface as an explicit gap, with a
+        // pointer to `tirith ecosystem scan` (the path that DOES parse
+        // manifests). Severity escalates under `fail_mode: closed` so a
+        // strict-mode policy hard-blocks instead of just warning.
+        if let Some(manifest_arg) = detect_manifest_flag(request.user_args) {
+            let strict = matches!(request.policy.fail_mode, FailMode::Closed);
+            let severity = if strict {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
+            let mode_note = if strict {
+                "Under `fail_mode: closed` the manifest path must be analyzed before \
+                 the install is allowed to proceed."
+            } else {
+                "Re-run `tirith ecosystem scan` against the manifest to score every \
+                 declared dependency before proceeding."
+            };
+            let manifest_label = match &manifest_arg {
+                ManifestFlag::PathArg { flag, value } => format!("{flag} {value}"),
+                ManifestFlag::JoinedPath { token } => token.clone(),
+                ManifestFlag::Bareword { token } => token.clone(),
+                ManifestFlag::NoArgs => "(no package argument)".to_string(),
+            };
+            let scan_target: &str = match &manifest_arg {
+                ManifestFlag::PathArg { value, .. } => value,
+                ManifestFlag::JoinedPath { token } => {
+                    token.split_once('=').map(|(_k, v)| v).unwrap_or(".")
+                }
+                ManifestFlag::Bareword { token } => token,
+                ManifestFlag::NoArgs => ".",
+            };
+            findings.push(Finding {
+                rule_id: RuleId::ThreatSuspiciousPackage,
+                severity,
+                title: format!(
+                    "{} manifest install — package names could not be extracted \
+                     from {}",
+                    manager.label(),
+                    manifest_label,
+                ),
+                description: format!(
+                    "`{}` is a manifest-driven install ({}): package names could \
+                     not be extracted from the manifest {}, so per-package risk \
+                     scoring did NOT run. Without scoring, a malicious or \
+                     typosquatted dependency declared in the manifest would not \
+                     surface in this verdict. {} Run `tirith ecosystem scan {}`.",
+                    analysis_command,
+                    manifest_arg.describe(),
+                    manifest_label,
+                    mode_note,
+                    scan_target,
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!(
+                        "manager={} manifest_form={} manifest_arg={} \
+                         fail_mode={}",
+                        manager.label(),
+                        manifest_arg.describe(),
+                        manifest_label,
+                        if strict { "closed" } else { "open" },
+                    ),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
     }
 
     // --- (5) compose the verdict ----------------------------------------
@@ -324,6 +405,146 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         verdict,
         notes,
     }
+}
+
+/// The kind of manifest-driven install flag detected on a `planned.is_empty()`
+/// install command. Surfaces enough structure that a finding can carry the
+/// exact manifest path / form back to the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestFlag {
+    /// A flag that takes a separate-token path: `pip install -r requirements.txt`,
+    /// `pip install --requirement requirements.txt`, `pip install -e .`,
+    /// `cargo install --path .`, etc.
+    PathArg { flag: String, value: String },
+    /// A `flag=value` joined form: `pip install --requirement=requirements.txt`,
+    /// `cargo install --path=.`.
+    JoinedPath { token: String },
+    /// A bareword that is itself a manifest reference: `pip install .`,
+    /// `pip install ./subdir`, `pip install /abs/path` (pip uses a path
+    /// positional to install from `pyproject.toml`).
+    Bareword { token: String },
+    /// `npm install` with NO user arguments (npm uses the local
+    /// `package-lock.json` / `package.json` implicitly).
+    NoArgs,
+}
+
+impl ManifestFlag {
+    /// One-line description used in finding bodies.
+    fn describe(&self) -> &'static str {
+        match self {
+            ManifestFlag::PathArg { .. } | ManifestFlag::JoinedPath { .. } => {
+                "explicit manifest flag"
+            }
+            ManifestFlag::Bareword { .. } => "manifest path positional",
+            ManifestFlag::NoArgs => "implicit local manifest (no args)",
+        }
+    }
+}
+
+/// Detect whether `user_args` represents a manifest-driven install.
+///
+/// The detection is conservative: only the well-known manifest forms across
+/// pip / npm / cargo are recognized. A future package manager (or a flag this
+/// list does not cover) returns `None` and falls through to the existing
+/// "no package on the command line" note without escalating to a finding.
+///
+/// Forms recognized today:
+///
+/// * pip — `-r FILE`, `--requirement FILE`, `--requirements FILE`, `-c FILE`,
+///   `--constraint FILE`, `-e PATH` (editable), `--editable PATH`,
+///   `--requirement=FILE` / `--constraint=FILE` / `--editable=PATH` joined,
+///   and a bareword path (`.`, `./x`, `/abs/path`).
+/// * npm — install with NO user args (the default reads
+///   `package.json`/`package-lock.json`).
+/// * cargo — `--path PATH`, `--path=PATH`, `--git URL`, `--git=URL`.
+///
+/// The check runs *before* the verdict is composed — `user_args` here is the
+/// caller's arguments after the `<source>` positional, i.e. exactly what the
+/// install subcommand will see.
+fn detect_manifest_flag(user_args: &[String]) -> Option<ManifestFlag> {
+    // npm install with NO args — implicit local manifest. The same is *not*
+    // true for pip / cargo: a bare `pip install` or `cargo install` is a
+    // usage error (no target), so we only treat the empty-args form as
+    // manifest-driven when SOME flag-or-positional is present. Empty
+    // `user_args` therefore returns `NoArgs` only when the engine analyzed
+    // an actual `<manager> install` invocation with no further args; the
+    // CLI rejects empty args before `plan_install` is called for pip/cargo,
+    // so in practice NoArgs surfaces for npm.
+    if user_args.is_empty() {
+        return Some(ManifestFlag::NoArgs);
+    }
+
+    // Separate-token flags (`-r FILE` / `--path PATH` / etc.).
+    const SEPARATE_FLAGS: &[&str] = &[
+        // pip
+        "-r",
+        "--requirement",
+        "--requirements",
+        "-c",
+        "--constraint",
+        "-e",
+        "--editable",
+        // cargo
+        "--path",
+        "--git",
+    ];
+    let mut i = 0;
+    while i < user_args.len() {
+        let arg = user_args[i].as_str();
+        if SEPARATE_FLAGS.contains(&arg) {
+            // Need a following value token. If the user wrote `pip install -r`
+            // with nothing after it, that's a usage error pip itself catches;
+            // we still surface the manifest-form finding with an empty value.
+            let value = user_args.get(i + 1).cloned().unwrap_or_default();
+            return Some(ManifestFlag::PathArg {
+                flag: arg.to_string(),
+                value,
+            });
+        }
+        // Joined `flag=value` forms.
+        if let Some((flag_part, _value_part)) = arg.split_once('=') {
+            const JOINED_FLAGS: &[&str] = &[
+                // pip
+                "--requirement",
+                "--requirements",
+                "--constraint",
+                "--editable",
+                // cargo
+                "--path",
+                "--git",
+            ];
+            if JOINED_FLAGS.contains(&flag_part) {
+                return Some(ManifestFlag::JoinedPath {
+                    token: arg.to_string(),
+                });
+            }
+        }
+        // Bareword path positional (pip's `pip install .` form). We treat a
+        // bareword as a manifest reference when it *looks* like a path
+        // (starts with `.`, `/`, or `~`). A normal package name like
+        // `requests` is not a manifest reference — pip parses it as a name.
+        //
+        // We deliberately ignore arguments that start with `-` (they're
+        // flags), and we only consider a token a path-positional when it
+        // STARTS with one of those characters (a bare `.` is the canonical
+        // "install from this directory" pip form; `requirements.txt` alone
+        // without `-r` is NOT a manifest install per pip's CLI, so we do
+        // NOT treat a `.txt` suffix as a signal).
+        if !arg.starts_with('-')
+            && (arg == "."
+                || arg == ".."
+                || arg.starts_with("./")
+                || arg.starts_with("../")
+                || arg.starts_with('/')
+                || arg.starts_with('~'))
+        {
+            return Some(ManifestFlag::Bareword {
+                token: arg.to_string(),
+            });
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Build the real install argv for `manager` from the user's arguments.
@@ -662,6 +883,202 @@ mod tests {
                 .any(|n| n.contains("no installable package")),
             "notes: {:?}",
             plan.notes
+        );
+    }
+
+    #[test]
+    fn plan_install_pip_dash_r_manifest_bypass_emits_finding() {
+        // PR #121 fix-list item 1 regression pin — a `pip install -r
+        // requirements.txt` invocation used to fall through to a clean ALLOW
+        // because no package name could be extracted from the command line.
+        // Now the manifest-form path emits a Medium finding under the default
+        // `fail_mode: open` so the unanalyzed surface is visible.
+        let req = PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &["-r".to_string(), "requirements.txt".to_string()],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert!(
+            plan.packages.is_empty(),
+            "no per-package scoring on a manifest install"
+        );
+        assert_ne!(
+            plan.verdict.action,
+            Action::Allow,
+            "manifest-form install must NOT silently allow — verdict: {:?} \
+             findings: {:?}",
+            plan.verdict.action,
+            plan.verdict.findings,
+        );
+        let manifest_findings: Vec<_> = plan
+            .verdict
+            .findings
+            .iter()
+            .filter(|f| {
+                f.rule_id == RuleId::ThreatSuspiciousPackage && f.title.contains("manifest install")
+            })
+            .collect();
+        assert_eq!(
+            manifest_findings.len(),
+            1,
+            "expected exactly one manifest-install finding, got: {:?}",
+            plan.verdict.findings,
+        );
+        assert_eq!(manifest_findings[0].severity, Severity::Medium);
+        assert!(
+            manifest_findings[0]
+                .description
+                .contains("tirith ecosystem scan"),
+            "the manifest finding must point at ecosystem scan: {}",
+            manifest_findings[0].description,
+        );
+    }
+
+    #[test]
+    fn plan_install_pip_dash_r_under_fail_closed_escalates_to_high() {
+        // Same manifest-form bypass, but with `fail_mode: closed` — the
+        // severity escalates from Medium to High so a strict-mode policy
+        // hard-blocks. Action goes Warn → Block.
+        let policy = Policy {
+            fail_mode: FailMode::Closed,
+            ..Policy::default()
+        };
+        let req = PlanRequest {
+            manager: PackageManager::Pip,
+            user_args: &["-r".to_string(), "requirements.txt".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        let manifest_finding = plan
+            .verdict
+            .findings
+            .iter()
+            .find(|f| {
+                f.rule_id == RuleId::ThreatSuspiciousPackage && f.title.contains("manifest install")
+            })
+            .expect("manifest-install finding must be present under fail_mode: closed");
+        assert_eq!(manifest_finding.severity, Severity::High);
+        assert_eq!(plan.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn plan_install_pip_editable_dot_emits_finding() {
+        // `pip install -e .` and `pip install .` are pip's "install from this
+        // directory's pyproject.toml" forms. Same manifest-bypass surface.
+        for args in [
+            vec!["-e".to_string(), ".".to_string()],
+            vec![".".to_string()],
+            vec!["./subproject".to_string()],
+            vec!["--editable=.".to_string()],
+        ] {
+            let req = PlanRequest {
+                manager: PackageManager::Pip,
+                user_args: &args,
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            };
+            let plan = plan_install(&req);
+            assert!(
+                plan.verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.title.contains("manifest install")),
+                "expected manifest-install finding for `pip install {}` — got: {:?}",
+                args.join(" "),
+                plan.verdict.findings,
+            );
+        }
+    }
+
+    #[test]
+    fn plan_install_npm_no_args_emits_manifest_finding() {
+        // `npm install` with no further args reads the local
+        // package-lock.json / package.json — a manifest-driven install with
+        // no package on the command line. (The tirith CLI rejects empty args
+        // for pip/cargo before this function is called, so this exercises the
+        // npm-specific path.)
+        let req = PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &[],
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        };
+        let plan = plan_install(&req);
+        assert!(
+            plan.verdict
+                .findings
+                .iter()
+                .any(|f| f.title.contains("manifest install")),
+            "expected manifest-install finding for `npm install` with no args: {:?}",
+            plan.verdict.findings,
+        );
+    }
+
+    #[test]
+    fn plan_install_cargo_path_manifest_emits_finding() {
+        // `cargo install --path .` builds the crate at `.` rather than a
+        // published name — no name extractable from the command line.
+        for args in [
+            vec!["--path".to_string(), ".".to_string()],
+            vec!["--path=.".to_string()],
+            vec![
+                "--git".to_string(),
+                "https://github.com/example/repo".to_string(),
+            ],
+        ] {
+            let req = PlanRequest {
+                manager: PackageManager::Cargo,
+                user_args: &args,
+                db: None,
+                policy: &empty_policy(),
+                cwd: None,
+                interactive: false,
+                online: OnlineMode::Off,
+            };
+            let plan = plan_install(&req);
+            assert!(
+                plan.verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.title.contains("manifest install")),
+                "expected manifest-install finding for `cargo install {}`: {:?}",
+                args.join(" "),
+                plan.verdict.findings,
+            );
+        }
+    }
+
+    #[test]
+    fn plan_install_detect_manifest_flag_recognizes_known_forms() {
+        // Direct unit test on the detector — narrow coverage so adding a new
+        // flag is a one-line diff with a clear pin.
+        assert!(detect_manifest_flag(&[]).is_some());
+        assert!(detect_manifest_flag(&["-r".to_string(), "req.txt".to_string()]).is_some());
+        assert!(detect_manifest_flag(&["--requirement=r.txt".to_string()]).is_some());
+        assert!(detect_manifest_flag(&["-e".to_string(), ".".to_string()]).is_some());
+        assert!(detect_manifest_flag(&[".".to_string()]).is_some());
+        assert!(detect_manifest_flag(&["./foo".to_string()]).is_some());
+        assert!(detect_manifest_flag(&["--path".to_string(), ".".to_string()]).is_some());
+        // Normal package names are NOT manifest references.
+        assert!(detect_manifest_flag(&["requests".to_string()]).is_none());
+        assert!(
+            detect_manifest_flag(&["left-pad".to_string(), "--save-dev".to_string()]).is_none(),
+            "a package name plus an npm flag must not be a manifest install"
         );
     }
 

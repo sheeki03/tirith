@@ -3439,6 +3439,12 @@ fn install_no_exec_after_source_is_a_hard_error() {
 fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
     // The JSON envelope for an analyzed transaction must parse, identify
     // itself, and carry `sandboxed: false` — tirith never claims to sandbox.
+    //
+    // PR #121 fix-list item 3 — the schema is now a SINGLE top-level
+    // document `{"analysis": {...}, "outcome": null|{...}}`. The pre-fix
+    // shape (separate `install_analysis` / `install_outcome` writes
+    // interleaved with package-manager stdout) was unparseable as one
+    // document. This test pins the new shape.
     let out = tirith_install()
         .args([
             "install",
@@ -3460,21 +3466,32 @@ fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("install --no-exec --format json must produce valid JSON");
-    assert_eq!(json["kind"], "install_analysis");
-    assert_eq!(json["manager"], "npm");
+    // Single top-level envelope.
+    assert_eq!(json["kind"], "install");
+    let analysis = &json["analysis"];
+    assert!(
+        analysis.is_object(),
+        "the envelope must carry an `analysis` object"
+    );
+    assert_eq!(analysis["kind"], "install_analysis");
+    assert_eq!(analysis["manager"], "npm");
     assert_eq!(
-        json["sandboxed"], false,
+        analysis["sandboxed"], false,
         "install must never report itself as sandboxed"
     );
-    assert_eq!(json["command"], "npm install my-unique-internal-pkg-xyzzy");
+    assert_eq!(
+        analysis["command"], "npm install my-unique-internal-pkg-xyzzy"
+    );
     assert!(
-        json["verdict"].is_object(),
+        analysis["verdict"].is_object(),
         "the JSON must embed the analysis verdict"
     );
-    // --no-exec means the transaction never produced an `install_outcome`.
+    // --no-exec means the transaction never produced an `install_outcome` —
+    // the envelope's `outcome` field is JSON null.
     assert!(
-        json.get("ran").is_none(),
-        "an analyze-only run must not report `ran`"
+        json["outcome"].is_null(),
+        "an analyze-only run must carry `outcome: null`, got: {}",
+        json["outcome"]
     );
 }
 
