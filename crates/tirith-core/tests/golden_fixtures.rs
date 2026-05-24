@@ -1319,6 +1319,19 @@ fn test_lab_corpus_reaches_tier3() {
         // tier-3 and produce at least one finding. If a future refactor
         // accidentally gates a rule out of the hot path, this fires.
         if expected != Action::Allow {
+            // First: the verdict actually reached the tier-3 rule layer.
+            // The test name promises "reaches_tier3" — pin the contract
+            // explicitly rather than inferring it from the presence of
+            // findings (CR follow-up). A future regression that gates the
+            // engine at tier-1 / tier-2 would otherwise still pass as long
+            // as some finding sneaks out via a byte-scan path.
+            assert!(
+                verdict.tier_reached >= 3,
+                "Lab scenario '{}' (expected {:?}): engine reached tier {} but the corpus requires tier-3 coverage",
+                scenario.name,
+                expected,
+                verdict.tier_reached,
+            );
             assert!(
                 !verdict.findings.is_empty(),
                 "Lab scenario '{}' (expected {:?}): tier-3 produced no findings — corpus has lost detection coverage",

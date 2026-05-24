@@ -319,8 +319,22 @@ fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<St
 /// without driving the whole `print_human` function.
 fn format_inventory_server_line(server: &mcp_lock::McpServerEntry) -> String {
     let transport = describe_transport(&server.transport);
-    let tools = if server.tools.is_empty() {
-        "all tools (none declared)".to_string()
+    // Branch on `tools_declared` so the operator can distinguish three states:
+    //   1. tools omitted in the source config — MCP clients treat this as
+    //      "any tool the server exposes at runtime". The lockfile captures no
+    //      tool list because none was declared.
+    //   2. tools declared as `"tools": []` — an explicit empty allowlist. The
+    //      source config intentionally allows no tools.
+    //   3. tools declared with one or more entries — the normal case.
+    // Without this distinction (the pre-fix code rendered cases 1 and 2 with
+    // the same "all tools (none declared)" string), an operator could not
+    // tell whether a server was deliberately scoped to zero tools or whether
+    // the runtime would surface every tool the server exposes — a real
+    // policy ambiguity that the lockfile is supposed to resolve.
+    let tools = if !server.tools_declared {
+        "tools omitted — server may expose runtime tools".to_string()
+    } else if server.tools.is_empty() {
+        "no tools declared (explicit empty)".to_string()
     } else {
         format!("{} tool(s)", server.tools.len())
     };
@@ -396,21 +410,31 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
         mcp_lock::McpTransport::Url { url, userinfo_hash } => {
             // The stored `url` is already userinfo-stripped (a credential, if
-            // any, has been replaced with a salted hash); print it verbatim.
+            // any, has been replaced with a salted hash). The URL still came
+            // from a `.mcp.json` checked into the repo and must be treated as
+            // attacker-controllable — debug-escape the bytes so control chars
+            // (ANSI, CR, BEL, …) cannot rewrite the operator's terminal
+            // (PR #121 follow-up: every printer escapes attacker-controllable
+            // strings, transport fields are no exception).
             // When `userinfo_hash` is Some, append a fixed phrase so the
             // operator can see that the source declared a credential —
             // never the credential itself.
             if userinfo_hash.is_some() {
-                format!("url {url} (credentials in source URL)")
+                format!("url {} (credentials in source URL)", escape_name(url))
             } else {
-                format!("url {url}")
+                format!("url {}", escape_name(url))
             }
         }
         mcp_lock::McpTransport::Stdio { command, args, env } => {
+            // Both `command` and every `args` element originated from the
+            // `.mcp.json` and are hostile-by-default. Debug-format each so a
+            // command/arg containing ESC / CR / BEL renders as `\u{NN}` rather
+            // than reaching the terminal raw.
             let mut desc = if args.is_empty() {
-                format!("stdio {command}")
+                format!("stdio {}", escape_name(command))
             } else {
-                format!("stdio {} {}", command, args.join(" "))
+                let escaped_args: Vec<String> = args.iter().map(|a| escape_name(a)).collect();
+                format!("stdio {} {}", escape_name(command), escaped_args.join(" "))
             };
             if !env.is_empty() {
                 // Debug-format each name so control bytes (ANSI escapes,
@@ -1260,12 +1284,17 @@ mod tests {
 
     #[test]
     fn describe_transport_renders_each_variant() {
+        // URL / command / args are debug-escaped through `escape_name`, so the
+        // human-summary string is the Debug-quoted form. Costless for well-
+        // formed inputs (they round-trip with surrounding quotes) and the
+        // principled default for any future code path that introduces an
+        // attacker-controllable transport string.
         assert_eq!(
             describe_transport(&McpTransport::Url {
                 url: "https://x.example".into(),
                 userinfo_hash: None,
             }),
-            "url https://x.example"
+            r#"url "https://x.example""#
         );
         assert_eq!(
             describe_transport(&McpTransport::Stdio {
@@ -1273,7 +1302,7 @@ mod tests {
                 args: vec![],
                 env: vec![],
             }),
-            "stdio node"
+            r#"stdio "node""#
         );
         assert_eq!(
             describe_transport(&McpTransport::Stdio {
@@ -1281,7 +1310,7 @@ mod tests {
                 args: vec!["-y".into(), "server".into()],
                 env: vec![],
             }),
-            "stdio npx -y server"
+            r#"stdio "npx" "-y" "server""#
         );
         // A stdio server with env: the variable NAMES are shown (debug-escaped
         // so a control byte inside a name cannot reach the terminal); raw
@@ -1295,7 +1324,7 @@ mod tests {
                     McpEnvEntry::from_raw("DEBUG", "1"),
                 ],
             }),
-            r#"stdio node (env: "API_TOKEN", "DEBUG")"#
+            r#"stdio "node" (env: "API_TOKEN", "DEBUG")"#
         );
         assert_eq!(
             describe_transport(&McpTransport::Unknown),
@@ -1315,7 +1344,7 @@ mod tests {
                 url: "https://mcp.example.com/sse".into(),
                 userinfo_hash: Some("deadbeef".into()),
             }),
-            "url https://mcp.example.com/sse (credentials in source URL)"
+            r#"url "https://mcp.example.com/sse" (credentials in source URL)"#
         );
         // The annotation MUST NOT contain the hash itself — the print
         // surface is for the human, the hash is a wire-format detail.
@@ -1371,6 +1400,57 @@ mod tests {
             assert!(
                 out.contains(needle),
                 "expected escaped form {needle} in env-name summary: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_transport_escapes_control_bytes_in_transport_fields() {
+        // CodeRabbit follow-up: the URL, command, and args fields all
+        // originate from `.mcp.json` and must be debug-escaped before
+        // reaching the terminal. The pre-fix code emitted them verbatim,
+        // letting ANSI / CR / BEL bytes carried in a hostile config rewrite
+        // the operator's rendering. Every transport-derived string now
+        // goes through `escape_name` (Debug formatting).
+        //
+        // URL variant: ANSI red embedded in the (already userinfo-stripped)
+        // URL would colourize every subsequent terminal byte if printed raw.
+        let url_out = describe_transport(&McpTransport::Url {
+            url: "https://evil\x1b[31m.example".into(),
+            userinfo_hash: None,
+        });
+        for ch in url_out.chars() {
+            assert!(
+                !ch.is_control(),
+                "raw control char {:?} (U+{:04X}) leaked into url transport line: {url_out:?}",
+                ch,
+                ch as u32,
+            );
+        }
+        assert!(
+            url_out.contains(r"\u{1b}"),
+            "expected escaped ESC form in url transport line: {url_out:?}",
+        );
+
+        // Stdio command + args: CR in command and BEL/newline in args. None
+        // may reach the terminal raw.
+        let stdio_out = describe_transport(&McpTransport::Stdio {
+            command: "evil\rcmd".into(),
+            args: vec!["safe".into(), "bell\x07arg".into(), "multi\nline".into()],
+            env: vec![],
+        });
+        for ch in stdio_out.chars() {
+            assert!(
+                !ch.is_control(),
+                "raw control char {:?} (U+{:04X}) leaked into stdio transport line: {stdio_out:?}",
+                ch,
+                ch as u32,
+            );
+        }
+        for needle in [r"\r", r"\u{7}", r"\n"] {
+            assert!(
+                stdio_out.contains(needle),
+                "expected escaped form {needle} in stdio transport line: {stdio_out:?}",
             );
         }
     }
@@ -2207,6 +2287,76 @@ mod tests {
         assert!(
             line.contains("hostile"),
             "the legible portion of source_config should still appear: {line}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — `format_inventory_server_line` distinguishes
+    // the three tools states (omitted / declared empty / declared with N
+    // entries). The pre-fix renderer collapsed "omitted" and "explicit
+    // empty" into the same string, which hid a real policy ambiguity:
+    // "tools omitted" means the runtime may surface any tool the server
+    // exposes, while `"tools": []` is an explicit zero-tool allowlist.
+    // The lockfile already captures the distinction via the
+    // `tools_declared` bool; the printer now branches on it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_inventory_server_line_distinguishes_tools_states() {
+        let base_transport = mcp_lock::McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![],
+            env: vec![],
+        };
+        // State 1: tools omitted in the source config — runtime may expose
+        // any tool the server defines.
+        let omitted = mcp_lock::McpServerEntry {
+            name: "srv-omitted".into(),
+            transport: base_transport.clone(),
+            tools: vec![],
+            tools_declared: false,
+            source_config: ".mcp.json".into(),
+        };
+        let line_omitted = format_inventory_server_line(&omitted);
+        assert!(
+            line_omitted.contains("tools omitted"),
+            "omitted-tools state must use the 'tools omitted' phrasing: {line_omitted}",
+        );
+        assert!(
+            line_omitted.contains("runtime tools"),
+            "omitted-tools state must mention runtime tools: {line_omitted}",
+        );
+
+        // State 2: tools explicitly declared as `[]` — zero-tool allowlist.
+        let empty_declared = mcp_lock::McpServerEntry {
+            name: "srv-empty".into(),
+            transport: base_transport.clone(),
+            tools: vec![],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+        };
+        let line_empty = format_inventory_server_line(&empty_declared);
+        assert!(
+            line_empty.contains("no tools declared"),
+            "explicit-empty state must use the 'no tools declared' phrasing: {line_empty}",
+        );
+        assert!(
+            line_empty.contains("explicit empty"),
+            "explicit-empty state must mention 'explicit empty': {line_empty}",
+        );
+
+        // State 3: tools declared with N entries — normal case, count is shown.
+        let with_tools = mcp_lock::McpServerEntry {
+            name: "srv-tools".into(),
+            transport: base_transport,
+            tools: vec!["read".into(), "write".into()],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+        };
+        let line_tools = format_inventory_server_line(&with_tools);
+        assert!(
+            line_tools.contains("2 tool(s)"),
+            "declared-tools state must show the count: {line_tools}",
         );
     }
 

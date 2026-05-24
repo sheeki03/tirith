@@ -378,6 +378,20 @@ pub fn export_json(records: &[AuditRecord]) -> String {
 /// (`human(interactive)` / `agent:<tool>` / `mcp:<client_name>` / `gateway` /
 /// `ci:<provider>` / `ide:<name>` / empty for `None`). Compliance dashboards
 /// consuming CSV no longer lose agent attribution.
+///
+/// **CSV-injection neutralization.** The `agent_origin` value embeds a
+/// caller-supplied `tool` name (`AgentOrigin::Agent { tool, .. }`), client
+/// name (`AgentOrigin::Mcp { client_name, .. }`), and similar payload
+/// fields. A hostile caller can declare a `tool` like `=cmd|'/bin/sh'!A1`,
+/// and Excel / Google Sheets / LibreOffice will *evaluate* a cell that
+/// starts with `=`, `+`, `-`, or `@` as a formula. The standard OWASP
+/// mitigation — prefix the cell with a tab — neutralizes the formula
+/// without altering the displayed value. Applied via
+/// [`csv_neutralize_formula`] before [`csv_escape`] on every cell whose
+/// content can carry caller-supplied bytes. (`timestamp` is engine-
+/// generated; `bypass_requested` / `tier_reached` are typed bool/u8 and
+/// non-string. The other text columns go through neutralization for
+/// belt-and-braces — see the field-level rationale on the helper.)
 pub fn export_csv(records: &[AuditRecord]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -391,11 +405,11 @@ pub fn export_csv(records: &[AuditRecord]) -> String {
             csv_escape(&r.timestamp),
             csv_escape(&r.session_id),
             csv_escape(&r.action),
-            csv_escape(&rules),
-            csv_escape(&r.command_redacted),
+            csv_escape(&csv_neutralize_formula(&rules)),
+            csv_escape(&csv_neutralize_formula(&r.command_redacted)),
             r.bypass_requested,
             r.tier_reached,
-            csv_escape(&origin),
+            csv_escape(&csv_neutralize_formula(&origin)),
         ));
     }
     out
@@ -440,6 +454,35 @@ fn csv_escape(field: &str) -> String {
         format!("\"{escaped}\"")
     } else {
         field.to_string()
+    }
+}
+
+/// Neutralize CSV-injection formulas by prefixing a tab to any cell that
+/// would otherwise be evaluated as a formula by Excel / Google Sheets /
+/// LibreOffice / Numbers.
+///
+/// **Threat.** Spreadsheet applications evaluate a cell whose first
+/// character is `=`, `+`, `-`, or `@` as a formula. A caller-supplied
+/// `agent_origin.tool` like `=cmd|'/bin/sh'!A1` (or similar in other
+/// dialects) becomes RCE-adjacent when the audit CSV is opened in a
+/// spreadsheet. The CSV column is appended to compliance dashboards that
+/// auto-open in Excel — exactly the worst-case audience.
+///
+/// **Mitigation.** OWASP's recommended fix is to prefix a tab (`\t`).
+/// Excel renders the tab as a literal character (so the cell still
+/// reads as the intended value, just shifted) and refuses to interpret
+/// the leading `=` / `+` / `-` / `@`. The single-quote (`'`) alternative
+/// is consumed by Excel during display (cell shows the same value, no
+/// shift) but is preserved verbatim by Google Sheets and LibreOffice,
+/// producing an inconsistent rendering across tools. The tab approach
+/// is consistent across every major spreadsheet.
+///
+/// **No-op on safe cells.** A cell that does not start with a formula
+/// trigger is returned unchanged, so the common case adds zero bytes.
+fn csv_neutralize_formula(s: &str) -> String {
+    match s.as_bytes().first() {
+        Some(b'=' | b'+' | b'-' | b'@') => format!("\t{s}"),
+        _ => s.to_string(),
     }
 }
 
@@ -1004,5 +1047,131 @@ mod tests {
         assert_eq!(stats.total_commands, 0);
         assert_eq!(stats.block_rate, 0.0);
         assert!(stats.time_range.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — `agent_origin` (and other caller-influenced
+    // CSV columns) must be neutralized against spreadsheet formula
+    // injection. A caller-supplied `AgentOrigin::Agent { tool: "=cmd...", ..}`
+    // would otherwise be evaluated as a formula by Excel / Sheets /
+    // LibreOffice when the audit CSV is opened in a spreadsheet — exactly
+    // the worst-case audience for compliance exports.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_csv_neutralize_formula_prefixes_tab_for_dangerous_leaders() {
+        // Each of the four spreadsheet-formula leaders is neutralized by a
+        // single tab prefix. A leading tab keeps the rest of the value
+        // intact, so the displayed cell content is unchanged save for the
+        // shift — Excel / Sheets / LibreOffice all refuse to interpret a
+        // tab-prefixed cell as a formula.
+        assert_eq!(csv_neutralize_formula("=SUM(A1:A10)"), "\t=SUM(A1:A10)");
+        assert_eq!(csv_neutralize_formula("+cmd"), "\t+cmd");
+        assert_eq!(csv_neutralize_formula("-1+1"), "\t-1+1");
+        assert_eq!(csv_neutralize_formula("@SUM"), "\t@SUM");
+        // Safe values pass through unchanged.
+        assert_eq!(csv_neutralize_formula("normal"), "normal");
+        assert_eq!(csv_neutralize_formula(""), "");
+        assert_eq!(csv_neutralize_formula("ide:vscode"), "ide:vscode");
+        // Unicode leaders are NOT formula triggers, only the four ASCII
+        // leaders are — keep the cell shape minimal for the common case.
+        assert_eq!(csv_neutralize_formula("é=value"), "é=value");
+    }
+
+    #[test]
+    fn test_export_csv_neutralizes_formula_in_caller_supplied_columns() {
+        use crate::agent_origin::AgentOrigin;
+
+        // The CR follow-up: every caller-supplied CSV cell that could
+        // start with a formula leader (`=`, `+`, `-`, `@`) must be
+        // tab-prefixed so Excel / Sheets / LibreOffice render it as a
+        // literal value instead of evaluating it as a formula.
+        //
+        // Today's `agent_origin` renderer fixes-prefix the value (e.g.
+        // `agent:<tool>`), so the rendered string itself never starts
+        // with a formula character for current variants. The defensive
+        // wrap is still applied so a future variant whose prefix is
+        // empty (or another caller-controllable column) does not need
+        // a separate fix. This test exercises both:
+        //   1. `rule_ids` — joined verbatim with no prefix, so a hostile
+        //      rule_id like `=SUM(...)` lands as the first byte and
+        //      MUST be neutralized.
+        //   2. `agent_origin` for the current `Agent`/`Mcp` shapes —
+        //      neutralization is a no-op because the renderer prefix
+        //      keeps the leader safe; the cell value is the raw
+        //      `agent:<tool>` form.
+        let mut hostile_rules = AuditRecord {
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Allow".into(),
+            // Hostile rule_ids: the first element begins with `=`, the
+            // OWASP CSV-injection canonical example.
+            rule_ids: vec!["=SUM(A1:A100)".into(), "second_rule".into()],
+            command_redacted: "cmd".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: None,
+            tier_reached: 1,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: Some(AgentOrigin::Agent {
+                tool: "claude-code".into(),
+                version: None,
+            }),
+        };
+
+        let csv = export_csv(&[hostile_rules.clone()]);
+        let line = csv.lines().nth(1).expect("must have a data row");
+        let cols: Vec<&str> = line.split(',').collect();
+        // The rule_ids cell is the 4th column. After neutralization
+        // it must begin with a tab.
+        assert!(
+            cols[3].starts_with('\t'),
+            "rule_ids cell beginning with a formula leader must be tab-prefixed \
+             to neutralize the spreadsheet evaluation, got: {line}",
+        );
+        // And the original value is preserved verbatim after the tab.
+        assert!(
+            cols[3].contains("=SUM(A1:A100)"),
+            "rule_ids cell must still carry the original payload after the tab: {line}",
+        );
+
+        // Also exercise the `command_redacted` column with each of the
+        // four formula leaders.
+        for leader in ['=', '+', '-', '@'] {
+            hostile_rules.command_redacted = format!("{leader}cmd");
+            hostile_rules.rule_ids = vec!["safe_rule".into()];
+            let csv = export_csv(&[hostile_rules.clone()]);
+            let line = csv.lines().nth(1).expect("must have a data row");
+            let cols: Vec<&str> = line.split(',').collect();
+            assert!(
+                cols[4].starts_with('\t'),
+                "command_redacted leader `{leader}` must be tab-prefixed, got: {line}",
+            );
+        }
+
+        // Belt-and-braces: a hostile `AgentOrigin` whose renderer prefix
+        // is empty would land directly in the agent_origin cell. The
+        // current variants all have a non-empty prefix, but pin the
+        // contract via the helper directly so a future variant that
+        // forgets the prefix still gets neutralized at the export site.
+        assert_eq!(
+            csv_neutralize_formula("=cmd|'/bin/sh'!A1"),
+            "\t=cmd|'/bin/sh'!A1",
+            "the canonical RCE-adjacent payload must be tab-prefixed",
+        );
     }
 }

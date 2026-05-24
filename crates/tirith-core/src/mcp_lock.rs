@@ -1161,8 +1161,8 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
         // Unparseable URL: we can't structurally identify the userinfo
-        // boundary, so we can't compute a salted hash. But the raw string
-        // still frequently carries a `user:token@host` authority — and
+        // boundary the way `url::Url` would, but the raw string still
+        // frequently carries a `user:token@host` authority — and
         // `.tirith/mcp.lock` is designed to be committed. A previous
         // implementation stored the verbatim string, which leaked any
         // credential the malformed URL happened to carry. Run a best-
@@ -1172,10 +1172,18 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
         // conservative — it only fires when the input clearly carries a
         // scheme + authority + userinfo shape — so a malformed URL that
         // does not look authority-shaped is preserved as-is for
-        // diagnostic context. `userinfo_hash` remains `None` because we
-        // cannot reconstruct the exact userinfo substring without a safe
-        // parser.
-        Err(_) => return (strip_userinfo_best_effort(url), None),
+        // diagnostic context.
+        //
+        // **Credential-drift signal is preserved.** When the byte-scan
+        // strip identifies userinfo bytes, we hash THOSE bytes (with the
+        // server-name salt, matching the parsed-URL path) and return
+        // `Some(hash)`. Without this, two consecutive locks of a config
+        // that lost its credentials would both carry `userinfo_hash:
+        // None` and look identical — drift detection would silently fail
+        // on credential add/remove for malformed URLs. The actual
+        // credential is never stored; only the salted hash, which is the
+        // same shape `redact_url_userinfo`'s parsed path returns.
+        Err(_) => return strip_userinfo_best_effort(server_name, url),
     };
 
     let username = parsed.username();
@@ -1261,13 +1269,27 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
 /// would import a transitively large dependency. The byte-scan is small
 /// (~25 lines), allocation-free until the strip fires, and unambiguous
 /// over any byte content.
-fn strip_userinfo_best_effort(raw: &str) -> String {
+///
+/// **Returns `(stripped_url, Option<userinfo_hash>)`.** When the strip
+/// fires, the userinfo bytes (between `://` and `@`) are fed into the
+/// same `salted_sha256_hex(server_name, ...)` shape that the parsed-URL
+/// path uses, so a subsequent `mcp verify` notices when credentials are
+/// added or removed — even for malformed URLs. The hash captures the
+/// presence-of-credentials signal without storing the credential itself.
+/// When the strip does NOT fire (no scheme, no `@` in authority, etc.),
+/// the hash is `None` because there were no userinfo bytes to fingerprint.
+///
+/// If the userinfo substring is non-UTF-8 (technically impossible because
+/// the input is `&str`, but the byte-scan operates on `.as_bytes()` for
+/// regularity), the bytes are still fed verbatim into the SHA-256 hasher —
+/// the salted-hash construction is byte-defined, not string-defined.
+fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<String>) {
     let bytes = raw.as_bytes();
     // Find a scheme: at least one ASCII letter, then any of letter/digit/`+`/`-`/`.`,
     // terminated by `://`. RFC 3986 §3.1.
     let mut scheme_end = 0usize;
     if bytes.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
-        return raw.to_string();
+        return (raw.to_string(), None);
     }
     while scheme_end < bytes.len() {
         let c = bytes[scheme_end];
@@ -1279,7 +1301,7 @@ fn strip_userinfo_best_effort(raw: &str) -> String {
     }
     // After scheme: must be exactly `://`.
     if scheme_end + 3 > bytes.len() || &bytes[scheme_end..scheme_end + 3] != b"://" {
-        return raw.to_string();
+        return (raw.to_string(), None);
     }
     let auth_start = scheme_end + 3;
     // Authority terminates at `/`, `?`, `#`, or end. Find the first `@`
@@ -1298,8 +1320,27 @@ fn strip_userinfo_best_effort(raw: &str) -> String {
     }
     let Some(at) = at_pos else {
         // No `@` before the path/query/fragment boundary — nothing to
-        // strip.
-        return raw.to_string();
+        // strip and no userinfo signal to record.
+        return (raw.to_string(), None);
+    };
+    // Compute the salted hash from the userinfo BYTES before we drop
+    // them. Mirrors `redact_url_userinfo`'s salted_sha256_hex call:
+    // the server name is the per-entry salt so the same credential
+    // under two different servers hashes to two different digests.
+    // The bytes between `auth_start` and `at` are the userinfo
+    // substring; when the substring is empty (the `://@host` form),
+    // we record `None` because there are no credential bytes to
+    // fingerprint — only the strip rewrites the shape to `***` for
+    // consistency.
+    let userinfo_bytes = &bytes[auth_start..at];
+    let userinfo_hash = if userinfo_bytes.is_empty() {
+        None
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(server_name.as_bytes());
+        hasher.update(b":");
+        hasher.update(userinfo_bytes);
+        Some(hex_lower(&hasher.finalize()))
     };
     // If there's nothing between `://` and `@`, the input has no
     // userinfo content to redact — still rewrite to `***` so the
@@ -1309,7 +1350,7 @@ fn strip_userinfo_best_effort(raw: &str) -> String {
     out.push_str(&raw[..auth_start]);
     out.push_str("***");
     out.push_str(&raw[at..]);
-    out
+    (out, userinfo_hash)
 }
 
 /// Extract a stdio server's `env` object as `(name, value_hash)` entries,
@@ -5130,32 +5171,125 @@ mod tests {
             redacted.contains("/path"),
             "non-credential content should be preserved: {redacted}",
         );
-        // No userinfo hash for the malformed case — we can't
-        // structurally identify the substring without a safe parser.
-        assert_eq!(hash, None);
+        // A userinfo hash IS recorded for the malformed case (CR
+        // follow-up): the byte-scan strip identifies the userinfo
+        // bytes between `://` and `@`, hashes them with the same
+        // server-salted SHA-256 scheme the parsed path uses, and
+        // stores `Some(hash)` so a later `mcp verify` notices when
+        // credentials are added or removed. The hash mirrors
+        // `salted_sha256_hex(server_name, userinfo)`.
+        let h = hash.expect("malformed-URL strip with userinfo bytes must record a hash");
+        assert_eq!(h.len(), 64, "the hash must be 64 hex chars (SHA-256)");
+        assert_eq!(
+            h,
+            salted_sha256_hex("server", "user:token"),
+            "the recorded hash must match the salted-SHA-256 scheme: {h}",
+        );
     }
 
     #[test]
     fn strip_userinfo_best_effort_preserves_non_authority_urls() {
+        let srv = "srv";
         // A URL with no `@` before the path → no userinfo to strip,
-        // return verbatim.
+        // return verbatim and no hash (no credential bytes to fingerprint).
         assert_eq!(
-            strip_userinfo_best_effort("https://host.example/path"),
-            "https://host.example/path",
+            strip_userinfo_best_effort(srv, "https://host.example/path"),
+            ("https://host.example/path".to_string(), None),
         );
         // A relative URL or non-URL string is not authority-shaped →
-        // return verbatim.
+        // return verbatim, no hash.
         assert_eq!(
-            strip_userinfo_best_effort("not a url at all"),
-            "not a url at all",
+            strip_userinfo_best_effort(srv, "not a url at all"),
+            ("not a url at all".to_string(), None),
         );
-        assert_eq!(strip_userinfo_best_effort(""), "");
+        assert_eq!(strip_userinfo_best_effort(srv, ""), ("".to_string(), None),);
         // A URL whose `@` is INSIDE the path (after the `/`) is not
         // userinfo and must not be touched.
         assert_eq!(
-            strip_userinfo_best_effort("https://host.example/path@anchor"),
-            "https://host.example/path@anchor",
+            strip_userinfo_best_effort(srv, "https://host.example/path@anchor"),
+            ("https://host.example/path@anchor".to_string(), None),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — the malformed-URL strip path must preserve the
+    // credential-drift signal. Without a hash on the strip-fired path, two
+    // consecutive locks of a config that lost its credential would both
+    // carry `userinfo_hash: None` and look identical — drift detection
+    // would silently fail. The strip now hashes the userinfo bytes with
+    // the same `salted_sha256_hex(server_name, ...)` scheme the parsed
+    // path uses, so add/remove is visible at the inventory-hash level.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_userinfo_best_effort_records_hash_for_malformed_url_with_credentials() {
+        let srv = "srv";
+        // A malformed URL — `url::Url::parse` rejects URLs whose host
+        // contains an unencoded space — that nevertheless carries
+        // `user:token@host` in its authority position. The strip
+        // rewrites to `***` AND records a hash so drift sees credential
+        // presence/absence.
+        let raw = "https://user:t1@host with spaces/p";
+        // Sanity: this really is a malformed URL the parser rejects, so
+        // this branch is reachable from `redact_url_userinfo`.
+        assert!(
+            url::Url::parse(raw).is_err(),
+            "test relies on this URL being malformed (parser rejects host with space)"
+        );
+        let (stripped, hash) = strip_userinfo_best_effort(srv, raw);
+        assert_eq!(stripped, "https://***@host with spaces/p");
+        let h = hash.expect("strip with credentials must record a userinfo hash");
+        assert_eq!(h.len(), 64, "the hash must be 64 hex chars (SHA-256)");
+        // The hash must not contain any of the original credential bytes —
+        // sanity check that we did not accidentally store the credential.
+        assert!(
+            !h.contains("user") && !h.contains("t1"),
+            "hash must not echo the credential: {h}"
+        );
+    }
+
+    #[test]
+    fn strip_userinfo_best_effort_records_no_hash_for_empty_userinfo() {
+        // The `://@host` shape — with the host being malformed enough
+        // to fail `url::Url::parse` — has no userinfo bytes to
+        // fingerprint. The strip still rewrites to `***` for shape
+        // consistency, but the hash stays `None` because there is no
+        // credential signal.
+        let raw = "https://@host with spaces/p";
+        assert!(
+            url::Url::parse(raw).is_err(),
+            "test relies on this URL being malformed"
+        );
+        let (stripped, hash) = strip_userinfo_best_effort("srv", raw);
+        assert_eq!(stripped, "https://***@host with spaces/p");
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn strip_userinfo_best_effort_drift_signal_changes_when_credentials_change() {
+        // Two locks of the same malformed URL with DIFFERENT credentials
+        // must produce DIFFERENT userinfo hashes so drift comparison
+        // notices the change. (The salted hash is deterministic in the
+        // server-name salt + userinfo bytes; changing either flips it.)
+        let raw1 = "https://user1:t1@host with spaces/x";
+        let raw2 = "https://user2:t2@host with spaces/x";
+        let raw3 = "https://host with spaces/x";
+        for r in &[raw1, raw2, raw3] {
+            assert!(
+                url::Url::parse(r).is_err(),
+                "test relies on each URL being malformed: {r}"
+            );
+        }
+        let (_s1, h1) = strip_userinfo_best_effort("srv", raw1);
+        let (_s2, h2) = strip_userinfo_best_effort("srv", raw2);
+        assert_ne!(h1, h2, "credential change must flip the userinfo hash");
+        assert!(h1.is_some() && h2.is_some());
+
+        // And removing the credentials entirely flips Some(_) → None,
+        // which is the drift signal CodeRabbit's follow-up demands.
+        let (_s3, h3) = strip_userinfo_best_effort("srv", raw3);
+        assert_eq!(h3, None);
+        assert_ne!(h1, h3, "removing credentials must flip the userinfo hash");
     }
 
     // -----------------------------------------------------------------------

@@ -3466,6 +3466,15 @@ fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("install --no-exec --format json must produce valid JSON");
+    // Pin `schema_version: 2` at the top level so any future bump fails
+    // loudly (CR follow-up). A silent schema change would otherwise be
+    // caught only by downstream consumers; the test pins the version a
+    // build-time consumer would see.
+    assert_eq!(
+        json["schema_version"], 2,
+        "install envelope must advertise schema_version: 2, got: {}",
+        json["schema_version"]
+    );
     // Single top-level envelope.
     assert_eq!(json["kind"], "install");
     let analysis = &json["analysis"];
