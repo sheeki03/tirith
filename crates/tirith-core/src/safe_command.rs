@@ -10,33 +10,67 @@
 //!
 //! Every rewrite here must be mechanically correct and actually safer than the
 //! input. Where there is no safe mechanical rewrite of the literal command
-//! (homograph hostnames, archive extraction targets, dotfile writes, threat-DB
-//! hits, …), this module returns *no rewrite* — the caller falls back to the
-//! per-rule remediation text from [`crate::rule_explanations::remediation`],
-//! which is honest guidance rather than a fabricated command.
+//! (homograph hostnames, threat-DB hits with ambiguous targets, …), this
+//! module returns *no rewrite* — the caller falls back to the per-rule
+//! remediation text from [`crate::rule_explanations::remediation`], which is
+//! honest guidance rather than a fabricated command.
 //!
-//! Three transformations are supported, each provably safe:
+//! ## Output channel
+//!
+//! [`SafeSuggestion::safe_command`] is the *only* output channel for a
+//! rewrite. Multi-step rewrites (preview-then-extract, backup-then-redirect)
+//! are emitted as a single string with the individual steps joined by ` && `
+//! — no separate `command_steps: Vec<String>` field exists. Callers that need
+//! to display the steps individually should split on ` && `.
+//!
+//! Eight transformations are supported, each mechanically safe:
 //!
 //! 1. **Pipe-to-shell** (`curl URL | bash`) → download to a file, review it,
 //!    then run it. Covers `curl`/`wget`/`http`/`https`/`xh`/`fetch` piped into
 //!    a shell interpreter.
 //! 2. **Insecure TLS flag** (`-k`, `--insecure`, `--no-check-certificate`) →
-//!    drop the flag so certificate verification is restored. The command still
-//!    works whenever the server presents a valid certificate.
+//!    drop the flag so certificate verification is restored.
 //! 3. **Plain HTTP to a sink** (`http://…`) → switch the scheme to `https://`.
-//!    Suggested with an explicit "verify the host serves HTTPS" caveat.
+//! 4. **Typosquat rewrite** — when the threat DB unambiguously names a popular
+//!    target, suggest `<pm> install <target>` instead.
+//! 5. **Sudo narrow** — command-shape based: when `sudo` wraps a command that
+//!    would be `Allow` without the prefix (and isn't an interactive shell),
+//!    suggest dropping `sudo`.
+//! 6. **Env scrub** — when any High-severity finding is present and sensitive
+//!    env vars (`AWS_*`, `GITHUB_TOKEN`, …) are currently set, suggest
+//!    `env -u VAR1 -u VAR2 ... <original>`.
+//! 7. **Archive list-before-extract** — for [`RuleId::ArchiveExtract`], suggest
+//!    `tar -tzf <archive> | head && tar -xzf <archive>` (analogous for zip /
+//!    unzip / 7z).
+//! 8. **Dotfile redirect** — for [`RuleId::DotfileOverwrite`], suggest
+//!    `cp <target> <target>.bak && <original>` (only when the target actually
+//!    exists on disk).
 
+use std::path::Path;
+use std::sync::LazyLock;
+
+use crate::engine::{self, AnalysisContext};
+use crate::extract::ScanContext;
 use crate::tokenize::{self, ShellType};
-use crate::verdict::{Finding, RuleId, Verdict};
+use crate::verdict::{Action, Finding, RuleId, Severity, Verdict};
 
 /// A single safe-command suggestion tied to one finding.
+///
+/// Multi-step rewrites (preview-then-extract, backup-then-redirect) live in
+/// the single [`Self::safe_command`] field, with steps joined by ` && ` — no
+/// separate `command_steps: Vec<String>` field exists. Callers that need to
+/// display the steps individually should split on ` && `.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SafeSuggestion {
-    /// The rule this suggestion addresses (snake_case, e.g. `curl_pipe_shell`).
+    /// The rule this suggestion addresses (snake_case, e.g. `curl_pipe_shell`,
+    /// `sudo_narrow`, `env_scrub`).
     pub rule_id: String,
     /// A concrete safer command, when a correct mechanical rewrite exists.
     /// `None` means there is no safe rewrite of the literal command — the
     /// `remediation` field below carries honest guidance instead.
+    ///
+    /// Multi-step rewrites are emitted as a single string with steps joined by
+    /// ` && ` — see the type-level docs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_command: Option<String>,
     /// One-line explanation of why the suggestion is safer, or — when
@@ -46,12 +80,47 @@ pub struct SafeSuggestion {
     pub remediation: String,
 }
 
+/// Sensitive environment variable names loaded from `sensitive_env.toml`.
+///
+/// Used by the env-scrub transform and (in a later milestone) by the
+/// env-guard rule. Compiled into the binary at build time via `include_str!`.
+static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    #[derive(serde::Deserialize)]
+    struct SensitiveEnvFile {
+        sensitive: Vec<String>,
+    }
+    let toml_str = include_str!("../assets/data/sensitive_env.toml");
+    let parsed: SensitiveEnvFile = toml::from_str(toml_str).expect("invalid sensitive_env.toml");
+    // Leak each string to get a `&'static str`. The list is tiny (≤30 vars)
+    // and read once for the lifetime of the process.
+    parsed
+        .sensitive
+        .into_iter()
+        .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
+        .collect()
+});
+
+/// Public read-only accessor for the sensitive env-var list. M9 ch4's env-guard
+/// rule will share this same list — exposing it here keeps the asset file as
+/// the single source of truth.
+pub fn sensitive_env_vars() -> &'static [&'static str] {
+    &SENSITIVE_ENV_VARS
+}
+
 /// Build safe-command suggestions for every actionable finding in `verdict`.
 ///
 /// `cmd` is the original command text and `shell` the shell it was checked
 /// under. Returns one [`SafeSuggestion`] per finding, de-duplicated by rule id
-/// (the same rule firing twice yields a single suggestion). Returns an empty
-/// vec when the verdict has no findings.
+/// (the same rule firing twice yields a single suggestion).
+///
+/// In addition, two *command-shape* transforms run once per verdict and can
+/// append synthetic suggestions with rule ids `"sudo_narrow"` and
+/// `"env_scrub"`. They are not tied to any specific [`RuleId`] — they fire on
+/// the overall command shape and the set of process-level env vars currently
+/// set. Both are conservative: they never produce a rewrite that the engine
+/// itself would still flag.
+///
+/// Returns an empty vec when the verdict has no findings.
 pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
     let segments = tokenize::tokenize(cmd, shell);
     let mut out: Vec<SafeSuggestion> = Vec::new();
@@ -65,6 +134,19 @@ pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSugges
         seen.push(finding.rule_id);
         out.push(build_suggestion(cmd, shell, &segments, finding));
     }
+
+    // Command-shape transforms — fire at most once per verdict, independent of
+    // any specific rule id. Only run when the verdict has findings (an empty
+    // verdict has nothing to rewrite).
+    if !verdict.findings.is_empty() {
+        if let Some(s) = build_sudo_narrow_suggestion(cmd, shell, &segments, verdict) {
+            out.push(s);
+        }
+        if let Some(s) = build_env_scrub_suggestion(cmd, verdict) {
+            out.push(s);
+        }
+    }
+
     out
 }
 
@@ -120,6 +202,49 @@ fn build_suggestion(
             None => (
                 None,
                 "Fetch the URL over HTTPS instead of plain HTTP.".to_string(),
+            ),
+        },
+        RuleId::ThreatPackageTyposquat => match rewrite_typosquat(segments, shell, finding) {
+            Some(rewrite) => (
+                Some(rewrite),
+                "Replaces the typosquatted package name with the popular package the \
+                 threat database identifies it as impersonating."
+                    .to_string(),
+            ),
+            None => (
+                None,
+                "The threat database flagged this name as a typosquat but did not \
+                 unambiguously name a single popular target — pick the legitimate \
+                 package by hand."
+                    .to_string(),
+            ),
+        },
+        RuleId::ArchiveExtract => match rewrite_archive_list_first(segments, shell) {
+            Some(rewrite) => (
+                Some(rewrite),
+                "Lists the archive contents first so path-traversal entries (e.g. \
+                 `../../etc/passwd`) are visible before any file is written to disk."
+                    .to_string(),
+            ),
+            None => (
+                None,
+                "Inspect the archive contents (e.g. `tar -tzf <archive>`) before \
+                 extracting to a sensitive path."
+                    .to_string(),
+            ),
+        },
+        RuleId::DotfileOverwrite => match rewrite_dotfile_backup_first(cmd, segments, shell) {
+            Some(rewrite) => (
+                Some(rewrite),
+                "Backs up the existing dotfile before the redirect modifies it, so \
+                 the previous configuration can be restored if the change breaks login."
+                    .to_string(),
+            ),
+            None => (
+                None,
+                "Back up the target dotfile (`cp <file> <file>.bak`) before \
+                 redirecting output into it."
+                    .to_string(),
             ),
         },
         // Every other rule: no safe mechanical rewrite of the literal command.
@@ -298,6 +423,545 @@ fn rewrite_http_to_https(cmd: &str) -> Option<String> {
     None
 }
 
+// ── Typosquat rewrite ───────────────────────────────────────────────────────
+
+/// Extract the typosquat target name from a `ThreatPackageTyposquat` finding.
+///
+/// Both producers — `rules/threatintel.rs` and `install_txn.rs` — format the
+/// finding title as `"Confirmed typosquat: <name> → <target>"`. Parse the arrow
+/// out of the title.
+///
+/// `install_txn.rs` additionally stamps `typosquat_of=<target>` into the
+/// evidence text; that field is checked as a backup signal so the rewrite is
+/// robust against a future title-string tweak.
+fn typosquat_target(finding: &Finding) -> Option<String> {
+    // Primary parse: "Confirmed typosquat: <name> → <target>" — `→` is a BMP
+    // character so byte-indexing via `str::find` is safe.
+    let arrow = " → ";
+    if let Some(idx) = finding.title.find(arrow) {
+        let target = finding.title[idx + arrow.len()..].trim();
+        if !target.is_empty() && !target.contains(char::is_whitespace) {
+            return Some(target.to_string());
+        }
+    }
+
+    // Backup parse: install_txn evidence carries `typosquat_of=<name>`.
+    for ev in &finding.evidence {
+        if let crate::verdict::Evidence::Text { detail } = ev {
+            if let Some(pos) = detail.find("typosquat_of=") {
+                let after = &detail[pos + "typosquat_of=".len()..];
+                let end = after
+                    .find(|c: char| c.is_ascii_whitespace())
+                    .unwrap_or(after.len());
+                let target = after[..end].trim();
+                if !target.is_empty() {
+                    return Some(target.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Package-manager `install` shape detector. Returns `(pm_binary, install_verb)`
+/// when `segments` is a single segment whose leader is a recognized package
+/// manager and the first non-flag arg is an install-style verb. The verb is
+/// preserved so `npm install` stays `npm install` and `npm i` stays `npm i`.
+///
+/// The supported set mirrors what the install-txn engine pass already handles
+/// (`pip`/`pip3`, `npm`/`yarn`/`pnpm`, `cargo`, `gem`, `go`); other package
+/// managers fall through to "no rewrite".
+fn detect_pm_install(segments: &[tokenize::Segment], shell: ShellType) -> Option<(String, String)> {
+    if segments.len() != 1 {
+        return None;
+    }
+    let seg = &segments[0];
+    let cmd = base_command(seg.command.as_deref()?, shell);
+    let install_verbs: &[(&str, &[&str])] = &[
+        ("pip", &["install"]),
+        ("pip3", &["install"]),
+        ("npm", &["install", "i", "add"]),
+        ("yarn", &["add"]),
+        ("pnpm", &["add", "install", "i"]),
+        ("cargo", &["install", "add"]),
+        ("gem", &["install"]),
+        ("go", &["install", "get"]),
+    ];
+
+    let (_, verbs) = install_verbs.iter().find(|(name, _)| *name == cmd)?;
+    let verb_arg = seg
+        .args
+        .iter()
+        .find(|a| !strip_quotes(a).starts_with('-'))?;
+    let verb = strip_quotes(verb_arg);
+    if !verbs.contains(&verb.as_str()) {
+        return None;
+    }
+    Some((cmd, verb))
+}
+
+/// Build a typosquat rewrite when the target is unambiguous.
+///
+/// Returns `None` when:
+///  * the finding shape doesn't expose a single target (handled by
+///    [`typosquat_target`]), or
+///  * the command shape isn't a recognized `<pm> install <name>` (the only
+///    shape we can mechanically rewrite — touching a manifest file, a
+///    Brewfile, `npx`, etc. is out of scope for a one-line rewrite).
+fn rewrite_typosquat(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    finding: &Finding,
+) -> Option<String> {
+    let target = typosquat_target(finding)?;
+    let target = sanitize_for_display(&target);
+    if target.is_empty() {
+        return None;
+    }
+    let (pm, verb) = detect_pm_install(segments, shell)?;
+    Some(format!("{pm} {verb} {target}"))
+}
+
+// ── Archive list-before-extract ────────────────────────────────────────────
+
+/// Archive command names recognized by the `ArchiveExtract` rule.
+fn archive_command_kind(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "tar" => Some("tar"),
+        "unzip" => Some("unzip"),
+        "7z" => Some("7z"),
+        _ => None,
+    }
+}
+
+/// Find the archive filename in an extract command's args.
+///
+/// `tar -xzf <archive> [-C dir]` and `tar -x -z -f <archive>` both work — the
+/// archive is the first non-flag arg after `-f`/`--file`. For `unzip
+/// <archive>` it's the first non-flag arg. For `7z x <archive>` it's the
+/// first non-flag arg after the verb.
+fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
+    // Direct scan: `-f <file>`, `--file=<file>`, `--file <file>`, and combined
+    // short-form `-xzf <file>` / `-tzf <file>`.
+    let mut i = 0;
+    while i < args.len() {
+        let arg = strip_quotes(&args[i]);
+        if arg == "-f" || arg == "--file" {
+            if let Some(next) = args.get(i + 1) {
+                let v = strip_quotes(next);
+                if !v.starts_with('-') {
+                    return Some(v);
+                }
+            }
+        }
+        if let Some(rest) = arg.strip_prefix("--file=") {
+            return Some(rest.to_string());
+        }
+        // Combined short form `-xzf` / `-tzf` etc — `-f` is the trailing letter
+        // and the next positional is the archive.
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.len() > 2
+            && arg.ends_with('f')
+            && arg[1..].chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            if let Some(next) = args.get(i + 1) {
+                let v = strip_quotes(next);
+                if !v.starts_with('-') {
+                    return Some(v);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // For unzip / 7z: take the first non-flag positional (skipping the verb for 7z).
+    match kind {
+        "unzip" => args
+            .iter()
+            .map(|a| strip_quotes(a))
+            .find(|a| !a.starts_with('-') && !a.is_empty()),
+        "7z" => {
+            let mut it = args.iter().map(|a| strip_quotes(a));
+            // Skip the verb (e.g. `x`, `e`).
+            let _verb = it.find(|a| !a.starts_with('-') && !a.is_empty())?;
+            it.find(|a| !a.starts_with('-') && !a.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// Build the preview-then-extract rewrite for a flagged archive command.
+///
+/// Returns `None` when the command is multi-segment, the leader isn't one of
+/// `tar` / `unzip` / `7z`, or the archive filename can't be located.
+fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
+    if segments.len() != 1 {
+        return None;
+    }
+    let seg = &segments[0];
+    let cmd = base_command(seg.command.as_deref()?, shell);
+    let kind = archive_command_kind(&cmd)?;
+    let archive = find_archive_arg(&seg.args, kind)?;
+    let archive = sanitize_for_display(&archive);
+    if archive.is_empty() {
+        return None;
+    }
+    let raw = seg.raw.trim();
+    Some(match kind {
+        "tar" => format!("tar -tzf {archive} | head && {raw}"),
+        "unzip" => format!("unzip -l {archive} | head && {raw}"),
+        "7z" => format!("7z l {archive} | head && {raw}"),
+        _ => return None,
+    })
+}
+
+// ── Dotfile backup-first redirect ──────────────────────────────────────────
+
+/// Extract the redirect target path from a `> ~/.<file>` / `>> $HOME/.<file>`
+/// shape. Returns the literal token as written (so `~/.zshrc` stays
+/// `~/.zshrc`).
+fn dotfile_redirect_target(cmd: &str) -> Option<String> {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'>' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if j < bytes.len() && bytes[j] == b'>' {
+            j += 1;
+        }
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let rest = &cmd[j..];
+        let prefixes = ["~/.", "$HOME/."];
+        for prefix in &prefixes {
+            if rest.starts_with(prefix) {
+                let end = rest
+                    .find(|c: char| c.is_ascii_whitespace() || c == ';' || c == '|' || c == '&')
+                    .unwrap_or(rest.len());
+                let token = &rest[..end];
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+        i = j;
+    }
+    None
+}
+
+/// Expand `~/...` and `$HOME/...` to an absolute filesystem path for the
+/// dotfile existence check.
+fn expand_dotfile_to_fs_path(token: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::PathBuf::from(home);
+    if let Some(rest) = token.strip_prefix("~/") {
+        return Some(home.join(rest));
+    }
+    if let Some(rest) = token.strip_prefix("$HOME/") {
+        return Some(home.join(rest));
+    }
+    None
+}
+
+/// Build the backup-then-redirect rewrite for a dotfile-overwrite command.
+///
+/// Only fires when the target dotfile actually *exists* on disk — backing up a
+/// non-existent file produces a confusing error from `cp` and the backup has
+/// no value (there's nothing to lose).
+fn rewrite_dotfile_backup_first(
+    cmd: &str,
+    segments: &[tokenize::Segment],
+    _shell: ShellType,
+) -> Option<String> {
+    if segments.len() != 1 {
+        return None;
+    }
+    let target_token = dotfile_redirect_target(cmd)?;
+    let fs_path = expand_dotfile_to_fs_path(&target_token)?;
+    if !Path::new(&fs_path).exists() {
+        return None;
+    }
+    let target_token = sanitize_for_display(&target_token);
+    if target_token.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cp {target_token} {target_token}.bak && {cmd}",
+        cmd = cmd.trim()
+    ))
+}
+
+// ── Sudo narrow (command-shape based) ──────────────────────────────────────
+
+/// Interactive shells that must never appear as the "narrowed" base command of
+/// a `sudo` rewrite. Suggesting `sh` instead of `sudo sh` would be strictly
+/// worse — it would still produce a root shell, and a user copy-pasting the
+/// suggestion would lose the visible `sudo` cue.
+fn is_interactive_shell(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "pwsh" | "powershell" | "nu"
+    )
+}
+
+/// Heuristic catch-all for destructive command shapes the engine does not
+/// (yet) model as a finding but for which dropping `sudo` is obviously the
+/// wrong advice. `rm -rf /` is the canonical example: stripping sudo would
+/// still produce a dangerous command, just one that runs as the current user.
+///
+/// Tirith's detection engine deliberately does not have a `rm -rf /` rule —
+/// shell-builtin destructiveness is squarely the user's intent to express —
+/// but the suggester has a stricter mandate: never produce a rewrite a careful
+/// reviewer would call out as obviously worse than `--help` text. This
+/// denylist closes that gap for the handful of shapes everyone agrees on.
+fn looks_obviously_destructive(inner: &str) -> bool {
+    // Normalize whitespace runs so the matcher is robust against extra spaces.
+    let collapsed: String = inner.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Match leading `rm` with `-rf` / `-fr` / `-r -f` etc against `/`, `~`,
+    // `$HOME`, `*`. Bound the check to the LEADING segment of the command —
+    // anything later is somebody else's problem (and is the engine's domain).
+    let lower = collapsed.to_ascii_lowercase();
+    let triggers = [
+        "rm -rf /",
+        "rm -rf /*",
+        "rm -fr /",
+        "rm -fr /*",
+        "rm -rf ~",
+        "rm -rf $home",
+        "rm -rf --no-preserve-root",
+        "rm --no-preserve-root -rf /",
+        "dd if=/dev/zero of=/dev/sd",
+        "mkfs ",
+        ":(){ :|:&};:",
+    ];
+    triggers.iter().any(|t| lower.starts_with(t))
+}
+
+/// Strip a leading `sudo` from the command bytes, returning the inner command
+/// as raw text (preserving quoting / spacing). Returns `None` when no inner
+/// command can be located (`sudo` with no arguments, only flags, etc.).
+///
+/// Handles common option flags (`-u USER`, `--user=USER`, `--`, …). Exotic
+/// sudo flags fall through to "no rewrite" rather than risk a wrong strip.
+fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
+    let segs = tokenize::tokenize(cmd, shell);
+    let seg = segs.first()?;
+    let leader = base_command(seg.command.as_deref()?, shell);
+    if leader != "sudo" {
+        return None;
+    }
+
+    let value_short = ["-u", "-g", "-C", "-D", "-R", "-T"];
+    let value_long = [
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--role",
+        "--type",
+        "--other-user",
+        "--host",
+        "--timeout",
+    ];
+
+    let mut idx = 0;
+    let mut start_arg = None;
+    while idx < seg.args.len() {
+        let arg = strip_quotes(&seg.args[idx]);
+        if arg == "--" {
+            start_arg = Some(idx + 1);
+            break;
+        }
+        if arg.starts_with("--") {
+            if value_long.iter().any(|f| arg == *f) {
+                idx += 2;
+            } else {
+                // `--user=root` or any other `--flag=value` consumes one slot.
+                idx += 1;
+            }
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            if value_short.iter().any(|f| arg == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        start_arg = Some(idx);
+        break;
+    }
+
+    let start = start_arg?;
+    if start >= seg.args.len() {
+        return None;
+    }
+    // Reassemble the inner command from the raw segment so quoting is
+    // preserved verbatim: find where the first inner-arg token begins in the
+    // raw segment text and return everything from there onward.
+    let first_arg = &seg.args[start];
+    let stripped = strip_quotes(first_arg);
+    let raw = &seg.raw;
+    let pos = raw
+        .find(first_arg.as_str())
+        .or_else(|| raw.find(stripped.as_str()))?;
+    Some(raw[pos..].trim().to_string())
+}
+
+/// Build the sudo-narrow suggestion for the verdict.
+///
+/// Fires when:
+///  (i)   the parsed command's leader is `sudo`,
+///  (ii)  the verdict has at least one finding (caller-checked),
+///  (iii) the stripped leader is NOT an interactive shell, AND
+///  (iv)  re-running [`engine::analyze`] on the inner command yields
+///        [`Action::Allow`].
+///
+/// When (iii) fails, returns a `safe_command: None` suggestion with the
+/// interactive-shell remediation text. When (iv) fails the inner command is
+/// still flagged — per-finding suggestions already cover it, so returns `None`.
+fn build_sudo_narrow_suggestion(
+    cmd: &str,
+    shell: ShellType,
+    segments: &[tokenize::Segment],
+    _verdict: &Verdict,
+) -> Option<SafeSuggestion> {
+    // (i) leader is sudo.
+    let leader = base_command(segments.first()?.command.as_deref()?, shell);
+    if leader != "sudo" {
+        return None;
+    }
+
+    // Strip the prefix.
+    let inner = strip_sudo_prefix(cmd, shell)?;
+    if inner.is_empty() {
+        return None;
+    }
+
+    // (iii) interactive-shell trip wire on the stripped leader.
+    let inner_segs = tokenize::tokenize(&inner, shell);
+    let inner_leader = inner_segs
+        .first()
+        .and_then(|s| s.command.as_deref())
+        .map(|c| base_command(c, shell))
+        .unwrap_or_default();
+    if is_interactive_shell(&inner_leader) {
+        return Some(SafeSuggestion {
+            rule_id: "sudo_narrow".to_string(),
+            safe_command: None,
+            rationale: "no safe mechanical rewrite available; avoid interactive root shells — \
+                 run the specific non-privileged command you intended, or use sudo only \
+                 for the minimal command that requires elevation."
+                .to_string(),
+            remediation: "Identify the single command that needs elevation, then prefix only \
+                          that command with sudo. Don't run an interactive root shell."
+                .to_string(),
+        });
+    }
+
+    // Refuse to rewrite obvious shell-builtin destructiveness (`rm -rf /`)
+    // *before* re-analysis. The engine does not model these — it treats
+    // user-typed `rm -rf /` as expressing intent — but the suggester has the
+    // stricter mandate of never advising something a reviewer would call out
+    // as worse than the original.
+    if looks_obviously_destructive(&inner) {
+        return None;
+    }
+
+    // (iv) re-analyze the stripped command. If it still flags, the sudo
+    // wrapper was not the dangerous part — per-finding suggestions already
+    // describe the real issue, so we return None here.
+    let ctx = AnalysisContext {
+        input: inner.clone(),
+        shell,
+        scan_context: ScanContext::Exec,
+        raw_bytes: None,
+        interactive: false,
+        cwd: None,
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+    };
+    let inner_verdict = engine::analyze(&ctx);
+    if inner_verdict.action != Action::Allow {
+        return None;
+    }
+
+    Some(SafeSuggestion {
+        rule_id: "sudo_narrow".to_string(),
+        safe_command: Some(inner),
+        rationale: "The command is safe to run without sudo — dropping the sudo prefix \
+                    removes a privilege the inner command does not require."
+            .to_string(),
+        remediation: "Re-run the command without sudo. If the underlying tool genuinely \
+                      needs root, narrow sudo to only the minimal command that does."
+            .to_string(),
+    })
+}
+
+// ── Env scrub (command-shape based) ────────────────────────────────────────
+
+/// Currently-set sensitive env vars, in the order they appear in the asset
+/// file. Stable order keeps the suggested command deterministic.
+fn sensitive_env_set_in_process() -> Vec<&'static str> {
+    sensitive_env_vars()
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+        .collect()
+}
+
+/// Build an env-scrub suggestion for the verdict when:
+///  (i)  at least one finding is High severity or above, AND
+///  (ii) at least one sensitive env var is currently set in this process.
+///
+/// Returns `None` otherwise — there is no env to scrub.
+fn build_env_scrub_suggestion(cmd: &str, verdict: &Verdict) -> Option<SafeSuggestion> {
+    let any_high = verdict
+        .findings
+        .iter()
+        .any(|f| f.severity >= Severity::High);
+    if !any_high {
+        return None;
+    }
+
+    let set_vars = sensitive_env_set_in_process();
+    if set_vars.is_empty() {
+        return None;
+    }
+
+    // `env -u VAR1 -u VAR2 ... <original-cmd>` — works on POSIX shells.
+    let mut rewrite = String::from("env");
+    for var in &set_vars {
+        rewrite.push_str(" -u ");
+        rewrite.push_str(var);
+    }
+    rewrite.push(' ');
+    rewrite.push_str(cmd.trim());
+
+    Some(SafeSuggestion {
+        rule_id: "env_scrub".to_string(),
+        safe_command: Some(rewrite),
+        rationale: format!(
+            "Unsets {} sensitive env var(s) currently in your environment before \
+             running the command, so a malicious script cannot exfiltrate them.",
+            set_vars.len()
+        ),
+        remediation: "Unset sensitive environment variables (API tokens, cloud credentials) \
+                      before running untrusted commands, or use `env -u VAR ...` to scrub them \
+                      for a single invocation."
+            .to_string(),
+    })
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 /// URL-fetch command base names that piping into a shell is dangerous for.
@@ -369,7 +1033,7 @@ fn sanitize_for_display(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verdict::{Action, Evidence, Severity, Timings};
+    use crate::verdict::{Evidence, Timings};
 
     fn finding(rule_id: RuleId) -> Finding {
         Finding {
