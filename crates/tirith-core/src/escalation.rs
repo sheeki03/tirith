@@ -444,13 +444,36 @@ pub fn post_process_verdict(
         causal_rule_ids.extend(caused_by);
     }
 
+    // PR #121 fix-list item 9 (mirrors `mcp/tools.rs:335-348`):
+    // `apply_agent_rules` must run BEFORE approval, and `check_approval`
+    // must be gated on `verdict.action != Action::Block`. Pre-fix the
+    // order was reversed — `check_approval`/`apply_approval` stamped
+    // `requires_approval=Some(true)` and the rest of the approval
+    // metadata; then `apply_agent_rules` (at the end of post-processing)
+    // forced `Action::Block` without clearing those fields, producing a
+    // contradiction ("Block this" + "Approve to continue") for callers
+    // that honor both signals (gateway, daemon, integrations). The MCP
+    // diagnostic handlers already had the fix; this is the parallel
+    // change for the central post-processing pipeline.
+    //
+    // Running agent rules here (not at the end) is sound: `apply_agent_rules`
+    // only upgrades to Block (never downgrades), and an early Block
+    // suppresses approval just like an early escalation-driven Block
+    // would. Escalation later still has nothing to upgrade (it only fires
+    // on Warn/WarnAck per the `matches!` guard).
+    apply_agent_rules(&mut effective, policy);
+
     // Approval detection must run before session warning recording so an
     // approval-required verdict doesn't get booked as a vanilla warning.
-    if let Some(meta) = crate::approval::check_approval(&effective, policy) {
-        crate::approval::apply_approval(&mut effective, &meta);
-        causal_rule_ids.insert(meta.rule_id.clone());
-        if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
-            effective.action = Action::Block;
+    // Gated on `action != Block`: a denied / hard-blocked verdict carries
+    // no approval contract (see item 9 above).
+    if effective.action != Action::Block {
+        if let Some(meta) = crate::approval::check_approval(&effective, policy) {
+            crate::approval::apply_approval(&mut effective, &meta);
+            causal_rule_ids.insert(meta.rule_id.clone());
+            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
+                effective.action = Action::Block;
+            }
         }
     }
 
@@ -528,17 +551,21 @@ pub fn post_process_verdict(
         causal_rule_ids.extend(caused_by);
     }
 
-    // M4 item 8 chunk 3 — turn the chunk-2 `agent_rules` observation-only
-    // helper into enforcement. A `deny` matcher on the verdict's
-    // `agent_origin` forces Block; `allow` and `Unspecified` leave the
-    // verdict alone (the chunk-3 minimal cut documented in
-    // `docs/agent-governance-design.md` §5). Runs AFTER escalation so an
-    // escalation-driven Block stays Block (Block is the strictest action
-    // — `apply_agent_rules` only upgrades). Runs BEFORE warning recording
-    // so a Block flip via agent_rules correctly suppresses the Warn
-    // bookkeeping (matches the existing "Block skips Warn recording"
-    // contract).
-    apply_agent_rules(&mut effective, policy);
+    // M4 item 8 chunk 3 — `apply_agent_rules` was previously called HERE,
+    // after escalation and just before warning recording. PR #121 fix-list
+    // item 9 moved it ABOVE the approval block (see the top of this
+    // function): the approval contract must be derived from the
+    // post-deny verdict so a denied caller never sees both
+    // `action: Block` and `requires_approval: Some(true)`. The
+    // "AFTER escalation / BEFORE warning recording" invariant still holds
+    // for the late-arriving Block effect because:
+    //   * `apply_agent_rules` only upgrades the action (never downgrades),
+    //     so moving the call earlier cannot weaken any later state.
+    //   * Escalation runs only on `Warn` / `WarnAck` (see the `matches!`
+    //     guard above), so an early Block from `apply_agent_rules`
+    //     correctly short-circuits escalation without bookkeeping changes.
+    //   * Warning recording below already treats Block as a no-op via
+    //     the `matches!(effective.action, Warn | WarnAck)` guard.
 
     // Hidden findings = multiset diff of raw minus effective. Keep the actual
     // Finding references so record_outcome can store full HiddenEvent details
@@ -1464,6 +1491,78 @@ mod tests {
             finding.description.contains("claude-code"),
             "description should include the tool name: {}",
             finding.description,
+        );
+    }
+
+    #[test]
+    fn post_process_deny_does_not_emit_approval_metadata() {
+        // PR #121 fix-list item 9 — pre-fix, `post_process_verdict`
+        // ran `check_approval`/`apply_approval` BEFORE `apply_agent_rules`.
+        // A denied caller whose raw verdict also triggered an approval
+        // rule then received BOTH `action: Block` AND
+        // `requires_approval: Some(true)` — conflicting client
+        // instructions. The fix reorders the pipeline so
+        // `apply_agent_rules` runs first; approval is only derived when
+        // the verdict isn't already Block.
+        //
+        // Mirrors the MCP-side pin in
+        // `mcp_check_url_deny_does_not_emit_approval_metadata`.
+        let finding = make_finding(RuleId::PlainHttpToSink, Severity::High);
+        let raw = raw_verdict_with(
+            Action::Warn,
+            vec![finding],
+            Some(crate::agent_origin::AgentOrigin::human(true)),
+        );
+        let mut policy = deny_human_policy();
+        // An approval rule that matches the raw finding. Pre-fix this
+        // would stamp approval metadata even though the deny matcher
+        // also forces Block.
+        policy.approval_rules.push(crate::policy::ApprovalRule {
+            rule_ids: vec!["plain_http_to_sink".to_string()],
+            timeout_secs: 60,
+            fallback: "block".to_string(),
+        });
+
+        let result = post_process_verdict(
+            &raw,
+            &policy,
+            "curl http://example.com/install.sh",
+            "test-session-deny-approval",
+            CallerContext::Cli,
+        );
+
+        // Pin (1) — deny enforced.
+        assert_eq!(
+            result.action,
+            Action::Block,
+            "deny matcher must produce Block: {result:?}"
+        );
+        // Pin (2) — no approval contract on a denied verdict.
+        assert!(
+            result.requires_approval.is_none() || result.requires_approval == Some(false),
+            "denied verdict must NOT emit requires_approval=true: \
+             requires_approval={:?}",
+            result.requires_approval,
+        );
+        assert!(
+            result.approval_rule.is_none(),
+            "denied verdict must NOT emit approval_rule: {:?}",
+            result.approval_rule,
+        );
+        assert!(
+            result.approval_description.is_none(),
+            "denied verdict must NOT emit approval_description: {:?}",
+            result.approval_description,
+        );
+        assert!(
+            result.approval_timeout_secs.is_none(),
+            "denied verdict must NOT emit approval_timeout_secs: {:?}",
+            result.approval_timeout_secs,
+        );
+        assert!(
+            result.approval_fallback.is_none(),
+            "denied verdict must NOT emit approval_fallback: {:?}",
+            result.approval_fallback,
         );
     }
 }

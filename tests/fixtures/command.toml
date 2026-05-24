@@ -1635,6 +1635,63 @@ shell = "powershell"
 expected_action = "block"
 expected_rules = ["ps_set_execution_policy_bypass"]
 
+# PR #121 fix-list item 12 — PowerShell parameter-binding accepts `:` as
+# an equivalent joined-form separator to `=` (`-Param:Value` and
+# `-Param=Value` resolve to the same `Param=Value` binding). Pre-fix the
+# rule only matched `=`; attacker payloads that use the colon form
+# (`powershell -ExecutionPolicy:Bypass -Command ...`) reached tier 3 but
+# the rule never fired, producing `action: allow`.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_colon_form"
+min_milestone = 5
+input = "powershell -ExecutionPolicy:Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — `-ex` is the shortest unambiguous prefix
+# alias for `-ExecutionPolicy` (powershell.exe / pwsh have no other
+# `-Ex*` parameter). Pre-fix `-ex` failed at tier 1 (the PATTERN_TABLE
+# regex `-(?i:ExecutionPolicy|ep)\b` did not cover it), so the fast gate
+# evicted the payload before any tier-3 rule had a chance to run.
+[[fixture]]
+name = "ps_set_execution_policy_bypass_ex_alias"
+min_milestone = 5
+input = "powershell -ex Bypass -Command \"echo hi\""
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — same colon-joined form, but on the cmdlet
+# branch (the cmdlet path historically only looked for a bare `bypass`
+# token, never a `-ExecutionPolicy:Bypass` token). The post-fix cmdlet
+# branch delegates to `has_execution_policy_bypass_flag`, which covers
+# all four named forms (separated, `=`-joined, `:`-joined).
+[[fixture]]
+name = "ps_set_execution_policy_cmdlet_colon_form"
+min_milestone = 5
+input = "Set-ExecutionPolicy -ExecutionPolicy:Bypass -Scope Process -Force"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_set_execution_policy_bypass"]
+
+# PR #121 fix-list item 12 — colon-joined form for `Add-MpPreference`'s
+# `-ExclusionPath` flag. PowerShell parameter-binding accepts
+# `-ExclusionPath:C:\Users\...` as equivalent to `-ExclusionPath=...`
+# and the bare-flag separated form. Pre-fix the rule only matched
+# `-exclusionpath=`, so the colon form passed through silently.
+[[fixture]]
+name = "ps_defender_exclusion_colon_form"
+min_milestone = 5
+input = "Add-MpPreference -ExclusionPath:C:\\Users\\user\\AppData"
+context = "exec"
+shell = "powershell"
+expected_action = "block"
+expected_rules = ["ps_defender_exclusion"]
+
 # PowerShell 7+ pipeline chain operators `&&` and `||` are now first-class
 # separators in tokenize_powershell. With `;`-only splitting (the M5 chunk 1
 # state) the attacker could bypass `ps_inline_download_execute` by chaining

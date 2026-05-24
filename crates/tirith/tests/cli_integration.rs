@@ -3480,7 +3480,8 @@ fn install_no_exec_json_is_well_formed_and_not_sandboxed() {
         "install must never report itself as sandboxed"
     );
     assert_eq!(
-        analysis["command"], "npm install my-unique-internal-pkg-xyzzy"
+        analysis["command"],
+        "npm install my-unique-internal-pkg-xyzzy"
     );
     assert!(
         analysis["verdict"].is_object(),

@@ -384,14 +384,18 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "ps_set_execution_policy",
         tier1_exec_fragments: &[
             r"(?i:Set-ExecutionPolicy)\b",
-            // -ExecutionPolicy and its documented short alias -ep. The PS
-            // parser also accepts any unambiguous prefix (-Exec, -Execu, …)
-            // but those are uncommon in attacker payloads; the two forms
-            // above cover the published-malware-sample lookup.
-            r"-(?i:ExecutionPolicy|ep)\b",
+            // -ExecutionPolicy and its documented short aliases. PR #121
+            // fix-list item 12 adds `-ex` to the tier-1 gate: PowerShell's
+            // parameter binder accepts any unambiguous prefix, and `-ex`
+            // is the shortest prefix that unambiguously resolves to
+            // `-ExecutionPolicy` (the only `-Ex*` parameter on
+            // powershell.exe / pwsh). Without `-ex` in tier-1, payloads
+            // shaped `powershell -ex Bypass -Command "..."` fast-exit at
+            // tier 1 without reaching the tier-3 rule.
+            r"-(?i:ExecutionPolicy|ep|ex)\b",
         ],
         tier1_paste_only_fragments: &[],
-        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep flag form",
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe -ExecutionPolicy / -ep / -ex flag form",
     },
     PatternEntry {
         id: "ps_defender_exclusion",

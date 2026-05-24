@@ -95,12 +95,24 @@ fn check_set_execution_policy(
             continue;
         }
 
-        // Cmdlet form: first non-flag arg is the policy value.
+        // Cmdlet form: the policy value may appear in any of the following
+        // shapes (all equivalent to PowerShell's parameter binder):
+        //   * `Set-ExecutionPolicy Bypass`                      (positional)
+        //   * `Set-ExecutionPolicy -ExecutionPolicy Bypass`     (named, separated)
+        //   * `Set-ExecutionPolicy -ExecutionPolicy=Bypass`     (named, joined `=`)
+        //   * `Set-ExecutionPolicy -ExecutionPolicy:Bypass`     (named, joined `:`)
+        //
+        // PR #121 fix-list item 12: the colon-joined cmdlet form was the
+        // gap pre-fix — `seg.args` contained the literal
+        // `-ExecutionPolicy:Bypass` token, which `eq_ignore_ascii_case`
+        // never matched against the bare value `bypass`. Reusing
+        // `has_execution_policy_bypass_flag` here covers all four named
+        // forms; the positional check below catches `Set-ExecutionPolicy Bypass`.
         if cmdlet_path {
             let mentions_bypass = seg.args.iter().any(|a| {
                 let n = normalize_shell_token(a.trim(), shell);
                 n.eq_ignore_ascii_case("bypass")
-            });
+            }) || has_execution_policy_bypass_flag(&seg.args, shell);
             if mentions_bypass {
                 findings.push(Finding {
                     rule_id: RuleId::PsSetExecutionPolicyBypass,
@@ -149,28 +161,45 @@ fn check_set_execution_policy(
 }
 
 /// Return true if `args` contains both a `-ExecutionPolicy`-style flag and a
-/// `Bypass` value, in either of the standard forms:
+/// `Bypass` value, in any of the standard PowerShell parameter-binding forms:
 ///
 /// * `-ExecutionPolicy Bypass`  (separate tokens)
-/// * `-ExecutionPolicy=Bypass`  (joined)
-/// * `-ep Bypass` / `-ep=Bypass` (short alias)
+/// * `-ExecutionPolicy=Bypass`  (joined with `=`)
+/// * `-ExecutionPolicy:Bypass`  (joined with `:` — PS parameter-binding form,
+///   PR #121 fix-list item 12)
+/// * `-ep Bypass` / `-ep=Bypass` / `-ep:Bypass` (short alias)
+/// * `-ex Bypass` / `-ex=Bypass` / `-ex:Bypass` (unambiguous prefix alias,
+///   PR #121 fix-list item 12 — PS parameter binding accepts any unambiguous
+///   prefix; `-ex` is the shortest unambiguous form for `-ExecutionPolicy`
+///   that appears in published attacker payloads)
 fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
+    // The full set of recognized flag spellings. Keeping these as a constant
+    // array (rather than chained `strip_prefix` calls) keeps the joined-form
+    // and separated-form branches aligned: the same names cover both.
+    const FLAG_NAMES: &[&str] = &["-executionpolicy", "-ep", "-ex"];
+
     for (i, arg) in args.iter().enumerate() {
         let n = normalize_shell_token(arg.trim(), shell);
         let lower = n.to_ascii_lowercase();
 
-        // Joined form: -executionpolicy=bypass / -ep=bypass
-        if let Some(value) = lower
-            .strip_prefix("-executionpolicy=")
-            .or_else(|| lower.strip_prefix("-ep="))
-        {
-            if value.trim_matches(|c: char| c == '"' || c == '\'') == "bypass" {
-                return true;
+        // Joined form: `-<flag>=Bypass` OR `-<flag>:Bypass`. PowerShell's
+        // parameter binder treats `:` and `=` as equivalent joined-form
+        // separators (the colon form is documented and commonly used in
+        // attacker payloads precisely because some detectors only check
+        // `=`). PR #121 fix-list item 12 mandates both.
+        for flag in FLAG_NAMES {
+            for sep in ['=', ':'] {
+                let prefix = format!("{flag}{sep}");
+                if let Some(value) = lower.strip_prefix(&prefix) {
+                    if value.trim_matches(|c: char| c == '"' || c == '\'') == "bypass" {
+                        return true;
+                    }
+                }
             }
         }
 
-        // Separated form: -executionpolicy bypass / -ep bypass
-        if lower == "-executionpolicy" || lower == "-ep" {
+        // Separated form: `-<flag> Bypass` (the value sits in args[i+1]).
+        if FLAG_NAMES.contains(&lower.as_str()) {
             if let Some(next) = args.get(i + 1) {
                 let next_n = normalize_shell_token(next.trim(), shell);
                 if next_n.eq_ignore_ascii_case("bypass") {
@@ -200,13 +229,15 @@ fn check_defender_exclusion(
 
         let mentions_exclusion = seg.args.iter().any(|a| {
             let n = normalize_shell_token(a.trim(), shell).to_ascii_lowercase();
-            // Match both bare flag and joined `-flag=value` (PowerShell allows both).
-            n == "-exclusionpath"
-                || n == "-exclusionprocess"
-                || n == "-exclusionextension"
-                || n.starts_with("-exclusionpath=")
-                || n.starts_with("-exclusionprocess=")
-                || n.starts_with("-exclusionextension=")
+            // Match the bare flag plus all joined-form separators PowerShell
+            // accepts: `=` and `:`. PR #121 fix-list item 12 adds the colon
+            // form — `Add-MpPreference -ExclusionPath:C:\...` is a documented
+            // attacker payload shape pre-fix this was a quiet detection
+            // failure (the colon form passed through tier-3 with no finding).
+            const FLAGS: &[&str] = &["-exclusionpath", "-exclusionprocess", "-exclusionextension"];
+            FLAGS.iter().any(|f| {
+                n == *f || n.starts_with(&format!("{f}=")) || n.starts_with(&format!("{f}:"))
+            })
         });
         if !mentions_exclusion {
             continue;

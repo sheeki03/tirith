@@ -76,15 +76,22 @@ pub fn run(
         clipboard_html,
     };
 
-    let mut verdict = engine::analyze(&ctx);
+    // PR #121 fix-list item 18 (mirrors `install.rs:760` / `check.rs`):
+    // single policy snapshot for analysis + enforcement + audit. Pre-fix
+    // `engine::analyze` discovered policy internally, then the surrounding
+    // code re-ran `Policy::discover` for the `apply_agent_rules` /
+    // `filter_findings_by_paranoia` / audit calls below. A change to
+    // `.tirith/policy.yaml` between the two reads then routed detection
+    // and enforcement against inconsistent policies — a TOCTOU window.
+    // `analyze_returning_policy` returns the same snapshot the engine
+    // used so the rest of this function works against ONE policy.
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
     // M4 item 8: best-effort origin attribution for the paste path. The CLI
     // is the only place that knows whether the caller looked like a human,
     // an agent (via TIRITH_INTEGRATION), or a CI runner. The audit entry
     // below picks the origin up automatically.
     verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
-
-    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
 
     // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` here. The
     // paste path does NOT route through `post_process_verdict` (the engine

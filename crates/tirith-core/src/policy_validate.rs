@@ -476,6 +476,13 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "profiles",
     ];
     let known_checkpoint_fields = ["max_count", "max_age_hours", "max_storage_bytes"];
+    // PR #121 fix-list item 10 — `agent_rules` is in `known_top_level` but
+    // its children (`allow`/`deny`) were never validated. A typo like
+    // `agent_rules: { denyy: [...] }` then passed silently and the
+    // operator's intended block never fired. The lists below mirror
+    // `policy.rs::AgentRules` and `policy.rs::AgentMatcher`.
+    let known_agent_rules_fields = ["allow", "deny"];
+    let known_agent_matcher_fields = ["kind", "name"];
 
     // Parse as generic YAML value to check top-level keys
     if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) {
@@ -547,6 +554,58 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                         message: format!("unknown field 'checkpoints.{sk}'"),
                                         field: Some(format!("checkpoints.{sk}")),
                                     });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // PR #121 fix-list item 10 — validate the nested
+                // `agent_rules.{allow,deny}` keys and each matcher object's
+                // (`kind`, `name`) keys. A typo at either level was
+                // silently dropped pre-fix, e.g.
+                //   agent_rules: { denyy: [...] }                  (top key)
+                //   agent_rules: { deny: [{ kind: agent, namee: x }] }  (matcher key)
+                // both used to pass `validate`; the policy then loaded
+                // with the typo'd field discarded and the operator never
+                // knew their rule was a no-op.
+                if k == "agent_rules" {
+                    if let serde_yaml::Value::Mapping(sub_map) = value {
+                        for (sub_key, sub_val) in sub_map {
+                            let serde_yaml::Value::String(sk) = sub_key else {
+                                continue;
+                            };
+                            if !known_agent_rules_fields.contains(&sk.as_str()) {
+                                issues.push(PolicyIssue {
+                                    level: IssueLevel::Warning,
+                                    message: format!("unknown field 'agent_rules.{sk}'"),
+                                    field: Some(format!("agent_rules.{sk}")),
+                                });
+                                continue;
+                            }
+                            // For known `allow` / `deny` lists, recurse
+                            // into each matcher object and flag unknown
+                            // matcher fields. The fields on
+                            // `policy::AgentMatcher` are `kind` and `name`.
+                            if let serde_yaml::Value::Sequence(seq) = sub_val {
+                                for (i, item) in seq.iter().enumerate() {
+                                    let serde_yaml::Value::Mapping(matcher) = item else {
+                                        continue;
+                                    };
+                                    for mkey in matcher.keys() {
+                                        let serde_yaml::Value::String(mk) = mkey else {
+                                            continue;
+                                        };
+                                        if !known_agent_matcher_fields.contains(&mk.as_str()) {
+                                            issues.push(PolicyIssue {
+                                                level: IssueLevel::Warning,
+                                                message: format!(
+                                                    "unknown field 'agent_rules.{sk}[{i}].{mk}'"
+                                                ),
+                                                field: Some(format!("agent_rules.{sk}[{i}].{mk}")),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -721,6 +780,61 @@ custom_rules:
                 .iter()
                 .any(|i| i.message.contains("unknown field 'agent_rules'")),
             "agent_rules must be a known top-level field: {issues:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 fix-list item 10 — nested `agent_rules.*` unknown-field
+    // validation. Pre-fix a typo on the `allow`/`deny` slot or on a matcher
+    // field (`kind`/`name`) was silently dropped; the operator's intended
+    // rule then never fired but no warning surfaced.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_agent_rules_unknown_sub_key_warns() {
+        // `denyy` instead of `deny` — pre-fix this passed silently, the
+        // matcher list was dropped, and the policy looked "valid".
+        let yaml = "agent_rules:\n  denyy:\n    - kind: agent\n      name: claude-code\n";
+        let issues = validate(yaml);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("agent_rules.denyy")),
+            "typo on `agent_rules.deny` must produce an unknown-field warning: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_unknown_matcher_field_warns() {
+        // A typo on the matcher object itself (`namee` instead of `name`)
+        // — the matcher then deserialized as `{kind: agent, name: None}`,
+        // matched every Agent caller, and the operator's intent was lost.
+        // Note: a matcher with `name: None` does NOT trigger
+        // "matches nothing" (that's only fired on Human/Gateway), so the
+        // pre-fix path emitted zero warnings.
+        let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      namee: claude-code\n";
+        let issues = validate(yaml);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("agent_rules.deny[0].namee")),
+            "typo on a matcher field must produce an unknown-field warning: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_rules_valid_matcher_accepted() {
+        // Sanity check — the valid shape produces no `agent_rules.*`
+        // unknown-field warning. (Other warnings may still fire from
+        // unrelated checks; we look specifically for the unknown-field
+        // shape on this key.)
+        let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      name: claude-code\n";
+        let issues = validate(yaml);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown field 'agent_rules.")),
+            "valid agent_rules matcher must not produce an unknown-field warning: {issues:?}"
         );
     }
 }
