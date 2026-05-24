@@ -247,13 +247,15 @@ pub fn check(
     // their own right — exactly the failure mode of "snuck a tool past
     // `tirith mcp lock`" the per-tool gate is designed to catch.
     //
-    // **Trust applies here too.** A server name in `trusted_mcp_servers`
-    // means the operator has reviewed its surface and accepted it;
-    // suppressing drift-side findings while still firing on the
-    // lockfile-side tool check would be inconsistent — the operator
-    // declared "this server's tools are fine", so policy violations
-    // on it should follow the same trust rule as drift. Pass the
-    // trust list through to the helper.
+    // **Trust does NOT apply here.** `trusted_mcp_servers` suppresses
+    // *drift findings* — the operator accepts the server's surface as
+    // observed. `mcp_allowed_tools` is a separate, orthogonal mechanism:
+    // the per-tool allow-list the operator wrote because they want
+    // exactly that list enforced. An older version of this code did
+    // pass `trusted_mcp_servers` through and let trust silently override
+    // the explicit allow-list; PR #121 item 8 fixes that. The trust list
+    // is still passed (for backward signature stability and any future
+    // re-introduction), but is no longer consulted inside the helper.
     if let Some(finding) =
         finding_for_disallowed_lockfile_tools(&lockfile, mcp_allowed_tools, trusted_mcp_servers)
     {
@@ -354,8 +356,7 @@ fn any_added_tool_out_of_allowed(
 
 /// Build a finding for lockfile-recorded tools that are not in the
 /// `mcp_allowed_tools` set. Returns `None` if every recorded tool is
-/// allowed (or no policy entry exists for any server, or every offending
-/// server is in `trusted`).
+/// allowed (or no policy entry exists for any server).
 ///
 /// The finding lists at most a few server names and the offending tools
 /// per server; full per-server detail belongs in `tirith mcp verify`. The
@@ -363,16 +364,21 @@ fn any_added_tool_out_of_allowed(
 /// stronger signal than ordinary drift because the lockfile was supposed
 /// to have caught it.
 ///
-/// **Trust suppression.** A server whose name is in `trusted` is exempt
-/// from this check — the same rule the drift-side filter applies. The
-/// operator has accepted that server's surface, so a tool-not-in-policy
-/// flag on it would be inconsistent with the drift-suppression contract.
-/// (`mcp_allowed_tools` violations on UNtrusted servers still fire as
-/// before.)
+/// **`trusted` is intentionally not consulted here.** The previous
+/// behavior suppressed lockfile-side findings for trusted servers — but
+/// that conflated two orthogonal mechanisms. `trusted_mcp_servers`
+/// suppresses *drift findings* (the operator declared they accept the
+/// server's surface as-is). `mcp_allowed_tools` is a *per-tool allow-list*
+/// the operator wrote because they want exactly that list enforced. An
+/// operator who configures both means "trust drift, but still hold this
+/// server's tools to [list]"; trust must not silently override the
+/// allow-list. PR #121 item 8 fixes this — the parameter remains in the
+/// signature so callers don't change, but is no longer consulted. See the
+/// block comment inside the loop for the full rationale.
 fn finding_for_disallowed_lockfile_tools(
     lockfile: &mcp_lock::McpLockfile,
     mcp_allowed_tools: &HashMap<String, Vec<String>>,
-    trusted: &[String],
+    _trusted: &[String],
 ) -> Option<Finding> {
     if mcp_allowed_tools.is_empty() {
         return None;
@@ -380,17 +386,33 @@ fn finding_for_disallowed_lockfile_tools(
 
     // Collect (server_name, disallowed_tools) pairs in stable order:
     // servers in lockfile order (already sorted), tools as recorded.
-    // A server in the `trusted` list is skipped entirely — its surface
-    // has been accepted by policy, so a lockfile-side tool finding on
-    // it would be inconsistent with the drift-side trust filter.
+    //
+    // **Trust no longer bypasses an explicit allowed-tools entry.**
+    // `trusted_mcp_servers` suppresses drift findings (operator accepted
+    // the *surface* as-is), but `mcp_allowed_tools` is a separate,
+    // orthogonal mechanism — a per-tool allow-list that the operator
+    // wrote because they want exactly that list enforced. An operator
+    // who lists BOTH (trusted: [foo]) AND (mcp_allowed_tools: { foo:
+    // [bar] }) means "trust foo's drift, but still hold its tools to
+    // [bar]". The old behavior conflated the two, silently letting
+    // trust override the explicit policy — PR #121 item 8.
+    //
+    // The trust-bypass is still honored for servers that have NO
+    // `mcp_allowed_tools` entry: trust suppresses the finding the same
+    // way it suppresses drift findings, because there is no explicit
+    // policy to enforce against.
     let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
     for server in &lockfile.servers {
-        if trusted.iter().any(|t| t == &server.name) {
-            continue;
-        }
         let Some(allowed) = mcp_allowed_tools.get(&server.name) else {
+            // No explicit allow-list — trust would apply if the server
+            // were here, but with no policy to enforce there is nothing
+            // to flag.
             continue;
         };
+        // An explicit `mcp_allowed_tools` entry exists for this server.
+        // Enforce it regardless of whether the operator also marked the
+        // server trusted — `trusted` is intentionally not consulted on
+        // this branch (see the block comment above).
         let disallowed: Vec<String> = server
             .tools
             .iter()
@@ -986,6 +1008,7 @@ mod tests {
                     ),
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -1647,6 +1670,7 @@ mod tests {
                     env: vec![],
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -1691,6 +1715,7 @@ mod tests {
                     env: vec![],
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -1726,6 +1751,7 @@ mod tests {
                     env: vec![],
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -1745,18 +1771,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wave-end finding F14 — `finding_for_disallowed_lockfile_tools`
-    // respects `trusted_mcp_servers`. A server whose name is in the trust
-    // list is exempt from the lockfile-side disallowed-tool finding, the
-    // same way it is from drift-side findings.
+    // PR #121 item 8 — `mcp_allowed_tools` enforcement no longer bows to
+    // `trusted_mcp_servers`. Trust suppresses drift findings (operator
+    // accepted the surface as-is) but does NOT suppress the explicit
+    // per-tool allow-list — that's a separate, orthogonal mechanism. An
+    // operator who configures both means "trust drift, but still hold
+    // this server's tools to [list]"; the OLD behavior conflated the two
+    // and let trust silently override the allow-list.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn trusted_server_suppresses_lockfile_side_disallowed_tool_finding() {
+    fn trusted_server_does_not_bypass_mcp_allowed_tools() {
         // The lockfile records a tool outside `mcp_allowed_tools` for the
-        // ONLY server in the lockfile, but that server is in
-        // `trusted_mcp_servers`. The lockfile-side finding must NOT
-        // fire — the trust list applies to both sides.
+        // ONLY server in the lockfile, AND that server is in
+        // `trusted_mcp_servers`. The lockfile-side finding MUST still
+        // fire — trust suppresses drift findings only, not the per-tool
+        // allow-list.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1767,8 +1797,9 @@ mod tests {
         let inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &inv);
 
-        // Policy: server "trusted" is allowed only "read" — so it would
-        // normally fire the lockfile-side finding for "evil_tool". But:
+        // Policy: server "trusted" is allowed only "read" — so
+        // "evil_tool" must fire the lockfile-side finding, regardless
+        // of trust.
         let mut allowed = HashMap::new();
         allowed.insert("trusted".to_string(), vec!["read".to_string()]);
 
@@ -1777,19 +1808,61 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &trusted, &allowed);
+        let lockfile_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.title.contains("records tools outside"))
+            .collect();
+        assert_eq!(
+            lockfile_findings.len(),
+            1,
+            "trusted server with an explicit mcp_allowed_tools entry must still fire the \
+             disallowed-tool finding (trust suppresses drift only): {findings:?}",
+        );
+        let serialized = serde_json::to_string(lockfile_findings[0]).unwrap();
         assert!(
-            findings.is_empty(),
-            "a trusted server's lockfile-side disallowed-tool finding must be suppressed: \
-             {findings:?}",
+            serialized.contains("evil_tool"),
+            "finding must name the offending tool: {serialized}",
         );
     }
 
     #[test]
-    fn untrusted_server_still_fires_lockfile_side_when_others_are_trusted() {
-        // Two servers in the lockfile, both with disallowed tools.
-        // Only one is trusted; the other must still fire the
-        // lockfile-side finding, and that finding must name only the
-        // untrusted server.
+    fn trusted_server_without_mcp_allowed_tools_still_silent() {
+        // Trust still suppresses *when there is no explicit
+        // `mcp_allowed_tools` entry for the server* — the case that
+        // motivated the original trust-bypass behavior. With no
+        // per-tool policy declared, there is nothing for the lockfile-
+        // side check to enforce, and the drift-side trust filter does
+        // its job (no finding fires).
+        let repo = tempdir().unwrap();
+        write_config(
+            repo.path(),
+            ".mcp.json",
+            r#"{ "mcpServers": { "trusted": { "command": "node",
+                "tools": ["read", "anything"] } } }"#,
+        );
+        let inv = mcp_lock::build_inventory(repo.path());
+        write_lockfile_for(repo.path(), &inv);
+
+        // No `mcp_allowed_tools` entry for "trusted".
+        let allowed = HashMap::new();
+        let trusted = vec!["trusted".to_string()];
+
+        let lock_path = repo.path().join(".tirith").join("mcp.lock");
+        let content = fs::read_to_string(&lock_path).unwrap();
+        let findings = check(&content, Some(&lock_path), &trusted, &allowed);
+        assert!(
+            findings.is_empty(),
+            "no mcp_allowed_tools entry + trusted server → no findings: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn both_trusted_and_untrusted_fire_lockfile_side_when_both_have_allow_lists() {
+        // PR #121 item 8 — Both servers have an explicit
+        // `mcp_allowed_tools` entry (here, an empty allow-list that
+        // permits no tools). Trust no longer bypasses the lockfile-side
+        // disallowed-tool finding for the explicit-policy case, so BOTH
+        // servers' offending tools must appear.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1811,7 +1884,6 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &trusted, &allowed);
-        // Exactly one lockfile-side finding fires.
         let lockfile_findings: Vec<&Finding> = findings
             .iter()
             .filter(|f| f.title.contains("records tools outside"))
@@ -1819,12 +1891,14 @@ mod tests {
         assert_eq!(
             lockfile_findings.len(),
             1,
-            "exactly one lockfile-side disallowed-tool finding: got {findings:?}",
+            "exactly one lockfile-side disallowed-tool finding (covering both servers): \
+             got {findings:?}",
         );
         let serialized = serde_json::to_string(&lockfile_findings[0]).unwrap();
         assert!(
-            !serialized.contains("evil_tool_a"),
-            "trusted server's offending tool must NOT appear: {serialized}",
+            serialized.contains("evil_tool_a"),
+            "trusted server's offending tool MUST appear (explicit allow-list overrides trust): \
+             {serialized}",
         );
         assert!(
             serialized.contains("evil_tool_b"),

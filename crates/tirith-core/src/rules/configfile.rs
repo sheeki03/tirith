@@ -932,14 +932,21 @@ fn is_trusted_mcp_server(name: &str, trusted: &[String]) -> bool {
 /// Detect duplicate server names by raw JSON token scanning; `serde_json`
 /// deduplicates object keys silently so duplicates must be caught beforehand.
 ///
-/// `trusted_servers` is the policy's `trusted_mcp_servers` list — a duplicate
-/// entry whose name appears there is suppressed (operator has accepted that
-/// server's surface).
+/// **Trust does NOT suppress this finding.** A duplicate server name is a
+/// structural ambiguity — which entry wins when the MCP client reads the
+/// config? `trusted_mcp_servers` declares that the operator accepts a
+/// server's *surface*, but trust on one of two collisions does not
+/// resolve the collision: the consumer still picks one entry over the
+/// other in an order-dependent way. The hazard the duplicate finding
+/// reports (tool shadowing, definition override) is independent of
+/// whether the operator trusted either side. PR #121 item 15 fixes
+/// this; the parameter is no longer consulted here (kept for signature
+/// stability).
 fn check_mcp_duplicate_names(
     content: &str,
     path: &Path,
     findings: &mut Vec<Finding>,
-    trusted_servers: &[String],
+    _trusted_servers: &[String],
 ) {
     let servers_key_pos = content
         .find("\"mcpServers\"")
@@ -1024,13 +1031,10 @@ fn check_mcp_duplicate_names(
     let path_str = path.display().to_string();
     for key in &keys {
         if seen.contains(&key.as_str()) {
-            // A duplicate is suppressed when the operator has marked the
-            // server name as trusted — the tool-shadowing hazard is
-            // accepted along with the rest of that server's surface.
-            if is_trusted_mcp_server(key, trusted_servers) {
-                seen.push(key);
-                continue;
-            }
+            // PR #121 item 15 — duplicates always report, regardless of
+            // trust. A duplicate is a structural ambiguity (which entry
+            // wins?) that trust on one of the colliding names does not
+            // resolve.
             findings.push(Finding {
                 rule_id: RuleId::McpDuplicateServerName,
                 severity: Severity::High,
@@ -1754,15 +1758,20 @@ mod tests {
     }
 
     #[test]
-    fn test_trusted_mcp_server_suppresses_duplicate_name_finding() {
+    fn test_trusted_mcp_server_does_not_suppress_duplicate_name_finding() {
+        // PR #121 item 15 — A duplicate name is a structural ambiguity
+        // (which entry wins?) that trust on one of the colliding names
+        // does not resolve. The duplicate finding must fire regardless
+        // of trust.
         let content = r#"{"mcpServers":{"server-a":{"command":"a"},"server-a":{"command":"b"}}}"#;
         let trusted = vec!["server-a".to_string()];
         let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);
         assert!(
-            !findings
+            findings
                 .iter()
                 .any(|f| f.rule_id == RuleId::McpDuplicateServerName),
-            "trusted server name must suppress the duplicate-name finding: {findings:?}",
+            "duplicate MCP server name MUST fire even for trusted names \
+             (structural ambiguity, not surface acceptance): {findings:?}",
         );
     }
 

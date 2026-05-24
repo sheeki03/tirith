@@ -186,6 +186,28 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
              (.vscode/, .cursor/, .windsurf/, .cline/, .amazonq/, .continue/, .kiro/)."
         );
         eprintln!("  Wrote an empty lockfile so `tirith mcp verify` has a baseline.");
+
+        // PR #121 item 16 — show rejected configs even when the
+        // inventory is empty. [`McpInventory::is_empty`] explicitly
+        // notes that `rejected_configs` does NOT count toward
+        // emptiness: a repo whose only `.mcp.json` is a symlink-out /
+        // oversized / unreadable would otherwise see "no configs found"
+        // with no signal that a config was actually present but blocked.
+        // Surface the rejection list here so the operator can see the
+        // cause.
+        if !inventory.rejected_configs.is_empty() {
+            eprintln!();
+            eprintln!(
+                "  note: {} config path(s) were skipped during discovery and contributed no \
+                 servers — review these in case a legitimately-present config was \
+                 unintentionally blocked:",
+                inventory.rejected_configs.len(),
+            );
+            for line in format_rejected_config_lines(&inventory.rejected_configs) {
+                eprintln!("{line}");
+            }
+        }
+
         println!("{}", lock_path.display());
         return;
     }
@@ -215,16 +237,7 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
         eprintln!();
         eprintln!("  servers:");
         for server in &inventory.servers {
-            let transport = describe_transport(&server.transport);
-            let tools = if server.tools.is_empty() {
-                "all tools (none declared)".to_string()
-            } else {
-                format!("{} tool(s)", server.tools.len())
-            };
-            eprintln!(
-                "    - {} [{}] — {} — from {}",
-                server.name, transport, tools, server.source_config,
-            );
+            eprintln!("{}", format_inventory_server_line(server));
         }
     }
 
@@ -289,6 +302,35 @@ fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<St
             )
         })
         .collect()
+}
+
+/// Render one inventory server entry as it appears under the `servers:`
+/// block of `tirith mcp lock`'s human summary.
+///
+/// **Both `server.name` and `server.source_config` are debug-escaped.**
+/// Both originate from a `.mcp.json` checked into the repo and must be
+/// treated as attacker-controllable at every print site (PR #121 item
+/// 17). The codebase's stated discipline — see the comments at the top
+/// of [`format_rejected_config_lines`], at [`escape_name`], and at the
+/// drift / env-name printers (`describe_changed_entry`,
+/// `describe_transport`) — is "every printer escapes attacker-
+/// controllable strings". This site was missed before PR #121 fixed
+/// it; the helper is factored out so the contract can be unit-tested
+/// without driving the whole `print_human` function.
+fn format_inventory_server_line(server: &mcp_lock::McpServerEntry) -> String {
+    let transport = describe_transport(&server.transport);
+    let tools = if server.tools.is_empty() {
+        "all tools (none declared)".to_string()
+    } else {
+        format!("{} tool(s)", server.tools.len())
+    };
+    format!(
+        "    - {} [{}] — {} — from {:?}",
+        escape_name(&server.name),
+        transport,
+        tools,
+        server.source_config,
+    )
 }
 
 /// One-line human description of a [`mcp_lock::RejectedReason`].
@@ -1772,6 +1814,7 @@ mod tests {
                     env: vec![],
                 },
                 tools: vec!["weird\ntool".into()],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -2110,6 +2153,99 @@ mod tests {
             parsed.get("k").and_then(|v| v.as_str()),
             Some("\u{7f}"),
             "round-tripped value must byte-equal the input DEL",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 item 17 — `format_inventory_server_line` debug-escapes
+    // both the server name and the source_config path so a hostile
+    // `.mcp.json` cannot smuggle ANSI / CR / BEL / control bytes through
+    // the inventory printer. Adjacent printers in this file already
+    // followed this discipline; this site was missed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_inventory_server_line_escapes_ansi_in_name_and_source() {
+        // Server name carries an ANSI red-foreground sequence. A raw
+        // print would recolour every subsequent terminal byte until the
+        // next ANSI reset.
+        let server = mcp_lock::McpServerEntry {
+            name: "evil\x1b[31m".into(),
+            transport: mcp_lock::McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec!["read".into()],
+            tools_declared: true,
+            // Source config path with a CR + BEL — a raw print would
+            // overwrite the line and beep at the operator.
+            source_config: "hostile\rpath\x07.mcp.json".into(),
+        };
+        let line = format_inventory_server_line(&server);
+        // No raw ESC byte must reach the printer's output.
+        assert!(
+            !line.chars().any(|c| c == '\x1b'),
+            "raw ESC byte must NOT appear in formatted line: {line:?}",
+        );
+        // No raw CR or BEL either.
+        assert!(
+            !line.chars().any(|c| c == '\r'),
+            "raw CR byte must NOT appear in formatted line: {line:?}",
+        );
+        assert!(
+            !line.chars().any(|c| c == '\x07'),
+            "raw BEL byte must NOT appear in formatted line: {line:?}",
+        );
+        // The escaped form should be visible — `escape_name` and
+        // Debug-format both render control bytes as `\u{NN}` / `\x...`
+        // escapes.
+        assert!(
+            line.contains("evil"),
+            "the legible portion of the name should still appear: {line}",
+        );
+        assert!(
+            line.contains("hostile"),
+            "the legible portion of source_config should still appear: {line}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 item 16 — `format_rejected_config_lines` is reachable
+    // (and rendered) even when the inventory is otherwise empty. The
+    // helper is already covered by `format_rejected_config_lines_*`
+    // tests above; this test asserts that an inventory carrying ONLY
+    // rejected_configs (no servers, no parseable configs) still
+    // produces a non-empty rejected-config render — pinning the
+    // contract that the early-return branch of `print_human` is no
+    // longer the only consumer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejected_configs_render_even_when_inventory_is_empty() {
+        let inv = McpInventory {
+            servers: vec![],
+            configs: vec![],
+            malformed_configs: vec![],
+            rejected_configs: vec![mcp_lock::RejectedConfig {
+                path: ".mcp.json".to_string(),
+                reason: mcp_lock::RejectedReason::Symlink,
+            }],
+        };
+        assert!(
+            inv.is_empty(),
+            "test scaffold: inventory must be empty for this regression",
+        );
+        let lines = format_rejected_config_lines(&inv.rejected_configs);
+        assert_eq!(
+            lines.len(),
+            1,
+            "the rejection lines must still render for an otherwise-empty inventory: {lines:?}",
+        );
+        assert!(
+            lines[0].contains(".mcp.json"),
+            "the rejected path must appear in the rendered line: {}",
+            lines[0],
         );
     }
 }

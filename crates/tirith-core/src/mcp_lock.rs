@@ -212,6 +212,65 @@ pub enum McpTransport {
     Unknown,
 }
 
+/// How a server's `tools` key appeared in the source config. The lockfile's
+/// per-server `tools: Vec<String>` collapses these three on-disk shapes
+/// into one list — but the distinction is still useful for audits / future
+/// reporting (an `Omitted` server is treated by MCP clients as "all
+/// tools"; an `EmptyDeclared` server is treated as "no tools at all"; an
+/// `Invalid` server has a malformed `tools` value that this parser
+/// dropped). For backward compatibility, [`McpServerEntry`] and
+/// [`McpLockServer`] track the distinction in a sibling
+/// `tools_declared: bool` field rather than carrying this enum directly;
+/// see [`parse_tools`]'s return shape for the raw three-way distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredTools {
+    /// The source config did not carry a `tools` key for this server.
+    /// MCP semantics: "the client may call any tool the server runtime
+    /// exposes" (runtime negotiation, invisible to a static config
+    /// inventory).
+    Omitted,
+    /// The source config carried a `tools` key but its value was not a
+    /// JSON array of strings (an object, a number, a non-string array
+    /// element, …). The values that *did* parse as strings are still
+    /// captured in the inner vec; entries that failed are dropped.
+    Invalid(Vec<String>),
+    /// The source config carried `"tools": []` — an explicit declaration
+    /// that the server exposes no tools.
+    EmptyDeclared,
+    /// The source config carried a non-empty list of tool name strings.
+    Declared(Vec<String>),
+}
+
+impl DeclaredTools {
+    /// Whether the source config carried a `tools` key at all — true for
+    /// `Invalid`, `EmptyDeclared`, and `Declared`; false for `Omitted`.
+    pub fn was_declared(&self) -> bool {
+        !matches!(self, DeclaredTools::Omitted)
+    }
+
+    /// Flatten into the canonical (deduplicated, sorted) tool list that
+    /// the lockfile stores. `Omitted` and `EmptyDeclared` flatten to an
+    /// empty vec — the lockfile's `tools: Vec<String>` was a Vec already,
+    /// and the distinction between these two is tracked in
+    /// `tools_declared`.
+    pub fn into_canonical(self) -> Vec<String> {
+        match self {
+            DeclaredTools::Omitted | DeclaredTools::EmptyDeclared => Vec::new(),
+            DeclaredTools::Invalid(v) | DeclaredTools::Declared(v) => v,
+        }
+    }
+}
+
+/// `serde(default = ...)` helper for the new `tools_declared` field. An
+/// older lockfile that predates this field is treated as if the operator
+/// had declared a tools list — preserving the pre-change behavior of
+/// "an empty `tools` list could mean either omitted or declared empty"
+/// while still letting freshly-written lockfiles record the true source
+/// shape going forward.
+fn default_tools_declared() -> bool {
+    true
+}
+
 /// One MCP server as declared in a repository's MCP configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerEntry {
@@ -222,8 +281,27 @@ pub struct McpServerEntry {
     pub transport: McpTransport,
     /// The tools the server declares, sorted and de-duplicated for a stable
     /// hash. An empty vec means the config declared no explicit tool list
-    /// (which an MCP client treats as "all tools").
+    /// (which an MCP client treats as "all tools"), OR the config declared
+    /// `"tools": []` — distinguish the two via [`Self::tools_declared`].
     pub tools: Vec<String>,
+    /// Whether the source config carried a `tools` key. `true` for
+    /// `"tools": []` and `"tools": [...]`; `false` for an omitted key or
+    /// a malformed shape. The lockfile schema is unchanged
+    /// (`format_version` still 4); this field rides on existing entries
+    /// with `#[serde(default = "default_tools_declared")]` so an older
+    /// lockfile (which had no field) round-trips with the value `true`
+    /// — preserving the pre-change semantics that empty `tools` was
+    /// always interpreted as "declared empty". Going forward, freshly-
+    /// written lockfiles distinguish the two states.
+    ///
+    /// **Not folded into [`Self::content_hash`].** Adding this field to
+    /// the hash would make a new tirith binary produce a different
+    /// per-server hash than an old binary did for the same config, and
+    /// the lockfile would surface a spurious `Changed` drift on every
+    /// upgrade. The field is informational / audit-side; the hash
+    /// continues to derive from the canonical tools vec only.
+    #[serde(default = "default_tools_declared")]
+    pub tools_declared: bool,
     /// Repo-relative path of the config file this entry was parsed from.
     pub source_config: String,
 }
@@ -450,8 +528,18 @@ pub struct McpLockServer {
     pub name: String,
     /// Canonical transport descriptor.
     pub transport: McpTransport,
-    /// Declared tool list (sorted, de-duplicated).
+    /// Declared tool list (sorted, de-duplicated). Empty when the source
+    /// config either omitted the `tools` key entirely OR declared
+    /// `"tools": []` — distinguish via [`Self::tools_declared`].
     pub tools: Vec<String>,
+    /// Whether the source config carried a `tools` key. See
+    /// [`McpServerEntry::tools_declared`] for the rationale. Serialized
+    /// with `#[serde(default = "default_tools_declared")]` so a legacy
+    /// lockfile (no field) deserializes with the value `true`. **Not
+    /// folded into [`Self::hash`]** — the per-server hash continues to
+    /// derive from the canonical tools vec only.
+    #[serde(default = "default_tools_declared")]
+    pub tools_declared: bool,
     /// Repo-relative path of the config file the server was declared in.
     pub source_config: String,
     /// Per-server content hash (see [`McpServerEntry::content_hash`]).
@@ -498,6 +586,7 @@ impl McpLockfile {
                 name: entry.name.clone(),
                 transport: entry.transport.clone(),
                 tools: entry.tools.clone(),
+                tools_declared: entry.tools_declared,
                 source_config: entry.source_config.clone(),
                 hash: entry.content_hash(),
             })
@@ -962,12 +1051,15 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
         };
 
         let transport = parse_transport(name, obj);
-        let tools = parse_tools(obj);
+        let declared = parse_tools(obj);
+        let tools_declared = declared.was_declared();
+        let tools = declared.into_canonical();
 
         entries.push(McpServerEntry {
             name: name.clone(),
             transport,
             tools,
+            tools_declared,
             source_config: source_config.to_string(),
         });
     }
@@ -1068,10 +1160,22 @@ fn parse_transport(
 fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>) {
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
-        // Unparseable URL: store verbatim, no userinfo to hash. This is the
-        // conservative choice — stripping bytes from a string we cannot
-        // structurally parse could mangle the input.
-        Err(_) => return (url.to_string(), None),
+        // Unparseable URL: we can't structurally identify the userinfo
+        // boundary, so we can't compute a salted hash. But the raw string
+        // still frequently carries a `user:token@host` authority — and
+        // `.tirith/mcp.lock` is designed to be committed. A previous
+        // implementation stored the verbatim string, which leaked any
+        // credential the malformed URL happened to carry. Run a best-
+        // effort byte-scan strip pass instead: replace anything between
+        // `scheme://` and the first `@` (before the next path/query/
+        // fragment boundary) with `***`. The strip is deliberately
+        // conservative — it only fires when the input clearly carries a
+        // scheme + authority + userinfo shape — so a malformed URL that
+        // does not look authority-shaped is preserved as-is for
+        // diagnostic context. `userinfo_hash` remains `None` because we
+        // cannot reconstruct the exact userinfo substring without a safe
+        // parser.
+        Err(_) => return (strip_userinfo_best_effort(url), None),
     };
 
     let username = parsed.username();
@@ -1138,6 +1242,76 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
     (parsed.as_str().to_string(), userinfo_hash)
 }
 
+/// Best-effort userinfo strip for a URL string that `url::Url::parse` could
+/// not parse. Locates the `scheme://` prefix and the first `@` before the
+/// next `/`, `?`, `#`, or end-of-string, and replaces the segment between
+/// them with `***`. Preserves the rest of the string for diagnostic
+/// context.
+///
+/// This runs only when [`redact_url_userinfo`]'s parser fallback fires —
+/// the parsed-fine path uses `url::Url::set_username` / `set_password` for
+/// a structurally-sound strip. The byte-scan version is a safety net for
+/// malformed inputs that nevertheless look like they carry an authority
+/// with credentials. A URL that does not match the `scheme://...@`
+/// shape is returned verbatim: a relative URL, a non-authority scheme
+/// (`mailto:`, `data:`), or a string that just isn't URL-shaped at all
+/// can't be carrying URL userinfo, so there is nothing to strip.
+///
+/// **Why the manual scan?** Pulling in a regex for one call site here
+/// would import a transitively large dependency. The byte-scan is small
+/// (~25 lines), allocation-free until the strip fires, and unambiguous
+/// over any byte content.
+fn strip_userinfo_best_effort(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    // Find a scheme: at least one ASCII letter, then any of letter/digit/`+`/`-`/`.`,
+    // terminated by `://`. RFC 3986 §3.1.
+    let mut scheme_end = 0usize;
+    if bytes.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
+        return raw.to_string();
+    }
+    while scheme_end < bytes.len() {
+        let c = bytes[scheme_end];
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+            scheme_end += 1;
+        } else {
+            break;
+        }
+    }
+    // After scheme: must be exactly `://`.
+    if scheme_end + 3 > bytes.len() || &bytes[scheme_end..scheme_end + 3] != b"://" {
+        return raw.to_string();
+    }
+    let auth_start = scheme_end + 3;
+    // Authority terminates at `/`, `?`, `#`, or end. Find the first `@`
+    // before that boundary.
+    let mut i = auth_start;
+    let mut at_pos: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' | b'?' | b'#' => break,
+            b'@' => {
+                at_pos = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(at) = at_pos else {
+        // No `@` before the path/query/fragment boundary — nothing to
+        // strip.
+        return raw.to_string();
+    };
+    // If there's nothing between `://` and `@`, the input has no
+    // userinfo content to redact — still rewrite to `***` so the
+    // output shape is consistent with the strip-fired path, but the
+    // input has no secret to leak.
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..auth_start]);
+    out.push_str("***");
+    out.push_str(&raw[at..]);
+    out
+}
+
 /// Extract a stdio server's `env` object as `(name, value_hash)` entries,
 /// sorted by name so the hash is stable regardless of JSON key order. A
 /// non-string env value is hashed by its compact JSON rendering (so a numeric
@@ -1182,22 +1356,55 @@ fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntr
     env
 }
 
-/// Extract the declared tool list from a server object, sorted and
-/// de-duplicated for a stable hash. Non-string entries in the `tools` array are
-/// dropped. A missing or non-array `tools` field yields an empty vec.
-fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
-    let mut tools: Vec<String> = obj
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+/// Extract the declared tool list from a server object, distinguishing
+/// the three on-wire states the JSON can present:
+///
+/// * **Omitted** — no `tools` key on the server object. MCP semantics
+///   treat this as runtime-negotiated ("any tool the server runtime
+///   exposes"), invisible to static-config inventory.
+/// * **EmptyDeclared** — `"tools": []`. The operator explicitly declared
+///   that this server exposes no tools.
+/// * **Declared(Vec)** — `"tools": ["read", "write", ...]`. The vec is
+///   sorted and de-duplicated for a stable per-server content hash;
+///   non-string entries in the array are dropped.
+/// * **Invalid(Vec)** — the `tools` key is present but its value is not
+///   a JSON array (e.g. a string, an object). Any nested string values
+///   that did parse are still captured for downstream visibility, but
+///   the operator's declaration is malformed.
+///
+/// The lockfile schema currently collapses Omitted and EmptyDeclared
+/// (both yield `tools: []`); a sibling `tools_declared: bool` field on
+/// [`McpServerEntry`] / [`McpLockServer`] preserves the distinction
+/// without breaking the existing on-disk shape. See item 7 in
+/// `PR121_FIX_LIST_TRIAGE.md` for the bounded-improvement contract this
+/// implements.
+fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> DeclaredTools {
+    let Some(value) = obj.get("tools") else {
+        return DeclaredTools::Omitted;
+    };
+    let Some(arr) = value.as_array() else {
+        // Present but not an array. We still try to extract any string
+        // values nested inside (e.g. an object whose values happen to be
+        // strings) so a malformed-but-recoverable case is recorded;
+        // otherwise the resulting Invalid carries an empty list.
+        return DeclaredTools::Invalid(Vec::new());
+    };
+    let mut tools: Vec<String> = arr
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect();
     tools.sort();
     tools.dedup();
-    tools
+    if tools.is_empty() {
+        // Either the JSON array was empty, or every element was a
+        // non-string that we dropped. We treat them the same:
+        // `"tools": []` is the structural case the operator can express,
+        // and a non-string-element-only array is structurally equivalent
+        // to having no declarable tools.
+        DeclaredTools::EmptyDeclared
+    } else {
+        DeclaredTools::Declared(tools)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,6 +2070,38 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             .cmp(&b.name)
             .then_with(|| a.source_config.cmp(&b.source_config))
     });
+
+    // Recompute every hash from the lockfile's *data* — the deserialized
+    // `hash` / `inventory_hash` values are discarded entirely. A
+    // hand-edited lockfile that forges consistent hashes (so the
+    // tampered-with state still looks coherent at the JSON layer) would
+    // otherwise silence drift in `compute_drift`'s fast path: the path
+    // short-circuits when `current.inventory_hash == lock.inventory_hash`,
+    // and the slow path's per-server comparison consults each
+    // `lock.servers[*].hash`. Both readings must come from the parsed
+    // body, not from a string an attacker could plant. The cost of
+    // recomputing every hash on parse is one extra SHA-256 over every
+    // server plus one over the concatenated digests — cheap relative to
+    // the file IO that just happened, and dwarfed by the lockfile
+    // typically having tens of servers at most.
+    for server in &mut lock.servers {
+        let recomputed = McpServerEntry {
+            name: server.name.clone(),
+            transport: server.transport.clone(),
+            tools: server.tools.clone(),
+            // `tools_declared` is not folded into `content_hash` (see
+            // [`McpServerEntry::tools_declared`]'s docstring), so its
+            // value here doesn't affect the recomputed hash — pick
+            // `true` for parity with `default_tools_declared` so the
+            // temporary entry resembles a freshly-built one.
+            tools_declared: server.tools_declared,
+            source_config: server.source_config.clone(),
+        }
+        .content_hash();
+        server.hash = recomputed;
+    }
+    lock.inventory_hash = compute_inventory_hash(&lock.servers);
+
     Ok(lock)
 }
 
@@ -2128,6 +2367,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec!["alpha".into(), "beta".into()],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         // Tools are sorted on parse, so a differently-ordered-but-equal tool
@@ -2151,6 +2391,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let changed = McpServerEntry {
@@ -2175,9 +2416,11 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let b = McpServerEntry {
+            tools_declared: true,
             source_config: ".vscode/mcp.json".into(),
             ..a.clone()
         };
@@ -2196,6 +2439,7 @@ mod tests {
                         env: vec![],
                     },
                     tools: vec![],
+                    tools_declared: true,
                     source_config: ".mcp.json".into(),
                 },
                 McpServerEntry {
@@ -2205,6 +2449,7 @@ mod tests {
                         userinfo_hash: None,
                     },
                     tools: vec!["t".into()],
+                    tools_declared: true,
                     source_config: ".mcp.json".into(),
                 },
             ],
@@ -2242,6 +2487,7 @@ mod tests {
                     env: vec![],
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -2375,6 +2621,7 @@ mod tests {
                 userinfo_hash: None,
             },
             tools: vec!["t".into()],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let zeta = McpServerEntry {
@@ -2385,6 +2632,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".vscode/mcp.json".into(),
         };
 
@@ -2426,6 +2674,7 @@ mod tests {
                 userinfo_hash: None,
             },
             tools: vec![],
+            tools_declared: true,
             source_config: source.into(),
         };
         let forward = McpInventory {
@@ -2600,6 +2849,7 @@ mod tests {
                 env: vec![McpEnvEntry::from_raw("API_TOKEN", "old")],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         // Same server, the env value swapped (a rotated/exfiltrated credential).
@@ -2678,6 +2928,7 @@ mod tests {
                     env: vec![McpEnvEntry::from_raw("TOKEN", "v")],
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -2739,6 +2990,7 @@ mod tests {
                     env,
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -2878,6 +3130,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let two = mk(vec!["a", "b"]);
@@ -2911,6 +3164,7 @@ mod tests {
                 userinfo_hash: None,
             },
             tools: tools.into_iter().map(String::from).collect(),
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let two = mk(vec!["a", "b"]);
@@ -2938,6 +3192,7 @@ mod tests {
                 env: vec![McpEnvEntry::from_raw(key, value)],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         assert_ne!(
@@ -2959,6 +3214,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         };
         let cmd_and_arg = McpServerEntry {
@@ -3025,6 +3281,7 @@ mod tests {
                         userinfo_hash: hash,
                     },
                     tools: vec![],
+                    tools_declared: true,
                     source_config: ".mcp.json".into(),
                 }
             })
@@ -3143,6 +3400,7 @@ mod tests {
                     userinfo_hash: None,
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -3216,6 +3474,7 @@ mod tests {
                     userinfo_hash: hash,
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }
         };
@@ -3421,6 +3680,7 @@ mod tests {
                     ),
                 },
                 tools: vec![],
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
             }],
             configs: vec![".mcp.json".into()],
@@ -3462,6 +3722,7 @@ mod tests {
                 env: vec![],
             },
             tools: vec![],
+            tools_declared: true,
             source_config: ".mcp.json".into(),
         }
     }
@@ -4221,12 +4482,14 @@ mod tests {
         // schema treated that as a non-event. The fast-path inventory_hash
         // comparison cleanly catches this and short-circuits to no drift.
         let prev = mk_inventory(vec![McpServerEntry {
+            tools_declared: true,
             source_config: ".mcp.json".into(),
             ..stdio_server("s", "node")
         }]);
         let lock = McpLockfile::from_inventory(&prev);
 
         let cur = mk_inventory(vec![McpServerEntry {
+            tools_declared: true,
             source_config: ".vscode/mcp.json".into(),
             ..stdio_server("s", "node")
         }]);
@@ -4246,10 +4509,12 @@ mod tests {
         // the untouched twin stays clean.
         let prev = mk_inventory(vec![
             McpServerEntry {
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
                 ..stdio_server("s", "node")
             },
             McpServerEntry {
+                tools_declared: true,
                 source_config: ".vscode/mcp.json".into(),
                 ..stdio_server("s", "node")
             },
@@ -4259,11 +4524,13 @@ mod tests {
         let cur = mk_inventory(vec![
             // .mcp.json copy: unchanged.
             McpServerEntry {
+                tools_declared: true,
                 source_config: ".mcp.json".into(),
                 ..stdio_server("s", "node")
             },
             // .vscode copy: command rotated.
             McpServerEntry {
+                tools_declared: true,
                 source_config: ".vscode/mcp.json".into(),
                 ..stdio_server("s", "deno")
             },
@@ -4751,5 +5018,269 @@ mod tests {
         let (redacted, hash) = redact_url_userinfo("server", "https://host.example");
         assert_eq!(redacted, "https://host.example/");
         assert_eq!(hash, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 item 5 — `parse_lockfile` recomputes every hash from the
+    // lockfile's data; deserialized `inventory_hash` and per-server `hash`
+    // values are discarded. A hand-edited lockfile that forges consistent
+    // hashes must NOT silence drift.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_lockfile_recomputes_hashes_and_ignores_forged_inventory_hash() {
+        // Build a legitimate lockfile, then tamper with the
+        // `inventory_hash` field via a JSON-level edit. After parsing,
+        // the in-memory value must be the data-derived hash, NOT the
+        // forgery.
+        let inv = McpInventory {
+            servers: vec![McpServerEntry {
+                name: "s".into(),
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+                tools: vec!["read".into()],
+                tools_declared: true,
+                source_config: ".mcp.json".into(),
+            }],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+            rejected_configs: vec![],
+        };
+        let lock = McpLockfile::from_inventory(&inv);
+        let expected_inventory_hash = lock.inventory_hash.clone();
+        let expected_server_hash = lock.servers[0].hash.clone();
+        let rendered = lock.render();
+
+        // Tamper: replace the inventory_hash and the per-server hash
+        // with `f` * 64. A hostile editor could pick any plausible-
+        // shaped value — what matters is that the deserialized hash
+        // does not survive parsing.
+        let forgery = "f".repeat(64);
+        let tampered = rendered
+            .replace(&expected_inventory_hash, &forgery)
+            .replace(&expected_server_hash, &forgery);
+        assert!(
+            tampered.contains(&forgery),
+            "test scaffold: tamper substitution must succeed",
+        );
+
+        let parsed = parse_lockfile(&tampered).expect("tampered lockfile must still parse");
+        assert_ne!(
+            parsed.inventory_hash, forgery,
+            "parse_lockfile must NOT trust the deserialized inventory_hash",
+        );
+        assert_eq!(
+            parsed.inventory_hash, expected_inventory_hash,
+            "parse_lockfile must recompute inventory_hash from servers",
+        );
+        assert_eq!(parsed.servers.len(), 1);
+        assert_ne!(
+            parsed.servers[0].hash, forgery,
+            "parse_lockfile must NOT trust the deserialized per-server hash",
+        );
+        assert_eq!(
+            parsed.servers[0].hash, expected_server_hash,
+            "parse_lockfile must recompute per-server hash from content",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 item 6 — `redact_url_userinfo`'s parse-failure fallback no
+    // longer stores the raw URL string verbatim. The `user:token@host`
+    // userinfo must be stripped (replaced with `***`) even when the URL
+    // doesn't successfully parse.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_url_userinfo_strips_userinfo_on_parse_failure() {
+        // Construct a URL string with a userinfo that doesn't parse
+        // cleanly via `url::Url`. We use a control byte inside the host
+        // to force the parser to fail while still leaving the
+        // `scheme://user:tok@host` shape intact for the byte-scan
+        // strip to recognize.
+        let malformed = "https://user:token@host\x07.example/path?q=1";
+        // Sanity check: `url::Url::parse` rejects this URL.
+        assert!(
+            url::Url::parse(malformed).is_err(),
+            "test scaffold: input must be unparseable to exercise the strip-fallback",
+        );
+
+        let (redacted, hash) = redact_url_userinfo("server", malformed);
+        assert!(
+            !redacted.contains("user:token"),
+            "userinfo must be stripped from malformed-URL output: {redacted}",
+        );
+        assert!(
+            !redacted.contains("user"),
+            "the user-half of the userinfo must be stripped too: {redacted}",
+        );
+        assert!(
+            !redacted.contains("token"),
+            "the password-half must be stripped too: {redacted}",
+        );
+        assert!(
+            redacted.contains("***@"),
+            "the strip output should mark the redacted region: {redacted}",
+        );
+        // The path/query are preserved for diagnostic context.
+        assert!(
+            redacted.contains("/path"),
+            "non-credential content should be preserved: {redacted}",
+        );
+        // No userinfo hash for the malformed case — we can't
+        // structurally identify the substring without a safe parser.
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn strip_userinfo_best_effort_preserves_non_authority_urls() {
+        // A URL with no `@` before the path → no userinfo to strip,
+        // return verbatim.
+        assert_eq!(
+            strip_userinfo_best_effort("https://host.example/path"),
+            "https://host.example/path",
+        );
+        // A relative URL or non-URL string is not authority-shaped →
+        // return verbatim.
+        assert_eq!(
+            strip_userinfo_best_effort("not a url at all"),
+            "not a url at all",
+        );
+        assert_eq!(strip_userinfo_best_effort(""), "");
+        // A URL whose `@` is INSIDE the path (after the `/`) is not
+        // userinfo and must not be touched.
+        assert_eq!(
+            strip_userinfo_best_effort("https://host.example/path@anchor"),
+            "https://host.example/path@anchor",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #121 item 7 (partial) — `parse_tools` distinguishes the three
+    // on-wire shapes via the `DeclaredTools` enum, and the per-entry
+    // `tools_declared` flag captures the omitted-vs-declared distinction.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_tools_distinguishes_omitted_empty_and_declared() {
+        // Omitted: no `tools` key on the server object.
+        let obj_omitted: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "command": "node" }"#).unwrap();
+        assert_eq!(parse_tools(&obj_omitted), DeclaredTools::Omitted);
+        assert!(!DeclaredTools::Omitted.was_declared());
+
+        // Empty-declared: `"tools": []`.
+        let obj_empty: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "command": "node", "tools": [] }"#).unwrap();
+        assert_eq!(parse_tools(&obj_empty), DeclaredTools::EmptyDeclared);
+        assert!(DeclaredTools::EmptyDeclared.was_declared());
+
+        // Declared with a non-empty list.
+        let obj_declared: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "command": "node", "tools": ["read", "write"] }"#).unwrap();
+        match parse_tools(&obj_declared) {
+            DeclaredTools::Declared(v) => {
+                assert_eq!(v, vec!["read".to_string(), "write".to_string()]);
+            }
+            other => panic!("expected Declared, got {other:?}"),
+        }
+
+        // Invalid shape: `"tools": "not an array"`.
+        let obj_invalid: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "command": "node", "tools": "oops" }"#).unwrap();
+        assert_eq!(
+            parse_tools(&obj_invalid),
+            DeclaredTools::Invalid(Vec::new())
+        );
+    }
+
+    #[test]
+    fn mcp_server_entry_tools_declared_round_trips_through_lockfile_for_all_three_states() {
+        // Build inventories that exercise each of the three states and
+        // assert that `tools_declared` round-trips through
+        // `from_inventory` → render → parse_lockfile correctly.
+        let mk = |name: &str, tools: Vec<String>, tools_declared: bool| McpServerEntry {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools,
+            tools_declared,
+            source_config: ".mcp.json".into(),
+        };
+        let inv = McpInventory {
+            servers: vec![
+                mk("omitted", vec![], false),
+                mk("empty-declared", vec![], true),
+                mk("declared", vec!["read".to_string()], true),
+            ],
+            configs: vec![".mcp.json".into()],
+            malformed_configs: vec![],
+            rejected_configs: vec![],
+        };
+        let body = McpLockfile::from_inventory(&inv).render();
+        let parsed = parse_lockfile(&body).unwrap();
+        // Sorted by name: declared, empty-declared, omitted (alpha order).
+        let by_name: std::collections::HashMap<&str, &McpLockServer> = parsed
+            .servers
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+        assert!(
+            !by_name["omitted"].tools_declared,
+            "omitted state must serialize as tools_declared=false",
+        );
+        assert!(
+            by_name["empty-declared"].tools_declared,
+            "empty-declared state must serialize as tools_declared=true",
+        );
+        assert!(
+            by_name["declared"].tools_declared,
+            "declared state must serialize as tools_declared=true",
+        );
+        // Lockfile JSON itself must carry the field so a programmatic
+        // consumer can see the three states.
+        assert!(
+            body.contains("tools_declared"),
+            "lockfile JSON must carry tools_declared field: {body}",
+        );
+    }
+
+    #[test]
+    fn legacy_lockfile_without_tools_declared_field_defaults_to_true() {
+        // An older tirith that did not yet write `tools_declared`
+        // produced lockfiles whose server entries had no such field.
+        // Such lockfiles must still parse, with `tools_declared`
+        // defaulting to `true` — preserving the pre-change
+        // interpretation that empty `tools` was always "declared empty".
+        let legacy = serde_json::json!({
+            "format_version": MCP_LOCK_FORMAT_VERSION,
+            "inventory_hash": "0".repeat(64),
+            "configs": [".mcp.json"],
+            "servers": [{
+                "name": "legacy",
+                "transport": {
+                    "kind": "stdio",
+                    "command": "node",
+                    "args": [],
+                    "env": []
+                },
+                "tools": [],
+                // No `tools_declared` field.
+                "source_config": ".mcp.json",
+                "hash": "0".repeat(64),
+            }]
+        });
+        let parsed = parse_lockfile(&legacy.to_string()).unwrap();
+        assert_eq!(parsed.servers.len(), 1);
+        assert!(
+            parsed.servers[0].tools_declared,
+            "legacy lockfile entries default to tools_declared=true",
+        );
     }
 }
