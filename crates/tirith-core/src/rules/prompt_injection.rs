@@ -14,8 +14,7 @@
 //!   "DAN mode"). The bucket of last resort for the catalog.
 //!
 //! Both rules are **High severity**. The list of seeds lives in
-//! [`crate::SEEDS_ASSET`]
-//! (`crates/tirith-core/assets/data/prompt_injection_seeds.txt`) so it can
+//! `crates/tirith-core/assets/data/prompt_injection_seeds.txt` so it can
 //! grow over time without touching this file.
 //!
 //! # Honest scope
@@ -36,12 +35,15 @@
 //! [`check`] is called from:
 //! - [`crate::engine::analyze_output`] (and its streaming sibling
 //!   `analyze_output_finalize`) — the M7 ch1 output-direction pipeline.
-//! - [`crate::engine::analyze`] for `ScanContext::Paste` and
-//!   `ScanContext::FileScan` — so a `tirith paste` of agent output and a
-//!   `tirith scan` over a log file also catch the same patterns. The
-//!   PATTERN_TABLE entry `prompt_injection_seed` exists to keep the rule
-//!   reachable from tier-1 in those two contexts; the output pipeline
-//!   bypasses PATTERN_TABLE entirely (output is never gated by tier-1).
+//! - [`crate::engine::analyze`] for `ScanContext::Paste` only — so a
+//!   `tirith paste` of agent output catches the same patterns. The
+//!   PATTERN_TABLE entry `prompt_injection_seed` keeps the rule
+//!   reachable from tier-1 in that context; the output pipeline bypasses
+//!   PATTERN_TABLE entirely (output is never gated by tier-1).
+//! - `tirith logs scan` calls [`check`] **directly** from
+//!   `cli::logs.rs` for the file-scan audit target — the engine's
+//!   FileScan path deliberately does NOT wire this rule to avoid
+//!   false-flagging documentation that quotes injection seeds.
 //!
 //! # Asset format
 //!

@@ -1,6 +1,6 @@
 //! `tirith clipboard` — read/write/scan/guard the system clipboard (M7 ch3).
 //!
-//! Five user-facing actions:
+//! Six user-facing actions:
 //!
 //! - `tirith clipboard copy <file>` — read a file, refuse to copy if it
 //!   contains High-severity (secret-shaped) findings; with `--redact
@@ -378,6 +378,16 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
                 return 1;
             }
         }
+        // macOS: ensure ~/Library/Logs exists so launchd doesn't get
+        // EACCES on the StandardOutPath / StandardErrorPath we set in the
+        // plist. systemd users get journald logs so this is no-op on Linux.
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(home) = std::env::var("HOME") {
+                let log_dir = PathBuf::from(home).join("Library/Logs");
+                let _ = fs::create_dir_all(&log_dir);
+            }
+        }
         if let Err(e) = fs::write(path, &unit_content) {
             eprintln!(
                 "tirith clipboard guard install-service: failed to write {}: {e}",
@@ -510,6 +520,14 @@ pub fn daemon_foreground(json: bool) -> i32 {
     // (content_sha256_hex → last seen Instant) for debounce.
     let mut seen: HashMap<String, Instant> = HashMap::new();
 
+    // Silent-failure fix (Sev-5): persistent clipboard read errors used to
+    // be swallowed silently — an operator saw a "running" daemon failing
+    // every 2s for hours. Rate-limit by error string so transient errors
+    // stay quiet but a stuck-error condition surfaces (one stderr line per
+    // minute per distinct message).
+    let mut last_logged_error: HashMap<String, Instant> = HashMap::new();
+    const ERROR_LOG_RATE: std::time::Duration = std::time::Duration::from_secs(60);
+
     // First read: tell stderr the daemon is alive so an operator
     // watching `journalctl -u tirith-clipboard --user` sees something.
     if json {
@@ -539,7 +557,31 @@ pub fn daemon_foreground(json: bool) -> i32 {
                 std::thread::sleep(POLL_INTERVAL * 30);
                 continue;
             }
-            Err(_) => continue,
+            Err(e) => {
+                // Rate-limited stderr log so a persistent failure (perms,
+                // backend crash) surfaces without spamming the journal.
+                let key = e.to_string();
+                let now_inst = Instant::now();
+                let should_log = last_logged_error
+                    .get(&key)
+                    .map(|prev| now_inst.duration_since(*prev) >= ERROR_LOG_RATE)
+                    .unwrap_or(true);
+                if should_log {
+                    last_logged_error.insert(key.clone(), now_inst);
+                    if json {
+                        let env = serde_json::json!({
+                            "event": "clipboard_read_error",
+                            "error": key,
+                        });
+                        let _ = println_json(&env);
+                    } else {
+                        eprintln!("tirith clipboard daemon: read error: {key}");
+                    }
+                }
+                // GC the rate-limit map.
+                last_logged_error.retain(|_, t| now_inst.duration_since(*t) < ERROR_LOG_RATE * 5);
+                continue;
+            }
         };
 
         let hash = sha256_hex(text.as_bytes());
@@ -567,9 +609,17 @@ pub fn daemon_foreground(json: bool) -> i32 {
             continue;
         }
 
-        // Audit + stderr warn.
+        // Audit + stderr warn. Silent-failure fix: previously `let _ = …`
+        // swallowed audit-write failures, so `tirith last-trigger <event_id>`
+        // returned nothing for the id (disk full / perms etc.). Match the
+        // result and emit a stderr warning so the broken correlation is
+        // debuggable.
         let event_id = uuid::Uuid::new_v4().to_string();
-        let _ = tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &[]);
+        if let Err(e) =
+            tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &[])
+        {
+            eprintln!("tirith clipboard daemon: audit log write failed (event_id={event_id}): {e}");
+        }
 
         if json {
             let env = serde_json::json!({
@@ -775,6 +825,14 @@ pub(crate) fn render_service_unit() -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
+        // Code-reviewer fix #6: log to per-user `~/Library/Logs/...` instead
+        // of world-writable `/tmp`. On macOS `/tmp` is shared across local
+        // users; a pre-existing symlink there written by another user would
+        // redirect the daemon's logs. `~/Library/Logs` is private to the user.
+        // The directory is created by `install_service` before launchctl load.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let out_log = format!("{home}/Library/Logs/sh.tirith.clipboard.out.log");
+        let err_log = format!("{home}/Library/Logs/sh.tirith.clipboard.err.log");
         Some(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -794,9 +852,9 @@ pub(crate) fn render_service_unit() -> Option<String> {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/tirith-clipboard.out.log</string>
+    <string>{out_log}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/tirith-clipboard.err.log</string>
+    <string>{err_log}</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -1010,6 +1068,50 @@ mod tests {
         assert!(s.contains("graphical-session.target"));
         assert!(s.contains("ExecStart="));
         assert!(s.contains("clipboard daemon --foreground"));
+    }
+
+    /// macOS service unit logs to `~/Library/Logs/...`, not world-writable
+    /// `/tmp`. Code-reviewer #6: a symlink at `/tmp/tirith-clipboard.out.log`
+    /// written by another local user could redirect the daemon's logs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_service_unit_logs_to_user_library() {
+        let s = render_service_unit().expect("macos should render unit");
+        assert!(
+            !s.contains("/tmp/tirith-clipboard"),
+            "must not log to world-writable /tmp; got: {s}"
+        );
+        assert!(
+            s.contains("Library/Logs/sh.tirith.clipboard"),
+            "should log to ~/Library/Logs; got: {s}"
+        );
+    }
+
+    /// Idempotency: writing the same unit content twice is a no-op on the
+    /// second pass (compares file content, not just existence).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_service_idempotency_matches_content() {
+        // Mirror the `needs_write` predicate used by `install_service`.
+        let unit_content = render_service_unit().expect("unit");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &unit_content).unwrap();
+        let needs_write_first = !matches!(
+            std::fs::read_to_string(tmp.path()),
+            Ok(existing) if existing == unit_content
+        );
+        assert!(!needs_write_first, "matching content must skip the write");
+
+        // Mismatched content → needs_write flips back to true.
+        std::fs::write(tmp.path(), b"different content").unwrap();
+        let needs_write_second = !matches!(
+            std::fs::read_to_string(tmp.path()),
+            Ok(existing) if existing == unit_content
+        );
+        assert!(
+            needs_write_second,
+            "mismatched content must trigger the write"
+        );
     }
 
     /// `sha256_hex` produces a stable 64-char lowercase-hex digest.

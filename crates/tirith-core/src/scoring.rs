@@ -213,6 +213,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::OutputTerminalHyperlinkMismatch
         | RuleId::OutputTitleManipulation
         | RuleId::OutputClearScreen
+        | RuleId::OutputTruncatedEscapeSequence
         // M7 ch5 — prompt-injection seed phrases. Pattern-matching on
         // human-readable text; not threat-DB driven.
         | RuleId::PromptInjectionInOutput

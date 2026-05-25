@@ -981,6 +981,10 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("output_title_manipulation", "OutputTitleManipulation"),
     ("output_clear_screen", "OutputClearScreen"),
+    (
+        "output_truncated_escape_sequence",
+        "OutputTruncatedEscapeSequence",
+    ),
     // M7 ch5 — prompt-injection seed phrases.
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),

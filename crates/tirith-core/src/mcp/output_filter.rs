@@ -7,7 +7,7 @@
 //! * `Block` — replace `content` with a single placeholder text item and set
 //!   `isError: true`. The placeholder cites the `event_id` so an operator
 //!   reading the audit log can correlate.
-//! * `Warn` — keep `isError`; prepend a `[tirith: WARNING …]` text item;
+//! * `Warn` — preserve `isError`; prepend a `[tirith: WARNING …]` text item;
 //!   sanitize the existing text items in place (strip ANSI / OSC /
 //!   zero-width — bytes are scrubbed, structure preserved).
 //! * `Allow` — pass through unchanged.
@@ -64,10 +64,11 @@ pub struct FilterOutcome {
     /// caller may want to surface this to the user; the in-result placeholder
     /// (block path) cites it implicitly via the audit cross-reference.
     pub truncated: bool,
-    /// `true` when the underlying analysis errored and we forced a deny under
-    /// `fail_mode_closed`. v1 has no analysis-error path (the byte scanner is
-    /// infallible), so this is currently always `false` — reserved for future
-    /// rules that may fail loudly.
+    /// `true` when the wrapping response was force-blocked because the scan
+    /// could not be completed within budget under `fail_mode_closed`. v1
+    /// currently sets this only on the truncation-degrades-to-block path
+    /// (`MAX_SCAN_BYTES` exceeded with closed fail-mode); future analysis-
+    /// error rules may set it as well.
     pub fail_mode_triggered: bool,
 }
 
@@ -318,7 +319,12 @@ fn is_strippable_zero_width(ch: char) -> bool {
         | '\u{200D}' // ZERO WIDTH JOINER
         | '\u{2060}' // WORD JOINER
         | '\u{FEFF}' // BYTE ORDER MARK / ZERO WIDTH NO-BREAK SPACE
-    )
+    ) || ('\u{E0000}'..='\u{E007F}').contains(&ch)
+    // Unicode Tags block — invisible to display, used in steganographic
+    // attacks. Kept in sync with `cli::view::is_strippable_zero_width` and
+    // `cli::logs::is_strippable_zero_width`. Greptile P2: dropping this
+    // range would let an attacker smuggle hidden text through the MCP
+    // filter that `tirith view` would correctly strip.
 }
 
 #[cfg(test)]

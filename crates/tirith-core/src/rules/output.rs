@@ -22,9 +22,10 @@
 //!   Theme-dependent detection is out of v1 — documented in the plan and
 //!   listed as a follow-up.
 //!
-//! * **Fake prompt (`output_fake_prompt`)** — fires on a `PS1`-shaped
-//!   suffix at the END of the stream or surrounded by newlines, matching
-//!   `user@host:path[$# ]` or `[root@host …]#`. Inline `$ cmd` in
+//! * **Fake prompt (`output_fake_prompt`)** — root-prompt shapes fire on
+//!   ANY line of the stream (`[root@host …]#` is rarely benign); user-
+//!   prompt shapes (`user@host:path[$# ]`) fire only as a trailing-line
+//!   suffix on a stream that does NOT end in `\n`. Inline `$ cmd` in
 //!   prose paragraphs does NOT fire — too many tutorial logs would
 //!   false-positive.
 //!
@@ -393,6 +394,12 @@ fn sgr_marks_invisible(sgr: &OutputSgrHit) -> Option<String> {
 
 /// Extract host from a URL string. Returns None if it doesn't parse as one
 /// of the schemes we care about.
+///
+/// The bare-host branch requires the LAST segment (the TLD-shaped slot) to
+/// look like a real TLD — at least two characters, all alpha, not all-digits.
+/// Without this guard, version strings like `v1.2.3` or `1.0.0-alpha` parse
+/// as hosts and produce false-positive OSC8 mismatch findings on completely
+/// benign release-note hyperlinks.
 fn parse_url_host(s: &str) -> Option<String> {
     if let Ok(u) = url::Url::parse(s) {
         return u.host_str().map(|h| h.to_ascii_lowercase());
@@ -408,9 +415,20 @@ fn parse_url_host(s: &str) -> Option<String> {
         })
     {
         let host_only = first_chunk.split(':').next()?;
-        if host_only.contains('.') {
-            return Some(host_only.to_ascii_lowercase());
+        if !host_only.contains('.') {
+            return None;
         }
+        // TLD-shape check: the last dot-segment must be ≥2 chars, all alpha
+        // (no digits), no leading/trailing hyphen. Rejects `v1.2.3`, `1.0.0`,
+        // `10.0.0.1` (IPs are handled by `Url::parse` above), `foo.123`.
+        let last = host_only.rsplit('.').next()?;
+        if last.len() < 2 {
+            return None;
+        }
+        if !last.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        return Some(host_only.to_ascii_lowercase());
     }
     None
 }
@@ -568,6 +586,48 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::OutputTerminalHyperlinkMismatch),
             "same host must NOT fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hyperlink_no_fire_when_visible_text_is_a_version_string() {
+        // Regression: `parse_url_host` previously accepted `v1.2.3` as a
+        // bare-host because every dot-segment was alphanumeric. A release-
+        // notes OSC8 link with the version as label would falsely fire.
+        for label in ["v1.2.3", "1.0.0-alpha", "2.3.4", "release.1.0"] {
+            let mut s = scan();
+            s.hyperlinks.push(OutputHyperlinkHit {
+                offset: 0,
+                uri: "https://example.com/release".to_string(),
+                visible: label.to_string(),
+            });
+            let findings = check(&s);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::OutputTerminalHyperlinkMismatch),
+                "version-shaped label {label:?} must NOT fire mismatch: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyperlink_fires_when_visible_text_is_a_raw_host_string() {
+        // Positive control: a raw "github.com"-shaped label with the wrong
+        // href still fires the mismatch rule. Guards against over-rejecting
+        // the bare-host path in `parse_url_host`.
+        let mut s = scan();
+        s.hyperlinks.push(OutputHyperlinkHit {
+            offset: 0,
+            uri: "https://evil.example".to_string(),
+            visible: "github.com".to_string(),
+        });
+        let findings = check(&s);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::OutputTerminalHyperlinkMismatch),
+            "raw host label must fire mismatch on different uri host: {findings:?}"
         );
     }
 

@@ -415,6 +415,11 @@ pub fn run_gateway_with_options(
     let sd2 = shutdown.clone();
     let pw2 = Arc::clone(&pending_warns);
     let pf2 = Arc::clone(&pending_filter_ids);
+    // M7 ch4 fix: route the configured policy.fail_mode into the output filter
+    // so an operator setting `fail_mode: closed` gets fail-closed on the
+    // output direction too (not just the request direction). The default is
+    // "open" — backward-compatible with the original hardcoded behavior.
+    let fail_mode_closed = config.policy.fail_mode == "closed";
     let t_upstream = thread::spawn(move || {
         let mut reader = BufReader::new(child_stdout);
         loop {
@@ -426,7 +431,7 @@ pub fn run_gateway_with_options(
                     // Order matters: filter first (block can short-circuit warn-
                     // augmentation), then warn-augment any residual content.
                     let after_filter = if filter_output {
-                        filter_if_pending(&line, &pf2).unwrap_or(line)
+                        filter_if_pending(&line, &pf2, fail_mode_closed).unwrap_or(line)
                     } else {
                         line
                     };
@@ -1362,7 +1367,11 @@ fn build_invalid_id_request_response() -> String {
 /// matching the existing gateway audit format (event_id, rule_ids,
 /// elapsed_ms, fail_mode_triggered). Allow outcomes are silent — they are
 /// indistinguishable from the no-pending-match path on the response side.
-fn filter_if_pending(line: &[u8], pending: &Mutex<HashMap<Value, Instant>>) -> Option<Vec<u8>> {
+fn filter_if_pending(
+    line: &[u8],
+    pending: &Mutex<HashMap<Value, Instant>>,
+    fail_mode_closed: bool,
+) -> Option<Vec<u8>> {
     // Parse the upstream line to extract its id
     let parsed: Value = serde_json::from_slice(line).ok()?;
     let resp_id = parsed.get("id")?;
@@ -1380,24 +1389,100 @@ fn filter_if_pending(line: &[u8], pending: &Mutex<HashMap<Value, Instant>>) -> O
         map.remove(resp_id)?;
     }
 
-    apply_output_filter_to_response(parsed)
+    apply_output_filter_to_response(parsed, fail_mode_closed)
 }
 
 /// Parse `parsed["result"]` as a `ToolCallResult`, apply the filter, and
-/// re-serialize the full response. Returns `None` if the response shape
-/// doesn't carry a tool result we can filter (e.g. JSON-RPC error).
-fn apply_output_filter_to_response(mut parsed: Value) -> Option<Vec<u8>> {
+/// re-serialize the full response.
+///
+/// Branches:
+/// * `result` present + parses as `ToolCallResult` → run filter normally.
+/// * `result` present but malformed → under `fail_mode_closed`, synthesize a
+///   block envelope so an attacker cannot bypass `--filter-output` by emitting
+///   malformed `content[]`. Under fail-open, pass through (legacy behavior),
+///   but still write an audit line with `decision: "parse_error"`.
+/// * No `result` (JSON-RPC error envelope) → sanitize `error.message` and
+///   `error.data` text fields to scrub OSC52 / hyperlink / hidden-text
+///   payloads an upstream may smuggle through the error path. Greptile P1.
+fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) -> Option<Vec<u8>> {
+    // ── Error-response path ────────────────────────────────────────────────
+    // JSON-RPC error envelopes lack a top-level `result`. Pre-fix this path
+    // returned `None`, leaving the raw error untouched — a malicious upstream
+    // could embed OSC52 / hyperlinks in `error.message` to bypass the filter.
+    if parsed.get("result").is_none() {
+        if let Some(error) = parsed.get_mut("error") {
+            let sanitized_any = sanitize_error_fields(error);
+            if sanitized_any {
+                // Pass the sanitized envelope through with a best-effort audit
+                // line so operators can see when error-path sanitization fires.
+                let entry = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    "kind": "gateway_output_filter",
+                    "decision": "warn",
+                    "rule_ids": ["gateway_error_message_sanitized"],
+                    "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
+                });
+                if let Ok(json) = serde_json::to_string(&entry) {
+                    eprintln!("{json}");
+                }
+                return serde_json::to_vec(&parsed).ok();
+            }
+        }
+        return None;
+    }
+
+    // ── Result-response path ───────────────────────────────────────────────
     let result_val = parsed.get("result")?;
 
     // Reify `result` as a `ToolCallResult`. This deserializes the same shape
     // the dispatcher emits (`content[]`, `isError`, `structuredContent`).
-    // Defensive: if the shape mismatches (a generic upstream), we pass
-    // through unchanged rather than mangling unknown content.
-    let mut tool_result: ToolCallResult =
-        serde_json::from_value(reshape_for_deserialize(result_val.clone())).ok()?;
+    let mut tool_result: ToolCallResult = match serde_json::from_value(reshape_for_deserialize(
+        result_val.clone(),
+    )) {
+        Ok(tr) => tr,
+        Err(e) => {
+            // Sev-7 silent-failure fix: an upstream emitting tool-shaped-but-
+            // unparseable `result` previously caused us to pass the original
+            // bytes through unfiltered AND skip the audit line. Under closed
+            // fail-mode we now synthesize a block envelope so the bypass is
+            // closed; under open fail-mode we still pass through but emit an
+            // audit line with `decision: "parse_error"` for visibility.
+            let entry = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "kind": "gateway_output_filter",
+                "decision": if fail_mode_closed { "block" } else { "parse_error" },
+                "error": e.to_string(),
+                "fail_mode_triggered": fail_mode_closed,
+                "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
+            });
+            if let Ok(json) = serde_json::to_string(&entry) {
+                eprintln!("{json}");
+            }
+            if fail_mode_closed {
+                // Synthesize a block envelope. We can't reach back through
+                // the existing `apply_block` helper (which mutates a real
+                // ToolCallResult), so build the minimal compliant shape.
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let new_result = serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "[tirith: tool output blocked \u{2014} see audit log entry {event_id} for details]"
+                        ),
+                    }],
+                    "isError": true,
+                });
+                let obj = parsed.as_object_mut()?;
+                obj.insert("result".to_string(), new_result);
+                return serde_json::to_vec(&parsed).ok();
+            }
+            return None;
+        }
+    };
 
-    // Gateway default fail-mode: open (mirrors the gateway's policy default).
-    let outcome = output_filter::filter_tool_result(&mut tool_result, false);
+    // Honor the policy fail_mode (default open, mirroring gateway policy
+    // default — but operator-configurable per `policy.fail_mode: closed`).
+    let outcome = output_filter::filter_tool_result(&mut tool_result, fail_mode_closed);
 
     // Audit line: same channel the gateway already uses for verdict logs.
     write_filter_audit_line(&outcome);
@@ -1408,6 +1493,37 @@ fn apply_output_filter_to_response(mut parsed: Value) -> Option<Vec<u8>> {
     let result_slot = parsed.as_object_mut()?.get_mut("result")?;
     *result_slot = new_result;
     serde_json::to_vec(&parsed).ok()
+}
+
+/// Sanitize `error.message` and `error.data` string fields in place. Returns
+/// `true` if any field was sanitized. Used to scrub OSC52 / hyperlinks /
+/// hidden-text an upstream may embed in a JSON-RPC error response — without
+/// the rewrite the agent's terminal would still render the escape sequence.
+fn sanitize_error_fields(error: &mut Value) -> bool {
+    let Some(obj) = error.as_object_mut() else {
+        return false;
+    };
+    let mut touched = false;
+
+    if let Some(Value::String(msg)) = obj.get_mut("message") {
+        let mut out = Vec::with_capacity(msg.len());
+        tirith_core::mcp::output_filter::sanitize_text_into(msg.as_bytes(), &mut out);
+        if out != msg.as_bytes() {
+            *msg = String::from_utf8(out).unwrap_or_else(|_| std::mem::take(msg));
+            touched = true;
+        }
+    }
+
+    if let Some(Value::String(s)) = obj.get_mut("data") {
+        let mut out = Vec::with_capacity(s.len());
+        tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
+        if out != s.as_bytes() {
+            *s = String::from_utf8(out).unwrap_or_else(|_| std::mem::take(s));
+            touched = true;
+        }
+    }
+
+    touched
 }
 
 /// Coerce an upstream's `result.content` into the shape `ToolCallResult`
@@ -2603,7 +2719,7 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
 
-        let filtered = filter_if_pending(&line, &pending).expect("OSC52 must be filtered");
+        let filtered = filter_if_pending(&line, &pending, false).expect("OSC52 must be filtered");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
         // Envelope is preserved — id echoed back, JSON-RPC 2.0 shape.
@@ -2648,7 +2764,7 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
 
-        let filtered = filter_if_pending(&line, &pending).expect("must process pending id");
+        let filtered = filter_if_pending(&line, &pending, false).expect("must process pending id");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
         // Allow path: content identical. The `isError` field is omitted on
@@ -2677,12 +2793,13 @@ policy:
             "result": {"content": [{"type": "text", "text": "ok"}]}
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        assert!(filter_if_pending(&line, &pending).is_none());
+        assert!(filter_if_pending(&line, &pending, false).is_none());
     }
 
     #[test]
-    fn test_filter_if_pending_returns_none_for_error_envelope() {
-        // A JSON-RPC error response has no `result` to filter. Pass-through.
+    fn test_filter_if_pending_passes_through_benign_error_envelope() {
+        // A JSON-RPC error response without escape sequences in message/data
+        // passes through untouched (the sanitizer is a no-op).
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(1);
         pending.lock().unwrap().insert(id, Instant::now());
@@ -2693,10 +2810,67 @@ policy:
             "error": {"code": -32601, "message": "method not found"}
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        // Pass-through. The pending entry is consumed because the id matched
-        // (one-shot semantics), but no rewrite is applied.
-        assert!(filter_if_pending(&line, &pending).is_none());
+        // Sanitizer returned no-op → None to caller → pass through.
+        assert!(filter_if_pending(&line, &pending, false).is_none());
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_filter_if_pending_sanitizes_osc52_in_error_message() {
+        // Greptile P1 regression: a malicious upstream embedding OSC52 in
+        // `error.message` previously bypassed `--filter-output` entirely.
+        // The sanitizer must scrub escape sequences from the error path.
+        let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
+        let id = Value::from(11);
+        pending.lock().unwrap().insert(id, Instant::now());
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "error": {
+                "code": -32603,
+                "message": "internal\u{001B}]52;c;aGVsbG8=\u{0007}error",
+            }
+        });
+        let line = serde_json::to_vec(&upstream).unwrap();
+        let filtered = filter_if_pending(&line, &pending, false)
+            .expect("error-path sanitization must rewrite the envelope");
+        let v: Value = serde_json::from_slice(&filtered).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains('\u{001B}'),
+            "OSC52 escape must be stripped, got: {msg:?}"
+        );
+        assert!(msg.starts_with("internal") && msg.ends_with("error"));
+    }
+
+    #[test]
+    fn test_filter_if_pending_fail_closed_blocks_malformed_result() {
+        // Silent-failure fix: an upstream emitting tool-shaped-but-unparseable
+        // `result` previously caused the gateway to pass the original bytes
+        // through unfiltered AND skip the audit line. Under closed fail-mode
+        // we now synthesize a block envelope. We trigger the parse-error
+        // branch by sending `result` as a plain string — `ToolCallResult`
+        // cannot deserialize from a non-object.
+        let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
+        let id = Value::from(21);
+        pending.lock().unwrap().insert(id, Instant::now());
+
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "result": "just-a-string-not-a-tool-result-shape",
+        });
+        let line = serde_json::to_vec(&upstream).unwrap();
+        let filtered = filter_if_pending(&line, &pending, /*fail_mode_closed=*/ true)
+            .expect("fail-closed must synthesize a block envelope on parse error");
+        let v: Value = serde_json::from_slice(&filtered).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        let placeholder = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            placeholder.starts_with("[tirith: tool output blocked"),
+            "placeholder shape, got: {placeholder}"
+        );
     }
 
     #[test]
@@ -2723,7 +2897,7 @@ policy:
             }
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let Some(filtered) = filter_if_pending(&line, &pending) else {
+        let Some(filtered) = filter_if_pending(&line, &pending, false) else {
             // Rule landed at a different severity in this build — not a
             // contract failure for this test. Skip.
             return;
@@ -2759,7 +2933,7 @@ policy:
             }
         });
         let line = serde_json::to_vec(&upstream).unwrap();
-        let filtered = filter_if_pending(&line, &pending);
+        let filtered = filter_if_pending(&line, &pending, false);
         assert!(filtered.is_some(), "missing isError must not be fatal");
     }
 }

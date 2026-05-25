@@ -28,6 +28,9 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "MPL-2.0",
+    # BSL-1.0 (Boost Software License 1.0) — permissive, OSI/FSF approved.
+    # Reached transitively via `arboard` (M7 ch3 clipboard dep).
+    "BSL-1.0",
     "OpenSSL",
     "Zlib",
     "CC0-1.0",

@@ -664,6 +664,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "output_terminal_hyperlink_mismatch",
     "output_title_manipulation",
     "output_clear_screen",
+    "output_truncated_escape_sequence",
     // Prompt-injection rules (M7 ch5)
     "prompt_injection_in_output",
     "ignore_previous_instructions",
@@ -759,6 +760,11 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "output_terminal_hyperlink_mismatch",
     "output_title_manipulation",
     "output_clear_screen",
+    // M7 fix: emitted from `analyze_output_finalize`/`_mut` when an OSC or
+    // CSI sequence is open at end-of-stream. Covered by dedicated tests in
+    // `extract.rs::output_scan_tests` and `engine.rs`; no `output.toml`
+    // fixture because the trigger is EOF state, not literal byte content.
+    "output_truncated_escape_sequence",
     // M7 ch5 — prompt-injection rules fire from both
     // `engine::analyze_output` (covered by `output.toml` via
     // `test_output_fixtures` below) and from `engine::analyze` for
@@ -1054,6 +1060,7 @@ fn test_rule_id_list_is_complete() {
         RuleId::OutputTerminalHyperlinkMismatch,
         RuleId::OutputTitleManipulation,
         RuleId::OutputClearScreen,
+        RuleId::OutputTruncatedEscapeSequence,
         // Prompt-injection rules (M7 ch5)
         RuleId::PromptInjectionInOutput,
         RuleId::IgnorePreviousInstructions,

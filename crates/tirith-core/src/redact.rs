@@ -500,8 +500,14 @@ fn apply_private_ipv4(input: &str) -> (String, usize) {
         let end = cap.end();
 
         // Window of up to 20 bytes preceding the match for the
-        // keyword-context check.
-        let window_start = start.saturating_sub(20);
+        // keyword-context check. Walk forward from the saturating subtraction
+        // to the nearest char boundary — slicing inside a multibyte UTF-8
+        // sequence panics. Concrete repro before fix: `"日日日日日日日10.0.0.5"`
+        // (7×3 + IP) → start=21, window_start=1 (mid-`日`), `&input[1..21]` panics.
+        let mut window_start = start.saturating_sub(20);
+        while window_start < start && !input.is_char_boundary(window_start) {
+            window_start += 1;
+        }
         let preceding = &input[window_start..start];
 
         // Two trigger predicates (either suffices).
@@ -999,6 +1005,39 @@ mod tests {
     #[test]
     fn private_ipv4_on_own_line_is_redacted() {
         let input = "the host is below:\n  10.0.0.5\nand it responds quickly.\n";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert!(!report.redacted_content.contains("10.0.0.5"));
+        assert!(report.redactions.iter().any(|r| r.label == "private_ipv4"));
+    }
+
+    #[test]
+    fn private_ipv4_multibyte_preceding_chars_do_not_panic() {
+        // Regression for code-reviewer Critical-2: `start.saturating_sub(20)`
+        // could land mid-multibyte (e.g. `日` is 3 bytes). Slicing inside a
+        // UTF-8 sequence panics. We snap window_start to the next char
+        // boundary, so the IP is processed (own-line/keyword check decides
+        // whether to redact) without crashing.
+        let input = "日日日日日日日10.0.0.5"; // 7×3 + 9 = 30 bytes, IP starts at 21
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        // Must not panic. We don't assert on the redaction outcome — neither
+        // keyword nor own-line context fires here, so the IP is left alone.
+        let _ = report.total();
+    }
+
+    #[test]
+    fn private_ipv4_no_redact_for_public_dns_in_keyword_context() {
+        // 1.1.1.1 / 8.8.8.8 are public DNS — must NOT be redacted even
+        // with a `server` prefix. Validates the keyword-window heuristic is
+        // gated on the RFC1918 regex, not the keyword alone.
+        let input = "server 1.1.1.1 returned a response\nhost 8.8.8.8 too\n";
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert!(report.redacted_content.contains("1.1.1.1"));
+        assert!(report.redacted_content.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn private_ipv4_redacts_with_keyword_in_window() {
+        let input = "server 10.0.0.5 timed out";
         let report = redact_for_audience(input, ShareAudience::PublicPaste);
         assert!(!report.redacted_content.contains("10.0.0.5"));
         assert!(report.redactions.iter().any(|r| r.label == "private_ipv4"));

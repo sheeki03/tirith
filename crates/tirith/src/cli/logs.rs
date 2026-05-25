@@ -24,10 +24,12 @@
 //!
 //! `summarize` and `redact` MUST stream — a 1 GiB+ log read entirely
 //! into RAM would OOM the process and any agent driving it. Both
-//! actions use `BufReader::lines()` and write incrementally to stdout.
-//! `scan` falls back to a bounded read (10 MiB cap matches
-//! `scan::scan_single_file`) because the engine needs the whole input
-//! to spot patterns that cross line boundaries.
+//! actions read raw bytes via `BufReader::read_until(b'\n', …)` and
+//! lossy-decode each line so a corrupt UTF-8 byte (FFFD) doesn't abort
+//! the stream. They write incrementally to stdout.
+//! `scan` falls back to a bounded read (64 MiB cap; see [`SCAN_MAX_BYTES`])
+//! because the engine needs the whole input to spot patterns that cross
+//! line boundaries.
 //!
 //! ## Truncation contract for `summarize`
 //!
@@ -238,14 +240,32 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         }
     };
 
-    for line_res in reader.lines() {
-        let raw = match line_res {
-            Ok(s) => s,
+    // Silent-failure fix (Sev-5): `reader.lines()` aborts the entire stream
+    // on the first non-UTF-8 byte. A single corrupt byte in a 1 GiB log would
+    // make `logs summarize` unusable. Read raw bytes per-line and lossy-decode
+    // each line independently — bad bytes degrade to U+FFFD, the rest streams.
+    let mut reader = reader;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("tirith logs summarize: read error: {e}");
                 return 1;
             }
         };
+        // Strip trailing \n (and \r if present) before lossy decode so the
+        // line content matches what `BufReader::lines()` would have emitted.
+        let mut end = n;
+        if end > 0 && buf[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let raw = String::from_utf8_lossy(&buf[..end]).into_owned();
 
         let processed = if safe_for_agent {
             let (stripped, n_esc) = strip_ansi_and_zero_width(&raw);
@@ -552,14 +572,29 @@ pub fn redact(path: &Path, audience_str: &str, json: bool) -> i32 {
     let mut out_lines: Vec<String> = Vec::new();
     let mut stdout = std::io::stdout().lock();
 
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(s) => s,
+    // Silent-failure fix (Sev-5): same `BufReader::lines()` UTF-8 abort
+    // hazard as `summarize`. Lossy-decode per line so a corrupt byte does
+    // not lose the rest of a 1 GiB log.
+    let mut reader = reader;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("tirith logs redact: read error: {e}");
                 return 1;
             }
         };
+        let mut end = n;
+        if end > 0 && buf[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let line = String::from_utf8_lossy(&buf[..end]).into_owned();
         let report = redact_for_audience_with_custom(&line, audience, &customer_patterns);
         total += report.total();
         for r in &report.redactions {
@@ -731,5 +766,32 @@ mod tests {
         writeln!(f, "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE").unwrap();
         let code = redact(f.path(), "llm", false);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn summarize_survives_non_utf8_bytes() {
+        // Regression for Sev-5 silent-failure: a single non-UTF-8 byte in a
+        // log line previously aborted `summarize` with an I/O error. The
+        // lossy-decode path turns the bad byte into U+FFFD and keeps going.
+        use std::io::Write;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"clean line one\n").unwrap();
+        // 0xFF is invalid as a UTF-8 leading byte → would have made
+        // BufReader::lines() return Err(InvalidData).
+        f.write_all(b"garbled \xff trailing\n").unwrap();
+        f.write_all(b"clean line three\n").unwrap();
+        let code = summarize(f.path(), false, 100, false);
+        assert_eq!(code, 0, "summarize must not abort on bad UTF-8");
+    }
+
+    #[test]
+    fn redact_survives_non_utf8_bytes() {
+        use std::io::Write;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+            .unwrap();
+        f.write_all(b"bad \xff byte\n").unwrap();
+        let code = redact(f.path(), "llm", false);
+        assert_eq!(code, 0, "redact must not abort on bad UTF-8");
     }
 }

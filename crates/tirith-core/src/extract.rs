@@ -397,7 +397,11 @@ pub struct OutputSgrHit {
 }
 
 /// One-shot rolling state for [`scan_output_chunk`]. Persists across chunks
-/// so a sequence split on a 64 KiB boundary is still detected.
+/// so OSC/CSI/SGR sequences split across chunks ARE detected end-to-end.
+/// Zero-width runs are chunk-local (run counters reset at chunk boundaries —
+/// see the body of `scan_output_chunk`) because the v1 hidden-text threshold
+/// is well within a 64 KiB window and the per-class reset keeps the state
+/// machine compact.
 #[derive(Debug, Default, Clone)]
 pub struct OutputScanState {
     /// Absolute byte offset of the *next* byte to be fed in. The streaming
@@ -413,8 +417,13 @@ pub struct OutputScanState {
     osc_introducer: Vec<u8>,
     /// Bytes accumulated inside an SGR sequence (`\e[`…`m`).
     sgr_buf: Vec<u8>,
-    /// Set when the previous chunk ended with `\e`, so the next byte may be
-    /// the terminator's second half (`\\` → ST).
+    /// Reserved: previously intended to flag a chunk-boundary lone `\e` so
+    /// the next chunk's `\\` could finalize as ST. Today this case is
+    /// already handled via `OutputPhase::AfterEsc` carrying across chunks
+    /// (the `\e` transitions phase, and the next byte's match-arm decides
+    /// the disposition). Kept (unused) to preserve struct ABI for callers
+    /// constructing this manually. See code-reviewer #4.
+    #[allow(dead_code)]
     saw_lone_esc: bool,
     /// Set when we were inside [`OutputPhase::InOsc`] and saw `\e` — the
     /// next byte may be the OSC ST terminator (`\\`). If so, we finalize
@@ -532,10 +541,11 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                         state.osc_introducer.clear();
                         state.osc_buf.clear();
                     }
-                    b'\\' if state.saw_lone_esc => {
-                        // `\e\\` standalone — treat as ST while idle; no-op.
+                    b'\\' => {
+                        // Standalone `\e\\` (ST in idle context) — no-op.
+                        // Reached either via `\e` mid-chunk or `\e` at chunk
+                        // boundary; both paths land here.
                         state.phase = OutputPhase::Idle;
-                        state.saw_lone_esc = false;
                     }
                     _ => {
                         // Bail to idle on any non-control byte; we don't try
@@ -550,7 +560,16 @@ pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut
                 // SGR sequences end with `m`; we only care about parameter
                 // bytes (0x30..=0x3F) and final bytes (0x40..=0x7E).
                 if (0x40..=0x7E).contains(&b) {
-                    let abs_offset = chunk_start_offset + byte_idx - state.sgr_buf.len() - 2; // `-2` for `\e[`
+                    // `-2` for `\e[`. Comment-analyzer #6: when the `\e[`
+                    // landed at the tail of chunk N and the final byte arrives
+                    // at chunk N+1 byte_idx=0, the naive subtraction underflows
+                    // usize. `saturating_sub` clamps to 0 (start-of-file) for
+                    // those rare cross-chunk SGR sequences. The offset accuracy
+                    // loss for that edge case is acceptable — it always maps
+                    // to a tiny window near the chunk boundary.
+                    let abs_offset = (chunk_start_offset + byte_idx)
+                        .saturating_sub(state.sgr_buf.len())
+                        .saturating_sub(2);
                     if b == b'm' {
                         // Parse SGR params: ";"-separated decimal ints; empty = 0.
                         let params = parse_sgr_params(&state.sgr_buf);
@@ -690,7 +709,66 @@ pub fn scan_output_bytes(input: &[u8]) -> OutputScanResult {
     let mut state = OutputScanState::default();
     let mut result = OutputScanResult::default();
     scan_output_chunk(input, &mut state, &mut result);
+    // Flush any trailing in-flight sequence so a truncated `\e]52;…` at EOF
+    // is detected instead of silently dropped.
+    finalize_scan_state(&mut state);
     result
+}
+
+/// Status of the byte scanner at end-of-stream. Used by the output filter
+/// (and `tirith view`) to decide whether to flag an unterminated escape
+/// sequence — under fail-closed callers must DENY in that case.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OutputScanFinalize {
+    /// `true` when an OSC / CSI / OSC8-visible sequence was still in-flight
+    /// when the input ended. The most concerning case: a truncated `\e]52;…`
+    /// with no BEL/ST terminator — a partial clipboard-write payload that
+    /// the original implementation silently dropped.
+    pub truncated_escape: bool,
+    /// Specifically `true` when the truncation was in an OSC introduced as
+    /// `52;` (clipboard write). Callers can elevate severity for this case.
+    pub truncated_osc52: bool,
+}
+
+/// Finalize the scanner state at end-of-stream. Resets transient state so
+/// the `OutputScanState` is reusable, and returns a struct describing what,
+/// if anything, was in-flight at EOF. Always called by `scan_output_bytes`
+/// and by `engine::analyze_output_finalize` for the streaming path.
+///
+/// Silent-failure fix (Sev-5): pre-fix the scanner ended in `InOsc` /
+/// `InOsc8Visible` silently on truncation; the output filter accepted the
+/// (unfinalized) result as ok. Callers can now consult the returned struct
+/// and choose to emit a `OutputTruncatedEscapeSequence` finding.
+pub fn finalize_scan_state(state: &mut OutputScanState) -> OutputScanFinalize {
+    let mut out = OutputScanFinalize::default();
+    let in_flight = !matches!(state.phase, OutputPhase::Idle);
+    if in_flight {
+        out.truncated_escape = true;
+        // Detect whether the OSC introducer started with "52" — clipboard
+        // write. Introducer accumulates digits until the first `;`, so a
+        // leading `"52"` is a definitive signal even mid-payload.
+        if matches!(state.phase, OutputPhase::InOsc) {
+            let head: Vec<u8> = state
+                .osc_introducer
+                .iter()
+                .copied()
+                .take_while(|b| *b != b';')
+                .collect();
+            if head.starts_with(b"52") {
+                out.truncated_osc52 = true;
+            }
+        }
+        // Reset transient state so re-use of `state` is safe.
+        state.phase = OutputPhase::Idle;
+        state.osc_buf.clear();
+        state.osc_introducer.clear();
+        state.sgr_buf.clear();
+        state.saw_lone_esc = false;
+        state.osc_pending_st = false;
+        state.osc8_active_uri = None;
+        state.osc8_visible_buf.clear();
+    }
+    out
 }
 
 /// Parse an SGR parameter byte string (e.g. `b"38;5;208;48;5;240"`) into a
@@ -715,8 +793,10 @@ fn finalize_osc(
     // Offset of the introducing `\e]`. We track the START of the sequence by
     // subtracting the bytes we've consumed since `\e]`. The 2-byte introducer
     // (`\e]`) plus introducer + ";" + payload precedes the terminator.
+    // Use saturating_sub for the cross-chunk case where the `\e]` opener
+    // landed in chunk N and the terminator arrives early in chunk N+1.
     let consumed = state.osc_introducer.len() + state.osc_buf.len() + 2; // +2 for `\e]`
-    let abs_offset = chunk_start_offset + byte_idx - consumed;
+    let abs_offset = (chunk_start_offset + byte_idx).saturating_sub(consumed);
 
     // Split introducer into "head;rest" — the first `;` separates the
     // numeric introducer from its payload params.
@@ -868,6 +948,44 @@ mod output_scan_tests {
             "OSC 52 must be detected even when split across chunks"
         );
         assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn finalize_flags_truncated_osc52() {
+        // Sev-5 silent-failure regression: a `\e]52;…` that ends mid-payload
+        // (no BEL / no ST) used to leave `phase=InOsc` and produce no
+        // finding. `finalize_scan_state` must flag it.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello\x1b]52;c;aGVsbG8", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(fin.truncated_escape, "truncated OSC must flag in-flight");
+        assert!(
+            fin.truncated_osc52,
+            "OSC introducer 52 → osc52-specific flag"
+        );
+        assert_eq!(result.osc52.len(), 0, "no terminator → no OSC52 hit");
+    }
+
+    #[test]
+    fn finalize_clean_eof_is_no_op() {
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello world\n", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(!fin.truncated_escape);
+        assert!(!fin.truncated_osc52);
+    }
+
+    #[test]
+    fn finalize_flags_non_osc52_truncation() {
+        // CSI sequence that never reaches a final byte.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"prefix\x1b[31", &mut state, &mut result);
+        let fin = finalize_scan_state(&mut state);
+        assert!(fin.truncated_escape);
+        assert!(!fin.truncated_osc52, "CSI != OSC52");
     }
 
     #[test]

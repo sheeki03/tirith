@@ -286,6 +286,12 @@ pub enum RuleId {
     /// command, the program's output) off-screen so a fake banner can
     /// take its place.
     OutputClearScreen,
+    /// M7 ch1 — an escape sequence (OSC / CSI) was open at end-of-stream
+    /// without a terminator. Truncated `\e]52;<base64>` (no BEL/ST) used to
+    /// be silently dropped — the OSC52 attack started but produced zero
+    /// findings. We emit this with Medium severity so callers fail-closed
+    /// can DENY the response. Silent-failure fix (Sev-5).
+    OutputTruncatedEscapeSequence,
 
     // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection`
     // when a well-known instruction-override / role-override seed phrase

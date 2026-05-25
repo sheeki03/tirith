@@ -14,12 +14,14 @@
 //!
 //! Exit codes follow the standard tirith convention: 0 on Allow (no
 //! findings), 1 on Block (a High-severity finding fired), 2 on Warn.
+//! `Action::WarnAck` (hook-context-only) maps to exit 3; in `tirith view`
+//! it is folded back to 2 because no interactive ack channel exists here.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
-use tirith_core::engine::{self, OutputAnalyzerState, OutputContext};
+use tirith_core::engine::{self, OutputAnalyzerState};
 use tirith_core::verdict::{Action, Verdict};
 
 /// 64 KiB streaming chunks. Matches the M7 ch1 spec.
@@ -90,7 +92,10 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
         return 1;
     }
 
-    let verdict = engine::analyze_output_finalize(&state);
+    // Use the `_mut` variant so the byte-scanner's truncated-escape check
+    // can finalize state in place (clones are wasteful on hot path). The
+    // immutable wrapper is kept for `analyze_output`'s legacy one-shot use.
+    let verdict = engine::analyze_output_finalize_mut(&mut state);
 
     if json {
         return emit_json(path, &verdict, total_bytes, truncated);
@@ -269,13 +274,6 @@ fn emit_json(path: Option<&Path>, verdict: &Verdict, total_bytes: u64, truncated
         return 1;
     }
     verdict.action.exit_code()
-}
-
-// Allow `_ctx` callers later (M7 ch4 / ch5). The `analyze_output` whole-buffer
-// path is the public API; we just re-export the OutputContext default here.
-#[allow(dead_code)]
-fn _unused_ctx() -> OutputContext {
-    OutputContext::default()
 }
 
 #[cfg(test)]
