@@ -100,6 +100,13 @@ help_example_tests! {
     help_clipboard_copy  => (["clipboard", "copy", "--help"], "tirith clipboard copy ./snippet.sh");
     help_clipboard_scan  => (["clipboard", "scan", "--help"], "tirith clipboard scan");
     help_clipboard_guard => (["clipboard", "guard", "--help"], "tirith clipboard guard install-service");
+    // M7 ch4 — `gateway run --filter-output` and `mcp-server
+    // --sanitize-tool-output`. Pin both to the help output so a future
+    // re-organization that drops the flags is caught here.
+    help_gateway_run_filter_output    => (["gateway", "run", "--help"], "--filter-output");
+    help_gateway_run_filter_output_ex => (["gateway", "run", "--help"], "tirith gateway run --filter-output");
+    help_mcp_server_sanitize          => (["mcp-server", "--help"], "--sanitize-tool-output");
+    help_mcp_server_sanitize_ex       => (["mcp-server", "--help"], "tirith mcp-server --sanitize-tool-output");
 }
 
 #[test]

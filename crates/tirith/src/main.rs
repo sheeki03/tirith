@@ -569,10 +569,24 @@ Examples:
         after_help = "\
 Examples:
   tirith mcp-server
+  tirith mcp-server --sanitize-tool-output
 
-Used by MCP client configurations to run tirith as a local tool server."
+Used by MCP client configurations to run tirith as a local tool server.
+
+`--sanitize-tool-output` (M7 ch4) routes every tool result through the
+output-direction analyzer before sending it back to the calling agent. Blocks
+on OSC52 / hyperlink-mismatch / hidden-text / fake-prompt; the agent receives
+a sanitized placeholder citing the audit event_id. Opt-in until field-tested;
+default is current behavior (pass through unchanged)."
     )]
-    McpServer,
+    McpServer {
+        /// Route every tool result through the M7 output-direction analyzer.
+        /// Blocks on dangerous escape sequences (OSC52 clipboard write, OSC0/2
+        /// title rewrite, screen-clear, hyperlink mismatch, hidden text,
+        /// fake-prompt). Default is pass-through.
+        #[arg(long)]
+        sanitize_tool_output: bool,
+    },
 
     /// Govern the MCP servers a repository declares
     #[command(after_help = "\
@@ -1587,7 +1601,14 @@ enum GatewayAction {
     /// Run the gateway proxy
     #[command(after_help = "\
 Examples:
-  tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml")]
+  tirith gateway run --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml
+  tirith gateway run --filter-output --upstream-bin npx --upstream-arg @modelcontextprotocol/server-filesystem --config gateway.yaml
+
+`--filter-output` (M7 ch4) routes every guarded-tool response's
+`result.content` through the output-direction analyzer before it reaches the
+client. Blocks on OSC52 / hyperlink-mismatch / hidden-text / fake-prompt with
+a sanitized placeholder citing the audit event_id. Opt-in until
+field-tested.")]
     Run {
         /// Path to upstream MCP server binary
         #[arg(long)]
@@ -1600,6 +1621,14 @@ Examples:
         /// Path to gateway config YAML
         #[arg(long)]
         config: String,
+
+        /// Route every guarded-tool response's `result.content` through the
+        /// M7 output-direction analyzer. Blocks on dangerous escape sequences
+        /// (OSC52 clipboard write, OSC0/2 title rewrite, screen-clear,
+        /// hyperlink mismatch, hidden text, fake-prompt). Default is
+        /// pass-through (current behavior).
+        #[arg(long)]
+        filter_output: bool,
     },
     /// Validate gateway config file
     #[command(after_help = "\
@@ -2878,7 +2907,9 @@ fn run() {
             command,
         } => cli::fix::run(&command, &shell, non_interactive, json),
 
-        Commands::McpServer => cli::mcp_server::run(),
+        Commands::McpServer {
+            sanitize_tool_output,
+        } => cli::mcp_server::run(sanitize_tool_output),
 
         Commands::Mcp { action } => match action {
             McpAction::Lock { format, json } => {
@@ -2972,7 +3003,13 @@ fn run() {
                 upstream_bin,
                 upstream_arg,
                 config,
-            } => cli::gateway::run_gateway(&upstream_bin, &upstream_arg, &config),
+                filter_output,
+            } => cli::gateway::run_gateway_with_options(
+                &upstream_bin,
+                &upstream_arg,
+                &config,
+                cli::gateway::GatewayOptions { filter_output },
+            ),
             GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),
         },
 

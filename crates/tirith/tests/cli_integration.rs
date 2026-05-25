@@ -7312,3 +7312,174 @@ fn clipboard_daemon_requires_foreground_flag() {
         "stderr must explain the --foreground requirement: {stderr}"
     );
 }
+
+// ============================================================================
+// M7 ch4 — `tirith gateway run --filter-output` end-to-end golden test.
+// ============================================================================
+//
+// Spawns the gateway against an attacker-stub upstream that returns an
+// OSC52 (`\e]52;c;<b64>\a`) payload in `result.content[].text`. Verifies the
+// gateway transforms the response to:
+//   - `isError: true`
+//   - `content` collapsed to a single sanitized placeholder citing the audit
+//     event_id
+//   - NOT a JSON-RPC error envelope
+//
+// Pins the protocol contract documented in `docs/mcp-output-filter.md`.
+
+/// Unix-only because the stub upstream is a `/bin/sh` script. The Windows
+/// gateway path is exercised by the unit tests in `cli/gateway.rs` which
+/// hit the same `filter_if_pending` entry point.
+#[cfg(unix)]
+#[test]
+fn gateway_filter_output_blocks_osc52_payload() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Stub upstream: a /bin/sh script that responds to the first two JSON-RPC
+    // requests it sees. The exact `id` of each response is irrelevant for the
+    // test as long as the second response (tools/call) carries the OSC52
+    // payload — the gateway routes by `id` field which the test echoes.
+    let stub_path = dir.path().join("stub_upstream.sh");
+    // OSC52: ESC `]` `5` `2` `;` `c` `;` <base64> BEL (0x07). We embed the
+    // escape and BEL as JSON `` / `` escapes inside the
+    // tools/call response string — these are valid JSON per RFC 8259 and
+    // serde_json decodes them to bytes 0x1B / 0x07 when the gateway parses
+    // the upstream response. That gives `analyze_output` exactly the byte
+    // sequence an attacker upstream would emit.
+    //
+    // We do NOT embed raw 0x1B / 0x07 bytes in this source file (which
+    // would also be a control-char-in-string parse error on the gateway's
+    // side and would survive in the .rs file as invisible payload).
+    let stub = r#"#!/bin/sh
+# Stub MCP server: respond to initialize, then to tools/call with OSC52.
+set -u
+IFS= read -r line1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"stub","version":"0.0.1"}}}'
+IFS= read -r line2
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"prefix\u001B]52;c;aGVsbG8=\u0007suffix"}],"isError":false}}'
+# Block until stdin closes so the gateway shuts us down cleanly.
+cat > /dev/null
+"#;
+    fs::write(&stub_path, stub).expect("write stub");
+    let mut perms = fs::metadata(&stub_path).expect("stub perms").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub_path, perms).expect("chmod stub");
+
+    // Gateway config: guard the "Bash" tool by name so the test's tools/call
+    // exercises the guarded-call path (which is where the filter pending-map
+    // entries are inserted).
+    let config_path = dir.path().join("gateway.yaml");
+    fs::write(
+        &config_path,
+        r#"guarded_tools:
+  - pattern: "^Bash$"
+    command_paths: ["/arguments/command"]
+    shell: posix
+policy:
+  warn_action: forward
+  fail_mode: open
+  timeout_ms: 10000
+  max_message_bytes: 1048576
+"#,
+    )
+    .expect("write config");
+
+    let mut child = tirith()
+        .args([
+            "gateway",
+            "run",
+            "--filter-output",
+            "--upstream-bin",
+            stub_path.to_str().expect("utf-8 stub path"),
+            "--config",
+            config_path.to_str().expect("utf-8 config path"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn gateway");
+
+    let mut child_stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    // Step 1: initialize. Gateway forwards, stub responds.
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    writeln!(child_stdin, "{init}").expect("write initialize");
+
+    // Step 2: tools/call for the guarded "Bash" tool. The command is benign
+    // ("echo hi") so command-direction analysis allows the forward; the
+    // OSC52 attack is in the RESPONSE, which is what --filter-output guards.
+    let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"echo hi"}}}"#;
+    writeln!(child_stdin, "{call}").expect("write tools/call");
+
+    // Read responses. The gateway emits one response per request line.
+    let mut init_resp = String::new();
+    reader
+        .read_line(&mut init_resp)
+        .expect("read init response");
+    assert!(
+        init_resp.contains("\"id\":1"),
+        "first response should echo id=1: {init_resp}"
+    );
+
+    let mut call_resp = String::new();
+    reader
+        .read_line(&mut call_resp)
+        .expect("read tools/call response");
+
+    // Close stdin so the gateway shuts down the stub.
+    drop(child_stdin);
+    let _ = child.wait();
+
+    // Pin the contract.
+    let v: serde_json::Value =
+        serde_json::from_str(call_resp.trim()).expect("response is valid JSON");
+    assert_eq!(v["jsonrpc"], "2.0", "{call_resp}");
+    assert_eq!(v["id"], 2, "must echo request id: {call_resp}");
+
+    // BLOCK contract: result.isError == true.
+    assert_eq!(
+        v["result"]["isError"], true,
+        "filter must set isError=true on OSC52 payload: {call_resp}"
+    );
+
+    // BLOCK contract: content collapsed to a single sanitized placeholder
+    // citing the audit event_id.
+    let content = v["result"]["content"]
+        .as_array()
+        .expect("content array present");
+    assert_eq!(
+        content.len(),
+        1,
+        "block must collapse content to one placeholder item: {call_resp}"
+    );
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().expect("placeholder text");
+    assert!(
+        text.starts_with("[tirith: tool output blocked"),
+        "placeholder must start with '[tirith: tool output blocked', got: {text}"
+    );
+    assert!(
+        text.contains("see audit log entry"),
+        "placeholder must cite audit log entry, got: {text}"
+    );
+
+    // BLOCK contract: original OSC52 payload must NOT leak through.
+    let raw = call_resp.as_str();
+    assert!(
+        !raw.contains("\\u001b]52") && !raw.contains("aGVsbG8="),
+        "OSC52 payload must not leak through the filter: {raw}"
+    );
+
+    // BLOCK contract: NOT a JSON-RPC error envelope.
+    assert!(
+        v.get("error").is_none(),
+        "block path must NOT emit a JSON-RPC error envelope: {call_resp}"
+    );
+}

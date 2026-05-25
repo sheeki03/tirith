@@ -104,17 +104,19 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ContentItem>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    // M7 ch4: also deserialized for the output-filter wire path. Default
+    // false so an upstream that omits `isError` is treated as "no error".
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub is_error: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub structured_content: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContentItem {
     #[serde(rename = "type")]
     pub content_type: String,

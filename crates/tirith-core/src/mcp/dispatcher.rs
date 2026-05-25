@@ -2,7 +2,7 @@ use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
-use super::{resources, tools, types::*};
+use super::{output_filter, resources, tools, types::*};
 
 /// Server state machine.
 enum State {
@@ -11,12 +11,40 @@ enum State {
     Ready,
 }
 
-/// Run the MCP server loop over stdio.
+/// Per-run options for the MCP server dispatcher.
+///
+/// `sanitize_tool_output` (M7 ch4) routes every `tools/call` return through
+/// [`crate::mcp::output_filter::filter_tool_result`] so a malicious upstream
+/// (or a malicious tool result the server itself produces, e.g. a paste fed
+/// through `tirith_check_paste`) cannot smuggle OSC52 / hyperlink-mismatch
+/// payloads through to the calling agent. Default: `false` (preserves current
+/// behavior; opt-in until field-tested). When enabled, the dispatcher uses
+/// `fail_mode_closed = true` so an analysis-truncation or rule-error path
+/// denies rather than passes through (stricter than the gateway default).
+#[derive(Debug, Clone, Default)]
+pub struct DispatcherOptions {
+    pub sanitize_tool_output: bool,
+}
+
+/// Run the MCP server loop over stdio with default options.
 ///
 /// Reads JSON-RPC messages from `input` (one per line), writes responses to
 /// `output`. Logs go to `log` (typically stderr). Returns exit code 0 on clean
 /// shutdown (EOF on input).
-pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write) -> i32 {
+pub fn run(input: impl BufRead, output: impl Write, log: impl Write) -> i32 {
+    run_with_options(input, output, log, DispatcherOptions::default())
+}
+
+/// Like [`run`] but accepts a [`DispatcherOptions`] for M7 ch4
+/// `--sanitize-tool-output` behavior. `run` is preserved as a back-compat
+/// wrapper so existing callers (and the unit-test suite) do not need to pipe
+/// an options struct through.
+pub fn run_with_options(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    mut log: impl Write,
+    options: DispatcherOptions,
+) -> i32 {
     let mut state = State::AwaitingInit;
 
     /// Maximum line size: 10 MiB. Prevents a single huge JSON-RPC message
@@ -227,7 +255,16 @@ pub fn run(mut input: impl BufRead, mut output: impl Write, mut log: impl Write)
                     JsonRpcResponse::ok(id, json!({ "tools": tools }))
                 }
                 "tools/call" => {
-                    let result = handle_tools_call(&params);
+                    let mut result = handle_tools_call(&params);
+                    if options.sanitize_tool_output {
+                        // M7 ch4. Default fail-mode is closed: an analysis
+                        // truncation under `mcp-server --sanitize-tool-output`
+                        // denies rather than passes through. Stricter than the
+                        // gateway default because the calling agent is the
+                        // highest-privilege consumer of these results.
+                        let outcome = output_filter::filter_tool_result(&mut result, true);
+                        write_filter_audit(&mut log, &outcome);
+                    }
                     match serde_json::to_value(result) {
                         Ok(v) => JsonRpcResponse::ok(id, v),
                         Err(e) => JsonRpcResponse::err(
@@ -387,6 +424,40 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
     }
 }
 
+/// Emit a JSONL audit line for an output-filter pass to `log` (typically
+/// stderr — same channel the dispatcher already uses for diagnostic lines so
+/// operators read one stream).
+///
+/// The line is best-effort: on serialization or write failure we silently
+/// drop, mirroring the dispatcher's existing diagnostic-line policy. The
+/// audit log file and structured audit envelope is owned by the audit module
+/// for verdict-tagged events; the dispatcher does not have a `command` to log
+/// here, so the dedicated stderr line is the right granularity.
+fn write_filter_audit(log: &mut impl Write, outcome: &output_filter::FilterOutcome) {
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "kind": "mcp_output_filter",
+        "decision": match outcome.action {
+            crate::verdict::Action::Block => "block",
+            crate::verdict::Action::Warn | crate::verdict::Action::WarnAck => "warn",
+            crate::verdict::Action::Allow => "allow",
+        },
+        "event_id": outcome.event_id,
+        "rule_ids": outcome.rule_ids,
+        "findings_count": outcome.rule_ids.len(),
+        "highest_severity": outcome
+            .max_severity
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "NONE".to_string()),
+        "elapsed_ms": outcome.elapsed_ms,
+        "truncated": outcome.truncated,
+        "fail_mode_triggered": outcome.fail_mode_triggered,
+    });
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = writeln!(log, "{json}");
+    }
+}
+
 /// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
 fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
     match serde_json::to_string(resp) {
@@ -426,6 +497,21 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run(reader, &mut stdout, &mut stderr);
+        assert_eq!(code, 0, "Server should exit cleanly");
+        (
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// Like [`run_session`] but threads [`DispatcherOptions`] through. Used by
+    /// the M7 ch4 `--sanitize-tool-output` regression tests.
+    fn run_session_with_options(input: &str, options: DispatcherOptions) -> (String, String) {
+        let _serial = super::super::origin::serial_lock();
+        let reader = BufReader::new(input.as_bytes());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with_options(reader, &mut stdout, &mut stderr, options);
         assert_eq!(code, 0, "Server should exit cleanly");
         (
             String::from_utf8(stdout).unwrap(),
@@ -717,6 +803,53 @@ mod tests {
         assert_eq!(resps.len(), 2);
         assert_eq!(resps[1]["id"], Value::Null);
         assert_eq!(resps[1]["result"], json!({}));
+    }
+
+    /// M7 ch4: `--sanitize-tool-output` smoke test. When the option is
+    /// enabled, the dispatcher writes a JSONL audit line to stderr for every
+    /// `tools/call` (kind = "mcp_output_filter"). Pin this so a refactor
+    /// that quietly drops the filter pass is caught here.
+    ///
+    /// We can't easily make a built-in tool emit OSC52 content (every tool
+    /// produces a verdict-shaped text body, not a raw payload), so this
+    /// test only verifies the filter ran. The content-level contract is
+    /// pinned by the `output_filter::tests` and the gateway integration
+    /// test.
+    #[test]
+    fn test_sanitize_tool_output_emits_audit_line() {
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tirith_check_command","arguments":{"command":"echo hi"}}}"#,
+        );
+        let (_stdout, stderr) = run_session_with_options(
+            &input,
+            DispatcherOptions {
+                sanitize_tool_output: true,
+            },
+        );
+        assert!(
+            stderr.contains("\"kind\":\"mcp_output_filter\""),
+            "sanitize_tool_output=true must emit one audit line per tools/call; got stderr:\n{stderr}"
+        );
+    }
+
+    /// Default `sanitize_tool_output = false` MUST NOT emit a filter audit
+    /// line — preserves the pre-M7-ch4 behavior. Counterpart to the
+    /// positive smoke test above.
+    #[test]
+    fn test_default_sanitize_tool_output_off_does_not_filter() {
+        let input = format!(
+            "{}\n{}\n",
+            init_msg(1, "2025-11-25"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tirith_check_command","arguments":{"command":"echo hi"}}}"#,
+        );
+        // Default options (filter off).
+        let (_stdout, stderr) = run_session_with_options(&input, DispatcherOptions::default());
+        assert!(
+            !stderr.contains("\"kind\":\"mcp_output_filter\""),
+            "default behavior must NOT engage the output filter; got stderr:\n{stderr}"
+        );
     }
 
     /// CodeRabbit Minor (cid 3292343379): an `initialize` payload that
