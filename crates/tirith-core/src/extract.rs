@@ -356,6 +356,552 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
     result
 }
 
+// ─── Output-stream byte scanning (M7 ch1) ────────────────────────────────────
+//
+// The output pipeline (`engine::analyze_output_chunk`) scans terminal output
+// for escape sequences that hide / mislead what the user is shown. Unlike
+// `scan_bytes` (single-shot, used by exec/paste), the output scanner is
+// streaming: callers feed 64 KiB chunks and the state machine carries
+// partial-sequence context across chunk boundaries (e.g. `\e]52;` split at
+// byte 64 of one chunk and byte 0 of the next).
+//
+// What we look for:
+//   - `\e]52;` (OSC 52, clipboard write)             → OutputOsc52ClipboardWrite
+//   - `\e]8;`  (OSC 8,  hyperlink)                   → captured for url-mismatch rule
+//   - `\e]0;` / `\e]2;` (OSC 0/2, terminal title)    → OutputTitleManipulation
+//   - `\e[2J`  (CSI 2J, screen clear)                → OutputClearScreen
+//   - `\e[H`   (CSI H,  cursor home, no-args form)   → OutputClearScreen
+//   - SGR sequences `\e[...m`                         → captured for hidden-text rule
+//
+// The state machine is intentionally small — it does NOT try to be a full VT
+// parser. It tracks just enough to (a) recognize the introducers above and
+// (b) consume the terminator (`\a` BEL, or `\e\\` ST). On chunk boundaries
+// where a sequence is mid-introducer or mid-terminator, the state carries
+// across to the next chunk via `OutputAnalyzerState`.
+
+/// A single OSC 8 hyperlink span recovered from output (uri + visible label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputHyperlinkHit {
+    pub offset: usize,
+    pub uri: String,
+    pub visible: String,
+}
+
+/// A single SGR escape sequence (`\e[...m`) recovered from output, with the
+/// parsed numeric parameter list (semicolon-split, empties = 0). Used by the
+/// hidden-text rule to spot `fg == bg` within a single SGR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSgrHit {
+    pub offset: usize,
+    pub params: Vec<u32>,
+}
+
+/// One-shot rolling state for [`scan_output_chunk`]. Persists across chunks
+/// so a sequence split on a 64 KiB boundary is still detected.
+#[derive(Debug, Default, Clone)]
+pub struct OutputScanState {
+    /// Absolute byte offset of the *next* byte to be fed in. The streaming
+    /// driver bumps this by the chunk length after each call so emitted
+    /// offsets are file-wide, not chunk-relative.
+    pub byte_offset: usize,
+    /// Where we are inside the small VT parser.
+    phase: OutputPhase,
+    /// Partial OSC payload accumulated mid-sequence (capped — see CAP).
+    osc_buf: Vec<u8>,
+    /// OSC introducer that started the current payload (`0`, `2`, `52`, `8`).
+    /// We accumulate digits and then dispatch on `;`.
+    osc_introducer: Vec<u8>,
+    /// Bytes accumulated inside an SGR sequence (`\e[`…`m`).
+    sgr_buf: Vec<u8>,
+    /// Set when the previous chunk ended with `\e`, so the next byte may be
+    /// the terminator's second half (`\\` → ST).
+    saw_lone_esc: bool,
+    /// Set when we were inside [`OutputPhase::InOsc`] and saw `\e` — the
+    /// next byte may be the OSC ST terminator (`\\`). If so, we finalize
+    /// the OSC sequence; otherwise we drop back to OSC payload accumulation.
+    osc_pending_st: bool,
+    /// For OSC 8: when we've consumed `\e]8;PARAMS;URI<ST>`, we are then
+    /// inside the "visible text" until the next `\e]8;;<ST>` closer.
+    osc8_active_uri: Option<String>,
+    osc8_visible_buf: Vec<u8>,
+    osc8_uri_start_offset: usize,
+}
+
+/// Hard cap on payload bytes we'll buffer inside a single escape sequence.
+/// A legitimate OSC 8 URI is at most a few KiB; if we see a sequence larger
+/// than this, we abort the sequence and drop back to copy-through mode.
+const OUTPUT_OSC_CAP: usize = 16 * 1024;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum OutputPhase {
+    #[default]
+    Idle,
+    /// Just saw `\e`, waiting for next byte.
+    AfterEsc,
+    /// Inside `\e[…` waiting for a final byte in 0x40..=0x7E.
+    InCsi,
+    /// Inside `\e]…` (OSC). Collecting the introducer + payload.
+    InOsc,
+    /// OSC 8 link is open — we're collecting its visible text between
+    /// the opening `\e]8;…<ST>` and the closing `\e]8;;<ST>`.
+    InOsc8Visible,
+}
+
+/// Aggregate results from one or more streamed chunks.
+#[derive(Debug, Default, Clone)]
+pub struct OutputScanResult {
+    /// OSC 52 clipboard write sequences (offsets are file-wide).
+    pub osc52: Vec<OutputOscHit>,
+    /// OSC 0 / OSC 2 title-set sequences.
+    pub title_set: Vec<OutputOscHit>,
+    /// Explicit `\e[2J` / `\e[H` screen-clear sequences.
+    pub screen_clear: Vec<OutputOscHit>,
+    /// OSC 8 hyperlinks with their visible label captured.
+    pub hyperlinks: Vec<OutputHyperlinkHit>,
+    /// SGR sequences (used by the hidden-text rule).
+    pub sgr: Vec<OutputSgrHit>,
+    /// Runs of zero-width characters longer than the v1 threshold (8 chars).
+    pub zero_width_runs: Vec<OutputZeroWidthRun>,
+}
+
+/// One generic OSC hit (file-wide offset + decoded payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOscHit {
+    pub offset: usize,
+    pub payload: String,
+}
+
+/// A run of >8 consecutive zero-width characters detected by the output scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputZeroWidthRun {
+    pub offset: usize,
+    pub count: usize,
+}
+
+/// Streaming output scanner — drive this with one or more 64 KiB chunks of
+/// the file being viewed. `state` carries across calls so a sequence split
+/// on a chunk boundary is still detected end-to-end.
+///
+/// Findings are *appended* to `result`. The caller (`engine::analyze_output_*`)
+/// translates `OutputScanResult` into `Finding`s after every chunk has been
+/// fed.
+pub fn scan_output_chunk(chunk: &[u8], state: &mut OutputScanState, result: &mut OutputScanResult) {
+    // Track consecutive zero-width chars within this chunk only — runs that
+    // straddle a chunk boundary intentionally do NOT count, since the v1
+    // hidden-text threshold (>8) is well within a 64 KiB window. The simpler
+    // rule keeps the state machine compact and avoids an entire second class
+    // of edge cases around encoding-boundary splits.
+    let mut zw_run_start: Option<usize> = None;
+    let mut zw_run_count: usize = 0;
+    let chunk_start_offset = state.byte_offset;
+
+    // Decode the chunk as UTF-8 lossily for zero-width detection — invalid
+    // UTF-8 in output is itself a corruption signal but is reported via the
+    // byte-level scan; the output scanner only needs char counts here.
+    let mut byte_idx = 0;
+    while byte_idx < chunk.len() {
+        let b = chunk[byte_idx];
+
+        // Handle phase transitions first.
+        match state.phase {
+            OutputPhase::Idle | OutputPhase::InOsc8Visible => {
+                if b == 0x1B {
+                    state.phase = OutputPhase::AfterEsc;
+                    state.saw_lone_esc = false;
+                    byte_idx += 1;
+                    continue;
+                }
+                if state.phase == OutputPhase::InOsc8Visible {
+                    state.osc8_visible_buf.push(b);
+                    if state.osc8_visible_buf.len() > OUTPUT_OSC_CAP {
+                        // Bail — visible text is unreasonably large, abort the link.
+                        state.phase = OutputPhase::Idle;
+                        state.osc8_active_uri = None;
+                        state.osc8_visible_buf.clear();
+                    }
+                }
+            }
+            OutputPhase::AfterEsc => {
+                match b {
+                    b'[' => {
+                        state.phase = OutputPhase::InCsi;
+                        state.sgr_buf.clear();
+                    }
+                    b']' => {
+                        state.phase = OutputPhase::InOsc;
+                        state.osc_introducer.clear();
+                        state.osc_buf.clear();
+                    }
+                    b'\\' if state.saw_lone_esc => {
+                        // `\e\\` standalone — treat as ST while idle; no-op.
+                        state.phase = OutputPhase::Idle;
+                        state.saw_lone_esc = false;
+                    }
+                    _ => {
+                        // Bail to idle on any non-control byte; we don't try
+                        // to model the whole VT100 grammar.
+                        state.phase = OutputPhase::Idle;
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+            OutputPhase::InCsi => {
+                // SGR sequences end with `m`; we only care about parameter
+                // bytes (0x30..=0x3F) and final bytes (0x40..=0x7E).
+                if (0x40..=0x7E).contains(&b) {
+                    let abs_offset = chunk_start_offset + byte_idx - state.sgr_buf.len() - 2; // `-2` for `\e[`
+                    if b == b'm' {
+                        // Parse SGR params: ";"-separated decimal ints; empty = 0.
+                        let params = parse_sgr_params(&state.sgr_buf);
+                        result.sgr.push(OutputSgrHit {
+                            offset: abs_offset,
+                            params,
+                        });
+                    } else if b == b'J' && state.sgr_buf == b"2" {
+                        result.screen_clear.push(OutputOscHit {
+                            offset: abs_offset,
+                            payload: "\\e[2J".to_string(),
+                        });
+                    } else if b == b'H' && state.sgr_buf.is_empty() {
+                        result.screen_clear.push(OutputOscHit {
+                            offset: abs_offset,
+                            payload: "\\e[H".to_string(),
+                        });
+                    }
+                    state.phase = OutputPhase::Idle;
+                    state.sgr_buf.clear();
+                } else {
+                    state.sgr_buf.push(b);
+                    if state.sgr_buf.len() > 64 {
+                        // Unreasonable CSI length — bail.
+                        state.phase = OutputPhase::Idle;
+                        state.sgr_buf.clear();
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+            OutputPhase::InOsc => {
+                // Terminators: BEL (\a, 0x07) or ST (\e\\). Also tolerant of
+                // bare 0x9C (8-bit ST, rare in modern terminals).
+                let is_bel = b == 0x07;
+                let is_st_8bit = b == 0x9C;
+                let is_st_start = b == 0x1B;
+
+                // Were we waiting for the ST tail (`\\`) after a `\e`?
+                if state.osc_pending_st {
+                    state.osc_pending_st = false;
+                    if b == b'\\' {
+                        finalize_osc(state, result, chunk_start_offset, byte_idx);
+                        byte_idx += 1;
+                        continue;
+                    }
+                    // False alarm — that `\e` was just a stray byte in the
+                    // payload. Carry on accumulating. (We do NOT push the
+                    // stray `\e` into the payload — it was an attempted
+                    // terminator, treat it as protocol noise.)
+                }
+
+                if is_bel || is_st_8bit {
+                    finalize_osc(state, result, chunk_start_offset, byte_idx);
+                    byte_idx += 1;
+                    continue;
+                }
+                if is_st_start {
+                    // Stay InOsc; flip the pending-ST flag and wait one byte.
+                    state.osc_pending_st = true;
+                    byte_idx += 1;
+                    continue;
+                }
+                if state.osc_introducer.contains(&b';') {
+                    // Past the introducer separator — accumulate payload.
+                    state.osc_buf.push(b);
+                    if state.osc_buf.len() > OUTPUT_OSC_CAP {
+                        state.phase = OutputPhase::Idle;
+                        state.osc_buf.clear();
+                        state.osc_introducer.clear();
+                    }
+                } else {
+                    state.osc_introducer.push(b);
+                    if state.osc_introducer.len() > 32 {
+                        state.phase = OutputPhase::Idle;
+                        state.osc_buf.clear();
+                        state.osc_introducer.clear();
+                    }
+                }
+                byte_idx += 1;
+                continue;
+            }
+        }
+
+        // Idle-mode zero-width tracking (multi-byte chars).
+        if state.phase == OutputPhase::Idle && b >= 0xc0 {
+            let remaining = &chunk[byte_idx..];
+            if let Some(ch) = std::str::from_utf8(remaining)
+                .ok()
+                .or_else(|| std::str::from_utf8(&remaining[..remaining.len().min(4)]).ok())
+                .and_then(|s| s.chars().next())
+            {
+                if is_zero_width(ch) || is_unicode_tag(ch) {
+                    if zw_run_start.is_none() {
+                        zw_run_start = Some(chunk_start_offset + byte_idx);
+                    }
+                    zw_run_count += 1;
+                    byte_idx += ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+
+        // Non-ZW byte — flush any in-flight run.
+        if zw_run_count > 8 {
+            if let Some(off) = zw_run_start {
+                result.zero_width_runs.push(OutputZeroWidthRun {
+                    offset: off,
+                    count: zw_run_count,
+                });
+            }
+        }
+        zw_run_start = None;
+        zw_run_count = 0;
+
+        byte_idx += 1;
+    }
+
+    // End-of-chunk ZW flush.
+    if zw_run_count > 8 {
+        if let Some(off) = zw_run_start {
+            result.zero_width_runs.push(OutputZeroWidthRun {
+                offset: off,
+                count: zw_run_count,
+            });
+        }
+    }
+
+    // Advance global offset for next chunk.
+    state.byte_offset = chunk_start_offset + chunk.len();
+}
+
+/// Convenience whole-buffer wrapper for the streaming scanner. Used by
+/// `engine::analyze_output` (M7 ch4 MCP gateway, etc.) — guarantees the
+/// state machine is shared with the streaming code path.
+pub fn scan_output_bytes(input: &[u8]) -> OutputScanResult {
+    let mut state = OutputScanState::default();
+    let mut result = OutputScanResult::default();
+    scan_output_chunk(input, &mut state, &mut result);
+    result
+}
+
+/// Parse an SGR parameter byte string (e.g. `b"38;5;208;48;5;240"`) into a
+/// list of integers. Empty fields default to 0, matching xterm semantics.
+fn parse_sgr_params(buf: &[u8]) -> Vec<u32> {
+    let s = std::str::from_utf8(buf).unwrap_or("");
+    s.split(';')
+        .map(|tok| tok.trim().parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+/// Finalize an in-progress OSC sequence (terminator hit). Dispatches on the
+/// introducer (`0`, `2`, `8`, `52`) and either records the finding or opens
+/// the OSC 8 visible-text capture.
+fn finalize_osc(
+    state: &mut OutputScanState,
+    result: &mut OutputScanResult,
+    chunk_start_offset: usize,
+    byte_idx: usize,
+) {
+    state.osc_pending_st = false;
+    // Offset of the introducing `\e]`. We track the START of the sequence by
+    // subtracting the bytes we've consumed since `\e]`. The 2-byte introducer
+    // (`\e]`) plus introducer + ";" + payload precedes the terminator.
+    let consumed = state.osc_introducer.len() + state.osc_buf.len() + 2; // +2 for `\e]`
+    let abs_offset = chunk_start_offset + byte_idx - consumed;
+
+    // Split introducer into "head;rest" — the first `;` separates the
+    // numeric introducer from its payload params.
+    let mut head_buf: Vec<u8> = Vec::new();
+    let mut rest_buf: Vec<u8> = Vec::new();
+    let mut seen_semi = false;
+    for &b in &state.osc_introducer {
+        if !seen_semi && b == b';' {
+            seen_semi = true;
+            continue;
+        }
+        if seen_semi {
+            rest_buf.push(b);
+        } else {
+            head_buf.push(b);
+        }
+    }
+
+    let head = std::str::from_utf8(&head_buf).unwrap_or("").trim();
+    let payload_str = std::str::from_utf8(&state.osc_buf)
+        .unwrap_or("")
+        .to_string();
+    let rest_str = std::str::from_utf8(&rest_buf).unwrap_or("");
+
+    match head {
+        "0" | "2" => {
+            result.title_set.push(OutputOscHit {
+                offset: abs_offset,
+                payload: format!("{rest_str}{payload_str}"),
+            });
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        "52" => {
+            result.osc52.push(OutputOscHit {
+                offset: abs_offset,
+                payload: payload_str,
+            });
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        "8" => {
+            // OSC 8 shape: `\e]8;params;uri\e\\<visible>\e]8;;\e\\`. The
+            // *params* field sits between the introducer (`8`) and the
+            // payload (`uri`). Our split-on-first-semi puts an empty `rest`
+            // and the payload becomes `;uri` (with the params-separator
+            // semicolon still attached). Strip one leading `;` so the URI
+            // we hand to the rule layer is clean.
+            //
+            // For the closer (`\e]8;;\e\\`), payload_str ends up `";"` or
+            // empty — that's fine; we ignore it on the closer branch.
+            let stripped_uri = payload_str
+                .strip_prefix(';')
+                .unwrap_or(&payload_str)
+                .to_string();
+            let uri = stripped_uri;
+            if state.osc8_active_uri.is_some() {
+                // This is the CLOSER — emit the captured link.
+                let visible = std::str::from_utf8(&state.osc8_visible_buf)
+                    .unwrap_or("")
+                    .to_string();
+                let captured_uri = state.osc8_active_uri.take().unwrap_or_default();
+                result.hyperlinks.push(OutputHyperlinkHit {
+                    offset: state.osc8_uri_start_offset,
+                    uri: captured_uri,
+                    visible,
+                });
+                state.osc8_visible_buf.clear();
+                state.phase = OutputPhase::Idle;
+            } else {
+                // OPENER — start collecting the visible label.
+                state.osc8_active_uri = Some(uri);
+                state.osc8_uri_start_offset = abs_offset;
+                state.osc8_visible_buf.clear();
+                state.phase = OutputPhase::InOsc8Visible;
+            }
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+        _ => {
+            // Unknown OSC code — ignore (no finding) but reset state.
+            state.phase = OutputPhase::Idle;
+            state.osc_introducer.clear();
+            state.osc_buf.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_scan_tests {
+    use super::*;
+
+    #[test]
+    fn detects_osc52_clipboard_write() {
+        let input = b"hello\x1b]52;c;aGVsbG8=\x07world";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.osc52.len(), 1, "should detect OSC 52");
+        // Payload format: `<selector>;<base64>` — `c` = clipboard
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn detects_osc52_with_st_terminator() {
+        let input = b"hello\x1b]52;c;aGVsbG8=\x1b\\world";
+        let result = scan_output_bytes(input);
+        assert_eq!(
+            result.osc52.len(),
+            1,
+            "should detect OSC 52 with ST terminator"
+        );
+    }
+
+    #[test]
+    fn detects_title_set() {
+        let input = b"\x1b]0;Untitled\x07rest";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.title_set.len(), 1);
+        assert_eq!(result.title_set[0].payload, "Untitled");
+    }
+
+    #[test]
+    fn detects_screen_clear() {
+        let input = b"banner\x1b[2Jfresh\x1b[H";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.screen_clear.len(), 2);
+    }
+
+    #[test]
+    fn detects_osc8_hyperlink_with_mismatch() {
+        let input = b"click \x1b]8;;https://evil.example\x1b\\github.com\x1b]8;;\x1b\\!";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.hyperlinks.len(), 1, "should detect OSC 8");
+        assert_eq!(result.hyperlinks[0].uri, "https://evil.example");
+        assert_eq!(result.hyperlinks[0].visible, "github.com");
+    }
+
+    #[test]
+    fn streaming_split_on_osc_boundary() {
+        // Split `\x1b]52;c;aGVsbG8=\x07` between `\x1b]` and `52;…\x07`.
+        let mut state = OutputScanState::default();
+        let mut result = OutputScanResult::default();
+        scan_output_chunk(b"hello\x1b]", &mut state, &mut result);
+        scan_output_chunk(b"52;c;aGVsbG8=\x07world", &mut state, &mut result);
+        assert_eq!(
+            result.osc52.len(),
+            1,
+            "OSC 52 must be detected even when split across chunks"
+        );
+        assert_eq!(result.osc52[0].payload, "c;aGVsbG8=");
+    }
+
+    #[test]
+    fn captures_sgr_params() {
+        let input = b"\x1b[37;47mhidden\x1b[0m";
+        let result = scan_output_bytes(input);
+        assert_eq!(result.sgr.len(), 2, "should capture both SGRs");
+        assert_eq!(result.sgr[0].params, vec![37, 47]);
+        assert_eq!(result.sgr[1].params, vec![0]);
+    }
+
+    #[test]
+    fn detects_zero_width_run() {
+        let mut input = b"abc".to_vec();
+        for _ in 0..10 {
+            input.extend_from_slice("\u{200B}".as_bytes());
+        }
+        input.extend_from_slice(b"def");
+        let result = scan_output_bytes(&input);
+        assert_eq!(result.zero_width_runs.len(), 1);
+        assert_eq!(result.zero_width_runs[0].count, 10);
+    }
+
+    #[test]
+    fn clean_text_no_findings() {
+        let result = scan_output_bytes(b"hello world\n");
+        assert!(result.osc52.is_empty());
+        assert!(result.title_set.is_empty());
+        assert!(result.screen_clear.is_empty());
+        assert!(result.hyperlinks.is_empty());
+        assert!(result.zero_width_runs.is_empty());
+    }
+}
+
 /// Check if a character is a bidi control.
 fn is_bidi_control(ch: char) -> bool {
     matches!(

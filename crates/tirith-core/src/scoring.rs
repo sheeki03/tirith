@@ -204,7 +204,15 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PackagePolicyLowDownloads
         | RuleId::PackagePolicyTyposquatDistance
         | RuleId::PackagePolicyUnknownPackageWithInstallScripts
-        | RuleId::PackagePolicyNotFound => false,
+        | RuleId::PackagePolicyNotFound
+        // M7 ch1 — output-direction rules. Structural escape-sequence
+        // detection on stdout/stderr; never threat-DB driven.
+        | RuleId::OutputOsc52ClipboardWrite
+        | RuleId::OutputHiddenText
+        | RuleId::OutputFakePrompt
+        | RuleId::OutputTerminalHyperlinkMismatch
+        | RuleId::OutputTitleManipulation
+        | RuleId::OutputClearScreen => false,
     }
 }
 

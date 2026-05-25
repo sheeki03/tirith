@@ -250,6 +250,42 @@ pub enum RuleId {
 
     // License/infrastructure rules
     LicenseRequired,
+
+    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output`
+    // when scanning the stdout/stderr of a command (e.g. `tirith view <file>`,
+    // future M7 ch4 MCP gateway, M7 ch5 log viewer). They never fire from the
+    // exec / paste hot path. Detection is byte-scan based (OSC52, OSC8, title
+    // set, screen-clear sequences) and bypasses `PATTERN_TABLE` — the
+    // `analyze_output` pipeline does not go through the tier-1 exec/paste
+    // regex gate.
+    /// M7 ch1 — `\e]52;c;<base64>\a` writes to the system clipboard from a
+    /// stream the user is only watching. High severity — silent exfil of
+    /// secrets the user just typed becomes a one-key paste away.
+    OutputOsc52ClipboardWrite,
+    /// M7 ch1 — text rendered invisibly. v1 scope is narrow: (i) explicit
+    /// ANSI foreground == explicit ANSI background within a single SGR
+    /// sequence, OR (ii) a zero-width-character run > 8 chars. Terminal-
+    /// theme-dependent detection (text inherits a default color) is out of
+    /// v1 — documented as a follow-up in `rules/output.rs`.
+    OutputHiddenText,
+    /// M7 ch1 — a `[PS1-shaped text]` injected mid-stream looks like a
+    /// fresh prompt and tricks the user into typing the next command at
+    /// what is actually the wrapped command's output. Medium severity.
+    OutputFakePrompt,
+    /// M7 ch1 — OSC 8 hyperlink where the visible text itself parses as a
+    /// URL with a host that differs from the link's `href` host. High
+    /// severity. "Click here" vs `https://example.com` does NOT fire —
+    /// only when the visible text is a URL whose host doesn't match.
+    OutputTerminalHyperlinkMismatch,
+    /// M7 ch1 — terminal window title rewrite (`\e]0;…\a` / `\e]2;…\a`)
+    /// from an untrusted output stream. Info severity. Used by attackers
+    /// to mask a backgrounded shell as "$EDITOR foo.txt".
+    OutputTitleManipulation,
+    /// M7 ch1 — explicit screen-clear sequences (`\e[2J` / `\e[H`) mid-
+    /// stream. Info severity — used to scroll the prior output (your
+    /// command, the program's output) off-screen so a fake banner can
+    /// take its place.
+    OutputClearScreen,
 }
 
 impl fmt::Display for RuleId {

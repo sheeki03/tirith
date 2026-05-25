@@ -932,6 +932,19 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("custom_rule_match", "CustomRuleMatch"),
     // License/infrastructure
     ("license_required", "LicenseRequired"),
+    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output`.
+    // Detection is byte-scan based; the `analyze_output` pipeline does not
+    // go through the tier-1 exec/paste regex gate, so NO new PATTERN_TABLE
+    // entry is required for these rules.
+    ("output_osc52_clipboard_write", "OutputOsc52ClipboardWrite"),
+    ("output_hidden_text", "OutputHiddenText"),
+    ("output_fake_prompt", "OutputFakePrompt"),
+    (
+        "output_terminal_hyperlink_mismatch",
+        "OutputTerminalHyperlinkMismatch",
+    ),
+    ("output_title_manipulation", "OutputTitleManipulation"),
+    ("output_clear_screen", "OutputClearScreen"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -954,6 +967,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "custom",
     "license",
     "threatintel",
+    "output",
 ];
 
 #[derive(Deserialize)]

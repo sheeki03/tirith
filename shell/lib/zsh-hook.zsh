@@ -296,3 +296,21 @@ autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook zshexit _tirith_exit_summa
 if [[ -o interactive ]]; then
   TIRITH_STATUS="blocks"
 fi
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# tirith-output-guard-wrap() {
+#   if [[ "$#" -eq 0 ]]; then
+#     printf 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]\n' >&2
+#     return 2
+#   fi
+#   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
+# }
+# alias tirith-out='tirith-output-guard-wrap'

@@ -1547,3 +1547,74 @@ examples_bad = ["`tirith install npm nonexistent-package-xyz123 --online` with `
 examples_good = ["`tirith install npm react --online` — registry confirms the package exists"]
 false_positive_guidance = "Cannot fire under bare offline `tirith install` (output prints '(package-existence signal requires --online)'). A genuine 404 is unambiguous evidence."
 remediation = "Verify the package name's spelling and the intended registry. The name may be a typo, may belong to a private registry the public registry does not know about, or may be a stale removed package."
+
+# ── Output-direction rules (M7 ch1) ──────────────────────────────────────
+# These rules fire only from `engine::analyze_output` — used by
+# `tirith view <file>` and (later in M7) the MCP output gateway and log
+# viewer. They are NOT reachable from the `tirith check` exec hot path.
+
+[[rule]]
+id = "output_osc52_clipboard_write"
+title = "OSC 52 clipboard write from output stream"
+category = "output"
+severity_rationale = "High — OSC 52 (`\\e]52;c;<base64>\\a`) writes directly to the system clipboard from a stream the user is only watching. An attacker who controls a log file, command output, or MCP tool response can silently stage a malicious command in the clipboard so the user's next paste runs it. Most modern terminals expose this surface by default."
+description = "An OSC 52 escape sequence appeared in the scanned output. `\\e]52;<clipboard>;<base64>\\a` is the xterm/iTerm/kitty clipboard-write protocol — content silently lands in the user's system clipboard. `tirith view` strips the sequence before printing; sanitized output is safe to display."
+examples_bad = ["`tirith view /tmp/evil.log` where the log contains `\\e]52;c;cm0gLXJmIH4K\\a` (base64 of `rm -rf ~`)"]
+examples_good = ["A log file with no OSC 52 sequences — only printable text and benign SGR color sequences."]
+false_positive_guidance = "OSC 52 has no legitimate use case in a normal log / file / command output. Programs that need to write to the clipboard call a platform API (`pbcopy`, `xclip`, `wl-copy`); they do not emit OSC 52 into stdout. If you see this from a tool you trust, file an issue with the tool — it is leaking a privileged escape into a stream that gets piped around."
+remediation = "`tirith view` already neutralized the sequence in the displayed output. Treat the source as compromised: do NOT paste anything from your clipboard, run `pbcopy < /dev/null` (macOS) / `xclip -i /dev/null` (Linux) to clear it, and audit how the content reached your stream."
+
+[[rule]]
+id = "output_hidden_text"
+title = "Hidden text in output stream"
+category = "output"
+severity_rationale = "Medium — text that renders invisibly (same foreground/background color, or a long run of zero-width characters) can hide commands an LLM agent or grep-on-output user will still process, while a human reading the stream sees blank space."
+description = "Output contains text the user cannot see but downstream consumers (an AI agent reading the stream, a `grep`-on-log pipeline, a copy-paste into a chat client) still process. v1 detection is deliberately narrow: (i) explicit ANSI foreground == explicit ANSI background within the same SGR sequence (no inference of the user's terminal default colors), OR (ii) a zero-width-character run longer than 8 chars. Theme-dependent hiding (text inherits the user's default color) is out of v1."
+examples_bad = ["`echo -e '\\e[37;47mhidden-message\\e[0m'` — white-on-white inside a single SGR.", "A line containing 12+ consecutive U+200B / U+200D / U+FEFF code points."]
+examples_good = ["`echo -e '\\e[31mERROR\\e[0m: something failed'` — explicit fg, default bg.", "A document containing two or three ZWJ characters used for legitimate emoji sequencing."]
+false_positive_guidance = "If your terminal theme uses identical-RGB SGR codes for accessibility (rare), pass the file to `tirith view --json` and add a policy allowlist for the affected stream. ZWJ / ZWNJ inside scripts that legitimately use them (Arabic, Devanagari) only fire when the run length exceeds 8 — short legitimate sequences are not flagged."
+remediation = "`tirith view` neutralizes the SGR sequence in the displayed output and surfaces the hidden text. Treat the stream as untrusted: if it came from a downloaded log or an AI tool response, examine the hidden content before forwarding to another agent or chat client."
+
+[[rule]]
+id = "output_fake_prompt"
+title = "Fake shell prompt injected mid-stream"
+category = "output"
+severity_rationale = "Medium — a `[user@host ~]$` or `PS1`-shaped suffix appended to a command's output tricks the user into thinking the command finished and a fresh prompt is waiting, when they are actually still inside the wrapped command's output. The next keystrokes then go to that command, not the shell."
+description = "Output ends with (or contains mid-stream) a line shaped like a typical shell prompt: a user@host fragment, a `$ ` / `# ` / `> ` trailer, or a `PS1`-like pattern with no preceding newline that breaks the illusion. Used by attackers running a fake interactive program that captures the user's next command."
+examples_bad = ["A log line ending in `\\nalice@laptop ~ %% ` followed by no newline.", "Output containing `\\n[root@server ~]# ` between two unrelated lines."]
+examples_good = ["Real shell prompts in the user's actual terminal (those are not in scanned output)."]
+false_positive_guidance = "Educational content that documents prompts (e.g. tutorial logs with `$ command` examples) may match. v1 fires only on prompts at the END of the stream and on `root@`/`#` shapes — markdown-style `$ cmd` blocks inline in a paragraph do not fire."
+remediation = "If you see this in `tirith view` output, ignore any apparent prompt in the stream. The real shell prompt is below the rendered file, after tirith's own output. Press Ctrl+C if you typed into the embedded fake prompt before tirith caught it."
+
+[[rule]]
+id = "output_terminal_hyperlink_mismatch"
+title = "OSC 8 hyperlink visible text doesn't match link target"
+category = "output"
+severity_rationale = "High — OSC 8 (`\\e]8;;<url>\\e\\\\<text>\\e]8;;\\e\\\\`) lets a stream render clickable text whose visible label is one URL and whose actual link target is another. In a modern terminal, clicking opens the hidden URL — the visible URL is decoration."
+description = "An OSC 8 terminal hyperlink was found where the visible link text itself parses as a URL whose host differs from the hyperlink's `href` host. This is the terminal equivalent of a phishing `<a href=evil.com>github.com</a>`. We only flag when the visible text PARSES as a URL — 'Click here' vs `https://example.com` does not fire (legitimate URL-shortener pattern); `github.com` vs `https://evil.example` does fire."
+examples_bad = ["`\\e]8;;https://evil.example\\e\\\\github.com\\e]8;;\\e\\\\` — the visible `github.com` clicks through to `evil.example`."]
+examples_good = ["`\\e]8;;https://example.com/article/123\\e\\\\Read the full article\\e]8;;\\e\\\\` — visible text is human prose, not a URL.", "`\\e]8;;https://github.com/torvalds/linux\\e\\\\github.com/torvalds/linux\\e]8;;\\e\\\\` — same host on both sides."]
+false_positive_guidance = "URL shorteners with a vanity domain on the link and a different target URL as the visible text would fire (rare in the wild). If you trust the stream's source, add the source path to a policy allowlist."
+remediation = "`tirith view` strips the OSC 8 wrapper in the displayed output so you see both the visible text and the target. Click the target directly in your browser only after inspecting it; never click the rendered hyperlink as displayed by the originating tool."
+
+[[rule]]
+id = "output_title_manipulation"
+title = "Terminal title rewrite from output stream"
+category = "output"
+severity_rationale = "Info — `\\e]0;<title>\\a` / `\\e]2;<title>\\a` rewrites the terminal window's title bar. Not a direct attack, but used by malicious tools to mask a backgrounded shell as `'$EDITOR notes.txt'` so the user can't find the dangerous tab in their window list."
+description = "Output contains an OSC 0 or OSC 2 sequence that rewrites the terminal window title. Legitimate programs (your shell, vim, tmux) DO write the title, but they do it directly to /dev/tty — they don't emit it into a stream you pipe through `tirith view` or stash in a log file."
+examples_bad = ["A downloaded log file that opens with `\\e]0;Untitled\\a` to mask the source.", "An MCP tool response that pushes a title rewrite into its content payload."]
+examples_good = ["A log file with no OSC 0 / OSC 2 sequences."]
+false_positive_guidance = "Tools that capture a full PTY session (asciinema, terminal recorders) record the title-set sequences emitted by your shell during that session — those reach `tirith view` legitimately. If the source is your own captured PTY, the Info severity won't block anything and can be ignored."
+remediation = "`tirith view` neutralizes the title-set in the displayed output. The current title is whatever your shell last set; no manual reset is required after the rendered output ends."
+
+[[rule]]
+id = "output_clear_screen"
+title = "Screen-clear sequence in output stream"
+category = "output"
+severity_rationale = "Info — `\\e[2J` / `\\e[H` mid-stream wipe the visible terminal and home the cursor. Attackers use this to scroll your prior commands (and any unsafe content you noticed) off-screen, then render a fake 'all clear' banner where the suspicious output used to be."
+description = "Output contains an explicit ANSI screen-clear (`\\e[2J`) or cursor-home (`\\e[H`) sequence. Legitimate programs that clear the screen (top, htop, less) do it directly on /dev/tty — these sequences in a piped / saved stream are nearly always trying to hide what came before them."
+examples_bad = ["A captured CI log that opens with `\\e[2J\\e[H` to wipe the build context before printing a fake 'success' banner."]
+examples_good = ["A log file with no screen-clear sequences."]
+false_positive_guidance = "Recorded PTY sessions of programs like `less` or `top` that legitimately clear-and-redraw will include these sequences. The Info severity won't block anything; if the source is your own captured PTY, this is expected."
+remediation = "`tirith view` neutralizes the screen-clear in the displayed output. Read the rendered output above and below — nothing was actually wiped from your terminal."

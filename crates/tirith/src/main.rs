@@ -1038,6 +1038,71 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+
+    /// Render a file with terminal-deception sequences neutralized
+    #[command(after_help = "\
+Streams the file in 64 KiB chunks, neutralizes ANSI / OSC / DCS escape
+sequences and zero-width characters in the displayed output, and flags
+output-direction deception attacks (OSC 52 clipboard write, OSC 8 hyperlink
+mismatch, hidden text via fg==bg SGR, fake-prompt injection, screen-clear,
+title rewrite).
+
+The default scan cap is 16 MiB. Use --max-bytes to scan larger files (and
+accept the per-byte work that entails).
+
+Examples:
+  tirith view /var/log/system.log
+  tirith view --json --max-bytes 33554432 /tmp/build.log
+  cat /tmp/file | tirith view -")]
+    View {
+        /// File to view. Use `-` (or omit) to read stdin.
+        path: Option<String>,
+
+        /// Maximum bytes to scan. Default 16 MiB.
+        #[arg(long, default_value_t = cli::view::DEFAULT_MAX_BYTES)]
+        max_bytes: u64,
+
+        /// Output the verdict as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manage opt-in output-direction protections
+    #[command(after_help = "\
+Subcommands:
+  tirith output wrap on | off | status   — install/remove the `tirith-out`
+                                           shell wrapper that pipes a single
+                                           command's stdout/stderr through
+                                           `tirith view`.
+
+Honesty: the wrapper applies to INDIVIDUAL commands invoked via
+`tirith-out <cmd>`. It does NOT intercept output from anything run outside
+the wrapper.
+
+Examples:
+  tirith output wrap on | off | status")]
+    Output {
+        #[command(subcommand)]
+        action: OutputAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutputAction {
+    /// Install (on), remove (off), or report (status) the `tirith-out` wrapper
+    #[command(after_help = "\
+Installs a shell function `tirith-output-guard-wrap` (alias: `tirith-out`)
+in your shell profile that pipes the wrapped command's stdout/stderr through
+`tirith view`. Usage after enabling: `tirith-out ./my-script`.
+
+Examples:
+  tirith output wrap on
+  tirith output wrap off
+  tirith output wrap status")]
+    Wrap {
+        /// One of: on, off, status.
+        action: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3048,6 +3113,22 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::selfupdate::version(provenance, json)
         }
+
+        Commands::View {
+            path,
+            max_bytes,
+            json,
+        } => {
+            let path_arg = match path.as_deref() {
+                None | Some("-") => None,
+                Some(p) => Some(std::path::PathBuf::from(p)),
+            };
+            cli::view::run(path_arg.as_deref(), max_bytes, json)
+        }
+
+        Commands::Output { action } => match action {
+            OutputAction::Wrap { action } => cli::output_guard::run(&action),
+        },
     };
 
     std::process::exit(exit_code);

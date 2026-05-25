@@ -344,3 +344,22 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 # inherited status would misrepresent it. The hook above already returned
 # early for a non-interactive session, so this only runs interactively.
 $global:TIRITH_STATUS = 'blocks'
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# function tirith-output-guard-wrap {
+#     param([Parameter(ValueFromRemainingArguments=$true)]$Args)
+#     if ($Args.Count -eq 0) {
+#         Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'
+#         return
+#     }
+#     & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 -
+# }
+# Set-Alias tirith-out tirith-output-guard-wrap

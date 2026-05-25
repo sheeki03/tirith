@@ -373,6 +373,153 @@ fn has_unquoted_ampersand(input: &str, shell: ShellType) -> bool {
     false
 }
 
+/// Context flag for [`analyze_output`]. v1 carries no fields — reserved for
+/// later chunks (M7 ch4 MCP gateway, ch5 logs) to pass source-stream metadata
+/// without breaking the entry-point signature.
+#[derive(Debug, Clone, Default)]
+pub struct OutputContext {
+    /// Optional source-path hint for evidence (e.g. the file being viewed).
+    /// Never used to gate findings.
+    pub source_label: Option<String>,
+}
+
+/// Streaming state for [`analyze_output_chunk`] — carries the byte-scanner's
+/// rolling state, the accumulated `OutputScanResult`, and the captured plain
+/// text (used by `check_fake_prompt` at end-of-stream). Reuse this across
+/// chunks; pass `&mut` so streaming `tirith view` and the whole-buffer
+/// `analyze_output` share one state machine — important so an escape sequence
+/// split on a 64 KiB boundary is still detected.
+#[derive(Debug, Default)]
+pub struct OutputAnalyzerState {
+    scan_state: extract::OutputScanState,
+    scan_result: extract::OutputScanResult,
+    /// Captured plain text for end-of-stream prompt detection. We cap this at
+    /// the last few KiB to avoid pinning the whole file in memory.
+    tail_text: String,
+}
+
+const OUTPUT_TAIL_KEEP: usize = 16 * 1024;
+
+impl OutputAnalyzerState {
+    /// Drop everything but the last `OUTPUT_TAIL_KEEP` bytes of accumulated
+    /// text so we don't grow unbounded on a multi-GB stream.
+    fn append_tail(&mut self, chunk: &str) {
+        self.tail_text.push_str(chunk);
+        if self.tail_text.len() > OUTPUT_TAIL_KEEP * 2 {
+            let drop_to = self.tail_text.len() - OUTPUT_TAIL_KEEP;
+            // Safe truncate at a char boundary.
+            let mut cut = drop_to;
+            while cut < self.tail_text.len() && !self.tail_text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail_text.replace_range(..cut, "");
+        }
+    }
+}
+
+/// Streaming entry point — feed one 64 KiB (or any-sized) chunk and receive
+/// new findings produced by that chunk. State persists across calls.
+///
+/// The end-of-stream `OutputFakePrompt` check runs in [`finalize_output_chunks`]
+/// — the caller drives this after the last chunk.
+pub fn analyze_output_chunk(
+    chunk: &str,
+    state: &mut OutputAnalyzerState,
+) -> Vec<crate::verdict::Finding> {
+    // Snapshot lengths so we only translate freshly-discovered hits to findings.
+    let before = ScanSnapshot::take(&state.scan_result);
+
+    extract::scan_output_chunk(
+        chunk.as_bytes(),
+        &mut state.scan_state,
+        &mut state.scan_result,
+    );
+    state.append_tail(chunk);
+
+    before.new_findings(&state.scan_result)
+}
+
+/// End-of-stream hook — runs `check_fake_prompt` on the tail buffer. The
+/// streaming driver MUST call this exactly once after the last chunk so the
+/// final prompt-shape heuristic sees the complete trailing line.
+pub fn finalize_output_chunks(state: &OutputAnalyzerState) -> Vec<crate::verdict::Finding> {
+    crate::rules::output::check_fake_prompt(&state.tail_text)
+}
+
+/// Build a [`Verdict`] from the accumulated streaming state. Useful for
+/// callers that want a single object out of a streamed scan.
+pub fn analyze_output_finalize(state: &OutputAnalyzerState) -> Verdict {
+    let start = Instant::now();
+    let mut findings = crate::rules::output::check(&state.scan_result);
+    findings.extend(finalize_output_chunks(state));
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Verdict::from_findings(
+        findings,
+        3,
+        Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: Some(elapsed_ms),
+            total_ms: elapsed_ms,
+        },
+    )
+}
+
+/// Whole-buffer entry point used by M7 ch4 MCP filtering / M7 ch5 logs /
+/// any caller that has the full content in hand. Implemented as a thin
+/// one-chunk driver over [`analyze_output_chunk`] so the streaming code
+/// path and the whole-buffer path share the same byte-scanner state machine.
+pub fn analyze_output(input: &str, _ctx: OutputContext) -> Verdict {
+    let mut state = OutputAnalyzerState::default();
+    let _new = analyze_output_chunk(input, &mut state);
+    analyze_output_finalize(&state)
+}
+
+/// Snapshot of the streaming scan-result lengths, used by
+/// `analyze_output_chunk` to translate just the NEW hits into findings.
+struct ScanSnapshot {
+    osc52: usize,
+    title_set: usize,
+    screen_clear: usize,
+    hyperlinks: usize,
+    sgr: usize,
+    zero_width_runs: usize,
+}
+
+impl ScanSnapshot {
+    fn take(r: &extract::OutputScanResult) -> Self {
+        Self {
+            osc52: r.osc52.len(),
+            title_set: r.title_set.len(),
+            screen_clear: r.screen_clear.len(),
+            hyperlinks: r.hyperlinks.len(),
+            sgr: r.sgr.len(),
+            zero_width_runs: r.zero_width_runs.len(),
+        }
+    }
+
+    fn new_findings(&self, r: &extract::OutputScanResult) -> Vec<crate::verdict::Finding> {
+        // Construct a fresh scan slice covering only the newly-appended hits.
+        let mut slice = extract::OutputScanResult::default();
+        slice.osc52.extend_from_slice(&r.osc52[self.osc52..]);
+        slice
+            .title_set
+            .extend_from_slice(&r.title_set[self.title_set..]);
+        slice
+            .screen_clear
+            .extend_from_slice(&r.screen_clear[self.screen_clear..]);
+        slice
+            .hyperlinks
+            .extend_from_slice(&r.hyperlinks[self.hyperlinks..]);
+        slice.sgr.extend_from_slice(&r.sgr[self.sgr..]);
+        slice
+            .zero_width_runs
+            .extend_from_slice(&r.zero_width_runs[self.zero_width_runs..]);
+        crate::rules::output::check(&slice)
+    }
+}
+
 /// Run the tiered analysis pipeline.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0

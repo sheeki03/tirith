@@ -1,0 +1,173 @@
+# Output-direction rule fixtures (M7 ch1)
+#
+# These fire from `engine::analyze_output`, NOT `engine::analyze`. The
+# `engine::analyze` golden-fixture runner does NOT cover them — they are
+# tested by the dedicated `test_output_fixtures` driver in golden_fixtures.rs
+# which calls `engine::analyze_output` directly.
+#
+# Context field is left as "exec" (any value works — the test runner ignores
+# it for output fixtures). raw_bytes is used where the escape sequence
+# encoding matters; the `input` field is decoded UTF-8 for documentation.
+
+# ── OutputOsc52ClipboardWrite ────────────────────────────────────────────
+
+[[fixture]]
+name = "osc52_clipboard_write_bel_term"
+min_milestone = 7
+input = "before\u001b]52;c;aGVsbG8=\u0007after"
+context = "exec"
+expected_action = "block"
+expected_rules = ["output_osc52_clipboard_write"]
+
+[[fixture]]
+name = "osc52_clipboard_write_st_term"
+min_milestone = 7
+input = "x\u001b]52;c;dGVzdA==\u001b\\y"
+context = "exec"
+expected_action = "block"
+expected_rules = ["output_osc52_clipboard_write"]
+
+# ── OutputTitleManipulation ──────────────────────────────────────────────
+
+[[fixture]]
+name = "title_set_osc0"
+min_milestone = 7
+input = "\u001b]0;Innocent Title\u0007log line\n"
+context = "exec"
+expected_action = "allow"  # Info severity → Allow
+expected_rules = ["output_title_manipulation"]
+
+[[fixture]]
+name = "title_set_osc2"
+min_milestone = 7
+input = "\u001b]2;$EDITOR notes.txt\u0007rest\n"
+context = "exec"
+expected_action = "allow"  # Info severity → Allow
+expected_rules = ["output_title_manipulation"]
+
+# ── OutputClearScreen ────────────────────────────────────────────────────
+
+[[fixture]]
+name = "clear_screen_2j"
+min_milestone = 7
+input = "previous output\u001b[2Jfresh banner\n"
+context = "exec"
+expected_action = "allow"  # Info severity → Allow
+expected_rules = ["output_clear_screen"]
+
+[[fixture]]
+name = "cursor_home"
+min_milestone = 7
+input = "old\u001b[Hnew\n"
+context = "exec"
+expected_action = "allow"  # Info severity → Allow
+expected_rules = ["output_clear_screen"]
+
+# ── OutputTerminalHyperlinkMismatch ──────────────────────────────────────
+
+[[fixture]]
+name = "osc8_visible_url_different_host"
+min_milestone = 7
+input = "Click \u001b]8;;https://evil.example\u001b\\github.com\u001b]8;;\u001b\\ now."
+context = "exec"
+expected_action = "block"
+expected_rules = ["output_terminal_hyperlink_mismatch"]
+
+[[fixture]]
+name = "osc8_visible_prose_no_fire"
+min_milestone = 7
+input = "Read \u001b]8;;https://example.com/article/1\u001b\\the full article\u001b]8;;\u001b\\."
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["output_terminal_hyperlink_mismatch"]
+
+[[fixture]]
+name = "osc8_same_host_no_fire"
+min_milestone = 7
+input = "Open \u001b]8;;https://github.com/torvalds/linux\u001b\\github.com/torvalds/linux\u001b]8;;\u001b\\."
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["output_terminal_hyperlink_mismatch"]
+
+# ── OutputHiddenText ─────────────────────────────────────────────────────
+
+[[fixture]]
+name = "hidden_text_fg_eq_bg_sgr"
+min_milestone = 7
+input = "visible\u001b[37;47mhidden\u001b[0m more"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["output_hidden_text"]
+
+[[fixture]]
+name = "hidden_text_long_zero_width_run"
+min_milestone = 7
+input = "abc​​​​​​​​​​​​def"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["output_hidden_text"]
+
+[[fixture]]
+name = "hidden_text_short_zero_width_no_fire"
+min_milestone = 7
+input = "abc​​def"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["output_hidden_text"]
+
+[[fixture]]
+name = "clean_sgr_fg_only_no_fire"
+min_milestone = 7
+input = "\u001b[31mERROR\u001b[0m: something failed"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["output_hidden_text"]
+
+# ── OutputFakePrompt ─────────────────────────────────────────────────────
+
+[[fixture]]
+name = "fake_root_prompt_inline"
+min_milestone = 7
+input = "some output\n[root@target ~]# \nmore output\n"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["output_fake_prompt"]
+
+[[fixture]]
+name = "fake_user_prompt_at_eof"
+min_milestone = 7
+input = "running command\nalice@laptop ~ $ "
+context = "exec"
+expected_action = "warn"
+expected_rules = ["output_fake_prompt"]
+
+[[fixture]]
+name = "tutorial_inline_dollar_no_fire"
+min_milestone = 7
+input = "Run the following:\n$ npm install\nThen build.\n"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["output_fake_prompt"]
+
+# ── Clean stream — no findings ───────────────────────────────────────────
+
+[[fixture]]
+name = "clean_output_plain_text"
+min_milestone = 7
+input = "hello world\nthis is a clean log\n"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "clean_output_basic_sgr_color"
+min_milestone = 7
+input = "\u001b[31mError:\u001b[0m something failed\n\u001b[32mOK:\u001b[0m all good\n"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

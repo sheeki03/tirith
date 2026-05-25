@@ -91,6 +91,9 @@ help_example_tests! {
     help_update_rollback => (["update", "--help"], "tirith update --rollback");
     help_version    => (["version", "--help"], "tirith version --provenance");
     help_lab        => (["lab", "--help"], "tirith lab --filter powershell");
+    help_view       => (["view", "--help"], "tirith view /var/log/system.log");
+    help_output     => (["output", "--help"], "tirith output wrap on | off | status");
+    help_output_wrap => (["output", "wrap", "--help"], "tirith output wrap on");
 }
 
 #[test]

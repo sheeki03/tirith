@@ -54,3 +54,21 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
         }
     )
 }
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# def tirith-output-guard-wrap [...cmd] {
+#     if ($cmd | length) == 0 {
+#         print --stderr 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'
+#         return 2
+#     }
+#     run-external $cmd.0 ...($cmd | skip 1) | tirith view --max-bytes 16777216 -
+# }
+# alias tirith-out = tirith-output-guard-wrap

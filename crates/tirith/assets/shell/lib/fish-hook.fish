@@ -344,3 +344,21 @@ end
 if status is-interactive
     set -g TIRITH_STATUS blocks
 end
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# function tirith-output-guard-wrap
+#     if test (count $argv) -eq 0
+#         echo 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]' >&2
+#         return 2
+#     end
+#     $argv 2>&1 | tirith view --max-bytes 16777216 -
+# end
+# alias tirith-out 'tirith-output-guard-wrap'

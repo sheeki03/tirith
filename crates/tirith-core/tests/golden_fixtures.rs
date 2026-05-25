@@ -494,6 +494,10 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "threatintel.toml",
 ];
 
+/// Output-direction fixture files. NOT in `ALL_FIXTURE_FILES` — those drive
+/// `engine::analyze`, whereas output fixtures need `engine::analyze_output`.
+const OUTPUT_FIXTURE_FILES: &[&str] = &["output.toml"];
+
 /// Complete list of all RuleId variants (snake_case serialized form).
 /// MAINTENANCE: when adding a new RuleId variant, add it here too — the test
 /// will fail if a variant is missing, catching the omission.
@@ -653,6 +657,13 @@ const ALL_RULE_IDS: &[&str] = &[
     "custom_rule_match",
     // License/infrastructure
     "license_required",
+    // Output-direction rules (M7 ch1)
+    "output_osc52_clipboard_write",
+    "output_hidden_text",
+    "output_fake_prompt",
+    "output_terminal_hyperlink_mismatch",
+    "output_title_manipulation",
+    "output_clear_screen",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -734,7 +745,123 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "package_policy_typosquat_distance",
     "package_policy_unknown_package_with_install_scripts",
     "package_policy_not_found",
+    // M7 ch1 — output-direction rules fire from `engine::analyze_output`,
+    // NOT the `engine::analyze` pipeline that the golden-fixture runner
+    // drives. They are covered by `tests/fixtures/output.toml` via a
+    // dedicated test (`test_output_fixtures`) below and by per-rule unit
+    // tests in `rules/output.rs` and `extract.rs::output_scan_tests`.
+    "output_osc52_clipboard_write",
+    "output_hidden_text",
+    "output_fake_prompt",
+    "output_terminal_hyperlink_mismatch",
+    "output_title_manipulation",
+    "output_clear_screen",
 ];
+
+/// Collect expected_rules across the output-direction fixture files.
+fn collect_output_fixture_rules() -> HashSet<String> {
+    let mut covered = HashSet::new();
+    for file in OUTPUT_FIXTURE_FILES {
+        for fixture in load_fixtures(file) {
+            for rule in &fixture.expected_rules {
+                covered.insert(rule.clone());
+            }
+        }
+    }
+    covered
+}
+
+/// Drive the output-direction rule pipeline against the dedicated fixture
+/// files. This is the analogue of [`test_hostname_fixtures`] etc. for the
+/// `engine::analyze_output` sibling pipeline.
+#[test]
+fn test_output_fixtures() {
+    use tirith_core::engine::{analyze_output, OutputContext};
+
+    for file in OUTPUT_FIXTURE_FILES {
+        let fixtures = load_fixtures(file);
+        let count = fixtures.len();
+        for fixture in &fixtures {
+            let verdict = analyze_output(&fixture.input, OutputContext::default());
+            let expected = match fixture.expected_action.as_str() {
+                "allow" => Action::Allow,
+                "warn" => Action::Warn,
+                "block" => Action::Block,
+                other => panic!(
+                    "Unknown expected_action '{}' in output fixture {}",
+                    other, fixture.name
+                ),
+            };
+            assert_eq!(
+                verdict.action,
+                expected,
+                "output fixture '{}': expected {:?} got {:?}; findings = {:?}",
+                fixture.name,
+                expected,
+                verdict.action,
+                verdict
+                    .findings
+                    .iter()
+                    .map(|f| format!("{}: {}", f.rule_id, f.title))
+                    .collect::<Vec<_>>()
+            );
+
+            let found_rules: Vec<String> = verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect();
+            for expected_rule in &fixture.expected_rules {
+                assert!(
+                    found_rules.contains(expected_rule),
+                    "output fixture '{}': expected rule '{}' not found. Found: {:?}",
+                    fixture.name,
+                    expected_rule,
+                    found_rules
+                );
+            }
+            for forbidden in &fixture.forbidden_rules {
+                assert!(
+                    !found_rules.contains(forbidden),
+                    "output fixture '{}': forbidden rule '{}' was found. Findings: {:?}",
+                    fixture.name,
+                    forbidden,
+                    found_rules
+                );
+            }
+        }
+        eprintln!("Passed {count} output fixtures ({file})");
+    }
+}
+
+/// Sibling of `test_all_rule_ids_have_fixture_coverage` that pins coverage
+/// for the 6 output-direction rules against the `output.toml` fixtures.
+#[test]
+fn test_output_rule_ids_have_fixture_coverage() {
+    let covered = collect_output_fixture_rules();
+    let required = [
+        "output_osc52_clipboard_write",
+        "output_hidden_text",
+        "output_fake_prompt",
+        "output_terminal_hyperlink_mismatch",
+        "output_title_manipulation",
+        "output_clear_screen",
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|r| !covered.contains(*r))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "Output-direction rules missing fixture coverage in tests/fixtures/output.toml:\n{}",
+        missing
+            .iter()
+            .map(|r| format!("  - {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
 
 #[test]
 fn test_all_rule_ids_have_fixture_coverage() {
@@ -904,6 +1031,13 @@ fn test_rule_id_list_is_complete() {
         RuleId::PolicyBlocklisted,
         RuleId::AgentDeniedByPolicy,
         RuleId::LicenseRequired,
+        // Output-direction rules (M7 ch1)
+        RuleId::OutputOsc52ClipboardWrite,
+        RuleId::OutputHiddenText,
+        RuleId::OutputFakePrompt,
+        RuleId::OutputTerminalHyperlinkMismatch,
+        RuleId::OutputTitleManipulation,
+        RuleId::OutputClearScreen,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
