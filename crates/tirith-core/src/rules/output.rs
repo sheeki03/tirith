@@ -418,14 +418,27 @@ fn parse_url_host(s: &str) -> Option<String> {
         if !host_only.contains('.') {
             return None;
         }
-        // TLD-shape check: the last dot-segment must be ≥2 chars, all alpha
-        // (no digits), no leading/trailing hyphen. Rejects `v1.2.3`, `1.0.0`,
-        // `10.0.0.1` (IPs are handled by `Url::parse` above), `foo.123`.
+        // TLD-shape check: the last dot-segment must be ≥2 chars and either
+        // (a) all ASCII alphabetic — rejects `v1.2.3`, `1.0.0`, `foo.123`, or
+        // (b) an IDN punycode label of the form `xn--<rest>` where <rest> is
+        //     `[a-z0-9-]+`. Accepts real IDN TLDs like `xn--p1ai` (.рф),
+        //     `xn--80akhbyknj4f` (.испытание) so visible-text-vs-href phishing
+        //     against IDN hostnames is still caught.
+        //
+        // IPs are handled by `Url::parse` above; this branch only sees bare
+        // host-shaped strings that failed URL parsing.
         let last = host_only.rsplit('.').next()?;
         if last.len() < 2 {
             return None;
         }
-        if !last.chars().all(|c| c.is_ascii_alphabetic()) {
+        let last_lower = last.to_ascii_lowercase();
+        let is_alpha_tld = last_lower.chars().all(|c| c.is_ascii_alphabetic());
+        let is_punycode_tld = last_lower.starts_with("xn--")
+            && last_lower.len() > 4
+            && last_lower[4..]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !is_alpha_tld && !is_punycode_tld {
             return None;
         }
         return Some(host_only.to_ascii_lowercase());
@@ -599,6 +612,50 @@ mod tests {
             s.hyperlinks.push(OutputHyperlinkHit {
                 offset: 0,
                 uri: "https://example.com/release".to_string(),
+                visible: label.to_string(),
+            });
+            let findings = check(&s);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::OutputTerminalHyperlinkMismatch),
+                "version-shaped label {label:?} must NOT fire mismatch: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyperlink_fires_when_visible_text_is_a_punycode_host() {
+        // Regression: the alpha-only TLD guard added to suppress version
+        // strings (`v1.2.3`) accidentally rejected legitimate punycode IDN
+        // TLDs like `xn--p1ai` (.рф), which is exactly the visible-text-vs-
+        // href shape the OSC8 mismatch rule is supposed to catch.
+        let mut s = scan();
+        s.hyperlinks.push(OutputHyperlinkHit {
+            offset: 0,
+            uri: "https://example.com/path".to_string(),
+            visible: "xn--80ak6aa92e.xn--p1ai".to_string(),
+        });
+        let findings = check(&s);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::OutputTerminalHyperlinkMismatch),
+            "punycode IDN host label must fire mismatch on different href host: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hyperlink_no_fire_when_visible_text_is_version_or_numeric() {
+        // Companion to the punycode test: confirm the version-string
+        // suppression still holds after widening the TLD guard to accept
+        // `xn--…` labels. Both `v1.2.3` and a bare `1.0.0` semver shape
+        // must continue to be ignored on legit hrefs.
+        for label in ["v1.2.3", "1.0.0"] {
+            let mut s = scan();
+            s.hyperlinks.push(OutputHyperlinkHit {
+                offset: 0,
+                uri: "https://github.com/owner/repo/releases".to_string(),
                 visible: label.to_string(),
             });
             let findings = check(&s);
