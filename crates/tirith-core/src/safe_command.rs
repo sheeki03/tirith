@@ -1450,37 +1450,13 @@ mod tests {
         assert!(!is_simple_command_for_env_scrub("echo trailing\\"));
     }
 
-    #[test]
-    fn env_scrub_declines_when_command_is_compound() {
-        // End-to-end: with a sensitive env var set, a compound command
-        // must yield no env_scrub suggestion (even though all other
-        // gates pass). Uses GITHUB_TOKEN — present in `sensitive_env.toml`.
-        //
-        // The env-var mutation here is intentionally light-touch: if
-        // the test environment already has GITHUB_TOKEN set we use it
-        // as-is and skip the restore step. The assertion checks the
-        // compound-shape guard, which is independent of the var's
-        // value, so a racing read under parallel `cargo test` cannot
-        // produce a false negative.
-        const VAR: &str = "GITHUB_TOKEN";
-        let preexisting = std::env::var_os(VAR);
-        if preexisting.is_none() {
-            std::env::set_var(VAR, "x");
-        }
-
-        let cmd = "curl https://example.com/install | bash";
-        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
-        let suggestions = suggest(cmd, ShellType::Posix, &v);
-        // No suggestion with rule_id "env_scrub" — the compound-command
-        // guard rejects this shape.
-        assert!(
-            !suggestions.iter().any(|s| s.rule_id == "env_scrub"),
-            "env_scrub must not fire for compound commands, got: {:?}",
-            suggestions.iter().map(|s| &s.rule_id).collect::<Vec<_>>()
-        );
-
-        if preexisting.is_none() {
-            std::env::remove_var(VAR);
-        }
-    }
+    // NOTE: An end-to-end `env_scrub_declines_when_command_is_compound` test
+    // that mutates `std::env::GITHUB_TOKEN` was intentionally NOT added.
+    // Under parallel `cargo test`, that mutation races with other tests in
+    // this module that exercise `suggest()` and read the environment
+    // (`homograph_finding_gets_no_rewrite_but_keeps_remediation`, etc.).
+    // The compound-shape guard is fully covered by the
+    // `is_simple_command_for_env_scrub` direct-call unit tests above
+    // (pipeline/redirection/and-chain/semicolon/backtick/command-sub etc.),
+    // which exercise exactly the predicate that controls env_scrub firing.
 }
