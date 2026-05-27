@@ -532,7 +532,274 @@ pub fn check(
         }
     }
 
+    // M8 ch5 — `.devcontainer/devcontainer.json` (or `.devcontainer.json`) is
+    // a known config file. Scan its `runArgs` / `mounts` arrays for
+    // `--privileged` and sensitive bind-mount sources. Uses the shared
+    // strip-then-parse JSONC tolerant reader.
+    if let Some(path) = file_path {
+        if is_devcontainer_file(path) {
+            check_devcontainer_config(content, &mut findings);
+        }
+    }
+
     findings
+}
+
+/// Returns `true` when `path` is a devcontainer.json (nested under
+/// `.devcontainer/` or at the repo root as `.devcontainer.json`).
+fn is_devcontainer_file(path: &Path) -> bool {
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if basename == ".devcontainer.json" {
+        return true;
+    }
+    if basename == "devcontainer.json" {
+        // Accept any path whose basename is devcontainer.json — covers
+        // `.devcontainer/devcontainer.json` (the most common layout) as
+        // well as nested feature variants like
+        // `.devcontainer/dev/devcontainer.json` that the VS Code remote
+        // extension also recognizes.
+        return true;
+    }
+    false
+}
+
+/// M8 ch5 — scan a devcontainer.json's `runArgs` and `mounts` arrays
+/// for high-risk container-runtime settings. Uses the shared
+/// `strip_jsonc_comments` helper so JSONC comments / trailing commas
+/// don't break the parser.
+fn check_devcontainer_config(content: &str, findings: &mut Vec<Finding>) {
+    let stripped = crate::devcontainer_writer::strip_jsonc_comments(content);
+    let value: serde_json::Value = match serde_json::from_str(&stripped) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // runArgs is an array of strings forwarded verbatim to `docker run`.
+    if let Some(args) = value.get("runArgs").and_then(|v| v.as_array()) {
+        let has_privileged = args.iter().any(|v| {
+            v.as_str()
+                .map(|s| s == "--privileged" || s == "--privileged=true")
+                .unwrap_or(false)
+        });
+        if has_privileged {
+            findings.push(Finding {
+                rule_id: RuleId::DockerRunPrivileged,
+                severity: Severity::High,
+                title: "devcontainer.json `runArgs` includes `--privileged`".to_string(),
+                description: "The `runArgs` array forwards arguments directly to `docker run`. A \
+                     `--privileged` entry disables every Linux kernel security boundary \
+                     for the dev container — a misbehaving extension, supply-chain script, \
+                     or rogue agent inside the container becomes equivalent to root on the \
+                     host. Remove the `--privileged` entry and add only the specific \
+                     `--cap-add=<name>` capabilities the workload needs."
+                    .to_string(),
+                evidence: vec![Evidence::Text {
+                    detail: "runArgs contains --privileged".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+
+        // -v / --volume entries inside runArgs too. The shape is
+        // `runArgs: ["-v", "/var/run/docker.sock:/var/run/docker.sock", ...]`
+        // OR `["--volume=/etc:/host/etc", ...]`.
+        if let Some(src) = devcontainer_run_args_bind_mount(args) {
+            findings.push(Finding {
+                rule_id: RuleId::DockerRunSensitiveBindMount,
+                severity: Severity::High,
+                title: format!("devcontainer.json `runArgs` mounts sensitive host path '{src}'"),
+                description: format!(
+                    "The `runArgs` array forwards a bind-mount that exposes a sensitive \
+                     host path (`{src}`) inside the dev container. Once the container has \
+                     the host's docker socket / SSH keys / AWS credentials, every process \
+                     inside is operating with the host operator's authority. Use a narrower \
+                     bind (only the subdirectory the workload needs) or move the credential \
+                     out of the container."
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!("runArgs bind-mount source: {src}"),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+
+    // The dedicated `mounts` array uses the same `type=bind,source=…`
+    // shape as `docker run --mount`. Each entry is a string OR an object
+    // with a `source` / `src` field.
+    if let Some(mounts) = value.get("mounts").and_then(|v| v.as_array()) {
+        if let Some(src) = devcontainer_mounts_sensitive(mounts) {
+            findings.push(Finding {
+                rule_id: RuleId::DockerRunSensitiveBindMount,
+                severity: Severity::High,
+                title: format!("devcontainer.json `mounts` exposes sensitive host path '{src}'"),
+                description: format!(
+                    "A `mounts` entry binds `{src}` from the host into the container. \
+                     This is the devcontainer.json equivalent of `docker run -v {src}:…` \
+                     and carries the same escalation surface. Narrow the bind to a \
+                     specific subdirectory, or remove the mount entirely if the \
+                     container does not need that access."
+                ),
+                evidence: vec![Evidence::Text {
+                    detail: format!("mounts source: {src}"),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
+    }
+}
+
+/// Walk `runArgs` looking for a `-v src:dst` / `--volume=src:dst` /
+/// `--mount source=src` whose source side is on the sensitive list.
+fn devcontainer_run_args_bind_mount(args: &[serde_json::Value]) -> Option<String> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let s = match arg.as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+        if s == "-v" || s == "--volume" {
+            if let Some(next) = iter.next() {
+                if let Some(v) = next.as_str() {
+                    if let Some(src) = v.split(':').next() {
+                        if is_sensitive_bind_source(src) {
+                            return Some(src.to_string());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("--volume=") {
+            if let Some(src) = rest.split(':').next() {
+                if is_sensitive_bind_source(src) {
+                    return Some(src.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("-v=") {
+            if let Some(src) = rest.split(':').next() {
+                if is_sensitive_bind_source(src) {
+                    return Some(src.to_string());
+                }
+            }
+            continue;
+        }
+        if s == "--mount" {
+            if let Some(next) = iter.next() {
+                if let Some(v) = next.as_str() {
+                    if let Some(src) = mount_spec_source(v) {
+                        if is_sensitive_bind_source(&src) {
+                            return Some(src);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("--mount=") {
+            if let Some(src) = mount_spec_source(rest) {
+                if is_sensitive_bind_source(&src) {
+                    return Some(src);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Walk `mounts` — each entry is either a `type=bind,source=…,target=…`
+/// string or an object with a `source` / `src` field.
+fn devcontainer_mounts_sensitive(mounts: &[serde_json::Value]) -> Option<String> {
+    for m in mounts {
+        if let Some(s) = m.as_str() {
+            if let Some(src) = mount_spec_source(s) {
+                if is_sensitive_bind_source(&src) {
+                    return Some(src);
+                }
+            }
+            continue;
+        }
+        if let Some(obj) = m.as_object() {
+            let src = obj
+                .get("source")
+                .or_else(|| obj.get("src"))
+                .and_then(|v| v.as_str());
+            if let Some(src) = src {
+                if is_sensitive_bind_source(src) {
+                    return Some(src.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn mount_spec_source(spec: &str) -> Option<String> {
+    for part in spec.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("source=") {
+            return Some(v.to_string());
+        }
+        if let Some(v) = part.strip_prefix("src=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn is_sensitive_bind_source(src: &str) -> bool {
+    let sensitive_exact = [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/var/run/podman/podman.sock",
+        "~/.ssh",
+        "~/.aws",
+        "~/.kube",
+        "~/.docker",
+        "/etc",
+        "/root/.ssh",
+        "/root/.aws",
+        "${env:HOME}/.ssh",
+        "${env:HOME}/.aws",
+        "${env:HOME}/.docker",
+        "${localEnv:HOME}/.ssh",
+        "${localEnv:HOME}/.aws",
+        "${localEnv:HOME}/.docker",
+    ];
+    if sensitive_exact.contains(&src) {
+        return true;
+    }
+    let trimmed = src.trim_end_matches('/');
+    if sensitive_exact.contains(&trimmed) {
+        return true;
+    }
+    let prefixes = [
+        "/etc/",
+        "~/.ssh/",
+        "~/.aws/",
+        "~/.kube/",
+        "~/.docker/",
+        "${env:HOME}/.ssh/",
+        "${env:HOME}/.aws/",
+        "${localEnv:HOME}/.ssh/",
+        "${localEnv:HOME}/.aws/",
+    ];
+    prefixes.iter().any(|p| src.starts_with(p))
 }
 
 /// Check if a file path matches a known AI config file (test helper).
@@ -1817,6 +2084,97 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::McpInsecureServer),
             "trust matching must be case-sensitive: {findings:?}",
+        );
+    }
+
+    // M8 ch5 — devcontainer.json scanning.
+
+    #[test]
+    fn test_devcontainer_privileged_run_args_fires() {
+        let content = r#"{
+            // comment ok
+            "name": "demo",
+            "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+            "runArgs": ["--privileged"],
+        }"#;
+        let findings = check(
+            content,
+            Some(Path::new(".devcontainer/devcontainer.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DockerRunPrivileged),
+            "devcontainer.json with runArgs[--privileged] must fire: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_devcontainer_mounts_ssh_fires() {
+        let content = r#"{
+            "name": "demo",
+            "mounts": ["source=${env:HOME}/.ssh,target=/root/.ssh,type=bind"]
+        }"#;
+        let findings = check(
+            content,
+            Some(Path::new(".devcontainer/devcontainer.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DockerRunSensitiveBindMount),
+            "devcontainer.json with mounts[~/.ssh] must fire: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_devcontainer_clean_does_not_fire() {
+        let content = r#"{
+            "name": "demo",
+            "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+            "runArgs": ["--cap-add=NET_ADMIN"],
+            "mounts": ["source=/workspace,target=/workspace,type=bind"]
+        }"#;
+        let findings = check(
+            content,
+            Some(Path::new(".devcontainer/devcontainer.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f.rule_id,
+                RuleId::DockerRunPrivileged | RuleId::DockerRunSensitiveBindMount
+            )),
+            "clean devcontainer.json must not fire container rules: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_devcontainer_docker_sock_run_args_fires() {
+        let content = r#"{
+            "name": "demo",
+            "runArgs": ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+        }"#;
+        let findings = check(
+            content,
+            Some(Path::new(".devcontainer.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DockerRunSensitiveBindMount),
+            "devcontainer.json with docker-sock runArgs must fire: {findings:?}",
         );
     }
 }

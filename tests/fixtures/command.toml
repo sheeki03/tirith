@@ -1188,36 +1188,36 @@ expected_action = "allow"
 expected_rules = []
 
 [[fixture]]
-name = "docker_local_privileged_allow"
-min_milestone = 1
+name = "docker_local_privileged_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run --privileged myimage"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_lowercase_h_hostname_allow"
-min_milestone = 1
+name = "docker_lowercase_h_hostname_with_privileged_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run -h tcp://somename --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_container_env_e_allow"
-min_milestone = 1
+name = "docker_container_env_e_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run -e DOCKER_HOST=tcp://target:2375 --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
-name = "docker_container_env_flag_allow"
-min_milestone = 1
+name = "docker_container_env_flag_blocks_m8_ch5"
+min_milestone = 8
 input = "docker run --env DOCKER_HOST=tcp://target:2375 --privileged alpine"
 context = "exec"
-expected_action = "allow"
-expected_rules = []
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
 
 [[fixture]]
 name = "docker_remote_mount_src_last"
@@ -1948,6 +1948,32 @@ expected_rules = []
 name = "sudo_chmod_narrow_allows"
 min_milestone = 8
 input = "sudo chmod -R 755 /home/me/proj"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+# M8 ch5 — container-runtime rules.
+
+[[fixture]]
+name = "docker_run_privileged_blocks"
+min_milestone = 8
+input = "docker run --privileged alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
+
+[[fixture]]
+name = "docker_run_docker_sock_bind_mount_blocks"
+min_milestone = 8
+input = "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"
+context = "exec"
+expected_action = "block"
+expected_rules = ["docker_run_sensitive_bind_mount"]
+
+[[fixture]]
+name = "docker_run_benign_allows"
+min_milestone = 8
+input = "docker run --rm alpine echo ok"
 context = "exec"
 expected_action = "allow"
 expected_rules = []

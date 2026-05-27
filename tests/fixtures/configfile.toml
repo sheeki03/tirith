@@ -722,3 +722,23 @@ context = "file"
 file_path = ".github/hooks/copilot-cli-policy.json"
 expected_action = "block"
 expected_rules = ["config_injection"]
+
+# M8 ch5 — devcontainer.json scanning.
+
+[[fixture]]
+name = "devcontainer_run_args_privileged_blocks"
+min_milestone = 8
+input = "{\n  // privileged dev container\n  \"name\": \"demo\",\n  \"image\": \"mcr.microsoft.com/devcontainers/base:ubuntu\",\n  \"runArgs\": [\"--privileged\"]\n}"
+context = "file"
+file_path = ".devcontainer/devcontainer.json"
+expected_action = "block"
+expected_rules = ["docker_run_privileged"]
+
+[[fixture]]
+name = "devcontainer_mounts_ssh_blocks"
+min_milestone = 8
+input = '{ "name": "demo", "mounts": ["source=${env:HOME}/.ssh,target=/root/.ssh,type=bind"] }'
+context = "file"
+file_path = ".devcontainer/devcontainer.json"
+expected_action = "block"
+expected_rules = ["docker_run_sensitive_bind_mount"]

@@ -687,6 +687,21 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "IaC CLIs for apply-gate / destroy detection (M8 ch3)",
     },
     PatternEntry {
+        id: "docker_exec",
+        // M8 ch5 — `docker exec` and `podman exec` against a labeled
+        // production container. The existing `docker_command` PATTERN_TABLE
+        // entry matches `docker (pull|run|build|create|compose|image)` but
+        // NOT `exec`, so the container-runtime exec rule needs its own
+        // tier-1 admission ticket.
+        //
+        // The privileged-run and sensitive-bind-mount rules ride on the
+        // existing `docker_command` entry (which already matches `docker
+        // run` / `docker create`).
+        tier1_exec_fragments: &[r"(?:docker|podman)\s+exec"],
+        tier1_paste_only_fragments: &[],
+        notes: "Docker / Podman exec subcommand for prod-container detection (M8 ch5)",
+    },
+    PatternEntry {
         id: "sudo_cmd",
         // M8 ch4 — `sudo` invocations. The PATTERN_TABLE entry is a
         // coarse tier-1 probe; the precise interactive-shell /
@@ -1092,6 +1107,13 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "sudo_recursive_perms_broad_path",
         "SudoRecursivePermsBroadPath",
     ),
+    // Container-runtime rules (M8 ch5).
+    ("docker_run_privileged", "DockerRunPrivileged"),
+    (
+        "docker_run_sensitive_bind_mount",
+        "DockerRunSensitiveBindMount",
+    ),
+    ("docker_exec_prod_container", "DockerExecProdContainer"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

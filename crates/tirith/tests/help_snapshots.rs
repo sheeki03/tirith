@@ -131,6 +131,13 @@ help_example_tests! {
     help_sudo_guard            => (["sudo", "guard", "--help"], "tirith sudo guard on");
     help_sudo_session          => (["sudo", "session", "--help"], "tirith sudo session start --ttl 30m --reason");
     help_sudo_require_reason   => (["sudo", "require-reason", "--help"], "tirith sudo require-reason on");
+    // M8 ch5 — `tirith devcontainer guard|inject` and `tirith codespaces setup|inject`.
+    help_devcontainer          => (["devcontainer", "--help"], "tirith devcontainer guard on");
+    help_devcontainer_guard    => (["devcontainer", "guard", "--help"], "tirith devcontainer guard on");
+    help_devcontainer_inject   => (["devcontainer", "inject", "--help"], "tirith devcontainer inject");
+    help_codespaces            => (["codespaces", "--help"], "tirith codespaces setup");
+    help_codespaces_setup      => (["codespaces", "setup", "--help"], "tirith codespaces setup");
+    help_codespaces_inject     => (["codespaces", "inject", "--help"], "tirith codespaces inject");
 }
 
 #[test]

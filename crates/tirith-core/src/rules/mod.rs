@@ -4,6 +4,7 @@ pub mod cloaking;
 pub mod codefile;
 pub mod command;
 pub mod configfile;
+pub mod container;
 pub mod context;
 pub mod credential;
 pub mod custom;

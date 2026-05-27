@@ -688,6 +688,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "sudo_tee_system_file",
     "sudo_download_install",
     "sudo_recursive_perms_broad_path",
+    // Container-runtime rules (M8 ch5)
+    "docker_run_privileged",
+    "docker_run_sensitive_bind_mount",
+    "docker_exec_prod_container",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -827,6 +831,13 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "iac_destroy_prod",
     "iac_plan_high_risk_changes",
     "iac_plan_hash_mismatch",
+    // M8 ch5 — `docker_exec_prod_container` requires an operator-
+    // supplied `container:<name>` entry in `policy.context_labels`,
+    // which the static fixture runner does not seed. Covered by unit
+    // tests in `rules/container.rs`. The `docker_run_privileged` and
+    // `docker_run_sensitive_bind_mount` rules DO have static fixtures
+    // (see `command.toml`).
+    "docker_exec_prod_container",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1138,6 +1149,10 @@ fn test_rule_id_list_is_complete() {
         RuleId::SudoTeeSystemFile,
         RuleId::SudoDownloadInstall,
         RuleId::SudoRecursivePermsBroadPath,
+        // Container-runtime rules (M8 ch5)
+        RuleId::DockerRunPrivileged,
+        RuleId::DockerRunSensitiveBindMount,
+        RuleId::DockerExecProdContainer,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
@@ -1210,6 +1225,9 @@ fn test_no_url_rules_have_no_url_fixtures() {
         "notebook_suspicious_output",   // .ipynb scan, no URL needed
         "agent_instruction_hidden",     // AI-instruction file scan, no URL needed
         "svg_script_embedded",          // SVG scan, no URL needed
+        // M8 ch5 — container-runtime rules fire without a URL in the input.
+        "docker_run_privileged",           // docker run --privileged alpine
+        "docker_run_sensitive_bind_mount", // docker run -v /var/run/docker.sock:...
     ]
     .into_iter()
     .collect();

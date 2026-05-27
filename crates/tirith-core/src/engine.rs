@@ -1021,6 +1021,13 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // lazy (only when a finding fires).
             let sudo_findings = crate::rules::sudo::check(&ctx.input, ctx.shell, &policy);
             findings.extend(sudo_findings);
+
+            // M8 ch5 — container-runtime rules. Non-docker leader
+            // short-circuits inside `container::check`; tier-1 gates
+            // are the `docker_command` (run / create) and
+            // `docker_exec` PATTERN_TABLE entries.
+            let container_findings = crate::rules::container::check(&ctx.input, ctx.shell, &policy);
+            findings.extend(container_findings);
         }
 
         let cred_findings =

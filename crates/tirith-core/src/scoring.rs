@@ -246,7 +246,13 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::SudoEnvPreserveSensitive
         | RuleId::SudoTeeSystemFile
         | RuleId::SudoDownloadInstall
-        | RuleId::SudoRecursivePermsBroadPath => false,
+        | RuleId::SudoRecursivePermsBroadPath
+        // M8 ch5 — container-runtime rules. Heuristics on parsed
+        // docker / podman args + (for exec) operator-supplied context
+        // labels keyed by `container:<name>`. No threat-DB involvement.
+        | RuleId::DockerRunPrivileged
+        | RuleId::DockerRunSensitiveBindMount
+        | RuleId::DockerExecProdContainer => false,
     }
 }
 

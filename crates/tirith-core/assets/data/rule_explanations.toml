@@ -1852,3 +1852,41 @@ examples_good = ["sudo chmod -R 755 /home/me/proj", "sudo chown -R user:user /et
 false_positive_guidance = "If you're rebuilding a system from backup and the broad scope is intentional, use `tirith sudo session start --reason \"restoring filesystem\"` to downgrade the rule for the recovery window."
 remediation = "Narrow the path to the specific subdirectory you intended to modify. Use `find … -type f` / `-type d` to scope the change further if you only want to touch files or directories."
 mitre_id = "T1222"
+
+# M8 ch5 — container-runtime rules.
+
+[[rule]]
+id = "docker_run_privileged"
+title = "docker run --privileged drops kernel-security boundaries"
+category = "context"
+severity_rationale = "High — `docker run --privileged` disables every Linux kernel security boundary the runtime normally enforces (caps, seccomp, AppArmor, device cgroup). A breakout from the container becomes a breakout to the host."
+description = "A `docker run` / `docker create` / `podman run` invocation whose argument list contains `--privileged` (or `--privileged=true`). Also fires when scanning a `.devcontainer/devcontainer.json` whose `runArgs` array contains `--privileged`."
+examples_bad = ["docker run --privileged alpine", "docker run --privileged=true ubuntu bash", "{ \"runArgs\": [\"--privileged\"] }  # in .devcontainer/devcontainer.json"]
+examples_good = ["docker run alpine echo hello", "docker run --cap-add=NET_ADMIN alpine", "docker run --device=/dev/fuse:/dev/fuse alpine  # specific device, not --privileged"]
+false_positive_guidance = "Some workloads (nested-container CI runners, kernel-driver tests) genuinely need broad capabilities. Use `--cap-add=<specific>` and `--device=<specific>` rather than `--privileged` — those scope to what the workload actually needs."
+remediation = "Drop `--privileged`. Identify the specific capabilities / devices the container needs and add them with `--cap-add=<name>` and `--device=<path>`. Test under reduced privilege before deploying."
+mitre_id = "T1611"
+
+[[rule]]
+id = "docker_run_sensitive_bind_mount"
+title = "docker run mounts a sensitive host path into the container"
+category = "context"
+severity_rationale = "High — bind-mounting `/var/run/docker.sock`, `~/.ssh`, `~/.aws`, `~/.kube`, or `/etc` into a container is the textbook escalation surface. The docker-socket variant is equivalent to host root once mounted; the other paths leak credentials / system config into the container."
+description = "A `docker run` (or `docker create`, `podman run`) whose `-v src:dst[:opts]` / `--volume src:dst` / `--mount type=bind,source=src,…` argument names one of the documented sensitive source paths. Also fires when scanning a `.devcontainer/devcontainer.json` whose `runArgs` or `mounts` arrays expose a sensitive source."
+examples_bad = ["docker run -v /var/run/docker.sock:/var/run/docker.sock alpine", "docker run -v ~/.ssh:/root/.ssh:ro alpine", "docker run --mount type=bind,source=/etc,target=/host/etc alpine", "{ \"mounts\": [\"source=${env:HOME}/.ssh,target=/root/.ssh,type=bind\"] }"]
+examples_good = ["docker run -v $(pwd):/workspace alpine", "docker run --mount type=volume,source=cache,target=/var/cache alpine"]
+false_positive_guidance = "If a workflow legitimately needs the docker socket (e.g. a CI runner that builds images), accept the risk explicitly via `tirith devcontainer guard off` for the scope of that workload, or scope the bind to a narrower subdirectory."
+remediation = "Bind only the specific subdirectory the workload needs. Prefer a named Docker volume for cached state. For credentials, copy them into the container at build time from a secret store rather than bind-mounting the host directory."
+mitre_id = "T1611"
+
+[[rule]]
+id = "docker_exec_prod_container"
+title = "docker exec against a production-labeled container"
+category = "context"
+severity_rationale = "Medium — `docker exec` into a prod-labeled container opens an interactive session against a workload tirith's labels file marks as critical. Reading logs is often legitimate, but mutating commands inside (file edits, network probes, restarts) deserve a confirmation step. The Medium severity is intentional — surface the signal, do not hard-block."
+description = "A `docker exec <container> …` invocation where `<container>` has a `container:<name>` entry in `policy.context_labels` resolving to `prod` / `production` / `critical` / `live` / `p0` / `p1`. Fires regardless of the inner command — even a benign `docker exec payments-prod ls` triggers the audit-trail signal."
+examples_bad = ["docker exec payments-prod /bin/sh", "docker exec payments-prod rm -rf /tmp/x"]
+examples_good = ["docker exec my-dev-container /bin/sh  # no label", "docker logs payments-prod  # read-only, no exec"]
+false_positive_guidance = "Unlabel the container if it's no longer production (`tirith context label container:<name> dev --scope user` — labels file overwrite). Or accept the audit-trail entry and continue."
+remediation = "Use `docker logs <container>` for read-only inspection. For mutations, prefer the upstream deploy pipeline rather than `docker exec` into a live container — the latter leaves no audit trail outside tirith's local log."
+mitre_id = "T1059"

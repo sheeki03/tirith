@@ -10,6 +10,7 @@ pub mod confusables;
 pub mod context_detect;
 pub mod data;
 pub mod dep_confusion;
+pub mod devcontainer_writer;
 pub mod ecosystem_scan;
 pub mod engine;
 pub mod escalation;

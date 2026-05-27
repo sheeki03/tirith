@@ -430,6 +430,34 @@ pub enum RuleId {
     /// locks operators out of their homedirs, or breaks distro
     /// packages. High severity.
     SudoRecursivePermsBroadPath,
+
+    // Container-runtime rules (M8 ch5) — fire from `rules::container`
+    // when the parsed command's leader is `docker` / `podman` and the
+    // subcommand is `run` / `create` / `exec`. PATTERN_TABLE entries
+    // `docker_run` and `docker_exec` are the tier-1 gates. The
+    // `--privileged` and sensitive-bind-mount rules fire from `run` /
+    // `create`; the prod-container rule fires from `exec` against
+    // a container whose `container:<name>` label is in
+    // `policy.context_labels`.
+    /// M8 ch5 — `docker run --privileged …` disables every Linux
+    /// kernel security boundary the runtime normally enforces (caps,
+    /// seccomp, AppArmor, device cgroup). A breakout from the
+    /// container becomes a breakout to the host. High severity.
+    DockerRunPrivileged,
+    /// M8 ch5 — `docker run -v <sensitive>:…` where `<sensitive>` is
+    /// one of `/var/run/docker.sock`, `~/.ssh`, `~/.aws`, `/etc`, or
+    /// the equivalent `--mount type=bind,source=…` shape. The
+    /// docker-socket variant is equivalent to host root once mounted;
+    /// the other paths leak credentials / system config into the
+    /// container. High severity.
+    DockerRunSensitiveBindMount,
+    /// M8 ch5 — `docker exec <container> …` against a container
+    /// whose `container:<name>` entry in `policy.context_labels`
+    /// resolves to `prod` / `production` / `critical` / `live` / `p0`
+    /// / `p1`. Medium severity — surface the signal, do not block,
+    /// because reading logs is often legitimate even on a prod
+    /// container.
+    DockerExecProdContainer,
 }
 
 impl fmt::Display for RuleId {

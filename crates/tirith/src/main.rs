@@ -1449,6 +1449,77 @@ Examples:
         #[command(subcommand)]
         action: SudoAction,
     },
+
+    /// Guard / wire devcontainer.json with the tirith init hook (M8 ch5)
+    #[command(after_help = "\
+Subcommands:
+  tirith devcontainer guard on | off | status     — flip the shared
+                                                    operational-context
+                                                    switch (same flag
+                                                    as `tirith context
+                                                    guard`).
+  tirith devcontainer inject                      — locate
+        [--path <dir>] [--create]                   `.devcontainer/devcontainer.json`
+                                                    under <dir> (or cwd) and
+                                                    add a tirith
+                                                    `postCreateCommand` line
+                                                    + TIRITH_DEVCONTAINER=1.
+                                                    Idempotent.
+
+What it catches:
+  At command time:
+    docker run --privileged alpine                  — High.
+    docker run -v /var/run/docker.sock:… alpine     — High.
+    docker run -v ~/.ssh:/root/.ssh alpine          — High.
+    docker exec <prod-labeled> /bin/sh              — Medium (requires
+                                                       `context_labels`
+                                                       entry keyed by
+                                                       `container:<name>`).
+  At file scan:
+    `runArgs: [\"--privileged\"]` in devcontainer.json — High.
+    `mounts: [\"source=…ssh…\"]` in devcontainer.json — High.
+
+Devcontainer.json is JSONC: comments and trailing commas are accepted.
+tirith strips them before parsing and re-emits a clean JSON file on
+inject; existing fields tirith does NOT modify are preserved.
+
+Examples:
+  tirith devcontainer guard on
+  tirith devcontainer guard status
+  tirith devcontainer inject
+  tirith devcontainer inject --path /workspaces/myrepo
+  tirith devcontainer inject --create")]
+    Devcontainer {
+        #[command(subcommand)]
+        action: DevcontainerAction,
+    },
+
+    /// GitHub Codespaces helpers (M8 ch5) — separate namespace from devcontainer
+    #[command(after_help = "\
+Subcommands:
+  tirith codespaces setup                         — write
+        [--path <dir>]                              `.devcontainer/devcontainer.json`
+                                                    (if absent) with the
+                                                    tirith hook +
+                                                    TIRITH_DEVCONTAINER=1,
+                                                    and append `.tirith/`
+                                                    to .gitignore.
+  tirith codespaces inject                        — alias of
+        [--path <dir>] [--create]                   `tirith devcontainer
+                                                    inject` for operators
+                                                    who think in
+                                                    Codespaces terms.
+
+Setup is idempotent — re-running on an already-wired repo is a no-op.
+
+Examples:
+  tirith codespaces setup
+  tirith codespaces setup --path /workspaces/myrepo
+  tirith codespaces inject --create")]
+    Codespaces {
+        #[command(subcommand)]
+        action: CodespacesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1755,6 +1826,126 @@ Examples:
     },
     /// Report whether a sudo session is active + how much TTL remains
     Status {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevcontainerAction {
+    /// Turn the shared operational-context rule on or off
+    #[command(after_help = "\
+Examples:
+  tirith devcontainer guard on
+  tirith devcontainer guard off
+  tirith devcontainer guard status
+
+Note: This flips the SAME `context_guard_enabled` policy field that
+`tirith context guard`, `tirith ssh guard`, `tirith iac guard`, and
+`tirith sudo guard` operate on — one operator switch silences ALL
+operational-context findings (cloud CLI, SSH, IaC, sudo, container).")]
+    Guard {
+        /// One of: on, off, status.
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Inject the tirith hook into devcontainer.json (idempotent)
+    #[command(after_help = "\
+What it writes:
+  Adds a `postCreateCommand` that runs `tirith init --shell auto || true`
+  AND sets `containerEnv.TIRITH_DEVCONTAINER=1` so commands inside the
+  container know they are inside a tirith-wired devcontainer.
+
+Idempotency:
+  Re-running with the hook already in place is a no-op. The existing
+  `postCreateCommand` (if any) is preserved — tirith joins its command
+  with `&&` so the user's setup still runs.
+
+JSONC:
+  devcontainer.json is JSONC: comments and trailing commas are accepted.
+  tirith strips them before parsing and re-emits a clean JSON file on
+  update; existing fields tirith does NOT modify are preserved
+  semantically (formatting is re-flowed by serde_json::to_string_pretty).
+
+Examples:
+  tirith devcontainer inject
+  tirith devcontainer inject --path /workspaces/myrepo
+  tirith devcontainer inject --create
+  tirith devcontainer inject --create --json")]
+    Inject {
+        /// Repository / workspace path. Defaults to the current
+        /// working directory.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Create a minimal devcontainer.json if one does not exist
+        /// under `<path>/.devcontainer/`.
+        #[arg(long)]
+        create: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodespacesAction {
+    /// Bootstrap a codespace-ready devcontainer.json + .gitignore entry
+    #[command(after_help = "\
+What it does:
+  1. Locate (or create) `.devcontainer/devcontainer.json` under <path>.
+  2. Add the tirith hook (`postCreateCommand` + `TIRITH_DEVCONTAINER=1`).
+  3. Append `.tirith/` to <path>/.gitignore so per-codespace state
+     never leaks into the operator's repo.
+
+Idempotent — re-running on an already-wired repo is a no-op.
+
+Examples:
+  tirith codespaces setup
+  tirith codespaces setup --path /workspaces/myrepo
+  tirith codespaces setup --json")]
+    Setup {
+        /// Repository / workspace path. Defaults to the current
+        /// working directory.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Alias of `tirith devcontainer inject` in the codespaces namespace
+    #[command(after_help = "\
+Identical to `tirith devcontainer inject`. Use either one — they share
+the same implementation.
+
+Examples:
+  tirith codespaces inject
+  tirith codespaces inject --create
+  tirith codespaces inject --path /workspaces/myrepo")]
+    Inject {
+        /// Repository / workspace path. Defaults to the current
+        /// working directory.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Create a minimal devcontainer.json if one does not exist.
+        #[arg(long)]
+        create: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4332,6 +4523,42 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::sudo::require_reason(&action, json)
+            }
+        },
+
+        Commands::Devcontainer { action } => match action {
+            DevcontainerAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::devcontainer::guard(&action, json)
+            }
+            DevcontainerAction::Inject {
+                path,
+                create,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::devcontainer::inject(path.as_deref(), create, json)
+            }
+        },
+
+        Commands::Codespaces { action } => match action {
+            CodespacesAction::Setup { path, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::codespaces::setup(path.as_deref(), json)
+            }
+            CodespacesAction::Inject {
+                path,
+                create,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::codespaces::inject(path.as_deref(), create, json)
             }
         },
     };
