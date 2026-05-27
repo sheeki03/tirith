@@ -54,6 +54,10 @@ help_example_tests! {
     help_fix        => (["fix", "--help"], "tirith fix --");
     help_setup      => (["setup", "--help"], "tirith setup claude-code");
     help_init       => (["init", "--help"], "tirith init --shell");
+    // M8 ch6 — `--prompt-status` flag and `tirith prompt-status` subcommand.
+    help_init_prompt_status_flag => (["init", "--help"], "tirith init --shell zsh --prompt-status");
+    help_prompt_status            => (["prompt-status", "--help"], "tirith prompt-status --short");
+    help_prompt_status_json       => (["prompt-status", "--help"], "tirith prompt-status --json");
     help_doctor     => (["doctor", "--help"], "tirith doctor --fix");
     help_warnings   => (["warnings", "--help"], "tirith warnings");
     help_policy     => (["policy", "--help"], "tirith policy init");

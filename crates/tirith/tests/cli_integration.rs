@@ -7779,3 +7779,343 @@ fn logs_redact_audience_public_paste_strips_home_path() {
         "public-paste must strip /home/<user>: {stdout}"
     );
 }
+
+// ── M8 ch6: `tirith prompt-status` + opt-in PS1 hooks ────────────────────────
+
+/// Helper — point the prompt-status cache + sudo-session + state to a fresh
+/// temp dir for each test. Returns the tempdir so it stays alive for the
+/// test's lifetime (drop removes it).
+///
+/// Mutates `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `HOME`, `KUBECONFIG`,
+/// `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `TIRITH_STATUS`, `TIRITH_SSH_REMOTE`
+/// in the *child* process's env via `Command::env_*` only; we never touch
+/// the parent test process's env so the tests stay parallelizable.
+fn prompt_status_cmd(env_dir: &std::path::Path) -> Command {
+    let mut cmd = tirith();
+    cmd.env("XDG_RUNTIME_DIR", env_dir.join("runtime"))
+        .env("XDG_STATE_HOME", env_dir.join("state"))
+        .env("HOME", env_dir.join("home"))
+        // Wipe inherited cloud / shell-hook signals so tests see a clean
+        // baseline regardless of the developer's shell state.
+        .env_remove("TIRITH_STATUS")
+        .env_remove("TIRITH_SSH_REMOTE")
+        .env_remove("KUBECONFIG")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_DEFAULT_PROFILE")
+        .env_remove("AWS_REGION");
+    // `home::home_dir()` on macOS prefers `getpwuid_r` over `HOME`; the
+    // env-based override doesn't reach the kube-config fallback path. We
+    // accept that — tests below either explicitly set KUBECONFIG to a temp
+    // file or assert behaviour that doesn't depend on a kubeconfig at all.
+    cmd
+}
+
+#[test]
+fn prompt_status_short_starts_with_tirith_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let out = prompt_status_cmd(dir.path())
+        .args(["prompt-status", "--short"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prompt-status --short should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.trim();
+    assert!(
+        line.starts_with("[tirith:"),
+        "short form must begin with [tirith:…], got {line:?}"
+    );
+    // Exactly one line of output.
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "short form must be one line, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn prompt_status_short_reflects_tirith_status_env() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let out = prompt_status_cmd(dir.path())
+        .env("TIRITH_STATUS", "blocks")
+        .args(["prompt-status", "--short"])
+        .output()
+        .expect("failed to run tirith");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().starts_with("[tirith:guarded"),
+        "TIRITH_STATUS=blocks must map to [tirith:guarded…], got {stdout:?}"
+    );
+}
+
+#[test]
+fn prompt_status_short_surfaces_ssh_remote_when_set() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let out = prompt_status_cmd(dir.path())
+        .env("TIRITH_SSH_REMOTE", "1")
+        .args(["prompt-status", "--short"])
+        .output()
+        .expect("failed to run tirith");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[ssh:remote]"),
+        "TIRITH_SSH_REMOTE=1 must surface [ssh:remote] in short form, got {stdout:?}"
+    );
+}
+
+#[test]
+fn prompt_status_json_is_valid_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let out = prompt_status_cmd(dir.path())
+        .args(["prompt-status", "--json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prompt-status --json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("output must be valid JSON");
+    let obj = value.as_object().expect("envelope must be a JSON object");
+    assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(1));
+    assert!(
+        obj.contains_key("protection_mode"),
+        "envelope must contain protection_mode"
+    );
+    assert!(
+        obj.contains_key("contexts"),
+        "envelope must contain contexts"
+    );
+    assert!(
+        obj.contains_key("ssh_remote"),
+        "envelope must contain ssh_remote"
+    );
+    assert!(
+        obj.contains_key("sudo_active"),
+        "envelope must contain sudo_active"
+    );
+    assert!(
+        obj.get("ssh_remote").and_then(|v| v.as_bool()).is_some(),
+        "ssh_remote must be a boolean"
+    );
+    assert!(
+        obj.get("sudo_active").and_then(|v| v.as_bool()).is_some(),
+        "sudo_active must be a boolean"
+    );
+    assert!(
+        obj.get("contexts").and_then(|v| v.as_object()).is_some(),
+        "contexts must be an object"
+    );
+}
+
+#[test]
+fn prompt_status_long_form_uses_semicolons() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let out = prompt_status_cmd(dir.path())
+        .args(["prompt-status"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.trim();
+    assert!(
+        line.starts_with("tirith:"),
+        "long form must begin with 'tirith:', got {line:?}"
+    );
+    // The long form never uses brackets — that's the short-form sigil.
+    assert!(
+        !line.starts_with('['),
+        "long form must not start with [, got {line:?}"
+    );
+}
+
+#[test]
+fn prompt_status_warm_cache_is_faster_than_cold() {
+    // Sanity: the warm path must be no slower than the cold path. We
+    // measure the second call after seeding the cache via the first.
+    // Both calls inherit identical env so any timing difference comes
+    // from the on-disk cache hit. We're tolerant — this is not a hard
+    // perf gate, only a correctness check that the cache is consulted.
+    use std::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+
+    // Cold call (also seeds the cache).
+    let cold_start = Instant::now();
+    let cold_out = prompt_status_cmd(dir.path())
+        .args(["prompt-status", "--short"])
+        .output()
+        .expect("failed to run tirith");
+    let cold = cold_start.elapsed();
+    assert_eq!(cold_out.status.code(), Some(0));
+
+    // Warm call — same temp env, cache file now exists.
+    let warm_start = Instant::now();
+    let warm_out = prompt_status_cmd(dir.path())
+        .args(["prompt-status", "--short"])
+        .output()
+        .expect("failed to run tirith");
+    let warm = warm_start.elapsed();
+    assert_eq!(warm_out.status.code(), Some(0));
+
+    // The cache file must exist after the cold call (in state_dir on
+    // macOS, in XDG_RUNTIME_DIR on Linux).
+    let runtime = dir.path().join("runtime/tirith");
+    let state = dir.path().join("state/tirith");
+    let cache_exists = runtime
+        .read_dir()
+        .ok()
+        .map(|mut it| it.any(|e| e.is_ok()))
+        .unwrap_or(false)
+        || state
+            .read_dir()
+            .ok()
+            .map(|mut it| it.any(|e| e.is_ok()))
+            .unwrap_or(false);
+    assert!(
+        cache_exists,
+        "cache directory must contain at least one file after the cold call; runtime={runtime:?} state={state:?}"
+    );
+
+    // Soft assertion — log only. Process startup overhead dominates so
+    // the absolute numbers are tens of ms each. We just verify the warm
+    // call doesn't blow past 3× cold (a regression that would mean the
+    // cache file is being ignored).
+    eprintln!("prompt-status timing: cold={cold:?} warm={warm:?}");
+    assert!(
+        warm.as_millis() < cold.as_millis() * 3 + 100,
+        "warm path should not be dramatically slower than cold; cold={cold:?} warm={warm:?}"
+    );
+}
+
+#[test]
+fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
+    let out = tirith()
+        .args(["init", "--shell", "zsh", "--prompt-status"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Hook source line still emitted.
+    assert!(
+        stdout.contains("source ") && stdout.contains("zsh-hook.zsh"),
+        "init zsh must still emit the hook source line; got: {stdout}"
+    );
+    // Prompt-status snippet present, marker-wrapped.
+    assert!(
+        stdout.contains("# >>> tirith prompt-status (M8 ch6) >>>"),
+        "snippet must start with the BEGIN marker; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("# <<< tirith prompt-status (M8 ch6) <<<"),
+        "snippet must end with the END marker; got: {stdout}"
+    );
+    // PROMPT_SUBST + single-quoted substitution.
+    assert!(
+        stdout.contains("setopt PROMPT_SUBST"),
+        "zsh snippet must set PROMPT_SUBST; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("'$(tirith prompt-status --short) '"),
+        "zsh snippet must single-quote the command substitution; got: {stdout}"
+    );
+}
+
+#[test]
+fn init_prompt_status_is_idempotent_when_run_twice() {
+    // Running `tirith init --shell zsh --prompt-status` twice must produce
+    // the SAME single-snippet output each time — repeat invocations are
+    // idempotent (the snippet itself is also guarded by
+    // _TIRITH_PROMPT_STATUS_LOADED so eval-ing it twice in one shell
+    // doesn't double-wrap PROMPT either). We assert the per-invocation
+    // count of the snippet body is exactly 1.
+    let out_a = tirith()
+        .args(["init", "--shell", "zsh", "--prompt-status"])
+        .output()
+        .expect("failed to run tirith (run 1)");
+    let out_b = tirith()
+        .args(["init", "--shell", "zsh", "--prompt-status"])
+        .output()
+        .expect("failed to run tirith (run 2)");
+    assert_eq!(out_a.status.code(), Some(0));
+    assert_eq!(out_b.status.code(), Some(0));
+
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout).into_owned();
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout).into_owned();
+    assert_eq!(
+        stdout_a, stdout_b,
+        "two invocations of init --prompt-status must produce identical stdout"
+    );
+
+    // Each invocation contains EXACTLY one snippet block.
+    let begin_marker = "# >>> tirith prompt-status (M8 ch6) >>>";
+    let end_marker = "# <<< tirith prompt-status (M8 ch6) <<<";
+    assert_eq!(
+        stdout_a.matches(begin_marker).count(),
+        1,
+        "snippet BEGIN marker must appear exactly once per invocation"
+    );
+    assert_eq!(
+        stdout_a.matches(end_marker).count(),
+        1,
+        "snippet END marker must appear exactly once per invocation"
+    );
+
+    // The PS1 / PROMPT wrap-line must also appear exactly once.
+    let prompt_line = "PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"";
+    assert_eq!(
+        stdout_a.matches(prompt_line).count(),
+        1,
+        "PROMPT wrap-line must appear exactly once per invocation; got: {stdout_a}"
+    );
+}
+
+#[test]
+fn init_without_prompt_status_does_not_emit_snippet() {
+    let out = tirith()
+        .args(["init", "--shell", "zsh"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("# >>> tirith prompt-status"),
+        "default `tirith init` must NOT emit the prompt-status snippet; got: {stdout}"
+    );
+}
+
+#[test]
+fn init_prompt_status_supports_bash_and_fish_and_powershell() {
+    for (shell, must_contain) in [
+        ("bash", "PS1='$(tirith prompt-status --short) '\"$PS1\""),
+        ("fish", "function fish_right_prompt"),
+        ("powershell", "function global:prompt"),
+    ] {
+        let out = tirith()
+            .args(["init", "--shell", shell, "--prompt-status"])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(0), "shell={shell}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("# >>> tirith prompt-status (M8 ch6) >>>"),
+            "snippet must be marker-wrapped (shell={shell}); got: {stdout}"
+        );
+        assert!(
+            stdout.contains(must_contain),
+            "snippet for {shell} must contain {must_contain:?}; got: {stdout}"
+        );
+    }
+}

@@ -161,6 +161,7 @@ pub mod output_guard;
 pub mod package;
 pub mod paste;
 pub mod policy;
+pub mod prompt_status;
 pub mod receipt;
 pub mod scan;
 pub mod score;

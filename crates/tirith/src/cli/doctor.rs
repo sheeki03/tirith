@@ -66,7 +66,7 @@ fn run_fix(yes: bool) -> i32 {
     if !hooks_installed() {
         println!("Fix: Install shell hooks");
         if confirm("  Install hooks?", yes) {
-            let rc = crate::cli::init::run(None);
+            let rc = crate::cli::init::run(None, false);
             if rc == 0 {
                 println!("  Hooks installed.");
                 fixed += 1;

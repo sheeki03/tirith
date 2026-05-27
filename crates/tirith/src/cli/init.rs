@@ -35,7 +35,7 @@ fn check_path_shadow() -> Option<String> {
     ))
 }
 
-pub fn run(shell: Option<&str>) -> i32 {
+pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
     if let Some(warning) = check_path_shadow() {
         eprintln!("{warning}");
     }
@@ -55,6 +55,9 @@ pub fn run(shell: Option<&str>) -> i32 {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
             }
+            if prompt_status {
+                println!("{}", prompt_status_snippet("zsh"));
+            }
             0
         }
         "bash" => {
@@ -67,6 +70,9 @@ pub fn run(shell: Option<&str>) -> i32 {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
             }
+            if prompt_status {
+                println!("{}", prompt_status_snippet("bash"));
+            }
             0
         }
         "fish" => {
@@ -78,6 +84,9 @@ pub fn run(shell: Option<&str>) -> i32 {
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
+            }
+            if prompt_status {
+                println!("{}", prompt_status_snippet("fish"));
             }
             0
         }
@@ -93,6 +102,9 @@ pub fn run(shell: Option<&str>) -> i32 {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
             }
+            if prompt_status {
+                println!("{}", prompt_status_snippet("powershell"));
+            }
             0
         }
         "nushell" | "nu" => {
@@ -105,6 +117,13 @@ pub fn run(shell: Option<&str>) -> i32 {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
             }
+            if prompt_status {
+                // Nushell prompts use closures with PROMPT_COMMAND. The shipped
+                // hook does the wiring (see shell/lib/nushell-hook.nu); we
+                // emit a no-op marker so `--prompt-status` is at least
+                // signaled, with a note for manual install.
+                println!("{}", prompt_status_snippet("nushell"));
+            }
             0
         }
         _ => {
@@ -113,6 +132,92 @@ pub fn run(shell: Option<&str>) -> i32 {
             eprintln!("  try: tirith init --shell zsh");
             1
         }
+    }
+}
+
+/// Render the opt-in `--prompt-status` snippet for `shell`.
+///
+/// Each snippet is wrapped in a guard so eval-ing it twice (once per shell
+/// startup, again after `source ~/.zshrc`) does not double-wrap the
+/// operator's PS1 / PROMPT / `prompt` function.
+///
+/// We use **single quotes** around `$(tirith prompt-status --short)` so the
+/// command substitution is deferred to *prompt render time*, not the moment
+/// `eval` runs. That's the documented PS1 quoting pattern and the only one
+/// that produces a live status.
+pub(crate) fn prompt_status_snippet(shell: &str) -> String {
+    match shell {
+        "zsh" => [
+            "# >>> tirith prompt-status (M8 ch6) >>>",
+            "if [[ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]]; then",
+            "  _TIRITH_PROMPT_STATUS_LOADED=1",
+            "  setopt PROMPT_SUBST",
+            "  PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"",
+            "fi",
+            "# <<< tirith prompt-status (M8 ch6) <<<",
+        ]
+        .join("\n"),
+        "bash" => [
+            "# >>> tirith prompt-status (M8 ch6) >>>",
+            "if [ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]; then",
+            "  _TIRITH_PROMPT_STATUS_LOADED=1",
+            "  PS1='$(tirith prompt-status --short) '\"$PS1\"",
+            "fi",
+            "# <<< tirith prompt-status (M8 ch6) <<<",
+        ]
+        .join("\n"),
+        "fish" => [
+            "# >>> tirith prompt-status (M8 ch6) >>>",
+            "if not set -q _TIRITH_PROMPT_STATUS_LOADED",
+            "    set -g _TIRITH_PROMPT_STATUS_LOADED 1",
+            "    functions -q fish_right_prompt; and functions -e _tirith_orig_fish_right_prompt",
+            "    if functions -q fish_right_prompt",
+            "        functions -c fish_right_prompt _tirith_orig_fish_right_prompt",
+            "    end",
+            "    function fish_right_prompt",
+            "        tirith prompt-status --short",
+            "        if functions -q _tirith_orig_fish_right_prompt",
+            "            _tirith_orig_fish_right_prompt",
+            "        end",
+            "    end",
+            "end",
+            "# <<< tirith prompt-status (M8 ch6) <<<",
+        ]
+        .join("\n"),
+        "powershell" | "pwsh" => [
+            "# >>> tirith prompt-status (M8 ch6) >>>",
+            "if (-not $global:_TIRITH_PROMPT_STATUS_LOADED) {",
+            "    $global:_TIRITH_PROMPT_STATUS_LOADED = $true",
+            "    if (Test-Path Function:prompt) {",
+            "        Copy-Item Function:prompt Function:_tirith_orig_prompt -Force",
+            "    }",
+            "    function global:prompt {",
+            "        $line = (& tirith prompt-status --short) 2>$null",
+            "        if (Get-Command _tirith_orig_prompt -ErrorAction SilentlyContinue) {",
+            "            \"$line $(_tirith_orig_prompt)\"",
+            "        } else {",
+            "            \"$line PS $($executionContext.SessionState.Path.CurrentLocation)> \"",
+            "        }",
+            "    }",
+            "}",
+            "# <<< tirith prompt-status (M8 ch6) <<<",
+        ]
+        .join("\n"),
+        // Nushell wiring requires `$env.PROMPT_COMMAND` / `prompt-string`
+        // configuration which lives in the user's config.nu — we can't
+        // safely splice a closure via `eval`. Print a pointer instead so
+        // `--prompt-status` always produces *something*, but document the
+        // manual install path.
+        "nushell" | "nu" => [
+            "# >>> tirith prompt-status (M8 ch6) >>>",
+            "# Nushell does not support eval-style prompt wiring; add this to",
+            "# your config.nu (~/.config/nushell/config.nu):",
+            "#   $env.PROMPT_COMMAND = {|| $\"(tirith prompt-status --short) ($env.PWD)> \"}",
+            "# See docs/prompt-integration.md for details.",
+            "# <<< tirith prompt-status (M8 ch6) <<<",
+        ]
+        .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -363,7 +468,9 @@ fn materialize_hooks() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_shell_name, posix_single_quote, powershell_single_quote};
+    use super::{
+        normalize_shell_name, posix_single_quote, powershell_single_quote, prompt_status_snippet,
+    };
 
     #[test]
     fn normalize_shell_name_from_paths_and_login_shells() {
@@ -430,5 +537,62 @@ mod tests {
             powershell_single_quote("C:\\temp\\it's.ps1"),
             "'C:\\temp\\it''s.ps1'"
         );
+    }
+
+    /// Each per-shell snippet must:
+    ///   1. Carry the BEGIN/END marker comments so idempotency can be
+    ///      detected by an external dedupe layer (rc-file editor).
+    ///   2. Reference `tirith prompt-status --short` so the command
+    ///      substitution actually exists.
+    ///   3. Guard against double-evaluation in-process (the
+    ///      `_TIRITH_PROMPT_STATUS_LOADED` variable or equivalent).
+    ///   4. Use SINGLE quotes around `$(tirith …)` so the substitution is
+    ///      deferred to prompt render — printf-evaluating it at eval time
+    ///      would freeze the status.
+    #[test]
+    fn prompt_status_snippet_zsh_is_marker_wrapped_and_deferred() {
+        let s = prompt_status_snippet("zsh");
+        assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
+        assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
+        assert!(s.contains("setopt PROMPT_SUBST"));
+        assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
+        // The substitution must be inside SINGLE quotes so PROMPT is
+        // re-rendered each redraw.
+        assert!(s.contains("'$(tirith prompt-status --short) '"));
+    }
+
+    #[test]
+    fn prompt_status_snippet_bash_uses_ps1_with_single_quoted_subst() {
+        let s = prompt_status_snippet("bash");
+        assert!(s.contains("PS1='$(tirith prompt-status --short) '\"$PS1\""));
+        assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
+        assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
+        assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
+    }
+
+    #[test]
+    fn prompt_status_snippet_fish_wraps_right_prompt() {
+        let s = prompt_status_snippet("fish");
+        assert!(s.contains("function fish_right_prompt"));
+        assert!(s.contains("tirith prompt-status --short"));
+        assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
+    }
+
+    #[test]
+    fn prompt_status_snippet_powershell_wraps_prompt_function() {
+        for shell in ["powershell", "pwsh"] {
+            let s = prompt_status_snippet(shell);
+            assert!(s.contains("function global:prompt"), "shell={shell}");
+            assert!(s.contains("tirith prompt-status --short"), "shell={shell}");
+            assert!(s.contains("$global:_TIRITH_PROMPT_STATUS_LOADED"));
+        }
+    }
+
+    #[test]
+    fn prompt_status_snippet_nushell_emits_manual_install_pointer() {
+        let s = prompt_status_snippet("nushell");
+        // Nushell can't `eval` a closure, so the snippet is a doc pointer.
+        assert!(s.contains("docs/prompt-integration.md"));
+        assert!(s.contains("tirith prompt-status --short"));
     }
 }

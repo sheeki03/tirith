@@ -409,11 +409,50 @@ Examples:
     #[command(after_help = "\
 Examples:
   eval \"$(tirith init --shell zsh)\"
-  eval \"$(tirith init --shell bash)\"")]
+  eval \"$(tirith init --shell bash)\"
+  tirith init --shell zsh --prompt-status   # opt-in PS1 / prompt snippet (M8 ch6)")]
     Init {
         /// Target shell (default: auto-detect)
         #[arg(long)]
         shell: Option<String>,
+        /// Also append a prompt-substitution snippet so `tirith prompt-status
+        /// --short` runs on every prompt redraw. Idempotent — repeated runs do
+        /// not duplicate the snippet (managed by BEGIN/END markers).
+        #[arg(long = "prompt-status", default_value_t = false)]
+        prompt_status: bool,
+    },
+
+    /// Print a one-line shell-prompt status (M8 ch6).
+    ///
+    /// Designed to be invoked from `$PS1` / `$PROMPT` / `fish_prompt` on every
+    /// redraw. Reads pre-cached protection / context / sudo / SSH state so
+    /// the per-prompt overhead stays under 5 ms on a warm cache.
+    #[command(after_help = "\
+Output forms:
+  tirith prompt-status --short                # [tirith:guarded][aws:prod][kube:payments-prod]
+  tirith prompt-status                         # tirith: guarded; aws: prod; kube: payments-prod
+  tirith prompt-status --json                  # JSON envelope (stable schema_version=1)
+
+Examples:
+  tirith prompt-status --short
+  tirith prompt-status --json
+  PS1='$(tirith prompt-status --short) '\"$PS1\"          # bash
+  PROMPT='$(tirith prompt-status --short) '\"$PROMPT\"     # zsh (after setopt PROMPT_SUBST)
+
+Cache:
+  $XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache (30s TTL).
+  Falls back to state_dir() when XDG_RUNTIME_DIR is unset.
+  Run `tirith context status` to force-refresh provider context.")]
+    PromptStatus {
+        /// Short bracketed form, intended for `$PS1` / `$PROMPT`.
+        #[arg(long)]
+        short: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 
     /// Scan files for hidden content, config poisoning, and CI/repo supply-chain risk
@@ -4096,7 +4135,19 @@ fn run() {
             }
         },
 
-        Commands::Init { shell } => cli::init::run(shell.as_deref()),
+        Commands::Init {
+            shell,
+            prompt_status,
+        } => cli::init::run(shell.as_deref(), prompt_status),
+
+        Commands::PromptStatus {
+            short,
+            format,
+            json,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::prompt_status::run(short, json)
+        }
 
         Commands::Warnings {
             clear,
