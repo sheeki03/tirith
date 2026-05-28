@@ -184,6 +184,31 @@ help_example_tests! {
     help_taint_list            => (["taint", "list", "--help"], "tirith taint list --json");
     help_taint_explain         => (["taint", "explain", "--help"], "tirith taint explain ./install.sh");
     help_taint_clear           => (["taint", "clear", "--help"], "tirith taint clear ./install.sh --yes");
+    // M10 ch4 — `tirith intend` intent-vs-command heuristic.
+    help_intend                => (["intend", "--help"], "tirith intend \"install a formatter\" -- \"curl https://x/install.sh | bash\"");
+}
+
+#[test]
+fn help_intend_documents_exit_codes() {
+    // `tirith intend` is Info-level and never blocks, but a non-zero exit on
+    // mismatch lets scripts detect one. The help must spell the codes out so
+    // the documented contract matches the integration tests.
+    let out = tirith().args(["intend", "--help"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Exit codes"),
+        "intend --help must document its exit codes, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1  at least one mismatch"),
+        "intend --help must document exit 1 on mismatch, got:\n{stdout}"
+    );
+    // The honesty caveat: never blocks.
+    let collapsed: String = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains("NEVER blocks") || collapsed.contains("never blocks"),
+        "intend --help must state it never blocks, got:\n{stdout}"
+    );
 }
 
 #[test]

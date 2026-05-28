@@ -24,6 +24,7 @@ pub mod hygiene;
 pub mod iac_plan;
 pub mod install_script_analysis;
 pub mod install_txn;
+pub mod intent;
 pub mod license;
 pub mod mcp;
 pub mod mcp_lock;

@@ -155,6 +155,7 @@ pub mod hygiene;
 pub mod iac;
 pub mod init;
 pub mod install;
+pub mod intent;
 pub mod lab;
 pub mod last_trigger;
 pub mod license_cmd;

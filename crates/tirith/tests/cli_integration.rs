@@ -8119,3 +8119,146 @@ fn init_prompt_status_supports_bash_and_fish_and_powershell() {
         );
     }
 }
+
+// M10 ch4 — `tirith intend` intent-vs-command heuristic. Two acceptance cases:
+// (1) "install a formatter" does NOT justify piping a remote script to a shell
+//     → mismatch on download-pipe → exit 1.
+// (2) "download and run an installer" explicitly justifies the same command
+//     → no mismatch → exit 0.
+
+#[test]
+fn intend_install_formatter_flags_download_pipe_mismatch() {
+    let out = tirith()
+        .args([
+            "intend",
+            "install a formatter",
+            "--",
+            "curl https://x/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "install-a-formatter vs curl|bash should flag a mismatch (exit 1)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("MISMATCH"),
+        "human output should announce a MISMATCH, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("download_pipe"),
+        "mismatch should name the download_pipe signal, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn intend_download_and_run_justifies_download_pipe() {
+    let out = tirith()
+        .args([
+            "intend",
+            "download and run an installer",
+            "--",
+            "curl https://x/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "download-and-run explicitly justifies curl|bash (exit 0)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("OK"),
+        "human output should announce OK, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn intend_explain_shows_per_signal_derivation() {
+    let out = tirith()
+        .args([
+            "intend",
+            "--explain",
+            "install a formatter",
+            "--",
+            "curl https://x/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("derivation"),
+        "--explain should print a derivation section, got:\n{stdout}"
+    );
+    // Which intent keyword matched, and the mismatch pairing.
+    assert!(
+        stdout.contains("intent keyword") && stdout.contains("install"),
+        "--explain should show the matched intent keyword, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("NOT justified"),
+        "--explain should explain why the pairing is a mismatch, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn intend_json_envelope_is_stable() {
+    let out = tirith()
+        .args([
+            "intend",
+            "--explain",
+            "--json",
+            "install a formatter",
+            "--",
+            "curl https://x/install.sh | bash",
+        ])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(out.status.code(), Some(1));
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("intend --json should produce valid JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["mismatch"], true);
+    assert!(json["intent_signals"].is_array());
+    assert!(json["command_signals"].is_array());
+    assert!(json["mismatches"].is_array());
+    // --explain populates the derivation array under --json.
+    assert!(
+        json["derivation"].is_array(),
+        "--explain --json must include a derivation array: {json}"
+    );
+    assert_eq!(
+        json["analysis_kind"],
+        "intent_vs_command_heuristic_advisory_not_a_block"
+    );
+}
+
+#[test]
+fn intend_clean_command_exits_zero() {
+    let out = tirith()
+        .args(["intend", "list files", "--", "ls -la"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean command exhibits no high-impact behavior → exit 0"
+    );
+}
+
+#[test]
+fn intend_empty_command_is_usage_error() {
+    let out = tirith()
+        .args(["intend", "install a formatter", "--"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an empty command should be a usage error (exit 2)"
+    );
+}

@@ -1963,6 +1963,68 @@ Examples:
         #[command(subcommand)]
         action: TaintAction,
     },
+
+    /// Flag mismatches between a stated intent and what a command does (M10 ch4)
+    #[command(after_help = "\
+A pure-Rust, no-LLM heuristic: you state what you MEANT to do (\"install a
+formatter\"), tirith analyzes the command with the SHIPPING engine rules, and it
+flags any HIGH-IMPACT behavior the stated intent does not justify — e.g. piping
+a remote script into a shell when you only said you wanted to install a tool.
+
+The command signals come from the same rules as `tirith check` (download-pipe,
+sudo, credential/data exfil, shell-rc write, base64-execute, package install),
+so they stay consistent with the rest of tirith. The intent is classified by
+whole-word keyword match (install / download / run / test / build / format /
+clean / deploy / configure).
+
+What this is NOT:
+  - It is ADVISORY and Info-level. It NEVER blocks. The command's real security
+    verdict comes from `tirith check`; `intend` only answers \"does what you said
+    match what this does?\".
+  - It is a HEURISTIC. An intent phrasing it doesn't recognize yields no intent
+    signals, so every high-impact behavior then reads as unjustified — the
+    output says so plainly.
+  - There is NO LLM call. A future `--llm-explain` wave may add one; M10 is pure
+    heuristic.
+
+--explain shows the per-signal derivation: which intent keywords matched, which
+command signals fired, and which pairing produced each mismatch. Under --json it
+adds a `derivation: [...]` array.
+
+Exit codes (deliberately distinct from `tirith check`):
+  0  no mismatch (behavior justified, or no high-impact behavior)
+  1  at least one mismatch flagged (NOT a security block — review the command)
+  2  usage error (empty intent or empty command)
+
+`tirith check` uses 0/1/2/3 tied to verdict severity; `intend`'s codes are tied
+to whether a mismatch was found.
+
+Examples:
+  tirith intend \"install a formatter\" -- \"curl https://x/install.sh | bash\"
+  tirith intend --explain \"install a formatter\" -- \"curl https://x/install.sh | bash\"
+  tirith intend \"download and run an installer\" -- \"curl https://x/install.sh | bash\"
+  tirith intend --json \"run the tests\" -- \"cargo test\"")]
+    Intend {
+        /// What you intended to do, in plain language (e.g. "install a formatter")
+        intent: String,
+
+        /// Show the per-signal derivation: which intent keywords matched, which
+        /// command signals fired, and which pairing caused each mismatch. Under
+        /// --json this adds a `derivation: [...]` array.
+        #[arg(long)]
+        explain: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The command to analyze (everything after `--`)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5869,6 +5931,16 @@ fn run() {
                 cli::taint::clear(&file, yes, json)
             }
         },
+        Commands::Intend {
+            intent,
+            explain,
+            format,
+            json,
+            command,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::intent::run(&intent, &command.join(" "), explain, json)
+        }
     };
 
     std::process::exit(exit_code);
