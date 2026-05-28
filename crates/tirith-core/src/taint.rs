@@ -104,11 +104,18 @@ pub fn normalize_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
             Component::ParentDir => {
                 out.pop();
             }
-            Component::RootDir => {
-                out = PathBuf::from(comp.as_os_str());
-            }
             Component::Prefix(p) => {
+                // Drive/UNC prefix on Windows is always the first component of
+                // an absolute path; seed `out` with it. (No-op on Unix.)
                 out = PathBuf::from(p.as_os_str());
+            }
+            Component::RootDir => {
+                // Append the root anchor to whatever prefix `out` already holds,
+                // rather than replacing it: on Windows `C:` + `\` must stay
+                // `C:\` (replacing it would drop the drive and collide across
+                // drives); on Unix this turns an empty `out` into `/`. This is
+                // cargo's canonical `normalize_path` ordering.
+                out.push(comp.as_os_str());
             }
             Component::Normal(seg) => out.push(seg),
         }
