@@ -9662,21 +9662,6 @@ fn commands_run_interactive_warn_ack_gates_execution() {
     );
 }
 
-/// Recursively locate the first `log.jsonl` (the audit log) under `root`.
-fn find_audit_log(root: &std::path::Path) -> Option<PathBuf> {
-    for entry in fs::read_dir(root).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_audit_log(&path) {
-                return Some(found);
-            }
-        } else if path.file_name().is_some_and(|n| n == "log.jsonl") {
-            return Some(path);
-        }
-    }
-    None
-}
-
 #[test]
 fn commands_run_audit_applies_operator_dlp_patterns() {
     // Finding B: the `commands run` audit must redact the command text with the
@@ -9713,14 +9698,44 @@ fn commands_run_audit_applies_operator_dlp_patterns() {
         .expect("commands run emit");
     assert_eq!(out.status.code(), Some(0), "clean allowed command runs");
 
-    let log = find_audit_log(root.path()).expect("audit log should be written under the tempdir");
-    let body = fs::read_to_string(&log).expect("read audit log");
+    // Collect EVERY log.jsonl under the isolated root and check the combined
+    // content. A plain depth-first "first log.jsonl" search can return an empty
+    // or unrelated file before the real audit log; scanning all of them is
+    // order-independent. On failure, dump each log's path + byte size so a
+    // platform-specific miss is diagnosable from CI without guesswork.
+    fn collect_logs(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_logs(&p, out);
+            } else if p.file_name().is_some_and(|n| n == "log.jsonl") {
+                let content = fs::read_to_string(&p).unwrap_or_default();
+                out.push((p, content));
+            }
+        }
+    }
+    let mut logs: Vec<(PathBuf, String)> = Vec::new();
+    collect_logs(root.path(), &mut logs);
+    let combined: String = logs
+        .iter()
+        .map(|(_, c)| c.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let inventory = if logs.is_empty() {
+        "  (no log.jsonl found under root)".to_string()
+    } else {
+        logs.iter()
+            .map(|(p, c)| format!("  {} ({} bytes)", p.display(), c.len()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert!(
-        body.contains("[REDACTED:custom]"),
-        "the operator DLP pattern must redact the audited command, got:\n{body}"
+        combined.contains("[REDACTED:custom]"),
+        "the operator DLP pattern must redact the audited command.\naudit logs under root:\n{inventory}\n--- combined ---\n{combined}"
     );
     assert!(
-        !body.contains("INTERNAL-12345"),
-        "the sensitive token must NOT appear verbatim in the audit log, got:\n{body}"
+        !combined.contains("INTERNAL-12345"),
+        "the sensitive token must NOT appear verbatim in any audit log, got:\n{combined}"
     );
 }
