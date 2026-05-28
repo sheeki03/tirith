@@ -848,11 +848,20 @@ pub enum RuleId {
     // golden fixtures.
     /// M11 ch1 — a trusted, unexpired command card signed the EXACT command
     /// being run. Info severity — improves audit confidence but does NOT
-    /// change the verdict (other findings still apply unchanged). A card
-    /// supplied but not verifiable (untrusted key / bad signature / expired)
-    /// also surfaces under this rule as an Info "card present but not
-    /// verified" note; an entirely card-less command emits nothing.
+    /// change the verdict (other findings still apply unchanged). Emitted ONLY
+    /// for a genuine verification (a Match). A card that is present but could
+    /// not be verified surfaces under [`RuleId::CommandCardUnverified`], NOT
+    /// this rule — so a consumer counting `command_card_verified` never
+    /// miscounts a FAILED verification as a verified one.
     CommandCardVerified,
+    /// M11 ch1 — a command card was supplied (sidecar `--card` or a
+    /// `# tirith-card:` comment) but could NOT be verified: an untrusted key,
+    /// a bad signature, an expired card, a malformed/unreadable card file, or a
+    /// remote URL that v1 will not fetch on the hot path. Info severity — a
+    /// diagnostic note that does NOT claim trust and does NOT change the
+    /// verdict. An entirely card-less command (or an unsigned card) emits
+    /// nothing on this axis.
+    CommandCardUnverified,
     /// M11 ch1 — a trusted command card was found, but the command being run
     /// differs from the command the card attests to (tampering after the card
     /// was published). High severity.
@@ -876,10 +885,12 @@ pub enum RuleId {
     /// manifest exists, this rule never fires.
     RepoCommandUnknown,
     /// M11 ch2 — the command matched a `dangerous[*]` glob pattern (`*`-only in
-    /// v1) declared in the repo's `.tirith/commands.yaml`. Block severity
-    /// (High). ELEVATION ONLY: a dangerous match adds this finding regardless
-    /// of what `analyze()` returned (stricter is always safe). The manifest can
-    /// elevate via this rule but can NEVER weaken an engine finding of severity
+    /// v1) declared in the repo's `.tirith/commands.yaml`. High severity
+    /// (which maps to the Block action) for `action: block`, Medium (→ Warn
+    /// action) for `action: warn` — there is no `Severity::Block`. ELEVATION
+    /// ONLY: a dangerous match adds this finding regardless of what `analyze()`
+    /// returned (stricter is always safe). The manifest can elevate via this
+    /// rule but can NEVER weaken an engine finding of severity
     /// ≥ High.
     RepoCommandDangerousPattern,
 

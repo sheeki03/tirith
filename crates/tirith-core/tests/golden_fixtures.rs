@@ -1067,6 +1067,7 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // create -> sign -> trust -> check round trip, the mismatch case, and the
     // no-hot-path-network URL-comment case).
     "command_card_verified",
+    "command_card_unverified",
     "command_card_mismatch",
     // M11 ch2 — repo-command-manifest rules fire from `engine::analyze` (Exec)
     // only when a `.tirith/commands.yaml` exists on disk for the repo discovered

@@ -239,6 +239,15 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
 /// PRIVACY: fetching a card tells the maintainer's domain that a tirith user is
 /// pulling their card (an IP + timestamp + the request). This is unavoidable
 /// for an explicit fetch — documented in `--help`.
+///
+/// UNIX-ONLY (v1): this reuses `tirith_core::runner::download_to_path`, the
+/// hardened (30s-timeout / 10 MiB-cap) download path, which is `#[cfg(unix)]`
+/// today — exactly like `tirith run` / `tirith fetch`. The `Fetch` CLI variant
+/// is therefore compiled in only on Unix; on Windows `create`/`sign`/`verify`
+/// (no network) remain available and a user copies the card to
+/// `~/.cache/tirith/cards/` manually. Removing this cfg gate requires a
+/// cross-platform `download_to_path`.
+#[cfg(unix)]
 pub fn fetch(url: &str, json: bool) -> i32 {
     let cache_dir = match command_card::cards_cache_dir() {
         Some(d) => d,

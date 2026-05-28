@@ -161,7 +161,11 @@ pub static PROVIDERS: &[Provider] = &[
             "Update CI publish secrets and ~/.cargo/credentials.toml.",
             "Check your crates' version history for unexpected publishes.",
         ],
-        key_prefix_shapes: &["cio", "cargo-registry-token"],
+        // NB: crates.io tokens are `cio…`, but the bare 3-char substring "cio"
+        // false-matches common words ("suspicious", "precious", …) and would
+        // mis-route an unrelated leak to crates.io. Match cargo only via the
+        // explicit `cargo-registry-token` config key — no short-prefix shape.
+        key_prefix_shapes: &["cargo-registry-token"],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -491,6 +495,32 @@ mod tests {
             Some("anthropic")
         );
         assert!(match_provider("nothing credential-shaped here").is_none());
+    }
+
+    #[test]
+    fn cargo_cio_substring_does_not_false_match() {
+        // Regression (code-reviewer #1): the dropped 3-char "cio" shape matched
+        // inside common words. A benign command containing "suspicious" /
+        // "precious" must NOT route to cargo (crates.io).
+        assert!(
+            match_provider("npm install suspicious-pkg").is_none(),
+            "'suspicious' must not route to cargo via a 'cio' substring"
+        );
+        assert!(match_provider("echo precious metals").is_none());
+        // The explicit cargo config key still routes correctly.
+        assert_eq!(
+            match_provider("cargo-registry-token = redacted").map(|p| p.provider),
+            Some("cargo")
+        );
+    }
+
+    #[test]
+    fn benign_non_credential_command_yields_no_provider() {
+        // pr-test-analyzer #9: a benign command that merely mentions a
+        // credential-shaped WORD (not an actual token) must not attribute a
+        // provider — no false triage routing.
+        assert!(match_provider("echo sk_live is my variable name").is_none());
+        assert!(match_provider("git commit -m 'add aws docs'").is_none());
     }
 
     #[test]

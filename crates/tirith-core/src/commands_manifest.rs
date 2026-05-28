@@ -7,9 +7,13 @@
 //!    *only* [`RuleId::RepoCommandUnknown`] (Info) for the matched command —
 //!    the "this command is not in the repo's catalogue" annotation. It cannot
 //!    touch, downgrade, or remove any other finding.
-//! 2. **Elevate to Block.** A `dangerous[*]` glob match ADDS a Block-severity
+//! 2. **Elevate.** A `dangerous[*]` glob match ADDS a
 //!    [`RuleId::RepoCommandDangerousPattern`] finding, regardless of what the
-//!    engine already found. Stricter-is-safe; this is always allowed.
+//!    engine already found. With `action: block` (the default) the finding is
+//!    High severity (which `action_from_findings` maps to [`Action::Block`]);
+//!    with `action: warn` it is Medium severity (→ Warn action). There is no
+//!    `Severity::Block` — "Block" names the *action*, derived from a High/
+//!    Critical severity. Stricter-is-safe; this is always allowed.
 //!
 //! ## THE LOAD-BEARING INVARIANT
 //!
@@ -53,17 +57,34 @@ pub struct AllowedEntry {
     pub command: String,
 }
 
-/// The action a `dangerous[*]` entry requests. v1 only models `block`; the
-/// field exists so the schema is forward-compatible and so a future `warn`
-/// elevation can be added without a breaking change. An unknown / missing
-/// value deserializes to [`DangerousAction::Block`] (fail-strict: a dangerous
-/// pattern with a typo'd action still blocks rather than silently doing
-/// nothing).
+/// The action a `dangerous[*]` entry requests on a match.
+///
+/// * `block` → adds a High `RepoCommandDangerousPattern` finding (→ Block).
+/// * `warn`  → adds a Medium `RepoCommandDangerousPattern` finding (→ Warn).
+///
+/// A missing `action` defaults to `block` (the strict, safe default). An
+/// UNKNOWN string value is REJECTED at deserialize time (serde has no catch-all
+/// arm here) — a typo'd action fails the manifest load rather than silently
+/// downgrading to a no-op, which preserves the "stricter is always safe"
+/// posture. Both arms ELEVATE (add a finding); neither can weaken an engine
+/// finding.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DangerousAction {
     #[default]
     Block,
+    Warn,
+}
+
+impl DangerousAction {
+    /// The finding severity this action maps to. High → Block action; Medium →
+    /// Warn action (see [`crate::verdict::action_from_findings`]).
+    fn severity(self) -> Severity {
+        match self {
+            DangerousAction::Block => Severity::High,
+            DangerousAction::Warn => Severity::Medium,
+        }
+    }
 }
 
 /// One entry under `dangerous:` — a glob pattern that, when matched, elevates
@@ -117,8 +138,10 @@ impl std::error::Error for ManifestError {}
 pub struct ManifestOutcome {
     /// Findings the manifest contributes (at most one). Either a single
     /// `RepoCommandUnknown` (Info) when the command is not catalogued, OR one
-    /// or more `RepoCommandDangerousPattern` (Block) when a dangerous pattern
-    /// matched. Never both: a dangerous match takes precedence over the
+    /// or more `RepoCommandDangerousPattern` (High → Block action for
+    /// `action: block`, Medium → Warn action for `action: warn`) when a
+    /// dangerous pattern matched. Never both: a dangerous match takes precedence
+    /// over the
     /// "unknown" annotation (a dangerous command is, by definition, not a
     /// benign uncatalogued one).
     pub findings: Vec<Finding>,
@@ -190,9 +213,11 @@ impl CommandsManifest {
     /// found (`engine_findings`, read-only).
     ///
     /// Rules:
-    /// - A `dangerous[*]` match ADDS a Block `RepoCommandDangerousPattern`
-    ///   finding (elevation, always allowed). When any dangerous pattern
-    ///   matches, that is the whole contribution (no `RepoCommandUnknown`).
+    /// - A `dangerous[*]` match ADDS a `RepoCommandDangerousPattern` finding
+    ///   (elevation, always allowed) — High severity (→ Block action) for
+    ///   `action: block`, Medium (→ Warn action) for `action: warn`. When any
+    ///   dangerous pattern matches, that is the whole contribution (no
+    ///   `RepoCommandUnknown`).
     /// - Otherwise, if the command is NOT in `allowed[*]`, ADD an Info
     ///   `RepoCommandUnknown` finding.
     /// - If the command IS in `allowed[*]` (and no dangerous match), contribute
@@ -200,11 +225,15 @@ impl CommandsManifest {
     ///   sole suppression: it suppresses only the `RepoCommandUnknown` that
     ///   would otherwise be emitted.
     ///
-    /// `engine_findings` is `&[Finding]` and is only inspected to decide
-    /// whether emitting the Info `RepoCommandUnknown` is meaningful (it is
-    /// emitted regardless of engine findings — the action still follows the
-    /// engine's max severity). It is NEVER mutated or returned. This signature
-    /// is what makes the load-bearing invariant structural.
+    /// `engine_findings` is accepted as an immutable `&[Finding]` but is
+    /// DELIBERATELY NOT READ (hence the `_` binding): the manifest's
+    /// contribution is computed purely from `command` and the manifest's own
+    /// `allowed[]`/`dangerous[]` entries. `RepoCommandUnknown` is emitted
+    /// regardless of what the engine found — the final action still follows the
+    /// engine's max severity over the combined list. Taking the slice by
+    /// shared reference with no mutation/return path is exactly what makes the
+    /// load-bearing "manifest cannot weaken an engine finding" invariant
+    /// STRUCTURAL: there is simply no API here to touch an existing finding.
     pub fn evaluate(&self, command: &str, _engine_findings: &[Finding]) -> ManifestOutcome {
         let matched_allowed_name = self.match_allowed(command).map(str::to_string);
 
@@ -218,7 +247,7 @@ impl CommandsManifest {
             // dangerous pattern).
             let findings = dangerous
                 .iter()
-                .map(|e| dangerous_finding(&e.pattern, command))
+                .map(|e| dangerous_finding(&e.pattern, command, e.action))
                 .collect();
             return ManifestOutcome {
                 findings,
@@ -269,16 +298,24 @@ fn unknown_finding(command: &str) -> Finding {
     }
 }
 
-/// Build the Block `RepoCommandDangerousPattern` finding for a dangerous match.
-fn dangerous_finding(pattern: &str, command: &str) -> Finding {
+/// Build the `RepoCommandDangerousPattern` finding for a dangerous match. The
+/// entry's `action` selects the severity: `block` → High (→ Block action),
+/// `warn` → Medium (→ Warn action). Both ELEVATE; neither weakens an existing
+/// engine finding.
+fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> Finding {
+    let severity = action.severity();
+    let action_word = match action {
+        DangerousAction::Block => "block",
+        DangerousAction::Warn => "warn on",
+    };
     Finding {
         rule_id: RuleId::RepoCommandDangerousPattern,
-        severity: Severity::High,
+        severity,
         title: "Command matches a repo-flagged dangerous pattern".to_string(),
         description: format!(
             "The command matches the dangerous pattern '{}' declared under \
              `dangerous[]` in this repo's `.tirith/commands.yaml`. The repo has \
-             explicitly flagged this shape to block.",
+             explicitly flagged this shape to {action_word}.",
             pattern.trim()
         ),
         evidence: vec![Evidence::CommandPattern {
@@ -495,6 +532,49 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_dangerous_warn_action_emits_medium() {
+        // type-design #4 / #7: `action: warn` must wire to a Medium-severity
+        // finding (→ Warn action), not the default High (→ Block). The `.action`
+        // field is now load-bearing, not a dead read.
+        let m = CommandsManifest::from_yaml(
+            r#"
+dangerous:
+  - pattern: "rm -rf *"
+    action: warn
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.dangerous[0].action, DangerousAction::Warn);
+        let out = m.evaluate("rm -rf /tmp/scratch", &[]);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].rule_id, RuleId::RepoCommandDangerousPattern);
+        assert_eq!(
+            out.findings[0].severity,
+            Severity::Medium,
+            "warn action must be Medium severity (maps to Warn, not Block)"
+        );
+        // And it maps to the Warn action, not Block.
+        assert_eq!(
+            crate::verdict::action_from_findings(&out.findings),
+            crate::verdict::Action::Warn
+        );
+    }
+
+    #[test]
+    fn dangerous_unknown_action_is_rejected_at_load() {
+        // A typo'd action must FAIL the manifest load (fail-strict), never
+        // silently downgrade to a no-op.
+        let err = CommandsManifest::from_yaml(
+            r#"
+dangerous:
+  - pattern: "x"
+    action: nope
+"#,
+        );
+        assert!(err.is_err(), "unknown dangerous action must be rejected");
+    }
+
+    #[test]
     fn evaluate_dangerous_wins_even_when_also_allowed() {
         // A malicious repo lists `curl ... | bash` under BOTH allowed and
         // dangerous. The dangerous elevation MUST win — you cannot allow-list
@@ -528,7 +608,6 @@ dangerous:
         // The invariant probe: evaluate is handed a High engine finding and
         // must NOT return it, downgrade it, or reference it. Its contribution
         // is purely additive.
-        let m = manifest();
         let engine_high = Finding {
             rule_id: RuleId::PipeToInterpreter,
             severity: Severity::High,
@@ -559,8 +638,6 @@ allowed:
         assert_eq!(out.matched_allowed_name.as_deref(), Some("installer"));
         assert!(out.findings.is_empty());
         assert!(!out.findings.iter().any(|f| f.severity >= Severity::High));
-        // (m is unused beyond construction sanity above.)
-        let _ = m;
     }
 
     #[test]

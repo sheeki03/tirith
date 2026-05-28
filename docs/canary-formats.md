@@ -25,7 +25,7 @@ marker. That serves three goals:
 | -------------------- | --------------------------------------------------------- | ------------------------------------------------------- |
 | `aws-like`           | `AKIA00CANARY` + 8 base32 chars                           | `AKIA00CANARYBMJY3PVA`                                   |
 | `github-like`        | `ghp_canary_` + 30 alphanumerics                          | `ghp_canary_ZDuktRyqJjF0YNEP1KbpI2wHBzCnXv`             |
-| `gcp-like`           | `AIzaCANARY` + 30 URL-safe chars                          | `AIzaCANARY8fK2…` (39 chars total)                      |
+| `gcp-like`           | `AIzaCANARY` + 30 URL-safe chars                          | `AIzaCANARY8fK2…` (40 chars total)                      |
 | `env-line`           | `TIRITH_CANARY_TOKEN=canary_` + 24 hex                    | `TIRITH_CANARY_TOKEN=canary_3f9a…`                      |
 | `private-key-shaped` | PEM block whose body is `TIRITHCANARY` + 52 base64 chars  | `-----BEGIN TIRITH CANARY PRIVATE KEY----- …`           |
 

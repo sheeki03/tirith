@@ -813,8 +813,9 @@ const TAINT_SOURCE_LEADERS: &[&str] = &["source", "."];
 /// analyzed command against it.
 ///
 /// Returns `(findings_to_append, matched_allowed_name)`:
-/// * a `dangerous[*]` glob match → a Block `RepoCommandDangerousPattern`
-///   finding (ELEVATION — always allowed, stricter is safe);
+/// * a `dangerous[*]` glob match → a `RepoCommandDangerousPattern` finding,
+///   High severity (→ Block action) for `action: block` or Medium (→ Warn
+///   action) for `action: warn` (ELEVATION — always allowed, stricter is safe);
 /// * else an uncatalogued command → an Info `RepoCommandUnknown` finding;
 /// * else (command is in `allowed[*]`) → no finding, and the matched entry's
 ///   `name` is returned for AUDIT CONTEXT ONLY.
@@ -860,8 +861,10 @@ fn check_command_manifest_hot(
 ///
 /// * trusted + unexpired + command matches → Info `CommandCardVerified`
 /// * trusted + unexpired + command differs → High `CommandCardMismatch`
-/// * untrusted key / bad sig / expired     → at most one Info note (NOT a
-///   trust claim); unsigned / absent       → nothing
+/// * untrusted key / bad sig / expired / unreadable / malformed / remote-URL →
+///   at most one Info `CommandCardUnverified` note (NOT a trust claim, NEVER
+///   `CommandCardVerified`)
+/// * unsigned / absent → nothing
 ///
 /// V1 invariant: NO remote URL is fetched here. A URL-shaped `# tirith-card:`
 /// value yields a "remote URLs require `tirith command-card fetch` first" Info
@@ -883,9 +886,11 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
     let path = match card_ref {
         CardRef::LocalPath(p) => p,
         CardRef::RemoteUrl(url) => {
-            // V1: never fetch on the hot path. Surface a fetch-first note.
+            // V1: never fetch on the hot path. Surface a fetch-first note. This
+            // is a diagnostic, NOT a verification — tag it CommandCardUnverified
+            // so audit counts of `command_card_verified` stay honest.
             return vec![Finding {
-                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                rule_id: crate::verdict::RuleId::CommandCardUnverified,
                 severity: crate::verdict::Severity::Info,
                 title: "Command card reference is a remote URL".to_string(),
                 description: format!(
@@ -922,7 +927,7 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
         Ok(b) => b,
         Err(_) => {
             return vec![Finding {
-                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                rule_id: crate::verdict::RuleId::CommandCardUnverified,
                 severity: crate::verdict::Severity::Info,
                 title: "Command card could not be read".to_string(),
                 description: format!(
@@ -945,7 +950,7 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
         Ok(c) => c,
         Err(_) => {
             return vec![Finding {
-                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                rule_id: crate::verdict::RuleId::CommandCardUnverified,
                 severity: crate::verdict::Severity::Info,
                 title: "Command card is malformed".to_string(),
                 description: "The referenced command card is not valid JSON. Treating the \
@@ -1553,6 +1558,39 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// (warned once) rather than emitting perpetual false `first-time` anomalies
 /// (F4). Because it runs only when a finding already exists and is flag-gated, it
 /// adds NO tier-1 force-past and zero I/O on an opted-out machine.
+///
+/// # M11 — trust-ecosystem hot subsets (cards, manifest, canary) + incident overlay
+///
+/// Three M11 runtime-state checks run from `analyze`, each forcing past the
+/// tier-1 fast-exit only when its trigger is present (the `card_triggered`,
+/// `manifest_triggered`, `canary_triggered` gates), so a machine using none of
+/// them pays only a cheap probe:
+///
+/// * **Command card (ch1)** — [`check_command_card_hot`] (Exec). When a card is
+///   referenced via the `--card` sidecar or a leading `# tirith-card:
+///   <local-path>` comment, the card is read FROM DISK (never fetched) and
+///   evaluated: a verified+matching card → Info `CommandCardVerified`; a
+///   verified+differing command → High `CommandCardMismatch`; any
+///   unverifiable/unreadable/remote-URL card → Info `CommandCardUnverified`.
+///   ATTESTATION-ONLY: none of these change another finding's action.
+/// * **Repo command manifest (ch2)** — [`check_command_manifest_hot`] (Exec).
+///   When `.tirith/commands.yaml` exists for the repo, a `dangerous[*]` glob
+///   match ADDS a `RepoCommandDangerousPattern` finding (High → Block, or
+///   Medium → Warn for `action: warn`); an uncatalogued command ADDS an Info
+///   `RepoCommandUnknown`. SUPPRESSION-BOUNDED: it can only ADD findings (and
+///   suppress its own `RepoCommandUnknown`) — it can NEVER weaken an engine
+///   finding (the load-bearing invariant).
+/// * **Canary (ch3)** — [`check_canary_hot`] (Exec + Paste; also
+///   `analyze_output`). When a token registered in the local canary store
+///   appears in the scanned text, fires High `CanaryTokenTouched`. Forced past
+///   tier-1 only when the store is non-empty.
+///
+/// AFTER policy discovery, [`crate::policy::Policy::apply_runtime_overrides`]
+/// overlays **incident mode** (ch5): when an incident is active it forces
+/// `fail_mode=Closed`, disables the `TIRITH=0` bypass, and elevates the curated
+/// [`crate::incident::INCIDENT_ELEVATED_RULES`]. Incident mode adds ZERO new
+/// RuleIds — it is purely a policy overlay. A corrupt incident flag fails SAFE
+/// (treated as active), never silently dropping the posture.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx).0
 }
@@ -3065,7 +3103,7 @@ mod tests {
     /// `dangerous[]` ELEVATION: a `curl … | bash` matching a dangerous pattern
     /// blocks via the added `RepoCommandDangerousPattern` finding. (Here the
     /// engine would block anyway; the point is the manifest finding is present
-    /// and Block-severity.)
+    /// at High severity, which maps to the Block action.)
     #[test]
     fn manifest_dangerous_pattern_elevates_to_block() {
         if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {

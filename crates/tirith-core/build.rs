@@ -1290,6 +1290,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("anomaly_rare_in_baseline", "AnomalyRareInBaseline"),
     // Command-card rules (M11 ch1).
     ("command_card_verified", "CommandCardVerified"),
+    ("command_card_unverified", "CommandCardUnverified"),
     ("command_card_mismatch", "CommandCardMismatch"),
     // Repo command-manifest rules (M11 ch2).
     ("repo_command_unknown", "RepoCommandUnknown"),

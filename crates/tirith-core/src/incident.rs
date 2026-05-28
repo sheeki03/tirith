@@ -2,10 +2,28 @@
 //!
 //! An *incident* is a manually-declared "we may be under attack right now"
 //! posture. While an incident is active tirith stops being advisory and turns
-//! the screws: the runtime policy is forced fail-closed, the `TIRITH=0` env
-//! bypass (interactive AND non-interactive) is disabled, and a curated set of
-//! already-shipping detection rules is elevated so the *next* suspicious thing
-//! the operator runs is far more likely to block.
+//! the screws via three levers: the runtime policy `fail_mode` is forced to
+//! [`crate::policy::FailMode::Closed`], the `TIRITH=0` env bypass (interactive
+//! AND non-interactive) is disabled, and a curated set of already-shipping
+//! detection rules is elevated so the *next* suspicious thing the operator runs
+//! is far more likely to block.
+//!
+//! Scope note: on the primary `tirith check` exec path the operative levers are
+//! the bypass-disable and the rule-elevation. `fail_mode=Closed` governs the
+//! fail-OPEN/CLOSED decision at the points that consult it (the MCP output
+//! filter and the install transaction); the ordinary `check` verdict derives
+//! its action from finding severity, so the elevation — not `fail_mode` — is
+//! what makes more commands block during an incident.
+//!
+//! # Corrupt flag → fail SAFE (NOT fail-open)
+//!
+//! The flag file's mere *existence* is the signal that an incident is active.
+//! If the file exists but is corrupt/truncated (a parse failure), tirith treats
+//! the incident as **active** — it applies the fail-closed overlay anyway and
+//! warns on stderr — rather than silently dropping the posture. Distinguishing
+//! "absent" (truly no incident) from "present-but-corrupt" (an incident WAS
+//! started; honor it) is what keeps the headline guarantee honest. See
+//! [`read_flag_at`] / [`active_cached`].
 //!
 //! # Zero new RuleIds
 //!
@@ -123,7 +141,7 @@ impl IncidentState {
     /// RFC-3339-ish display of `started_at` for human output. Falls back to the
     /// raw epoch seconds when the timestamp is outside chrono's range.
     pub fn started_at_display(&self) -> String {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(self.started_at as i64, 0)
+        chrono::DateTime::from_timestamp(self.started_at as i64, 0)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| format!("{} (epoch seconds)", self.started_at))
     }
@@ -162,23 +180,85 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
-/// Read the current incident state, if any. `None` when the flag file is
-/// missing or unparseable (a corrupt flag is treated as "no incident" — but
-/// see the safety note: deletion is the only intended way to end one, so a
-/// corrupt-flag fall-through is a degraded best-effort, not a security
-/// downgrade we rely on).
-///
-/// This is the un-cached read used by the CLI (`status`, `stop`, `report`).
-/// The hot-path read used by the engine goes through [`active_cached`].
-pub fn read_state() -> Option<IncidentState> {
-    let path = flag_path()?;
-    read_state_at(&path)
+/// Tri-state result of reading the incident flag file. Distinguishing
+/// `Absent` from `Corrupt` is load-bearing for the fail-SAFE posture: a corrupt
+/// flag means an incident WAS started and the file later got mangled, so we
+/// must keep enforcing — never silently fall back to "no incident".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlagRead {
+    /// No flag file on disk → no incident is active (the common path).
+    Absent,
+    /// Flag file present and parsed cleanly.
+    Valid(IncidentState),
+    /// Flag file present but unreadable/unparseable. Treated as ACTIVE
+    /// (fail-safe): an incident was declared and the file is now corrupt.
+    Corrupt,
 }
 
-/// [`read_state`] against an explicit path (test seam).
+/// A synthetic [`IncidentState`] used when the flag file exists but is corrupt.
+/// `started_at: 0` and the marker reason make the degraded state obvious in
+/// `status`/`report` output while still driving the fail-closed overlay.
+pub fn corrupt_placeholder_state() -> IncidentState {
+    IncidentState {
+        started_at: 0,
+        started_by: String::new(),
+        reason: CORRUPT_FLAG_REASON.to_string(),
+    }
+}
+
+/// Marker reason stamped on the synthetic state for a corrupt flag.
+pub const CORRUPT_FLAG_REASON: &str =
+    "incident flag file is corrupt — fail-closed posture applied (run `tirith incident status`)";
+
+/// Read the current incident flag as a tri-state. This is the un-cached read;
+/// the hot path goes through [`active_cached`].
+pub fn read_flag() -> FlagRead {
+    match flag_path() {
+        Some(path) => read_flag_at(&path),
+        None => FlagRead::Absent,
+    }
+}
+
+/// [`read_flag`] against an explicit path (test seam). Distinguishes
+/// file-absent (→ [`FlagRead::Absent`]) from present-but-unparseable
+/// (→ [`FlagRead::Corrupt`]) — a corrupt flag must NOT downgrade to "no
+/// incident".
+pub fn read_flag_at(path: &Path) -> FlagRead {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        // Truly absent (ENOENT) → no incident. Any OTHER read error on an
+        // existing path is treated as corrupt (fail-safe).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FlagRead::Absent,
+        Err(_) => return FlagRead::Corrupt,
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => FlagRead::Valid(state),
+        Err(_) => FlagRead::Corrupt,
+    }
+}
+
+/// Read the current incident state for the CLI (`status`, `stop`, `report`).
+/// `None` only when no flag file exists. A corrupt flag yields the synthetic
+/// [`corrupt_placeholder_state`] (fail-safe: an incident is still considered
+/// active).
+///
+/// The hot-path read used by the engine goes through [`active_cached`].
+pub fn read_state() -> Option<IncidentState> {
+    match read_flag() {
+        FlagRead::Absent => None,
+        FlagRead::Valid(state) => Some(state),
+        FlagRead::Corrupt => Some(corrupt_placeholder_state()),
+    }
+}
+
+/// [`read_state`] against an explicit path (test seam). A corrupt flag yields
+/// the synthetic [`corrupt_placeholder_state`]; an absent flag yields `None`.
 pub fn read_state_at(path: &Path) -> Option<IncidentState> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    match read_flag_at(path) {
+        FlagRead::Absent => None,
+        FlagRead::Valid(state) => Some(state),
+        FlagRead::Corrupt => Some(corrupt_placeholder_state()),
+    }
 }
 
 /// Declare an incident: atomically create the flag file with `0o600`. Fails
@@ -214,7 +294,12 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
             Ok(state)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Someone beat us to it. Surface the *existing* state, not ours.
+            // Someone beat us to it. Surface the *existing* state, not ours. A
+            // corrupt existing flag reads back as the corrupt-marker state
+            // (CORRUPT_FLAG_REASON) rather than a blank "since 1970" — so the
+            // user is told the live flag is unreadable (F9). The empty fallback
+            // only fires in the narrow TOCTOU window where the file vanished
+            // between the O_EXCL failure and this read.
             let existing = read_state_at(path).unwrap_or_else(|| IncidentState {
                 started_at: 0,
                 started_by: String::new(),
@@ -285,8 +370,10 @@ fn mtime_nanos(path: &Path) -> (bool, u128) {
 }
 
 /// The hot-path read: returns the active incident state through the 5s cache.
-/// `None` when no incident is active. Used by
-/// [`crate::policy::Policy::apply_runtime_overrides`].
+/// `None` ONLY when the flag file is absent (no incident). A present-but-corrupt
+/// flag is FAIL-SAFE: it returns the synthetic [`corrupt_placeholder_state`] so
+/// [`crate::policy::Policy::apply_runtime_overrides`] still applies the
+/// fail-closed overlay, and a one-line warning is emitted to stderr.
 pub fn active_cached() -> Option<IncidentState> {
     let path = flag_path()?;
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -303,8 +390,18 @@ pub fn active_cached() -> Option<IncidentState> {
         }
     }
 
-    // Cache miss / stale: re-read. Absent file → None (the common path).
-    let parsed = if existed { read_state_at(&path) } else { None };
+    // Cache miss / stale: re-read via the tri-state. Absent → None (common
+    // path). Corrupt → fail-safe synthetic active state + a stderr warning
+    // (rate-limited to once per corrupt (path, mtime) so the hot path is not
+    // spammed). Valid → the parsed state.
+    let parsed = match read_flag_at(&path) {
+        FlagRead::Absent => None,
+        FlagRead::Valid(state) => Some(state),
+        FlagRead::Corrupt => {
+            warn_corrupt_flag_once(&path, cur_mtime);
+            Some(corrupt_placeholder_state())
+        }
+    };
     *guard = Some(CacheState {
         path: path.clone(),
         state: parsed.clone(),
@@ -313,6 +410,23 @@ pub fn active_cached() -> Option<IncidentState> {
         existed,
     });
     parsed
+}
+
+/// Stderr warning for an honored corrupt flag, de-duplicated per
+/// `(path, mtime)` so a long-lived process re-reading every 5s does not spam.
+fn warn_corrupt_flag_once(path: &Path, mtime: u128) {
+    use std::sync::Mutex as StdMutex;
+    static LAST_WARNED: StdMutex<Option<(PathBuf, u128)>> = StdMutex::new(None);
+    let mut guard = LAST_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (path.to_path_buf(), mtime);
+    if guard.as_ref() == Some(&key) {
+        return;
+    }
+    *guard = Some(key);
+    eprintln!(
+        "tirith: incident flag corrupt — applying fail-closed posture; \
+         run `tirith incident status`"
+    );
 }
 
 /// `true` when an incident is currently active (cached). Convenience over
@@ -443,11 +557,42 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_flag_reads_as_none() {
+    fn corrupt_flag_fails_safe_to_active() {
+        // F1 (Sev-7): a flag file that EXISTS but is corrupt means an incident
+        // WAS started and the file got mangled — it must fail SAFE (treated as
+        // active), NOT fall through to "no incident". The file's existence is
+        // the signal; a parse failure must never downgrade the posture.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         std::fs::write(&flag, b"this is not json").unwrap();
+
+        // Tri-state read distinguishes corrupt from absent.
+        assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
+
+        // read_state_at yields the synthetic placeholder, NOT None.
+        let state = read_state_at(&flag).expect("corrupt flag must read as active");
+        assert_eq!(state.started_at, 0);
+        assert_eq!(state.reason, CORRUPT_FLAG_REASON);
+    }
+
+    #[test]
+    fn absent_flag_reads_as_none() {
+        // The contrast case: a truly-absent flag is NOT an incident.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        assert_eq!(read_flag_at(&flag), FlagRead::Absent);
         assert!(read_state_at(&flag).is_none());
+    }
+
+    #[test]
+    fn valid_flag_reads_as_valid() {
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+        start_at(&flag, "real incident").unwrap();
+        match read_flag_at(&flag) {
+            FlagRead::Valid(s) => assert_eq!(s.reason, "real incident"),
+            other => panic!("expected Valid, got {other:?}"),
+        }
     }
 
     #[test]

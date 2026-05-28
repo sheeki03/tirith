@@ -155,7 +155,13 @@ fn parse_store(path: &Path) -> Vec<TaintEntry> {
     };
     let reader = BufReader::new(file);
     let mut out = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    // Skip blank / unparseable lines AND continue past reader I/O errors
+    // (invalid UTF-8 mid-file). A previous `map_while(Result::ok)` stopped at
+    // the first reader Err, silently dropping every entry after it.
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

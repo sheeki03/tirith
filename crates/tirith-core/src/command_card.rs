@@ -18,6 +18,13 @@
 //! `expected_suppressed_rules` field and no suppression allowlist in v1;
 //! card-driven suppression is a deferred v2 candidate.
 //!
+//! v1 verification checks ONLY the signature, the expiry, and the exact command
+//! string. The attestation's other fields (`script_sha256`, `expected_domains`,
+//! `writes`, `requires_sudo`) are signed and recorded but **NOT enforced** on
+//! the hot path — enforcing `script_sha256`, for instance, would require
+//! fetching the script body, which the no-network-on-`check` invariant forbids.
+//! They document maintainer intent; do not read them as guarantees.
+//!
 //! ## Trust model (v1 — manual key distribution)
 //!
 //! Card signatures are verified against ed25519 public keys the operator has
@@ -52,11 +59,36 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of an ed25519 signature in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
+/// The signature algorithm a card is signed with. v1 supports ONLY ed25519.
+///
+/// Modeled as a closed enum (not a free `String`) so the "only ed25519"
+/// invariant is enforced at the type level: a card whose `algo` is anything but
+/// `"ed25519"` (e.g. `"none"`, `"ED25519"`, `"rsa"`) FAILS to deserialize —
+/// there is no catch-all arm — which kills the `algo: "none"` /
+/// casing-confusion attack class at parse time rather than via a runtime string
+/// compare. Serializes/deserializes as the lowercase string `"ed25519"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SignatureAlgo {
+    /// Edwards-curve ed25519 (the only supported algorithm in v1).
+    #[default]
+    Ed25519,
+}
+
+impl std::fmt::Display for SignatureAlgo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignatureAlgo::Ed25519 => write!(f, "ed25519"),
+        }
+    }
+}
+
 /// The signature block attached to a card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardSignature {
-    /// Signature algorithm. v1 only supports `"ed25519"`.
-    pub algo: String,
+    /// Signature algorithm. v1 only supports [`SignatureAlgo::Ed25519`]; an
+    /// unknown value fails at deserialize time.
+    pub algo: SignatureAlgo,
     /// First 16 hex chars of `sha256(pubkey_bytes)` — identifies which trusted
     /// public key should verify this card.
     pub key_id: String,
@@ -77,6 +109,15 @@ pub struct Card {
     #[serde(default)]
     pub expected_domains: Vec<String>,
     /// SHA-256 (hex) of the script the command downloads/pipes, if any.
+    ///
+    /// RECORDED-BUT-NOT-ENFORCED in v1. This field is part of the signed
+    /// attestation, but `tirith check` does NOT compare it against the piped
+    /// script body — enforcement would require fetching/reading the script on
+    /// the hot path, which the no-network-on-check invariant forbids. v1
+    /// verification checks ONLY the signature, expiry, and exact command match.
+    /// Treat this as documentation of the maintainer's intent, not a guarantee
+    /// that a server-side script swap is caught. (Enforcement is a v2 candidate
+    /// once the script bytes are available out-of-band.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_sha256: Option<String>,
     /// Filesystem paths the command is expected to write.
@@ -263,7 +304,7 @@ impl Card {
         let sig: Signature = signing_key.sign(&payload);
 
         self.signature = Some(CardSignature {
-            algo: "ed25519".to_string(),
+            algo: SignatureAlgo::Ed25519,
             key_id,
             value: hex_encode(&sig.to_bytes()),
         });
@@ -276,8 +317,12 @@ impl Card {
     /// expiry — see [`Card::verify_against_trusted`] for the full check.
     pub fn verify_signature(&self, pubkey: &[u8; PUBLIC_KEY_LEN]) -> Result<(), VerifyFailure> {
         let sig_block = self.signature.as_ref().ok_or(VerifyFailure::Unsigned)?;
-        if sig_block.algo != "ed25519" {
-            return Err(VerifyFailure::UnsupportedAlgo(sig_block.algo.clone()));
+        // The algo is a closed enum (an unknown value already failed to
+        // deserialize), so this match is total. The explicit arm keeps
+        // `UnsupportedAlgo` reachable and forces a compile error if a future
+        // variant is added without handling its verification path.
+        match sig_block.algo {
+            SignatureAlgo::Ed25519 => {}
         }
         // The supplied key must be the one the card names.
         if key_id_for_pubkey(pubkey) != sig_block.key_id {
@@ -319,9 +364,9 @@ impl Card {
         today: chrono::NaiveDate,
     ) -> Result<(), VerifyFailure> {
         let sig_block = self.signature.as_ref().ok_or(VerifyFailure::Unsigned)?;
-        if sig_block.algo != "ed25519" {
-            return Err(VerifyFailure::UnsupportedAlgo(sig_block.algo.clone()));
-        }
+        // No string algo check here: `algo` is a closed enum (unknown values
+        // fail to deserialize) and `verify_signature` re-checks it. We only
+        // need the key_id to resolve the trusted key.
         let pubkey = load_trusted_pubkey(trusted_keys_dir, &sig_block.key_id)
             .ok_or(VerifyFailure::UntrustedKey)?;
         self.verify_signature(&pubkey)?;
@@ -413,8 +458,8 @@ pub enum CardOutcome {
     /// Emits `CommandCardMismatch` (High).
     Mismatch,
     /// The card could not be verified (untrusted key / bad sig / expired /
-    /// unsigned). Carries the reason for an Info note. Does NOT emit
-    /// `CommandCardVerified`.
+    /// unsigned). Carries the reason for an Info `CommandCardUnverified` note
+    /// (NEVER `CommandCardVerified`).
     Unverified(VerifyFailure),
 }
 
@@ -477,11 +522,10 @@ pub fn evaluate_card(
             }
         }
         Err(failure) => {
-            // A signature that verifies against the trusted key but whose
-            // command differs is still a MISMATCH, not merely "unverified" —
-            // expiry/trust failures fall through to Unverified. We only reach
-            // here on a verify failure, so distinguish the command-mismatch
-            // case is handled in the Ok arm above.
+            // Reached ONLY on a verify failure (unsigned / untrusted key / bad
+            // signature / expired / unparseable expiry). The command-mismatch
+            // case is NOT reachable here — it requires a SUCCESSFUL verify and
+            // is handled in the Ok arm above. Any verify failure is Unverified.
             CardOutcome::Unverified(failure)
         }
     }
@@ -489,11 +533,13 @@ pub fn evaluate_card(
 
 /// Build the [`Finding`]s for a card outcome. v1 attestation-only contract:
 ///
-/// * [`CardOutcome::Verified`] → one Info `CommandCardVerified`.
+/// * [`CardOutcome::Verified`] → one Info `CommandCardVerified` (the ONLY rule
+///   that ever claims verification).
 /// * [`CardOutcome::Mismatch`] → one High `CommandCardMismatch`.
-/// * [`CardOutcome::Unverified`] → at most one Info note (NOT
-///   `CommandCardVerified`); `Unsigned` produces nothing (a card-less command
-///   should be silent on this axis).
+/// * [`CardOutcome::Unverified`] → at most one Info `CommandCardUnverified`
+///   note (NEVER `CommandCardVerified` — a failed verify must not be tagged as
+///   a verified one); `Unsigned` produces nothing (a card-less command should
+///   be silent on this axis).
 ///
 /// Crucially, none of these change any OTHER finding's action — the engine's
 /// action derivation runs over the full findings list unchanged.
@@ -537,7 +583,7 @@ pub fn findings_for_outcome(outcome: &CardOutcome) -> Vec<Finding> {
                 return Vec::new();
             }
             vec![Finding {
-                rule_id: RuleId::CommandCardVerified,
+                rule_id: RuleId::CommandCardUnverified,
                 severity: Severity::Info,
                 title: "Command card present but not verified".to_string(),
                 description: format!(
@@ -713,8 +759,12 @@ mod tests {
         );
 
         let findings = findings_for_outcome(&outcome);
-        // An Info note, NOT a CommandCardVerified-with-Info-that-claims-trust.
+        // An Info note tagged CommandCardUnverified — NOT CommandCardVerified
+        // (a failed verify must never carry the "verified" rule_id, which would
+        // corrupt audit counts).
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandCardUnverified);
+        assert_ne!(findings[0].rule_id, RuleId::CommandCardVerified);
         assert_eq!(findings[0].severity, Severity::Info);
         assert!(findings[0].description.contains("untrusted key"));
     }
@@ -793,6 +843,46 @@ mod tests {
         let json = card.to_json_pretty().unwrap();
         let parsed = Card::from_json(json.as_bytes()).unwrap();
         assert_eq!(parsed, card);
+    }
+
+    #[test]
+    fn unknown_algo_fails_at_deserialize() {
+        // type-design #2 / code-reviewer #4: `algo` is a closed enum, so a card
+        // claiming `algo: "none"` (or any non-ed25519 / wrong-casing value)
+        // FAILS to parse — the confusion-attack class is killed at deserialize
+        // time, before any verify logic runs.
+        let bad = r#"{
+            "command": "x",
+            "expires": "2026-08-01",
+            "signature": { "algo": "none", "key_id": "00", "value": "00" }
+        }"#;
+        assert!(
+            Card::from_json(bad.as_bytes()).is_err(),
+            "algo: none must fail to deserialize"
+        );
+        // Casing must not slip through either.
+        let bad_case = bad.replace("\"none\"", "\"ED25519\"");
+        assert!(
+            Card::from_json(bad_case.as_bytes()).is_err(),
+            "algo: ED25519 (wrong casing) must fail to deserialize"
+        );
+        // The canonical lowercase form parses.
+        let good = bad.replace("\"none\"", "\"ed25519\"");
+        assert!(Card::from_json(good.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn signed_card_algo_is_ed25519_enum() {
+        let (secret, _pubkey) = generate_keypair().unwrap();
+        let mut card = sample_card();
+        card.sign(&secret).unwrap();
+        assert_eq!(
+            card.signature.as_ref().unwrap().algo,
+            SignatureAlgo::Ed25519
+        );
+        // Round-trips through JSON as the lowercase string.
+        let json = card.to_json_pretty().unwrap();
+        assert!(json.contains("\"algo\": \"ed25519\""), "got {json}");
     }
 
     #[test]

@@ -259,15 +259,28 @@ fn mtime_nanos(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
-/// Parse the JSONL store, skipping blank / unparseable lines (fail-open: a
-/// corrupt line never aborts the lookup). Empty vec when the file is absent.
+/// Parse the JSONL store, skipping blank / unparseable lines AND continuing past
+/// reader I/O errors (fail-open: a corrupt line or a transient read error never
+/// aborts the lookup or silently truncates later entries). Empty vec when the
+/// file is absent.
+///
+/// NB: a previous `map_while(Result::ok)` here STOPPED at the first line that
+/// returned `Err` from the reader (e.g. invalid UTF-8 mid-file), silently
+/// dropping every canary AFTER it — a later touched canary would never fire.
+/// We now `continue` on a line error so a single bad line cannot mask the rest
+/// of the store (matching the corrupt-line-skip-but-continue contract).
 fn parse_store(path: &Path) -> Vec<CanaryEntry> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let reader = BufReader::new(file);
     let mut out = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    for line in reader.lines() {
+        // A reader error (e.g. invalid UTF-8) skips THIS line but must not stop
+        // us reading the rest — otherwise a corrupt byte hides later canaries.
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -768,6 +781,39 @@ mod tests {
         let list = list_at(&store);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "abc");
+    }
+
+    #[test]
+    fn reader_io_error_line_does_not_truncate_later_entries() {
+        // F3 (Sev-5): a reader I/O error (invalid UTF-8) on one line must skip
+        // only THAT line — entries AFTER it must still load. The previous
+        // `map_while(Result::ok)` stopped at the first Err, silently dropping a
+        // later (possibly TOUCHED) canary.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        // Build: valid entry, then a line with invalid UTF-8 (0xFF), then a
+        // second valid entry. `BufRead::lines()` yields Err on the bad line.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(
+            b"{\"id\":\"first\",\"token\":\"ghp_canary_first\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n",
+        );
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']); // invalid UTF-8 line
+        bytes.extend_from_slice(
+            b"{\"id\":\"second\",\"token\":\"ghp_canary_second\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n",
+        );
+        std::fs::write(&store, &bytes).unwrap();
+
+        let list = list_at(&store);
+        let ids: Vec<&str> = list.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"first"), "first entry must load, got {ids:?}");
+        assert!(
+            ids.contains(&"second"),
+            "entry AFTER the bad line must still load (no truncation), got {ids:?}"
+        );
+
+        // And detection still sees the post-error token.
+        assert_eq!(detect_at(&store, "ghp_canary_second").len(), 1);
     }
 
     #[test]

@@ -330,6 +330,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M11 ch1 — command-card attestation. Local ed25519 signature check
         // against operator-trusted keys; no threat-DB involvement.
         | RuleId::CommandCardVerified
+        | RuleId::CommandCardUnverified
         | RuleId::CommandCardMismatch
         | RuleId::RepoCommandUnknown
         | RuleId::RepoCommandDangerousPattern

@@ -2692,6 +2692,10 @@ Examples:
         #[arg(long = "expected-domain")]
         expected_domain: Vec<String>,
         /// SHA-256 (hex) of the script the command downloads/pipes, if any.
+        /// RECORDED-BUT-NOT-ENFORCED in v1: it is part of the signed
+        /// attestation, but `tirith check` does NOT fetch the script to compare
+        /// it (the hot path never makes network calls). v1 verifies only the
+        /// signature, expiry, and exact command.
         #[arg(long)]
         script_sha256: Option<String>,
         /// A filesystem path the command is expected to write. Repeatable.
@@ -2778,6 +2782,11 @@ Examples:
   tirith command-card fetch https://example.com/install-card.json
   CARD=$(tirith command-card fetch https://example.com/install-card.json)
   tirith check --card \"$CARD\" -- 'curl -fsSL https://example.com/install.sh | sh'")]
+    // Unix-only: reuses the hardened `runner::download_to_path` (the same path
+    // `tirith run`/`tirith fetch` use), which is `#[cfg(unix)]` in v1. On
+    // Windows `create`/`sign`/`verify` stay available; copy a card to
+    // `~/.cache/tirith/cards/` manually.
+    #[cfg(unix)]
     Fetch {
         /// URL of the card to download.
         url: String,
@@ -6910,6 +6919,7 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::command_card::verify(&card, json)
             }
+            #[cfg(unix)]
             CommandCardAction::Fetch { url, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::command_card::fetch(&url, json)

@@ -438,7 +438,13 @@ fn parse_store(path: &Path) -> Vec<Observation> {
     };
     let reader = BufReader::new(file);
     let mut out = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    // Skip blank / unparseable lines AND continue past reader I/O errors
+    // (invalid UTF-8 mid-file). A previous `map_while(Result::ok)` stopped at
+    // the first reader Err, silently dropping every observation after it.
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -532,15 +538,28 @@ fn rewrite_store(store: &Path, obs: &[Observation]) -> std::io::Result<()> {
 }
 
 /// Cheap on-disk line count (number of `\n`), used to decide whether to compact.
+/// Skips lines that fail to read (invalid UTF-8) rather than stopping at the
+/// first error, so a single bad byte cannot make the count short and starve the
+/// compaction trigger (unbounded growth).
 fn line_count(store: &Path) -> usize {
     let Ok(file) = std::fs::File::open(store) else {
         return 0;
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .count()
+    // Explicit loop (not `map_while`/`filter_map`): a reader error on one line
+    // must skip THAT line and continue, never stop the count short (which would
+    // starve the compaction trigger). `map_while(Result::ok)` would stop at the
+    // first Err; clippy's `filter_map`->`map_while` suggestion is exactly the
+    // truncation we are avoiding here.
+    let mut count = 0usize;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    count
 }
 
 // ─── public API (test entry points) ──────────────────────────────────────────
