@@ -77,13 +77,65 @@ pub(crate) fn offline_env_active() -> bool {
 /// Returns `false` on a write failure so the caller can exit non-zero — a
 /// piped consumer must not see truncated JSON paired with a success code.
 pub(crate) fn write_json_stdout<T: serde::Serialize>(value: &T, ctx: &str) -> bool {
-    use std::io::Write;
     let mut out = std::io::stdout().lock();
-    if serde_json::to_writer_pretty(&mut out, value).is_err() || writeln!(out).is_err() {
+    if write_json_to(&mut out, value) {
+        true
+    } else {
         eprintln!("{ctx}");
-        return false;
+        false
     }
-    true
+}
+
+/// Write `value` as pretty JSON followed by a trailing newline to `out`.
+/// Returns `false` if either the JSON body or the newline failed to write.
+/// Factored out of [`write_json_stdout`] so the failure path is unit-testable
+/// with a deliberately-failing writer (the real stdout cannot be made to fail
+/// deterministically across platforms).
+fn write_json_to<W: Write, T: serde::Serialize>(out: &mut W, value: &T) -> bool {
+    serde_json::to_writer_pretty(&mut *out, value).is_ok() && writeln!(out).is_ok()
+}
+
+#[cfg(test)]
+mod write_json_tests {
+    use super::write_json_to;
+
+    /// A writer that always fails — models a broken pipe / closed stdout.
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+    }
+
+    #[test]
+    fn write_json_to_reports_failure_on_write_error() {
+        // The contract the `command-card sign/verify/fetch` (and canary)
+        // callers rely on: a failed write returns `false` so they can exit
+        // non-zero rather than pairing truncated JSON with a success code.
+        let mut w = FailingWriter;
+        assert!(
+            !write_json_to(&mut w, &serde_json::json!({"signed": true})),
+            "a writer that errors must make write_json_to return false"
+        );
+    }
+
+    #[test]
+    fn write_json_to_succeeds_to_a_buffer() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(write_json_to(&mut buf, &serde_json::json!({"ok": 1})));
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("\"ok\""));
+        assert!(s.ends_with('\n'), "a trailing newline must be written");
+    }
 }
 
 /// Suggest the closest match from a list of candidates using Levenshtein distance.

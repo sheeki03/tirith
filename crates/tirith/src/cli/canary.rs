@@ -34,14 +34,23 @@ pub fn create(kind: &str, callback_url: Option<String>, json: bool) -> i32 {
 
     // Reject an obviously-malformed callback URL early (must be http(s)). We do
     // NOT verify reachability — the URL is the user's self-hosted endpoint and
-    // is only contacted on detection.
-    if let Some(ref url) = callback_url {
-        let u = url.trim();
-        if !(u.starts_with("http://") || u.starts_with("https://")) {
-            eprintln!("tirith canary create: --callback-url must be an http(s) URL (got '{url}')");
-            return 2;
+    // is only contacted on detection. Normalize (trim) the value here and
+    // persist the trimmed form, so whitespace padding from the CLI never lands
+    // in the store (and never reaches the detached callback POST, which only
+    // re-trims as a defensive backstop).
+    let callback_url = match callback_url {
+        Some(url) => {
+            let trimmed = url.trim();
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                eprintln!(
+                    "tirith canary create: --callback-url must be an http(s) URL (got '{url}')"
+                );
+                return 2;
+            }
+            Some(trimmed.to_string())
         }
-    }
+        None => None,
+    };
 
     match canary::create(kind, callback_url) {
         Ok(entry) => {

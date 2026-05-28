@@ -270,6 +270,18 @@ pub fn start(reason: impl Into<String>) -> Result<IncidentState, StartError> {
 }
 
 /// [`start`] against an explicit path (test seam).
+///
+/// The flag is published ATOMICALLY with its full JSON body already present:
+/// the body is written to a sibling temp file, then `hard_link(tmp, path)`
+/// claims the final path. `hard_link` errors with `AlreadyExists` when `path`
+/// already exists — the exact same "someone beat us to it" semantics as the
+/// O_EXCL open, but a concurrent [`active_cached`] now sees either no file or a
+/// COMPLETE file, never the empty window between O_EXCL-create and `write_all`.
+/// If `hard_link` is unsupported on the platform/filesystem we fall back to the
+/// original O_EXCL-then-write path (whose only downside — a momentary empty
+/// file — is already fail-SAFE: a partial read is treated as an active
+/// incident). The `AlreadyExists` → surface-existing-state path is preserved in
+/// both branches.
 pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState, StartError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(StartError::Io)?;
@@ -278,6 +290,47 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
     let body =
         serde_json::to_vec_pretty(&state).map_err(|e| StartError::Io(std::io::Error::other(e)))?;
 
+    // Write the FULL body to a sibling temp file first, then atomically claim
+    // the final path via hard_link. NamedTempFile cleans itself up on drop, so
+    // a failed/loser claim never leaves a stray temp file behind.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp_result = match dir {
+        Some(d) => tempfile::NamedTempFile::new_in(d),
+        None => tempfile::NamedTempFile::new_in("."),
+    };
+    if let Ok(mut tmp) = tmp_result {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort 0600 on the temp file before it becomes the flag.
+            let _ = tmp
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        if tmp.write_all(&body).is_ok() && tmp.flush().is_ok() {
+            match std::fs::hard_link(tmp.path(), path) {
+                Ok(()) => {
+                    // We won the race; the final path now points at the fully
+                    // written content. Drop `tmp` to unlink the temp name (the
+                    // linked final path keeps the inode/content).
+                    drop(tmp);
+                    invalidate_cache();
+                    return Ok(state);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(already_active(path));
+                }
+                // hard_link unsupported (e.g. some filesystems) or another
+                // error: fall through to the O_EXCL path below. `tmp` is dropped
+                // here, removing the temp file.
+                Err(_) => {}
+            }
+        }
+    }
+
+    // Fallback: O_EXCL create then write. Momentary empty window is fail-safe
+    // (a partial read is treated as an active incident).
     let mut opts = std::fs::OpenOptions::new();
     // create_new => O_EXCL: fail rather than clobber a concurrent incident.
     opts.write(true).create_new(true);
@@ -293,22 +346,24 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
             invalidate_cache();
             Ok(state)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Someone beat us to it. Surface the *existing* state, not ours. A
-            // corrupt existing flag reads back as the corrupt-marker state
-            // (CORRUPT_FLAG_REASON) rather than a blank "since 1970" — so the
-            // user is told the live flag is unreadable (F9). The empty fallback
-            // only fires in the narrow TOCTOU window where the file vanished
-            // between the O_EXCL failure and this read.
-            let existing = read_state_at(path).unwrap_or_else(|| IncidentState {
-                started_at: 0,
-                started_by: String::new(),
-                reason: String::new(),
-            });
-            Err(StartError::AlreadyActive(Box::new(existing)))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(already_active(path)),
         Err(e) => Err(StartError::Io(e)),
     }
+}
+
+/// Build the [`StartError::AlreadyActive`] for a start that lost the race:
+/// surface the *existing* on-disk state, not ours. A corrupt existing flag
+/// reads back as the corrupt-marker state (CORRUPT_FLAG_REASON) rather than a
+/// blank "since 1970" — so the user is told the live flag is unreadable (F9).
+/// The empty fallback only fires in the narrow TOCTOU window where the file
+/// vanished between the failed claim and this read.
+fn already_active(path: &Path) -> StartError {
+    let existing = read_state_at(path).unwrap_or_else(|| IncidentState {
+        started_at: 0,
+        started_by: String::new(),
+        reason: String::new(),
+    });
+    StartError::AlreadyActive(Box::new(existing))
 }
 
 /// End an incident: delete the flag file. **Always** succeeds when the file is
@@ -507,6 +562,42 @@ mod tests {
         let read = read_state_at(&flag).expect("flag present after start");
         assert_eq!(read.reason, "suspicious paste");
         assert_eq!(read.started_at, state.started_at);
+    }
+
+    #[test]
+    fn start_publishes_full_state_atomically_never_empty() {
+        // F5 (Major): the flag is published with its full JSON body already
+        // present (hard_link of a fully-written temp file), so a reader
+        // immediately after start sees a COMPLETE, valid state — never an empty
+        // or partial file. We cannot easily race a real concurrent reader here,
+        // but we CAN prove the post-condition the atomic publish guarantees: the
+        // file exists, is non-empty, and parses to the started state.
+        let dir = tempdir().unwrap();
+        let flag = flag_in(dir.path());
+
+        let state = start_at(&flag, "atomic publish").unwrap();
+
+        // Raw on-disk bytes are non-empty and valid JSON (no empty window left
+        // behind).
+        let bytes = std::fs::read(&flag).expect("flag file present after start");
+        assert!(!bytes.is_empty(), "published flag must never be empty");
+        let parsed: IncidentState =
+            serde_json::from_slice(&bytes).expect("published flag is complete, valid JSON");
+        assert_eq!(parsed.reason, "atomic publish");
+        assert_eq!(parsed.started_at, state.started_at);
+
+        // And the tri-state read sees it as Valid (not Corrupt/partial).
+        assert!(matches!(read_flag_at(&flag), FlagRead::Valid(_)));
+        // No stray temp file left in the directory besides the flag itself.
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != flag)
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "atomic publish must not leave a temp file behind, found: {stray:?}"
+        );
     }
 
     #[test]

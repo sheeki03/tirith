@@ -504,6 +504,26 @@ pub fn classify_card_ref(value: &str) -> CardRef {
     }
 }
 
+/// Remove any `# tirith-card: <ref>` marker line(s) from `input`, returning the
+/// command text the card actually attests to. The marker is transport
+/// metadata, never part of the signed command, so it MUST be stripped before
+/// the byte-for-byte [`Card::command_matches`] comparison — otherwise a command
+/// carried via a `# tirith-card:` comment would always falsely mismatch its own
+/// (correctly-signed) card, since the analyzed input still contains the marker.
+///
+/// Matches the same `trim_start().starts_with("# tirith-card:")` shape as
+/// [`find_card_comment`], so exactly the line(s) the resolver treats as the card
+/// reference are removed. Surviving lines are rejoined with `\n`; surrounding
+/// whitespace is left to [`Card::command_matches`]'s own trim.
+pub fn strip_card_comment_lines(input: &str) -> String {
+    const MARKER: &str = "# tirith-card:";
+    input
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(MARKER))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Evaluate an already-loaded card against the analyzed command, given the
 /// trusted-keys directory and today's date. Pure: callers do the disk read for
 /// the card and key files (or, in tests, supply a tempdir).
@@ -832,6 +852,56 @@ mod tests {
             find_card_comment("curl https://example.com/x.sh | sh"),
             None
         );
+    }
+
+    #[test]
+    fn strip_card_comment_lines_removes_only_the_marker() {
+        // A leading marker line is stripped; the command survives verbatim.
+        let input = "# tirith-card: ./card.json\ncurl -fsSL https://example.com/install.sh | sh";
+        assert_eq!(
+            strip_card_comment_lines(input),
+            "curl -fsSL https://example.com/install.sh | sh"
+        );
+        // Indented marker (the resolver trims leading whitespace) is also stripped.
+        let indented = "   # tirith-card: ./card.json\necho hi";
+        assert_eq!(strip_card_comment_lines(indented), "echo hi");
+        // No marker → unchanged.
+        assert_eq!(strip_card_comment_lines("echo hi"), "echo hi");
+        // A `#` comment that is NOT a tirith-card marker is preserved.
+        let other = "# just a note\necho hi";
+        assert_eq!(strip_card_comment_lines(other), other);
+    }
+
+    #[test]
+    fn comment_carried_card_verifies_after_marker_strip() {
+        // Regression (CRITICAL): a trusted, signed, non-expired card whose
+        // `command` equals the real command, referenced via a `# tirith-card:`
+        // comment, must yield Verified — NOT Mismatch. The marker line is
+        // transport metadata and must be stripped before the byte-for-byte
+        // command comparison. Before the fix, the analyzed input still carried
+        // the marker line, so a correctly-signed comment-carried card always
+        // falsely mismatched.
+        let dir = tempfile::tempdir().unwrap();
+        let (secret, pubkey) = generate_keypair().unwrap();
+        write_trusted_key(dir.path(), &pubkey);
+        let mut card = sample_card(); // command = "curl -fsSL https://example.com/install.sh | sh"
+        card.sign(&secret).unwrap();
+
+        // The full analyzed input as the engine sees it: marker comment +
+        // the real command on the next line.
+        let analyzed_input =
+            "# tirith-card: ./install-card.json\ncurl -fsSL https://example.com/install.sh | sh";
+        let command = strip_card_comment_lines(analyzed_input);
+
+        let outcome = evaluate_card(&card, &command, dir.path(), today());
+        assert_eq!(
+            outcome,
+            CardOutcome::Verified,
+            "comment-carried card with a matching command must verify, not mismatch"
+        );
+        let findings = findings_for_outcome(&outcome);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RuleId::CommandCardVerified);
     }
 
     #[test]

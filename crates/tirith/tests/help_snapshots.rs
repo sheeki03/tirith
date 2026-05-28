@@ -198,6 +198,9 @@ help_example_tests! {
     help_command_card_create   => (["command-card", "create", "--help"], "tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json");
     help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
     help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
+    // `command-card fetch` is #[cfg(unix)] (reuses the unix-only runner download
+    // path), so its --help only exists on Unix — gate the snapshot to match.
+    #[cfg(unix)]
     help_command_card_fetch    => (["command-card", "fetch", "--help"], "tirith command-card fetch https://example.com/install-card.json");
     // M11 ch2 — repo command manifest (`tirith commands ...`).
     help_commands              => (["commands", "--help"], "tirith commands run test");

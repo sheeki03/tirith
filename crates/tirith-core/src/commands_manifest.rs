@@ -44,6 +44,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -182,9 +184,17 @@ impl CommandsManifest {
     /// `.git` boundary looking for `.tirith/commands.yaml`. Returns `Ok(None)`
     /// when no manifest file exists (the common, no-manifest case), and
     /// `Err(..)` only when a present file fails to read or parse.
+    ///
+    /// HOT PATH: this runs on every `engine::analyze`. The parse is backed by a
+    /// per-process cache keyed on `(resolved_path, mtime)` with a 5-second TTL —
+    /// mirroring [`crate::incident`] / [`crate::canary`] — so a repeated check
+    /// in the same repo re-reads + re-parses the YAML at most once per 5s (and
+    /// re-parses immediately if the file's mtime changes). Path resolution
+    /// (`discover_manifest_path`, a few `is_file()` stats) still runs each call;
+    /// it is cheap and `cwd`-dependent, so it is intentionally not cached.
     pub fn discover(cwd: Option<&str>) -> Result<Option<Self>, ManifestError> {
         match discover_manifest_path(cwd) {
-            Some(path) => Self::load_from_path(&path).map(Some),
+            Some(path) => cached_load(&path).map(Some),
             None => Ok(None),
         }
     }
@@ -327,6 +337,71 @@ fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> F
         mitre_id: None,
         custom_rule_id: None,
     }
+}
+
+// ---- Hot-path parse cache -------------------------------------------------
+
+/// Per-process cache of a parsed manifest, keyed on the resolved file path.
+/// Mirrors [`crate::incident`] / [`crate::canary`]: load once, 5-second TTL,
+/// re-parse on the file's mtime change. Keyed on the resolved manifest PATH
+/// (not `cwd`), so multiple cwds resolving to the same manifest share the entry.
+struct CacheState {
+    path: PathBuf,
+    manifest: CommandsManifest,
+    loaded_at: Instant,
+    mtime_nanos: u128,
+}
+
+static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
+
+const CACHE_TTL: Duration = Duration::from_secs(5);
+
+fn manifest_mtime_nanos(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Load + parse the manifest at `path` through the per-process cache. Reloads
+/// when the cached path differs, the TTL expired, or the file's mtime changed.
+/// A parse/IO error is NOT cached (so a transient error does not stick): it is
+/// returned and the cache is left for the next call to retry.
+fn cached_load(path: &Path) -> Result<CommandsManifest, ManifestError> {
+    let cur_mtime = manifest_mtime_nanos(path);
+    let now = Instant::now();
+    {
+        let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = guard.as_ref() {
+            let fresh = state.path == path
+                && now.duration_since(state.loaded_at) < CACHE_TTL
+                && state.mtime_nanos == cur_mtime;
+            if fresh {
+                return Ok(state.manifest.clone());
+            }
+        }
+    }
+
+    // Miss / stale: read + parse outside the lock, then store.
+    let manifest = CommandsManifest::load_from_path(path)?;
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(CacheState {
+        path: path.to_path_buf(),
+        manifest: manifest.clone(),
+        loaded_at: now,
+        mtime_nanos: cur_mtime,
+    });
+    Ok(manifest)
+}
+
+/// Drop the per-process manifest cache. Tests that write/edit a manifest then
+/// assert via [`CommandsManifest::discover`] call this so a stale earlier load
+/// is not reused.
+pub fn invalidate_cache() {
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// Resolve the path of `.tirith/commands.yaml` for `cwd`, mirroring policy
@@ -652,5 +727,66 @@ allowed:
     fn malformed_yaml_is_parse_error() {
         let err = CommandsManifest::from_yaml("allowed: [this is not valid");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn cached_load_hits_then_remits_on_mtime_change() {
+        use std::io::Write as _;
+
+        // P2: discover() is hot-path; cached_load caches by (path, mtime) with a
+        // 5s TTL. Prove (a) a second load of an UNCHANGED file returns the
+        // cached parse (does not observe a sneaky out-of-band content change
+        // while the file's identity/mtime are unchanged), and (b) an mtime bump
+        // forces a re-read that reflects the new content.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.yaml");
+
+        std::fs::write(
+            &path,
+            "allowed:\n  - name: a\n    command: cmd-a\ndangerous: []\n",
+        )
+        .unwrap();
+
+        // Isolate from any sibling test that touched the global cache.
+        invalidate_cache();
+
+        let first = cached_load(&path).unwrap();
+        assert_eq!(first.allowed.len(), 1);
+        assert_eq!(first.allowed[0].name, "a");
+        let mtime_before = manifest_mtime_nanos(&path);
+
+        // A second load while the file is unchanged returns the SAME parse from
+        // cache (cheap hit) — this is the perf win we are pinning.
+        let cached = cached_load(&path).unwrap();
+        assert_eq!(cached.allowed[0].command, "cmd-a");
+
+        // Now change the content AND ensure the OS-reported mtime actually
+        // advanced before asserting a re-read. Spin (bounded) rather than a
+        // fixed sleep so the test is robust to coarse mtime granularity.
+        let mut tries = 0;
+        loop {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"allowed:\n  - name: b\n    command: cmd-b\ndangerous: []\n")
+                .unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            if manifest_mtime_nanos(&path) != mtime_before {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 1000, "mtime never advanced after rewrite");
+            std::thread::yield_now();
+        }
+
+        // The mtime changed, so the cache entry is stale: cached_load re-reads
+        // and reflects the new content (NOT the cached `a`).
+        let after = cached_load(&path).unwrap();
+        assert_eq!(
+            after.allowed[0].name, "b",
+            "an mtime bump must invalidate the cache and re-read the manifest"
+        );
+        assert_eq!(after.allowed[0].command, "cmd-b");
+
+        invalidate_cache();
     }
 }

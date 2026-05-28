@@ -255,15 +255,24 @@ pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
     )
 }
 
+/// The [`ShellType`](tirith_core::tokenize::ShellType) the safety re-check must
+/// tokenize with: it MUST match the shell `run_shell_command` actually executes
+/// (`cmd /C` on Windows, `$SHELL -c` → POSIX elsewhere). Analyzing a command
+/// with the wrong shell can mis-tokenize pipes/operators and miss findings.
+#[cfg(windows)]
+const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Cmd;
+#[cfg(not(windows))]
+const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Posix;
+
 /// Analyze `command` through the engine for `commands run`'s safety re-check.
 fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Verdict {
     use tirith_core::engine::{self, AnalysisContext};
     use tirith_core::extract::ScanContext;
-    use tirith_core::tokenize::ShellType;
 
     let ctx = AnalysisContext {
         input: command.to_string(),
-        shell: ShellType::Posix,
+        // Match the shell that will actually run the command (see RUN_SHELL).
+        shell: RUN_SHELL,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
         interactive: false,
@@ -306,5 +315,23 @@ fn emit_error(json: bool, ctx: &str, msg: &str) {
         super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
     } else {
         eprintln!("{ctx}: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUN_SHELL;
+    use tirith_core::tokenize::ShellType;
+
+    #[test]
+    fn run_shell_matches_execution_platform() {
+        // The `commands run` safety re-check must tokenize with the SAME shell
+        // `run_shell_command` executes: `cmd /C` on Windows, `$SHELL -c` (POSIX)
+        // elsewhere. A mismatch (e.g. always-Posix) can mis-tokenize and miss
+        // findings on Windows.
+        #[cfg(windows)]
+        assert_eq!(RUN_SHELL, ShellType::Cmd);
+        #[cfg(not(windows))]
+        assert_eq!(RUN_SHELL, ShellType::Posix);
     }
 }

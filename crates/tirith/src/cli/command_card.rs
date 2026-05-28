@@ -123,7 +123,12 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(card_path, format!("{out}\n")) {
+    // Write atomically: a temp file in the SAME directory then rename over the
+    // target. A plain `std::fs::write` truncates in place, so a crash mid-write
+    // would lose the original (unsigned) card and leave a truncated file. The
+    // rename is atomic on the same filesystem, so a reader sees either the old
+    // card or the fully-signed one, never a partial.
+    if let Err(e) = write_card_atomic(Path::new(card_path), &format!("{out}\n")) {
         emit_error(
             json,
             "tirith command-card sign",
@@ -140,7 +145,12 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             "key_id": sig.key_id,
             "algo": sig.algo,
         });
-        super::write_json_stdout(&v, "tirith command-card sign: failed to write JSON output");
+        // A failed JSON write (e.g. broken pipe / truncated output) must exit
+        // non-zero: the card WAS signed on disk, but a piped consumer that saw
+        // truncated JSON must not also see a success code.
+        if !super::write_json_stdout(&v, "tirith command-card sign: failed to write JSON output") {
+            return 2;
+        }
     } else {
         println!(
             "Signed {card_path} (key_id {}, algo {}).",
@@ -205,10 +215,15 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
             "key_id": card.signature.as_ref().map(|s: &CardSignature| s.key_id.clone()),
             "reason": reason,
         });
-        super::write_json_stdout(
+        // A failed JSON write must exit non-zero, even for a verified card: a
+        // consumer that saw truncated JSON must not read a success code. Exit 2
+        // is distinct from the "not verified" exit 1.
+        if !super::write_json_stdout(
             &v,
             "tirith command-card verify: failed to write JSON output",
-        );
+        ) {
+            return 2;
+        }
     } else if verified {
         println!("VERIFIED: card is signed by a trusted key and has not expired.");
         println!("  command: {}", card.command);
@@ -331,7 +346,11 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             "sha256": sha,
             "final_url": dl.final_url,
         });
-        super::write_json_stdout(&v, "tirith command-card fetch: failed to write JSON output");
+        // The card was cached on disk, but a failed JSON write must still exit
+        // non-zero so a piped consumer never pairs truncated JSON with success.
+        if !super::write_json_stdout(&v, "tirith command-card fetch: failed to write JSON output") {
+            return 2;
+        }
     } else {
         println!("{}", dest.display());
         eprintln!(
@@ -381,6 +400,24 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
     )))
 }
 
+/// Write `contents` to `path` atomically: a temp file in the same directory is
+/// written, flushed, then renamed over `path`. The rename is atomic on the same
+/// filesystem, so a concurrent reader (or a crash) never observes a truncated
+/// or half-written card — it sees either the previous file or the new one.
+fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match dir {
+        Some(d) => tempfile::NamedTempFile::new_in(d)?,
+        // No parent component (e.g. a bare filename): place the temp file in the
+        // current directory so the rename stays on the same filesystem.
+        None => tempfile::NamedTempFile::new_in(".")?,
+    };
+    tmp.write_all(contents.as_bytes())?;
+    tmp.flush()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 /// Prompt on stderr and read one line from stdin. Returns `None` if stdin is
 /// not readable.
 fn prompt(label: &str) -> Option<String> {
@@ -400,5 +437,43 @@ fn emit_error(json: bool, ctx: &str, msg: &str) {
         super::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
     } else {
         eprintln!("{ctx}: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_card_atomic;
+
+    #[test]
+    fn write_card_atomic_writes_and_replaces_without_leaving_temp() {
+        // F3 (Major): signing writes the card atomically (temp-in-same-dir then
+        // rename) so a crash mid-write cannot lose the original. Prove the write
+        // lands exactly, an overwrite fully replaces the prior content, and no
+        // temp file is left behind in the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.json");
+
+        write_card_atomic(&path, "{\"first\":true}\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"first\":true}\n"
+        );
+
+        // Overwrite in place: the new content fully replaces the old.
+        write_card_atomic(&path, "{\"second\":true}\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"second\":true}\n"
+        );
+
+        // The only file in the directory is the card itself — the temp file was
+        // renamed (consumed), not left dangling.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
+        assert_eq!(entries[0], path);
     }
 }

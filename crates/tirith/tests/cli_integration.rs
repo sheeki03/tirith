@@ -8645,6 +8645,102 @@ fn command_card_create_sign_verify_check_roundtrip() {
     assert_eq!(cjson["action"], "block");
 }
 
+/// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
+/// (not the `--card` sidecar) must VERIFY when its signed `command` matches the
+/// real command on the following line. The marker line is transport metadata
+/// and must be stripped before the byte-for-byte comparison; before the fix the
+/// analyzed input still carried the marker line, so a correctly-signed
+/// comment-carried card always falsely reported `command_card_mismatch`.
+#[cfg(unix)]
+#[test]
+fn command_card_comment_carried_verifies_not_mismatch() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    let command = "curl -fsSL https://example.com/install.sh | sh";
+
+    let create = tirith()
+        .args(["command-card", "create", "--command", command])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+    // The card must live at the relative path the comment references, resolved
+    // against the run's cwd (the project dir below).
+    let project = work.path().join("project");
+    let policy_dir = project.join(".tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 4\n").unwrap();
+    let card_path = project.join("install-card.json");
+    fs::write(&card_path, &create.stdout).unwrap();
+
+    let (secret, pubkey) = command_card::generate_keypair().unwrap();
+    let key_path = work.path().join("ed25519-priv.bin");
+    fs::write(&key_path, secret).unwrap();
+    let sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("sign");
+    assert_eq!(sign.status.code(), Some(0), "sign exits 0");
+
+    let key_id = command_card::key_id_for_pubkey(&pubkey);
+    for sub in [
+        ".config/tirith/trusted-card-keys",
+        "Library/Application Support/tirith/trusted-card-keys",
+    ] {
+        let dir = home.path().join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
+    }
+
+    // Carry the card via a `# tirith-card:` comment (NO --card flag), with the
+    // real command on the next line — exactly the shape that was broken.
+    let carded_input = format!("# tirith-card: ./install-card.json\n{command}");
+    let check = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            &carded_input,
+        ])
+        .current_dir(&project)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("check comment-carried card");
+
+    let cjson: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let rule_ids: Vec<String> = cjson["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        rule_ids.iter().any(|r| r == "command_card_verified"),
+        "comment-carried card with a matching command must verify; got {rule_ids:?}"
+    );
+    assert!(
+        !rule_ids.iter().any(|r| r == "command_card_mismatch"),
+        "a matching comment-carried card must NOT report a mismatch; got {rule_ids:?}"
+    );
+}
+
 /// A command that differs from its trusted card -> `command_card_mismatch`
 /// (High), and other findings continue to fire.
 #[cfg(unix)]
@@ -9289,5 +9385,62 @@ fn incident_report_to_stdout_without_out_flag() {
     assert!(
         stdout.contains("# Tirith Incident Report"),
         "report with no --out must print markdown to stdout, got:\n{stdout}"
+    );
+}
+
+/// A `tirith canary` invocation fully isolated to `state` on every platform —
+/// the canary store lives in `state_dir()` (XDG_STATE_HOME on Unix, APPDATA /
+/// LOCALAPPDATA on Windows), so pin all of them. Mirrors `incident_tirith`.
+fn canary_tirith(state: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env_remove("TIRITH");
+    cmd.env("XDG_STATE_HOME", state);
+    cmd.env("XDG_DATA_HOME", state);
+    cmd.env("APPDATA", state);
+    cmd.env("LOCALAPPDATA", state);
+    cmd
+}
+
+/// Regression (Minor): `canary create --callback-url` must persist the TRIMMED
+/// URL, not the raw padded value. The CLI trims for validation; before the fix
+/// it still stored the original whitespace-padded string.
+#[test]
+fn canary_create_persists_trimmed_callback_url() {
+    let state = tempfile::tempdir().expect("tempdir");
+
+    // A callback URL padded with surrounding whitespace. The leading space is
+    // part of the value passed as a single argv element.
+    let padded = "  https://my-host.example/hit  ";
+    let create = canary_tirith(state.path())
+        .args([
+            "canary",
+            "create",
+            "aws-like",
+            "--callback-url",
+            padded,
+            "--json",
+        ])
+        .output()
+        .expect("canary create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+    let cjson: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(
+        cjson["callback_url"], "https://my-host.example/hit",
+        "the created entry must carry the trimmed callback URL"
+    );
+
+    // And it is persisted trimmed: `canary list --json` reads it back from the
+    // store unchanged (no padding).
+    let list = canary_tirith(state.path())
+        .args(["canary", "list", "--json"])
+        .output()
+        .expect("canary list");
+    assert_eq!(list.status.code(), Some(0));
+    let ljson: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let entries = ljson.as_array().expect("list --json is an array");
+    assert_eq!(entries.len(), 1, "exactly one canary registered");
+    assert_eq!(
+        entries[0]["callback_url"], "https://my-host.example/hit",
+        "the stored callback URL must be trimmed, not whitespace-padded"
     );
 }

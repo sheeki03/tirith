@@ -972,7 +972,15 @@ fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
         None => return Vec::new(),
     };
     let today = chrono::Utc::now().date_naive();
-    let outcome = command_card::evaluate_card(&card, &ctx.input, &trusted_dir, today);
+    // Strip any `# tirith-card:` marker line(s) before the byte-for-byte command
+    // comparison: the marker is transport metadata, not part of the signed
+    // command. Without this, a command carried via a `# tirith-card:` comment
+    // always falsely MISMATCHES its own correctly-signed card (the analyzed
+    // input still contains the marker line, which the signed `command` never
+    // does). The `--card` sidecar path has no marker line, so stripping is a
+    // no-op there.
+    let command = command_card::strip_card_comment_lines(&ctx.input);
+    let outcome = command_card::evaluate_card(&card, &command, &trusted_dir, today);
     command_card::findings_for_outcome(&outcome)
 }
 

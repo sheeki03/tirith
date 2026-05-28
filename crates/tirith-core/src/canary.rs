@@ -325,6 +325,68 @@ pub fn invalidate_cache() {
     *guard = None;
 }
 
+/// An exclusive cross-process advisory lock on a sibling `<store>.lock` file,
+/// released on drop. All three store mutators (`create_at`, `prune_at`,
+/// `rotate_at`) hold this for the duration of their read-modify-write so two
+/// concurrent commands cannot lose each other's updates: e.g. a `create`
+/// appending while a `prune` rewrites the store from a now-stale snapshot would
+/// otherwise silently drop the freshly-created entry. Reads (`list`/`detect`)
+/// are deliberately NOT locked — they tolerate a torn view because
+/// [`rewrite_store`] swaps the file in atomically (rename), so a reader always
+/// sees a whole prior or whole next file, never a partial one.
+///
+/// Uses the same `fs2::FileExt` advisory locking as `audit.rs` /
+/// `session_warnings.rs`. The `.lock` file is a zero-byte sentinel: never read
+/// or written, only locked, and left in place between calls (creating and
+/// deleting it per-call would itself race).
+struct StoreLock {
+    file: std::fs::File,
+}
+
+impl StoreLock {
+    /// Acquire the exclusive lock guarding `store`. Creates parent dirs and the
+    /// sibling lock file as needed, then blocks until the lock is held. If
+    /// advisory locking is unsupported on the platform/filesystem we proceed
+    /// WITHOUT it (best-effort — never worse than the pre-lock behavior, and the
+    /// atomic rename in [`rewrite_store`] still prevents torn files).
+    fn acquire(store: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = store.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = lock_path_for(store);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path)?;
+        use fs2::FileExt;
+        // Blocking exclusive lock; fall back to a try-lock so an
+        // unsupported-locking filesystem does not hard-fail the mutation.
+        let _ = file.lock_exclusive().or_else(|_| file.try_lock_exclusive());
+        Ok(StoreLock { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        use fs2::FileExt;
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Path of the sibling lock file for `store` (`<store>.lock`).
+fn lock_path_for(store: &Path) -> PathBuf {
+    let mut name = store.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    match store.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 /// Append `entry` to the JSONL store at `store`, creating parent dirs and the
 /// file (`0600` on Unix) as needed.
 fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
@@ -384,6 +446,9 @@ pub fn create_at(
         created_at: chrono::Utc::now().to_rfc3339(),
         callback_url,
     };
+    // Hold the store lock across the append so it cannot interleave with a
+    // concurrent prune/rotate read-modify-write (which would drop this entry).
+    let _lock = StoreLock::acquire(store)?;
     append_entry(store, &entry)?;
     invalidate_cache();
     Ok(entry)
@@ -416,6 +481,9 @@ pub fn list() -> Vec<CanaryEntry> {
 /// Remove the canary with `id` from the store at `store`. Returns the number of
 /// entries removed (0 when the id is unknown).
 pub fn prune_at(store: &Path, id: &str) -> std::io::Result<usize> {
+    // Lock across the whole read-modify-write so a concurrent create/rotate
+    // cannot slip an update in between our snapshot and our rewrite.
+    let _lock = StoreLock::acquire(store)?;
     let entries = parse_store(store);
     let before = entries.len();
     let kept: Vec<CanaryEntry> = entries.into_iter().filter(|e| e.id != id).collect();
@@ -443,6 +511,9 @@ pub fn prune(id: &str) -> std::io::Result<usize> {
 /// of the SAME kind, preserving the id and callback URL. Returns the updated
 /// entry, or `None` when the id is unknown.
 pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>> {
+    // Lock across the whole read-modify-write (see `prune_at`): a concurrent
+    // create appending mid-rotate must not be lost by our rewrite.
+    let _lock = StoreLock::acquire(store)?;
     let mut entries = parse_store(store);
     let Some(idx) = entries.iter().position(|e| e.id == id) else {
         return Ok(None);
@@ -486,15 +557,20 @@ pub fn store_nonempty() -> bool {
 // ---- Detection ------------------------------------------------------------
 
 /// Scan `text` against every canary registered in the store at `store`. Returns
-/// one [`CanaryHit`] per matching canary (deduped by id — a token appearing
-/// twice yields one hit). `text.contains(&token)` substring match: a canary
-/// planted in a larger blob (e.g. a `cat ~/.aws/credentials` paste) still fires.
+/// one [`CanaryHit`] per matching canary, DEDUPED BY ID: a token appearing twice
+/// in `text` yields one hit (we iterate entries, not text matches), and a
+/// duplicate `id` in the store (the append-only store enforces no uniqueness, so
+/// a hand-edited or rotated-into-collision store could carry one) also yields a
+/// single hit for that id rather than firing the callback twice.
+/// `text.contains(&token)` is a substring match: a canary planted in a larger
+/// blob (e.g. a `cat ~/.aws/credentials` paste) still fires.
 pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
     if text.is_empty() {
         return Vec::new();
     }
     let entries = cached_entries(store);
     let mut hits = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in entries {
         // An empty token would `contains`-match everything; skip defensively
         // (a well-formed entry never has an empty token).
@@ -502,11 +578,15 @@ pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
             continue;
         }
         if text.contains(&e.token) {
-            hits.push(CanaryHit {
-                id: e.id,
-                kind: e.kind,
-                callback_url: e.callback_url,
-            });
+            // Dedup by id: a duplicate id in the store must not fire twice (one
+            // detection, one callback). First match for an id wins.
+            if seen_ids.insert(e.id.clone()) {
+                hits.push(CanaryHit {
+                    id: e.id,
+                    kind: e.kind,
+                    callback_url: e.callback_url,
+                });
+            }
         }
     }
     hits
@@ -700,6 +780,27 @@ mod tests {
     }
 
     #[test]
+    fn detect_dedups_duplicate_id_store_entries() {
+        // P2: the doc promises results are "deduped by id". The append-only
+        // store enforces no id-uniqueness, so two entries can share an id (e.g.
+        // a hand-edited store). Both matching the text must yield ONE hit for
+        // that id — never fire the (opt-in) callback twice for one id.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        // Two store lines with the SAME id but distinct tokens, both present in
+        // the scanned text.
+        std::fs::write(
+            &store,
+            "{\"id\":\"dup\",\"token\":\"ghp_canary_aaa\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n\
+             {\"id\":\"dup\",\"token\":\"ghp_canary_bbb\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n",
+        )
+        .unwrap();
+        let hits = detect_at(&store, "ghp_canary_aaa and ghp_canary_bbb");
+        assert_eq!(hits.len(), 1, "duplicate id must dedup to a single hit");
+        assert_eq!(hits[0].id, "dup");
+    }
+
+    #[test]
     fn list_returns_all_entries() {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
@@ -767,6 +868,34 @@ mod tests {
         assert!(!store_nonempty_at(&store));
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
         assert!(store_nonempty_at(&store));
+    }
+
+    #[test]
+    fn sequential_locked_mutations_each_persist_and_release_lock() {
+        // F2 (Major): the store mutators serialize behind a sibling `.lock`
+        // file. This proves the lock is RELEASED between calls (a still-held
+        // exclusive lock would deadlock the next blocking acquire) and that each
+        // mutation's effect persists — two creates then a prune all take effect.
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
+        // If the first create's lock were never released, this second acquire
+        // would block forever; reaching the assert proves release.
+        let b = create_at(&store, CanaryKind::GithubLike, None).unwrap();
+        assert_eq!(list_at(&store).len(), 2, "both creates persisted");
+
+        // A prune (its own read-modify-write under the lock) also acquires and
+        // releases cleanly, and its effect persists.
+        assert_eq!(prune_at(&store, &a.id).unwrap(), 1);
+        let remaining = list_at(&store);
+        assert_eq!(remaining.len(), 1, "prune persisted after the creates");
+        assert_eq!(remaining[0].id, b.id);
+
+        // The sibling lock file exists (left in place between calls) but the
+        // lock itself is free: another acquire returns immediately.
+        assert!(lock_path_for(&store).exists(), "lock sentinel persists");
+        let _g = StoreLock::acquire(&store).expect("lock is free to re-acquire");
     }
 
     #[test]
