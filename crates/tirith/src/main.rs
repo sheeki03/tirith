@@ -17,6 +17,37 @@ pub struct Cli {
     command: Commands,
 }
 
+/// Shared help text for the two `watch` spellings (`tirith watch …` and
+/// `tirith checkpoint watch …`) so both surfaces document the identical
+/// behavior and honesty caveats.
+const WATCH_AFTER_HELP: &str = "\
+What this does:
+  Snapshots the current directory (plus any --paths) and your runtime state
+  (env var names, $PATH, shell-rc file hashes), runs the command, then
+  re-snapshots and reports: new files, modified files, $PATH additions, env
+  vars added, and shell-rc modifications. A shell rc/profile file changed
+  DURING the run fires a HIGH `post_run_shell_rc_modified` finding.
+
+What this is NOT:
+  - It does NOT sandbox or isolate the command. The command runs with your
+    FULL privileges and can read your keychain, ssh keys, cloud creds, and the
+    network. `watch` is an after-the-fact LENS, not a gate or a boundary.
+  - It does NOT block. The exit code is the watched command's own exit code.
+  - File snapshotting is capped to the current directory and any --paths you
+    pass — it never walks all of $HOME.
+
+--with-net-hints (EXPERIMENTAL, off by default):
+  Emits best-effort network hints derived from a resolver-cache / log mtime
+  delta. Best-effort hints ONLY — may miss QUIC/UDP/direct-IP; NOT a network
+  monitor; not a security boundary. Absence of hints does NOT mean no network
+  activity occurred.
+
+Examples:
+  tirith watch -- npm install left-pad
+  tirith watch --paths ~/.config -- ./install.sh
+  tirith watch --with-net-hints -- pip install requests
+  tirith watch --json -- cargo build";
+
 #[derive(Subcommand)]
 enum Commands {
     /// Manage the tirith background daemon
@@ -1857,6 +1888,34 @@ Examples:
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
+
+    /// Run a command and diff its filesystem / $PATH / shell-rc impact (M10 ch2)
+    ///
+    /// Shortcut for `tirith checkpoint watch` — both dispatch to one impl.
+    #[command(after_help = WATCH_AFTER_HELP)]
+    Watch {
+        /// Extra paths to snapshot for file changes, in addition to the current
+        /// directory. Repeat the flag for multiple paths.
+        #[arg(long = "paths")]
+        paths: Vec<String>,
+
+        /// EXPERIMENTAL, off by default: emit best-effort network hints from a
+        /// resolver-cache / log mtime delta. May miss QUIC/UDP/direct-IP
+        /// entirely; NOT a network monitor and not a security boundary.
+        #[arg(long)]
+        with_net_hints: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The command to run and watch (everything after `--`)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3328,6 +3387,32 @@ Examples:
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
+    },
+    /// Snapshot, run a command, then diff (post-run blast-radius). Same impl as
+    /// the top-level `tirith watch`.
+    #[command(after_help = WATCH_AFTER_HELP)]
+    Watch {
+        /// Extra paths to snapshot for file changes, in addition to the current
+        /// directory. Repeat the flag for multiple paths.
+        #[arg(long = "paths")]
+        paths: Vec<String>,
+
+        /// EXPERIMENTAL, off by default: emit best-effort network hints from a
+        /// resolver-cache / log mtime delta. May miss QUIC/UDP/direct-IP
+        /// entirely; NOT a network monitor and not a security boundary.
+        #[arg(long)]
+        with_net_hints: bool,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The command to run and watch (everything after `--`)
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        command: Vec<String>,
     },
 }
 
@@ -4901,6 +4986,16 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::checkpoint::purge_checkpoints(json)
             }
+            CheckpointAction::Watch {
+                paths,
+                with_net_hints,
+                format,
+                json,
+                command,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::checkpoint::watch(&command, &paths, with_net_hints, json)
+            }
         },
 
         Commands::Activate { key } => cli::license_cmd::activate(&key),
@@ -5627,6 +5722,17 @@ fn run() {
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::preview::run(&command.join(" "), json)
+        }
+        Commands::Watch {
+            paths,
+            with_net_hints,
+            format,
+            json,
+            command,
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            // Identical impl to `tirith checkpoint watch` (CheckpointAction::Watch).
+            cli::checkpoint::watch(&command, &paths, with_net_hints, json)
         }
     };
 

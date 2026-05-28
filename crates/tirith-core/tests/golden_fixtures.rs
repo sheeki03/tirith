@@ -744,6 +744,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "blast_find_delete",
     "blast_rsync_delete",
     "blast_large_file_count",
+    // Post-run diff rule (M10 ch2)
+    "post_run_shell_rc_modified",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1014,6 +1016,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "blast_deletes_outside_repo",
     "blast_symlink_traversal",
     "blast_large_file_count",
+    // M10 ch2 — the post-run shell-rc-modified rule fires ONLY from the
+    // `tirith watch -- "<cmd>"` post-run diff (snapshot → run → snapshot), never
+    // from the `engine::analyze` golden-fixture runner. It needs a real
+    // before/after on-disk rc-file state that a static text fixture cannot
+    // reproduce. Covered by a unit test in `crates/tirith/src/cli/checkpoint.rs`
+    // (`watch_flags_shell_rc_modification`), following the M9-ch2 runtime-state
+    // pattern.
+    "post_run_shell_rc_modified",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1381,6 +1391,8 @@ fn test_rule_id_list_is_complete() {
         RuleId::BlastFindDelete,
         RuleId::BlastRsyncDelete,
         RuleId::BlastLargeFileCount,
+        // Post-run diff rule (M10 ch2)
+        RuleId::PostRunShellRcModified,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

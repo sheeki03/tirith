@@ -1255,6 +1255,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("blast_find_delete", "BlastFindDelete"),
     ("blast_rsync_delete", "BlastRsyncDelete"),
     ("blast_large_file_count", "BlastLargeFileCount"),
+    // Post-run diff rule (M10 ch2).
+    ("post_run_shell_rc_modified", "PostRunShellRcModified"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

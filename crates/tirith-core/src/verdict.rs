@@ -764,6 +764,17 @@ pub enum RuleId {
     /// than 1000 files in the destructive target tree. Info severity (never
     /// blocks). Requires the filesystem walk, so it never fires on the hot path.
     BlastLargeFileCount,
+
+    /// M10 ch2 (RUNTIME-STATE) — a `tirith watch -- <cmd>` run modified a shell
+    /// rc / profile file (`~/.bashrc`, `~/.zshrc`, `~/.profile`, fish /
+    /// PowerShell profiles) DURING the watched command. High severity: a command
+    /// you ran to "install a tool" quietly rewriting your login shell is the
+    /// classic persistence foothold. Fires only from the `tirith watch` post-run
+    /// diff (snapshot → run → snapshot), never from the `tirith check` hot path,
+    /// so it carries no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`, covered by a unit test in
+    /// `crates/tirith/src/cli/checkpoint.rs`.
+    PostRunShellRcModified,
 }
 
 impl fmt::Display for RuleId {

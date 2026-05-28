@@ -2450,3 +2450,15 @@ examples_good = ["`tirith preview -- \"rm -rf ./dist\"` reporting a handful of f
 false_positive_guidance = "Deleting a large generated tree (node_modules, target/, a cache) legitimately touches many files. The count is informational — confirm it matches the directory you mean to remove."
 remediation = "Confirm the large count corresponds to the directory you intend to delete (a generated/cache tree is expected). If the count is surprising, re-check the target path."
 mitre_id = "T1485"
+
+[[rule]]
+id = "post_run_shell_rc_modified"
+title = "Watched command modified a shell rc / profile file"
+category = "persistence"
+severity_rationale = "High — `tirith watch` snapshots your shell rc/profile files before and after the watched command and found one changed. A command you ran for some unrelated purpose (an installer, a package add) quietly rewriting `~/.bashrc` / `~/.zshrc` / `~/.profile` / a fish or PowerShell profile is a classic persistence foothold: the injected line runs on every new login shell and survives reboots."
+description = "Fired by `tirith watch -- \"<cmd>\"`, which records the sha256 of each shell rc/profile file, runs the command, then re-hashes. A changed hash means the command modified that file during the run. The finding reports WHICH file changed; it does not echo the file contents."
+examples_bad = ["`tirith watch -- npm install some-pkg` where the package's postinstall appends `source ~/.cache/x.sh` to ~/.zshrc", "an installer that adds a PATH shim to ~/.bashrc without asking"]
+examples_good = ["`tirith watch -- rustup-init` legitimately appending a `. \"$HOME/.cargo/env\"` line you expected — review the change and accept it", "a command that touches no rc file at all (no finding)"]
+false_positive_guidance = "Many legitimate installers edit a shell rc file to add their bin directory to PATH (rustup, nvm, conda, pyenv). This rule reports the CHANGE, not maliciousness — open the rc file, review the added lines, and accept them if you recognize the tool. It fires per watched run; it is not a persistent baseline."
+remediation = "Open the modified rc file and review what the command added. If it is an expected PATH/env line from a tool you just installed, keep it. If you do not recognize it, remove the line and investigate the command's provenance before running it again."
+mitre_id = "T1546.004"

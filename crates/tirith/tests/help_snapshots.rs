@@ -175,6 +175,10 @@ help_example_tests! {
     help_hooks_explain         => (["hooks", "explain", "--help"], "tirith hooks explain pre-commit");
     // M10 ch1 — `tirith preview` blast-radius simulator.
     help_preview               => (["preview", "--help"], "tirith preview -- \"rm -rf ./dist\"");
+    // M10 ch2 — `tirith watch` post-run diff. Two spellings, one impl: pin both
+    // the top-level shortcut and the namespaced `checkpoint watch` form.
+    help_watch                 => (["watch", "--help"], "tirith watch -- npm install left-pad");
+    help_checkpoint_watch      => (["checkpoint", "watch", "--help"], "tirith watch -- npm install left-pad");
 }
 
 #[test]

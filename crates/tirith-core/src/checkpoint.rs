@@ -513,6 +513,203 @@ pub struct PurgeResult {
     pub freed_bytes: u64,
 }
 
+/// Runtime-state observation captured by `tirith watch` (M10 ch2).
+///
+/// This is a BEST-EFFORT, after-the-fact observation of side effects a watched
+/// command had on the *environment* and *shell startup files* — distinct from
+/// the file-content checkpoint, which tracks the working tree. It is NOT a
+/// network monitor and NOT a security boundary; see the field docs.
+///
+/// `domains_contacted` is populated only when the caller opts into the
+/// experimental `--with-net-hints` heuristic. The empty default means "not
+/// observed", never "no network activity occurred".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostRunState {
+    /// Best-effort, heuristic DNS-resolver-side domain hints (experimental,
+    /// opt-in via `--with-net-hints`). May miss QUIC/UDP/direct-IP traffic
+    /// entirely. NOT authoritative and NOT a network monitor.
+    #[serde(default)]
+    pub domains_contacted: Vec<String>,
+    /// Names of environment variables present AFTER the run that were absent
+    /// before. Observed by diffing a snapshot of the current process env, so it
+    /// reflects only variables the watched command exported back into tirith's
+    /// own environment (rarely the case for child processes) — primarily useful
+    /// when `tirith watch` is itself invoked from a wrapper that re-exports.
+    #[serde(default)]
+    pub env_vars_added: Vec<String>,
+    /// Directories newly present on `$PATH` after the run (set-difference of the
+    /// colon-split `PATH` before vs after).
+    #[serde(default)]
+    pub path_dirs_added: Vec<String>,
+}
+
+/// A before/after snapshot pair for the `tirith watch` runtime-state diff.
+///
+/// Captured by [`capture_runtime_state`] immediately before and after the
+/// watched command, then compared by [`diff_runtime_state`]. Kept separate from
+/// the file-content [`CheckpointMeta`] so the two concerns (working-tree files
+/// vs environment/PATH/shell-rc) stay independently testable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStateSnapshot {
+    /// Names of every environment variable visible at capture time.
+    pub env_vars: Vec<String>,
+    /// Colon-split `$PATH` entries at capture time (order preserved).
+    pub path_dirs: Vec<String>,
+    /// Per shell-rc/profile file: relative-name → sha256 of its bytes. A file
+    /// that does not exist is recorded with the sha256 of the empty string so a
+    /// later *appearance* is detected as a change from "absent".
+    pub shell_rc_hashes: std::collections::BTreeMap<String, String>,
+    /// Absolute home directory used to resolve the shell-rc paths (recorded so
+    /// the after-snapshot resolves the identical set).
+    pub home: String,
+}
+
+/// Shell rc / profile files watched for modification during a `tirith watch`
+/// run. Mirrors the canonical list in `persistence.rs::SHELL_RC_FILES` plus the
+/// common PowerShell profile locations (only hashed when present).
+const WATCH_SHELL_RC_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".config/fish/config.fish",
+    ".config/powershell/Microsoft.PowerShell_profile.ps1",
+    "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+    "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
+];
+
+/// Capture the current runtime state (env var names, `$PATH` entries, shell-rc
+/// hashes) for a `tirith watch` before/after comparison.
+///
+/// `home` is taken as a parameter (not read from `std::env` here) so the unit
+/// tests can point it at a `tempfile::tempdir()` without mutating process-global
+/// `HOME` — mutating env in tests is a libc data race (see PR #125 history).
+pub fn capture_runtime_state(home: &Path) -> RuntimeStateSnapshot {
+    let mut env_vars: Vec<String> = std::env::vars_os()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    env_vars.sort();
+
+    let path_dirs: Vec<String> = std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut shell_rc_hashes = std::collections::BTreeMap::new();
+    for rel in WATCH_SHELL_RC_FILES {
+        let path = home.join(rel);
+        // Hash present files; record the empty-string hash for absent ones so a
+        // later appearance reads as a modification, not a no-op.
+        let sha = if path.is_file() {
+            match sha256_file(&path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        } else {
+            empty_sha256()
+        };
+        shell_rc_hashes.insert((*rel).to_string(), sha);
+    }
+
+    RuntimeStateSnapshot {
+        env_vars,
+        path_dirs,
+        shell_rc_hashes,
+        home: home.to_string_lossy().into_owned(),
+    }
+}
+
+/// Diff two runtime-state snapshots into the additive [`PostRunState`] plus the
+/// list of shell-rc files whose contents changed.
+///
+/// Returns `(state, modified_rc_files)` where `modified_rc_files` is the set of
+/// relative rc-file names whose sha256 differed between `before` and `after`
+/// (drives the [`crate::verdict::RuleId::PostRunShellRcModified`] finding).
+pub fn diff_runtime_state(
+    before: &RuntimeStateSnapshot,
+    after: &RuntimeStateSnapshot,
+) -> (PostRunState, Vec<String>) {
+    let before_env: std::collections::HashSet<&String> = before.env_vars.iter().collect();
+    let env_vars_added: Vec<String> = after
+        .env_vars
+        .iter()
+        .filter(|v| !before_env.contains(*v))
+        .cloned()
+        .collect();
+
+    let before_path: std::collections::HashSet<&String> = before.path_dirs.iter().collect();
+    let path_dirs_added: Vec<String> = after
+        .path_dirs
+        .iter()
+        .filter(|d| !before_path.contains(*d))
+        .cloned()
+        .collect();
+
+    let mut modified_rc_files: Vec<String> = Vec::new();
+    for (rel, after_sha) in &after.shell_rc_hashes {
+        match before.shell_rc_hashes.get(rel) {
+            Some(before_sha) if before_sha == after_sha => {}
+            // Changed hash, or a file that appeared (no prior entry) — both are
+            // modifications-during-run.
+            _ => modified_rc_files.push(rel.clone()),
+        }
+    }
+    modified_rc_files.sort();
+
+    (
+        PostRunState {
+            domains_contacted: Vec::new(),
+            env_vars_added,
+            path_dirs_added,
+            // domains_contacted is filled in by the CLI layer only under the
+            // experimental --with-net-hints opt-in; the pure diff never invents
+            // network claims.
+        },
+        modified_rc_files,
+    )
+}
+
+/// SHA-256 of the empty byte string. Used as the sentinel hash for an absent
+/// shell-rc file so a later appearance diffs as a change.
+fn empty_sha256() -> String {
+    format!("{:x}", Sha256::new().finalize())
+}
+
+/// Build the [`crate::verdict::Finding`] list for a `tirith watch` post-run
+/// diff. Currently emits one High [`crate::verdict::RuleId::PostRunShellRcModified`]
+/// finding listing every shell-rc file modified during the run, or no findings
+/// when none changed.
+///
+/// Kept in core (not the CLI) so the rule-firing behavior is unit-testable
+/// without spawning a process — it lives in `EXTERNALLY_TRIGGERED_RULES` and is
+/// covered by `watch_flags_shell_rc_modification` below.
+pub fn findings_for_modified_rc(modified_rc_files: &[String]) -> Vec<crate::verdict::Finding> {
+    use crate::verdict::{Finding, RuleId, Severity};
+    if modified_rc_files.is_empty() {
+        return Vec::new();
+    }
+    vec![Finding {
+        rule_id: RuleId::PostRunShellRcModified,
+        severity: Severity::High,
+        title: "Watched command modified a shell rc / profile file".to_string(),
+        description: format!(
+            "The watched command modified the following shell startup file(s) \
+             during its run: {}. A command rewriting your login shell is a \
+             persistence foothold — review the added lines before trusting it.",
+            modified_rc_files.join(", ")
+        ),
+        evidence: Vec::new(),
+        human_view: None,
+        agent_view: None,
+        mitre_id: Some("T1546.004".to_string()),
+        custom_rule_id: None,
+    }]
+}
+
 /// Create a checkpoint and then purge old ones with default limits.
 /// Convenience wrapper used in tests; CLI calls `create()` then `purge()` directly
 /// for distinct error messages.
@@ -835,6 +1032,110 @@ mod tests {
             remaining.len(),
             1,
             "exactly one new checkpoint should remain"
+        );
+    }
+
+    // --- M10 ch2: `tirith watch` runtime-state diff -------------------------
+
+    #[test]
+    fn watch_flags_shell_rc_modification() {
+        // Snapshot before, simulate an rc-file modification during the "run",
+        // snapshot after → the PostRunShellRcModified rule must fire High.
+        // Uses a tempdir as HOME; never mutates process-global env (libc race).
+        let home = tempfile::tempdir().unwrap();
+        let zshrc = home.path().join(".zshrc");
+        fs::write(&zshrc, "alias ll='ls -la'\n").unwrap();
+
+        let before = capture_runtime_state(home.path());
+
+        // Simulate the watched command appending a persistence line.
+        fs::write(&zshrc, "alias ll='ls -la'\nsource ~/.cache/evil.sh\n").unwrap();
+
+        let after = capture_runtime_state(home.path());
+
+        let (_state, modified) = diff_runtime_state(&before, &after);
+        assert_eq!(
+            modified,
+            vec![".zshrc".to_string()],
+            "the modified .zshrc must be detected"
+        );
+
+        let findings = findings_for_modified_rc(&modified);
+        assert_eq!(findings.len(), 1, "exactly one rc-modified finding");
+        assert_eq!(
+            findings[0].rule_id,
+            crate::verdict::RuleId::PostRunShellRcModified
+        );
+        assert_eq!(findings[0].severity, crate::verdict::Severity::High);
+        assert_eq!(
+            crate::verdict::action_from_findings(&findings),
+            crate::verdict::Action::Block,
+            "a High rc-modified finding must resolve to Block"
+        );
+    }
+
+    #[test]
+    fn watch_no_finding_when_rc_unchanged() {
+        // A run that touches no rc file must produce zero findings (clean diff).
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join(".bashrc"), "export EDITOR=vim\n").unwrap();
+
+        // Diff a single captured snapshot against ITSELF. Capturing the live env
+        // twice would race other test threads that mutate process-global env
+        // (e.g. XDG_STATE_HOME) between the two reads; diffing one snapshot
+        // against itself isolates the pure-diff contract we mean to test here.
+        let snap = capture_runtime_state(home.path());
+
+        let (state, modified) = diff_runtime_state(&snap, &snap);
+        assert!(modified.is_empty(), "no rc file changed: {modified:?}");
+        assert!(
+            findings_for_modified_rc(&modified).is_empty(),
+            "clean run must emit no findings"
+        );
+        // An unchanged snapshot adds nothing to env / PATH.
+        assert!(state.env_vars_added.is_empty());
+        assert!(state.path_dirs_added.is_empty());
+        assert!(state.domains_contacted.is_empty());
+    }
+
+    #[test]
+    fn watch_detects_new_rc_file_and_path_addition() {
+        // A shell-rc file that did not exist before but appears after must be
+        // flagged (appearance == modification-from-absent). Also exercises the
+        // PATH set-difference on synthetic snapshots.
+        let home = tempfile::tempdir().unwrap();
+        // .zshrc absent at first snapshot.
+        let before = capture_runtime_state(home.path());
+        assert_eq!(
+            before.shell_rc_hashes.get(".zshrc").map(String::as_str),
+            Some(super::empty_sha256().as_str()),
+            "absent rc file recorded with empty-string sha"
+        );
+
+        // The watched command creates ~/.zshrc.
+        fs::write(home.path().join(".zshrc"), "export FOO=1\n").unwrap();
+        let after = capture_runtime_state(home.path());
+
+        let (_state, modified) = diff_runtime_state(&before, &after);
+        assert!(
+            modified.contains(&".zshrc".to_string()),
+            "a newly-created rc file must be flagged: {modified:?}"
+        );
+
+        // PATH set-difference: construct two snapshots that differ only in PATH.
+        let mut b = before.clone();
+        let mut a = before.clone();
+        b.path_dirs = vec!["/usr/bin".to_string(), "/bin".to_string()];
+        a.path_dirs = vec![
+            "/usr/bin".to_string(),
+            "/bin".to_string(),
+            "/opt/evil/bin".to_string(),
+        ];
+        let (state, _m) = diff_runtime_state(&b, &a);
+        assert_eq!(
+            state.path_dirs_added,
+            vec!["/opt/evil/bin".to_string()],
+            "only the newly-added PATH dir is reported"
         );
     }
 }

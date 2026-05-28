@@ -315,7 +315,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::BlastEmptyVarGlob
         | RuleId::BlastFindDelete
         | RuleId::BlastRsyncDelete
-        | RuleId::BlastLargeFileCount => false,
+        | RuleId::BlastLargeFileCount
+        // M10 ch2 — post-run shell-rc modification. Snapshot-diff state change
+        // from `tirith watch`; no threat-DB involvement.
+        | RuleId::PostRunShellRcModified => false,
     }
 }
 
