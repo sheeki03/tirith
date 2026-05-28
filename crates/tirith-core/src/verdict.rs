@@ -802,6 +802,29 @@ pub enum RuleId {
     /// is only matched when it is the command leader, so this is a narrower,
     /// lower-confidence signal than `ExecOfTaintedFile`.
     CommandSourcedFromTaintedFile,
+
+    // Anomaly-detection rules (M10 ch5, design-decision D2). These fire from
+    // `engine::analyze` (any context) ONLY when `policy.baseline_enabled` is set
+    // (opt-in, default false) AND some other detection rule already fired: the
+    // engine looks up the firing finding's privacy-hashed tuple
+    // `(rule_id, host_hash, ecosystem, sudo_flag, cwd_repo_hash)` in the sliding
+    // window at `state_dir()/baseline.jsonl` (`crate::baseline`) and, if the
+    // pattern is new / rare for this user, appends one of these Info findings.
+    // The observation is recorded regardless. They carry no PATTERN_TABLE entry
+    // (the trigger is runtime baseline STATE plus another finding, not a regex /
+    // byte signal on the input) and live in `EXTERNALLY_TRIGGERED_RULES`,
+    // covered by unit tests in `crate::baseline` against a `tempfile::tempdir()`
+    // store. Privacy: the store records salted-sha256 hashes, NEVER raw
+    // hostnames or paths — see the `baseline` module doc.
+    /// M10 ch5 — the privacy-hashed tuple of a firing finding has never been
+    /// seen in this user's baseline window (`count == 0`). Info severity: it
+    /// annotates "this is new for you" and never changes the action. Only
+    /// emitted when `policy.baseline_enabled` is on.
+    AnomalyFirstTimeInThisRepo,
+    /// M10 ch5 — the tuple has been seen before but rarely (`0 < count < 3`) in
+    /// the baseline window. Info severity. Only emitted when
+    /// `policy.baseline_enabled` is on.
+    AnomalyRareInBaseline,
 }
 
 impl fmt::Display for RuleId {

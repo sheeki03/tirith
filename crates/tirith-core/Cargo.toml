@@ -39,6 +39,9 @@ csv = { workspace = true }
 owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 arboard = { workspace = true }
+# OS RNG for the per-install anomaly-baseline salt (M10 ch5). Tiny, OS-only
+# entropy source; already present transitively. Used by `baseline::load_or_create_salt`.
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

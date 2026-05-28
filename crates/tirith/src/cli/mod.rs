@@ -131,6 +131,7 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 pub mod agent;
 pub mod aliases;
 pub mod audit;
+pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
 pub mod check;

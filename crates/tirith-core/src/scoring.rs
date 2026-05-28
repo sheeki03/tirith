@@ -322,7 +322,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M10 ch3 — tainted-content tracking. Path-key match against the local
         // taint store; no threat-DB involvement.
         | RuleId::ExecOfTaintedFile
-        | RuleId::CommandSourcedFromTaintedFile => false,
+        | RuleId::CommandSourcedFromTaintedFile
+        // M10 ch5 — anomaly-detection rules. Sliding-window novelty signal from
+        // the local baseline store; no threat-DB involvement.
+        | RuleId::AnomalyFirstTimeInThisRepo
+        | RuleId::AnomalyRareInBaseline => false,
     }
 }
 

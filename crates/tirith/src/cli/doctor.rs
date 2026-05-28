@@ -648,6 +648,23 @@ struct DoctorInfo {
     /// Threat intelligence database status.
     #[serde(skip_serializing_if = "Option::is_none")]
     threat_db: Option<ThreatDbDoctorInfo>,
+    /// M10 ch5 — opt-in anomaly-baseline status. Always present (the baseline
+    /// is a core feature); `enabled` reflects `policy.baseline_enabled`.
+    baseline: BaselineDoctorInfo,
+}
+
+/// M10 ch5 — anomaly-baseline status for the doctor report. Surfaces whether
+/// the opt-in baseline is enabled, how many observations are in the window, and
+/// the early-baseline-mode flag (per risk #2: until ~30 observations the signal
+/// is not yet meaningful).
+#[derive(Debug, Clone, serde::Serialize)]
+struct BaselineDoctorInfo {
+    /// `policy.baseline_enabled` (opt-in; default false).
+    enabled: bool,
+    /// In-window observation count.
+    total_observations: usize,
+    /// `true` while `total_observations < EARLY_BASELINE_ENTRIES` (~30).
+    early_baseline_mode: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -729,6 +746,7 @@ fn gather_info() -> DoctorInfo {
     let shadow_binaries = super::find_shadow_binaries();
     let detection_gaps = check_detection_gaps();
     let threat_db = gather_threat_db_info();
+    let baseline = gather_baseline_info();
 
     // Cached bash enter-mode delivery verdict (issue #111). Read-only here —
     // the cache is written by the self-test in `--simulate-enter` and by a
@@ -802,6 +820,19 @@ fn gather_info() -> DoctorInfo {
         shadow_binaries,
         detection_gaps,
         threat_db,
+        baseline,
+    }
+}
+
+/// M10 ch5 — read the anomaly-baseline status for the doctor report. Reads the
+/// store + the `policy.baseline_enabled` flag (no writes, no env mutation).
+fn gather_baseline_info() -> BaselineDoctorInfo {
+    let enabled = tirith_core::policy::Policy::discover_partial(None).baseline_enabled;
+    let total = tirith_core::baseline::entry_count();
+    BaselineDoctorInfo {
+        enabled,
+        total_observations: total,
+        early_baseline_mode: total < tirith_core::baseline::EARLY_BASELINE_ENTRIES,
     }
 }
 
@@ -2190,6 +2221,27 @@ fn print_human(info: &DoctorInfo) {
         }
     } else {
         println!("  threat DB:    not available");
+    }
+
+    // M10 ch5 — opt-in anomaly baseline. Always shown so the reader knows it
+    // exists and whether it is on. When on but sparse, call out early-baseline
+    // mode (per risk #2) so a flood of "first time" Info notes is understood as
+    // expected, not a bug.
+    if info.baseline.enabled {
+        if info.baseline.early_baseline_mode {
+            println!(
+                "  anomaly base: ON — early-baseline mode ({} obs; signals not yet meaningful until {})",
+                info.baseline.total_observations,
+                tirith_core::baseline::EARLY_BASELINE_ENTRIES,
+            );
+        } else {
+            println!(
+                "  anomaly base: ON ({} observations in window)",
+                info.baseline.total_observations
+            );
+        }
+    } else {
+        println!("  anomaly base: off (opt-in — enable with 'tirith baseline learn')");
     }
 
     if let Some(ref gaps) = info.detection_gaps {

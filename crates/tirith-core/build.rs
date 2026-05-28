@@ -1263,6 +1263,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "command_sourced_from_tainted_file",
         "CommandSourcedFromTaintedFile",
     ),
+    // Anomaly-detection rules (M10 ch5, D2).
+    (
+        "anomaly_first_time_in_this_repo",
+        "AnomalyFirstTimeInThisRepo",
+    ),
+    ("anomaly_rare_in_baseline", "AnomalyRareInBaseline"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1294,6 +1300,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "hooks",
     "blast",
     "taint",
+    "anomaly",
 ];
 
 #[derive(Deserialize)]

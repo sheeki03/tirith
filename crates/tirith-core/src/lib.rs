@@ -5,6 +5,7 @@ pub mod audit;
 pub mod audit_aggregator;
 pub mod audit_tune;
 pub mod audit_upload;
+pub mod baseline;
 pub mod blast_radius;
 pub mod checkpoint;
 pub mod clipboard;

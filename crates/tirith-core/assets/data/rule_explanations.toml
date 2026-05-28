@@ -2486,3 +2486,27 @@ examples_good = ["reviewing the file then `tirith taint clear ./env.sh` before s
 false_positive_guidance = "Reports provenance, not malice. After you have read the sourced file and decided to trust it, run `tirith taint clear <file>`; subsequent `source`/`.` of that path will not fire. Use `tirith taint explain <file>` to see the recorded origin."
 remediation = "Read the file before sourcing it — sourcing runs its contents in your live shell. Once you trust it, run `tirith taint clear <file>` to clear the mark."
 mitre_id = "T1105"
+
+[[rule]]
+id = "anomaly_first_time_in_this_repo"
+title = "First time tirith has seen this pattern for you"
+category = "anomaly"
+severity_rationale = "Info — this is an OPT-IN baseline signal (off by default; enable with `tirith baseline learn`). When on, tirith records a privacy-hashed tuple for every detection-rule firing and notes when a firing finding's pattern has never been seen in your 90-day window. It is purely informational: it annotates 'this is new for you' and NEVER changes the verdict's action. The underlying finding's own severity is what gates the command."
+description = "Fired by the engine ONLY when `policy.baseline_enabled` is set AND another rule already fired. The engine looks up the firing finding's tuple `(rule_id, salted-host-hash, ecosystem, sudo-flag, salted-cwd/repo-hash)` in the sliding window at `state-dir/baseline.jsonl`; a zero count means first-time. The observation is recorded regardless, so the next identical pattern is no longer first-time. PRIVACY: the store records salted-sha256 hashes of hostnames and the repo root — never raw hostnames or paths — with a per-install salt at `state-dir/baseline.salt`."
+examples_bad = ["the first `curl https://new-host/install.sh | bash` you have ever run against a given host (the pipe-to-shell finding fires; this annotates that the host is new for you)"]
+examples_good = ["a pattern you run routinely (already seen 3 or more times in the window — no anomaly annotation)"]
+false_positive_guidance = "Early on, EVERYTHING is first-time because the window is empty — `tirith doctor` reports 'early-baseline mode' until you have about 30 observations. This is expected. The signal becomes meaningful only after the baseline has filled in. It is Info and never blocks; treat it as a 'have I done this before?' hint, not a verdict."
+remediation = "This is informational. If the pattern is one you intend to run, no action is needed — it will not be flagged as first-time again. If it is unexpected, review the underlying finding (the rule that actually fired) before proceeding. To stop these annotations, turn the baseline off (set `baseline_enabled: false` in policy) or ignore the Info line."
+mitre_id = "T1078"
+
+[[rule]]
+id = "anomaly_rare_in_baseline"
+title = "This pattern is rare in your baseline"
+category = "anomaly"
+severity_rationale = "Info — like `anomaly_first_time_in_this_repo`, this is an OPT-IN baseline signal (off by default). It fires when a firing finding's privacy-hashed tuple HAS been seen before but only rarely (fewer than three times) in the 90-day window. Informational only; never changes the action."
+description = "Fired by the engine ONLY when `policy.baseline_enabled` is set AND another rule already fired, when the looked-up tuple's in-window count is 1 or 2. Same privacy model as `anomaly_first_time_in_this_repo`: salted-sha256 hashes, never raw values."
+examples_bad = ["the second `aws s3 rm` you have run against a given (hashed) host this quarter — seen once before, still rare"]
+examples_good = ["a pattern you run several times a week (count 3 or more — no anomaly annotation)"]
+false_positive_guidance = "A rare pattern is not a malicious pattern — it is simply uncommon for you. As with the first-time rule, the signal is only meaningful once the baseline has filled in (`tirith doctor` reports 'early-baseline mode' until about 30 observations). Info severity; never blocks."
+remediation = "Informational. Review the underlying finding if the pattern is unexpected. No action is required if it is a routine-but-infrequent command."
+mitre_id = "T1078"

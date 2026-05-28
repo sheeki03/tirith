@@ -930,6 +930,228 @@ fn taint_finding(
     }
 }
 
+/// M10 ch5 — leaders that classify the command's ecosystem for the anomaly
+/// baseline tuple. A pure leader → ecosystem-label map; `None` for leaders that
+/// are not package/ecosystem commands. Low-cardinality, non-identifying.
+fn baseline_ecosystem_for_leader(leader: &str) -> Option<&'static str> {
+    match leader {
+        "npm" | "npx" | "yarn" | "pnpm" => Some("npm"),
+        "pip" | "pip3" | "pipx" | "poetry" | "uv" => Some("pypi"),
+        "cargo" => Some("crates"),
+        "go" => Some("go"),
+        "gem" => Some("rubygems"),
+        "docker" | "podman" => Some("docker"),
+        "apt" | "apt-get" => Some("apt"),
+        "dnf" => Some("dnf"),
+        "yum" => Some("yum"),
+        "brew" => Some("brew"),
+        "pacman" => Some("pacman"),
+        "scoop" => Some("scoop"),
+        "kubectl" | "helm" => Some("k8s"),
+        "git" => Some("git"),
+        _ => None,
+    }
+}
+
+/// M10 ch5 — the shared (per-analysis) components of the anomaly-baseline
+/// tuple: ecosystem (from the command leader), sudo flag, and the salted cwd /
+/// repo hash. Computed ONCE per analysis and paired with each firing finding's
+/// `rule_id` + per-finding host hash. Returns the components plus the bare,
+/// de-sudo'd leader (so the per-finding host derivation and ecosystem agree on
+/// the same parse).
+fn baseline_shared_components(ctx: &AnalysisContext) -> (Option<String>, bool, Option<String>) {
+    use crate::tokenize;
+
+    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let (sudo_flag, ecosystem) = match segs.first().and_then(|s| s.command.as_deref()) {
+        Some(raw) => {
+            let leader = raw
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .rsplit('/')
+                .next()
+                .unwrap_or(raw);
+            let sudo = matches!(leader, "sudo" | "doas");
+            // When the leader is a sudo wrapper, classify the WRAPPED command's
+            // ecosystem (first non-flag, non-assignment arg) so `sudo npm i …`
+            // still reads as `npm`.
+            let eco_leader = if sudo {
+                segs.first()
+                    .and_then(|s| {
+                        s.args
+                            .iter()
+                            .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
+                            .find(|a| !a.is_empty() && !a.starts_with('-') && !a.contains('='))
+                    })
+                    .map(|a| a.rsplit('/').next().unwrap_or(a))
+                    .unwrap_or(leader)
+            } else {
+                leader
+            };
+            (
+                sudo,
+                baseline_ecosystem_for_leader(eco_leader).map(str::to_string),
+            )
+        }
+        None => (false, None),
+    };
+
+    let cwd_repo_hash = crate::baseline::hash_cwd(ctx.cwd.as_deref());
+    (ecosystem, sudo_flag, cwd_repo_hash)
+}
+
+/// M10 ch5 — the host hash for one finding's tuple, derived from the finding's
+/// own URL evidence (the URL the rule fired on), falling back to the first
+/// extracted URL. Returns `None` when no host is associated.
+fn baseline_host_hash_for_finding(
+    finding: &Finding,
+    extracted: &[crate::extract::ExtractedUrl],
+) -> Option<String> {
+    use crate::verdict::Evidence;
+    // Prefer a URL named in this finding's evidence.
+    let raw = finding
+        .evidence
+        .iter()
+        .find_map(|e| match e {
+            Evidence::Url { raw } => Some(raw.clone()),
+            _ => None,
+        })
+        .or_else(|| extracted.first().map(|u| u.raw.clone()))?;
+    let host = crate::parse::extract_raw_host(&raw)?;
+    if host.is_empty() {
+        return None;
+    }
+    crate::baseline::hash_host(&host)
+}
+
+/// M10 ch5 — anomaly baseline. **Opt-in (D2): a no-op unless
+/// `policy.baseline_enabled` is set.** When enabled AND at least one detection
+/// rule already fired, for each firing finding it builds the privacy-hashed
+/// tuple `(rule_id, host_hash, ecosystem, sudo_flag, cwd_repo_hash)`, looks it
+/// up in the sliding window, and — when the pattern is first-time / rare —
+/// appends an Info-severity anomaly finding. The observation is recorded
+/// regardless of novelty (so the window fills in). Each distinct tuple is
+/// recorded once per analysis, and only ONE anomaly finding is appended per
+/// analysis (the strongest: first-time over rare) to avoid a wall of Info lines
+/// when many rules fire on one command.
+///
+/// Privacy: the store records only salted-sha256 hashes (host, cwd/repo) and
+/// low-cardinality categoricals (ecosystem, sudo) — never raw hostnames/paths.
+/// See `crate::baseline`.
+fn apply_baseline(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    extracted: &[crate::extract::ExtractedUrl],
+    findings: &mut Vec<Finding>,
+) {
+    use crate::verdict::RuleId;
+
+    if !policy.baseline_enabled {
+        return; // D2: default OFF — zero baseline I/O on the hot path.
+    }
+    // Only react to findings that already fired. Skip the anomaly rules
+    // themselves so we never observe-on-observe.
+    let real_findings: Vec<usize> = findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            !matches!(
+                f.rule_id,
+                RuleId::AnomalyFirstTimeInThisRepo | RuleId::AnomalyRareInBaseline
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if real_findings.is_empty() {
+        return;
+    }
+
+    let (ecosystem, sudo_flag, cwd_repo_hash) = baseline_shared_components(ctx);
+
+    // De-duplicate tuples within this single analysis: record each unique tuple
+    // once, and track the strongest novelty seen so we surface at most one
+    // anomaly finding.
+    let mut seen_tuples: std::collections::HashSet<crate::baseline::PatternKey> =
+        std::collections::HashSet::new();
+    let mut best: Option<(crate::verdict::RuleId, String)> = None; // (anomaly rule, the rule that triggered it)
+
+    for &idx in &real_findings {
+        let finding = &findings[idx];
+        let host_hash = baseline_host_hash_for_finding(finding, extracted);
+        let key = crate::baseline::PatternKey {
+            rule_id: finding.rule_id.to_string(),
+            host_hash,
+            ecosystem: ecosystem.clone(),
+            sudo_flag,
+            cwd_repo_hash: cwd_repo_hash.clone(),
+        };
+        if !seen_tuples.insert(key.clone()) {
+            continue; // already handled this exact tuple in this analysis
+        }
+
+        let seen = crate::baseline::lookup(&key);
+        if let Some(rule) = crate::baseline::anomaly_rule(seen) {
+            // first-time (count 0) beats rare (count 1..2): prefer the lower count.
+            let promote = match &best {
+                None => true,
+                Some((RuleId::AnomalyRareInBaseline, _)) => {
+                    rule == RuleId::AnomalyFirstTimeInThisRepo
+                }
+                _ => false,
+            };
+            if promote {
+                best = Some((rule, finding.rule_id.to_string()));
+            }
+        }
+
+        // Record the observation regardless of novelty (best-effort; an I/O
+        // failure must never break the verdict).
+        let _ = crate::baseline::record(key);
+    }
+
+    if let Some((anomaly_rule, triggering_rule)) = best {
+        findings.push(baseline_finding(anomaly_rule, &triggering_rule));
+    }
+}
+
+/// Build an Info-severity anomaly finding. `triggering_rule` is the rule whose
+/// firing pattern was novel — named so `tirith why` shows the connection.
+fn baseline_finding(rule_id: crate::verdict::RuleId, triggering_rule: &str) -> Finding {
+    use crate::verdict::{Evidence, RuleId, Severity};
+    let (title, detail) = match rule_id {
+        RuleId::AnomalyFirstTimeInThisRepo => (
+            "First time seen in your baseline",
+            format!(
+                "The pattern for `{triggering_rule}` (privacy-hashed: rule + host + \
+                 ecosystem + sudo + repo) has not appeared in your 90-day baseline. \
+                 This is informational and does not change the verdict."
+            ),
+        ),
+        RuleId::AnomalyRareInBaseline => (
+            "Rare in your baseline",
+            format!(
+                "The pattern for `{triggering_rule}` has been seen only rarely \
+                 (fewer than 3 times) in your 90-day baseline. Informational; does \
+                 not change the verdict."
+            ),
+        ),
+        // Not reachable — apply_baseline only constructs the two anomaly rules.
+        _ => ("Baseline anomaly", String::new()),
+    };
+    Finding {
+        rule_id,
+        severity: Severity::Info,
+        title: title.to_string(),
+        description: detail,
+        evidence: vec![Evidence::Text {
+            detail: format!("baseline novelty for rule: {triggering_rule}"),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: Some("T1078".to_string()),
+        custom_rule_id: None,
+    }
+}
+
 /// The `/tmp`-equivalent roots: `/tmp` plus `$TMPDIR` (macOS uses a per-user
 /// `$TMPDIR` under `/var/folders`). Used by the hot-path `ExecInTmp` /
 /// writable-dir checks.
@@ -1659,6 +1881,14 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                     .all(|url| policy.is_allowlisted(url) || rule_allowlisted(url))
         });
     }
+
+    // M10 ch5 — anomaly baseline (opt-in, D2). When `policy.baseline_enabled`
+    // is set AND at least one detection rule fired, look up each firing
+    // finding's privacy-hashed tuple in the sliding window and append an Info
+    // anomaly finding for a first-time / rare pattern; record the observation
+    // regardless. A no-op (zero baseline I/O) when the flag is off — the common
+    // case. Runs before enrichment so the anomaly finding is enriched too.
+    apply_baseline(ctx, &policy, &extracted, &mut findings);
 
     enrich_pro(&mut findings);
     enrich_team(&mut findings);
@@ -2856,5 +3086,100 @@ mod tests {
         // No marks written.
         let ctx = exec_ctx_in("bash ./install.sh", dir.path());
         assert!(check_taint_hot_with_store(&ctx, &store).is_empty());
+    }
+
+    // ---- M10 ch5 — anomaly-baseline wiring tests ---------------------------
+    //
+    // The store-level record/lookup/classification logic is covered exhaustively
+    // by `crate::baseline`'s own unit tests (against a tempdir). These tests
+    // cover the ENGINE wiring: (a) the opt-in guarantee — with the flag off,
+    // `apply_baseline` touches nothing and appends nothing — and (b) the shared
+    // tuple-component derivation (ecosystem / sudo classification). Neither test
+    // touches the real `state_dir()` or mutates env: the disabled-path test
+    // never reaches `crate::baseline`, and the component test is pure parsing.
+
+    fn synthetic_finding(rule_id: crate::verdict::RuleId) -> Finding {
+        use crate::verdict::Severity;
+        Finding {
+            rule_id,
+            severity: Severity::High,
+            title: "synthetic".into(),
+            description: String::new(),
+            evidence: vec![],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn apply_baseline_is_noop_when_disabled() {
+        // D2 opt-in guarantee: with `baseline_enabled` false (the default),
+        // apply_baseline must NOT append any anomaly finding and must not touch
+        // the store. We assert the findings list is left exactly as-is.
+        let ctx = exec_ctx("curl https://example.com/install.sh | bash");
+        let policy = Policy::default(); // baseline_enabled == false
+        assert!(!policy.baseline_enabled, "default must be OFF");
+        let mut findings = vec![synthetic_finding(crate::verdict::RuleId::CurlPipeShell)];
+        let before = findings.len();
+        apply_baseline(&ctx, &policy, &[], &mut findings);
+        assert_eq!(
+            findings.len(),
+            before,
+            "disabled baseline must not append any anomaly finding"
+        );
+        assert!(
+            findings.iter().all(|f| !matches!(
+                f.rule_id,
+                crate::verdict::RuleId::AnomalyFirstTimeInThisRepo
+                    | crate::verdict::RuleId::AnomalyRareInBaseline
+            )),
+            "no anomaly rule when disabled"
+        );
+    }
+
+    #[test]
+    fn apply_baseline_noop_when_no_real_findings() {
+        // Even enabled, with only anomaly findings present (or none), there is
+        // nothing to observe — apply_baseline must not loop on itself.
+        let ctx = exec_ctx("echo hi");
+        let policy = Policy {
+            baseline_enabled: true,
+            ..Policy::default()
+        };
+        let mut findings: Vec<Finding> = vec![];
+        apply_baseline(&ctx, &policy, &[], &mut findings);
+        assert!(findings.is_empty(), "no findings in, no findings out");
+    }
+
+    #[test]
+    fn baseline_shared_components_classifies_sudo_and_ecosystem() {
+        // `sudo npm install …` → sudo_flag true, ecosystem npm (the wrapped
+        // command's ecosystem, not sudo's).
+        let ctx = exec_ctx("sudo npm install left-pad");
+        let (eco, sudo, _cwd) = baseline_shared_components(&ctx);
+        assert!(sudo, "sudo leader → sudo_flag true");
+        assert_eq!(eco.as_deref(), Some("npm"), "wrapped ecosystem classified");
+
+        // Plain `pip3 install x` → not sudo, ecosystem pypi.
+        let ctx2 = exec_ctx("pip3 install requests");
+        let (eco2, sudo2, _) = baseline_shared_components(&ctx2);
+        assert!(!sudo2);
+        assert_eq!(eco2.as_deref(), Some("pypi"));
+
+        // A non-ecosystem command → no ecosystem label, not sudo.
+        let ctx3 = exec_ctx("echo hello");
+        let (eco3, sudo3, _) = baseline_shared_components(&ctx3);
+        assert!(!sudo3);
+        assert_eq!(eco3, None);
+    }
+
+    #[test]
+    fn baseline_ecosystem_leader_map_covers_common_managers() {
+        assert_eq!(baseline_ecosystem_for_leader("docker"), Some("docker"));
+        assert_eq!(baseline_ecosystem_for_leader("cargo"), Some("crates"));
+        assert_eq!(baseline_ecosystem_for_leader("kubectl"), Some("k8s"));
+        assert_eq!(baseline_ecosystem_for_leader("ls"), None);
     }
 }

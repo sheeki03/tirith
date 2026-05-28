@@ -186,6 +186,11 @@ help_example_tests! {
     help_taint_clear           => (["taint", "clear", "--help"], "tirith taint clear ./install.sh --yes");
     // M10 ch4 — `tirith intend` intent-vs-command heuristic.
     help_intend                => (["intend", "--help"], "tirith intend \"install a formatter\" -- \"curl https://x/install.sh | bash\"");
+    // M10 ch5 — `tirith baseline learn|status|reset` (opt-in anomaly baseline, D2).
+    help_baseline              => (["baseline", "--help"], "tirith baseline learn");
+    help_baseline_learn        => (["baseline", "learn", "--help"], "tirith baseline learn --json");
+    help_baseline_status       => (["baseline", "status", "--help"], "tirith baseline status --json");
+    help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
 }
 
 #[test]

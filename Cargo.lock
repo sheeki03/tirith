@@ -2961,6 +2961,7 @@ dependencies = [
  "ed25519-dalek",
  "etcetera",
  "fs2",
+ "getrandom 0.3.4",
  "home",
  "is-terminal",
  "libc",

@@ -389,6 +389,27 @@ pub struct Policy {
     /// and do not consult this flag). Toggled by `tirith hooks guard on|off`.
     #[serde(default)]
     pub hooks_guard_enabled: bool,
+
+    /// **M10 ch5 — opt-in anomaly-detection baseline (design-decision D2).**
+    ///
+    /// When `true`, the exec / paste hot path records every detection-rule
+    /// firing as a privacy-hashed observation in the sliding window at
+    /// `state_dir()/baseline.jsonl` (`crate::baseline`) and, when a firing
+    /// finding's tuple is new / rare for this user, appends one of the two
+    /// Info-severity anomaly findings
+    /// ([`crate::verdict::RuleId::AnomalyFirstTimeInThisRepo`] /
+    /// [`AnomalyRareInBaseline`](crate::verdict::RuleId::AnomalyRareInBaseline)).
+    /// The anomaly findings never change the verdict's action — they annotate
+    /// "this is new for you".
+    ///
+    /// When `false` (the default — the D2 opt-in decision), the engine performs
+    /// NO baseline I/O on the hot path: no JSONL read, no append, no salt read.
+    /// A machine that never opted in pays nothing. The `tirith baseline status`
+    /// / `reset` surfaces still read the store directly (independent of this
+    /// flag). Toggled by `tirith baseline learn` (on) and persisted via the
+    /// same single-line append-or-rewrite the M8/M9 guard flags use.
+    #[serde(default)]
+    pub baseline_enabled: bool,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -876,6 +897,7 @@ impl Default for Policy {
             env_guard_sensitive_vars: Vec::new(),
             exec_guard_enabled: false,
             hooks_guard_enabled: false,
+            baseline_enabled: false,
         }
     }
 }

@@ -2025,6 +2025,41 @@ Examples:
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
+
+    /// Opt-in per-user anomaly baseline: learn|status|reset (M10 ch5)
+    #[command(after_help = "\
+An OPT-IN sliding-window anomaly detector (default OFF — design-decision D2).
+When enabled, tirith records a privacy-hashed observation every time a detection
+rule fires and, for a pattern that is NEW or RARE for you, surfaces an extra
+Info-severity note alongside the normal verdict. The note NEVER blocks — it
+answers \"have I done this before?\", not \"is this dangerous?\".
+
+Privacy by design: the store records NO raw hostnames and NO raw paths. Hosts
+and the repo root are salted-sha256 hashed (per-install salt at
+<state-dir>/baseline.salt, mode 0600); ecosystem and the sudo flag are
+low-cardinality categoricals. The tuple is
+(rule_id, host-hash, ecosystem, sudo, cwd/repo-hash). The store lives at
+<state-dir>/baseline.jsonl, a 90-day window capped at 100k entries.
+
+Early-baseline mode: until the window holds ~30 observations, everything looks
+new — anomaly signals are not yet meaningful. `tirith doctor` and
+`tirith baseline status` say so.
+
+Subcommands:
+  learn   turn the baseline ON (sets policy.baseline_enabled = true)
+  status  show the top 20 patterns (privacy-hashed) + the enabled flag
+  reset   zero the store (prompts unless --yes)
+
+Examples:
+  tirith baseline learn
+  tirith baseline status
+  tirith baseline status --json
+  tirith baseline reset
+  tirith baseline reset --yes")]
+    Baseline {
+        #[command(subcommand)]
+        action: BaselineAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2075,6 +2110,70 @@ Examples:
     Clear {
         /// Path whose taint mark to remove.
         file: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BaselineAction {
+    /// Turn the opt-in anomaly baseline ON (sets policy.baseline_enabled = true)
+    #[command(after_help = "\
+Enables learning. After this, tirith records a privacy-hashed observation for
+every detection-rule firing and surfaces an Info 'first time / rare for you'
+note for novel patterns. No raw hostnames or paths are stored — only salted
+hashes. It never blocks. Expect early-baseline mode (everything looks new)
+until the window fills in.
+
+Examples:
+  tirith baseline learn
+  tirith baseline learn --json")]
+    Learn {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the top 20 patterns (privacy-hashed) and the enabled flag
+    #[command(after_help = "\
+Prints whether the baseline is enabled, how many observations are in the 90-day
+window, an early-baseline-mode note while the window is sparse, and the top 20
+patterns by count. All identifying fields are salted-sha256 hashes — never raw
+hostnames or paths.
+
+Examples:
+  tirith baseline status
+  tirith baseline status --json")]
+    Status {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Zero the baseline store (prompts for confirmation)
+    #[command(after_help = "\
+Removes every recorded observation. Prompts before zeroing unless --yes is
+passed. In a non-interactive shell without --yes the reset is refused (no silent
+zero). In --json mode, --yes is required to confirm. The per-install salt is
+left in place.
+
+Examples:
+  tirith baseline reset
+  tirith baseline reset --yes")]
+    Reset {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
@@ -5941,6 +6040,20 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::intent::run(&intent, &command.join(" "), explain, json)
         }
+        Commands::Baseline { action } => match action {
+            BaselineAction::Learn { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::baseline::learn(json)
+            }
+            BaselineAction::Status { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::baseline::status(json)
+            }
+            BaselineAction::Reset { yes, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::baseline::reset(yes, json)
+            }
+        },
     };
 
     std::process::exit(exit_code);

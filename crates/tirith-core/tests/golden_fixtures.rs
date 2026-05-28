@@ -749,6 +749,9 @@ const ALL_RULE_IDS: &[&str] = &[
     // Tainted-content tracking rules (M10 ch3)
     "exec_of_tainted_file",
     "command_sourced_from_tainted_file",
+    // Anomaly-detection rules (M10 ch5, D2)
+    "anomaly_first_time_in_this_repo",
+    "anomaly_rare_in_baseline",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1038,6 +1041,17 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // lookup at a temp store, following the M8/M9 runtime-state pattern.
     "exec_of_tainted_file",
     "command_sourced_from_tainted_file",
+    // M10 ch5 — anomaly-detection rules fire from `engine::analyze` ONLY when
+    // `policy.baseline_enabled` is set (opt-in, default false) AND another
+    // detection rule already fired, via a lookup of the firing finding's
+    // privacy-hashed tuple in the runtime baseline store at
+    // `state_dir()/baseline.jsonl`. The static golden-fixture runner uses the
+    // default policy (baseline off) and no baseline store, so a text fixture
+    // cannot drive either rule — the trigger is runtime state, not input
+    // content. Covered by unit tests in `crates/tirith-core/src/baseline.rs`
+    // against a `tempfile::tempdir()` store.
+    "anomaly_first_time_in_this_repo",
+    "anomaly_rare_in_baseline",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1410,6 +1424,9 @@ fn test_rule_id_list_is_complete() {
         // Tainted-content tracking rules (M10 ch3)
         RuleId::ExecOfTaintedFile,
         RuleId::CommandSourcedFromTaintedFile,
+        // Anomaly-detection rules (M10 ch5, D2)
+        RuleId::AnomalyFirstTimeInThisRepo,
+        RuleId::AnomalyRareInBaseline,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
