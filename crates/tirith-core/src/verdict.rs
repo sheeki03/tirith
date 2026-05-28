@@ -541,6 +541,36 @@ pub enum RuleId {
     /// the recorded snapshot. Medium severity — direnv auto-sources `.envrc`
     /// on `cd`, so a new file is auto-executed code.
     PersistenceDirenvNewEnvrc,
+
+    // Shell-alias / function risk rules (M9 ch3). These fire ONLY from the
+    // `tirith aliases scan|explain` parser (`crate::aliases`), which reads
+    // shell rc/profile files statically (and, opt-in, shells out with no-rc
+    // flags), never from the `engine::analyze` exec/paste hot path or
+    // `analyze_output`. They classify *parsed alias/function bodies*, so they
+    // carry no PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
+    // Covered by unit tests in `aliases.rs` against a `tempfile::tempdir()`
+    // root (always with `include_runtime=false` to keep CI hermetic).
+    /// M9 ch3 — an alias or function shadows a critical command
+    /// (`ls`, `cd`, `git`, `ssh`, `sudo`, `npm`, `pip`, `docker`, `kubectl`,
+    /// `aws`). Medium severity — overriding a trusted command is a classic way
+    /// to interpose a wrapper that exfiltrates arguments or alters behavior
+    /// (e.g. `alias sudo='sudo evil-wrapper'`).
+    AliasOverridesCriticalCommand,
+    /// M9 ch3 — an alias/function body makes a network call (`curl`, `wget`,
+    /// `nc`/`ncat`/`netcat`). High severity — a network call hidden inside an
+    /// everyday alias is a stealthy exfiltration / download-execute channel
+    /// that fires whenever the alias is invoked.
+    AliasContainsNetworkCall,
+    /// M9 ch3 — an alias/function body reads a credential file
+    /// (`~/.aws/credentials`, `~/.ssh/id_*`, `~/.netrc`, `~/.npmrc`, etc.).
+    /// High severity — an alias that quietly reads your secrets every time you
+    /// run it is a credential-theft foothold.
+    AliasContainsCredentialRead,
+    /// M9 ch3 — the rc file an alias/function was defined in was modified
+    /// within the last hour (file mtime). Info severity — surfaces a
+    /// *recently-added* alias for review (a freshly-planted malicious alias),
+    /// without claiming the alias itself is malicious.
+    AliasRecentlyAdded,
 }
 
 impl fmt::Display for RuleId {

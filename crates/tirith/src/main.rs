@@ -1647,6 +1647,45 @@ Examples:
         #[command(subcommand)]
         action: PersistenceAction,
     },
+
+    /// Detect risky shell aliases + functions (static-first) (M9 ch3)
+    #[command(after_help = "\
+Subcommands:
+  tirith aliases scan                             — enumerate every alias +
+        [--include-runtime] [--json]                function and flag risky ones.
+                                                    Exit 1 if any High finding.
+  tirith aliases explain <name>                   — show a definition's body +
+        [--include-runtime] [--json]                analysis (body redacted).
+
+Two-tier, static-first (safe by construction):
+  DEFAULT — a static parser reads ~/.bashrc, ~/.zshrc,
+  ~/.config/fish/config.fish, and PowerShell $PROFILE paths directly. It NEVER
+  executes your shell config, so inspecting a malicious rc cannot run code.
+  --include-runtime (OPT-IN) — additionally shells out with explicit no-rc
+  flags (bash --norc --noprofile -c 'alias', zsh -f -c 'alias',
+  fish --no-config -c 'functions') so your real rc files are NOT sourced.
+  Shells without reliable no-rc support are skipped.
+
+What fires:
+  alias/function body makes a network call (curl/wget/nc)   — High.
+  alias/function body reads a credential file               — High.
+  alias/function shadows a critical command                 — Medium.
+        (ls, cd, git, ssh, sudo, npm, pip, docker, kubectl, aws)
+  alias defined in an rc file modified within the last hour — Info.
+
+What it is NOT:
+  This is an observability surface. tirith never edits your rc files and never
+  evaluates them in the default static mode.
+
+Examples:
+  tirith aliases scan
+  tirith aliases scan --include-runtime
+  tirith aliases scan --json
+  tirith aliases explain git")]
+    Aliases {
+        #[command(subcommand)]
+        action: AliasesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2237,6 +2276,69 @@ Examples:
         /// Poll interval in seconds (default: 30).
         #[arg(long, default_value_t = 30)]
         interval: u64,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AliasesAction {
+    /// Enumerate aliases + functions and flag risky ones
+    #[command(after_help = "\
+What it does:
+  Statically parses ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish, and
+  PowerShell $PROFILE paths to enumerate aliases + functions, then classifies
+  each against four rules (network call / credential read / critical-command
+  override / recently added). NEVER executes your shell config in static mode.
+
+--include-runtime (opt-in):
+  Additionally shells out with no-rc flags (bash --norc --noprofile -c 'alias',
+  zsh -f -c 'alias', fish --no-config -c 'functions') so your real rc files are
+  NOT sourced. Results are cached per process for 60s.
+
+Exit codes:
+  0  no High/Critical finding (clean, or only Medium/Low/Info).
+  1  at least one High/Critical finding (network call / credential read).
+
+Examples:
+  tirith aliases scan
+  tirith aliases scan --include-runtime
+  tirith aliases scan --json")]
+    Scan {
+        /// Also introspect live shells via no-rc shell-outs (opt-in).
+        #[arg(long)]
+        include_runtime: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show a single alias/function's body + analysis (body redacted)
+    #[command(after_help = "\
+What it shows:
+  Every definition matching <name> (a name can be defined in more than one rc
+  file / shell), its body (credential-redacted), and any risk findings.
+
+Exit codes:
+  0  the name was found.
+  2  no alias or function with that name was found.
+
+Examples:
+  tirith aliases explain git
+  tirith aliases explain deploy --json")]
+    Explain {
+        /// The alias / function name to explain.
+        name: String,
+        /// Also introspect live shells via no-rc shell-outs (opt-in).
+        #[arg(long)]
+        include_runtime: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4904,6 +5006,25 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::persistence::watch(interval, json)
+            }
+        },
+        Commands::Aliases { action } => match action {
+            AliasesAction::Scan {
+                include_runtime,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::aliases::scan(include_runtime, json)
+            }
+            AliasesAction::Explain {
+                name,
+                include_runtime,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::aliases::explain(&name, include_runtime, json)
             }
         },
     };

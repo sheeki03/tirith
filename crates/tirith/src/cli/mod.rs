@@ -129,6 +129,7 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 }
 
 pub mod agent;
+pub mod aliases;
 pub mod audit;
 #[cfg(unix)]
 pub mod bash_capability;

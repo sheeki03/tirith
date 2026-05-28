@@ -273,7 +273,14 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PersistenceCrontabModified
         | RuleId::PersistenceLaunchAgentAdded
         | RuleId::PersistenceSshConfigInclude
-        | RuleId::PersistenceDirenvNewEnvrc => false,
+        | RuleId::PersistenceDirenvNewEnvrc
+        // M9 ch3 — shell-alias / function risk rules. Heuristics on parsed
+        // alias/function bodies from `tirith aliases`; no threat-DB
+        // involvement.
+        | RuleId::AliasOverridesCriticalCommand
+        | RuleId::AliasContainsNetworkCall
+        | RuleId::AliasContainsCredentialRead
+        | RuleId::AliasRecentlyAdded => false,
     }
 }
 

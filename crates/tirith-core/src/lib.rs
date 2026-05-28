@@ -1,4 +1,5 @@
 pub mod agent_origin;
+pub mod aliases;
 pub mod approval;
 pub mod audit;
 pub mod audit_aggregator;

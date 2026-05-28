@@ -151,6 +151,10 @@ help_example_tests! {
     help_persistence_scan      => (["persistence", "scan", "--help"], "tirith persistence scan --json");
     help_persistence_watch     => (["persistence", "watch", "--help"], "tirith persistence watch --interval 30");
     help_persistence_diff      => (["persistence", "diff", "--help"], "tirith persistence diff --json");
+    // M9 ch3 — `tirith aliases scan|explain`.
+    help_aliases               => (["aliases", "--help"], "tirith aliases scan");
+    help_aliases_scan          => (["aliases", "scan", "--help"], "tirith aliases scan --include-runtime");
+    help_aliases_explain       => (["aliases", "explain", "--help"], "tirith aliases explain git");
 }
 
 #[test]

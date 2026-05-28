@@ -742,3 +742,50 @@ context = "file"
 file_path = ".devcontainer/devcontainer.json"
 expected_action = "block"
 expected_rules = ["docker_run_sensitive_bind_mount"]
+
+# M9 ch3 — shell-alias / function risk rules fire ONLY from the
+# `tirith aliases scan|explain` parser (`crate::aliases`), NEVER from
+# `engine::analyze`. These fixtures document that scanning an rc file's CONTENT
+# through the engine's FileScan path does NOT spuriously fire an alias rule.
+# The alias rules are externally-triggered (see EXTERNALLY_TRIGGERED_RULES in
+# golden_fixtures.rs) and covered by unit tests in
+# `crates/tirith-core/src/aliases.rs`. An alias body that fires
+# `alias_contains_network_call` / `alias_contains_credential_read` in the alias
+# PARSER must remain `allow` when the same text is scanned as a generic rc file
+# by the engine.
+
+[[fixture]]
+name = "aliases_override_critical_not_engine_rule"
+min_milestone = 9
+input = "alias sudo='sudo evil-wrapper'\n"
+context = "file"
+file_path = ".bashrc"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "aliases_network_body_not_engine_rule"
+min_milestone = 9
+input = "alias dl='wget https://example.test/x'\n"
+context = "file"
+file_path = ".zshrc"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "aliases_credential_read_body_not_engine_rule"
+min_milestone = 9
+input = "getkey() {\n  printf '%s' ~/.aws/credentials\n}\n"
+context = "file"
+file_path = ".bashrc"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "aliases_benign_function_not_engine_rule"
+min_milestone = 9
+input = "gs() {\n  git status\n}\n"
+context = "file"
+file_path = ".zshrc"
+expected_action = "allow"
+expected_rules = []

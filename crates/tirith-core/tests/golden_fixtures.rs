@@ -710,6 +710,11 @@ const ALL_RULE_IDS: &[&str] = &[
     "persistence_launch_agent_added",
     "persistence_ssh_config_include",
     "persistence_direnv_new_envrc",
+    // Shell-alias / function risk rules (M9 ch3)
+    "alias_overrides_critical_command",
+    "alias_contains_network_call",
+    "alias_contains_credential_read",
+    "alias_recently_added",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -892,6 +897,21 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "persistence_launch_agent_added",
     "persistence_ssh_config_include",
     "persistence_direnv_new_envrc",
+    // M9 ch3 — shell-alias / function risk rules fire ONLY from the
+    // `tirith aliases scan|explain` parser (`crate::aliases`), which reads
+    // shell rc/profile files statically (and, opt-in, shells out with no-rc
+    // flags), never from `engine::analyze` (the golden-fixture runner) or
+    // `analyze_output`. They classify *parsed alias/function bodies*, which
+    // static text fixtures driving `engine::analyze` cannot reproduce (an
+    // alias definition is not an exec/paste input). Covered by unit tests in
+    // `crates/tirith-core/src/aliases.rs` against a `tempfile::tempdir()` root
+    // (always with `include_runtime=false`), following the M8 / M9-ch1 / ch2
+    // runtime-state pattern. The `configfile.toml` fixtures document the
+    // no-fire engine behavior for rc-file content shapes.
+    "alias_overrides_critical_command",
+    "alias_contains_network_call",
+    "alias_contains_credential_read",
+    "alias_recently_added",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1225,6 +1245,11 @@ fn test_rule_id_list_is_complete() {
         RuleId::PersistenceLaunchAgentAdded,
         RuleId::PersistenceSshConfigInclude,
         RuleId::PersistenceDirenvNewEnvrc,
+        // Shell-alias / function risk rules (M9 ch3)
+        RuleId::AliasOverridesCriticalCommand,
+        RuleId::AliasContainsNetworkCall,
+        RuleId::AliasContainsCredentialRead,
+        RuleId::AliasRecentlyAdded,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

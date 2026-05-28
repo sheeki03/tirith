@@ -1165,6 +1165,17 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "PersistenceSshConfigInclude",
     ),
     ("persistence_direnv_new_envrc", "PersistenceDirenvNewEnvrc"),
+    // Shell-alias / function risk rules (M9 ch3).
+    (
+        "alias_overrides_critical_command",
+        "AliasOverridesCriticalCommand",
+    ),
+    ("alias_contains_network_call", "AliasContainsNetworkCall"),
+    (
+        "alias_contains_credential_read",
+        "AliasContainsCredentialRead",
+    ),
+    ("alias_recently_added", "AliasRecentlyAdded"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1191,6 +1202,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "context",
     "hygiene",
     "persistence",
+    "aliases",
 ];
 
 #[derive(Deserialize)]
