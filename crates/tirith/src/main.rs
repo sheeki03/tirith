@@ -1602,6 +1602,51 @@ Examples:
         #[command(subcommand)]
         action: HygieneAction,
     },
+
+    /// Inventory + monitor persistence mechanisms for changes (M9 ch2)
+    #[command(after_help = "\
+Subcommands:
+  tirith persistence scan                         — inventory every watched
+        [--json]                                    persistence surface, print
+                                                    each location + sha256, and
+                                                    record the baseline snapshot.
+  tirith persistence diff                         — show what changed since the
+        [--json]                                    baseline: ADDED LINES ONLY,
+                                                    credential-redacted. Exit 1
+                                                    if any High finding.
+  tirith persistence watch                        — poll every --interval secs
+        [--interval <secs>] [--json]                (default 30) until Ctrl-C,
+                                                    reporting incremental changes.
+
+What it watches:
+  shell rc/profile files (~/.bashrc, ~/.zshrc, ~/.profile, fish/PowerShell
+  profiles), ~/.ssh/authorized_keys, ~/.ssh/config, ~/.gitconfig, ~/.npmrc,
+  the user crontab (crontab -l), ~/.config/systemd/user/*.service, macOS
+  ~/Library/LaunchAgents/*.plist, login items, .envrc in the cwd ancestry,
+  and the git global hooks path (core.hooksPath).
+
+What changes fire (on diff/watch):
+  authorized_keys new entry                       — High.
+  launch agent / systemd-user unit added          — High.
+  shell rc/profile modified                       — Medium.
+  crontab modified                                — Medium.
+  ~/.ssh/config Include directive added           — Medium.
+  new .envrc appeared                             — Medium.
+
+The snapshot lives at <state-dir>/persistence_snapshot.json (sha256 + size +
+content per surface). `scan` records the baseline; `diff` compares against it
+without updating it; re-run `scan` to re-baseline. tirith never modifies any
+watched file — this is an observability surface.
+
+Examples:
+  tirith persistence scan
+  tirith persistence scan --json
+  tirith persistence diff
+  tirith persistence watch --interval 30")]
+    Persistence {
+        #[command(subcommand)]
+        action: PersistenceAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2109,6 +2154,89 @@ Examples:
         /// Apply every chmod fix without per-finding confirmation.
         #[arg(long)]
         yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PersistenceAction {
+    /// Inventory every watched surface + record the baseline snapshot
+    #[command(after_help = "\
+What it inventories:
+  shell rc/profile files, ~/.ssh/{authorized_keys,config}, ~/.gitconfig,
+  ~/.npmrc, the user crontab (crontab -l), ~/.config/systemd/user/*.service,
+  macOS ~/Library/LaunchAgents/*.plist, login items, .envrc in the cwd
+  ancestry, and the git global hooks path. Prints each location + its current
+  sha256.
+
+Side effect:
+  Records the inventory as the baseline snapshot at
+  <state-dir>/persistence_snapshot.json so a later `diff` has a baseline.
+
+Exit codes:
+  0  always (pure observability — tirith never modifies a watched file).
+
+Examples:
+  tirith persistence scan
+  tirith persistence scan --json")]
+    Scan {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show what changed since the baseline (added lines only, redacted)
+    #[command(after_help = "\
+What it shows:
+  For each changed surface, only the ADDED LINES (never removed lines, never
+  full content), run through the shipping credential redactor. Requires a
+  baseline recorded by a prior `tirith persistence scan`.
+
+`diff` does NOT update the snapshot — re-run `tirith persistence scan` to
+accept the current state as the new baseline.
+
+Exit codes:
+  0  no change, or only Medium/Low changes.
+  1  at least one High/Critical change (new authorized key, new launch agent).
+
+Examples:
+  tirith persistence diff
+  tirith persistence diff --json")]
+    Diff {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Poll for changes every --interval seconds until SIGINT
+    #[command(after_help = "\
+What it does:
+  Polls every --interval seconds (default 30) until Ctrl-C. Each poll diffs
+  against the last-saved snapshot, reports any changes, then re-baselines so
+  the next poll reports only incremental changes.
+
+Exit codes:
+  0  on SIGINT (clean shutdown).
+
+Examples:
+  tirith persistence watch
+  tirith persistence watch --interval 30
+  tirith persistence watch --interval 10 --json")]
+    Watch {
+        /// Poll interval in seconds (default: 30).
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -4758,6 +4886,24 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::hygiene::fix(dry_run, yes, json)
+            }
+        },
+        Commands::Persistence { action } => match action {
+            PersistenceAction::Scan { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::persistence::scan(json)
+            }
+            PersistenceAction::Diff { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::persistence::diff(json)
+            }
+            PersistenceAction::Watch {
+                interval,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::persistence::watch(interval, json)
             }
         },
     };

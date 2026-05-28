@@ -161,6 +161,7 @@ pub mod mcp_server;
 pub mod output_guard;
 pub mod package;
 pub mod paste;
+pub mod persistence;
 pub mod policy;
 pub mod prompt_status;
 pub mod receipt;

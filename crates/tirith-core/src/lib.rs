@@ -29,6 +29,7 @@ pub mod osv_correlation;
 pub mod output;
 pub mod package_risk;
 pub mod parse;
+pub mod persistence;
 pub mod policy;
 pub mod policy_client;
 pub mod policy_migrations;

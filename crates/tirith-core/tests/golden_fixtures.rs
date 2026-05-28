@@ -703,6 +703,13 @@ const ALL_RULE_IDS: &[&str] = &[
     "hygiene_shell_history_secret_like",
     "hygiene_cloud_creds_bad_perms",
     "hygiene_db_dump_in_repo",
+    // Persistence-mechanism state-change rules (M9 ch2)
+    "persistence_shell_rc_modified",
+    "persistence_authorized_keys_new_entry",
+    "persistence_crontab_modified",
+    "persistence_launch_agent_added",
+    "persistence_ssh_config_include",
+    "persistence_direnv_new_envrc",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -870,6 +877,21 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "hygiene_shell_history_secret_like",
     "hygiene_cloud_creds_bad_perms",
     "hygiene_db_dump_in_repo",
+    // M9 ch2 — persistence-mechanism state-change rules fire ONLY from the
+    // `tirith persistence diff|watch` snapshot comparison
+    // (`crate::persistence`), never from `engine::analyze` (the golden-fixture
+    // runner) or `analyze_output`. They detect a *change* (new/modified
+    // content) in a watched persistence surface relative to a recorded
+    // snapshot, which static text fixtures cannot reproduce (they need a
+    // real before/after filesystem state). Covered by unit tests in
+    // `crates/tirith-core/src/persistence.rs` against a `tempfile::tempdir()`
+    // root, following the M8 / M9-ch1 runtime-state pattern.
+    "persistence_shell_rc_modified",
+    "persistence_authorized_keys_new_entry",
+    "persistence_crontab_modified",
+    "persistence_launch_agent_added",
+    "persistence_ssh_config_include",
+    "persistence_direnv_new_envrc",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1196,6 +1218,13 @@ fn test_rule_id_list_is_complete() {
         RuleId::HygieneShellHistorySecretLike,
         RuleId::HygieneCloudCredsBadPerms,
         RuleId::HygieneDbDumpInRepo,
+        // Persistence-mechanism state-change rules (M9 ch2)
+        RuleId::PersistenceShellRcModified,
+        RuleId::PersistenceAuthorizedKeysNewEntry,
+        RuleId::PersistenceCrontabModified,
+        RuleId::PersistenceLaunchAgentAdded,
+        RuleId::PersistenceSshConfigInclude,
+        RuleId::PersistenceDirenvNewEnvrc,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();

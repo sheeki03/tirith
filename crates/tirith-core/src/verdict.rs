@@ -506,6 +506,41 @@ pub enum RuleId {
     /// Medium severity — dumps frequently carry PII / credentials. Manual
     /// fix (move out of repo + .gitignore; tirith never deletes files).
     HygieneDbDumpInRepo,
+
+    // Persistence-mechanism state-change rules (M9 ch2). These fire ONLY
+    // from the `tirith persistence diff|watch` snapshot comparison
+    // (`crate::persistence`), never from the `engine::analyze` exec/paste
+    // hot path or `analyze_output`. They detect a *change* (new/modified
+    // content) in a well-known persistence surface relative to a recorded
+    // snapshot, so they carry no PATTERN_TABLE entry and live in
+    // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in
+    // `persistence.rs` against a `tempfile::tempdir()` root.
+    /// M9 ch2 — a shell rc/profile (`~/.bashrc`, `~/.zshrc`, `~/.profile`,
+    /// fish/PowerShell profile) changed (sha256 differs) since the recorded
+    /// snapshot. Medium severity — rc files are a classic persistence
+    /// foothold (aliases, exported PATH shims, sourced payloads).
+    PersistenceShellRcModified,
+    /// M9 ch2 — a new line was added to `~/.ssh/authorized_keys` since the
+    /// recorded snapshot. High severity — an added authorized key is a
+    /// direct remote-access backdoor.
+    PersistenceAuthorizedKeysNewEntry,
+    /// M9 ch2 — the user crontab (`crontab -l`) changed since the recorded
+    /// snapshot. Medium severity — cron is a common scheduled-execution
+    /// persistence channel.
+    PersistenceCrontabModified,
+    /// M9 ch2 — a launchd / systemd-user unit was added (a new
+    /// `~/Library/LaunchAgents/*.plist` or `~/.config/systemd/user/*.service`
+    /// not present in the snapshot). High severity — a new agent/unit runs
+    /// code at login / on a schedule.
+    PersistenceLaunchAgentAdded,
+    /// M9 ch2 — `~/.ssh/config` gained an `Include` directive since the
+    /// recorded snapshot. Medium severity — an added Include can pull in an
+    /// attacker-controlled SSH config fragment.
+    PersistenceSshConfigInclude,
+    /// M9 ch2 — a new `.envrc` (direnv) appeared in the cwd ancestry since
+    /// the recorded snapshot. Medium severity — direnv auto-sources `.envrc`
+    /// on `cd`, so a new file is auto-executed code.
+    PersistenceDirenvNewEnvrc,
 }
 
 impl fmt::Display for RuleId {

@@ -1146,6 +1146,25 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("hygiene_cloud_creds_bad_perms", "HygieneCloudCredsBadPerms"),
     ("hygiene_db_dump_in_repo", "HygieneDbDumpInRepo"),
+    // Persistence-mechanism state-change rules (M9 ch2).
+    (
+        "persistence_shell_rc_modified",
+        "PersistenceShellRcModified",
+    ),
+    (
+        "persistence_authorized_keys_new_entry",
+        "PersistenceAuthorizedKeysNewEntry",
+    ),
+    ("persistence_crontab_modified", "PersistenceCrontabModified"),
+    (
+        "persistence_launch_agent_added",
+        "PersistenceLaunchAgentAdded",
+    ),
+    (
+        "persistence_ssh_config_include",
+        "PersistenceSshConfigInclude",
+    ),
+    ("persistence_direnv_new_envrc", "PersistenceDirenvNewEnvrc"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1171,6 +1190,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "output",
     "context",
     "hygiene",
+    "persistence",
 ];
 
 #[derive(Deserialize)]

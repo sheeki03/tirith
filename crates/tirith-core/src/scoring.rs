@@ -264,7 +264,16 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::HygieneGitCredentialHelperStore
         | RuleId::HygieneShellHistorySecretLike
         | RuleId::HygieneCloudCredsBadPerms
-        | RuleId::HygieneDbDumpInRepo => false,
+        | RuleId::HygieneDbDumpInRepo
+        // M9 ch2 — persistence-mechanism state-change rules. Filesystem /
+        // crontab snapshot-diff detection from `tirith persistence`; no
+        // threat-DB involvement.
+        | RuleId::PersistenceShellRcModified
+        | RuleId::PersistenceAuthorizedKeysNewEntry
+        | RuleId::PersistenceCrontabModified
+        | RuleId::PersistenceLaunchAgentAdded
+        | RuleId::PersistenceSshConfigInclude
+        | RuleId::PersistenceDirenvNewEnvrc => false,
     }
 }
 

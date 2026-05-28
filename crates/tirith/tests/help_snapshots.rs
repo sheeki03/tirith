@@ -146,6 +146,11 @@ help_example_tests! {
     help_hygiene               => (["hygiene", "--help"], "tirith hygiene scan");
     help_hygiene_scan          => (["hygiene", "scan", "--help"], "tirith hygiene scan --json");
     help_hygiene_fix           => (["hygiene", "fix", "--help"], "tirith hygiene fix --dry-run");
+    // M9 ch2 — `tirith persistence scan|watch|diff`.
+    help_persistence           => (["persistence", "--help"], "tirith persistence scan");
+    help_persistence_scan      => (["persistence", "scan", "--help"], "tirith persistence scan --json");
+    help_persistence_watch     => (["persistence", "watch", "--help"], "tirith persistence watch --interval 30");
+    help_persistence_diff      => (["persistence", "diff", "--help"], "tirith persistence diff --json");
 }
 
 #[test]
