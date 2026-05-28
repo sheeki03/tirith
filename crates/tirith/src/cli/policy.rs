@@ -687,6 +687,7 @@ fn test_command(command: &str, json: bool) -> i32 {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let mut verdict = engine::analyze(&ctx);

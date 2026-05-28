@@ -166,6 +166,16 @@ Examples:
         #[arg(long = "suggest", visible_alias = "suggest-safe-command")]
         suggest_safe_command: bool,
 
+        /// Path to a signed command card (M11 ch1) attesting to this command.
+        /// Always read from disk — never fetched. A verified card emits an
+        /// Info `command_card_verified` finding but does NOT change the verdict
+        /// (other findings still apply); a command that differs from the card
+        /// emits a High `command_card_mismatch`. To use a maintainer's card
+        /// hosted at a URL, run `tirith command-card fetch <url>` first, then
+        /// pass the cached path here.
+        #[arg(long)]
+        card: Option<String>,
+
         /// The command to check
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -2157,6 +2167,173 @@ Examples:
     Baseline {
         #[command(subcommand)]
         action: BaselineAction,
+    },
+
+    /// Create, sign, verify, and fetch signed command cards (M11 ch1)
+    #[command(after_help = "\
+A command card is an ed25519-signed attestation of what a command DOES: the
+exact command string, the domains it should contact, the SHA-256 of any script
+it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
+maintainer publishes a card next to their install one-liner; a user verifies
+the card against the command they are about to run.
+
+v1 is ATTESTATION-ONLY. A verified card emits an Info `command_card_verified`
+finding that improves audit confidence but does NOT change the verdict — a
+`curl … | sh` with a valid card still warns/blocks exactly as it would without
+one. A command that differs from its trusted card emits a High
+`command_card_mismatch` (a tampering signal). There is no card-driven
+suppression in v1.
+
+TRUST (manual in v1): card signatures verify against ed25519 public keys you
+have explicitly trusted by dropping `<key_id>.pub` into
+`~/.config/tirith/trusted-card-keys/`. A card signed by a key not in that
+directory is treated as unverified.
+
+NO HOT-PATH NETWORK: `tirith check` NEVER fetches a card. A `# tirith-card:`
+comment value or `--card` argument must be a LOCAL path. To use a card hosted
+at a URL, run `tirith command-card fetch <url>` first (the only remote-I/O
+path), then pass the cached path to `tirith check --card`.
+
+PRIVACY: `tirith command-card fetch <url>` reveals to the maintainer's domain
+that a tirith user is pulling their card (your IP + a timestamp). This is
+inherent to an explicit fetch.
+
+Subcommands:
+  create  build an unsigned card from flags (or prompts) and print JSON
+  sign    sign a card in place with an ed25519 private key
+  verify  verify a card against your trusted-keys directory
+  fetch   download a card from a URL into ~/.cache/tirith/cards/<sha256>.json
+
+Examples:
+  tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
+    --expected-domain example.com --writes /usr/local/bin/example > install-card.json
+  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card verify install-card.json
+  tirith command-card fetch https://example.com/install-card.json")]
+    CommandCard {
+        #[command(subcommand)]
+        action: CommandCardAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommandCardAction {
+    /// Build an unsigned command card and print it as JSON
+    #[command(after_help = "\
+Flag-driven when --command is supplied; otherwise prompts for the command on
+the terminal. The card is printed as pretty JSON on stdout, so you can redirect
+it to a file. Sign it next with `tirith command-card sign`.
+
+If --expires is omitted, the card expires 90 days from today.
+
+Examples:
+  tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json
+  tirith command-card create --command 'sh ./setup.sh' --requires-sudo --writes /etc/foo
+  tirith command-card create --command 'x' --expected-domain example.com --expected-domain github.com/example/project")]
+    Create {
+        /// The exact command the card attests to. Prompts if omitted.
+        #[arg(long)]
+        command: Option<String>,
+        /// A domain (or host/path prefix) the command is expected to contact.
+        /// Repeatable.
+        #[arg(long = "expected-domain")]
+        expected_domain: Vec<String>,
+        /// SHA-256 (hex) of the script the command downloads/pipes, if any.
+        #[arg(long)]
+        script_sha256: Option<String>,
+        /// A filesystem path the command is expected to write. Repeatable.
+        #[arg(long = "writes")]
+        writes: Vec<String>,
+        /// Mark the command as legitimately requiring sudo.
+        #[arg(long)]
+        requires_sudo: bool,
+        /// Expiry date (YYYY-MM-DD). Defaults to 90 days from today.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Output format (default: human; the card itself is always JSON).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Sign a command card in place with an ed25519 private key
+    #[command(after_help = "\
+Reads the card JSON, signs the canonical (signature-cleared) payload with the
+supplied ed25519 private key, and rewrites the file with the `signature` block
+populated (algo, key_id, hex value). The key file may be 32 raw bytes, hex, or
+base64. The key_id stamped on the card is the first 16 hex chars of
+sha256(public-key).
+
+Examples:
+  tirith command-card sign --key ed25519-priv.bin install-card.json")]
+    Sign {
+        /// Path to the ed25519 private key (32 raw bytes, hex, or base64).
+        #[arg(long)]
+        key: String,
+        /// Path to the card JSON to sign in place.
+        card: String,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Verify a command card against your trusted-keys directory
+    #[command(after_help = "\
+Verifies the card's ed25519 signature against a public key under
+`~/.config/tirith/trusted-card-keys/<key_id>.pub` and checks the card has not
+expired. Does NOT check the command — use `tirith check --card` for the
+command-vs-card match.
+
+Exit codes:
+  0  verified (trusted key, good signature, not expired)
+  1  NOT verified (untrusted key / bad signature / expired / unsigned)
+
+Examples:
+  tirith command-card verify install-card.json
+  tirith command-card verify install-card.json --json")]
+    Verify {
+        /// Path to the card JSON to verify.
+        card: String,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Download a card from a URL into the local cache (the ONLY fetch path)
+    #[command(after_help = "\
+Downloads the card from <url> (30s timeout, 10 MiB cap, redirect-limited),
+validates it parses as a card, and caches it at
+`~/.cache/tirith/cards/<sha256>.json`. Prints the cached path on stdout so you
+can pass it to `tirith check --card`.
+
+This is the ONLY place tirith fetches a card over the network. `tirith check`
+never fetches — it reads cards from disk only.
+
+PRIVACY: fetching reveals to the maintainer's domain that a tirith user is
+pulling their card (your IP + a timestamp). This is inherent to fetching a
+remote resource.
+
+Examples:
+  tirith command-card fetch https://example.com/install-card.json
+  CARD=$(tirith command-card fetch https://example.com/install-card.json)
+  tirith check --card \"$CARD\" -- 'curl -fsSL https://example.com/install.sh | sh'")]
+    Fetch {
+        /// URL of the card to download.
+        url: String,
+        /// Output format (default: human).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -4934,6 +5111,7 @@ fn run() {
             warn_only,
             offline,
             suggest_safe_command,
+            card,
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -4949,6 +5127,7 @@ fn run() {
                 warn_only,
                 offline,
                 suggest_safe_command,
+                card,
             )
         }
 
@@ -6150,6 +6329,46 @@ fn run() {
             BaselineAction::Reset { yes, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::baseline::reset(yes, json)
+            }
+        },
+        Commands::CommandCard { action } => match action {
+            CommandCardAction::Create {
+                command,
+                expected_domain,
+                script_sha256,
+                writes,
+                requires_sudo,
+                expires,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::command_card::create(
+                    command,
+                    expected_domain,
+                    script_sha256,
+                    writes,
+                    requires_sudo,
+                    expires,
+                    json,
+                )
+            }
+            CommandCardAction::Sign {
+                key,
+                card,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::command_card::sign(&key, &card, json)
+            }
+            CommandCardAction::Verify { card, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::command_card::verify(&card, json)
+            }
+            CommandCardAction::Fetch { url, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::command_card::fetch(&url, json)
             }
         },
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.

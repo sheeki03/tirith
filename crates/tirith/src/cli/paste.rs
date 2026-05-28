@@ -74,6 +74,7 @@ pub fn run(
         repo_root: None,
         is_config_override: false,
         clipboard_html,
+        card_ref: None,
     };
 
     // PR #121 fix-list item 18 (mirrors `install.rs:760` / `check.rs`):

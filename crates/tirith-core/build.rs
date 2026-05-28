@@ -795,6 +795,25 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
                 The precise multi-word regex lives in `rules::prompt_injection`.",
     },
+    PatternEntry {
+        id: "command_card_shell_comment",
+        // M11 ch1 — the shell-comment card-reference channel. A command of the
+        // shape `# tirith-card: ./install-card.json\ncurl … | sh` carries a
+        // leading comment that points at a LOCAL card file. The marker is the
+        // tier-1 admission ticket so the engine forces past the fast-exit and
+        // the card check runs; `command_card::find_card_comment` does the
+        // precise parse + local-path-vs-URL classification at tier-3. The
+        // `--card <path>` sidecar flag is a SEPARATE channel that forces past
+        // tier-1 via `ctx.card_ref` (see `engine::analyze`), not this pattern.
+        //
+        // No HTML-comment pattern in v1 — the only comment channel is the
+        // shell `#` comment. A URL-shaped value after the marker is NOT
+        // fetched on the hot path (it emits a "fetch first" warning).
+        tier1_exec_fragments: &[r"#\s*tirith-card:"],
+        tier1_paste_only_fragments: &[],
+        notes: "Command-card shell-comment reference channel (M11 ch1) — \
+                `# tirith-card: <local-path>` preceding a command.",
+    },
 ];
 
 fn generate_tier1_regex(out_dir: &str) {
@@ -1269,6 +1288,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "AnomalyFirstTimeInThisRepo",
     ),
     ("anomaly_rare_in_baseline", "AnomalyRareInBaseline"),
+    // Command-card rules (M11 ch1).
+    ("command_card_verified", "CommandCardVerified"),
+    ("command_card_mismatch", "CommandCardMismatch"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1301,6 +1323,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "blast",
     "taint",
     "anomaly",
+    "command_card",
 ];
 
 #[derive(Deserialize)]

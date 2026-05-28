@@ -34,6 +34,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     engine::analyze(&ctx)
 }

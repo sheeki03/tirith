@@ -225,6 +225,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let mut verdict = engine::analyze(&ctx);

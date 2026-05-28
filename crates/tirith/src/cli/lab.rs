@@ -258,6 +258,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
 
         // Interactive prelude — show description, prompt before revealing

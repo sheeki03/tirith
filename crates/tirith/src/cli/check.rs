@@ -20,6 +20,7 @@ pub fn run(
     warn_only: bool,
     offline: bool,
     suggest_safe_command: bool,
+    card: Option<String>,
 ) -> i32 {
     if cmd.trim().is_empty() {
         if approval_check {
@@ -83,11 +84,16 @@ pub fn run(
     // enforce under bypass — to be addressed separately).
     let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
 
+    // M11 ch1 — a `--card <path>` sidecar must be honored by the LOCAL engine
+    // (the daemon protocol carries no card field in v1), so a card forces the
+    // local analysis path just like `--no-daemon`.
+    let use_daemon = !approval_check && !no_daemon && card.is_none();
+
     // Daemon delegation skipped for --approval-check (needs local policy +
-    // approval file writes) and --no-daemon. Local paths return the policy from
-    // the engine to avoid a redundant Policy::discover() call; daemon path
-    // returns None because analysis happened server-side.
-    let (mut raw_verdict, engine_policy) = if !approval_check && !no_daemon {
+    // approval file writes), --no-daemon, and --card. Local paths return the
+    // policy from the engine to avoid a redundant Policy::discover() call;
+    // daemon path returns None because analysis happened server-side.
+    let (mut raw_verdict, engine_policy) = if use_daemon {
         if let Some(resp) =
             crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
         {
@@ -135,6 +141,7 @@ pub fn run(
                     repo_root: None,
                     is_config_override: false,
                     clipboard_html: None,
+                    card_ref: card.clone(),
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -151,6 +158,7 @@ pub fn run(
                 repo_root: None,
                 is_config_override: false,
                 clipboard_html: None,
+                card_ref: card.clone(),
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -167,6 +175,7 @@ pub fn run(
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: card.clone(),
         };
         let (v, p) = engine::analyze_returning_policy(&ctx);
         (v, Some(p))

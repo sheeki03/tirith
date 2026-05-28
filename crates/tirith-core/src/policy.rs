@@ -2410,6 +2410,7 @@ mod tests {
                 repo_root: None,
                 is_config_override: false,
                 clipboard_html: None,
+                card_ref: None,
             };
             let v = analyze(&ctx);
             assert!(

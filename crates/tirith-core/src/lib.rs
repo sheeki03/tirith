@@ -9,6 +9,7 @@ pub mod baseline;
 pub mod blast_radius;
 pub mod checkpoint;
 pub mod clipboard;
+pub mod command_card;
 pub mod confusables;
 pub mod context_detect;
 pub mod data;

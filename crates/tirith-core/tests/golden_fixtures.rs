@@ -95,6 +95,7 @@ fn run_fixture(fixture: &Fixture) {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -1052,6 +1053,19 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // against a `tempfile::tempdir()` store.
     "anomaly_first_time_in_this_repo",
     "anomaly_rare_in_baseline",
+    // M11 ch1 — command-card rules fire from `engine::analyze` (Exec) when a
+    // card reference is supplied via the `--card <path>` sidecar flag or a
+    // leading `# tirith-card: <local-path>` shell comment. Verification needs
+    // runtime state a static text fixture cannot reproduce: a signed card file
+    // on disk AND a trusted ed25519 pubkey under
+    // `~/.config/tirith/trusted-card-keys/`. Covered by unit tests in
+    // `crates/tirith-core/src/command_card.rs` (sign/verify/evaluate against a
+    // `tempfile::tempdir()` trusted-keys dir) plus the `command_card_*` CLI
+    // integration tests in `crates/tirith/tests/cli_integration.rs` (full
+    // create -> sign -> trust -> check round trip, the mismatch case, and the
+    // no-hot-path-network URL-comment case).
+    "command_card_verified",
+    "command_card_mismatch",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1669,6 +1683,7 @@ fn test_tier1_does_not_gate_findings() {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1715,6 +1730,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -1867,6 +1883,7 @@ fn test_lab_corpus_reaches_tier3() {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1987,6 +2004,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2060,6 +2078,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2135,6 +2154,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2189,6 +2209,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2245,6 +2266,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2312,6 +2334,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2376,6 +2399,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2454,6 +2478,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
         engine::analyze(&ctx)
     };

@@ -359,6 +359,7 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;

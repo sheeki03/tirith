@@ -138,6 +138,7 @@ pub mod check;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod codespaces;
+pub mod command_card;
 pub mod completions;
 pub mod context;
 pub mod daemon;

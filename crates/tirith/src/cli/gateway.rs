@@ -679,6 +679,7 @@ fn handle_guarded_call(
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
         let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });
@@ -932,6 +933,7 @@ fn handle_guarded_notification(
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
         let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });

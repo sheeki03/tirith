@@ -209,6 +209,7 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
@@ -282,6 +283,7 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     // PR #120 fix-8 (CodeRabbit Major): use the same engine API as
@@ -383,6 +385,7 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     // PR #120 fix-8 (CodeRabbit Major): single Policy snapshot for

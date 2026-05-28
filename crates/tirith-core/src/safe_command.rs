@@ -893,6 +893,7 @@ fn build_sudo_narrow_suggestion(
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let inner_verdict = engine::analyze(&ctx);
     if inner_verdict.action != Action::Allow {

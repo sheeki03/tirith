@@ -426,6 +426,7 @@ pub fn command_signals(command: &str, shell: ShellType) -> Vec<CommandSignal> {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 

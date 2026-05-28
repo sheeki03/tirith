@@ -830,6 +830,33 @@ pub enum RuleId {
     /// the baseline window. Info severity. Only emitted when
     /// `policy.baseline_enabled` is on.
     AnomalyRareInBaseline,
+
+    // Command-card rules (M11 ch1). A command card is an ed25519-signed
+    // attestation of what a command does (`crate::command_card`). These fire
+    // from `engine::analyze` (Exec context) when a card reference is supplied
+    // via the `--card <path>` sidecar flag or a leading
+    // `# tirith-card: <local-path>` shell comment. The card is ALWAYS read
+    // from disk — no remote URL is fetched on the hot path (a URL-shaped
+    // `# tirith-card:` value emits a "fetch first" warning, never a fetch).
+    // v1 is attestation-only: a verified card does NOT suppress or change any
+    // other finding's action/severity (no `expected_suppressed_rules`, no
+    // suppression allowlist — that is a deferred v2 candidate). Because
+    // verification needs runtime state (a signed card file + a trusted pubkey
+    // under `~/.config/tirith/trusted-card-keys/`), these live in
+    // `EXTERNALLY_TRIGGERED_RULES` and are covered by unit tests in
+    // `command_card.rs` plus a CLI integration test, rather than static
+    // golden fixtures.
+    /// M11 ch1 — a trusted, unexpired command card signed the EXACT command
+    /// being run. Info severity — improves audit confidence but does NOT
+    /// change the verdict (other findings still apply unchanged). A card
+    /// supplied but not verifiable (untrusted key / bad signature / expired)
+    /// also surfaces under this rule as an Info "card present but not
+    /// verified" note; an entirely card-less command emits nothing.
+    CommandCardVerified,
+    /// M11 ch1 — a trusted command card was found, but the command being run
+    /// differs from the command the card attests to (tampering after the card
+    /// was published). High severity.
+    CommandCardMismatch,
 }
 
 impl fmt::Display for RuleId {

@@ -23,6 +23,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
 
     let verdict = engine::analyze(&ctx);

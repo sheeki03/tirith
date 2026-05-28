@@ -35,6 +35,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     engine::analyze(&ctx)
 }
@@ -562,6 +563,7 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
         repo_root: Some(repo.path().to_str().unwrap().to_string()),
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     engine::analyze(&ctx)
 }

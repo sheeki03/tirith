@@ -193,6 +193,12 @@ help_example_tests! {
     help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
     // M10 ch6 — `tirith temp-run` file-isolation workflow (D1, NOT a sandbox).
     help_temp_run              => (["temp-run", "--help"], "tirith temp-run -- ./script.sh");
+    // M11 ch1 — signed command cards.
+    help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card_create   => (["command-card", "create", "--help"], "tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json");
+    help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
+    help_command_card_fetch    => (["command-card", "fetch", "--help"], "tirith command-card fetch https://example.com/install-card.json");
 }
 
 /// The dominant requirement for `temp-run` is honesty-of-claim: the help text

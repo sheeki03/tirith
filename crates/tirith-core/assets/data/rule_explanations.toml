@@ -2510,3 +2510,29 @@ examples_good = ["a pattern you run several times a week (count 3 or more — no
 false_positive_guidance = "A rare pattern is not a malicious pattern — it is simply uncommon for you. As with the first-time rule, the signal is only meaningful once the baseline has filled in (`tirith doctor` reports 'early-baseline mode' until about 30 observations). Info severity; never blocks."
 remediation = "Informational. Review the underlying finding if the pattern is unexpected. No action is required if it is a routine-but-infrequent command."
 mitre_id = "T1078"
+
+# ── Command-card rules (M11 ch1) ────────────────────────────────────────
+
+[[rule]]
+id = "command_card_verified"
+title = "Command verified against a signed command card"
+category = "command_card"
+severity_rationale = "Info — a command card is an ed25519-signed attestation of what a command does (the command string, expected domains, script SHA-256, writes, sudo, expiry). When a trusted, unexpired card signs the EXACT command being run, tirith records this as improved audit confidence. It is deliberately Info and attestation-only in v1: a verified card does NOT suppress or downgrade any other finding — a `curl … | sh` with a valid card still warns/blocks exactly as it would without one. Card-driven suppression is a deferred v2 candidate."
+description = "Fired by the exec hot path when a card reference is supplied via the `--card <path>` sidecar flag or a leading `# tirith-card: <local-path>` shell comment, the referenced card is read FROM DISK (no remote URL is ever fetched during `tirith check`), its signature verifies against a public key the operator has trusted under `~/.config/tirith/trusted-card-keys/<key_id>.pub`, the card has not expired, and the card's `command` field equals the command being analyzed. A card supplied but not verifiable (untrusted key, bad signature, or expired) also surfaces under this rule as an Info 'card present but not verified' note rather than a trust claim; an entirely card-less command emits nothing on this axis."
+examples_bad = []
+examples_good = ["`tirith check --card ./install-card.json -- \"curl -fsSL https://example.com/install.sh | sh\"` where install-card.json is signed by a trusted key and attests to that exact command"]
+false_positive_guidance = "This is a positive signal, not a warning. If you see the 'card present but not verified' variant, the card could not be trusted — the most common causes are that the signing key is not in `~/.config/tirith/trusted-card-keys/`, the card has expired, or the card JSON was modified after signing. Add the maintainer's public key to the trusted directory (after verifying it out-of-band) to upgrade to a verified result."
+remediation = "No action required for a verified card. To trust a maintainer's cards, obtain their ed25519 public key through a trusted channel and drop it at `~/.config/tirith/trusted-card-keys/<key_id>.pub`. Remember that verification does NOT vouch for the command's safety — review the command's other findings regardless."
+mitre_id = ""
+
+[[rule]]
+id = "command_card_mismatch"
+title = "Command does not match its signed command card"
+category = "command_card"
+severity_rationale = "High — a trusted command card was found (its signature verifies against a trusted key and it has not expired), but the command being run differs from the command the card attests to. This is the signature of tampering: an attacker who swapped the install one-liner while leaving the legitimate maintainer's card in place. Treated as High so the verdict blocks by default."
+description = "Fired by the exec hot path when the card supplied via `--card <path>` or `# tirith-card: <local-path>` verifies against a trusted, unexpired key BUT its `command` field does not equal (after trimming surrounding whitespace) the command being analyzed. The card is always read from disk; no remote fetch occurs on the hot path."
+examples_bad = ["a README that ships `# tirith-card: ./card.json` plus `curl https://example.com/install.sh | sh`, where an attacker rewrote the curl line to point at a different host but left the maintainer's signed card untouched"]
+examples_good = ["running the exact command the card attests to (fires `command_card_verified` instead)"]
+false_positive_guidance = "A mismatch can be benign if you intentionally edited the command (added a flag, changed a path) after the card was published — the card simply no longer describes what you are running. Re-fetch or re-issue the card for the new command, or drop the `--card`/comment reference if you do not need attestation. But treat an UNEXPECTED mismatch as a tampering signal and inspect the command closely before running it."
+remediation = "Compare the command you are about to run against the card's `command` field (`tirith command-card verify ./card.json` prints it). If you changed the command deliberately, obtain an updated card from the maintainer. If you did not, do NOT run the command — the install instructions may have been tampered with."
+mitre_id = "T1565"

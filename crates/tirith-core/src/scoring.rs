@@ -326,7 +326,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // M10 ch5 — anomaly-detection rules. Sliding-window novelty signal from
         // the local baseline store; no threat-DB involvement.
         | RuleId::AnomalyFirstTimeInThisRepo
-        | RuleId::AnomalyRareInBaseline => false,
+        | RuleId::AnomalyRareInBaseline
+        // M11 ch1 — command-card attestation. Local ed25519 signature check
+        // against operator-trusted keys; no threat-DB involvement.
+        | RuleId::CommandCardVerified
+        | RuleId::CommandCardMismatch => false,
     }
 }
 

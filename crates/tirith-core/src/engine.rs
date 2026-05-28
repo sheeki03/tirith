@@ -37,6 +37,11 @@ pub struct AnalysisContext {
     /// Clipboard HTML content for rich-text paste analysis.
     /// Only populated when `tirith paste --html <path>` is used.
     pub clipboard_html: Option<String>,
+    /// M11 ch1 — path to a command-card sidecar file supplied via
+    /// `tirith check --card <path>`. Always read from disk; never fetched.
+    /// `None` when no `--card` flag was passed. A `# tirith-card:` shell
+    /// comment in `input` is a SEPARATE channel discovered during analysis.
+    pub card_ref: Option<String>,
 }
 
 /// Check if a VAR=VALUE word is `TIRITH=0`, stripping optional surrounding quotes
@@ -778,6 +783,125 @@ const TAINT_INTERPRETER_LEADERS: &[&str] = &[
 /// shell. A tainted sourced file fires `CommandSourcedFromTaintedFile`.
 const TAINT_SOURCE_LEADERS: &[&str] = &["source", "."];
 
+/// M11 ch1 — the command-card hot check. Resolves a card reference from the
+/// `--card <path>` sidecar flag (`ctx.card_ref`) OR a leading
+/// `# tirith-card: <local-path>` shell comment, reads the card FROM DISK, and
+/// evaluates it against the analyzed command. Returns the attestation
+/// finding(s):
+///
+/// * trusted + unexpired + command matches → Info `CommandCardVerified`
+/// * trusted + unexpired + command differs → High `CommandCardMismatch`
+/// * untrusted key / bad sig / expired     → at most one Info note (NOT a
+///   trust claim); unsigned / absent       → nothing
+///
+/// V1 invariant: NO remote URL is fetched here. A URL-shaped `# tirith-card:`
+/// value yields a "remote URLs require `tirith command-card fetch` first" Info
+/// warning and is NOT loaded. The sidecar flag is always a disk path. None of
+/// these findings change any OTHER finding's action — they are appended to the
+/// same list `action_from_findings` later folds.
+fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+    use crate::command_card::{self, CardRef};
+
+    // Sidecar `--card` flag wins; otherwise look for a `# tirith-card:` comment.
+    let card_ref = match ctx.card_ref.as_deref() {
+        Some(p) if !p.is_empty() => CardRef::LocalPath(p.to_string()),
+        _ => match command_card::find_card_comment(&ctx.input) {
+            Some(r) => r,
+            None => return Vec::new(),
+        },
+    };
+
+    let path = match card_ref {
+        CardRef::LocalPath(p) => p,
+        CardRef::RemoteUrl(url) => {
+            // V1: never fetch on the hot path. Surface a fetch-first note.
+            return vec![Finding {
+                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                severity: crate::verdict::Severity::Info,
+                title: "Command card reference is a remote URL".to_string(),
+                description: format!(
+                    "The command-card reference '{url}' is a remote URL. tirith does not \
+                     fetch cards during `tirith check`; remote URLs require \
+                     `tirith command-card fetch` first, then pass the cached path via \
+                     `--card`."
+                ),
+                evidence: vec![crate::verdict::Evidence::Text {
+                    detail: "remote URLs require `tirith command-card fetch` first".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }];
+        }
+    };
+
+    // Resolve a relative card path against cwd so `# tirith-card: ./card.json`
+    // works from the directory the command runs in.
+    let card_path = {
+        let p = std::path::PathBuf::from(&path);
+        if p.is_absolute() {
+            p
+        } else if let Some(cwd) = ctx.cwd.as_deref() {
+            std::path::Path::new(cwd).join(&p)
+        } else {
+            p
+        }
+    };
+
+    let bytes = match std::fs::read(&card_path) {
+        Ok(b) => b,
+        Err(_) => {
+            return vec![Finding {
+                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                severity: crate::verdict::Severity::Info,
+                title: "Command card could not be read".to_string(),
+                description: format!(
+                    "The referenced command card '{}' could not be read from disk. \
+                     Treating the command as if no card were present.",
+                    card_path.display()
+                ),
+                evidence: vec![crate::verdict::Evidence::Text {
+                    detail: "card file not found".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }];
+        }
+    };
+
+    let card = match command_card::Card::from_json(&bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return vec![Finding {
+                rule_id: crate::verdict::RuleId::CommandCardVerified,
+                severity: crate::verdict::Severity::Info,
+                title: "Command card is malformed".to_string(),
+                description: "The referenced command card is not valid JSON. Treating the \
+                              command as if no card were present."
+                    .to_string(),
+                evidence: vec![crate::verdict::Evidence::Text {
+                    detail: "card JSON parse error".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }];
+        }
+    };
+
+    let trusted_dir = match command_card::trusted_card_keys_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let today = chrono::Utc::now().date_naive();
+    let outcome = command_card::evaluate_card(&card, &ctx.input, &trusted_dir, today);
+    command_card::findings_for_outcome(&outcome)
+}
+
 /// Does `leader` look like a path (so the leader ITSELF is the executed file,
 /// e.g. `./install.sh`, `/tmp/x.sh`, `bin/run`)? A bare command name resolved
 /// via `$PATH` (`bash`, `git`) is NOT a path. We treat anything containing a
@@ -1406,6 +1530,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // / file scan never pay even the stat. Mirrors `exec_guard_triggered`.
     let taint_triggered = ctx.scan_context == ScanContext::Exec && crate::taint::store_nonempty();
 
+    // M11 ch1 — a `--card <path>` sidecar flag is not a regex/byte signal, so a
+    // clean-looking command (`curl … | sh` already trips tier-1, but a bare
+    // `./install.sh --card …` may not) would fast-exit before the card check
+    // ran. Force past the fast-exit when a sidecar card was supplied. The
+    // `# tirith-card:` COMMENT channel rides the `command_card_shell_comment`
+    // PATTERN_TABLE entry via `regex_triggered`, so it needs no force-past here.
+    // Gated to Exec — paste / file scan never carry a card reference.
+    let card_triggered = ctx.scan_context == ScanContext::Exec
+        && ctx.card_ref.as_deref().is_some_and(|p| !p.is_empty());
+
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
     if !byte_scan_triggered
@@ -1414,6 +1548,7 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         && !exec_guard_triggered
         && !hooks_guard_triggered
         && !taint_triggered
+        && !card_triggered
     {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
@@ -1832,6 +1967,19 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // CommandSourcedFromTaintedFile (Medium). The store is path-keyed
             // and cached per-process (5s TTL) — see `crate::taint`.
             findings.extend(check_taint_hot(ctx));
+
+            // M11 ch1 - command-card attestation. ATTESTATION-ONLY in v1: a
+            // verified card emits an Info CommandCardVerified and does NOT
+            // suppress or change any other finding's action; a mismatch emits a
+            // High CommandCardMismatch. The card is read FROM DISK only - a
+            // `--card <path>` sidecar (`ctx.card_ref`) or a leading
+            // `# tirith-card: <local-path>` shell comment. A URL-shaped comment
+            // value is NEVER fetched on the hot path (it surfaces a "fetch
+            // first" Info note). Appending these findings to the same list the
+            // action is later derived from keeps the verified case from altering
+            // any other finding - action_from_findings simply sees an extra Info
+            // entry.
+            findings.extend(check_command_card_hot(ctx));
         }
 
         let cred_findings =
@@ -2127,6 +2275,7 @@ mod tests {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -2566,6 +2715,7 @@ mod tests {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         }
     }
 
@@ -2583,6 +2733,7 @@ mod tests {
             repo_root: None,
             is_config_override: false,
             clipboard_html: None,
+            card_ref: None,
         }
     }
 

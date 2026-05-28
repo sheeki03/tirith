@@ -1104,6 +1104,7 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, P
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): return the policy
     // discovered by the engine so the caller's subsequent

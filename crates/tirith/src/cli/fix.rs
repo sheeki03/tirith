@@ -118,6 +118,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         repo_root: None,
         is_config_override: false,
         clipboard_html: None,
+        card_ref: None,
     };
     let verdict = engine::analyze(&ctx);
 

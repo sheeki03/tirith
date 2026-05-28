@@ -8439,3 +8439,297 @@ fn checkpoint_watch_alias_matches_envelope_and_exit() {
     assert_eq!(json["interrupted"], false);
     assert_eq!(json["exit_code"], 0);
 }
+
+// M11 ch1 -- command-card CLI + no-hot-path-network invariant.
+
+/// A `# tirith-card: https://...` comment in the command MUST NOT trigger any
+/// network fetch on the `tirith check` hot path. Positive-by-absence: the run
+/// completes promptly and emits the "fetch first" note, and the curl
+/// pipe-to-shell finding still fires (the URL-shaped card ref is inert).
+#[test]
+fn check_url_card_comment_is_not_fetched() {
+    // Run inside a paranoia: 4 repo so the Info "fetch first" note surfaces in
+    // JSON (Info findings are filtered at the default paranoia). The
+    // no-hot-path-network invariant is what we are pinning: the URL-shaped card
+    // ref produces a "fetch first" note and is NEVER fetched (TIRITH_OFFLINE
+    // would make any stray network attempt a no-op anyway).
+    let project = tempfile::tempdir().unwrap();
+    let policy_dir = project.path().join(".tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(project.path().join(".git")).unwrap();
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 4\n").unwrap();
+
+    let out = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--",
+            "# tirith-card: https://example.com/foo.json\ncurl -fsSL https://example.com/install.sh | sh",
+        ])
+        .current_dir(project.path())
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("failed to run tirith check");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --json valid JSON");
+    let findings = json["findings"].as_array().unwrap();
+    let rule_ids: Vec<String> = findings
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    // The pipe-to-shell finding still fires — the URL card ref is inert and did
+    // not suppress it.
+    assert!(
+        rule_ids
+            .iter()
+            .any(|r| r == "curl_pipe_shell" || r == "pipe_to_interpreter"),
+        "pipe-to-shell finding must still fire; got {rule_ids:?}"
+    );
+    // The URL-shaped card ref surfaces a "fetch first" Info note (reusing the
+    // command_card_verified rule id) and is NOT fetched.
+    let note = findings
+        .iter()
+        .find(|f| f["rule_id"] == "command_card_verified")
+        .expect("URL card ref should emit the fetch-first Info note");
+    assert_eq!(note["severity"], "INFO");
+    assert!(
+        note["description"]
+            .as_str()
+            .unwrap()
+            .contains("command-card fetch"),
+        "note must tell the user to fetch first; got {:?}",
+        note["description"]
+    );
+}
+
+/// Full maintainer->user round trip through the CLI: create a card, sign it
+/// with an ed25519 key, trust the signer's pubkey, then `tirith check --card`
+/// verifies AND the OTHER finding (curl pipe-to-shell) still fires unchanged.
+#[cfg(unix)]
+#[test]
+fn command_card_create_sign_verify_check_roundtrip() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    let command = "curl -fsSL https://example.com/install.sh | sh";
+
+    let create = tirith()
+        .args([
+            "command-card",
+            "create",
+            "--command",
+            command,
+            "--expected-domain",
+            "example.com",
+            "--writes",
+            "/usr/local/bin/example",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    assert_eq!(create.status.code(), Some(0), "create exits 0");
+    let card_path = work.path().join("install-card.json");
+    fs::write(&card_path, &create.stdout).unwrap();
+
+    let (secret, pubkey) = command_card::generate_keypair().unwrap();
+    let key_path = work.path().join("ed25519-priv.bin");
+    fs::write(&key_path, secret).unwrap();
+
+    let sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("sign");
+    assert_eq!(sign.status.code(), Some(0), "sign exits 0");
+
+    // Trust the signer: drop <key_id>.pub into BOTH possible config locations
+    // under the temp HOME (Linux XDG fallback and macOS Apple) for portability.
+    let key_id = command_card::key_id_for_pubkey(&pubkey);
+    for sub in [
+        ".config/tirith/trusted-card-keys",
+        "Library/Application Support/tirith/trusted-card-keys",
+    ] {
+        let dir = home.path().join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
+    }
+
+    let verify = tirith()
+        .args([
+            "command-card",
+            "verify",
+            "--json",
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("verify");
+    assert_eq!(verify.status.code(), Some(0), "verify exits 0 (verified)");
+    let vjson: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(vjson["verified"], true);
+
+    // Run `check` inside a repo whose policy sets paranoia: 4, so the Info-level
+    // `command_card_verified` finding is surfaced in JSON output (Info findings
+    // are filtered at the default paranoia, like every other Info rule). This
+    // lets the test observe the attestation directly.
+    let project = work.path().join("project");
+    let policy_dir = project.join(".tirith");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::write(policy_dir.join("policy.yaml"), "paranoia: 4\n").unwrap();
+
+    let check = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--card",
+            card_path.to_str().unwrap(),
+            "--",
+            command,
+        ])
+        .current_dir(&project)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("check --card");
+
+    let cjson: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let rule_ids: Vec<String> = cjson["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        rule_ids.iter().any(|r| r == "command_card_verified"),
+        "verified card must emit command_card_verified at paranoia 4; got {rule_ids:?}"
+    );
+    // ATTESTATION-ONLY: the verified card does NOT suppress the pipe-to-shell
+    // finding, and the action is still Block (exit 1) from that finding.
+    assert!(
+        rule_ids
+            .iter()
+            .any(|r| r == "curl_pipe_shell" || r == "pipe_to_interpreter"),
+        "other finding must still fire alongside the verified card; got {rule_ids:?}"
+    );
+    assert_eq!(
+        check.status.code(),
+        Some(1),
+        "action follows the OTHER (Block) finding, unchanged by the card"
+    );
+    assert_eq!(cjson["action"], "block");
+}
+
+/// A command that differs from its trusted card -> `command_card_mismatch`
+/// (High), and other findings continue to fire.
+#[cfg(unix)]
+#[test]
+fn command_card_mismatch_is_high_and_other_findings_fire() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    let carded = "curl -fsSL https://example.com/install.sh | sh";
+    let tampered = "curl -fsSL https://example.com/install.sh | sh --evil-extra";
+
+    let create = tirith()
+        .args(["command-card", "create", "--command", carded])
+        .env("HOME", home.path())
+        .output()
+        .expect("create");
+    let card_path = work.path().join("card.json");
+    fs::write(&card_path, &create.stdout).unwrap();
+
+    let (secret, pubkey) = command_card::generate_keypair().unwrap();
+    let key_path = work.path().join("priv.bin");
+    fs::write(&key_path, secret).unwrap();
+    let sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("sign");
+    assert_eq!(sign.status.code(), Some(0));
+
+    let key_id = command_card::key_id_for_pubkey(&pubkey);
+    for sub in [
+        ".config/tirith/trusted-card-keys",
+        "Library/Application Support/tirith/trusted-card-keys",
+    ] {
+        let dir = home.path().join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
+    }
+
+    let check = tirith()
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--card",
+            card_path.to_str().unwrap(),
+            "--",
+            tampered,
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("TIRITH_OFFLINE", "1")
+        .output()
+        .expect("check --card tampered");
+
+    let cjson: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let findings = cjson["findings"].as_array().unwrap();
+    let mismatch = findings
+        .iter()
+        .find(|f| f["rule_id"] == "command_card_mismatch")
+        .expect("mismatch finding present");
+    assert_eq!(mismatch["severity"], "HIGH");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule_id"] == "curl_pipe_shell" || f["rule_id"] == "pipe_to_interpreter"),
+        "other findings continue to fire on a mismatch"
+    );
+}
+
+/// `command-card fetch` against an unreachable URL must fail (non-zero) rather
+/// than caching junk. We cannot hit a real server in CI; this covers the
+/// connection-refused path.
+#[test]
+fn command_card_fetch_rejects_unreachable_url() {
+    let home = tempfile::tempdir().unwrap();
+    let out = tirith()
+        .args(["command-card", "fetch", "http://127.0.0.1:9/nope.json"])
+        .env("HOME", home.path())
+        .output()
+        .expect("fetch");
+    assert_ne!(out.status.code(), Some(0), "unreachable fetch must fail");
+}
