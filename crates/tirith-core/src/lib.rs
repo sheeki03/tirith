@@ -42,6 +42,7 @@ pub mod receipt;
 pub mod redact;
 pub mod registry_api;
 pub mod registry_history;
+pub mod repo_hooks;
 pub mod repo_mismatch;
 pub mod rule_explanations;
 pub mod rule_metadata;

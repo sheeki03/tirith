@@ -168,6 +168,11 @@ help_example_tests! {
     help_path_audit            => (["path", "audit", "--help"], "tirith path audit --json");
     help_path_watch            => (["path", "watch", "--help"], "tirith path watch --interval 30");
     help_path_which            => (["path", "which", "--help"], "tirith path which git --secure");
+    // M9 ch6 — `tirith hooks scan|guard|explain`.
+    help_hooks                 => (["hooks", "--help"], "tirith hooks scan");
+    help_hooks_scan            => (["hooks", "scan", "--help"], "tirith hooks scan --json");
+    help_hooks_guard           => (["hooks", "guard", "--help"], "tirith hooks guard on");
+    help_hooks_explain         => (["hooks", "explain", "--help"], "tirith hooks explain pre-commit");
 }
 
 #[test]

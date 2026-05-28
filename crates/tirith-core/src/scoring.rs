@@ -299,7 +299,14 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PathWritableDirBeforeSystem
         | RuleId::PathDuplicateCommandName
         | RuleId::PathDirInRepo
-        | RuleId::PathDirInTmp => false,
+        | RuleId::PathDirInTmp
+        // M9 ch6 — repo-hook / automation guard rules. Body-content heuristics
+        // from the `tirith hooks` scanner; no threat-DB involvement.
+        | RuleId::RepoHookNetworkCall
+        | RuleId::RepoHookCredentialRead
+        | RuleId::RepoHookSudo
+        | RuleId::RepoHookSuspiciousShellPattern
+        | RuleId::RepoHookExternalFetch => false,
     }
 }
 

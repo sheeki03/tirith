@@ -674,6 +674,41 @@ pub enum RuleId {
     /// severity — a scratch dir on PATH means anything dropped there shadows
     /// real commands. Fires only from `tirith path audit`.
     PathDirInTmp,
+
+    // Repo-hook / automation guard rules (M9 ch6). These fire from the
+    // `crate::repo_hooks` scanner that powers `tirith hooks scan|guard|explain`.
+    // The scanner classifies a hook BODY (a `.git/hooks/*`, `.husky/*`,
+    // `lefthook.yml`, `.pre-commit-config.yaml`, `package.json` lifecycle script,
+    // `.envrc`, `Makefile`/`justfile`/`Taskfile`, `mise`/`asdf` hook) as text —
+    // it never executes the hook. Three of the five (network / credential / sudo)
+    // can also surface on the `engine::analyze` exec hot path when a hot-path
+    // git / package-manager command runs in a repo whose triggered hooks carry
+    // them, gated behind `policy.hooks_guard_enabled` (default false). The
+    // trigger is repo STATE + a hot-path command, not a regex on the user's
+    // input, so they carry no PATTERN_TABLE entry and live in
+    // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in
+    // `crates/tirith-core/src/repo_hooks.rs` against `tempfile::tempdir()` roots.
+    /// M9 ch6 — a hook body makes a network call (`curl` / `wget` / `nc` /
+    /// `ncat` / `netcat` as a command word). High severity — a network call
+    /// inside a hook that fires on `git commit` / `npm install` is a stealthy
+    /// download-execute / exfiltration channel.
+    RepoHookNetworkCall,
+    /// M9 ch6 — a hook body reads a credential file / dir (`~/.aws`, `~/.ssh`,
+    /// `.env`, `~/.npmrc`, `~/.git-credentials`, …). High severity — a hook that
+    /// reads your secrets every commit/install is a credential-theft foothold.
+    RepoHookCredentialRead,
+    /// M9 ch6 — a hook body uses `sudo`. High severity — privilege escalation
+    /// triggered automatically by an everyday git / package-manager command.
+    RepoHookSudo,
+    /// M9 ch6 — a hook body pipes into a shell interpreter (`… | sh`), decodes
+    /// base64 then executes, or uses `eval`. Medium severity — the classic
+    /// obfuscated-payload shape, but heuristic, so it does not block by default.
+    RepoHookSuspiciousShellPattern,
+    /// M9 ch6 — a hook body fetches an external resource: a bare `http(s)://`
+    /// URL, or a remote-package runner (`npx` / `pnpm dlx`). Medium severity —
+    /// reaching out to the network during a hook is worth surfacing even when it
+    /// is not a raw `curl | sh`.
+    RepoHookExternalFetch,
 }
 
 impl fmt::Display for RuleId {

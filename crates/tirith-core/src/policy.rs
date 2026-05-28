@@ -368,6 +368,27 @@ pub struct Policy {
     /// `tirith path guard on|off`.
     #[serde(default)]
     pub exec_guard_enabled: bool,
+
+    /// **M9 ch6 — repo-hook / automation guard hot-path switch.**
+    ///
+    /// When `true`, the exec hot path proactively scans the repo's git /
+    /// husky / lefthook / pre-commit hooks (plus `package.json` lifecycle
+    /// scripts and `.envrc`) whenever the parsed command leader is a
+    /// hook-triggering command (`git commit|pull|checkout|merge|rebase|push`,
+    /// `npm|yarn|pnpm install`, `direnv allow|reload`), surfacing the three
+    /// hot-path-eligible repo-hook rules
+    /// ([`crate::verdict::RuleId::RepoHookNetworkCall`],
+    /// [`RepoHookCredentialRead`](crate::verdict::RuleId::RepoHookCredentialRead),
+    /// [`RepoHookSudo`](crate::verdict::RuleId::RepoHookSudo)) for ONLY the hook
+    /// types that leader actually triggers (e.g. `git commit` → `pre-commit`,
+    /// NOT `pre-push` and NOT the `Makefile`). The scan is per-repo mtime-cached
+    /// for 60s (see [`crate::repo_hooks::HOOK_CACHE_TTL`]).
+    ///
+    /// When `false` (the default), no repo-hook rule fires from the hot path;
+    /// `tirith hooks scan|explain` still work (they call the library directly
+    /// and do not consult this flag). Toggled by `tirith hooks guard on|off`.
+    #[serde(default)]
+    pub hooks_guard_enabled: bool,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration.
@@ -854,6 +875,7 @@ impl Default for Policy {
             env_guard_enabled: false,
             env_guard_sensitive_vars: Vec::new(),
             exec_guard_enabled: false,
+            hooks_guard_enabled: false,
         }
     }
 }

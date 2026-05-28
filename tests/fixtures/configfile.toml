@@ -789,3 +789,56 @@ context = "file"
 file_path = ".zshrc"
 expected_action = "allow"
 expected_rules = []
+
+# M9 ch6 — repo-hook guard rules are EXTERNALLY triggered: they fire ONLY from
+# the `tirith hooks scan|guard|explain` scanner (`crate::repo_hooks`), never
+# from `engine::analyze`. These fixtures document that a hook BODY scanned as a
+# generic file by the engine stays `allow` — the repo-hook rules are surfaced by
+# the dedicated scanner (and, on the hot path, only behind
+# `policy.hooks_guard_enabled` for a hook-triggering git/package command). The
+# positive cases are covered by unit tests in `crates/tirith-core/src/repo_hooks.rs`.
+
+[[fixture]]
+name = "hook_network_call_body_not_engine_rule"
+min_milestone = 9
+input = "#!/bin/sh\ncurl https://example.test/beacon\n"
+context = "file"
+file_path = "pre-commit"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "hook_credential_read_body_not_engine_rule"
+min_milestone = 9
+input = "#!/bin/sh\ncat ~/.aws/credentials\n"
+context = "file"
+file_path = "pre-push"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "hook_suspicious_shell_body_not_engine_rule"
+min_milestone = 9
+input = "#!/bin/sh\nVAR=$(echo aGVsbG8= | base64 --decode)\necho \"$VAR\"\n"
+context = "file"
+file_path = "pre-commit"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "hook_external_fetch_body_not_engine_rule"
+min_milestone = 9
+input = '{"scripts":{"postinstall":"npx some-remote-tool@latest setup"}}'
+context = "file"
+file_path = "package.json"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "hook_benign_body_not_engine_rule"
+min_milestone = 9
+input = "#!/bin/sh\nnpm run lint\n"
+context = "file"
+file_path = "pre-commit"
+expected_action = "allow"
+expected_rules = []

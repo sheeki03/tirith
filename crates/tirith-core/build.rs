@@ -1216,6 +1216,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("path_duplicate_command_name", "PathDuplicateCommandName"),
     ("path_dir_in_repo", "PathDirInRepo"),
     ("path_dir_in_tmp", "PathDirInTmp"),
+    // Repo-hook / automation guard rules (M9 ch6).
+    ("repo_hook_network_call", "RepoHookNetworkCall"),
+    ("repo_hook_credential_read", "RepoHookCredentialRead"),
+    ("repo_hook_sudo", "RepoHookSudo"),
+    (
+        "repo_hook_suspicious_shell_pattern",
+        "RepoHookSuspiciousShellPattern",
+    ),
+    ("repo_hook_external_fetch", "RepoHookExternalFetch"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1244,6 +1253,7 @@ const VALID_CATEGORIES: &[&str] = &[
     "persistence",
     "aliases",
     "exec",
+    "hooks",
 ];
 
 #[derive(Deserialize)]

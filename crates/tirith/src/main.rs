@@ -1773,6 +1773,44 @@ Examples:
         #[command(subcommand)]
         action: PathAction,
     },
+
+    /// Inventory + guard repo hooks — git / husky / lefthook / CI hooks (M9 ch6)
+    #[command(after_help = "\
+Subcommands:
+  tirith hooks scan              — inventory every hook + automation surface in
+        [--json]                   this repo (.git/hooks, .husky, lefthook,
+                                   pre-commit, package.json lifecycle scripts,
+                                   .envrc, mise/asdf, Makefile/justfile/Taskfile)
+                                   and classify each. Exit 1 on a HIGH finding.
+  tirith hooks guard on|off|status  — flip the exec-path hook guard (off by
+        [--json]                       default). When ON, a hook-triggering
+                                       command warns if its triggered hooks make
+                                       a network call / read creds / use sudo.
+  tirith hooks explain <name>    — show a surface's body (credential-REDACTED)
+        [--json]                   + analysis.
+
+Hooks vs automation:
+  Hooks (git/husky/lefthook/pre-commit/package.json/.envrc) are auto-executed on
+  a lifecycle event — the attack surface the guard watches. Automation
+  (Makefile/justfile/Taskfile, mise/asdf) is run by hand and is inventory-only;
+  it is NEVER auto-scanned per git/package-manager command.
+
+What the guard checks (HOT — only when `tirith hooks guard on`):
+  When the parsed leader is git commit|pull|checkout|merge|rebase|push,
+  npm|yarn|pnpm install, or direnv allow|reload, tirith scans ONLY the hook
+  types that leader triggers (git commit → pre-commit, NOT pre-push, NOT the
+  Makefile) and warns on a network call / credential read / sudo. The scan is
+  per-repo mtime-cached for 60s. Hook bodies are read as text, never executed.
+
+Examples:
+  tirith hooks scan
+  tirith hooks scan --json
+  tirith hooks guard on
+  tirith hooks explain pre-commit")]
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2654,6 +2692,88 @@ Examples:
         /// Exit 1 if the resolved binary is not a system binary.
         #[arg(long)]
         secure: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Inventory + classify every hook + automation surface in the repo
+    #[command(after_help = "\
+What it does:
+  Inventories .git/hooks/*, .husky/*, lefthook.yml, .pre-commit-config.yaml,
+  package.json lifecycle scripts (preinstall/install/postinstall/prepare),
+  .envrc, mise/asdf tool hooks, Makefile, justfile, and Taskfile, then
+  classifies each body against five rules (network call / credential read /
+  sudo / suspicious-shell-pattern / external-fetch). Hook bodies are read as
+  TEXT — never executed. Hooks and automation are listed separately.
+
+Exit codes:
+  0  no High/Critical finding.
+  1  at least one High/Critical finding.
+
+Examples:
+  tirith hooks scan
+  tirith hooks scan --json")]
+    Scan {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Flip the exec-path hook guard on/off (or report status)
+    #[command(after_help = "\
+What it does:
+  Sets policy.hooks_guard_enabled in your local policy.yaml (append-or-rewrite a
+  single line — other lines untouched). When ON, the exec hot path WARNS when a
+  hook-triggering command (git commit|pull|checkout|merge|rebase|push,
+  npm|yarn|pnpm install, direnv allow|reload) runs in a repo whose triggered
+  hooks make a network call, read credentials, or use sudo. Default is OFF.
+
+Exit codes:
+  0  on/off succeeded, or status reported.
+  2  unknown action (expected on|off|status).
+
+Examples:
+  tirith hooks guard on
+  tirith hooks guard off
+  tirith hooks guard status --json")]
+    Guard {
+        /// on | off | status
+        action: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show a single surface's body (credential-redacted) + analysis
+    #[command(after_help = "\
+What it shows:
+  Every surface matching <name> (a name like pre-commit can exist under
+  .git/hooks, .husky, AND lefthook.yml), its body (credential-REDACTED), and any
+  risk findings.
+
+Exit codes:
+  0  the name was found.
+  2  no hook or automation surface with that name was found.
+
+Examples:
+  tirith hooks explain pre-commit
+  tirith hooks explain postinstall --json")]
+    Explain {
+        /// The hook / surface name to explain.
+        name: String,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5396,6 +5516,24 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::path::which(&cmd, secure, json)
+            }
+        },
+        Commands::Hooks { action } => match action {
+            HooksAction::Scan { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::hooks::scan(json)
+            }
+            HooksAction::Guard {
+                action,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::hooks::guard(&action, json)
+            }
+            HooksAction::Explain { name, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::hooks::explain(&name, json)
             }
         },
     };

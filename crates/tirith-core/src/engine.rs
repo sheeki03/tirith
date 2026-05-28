@@ -662,6 +662,109 @@ fn check_exec_provenance_hot(ctx: &AnalysisContext) -> Vec<Finding> {
     crate::path_audit::leader_findings(&locations, &resolved.path.display().to_string())
 }
 
+/// M9 ch6 — cheap predicate for the tier-1 force-past decision: does this
+/// command's leader + first subcommand match a hook-triggering shape
+/// (`git commit`, `npm install`, `direnv allow`, …)? Tokenizes the first
+/// segment only and defers the actual recognition to
+/// [`crate::repo_hooks::is_hook_triggering_leader`]. Keeps an arbitrary command
+/// under a hooks-guard-on repo fast-exiting at tier-1.
+fn leader_is_hook_triggering(ctx: &AnalysisContext) -> bool {
+    use crate::tokenize;
+    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let Some(first) = segs.first() else {
+        return false;
+    };
+    let Some(leader) = first.command.as_deref() else {
+        return false;
+    };
+    let leader = leader.trim_matches(|c: char| c == '"' || c == '\'');
+    let subcommand = first
+        .args
+        .iter()
+        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
+        .find(|a| !a.is_empty() && !a.starts_with('-'));
+    crate::repo_hooks::is_hook_triggering_leader(leader, subcommand)
+}
+
+/// M9 ch6 — the repo-hook guard HOT subset. When the parsed command leader is a
+/// hook-triggering command, scan ONLY the hook types that leader triggers and
+/// return the network / credential / sudo findings, surfaced at WARN (Medium)
+/// on the hot path. Caller gates this behind `policy.hooks_guard_enabled` and
+/// `ScanContext::Exec`.
+///
+/// The leader + first subcommand are taken from the FIRST tokenized segment
+/// (`git commit …`, `npm install …`, `direnv allow`). A non-hook-triggering
+/// leader (or no repo root) yields no findings. The per-leader hook-type
+/// targeting + the 60s mtime cache live in `repo_hooks::scan_triggered_by_leader`.
+fn check_repo_hooks_hot(ctx: &AnalysisContext) -> Vec<Finding> {
+    use crate::tokenize;
+
+    let segs = tokenize::tokenize(&ctx.input, ctx.shell);
+    let Some(first) = segs.first() else {
+        return Vec::new();
+    };
+    let Some(leader) = first.command.as_deref() else {
+        return Vec::new();
+    };
+    let leader = leader.trim_matches(|c: char| c == '"' || c == '\'');
+    if leader.is_empty() {
+        return Vec::new();
+    }
+    // The first non-flag argument is the subcommand (`commit`, `install`, …).
+    let subcommand = first
+        .args
+        .iter()
+        .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))
+        .find(|a| !a.is_empty() && !a.starts_with('-'));
+
+    let Some(repo_root) = crate::policy::find_repo_root(ctx.cwd.as_deref()) else {
+        return Vec::new();
+    };
+
+    let Some(hook_findings) =
+        crate::repo_hooks::scan_triggered_by_leader(&repo_root, leader, subcommand)
+    else {
+        return Vec::new();
+    };
+
+    // Map repo-hook findings to engine findings. Only the three hot-path-
+    // eligible rules (network / credential / sudo) surface here, and they are
+    // DOWNGRADED to Medium so the hot path WARNS (the everyday-command UX)
+    // rather than blocks; the explicit `tirith hooks scan` reports the true
+    // High. The Medium suspicious-shell / external-fetch rules are inventory-
+    // only and are not surfaced on the hot path.
+    hook_findings
+        .into_iter()
+        .filter(|f| {
+            matches!(
+                f.rule_id,
+                crate::verdict::RuleId::RepoHookNetworkCall
+                    | crate::verdict::RuleId::RepoHookCredentialRead
+                    | crate::verdict::RuleId::RepoHookSudo
+            )
+        })
+        .map(|f| Finding {
+            rule_id: f.rule_id,
+            severity: crate::verdict::Severity::Medium,
+            title: format!("Repo hook `{}` ({})", f.name, f.provider.as_str()),
+            description: format!(
+                "A {} hook triggered by this command was flagged: {}. The hook runs \
+                 automatically — review it with `tirith hooks explain {}`.",
+                f.provider.as_str(),
+                f.detail,
+                f.name
+            ),
+            evidence: vec![crate::verdict::Evidence::Text {
+                detail: format!("{} @ {}", f.detail, f.location),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        })
+        .collect()
+}
+
 /// The `/tmp`-equivalent roots: `/tmp` plus `$TMPDIR` (macOS uses a per-user
 /// `$TMPDIR` under `/var/folders`). Used by the hot-path `ExecInTmp` /
 /// writable-dir checks.
@@ -784,19 +887,33 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         false
     };
 
-    // M9 ch5 — the exec-provenance hot subset is NOT a regex/byte signal, so a
-    // bare `/tmp/foo` command would fast-exit at tier-1 before the exec-rule
-    // block ever ran (the tier-1 gating bug class — see CLAUDE.md). When the
-    // opt-in `exec_guard_enabled` flag is set in Exec context, force past the
-    // fast-exit so `check_exec_provenance_hot` gets a chance to run. The flag
-    // read is a cheap partial-policy discover (local files only), gated to Exec
-    // so the common no-flag path adds nothing. Mirrors `exec_bidi_triggered`.
-    let exec_guard_triggered = ctx.scan_context == ScanContext::Exec
-        && Policy::discover_partial(ctx.cwd.as_deref()).exec_guard_enabled;
+    // M9 ch5 / ch6 — the exec-provenance and repo-hook hot subsets are NOT a
+    // regex/byte signal, so a bare `/tmp/foo` or a clean-looking `git commit`
+    // would fast-exit at tier-1 before the exec/hook-rule block ever ran (the
+    // tier-1 gating bug class — see CLAUDE.md). When the opt-in
+    // `exec_guard_enabled` / `hooks_guard_enabled` flag is set in Exec context,
+    // force past the fast-exit so the respective hot block gets a chance to run.
+    // The flag read is one cheap partial-policy discover (local files only),
+    // gated to Exec so the common no-flag path adds nothing. The hooks-guard
+    // force is additionally narrowed to a hook-triggering leader so an arbitrary
+    // command under a hooks-guard-on repo still fast-exits. Mirrors
+    // `exec_bidi_triggered`.
+    let (exec_guard_triggered, hooks_guard_triggered) = if ctx.scan_context == ScanContext::Exec {
+        let partial = Policy::discover_partial(ctx.cwd.as_deref());
+        let hooks = partial.hooks_guard_enabled && leader_is_hook_triggering(ctx);
+        (partial.exec_guard_enabled, hooks)
+    } else {
+        (false, false)
+    };
 
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
-    if !byte_scan_triggered && !regex_triggered && !exec_bidi_triggered && !exec_guard_triggered {
+    if !byte_scan_triggered
+        && !regex_triggered
+        && !exec_bidi_triggered
+        && !exec_guard_triggered
+        && !hooks_guard_triggered
+    {
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         return (
             Verdict::allow_fast(
@@ -1167,6 +1284,21 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // doc-comment for the full split.
             if policy.exec_guard_enabled {
                 findings.extend(check_exec_provenance_hot(ctx));
+            }
+
+            // M9 ch6 — repo-hook / automation guard HOT subset. Behind the
+            // opt-in `policy.hooks_guard_enabled` switch. When the parsed leader
+            // is a hook-triggering command (git commit/pull/checkout/merge/
+            // rebase/push, npm/yarn/pnpm install, direnv allow/reload), scan
+            // ONLY the hook types that leader actually triggers (per-leader
+            // targeting in `repo_hooks::scan_triggered_by_leader`) and surface
+            // the network/credential/sudo findings. Surfaced at WARN (Medium) on
+            // the hot path — the user is running an everyday command, not asking
+            // for an audit — while `tirith hooks scan` reports the true High.
+            // The scan is per-repo mtime-cached for 60s. Makefile/justfile/
+            // Taskfile are NOT triggered here (the user did not run make).
+            if policy.hooks_guard_enabled {
+                findings.extend(check_repo_hooks_hot(ctx));
             }
         }
 

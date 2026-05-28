@@ -730,6 +730,12 @@ const ALL_RULE_IDS: &[&str] = &[
     "path_duplicate_command_name",
     "path_dir_in_repo",
     "path_dir_in_tmp",
+    // Repo-hook / automation guard rules (M9 ch6)
+    "repo_hook_network_call",
+    "repo_hook_credential_read",
+    "repo_hook_sudo",
+    "repo_hook_suspicious_shell_pattern",
+    "repo_hook_external_fetch",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -966,6 +972,25 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "path_duplicate_command_name",
     "path_dir_in_repo",
     "path_dir_in_tmp",
+    // M9 ch6 — repo-hook / automation guard rules fire from the
+    // `tirith hooks scan|guard|explain` scanner (`crate::repo_hooks`), which
+    // classifies a hook BODY as text. The three High rules
+    // (`repo_hook_network_call`, `repo_hook_credential_read`, `repo_hook_sudo`)
+    // can ALSO surface on the `engine::analyze` exec hot path, but ONLY when
+    // `policy.hooks_guard_enabled` is set (opt-in, default false) AND a hot-path
+    // git / package-manager command runs in a repo whose triggered hooks carry
+    // them — a repo-STATE + command trigger the static golden-fixture runner
+    // (default policy, no on-disk repo hooks) cannot reproduce. The two Medium
+    // rules never reach the hot path at all. All five are covered by unit tests
+    // in `crates/tirith-core/src/repo_hooks.rs` against `tempfile::tempdir()`
+    // roots with the `scan_for_repo` / `scan_triggered_by_leader` entry points.
+    // The `configfile.toml` fixtures document the no-fire engine behavior for
+    // hook-body content shapes scanned as a generic file.
+    "repo_hook_network_call",
+    "repo_hook_credential_read",
+    "repo_hook_sudo",
+    "repo_hook_suspicious_shell_pattern",
+    "repo_hook_external_fetch",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1319,6 +1344,12 @@ fn test_rule_id_list_is_complete() {
         RuleId::PathDuplicateCommandName,
         RuleId::PathDirInRepo,
         RuleId::PathDirInTmp,
+        // Repo-hook / automation guard rules (M9 ch6)
+        RuleId::RepoHookNetworkCall,
+        RuleId::RepoHookCredentialRead,
+        RuleId::RepoHookSudo,
+        RuleId::RepoHookSuspiciousShellPattern,
+        RuleId::RepoHookExternalFetch,
     ];
 
     let all_rule_set: HashSet<&str> = ALL_RULE_IDS.iter().copied().collect();
