@@ -87,10 +87,15 @@ pub fn create(
     match card.to_json_pretty() {
         Ok(s) => {
             // Pretty JSON to stdout so `tirith command-card create > card.json`
-            // works directly. The `json` flag is accepted for parity but the
-            // card itself is already JSON.
-            let _ = json; // card output is JSON regardless
-            println!("{s}");
+            // works directly. `json` is accepted for parity (the card is already
+            // JSON). Use a FALLIBLE write — not `println!`, which panics/aborts on
+            // a stdout write error — so a write failure returns the
+            // JSON-write-failure exit code 2, matching this presenter's contract.
+            let _ = json;
+            let mut out = std::io::stdout();
+            if writeln!(out, "{s}").and_then(|()| out.flush()).is_err() {
+                return 2;
+            }
             0
         }
         Err(e) => {
