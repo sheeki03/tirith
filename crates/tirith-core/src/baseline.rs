@@ -219,6 +219,13 @@ fn salt_in(dir: &Path) -> PathBuf {
 /// degrade to a weak salt.
 const SALT_LEN: usize = 32;
 
+/// Read cap for the salt file (CodeRabbit R11 #4). The salt is exactly
+/// [`SALT_LEN`] (32) bytes; 4 KiB is generous slack so a slightly-larger file is
+/// still read (and then rejected as the wrong length), while a genuinely
+/// oversized / attacker-grown `baseline.salt` is refused BEFORE it is allocated
+/// rather than buffered whole.
+const SALT_READ_CAP: u64 = 4 * 1024;
+
 /// Per-process salt state. Resolved once (I1: no N+1 file reads on the hot path)
 /// and cached, keyed on the salt path so test entry points with distinct temp
 /// paths each resolve their own salt.
@@ -263,29 +270,26 @@ fn salt_state(salt_file: &Path) -> std::sync::Arc<SaltState> {
 /// hash and fire `AnomalyFirstTimeInThisRepo` forever (F4).
 fn load_salt_state(salt_file: &Path) -> SaltState {
     let mut existing_is_corrupt = false;
-    // CodeRabbit R9 #C: guard the salt read against a non-regular file. A FIFO/
-    // device at the salt path would block a plain `std::fs::read` forever. Stat
-    // first: a present non-regular file is treated as corrupt (overwrite path,
-    // same as a wrong-length salt) rather than read; an absent file falls through
-    // to fresh-salt generation. The salt is exactly `SALT_LEN` bytes, so a
-    // regular file is read directly (no unbounded alloc concern).
-    match std::fs::metadata(salt_file) {
-        Ok(meta) if meta.is_file() => {
-            if let Ok(bytes) = std::fs::read(salt_file) {
-                if bytes.len() == SALT_LEN {
-                    return SaltState::Ready(bytes);
-                }
-                // A short/oversized salt file is corrupt — must be OVERWRITTEN,
-                // not adopted (I2). Remember this so persist replaces it
-                // atomically rather than treating `AlreadyExists` as "another
-                // process won the race".
-                existing_is_corrupt = true;
-            }
-        }
-        // Present but NOT a regular file → corrupt (overwrite), never block on it.
+    // CodeRabbit R9 #C + R11 #1/#4: read the salt through the shared, race-free
+    // capped helper. A FIFO/device at the salt path would block a plain
+    // `std::fs::read` forever, and an oversized `baseline.salt` would be fully
+    // allocated before any length check. `read_regular_capped` opens with
+    // O_NONBLOCK, fstats the OPEN fd (closing the metadata→open TOCTOU), rejects
+    // non-regular files, and caps the read at SALT_READ_CAP (the salt is exactly
+    // SALT_LEN bytes; the cap is generous slack, so anything over it is corrupt).
+    //   * NotFound          → absent: fall through to fresh-salt generation.
+    //   * exactly SALT_LEN  → adopt the on-disk salt.
+    //   * any other length, non-regular, oversized, or I/O error → corrupt:
+    //     OVERWRITE it (I2), never adopt and never block.
+    match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
+        Ok(bytes) if bytes.len() == SALT_LEN => return SaltState::Ready(bytes),
+        // A short/oversized/non-regular/unreadable salt file is corrupt — must be
+        // OVERWRITTEN, not adopted (I2). Remember this so persist replaces it
+        // atomically rather than treating `AlreadyExists` as "another process won
+        // the race".
         Ok(_) => existing_is_corrupt = true,
-        // Absent (or unstattable) → fall through to fresh-salt generation.
-        Err(_) => {}
+        Err(crate::util::OpenRegularError::NotFound) => {}
+        Err(_) => existing_is_corrupt = true,
     }
 
     // Generate a fresh 32-byte salt from the OS RNG. On the (extremely unlikely)
@@ -375,15 +379,22 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
             Ok(salt.to_vec())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost the race — adopt the on-disk salt when it is the right
-            // length; otherwise propagate so the caller disables baseline.
-            match std::fs::read(salt_file) {
+            // Lost the race — adopt the on-disk salt when it is the right length;
+            // otherwise propagate so the caller disables baseline. Read through
+            // the race-free capped helper (R11 #1) so a FIFO/device that won the
+            // `create_new` race cannot block this read-back, and an oversized
+            // file cannot be buffered whole.
+            match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
                 Ok(bytes) if bytes.len() == SALT_LEN => Ok(bytes),
                 Ok(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "concurrent salt file is corrupt",
                 )),
-                Err(e) => Err(e),
+                Err(crate::util::OpenRegularError::Io(e)) => Err(e),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "concurrent salt file is not a usable regular file",
+                )),
             }
         }
         Err(e) => Err(e),
@@ -925,6 +936,57 @@ mod tests {
             hash_host_at(&salt_file, "GitHub.com"),
             hash_host_at(&salt_file, "github.com")
         );
+    }
+
+    #[test]
+    fn oversized_salt_file_is_rejected_and_regenerated() {
+        // CodeRabbit R11 #4: an oversized `baseline.salt` must NOT be allocated
+        // whole before the length check. The capped helper refuses it (over the
+        // SALT_READ_CAP), so it is treated as corrupt and OVERWRITTEN with a fresh
+        // 32-byte salt — hashing still works, and the on-disk file is back to
+        // SALT_LEN. We isolate the salt cache by using a unique temp path.
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        // Far larger than SALT_READ_CAP — a naive `std::fs::read` would buffer all
+        // of it; the cap refuses it before allocation.
+        std::fs::write(&salt_file, vec![0u8; (SALT_READ_CAP as usize) + 4096]).unwrap();
+
+        let h = hash_host_at(&salt_file, "github.com").expect("hash succeeds after regen");
+        assert_eq!(h.len(), 16);
+        assert_eq!(
+            std::fs::read(&salt_file).unwrap().len(),
+            SALT_LEN,
+            "an oversized salt must be regenerated to exactly SALT_LEN bytes"
+        );
+    }
+
+    /// CodeRabbit R11 #1: a FIFO at the salt path must NOT block the salt read.
+    /// The capped helper opens with O_NONBLOCK and rejects the FIFO, so the salt
+    /// is treated as corrupt and regenerated atomically (overwriting the FIFO).
+    /// A regression to a blocking `std::fs::read` would HANG here. Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_salt_does_not_hang_and_regenerates() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let salt_file = salt_in(dir.path());
+        let c_path = CString::new(salt_file.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // Must complete promptly; a blocking read on the FIFO would hang. The
+        // FIFO is corrupt → the salt is regenerated (the persist path replaces it
+        // atomically), so hashing returns a value and the file is now a regular
+        // 32-byte salt.
+        let h = hash_host_at(&salt_file, "github.com").expect("hash succeeds, no hang");
+        assert_eq!(h.len(), 16);
+        let meta = std::fs::metadata(&salt_file).unwrap();
+        assert!(
+            meta.is_file(),
+            "FIFO must have been replaced by a regular file"
+        );
+        assert_eq!(meta.len() as usize, SALT_LEN);
     }
 
     #[test]

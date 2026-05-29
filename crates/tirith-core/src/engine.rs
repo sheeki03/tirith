@@ -924,38 +924,30 @@ impl CardReadError {
 }
 
 /// Read a command-card file with hard guards against the two repo-carried-ref
-/// abuse cases (M11 / CodeRabbit R7 #2):
+/// abuse cases (M11 / CodeRabbit R7 #2, hardened R11 #1):
 ///
 /// 1. **Non-regular files.** A `# tirith-card:` pointing at a FIFO, character
 ///    device (`/dev/zero`), socket, or directory would hang or stream forever
-///    under a plain `std::fs::read`. We `stat` first and reject anything that is
-///    not a regular file.
-/// 2. **Oversized payloads.** A huge regular file would exhaust memory. We read
-///    at most [`CARD_READ_CAP`] + 1 bytes via `Read::take`; if the file yielded
-///    more than the cap, we treat it as unverifiable rather than buffering it.
+///    under a plain `std::fs::read`.
+/// 2. **Oversized payloads.** A huge regular file would exhaust memory.
+///
+/// Both are handled by the shared, race-free [`crate::util::read_regular_capped`]
+/// helper: it opens with `O_NONBLOCK` and `fstat`s the OPEN fd (closing the
+/// metadata→open TOCTOU a separate `stat`+`open` left), rejects non-regular
+/// files without blocking, and reads at most [`CARD_READ_CAP`] bytes (with a
+/// `take(cap + 1)` TOCTOU-grow check). We map its error onto the existing
+/// [`CardReadError`] variants so the surfaced `CommandCardUnverified` detail is
+/// unchanged.
 fn read_card_bytes_guarded(path: &std::path::Path) -> Result<Vec<u8>, CardReadError> {
-    use std::io::Read as _;
-    // `metadata` follows symlinks (so a symlink *to* a regular file is fine, and
-    // a symlink to a FIFO/device is correctly rejected by `is_file()`).
-    let meta = std::fs::metadata(path).map_err(|_| CardReadError::Unreadable)?;
-    if !meta.is_file() {
-        return Err(CardReadError::NotRegularFile);
-    }
-    // Even for a regular file, gate on the stat size before reading.
-    if meta.len() > CARD_READ_CAP {
-        return Err(CardReadError::TooLarge);
-    }
-    let file = std::fs::File::open(path).map_err(|_| CardReadError::Unreadable)?;
-    // Defense in depth against a TOCTOU grow between stat and read: cap the
-    // reader itself at CAP + 1 and reject if it actually delivered more than CAP.
-    let mut buf = Vec::new();
-    file.take(CARD_READ_CAP + 1)
-        .read_to_end(&mut buf)
-        .map_err(|_| CardReadError::Unreadable)?;
-    if buf.len() as u64 > CARD_READ_CAP {
-        return Err(CardReadError::TooLarge);
-    }
-    Ok(buf)
+    crate::util::read_regular_capped(path, CARD_READ_CAP).map_err(|e| match e {
+        crate::util::OpenRegularError::NotRegularFile => CardReadError::NotRegularFile,
+        crate::util::OpenRegularError::TooLarge => CardReadError::TooLarge,
+        // Absent / permission / I/O all collapse to the existing "unreadable"
+        // detail — a card-less or unreadable card is treated as no card.
+        crate::util::OpenRegularError::NotFound | crate::util::OpenRegularError::Io(_) => {
+            CardReadError::Unreadable
+        }
+    })
 }
 
 /// M11 ch1 — the command-card hot check. Resolves a card reference from the

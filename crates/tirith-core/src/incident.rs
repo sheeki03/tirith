@@ -229,51 +229,27 @@ const FLAG_READ_CAP: u64 = 64 * 1024;
 /// (→ [`FlagRead::Corrupt`]) — a corrupt flag must NOT downgrade to "no
 /// incident".
 ///
-/// HOT-PATH HARDENING (CodeRabbit R9 #C): the flag path is read on every exec
-/// through [`active_cached`], and an attacker who can write the state dir could
-/// point it at a FIFO/device (a plain `std::fs::read` would BLOCK forever
-/// waiting for a writer) or a huge regular file (unbounded allocation). We
-/// mirror the command-card read guard: `stat` first and reject any non-regular
-/// file as `Corrupt` (fail-SAFE: an incident is still considered active, so the
-/// posture is never silently dropped), and cap the read at [`FLAG_READ_CAP`].
-/// Neither case blocks the hot path.
+/// HOT-PATH HARDENING (CodeRabbit R9 #C, hardened R11 #1): the flag path is read
+/// on every exec through [`active_cached`], and an attacker who can write the
+/// state dir could point it at a FIFO/device (a plain `std::fs::read` would BLOCK
+/// forever waiting for a writer) or a huge regular file (unbounded allocation).
+/// We go through the shared, race-free [`crate::util::read_regular_capped`]
+/// helper — it opens with `O_NONBLOCK` and `fstat`s the OPEN fd (closing the
+/// metadata→open TOCTOU a separate `stat`+`open` left), rejects any non-regular
+/// file without blocking, and caps the read at [`FLAG_READ_CAP`]. The mapping is
+/// fail-SAFE: an `ENOENT` is the only `Absent` case; EVERYTHING else (non-regular
+/// file, oversized, permission/I/O error) is `Corrupt` so an incident is still
+/// considered active and the posture is never silently dropped.
 pub fn read_flag_at(path: &Path) -> FlagRead {
-    use std::io::Read as _;
-    // `metadata` follows symlinks: a symlink to a real regular flag is fine; a
-    // symlink to a FIFO/device/dir is correctly rejected by `is_file()`.
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        // Truly absent (ENOENT) → no incident. Any OTHER stat error on an
-        // existing path is treated as corrupt (fail-safe).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FlagRead::Absent,
+    let bytes = match crate::util::read_regular_capped(path, FLAG_READ_CAP) {
+        Ok(b) => b,
+        // Truly absent (ENOENT) → no incident.
+        Err(crate::util::OpenRegularError::NotFound) => return FlagRead::Absent,
+        // A non-regular flag (FIFO/device/socket/dir), an oversized flag, or any
+        // open/read error on a present path is fail-safe ACTIVE → Corrupt.
+        // `stop_at` clears a directory sentinel separately.
         Err(_) => return FlagRead::Corrupt,
     };
-    // A non-regular flag (FIFO/device/socket/dir) must NEVER be `read`-blocked.
-    // It is also not a thing a real `start` ever creates → treat as corrupt
-    // (fail-safe active). `stop_at` clears a directory sentinel separately.
-    if !meta.is_file() {
-        return FlagRead::Corrupt;
-    }
-    // Gate on the stat size before reading; an oversized flag is corrupt.
-    if meta.len() > FLAG_READ_CAP {
-        return FlagRead::Corrupt;
-    }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FlagRead::Absent,
-        Err(_) => return FlagRead::Corrupt,
-    };
-    // Defense in depth against a TOCTOU grow between stat and read: cap the
-    // reader at CAP + 1 and reject if it actually delivered more than the cap.
-    let mut bytes = Vec::new();
-    if file
-        .take(FLAG_READ_CAP + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > FLAG_READ_CAP
-    {
-        return FlagRead::Corrupt;
-    }
     match serde_json::from_slice(&bytes) {
         Ok(state) => FlagRead::Valid(state),
         Err(_) => FlagRead::Corrupt,

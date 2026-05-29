@@ -166,8 +166,49 @@ const MANIFEST_FILENAME: &str = "commands.yaml";
 
 impl CommandsManifest {
     /// Parse a manifest from YAML text.
+    ///
+    /// After deserializing, rejects a manifest with DUPLICATE `allowed[].name`
+    /// values (CodeRabbit R11 #5): `commands run <name>` and `match_allowed` are
+    /// first-match lookups, so two entries sharing a name make which one runs /
+    /// is reported ORDER-DEPENDENT and ambiguous. Failing the load turns that
+    /// latent ambiguity into a loud, fixable parse error rather than silent
+    /// first-wins behaviour. Duplicate `dangerous[].pattern` values are rejected
+    /// too — they are pure redundancy (every match already collects ALL matching
+    /// patterns), and a duplicated dangerous glob is almost always a copy-paste
+    /// mistake worth surfacing.
     pub fn from_yaml(text: &str) -> Result<Self, ManifestError> {
-        serde_yaml::from_str(text).map_err(|e| ManifestError::Parse(e.to_string()))
+        let manifest: Self =
+            serde_yaml::from_str(text).map_err(|e| ManifestError::Parse(e.to_string()))?;
+        manifest.validate_no_duplicates()?;
+        Ok(manifest)
+    }
+
+    /// Error on duplicate `allowed[].name` or duplicate `dangerous[].pattern`.
+    /// Names/patterns are compared VERBATIM (no trimming): two entries that
+    /// differ only by surrounding whitespace are still distinct keys on disk, and
+    /// surfacing the literal collision is clearer than silently normalizing.
+    fn validate_no_duplicates(&self) -> Result<(), ManifestError> {
+        let mut seen_names = std::collections::HashSet::with_capacity(self.allowed.len());
+        for entry in &self.allowed {
+            if !seen_names.insert(entry.name.as_str()) {
+                return Err(ManifestError::Parse(format!(
+                    "duplicate allowed[].name {:?}: each catalogued command name must be unique \
+                     (first-match lookup makes a duplicate name ambiguous)",
+                    entry.name
+                )));
+            }
+        }
+        let mut seen_patterns = std::collections::HashSet::with_capacity(self.dangerous.len());
+        for entry in &self.dangerous {
+            if !seen_patterns.insert(entry.pattern.as_str()) {
+                return Err(ManifestError::Parse(format!(
+                    "duplicate dangerous[].pattern {:?}: a dangerous pattern is redundant if \
+                     listed twice",
+                    entry.pattern
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Load the manifest from a specific file path.
@@ -591,6 +632,46 @@ mod tests {
         let ok = "dangerous:\n  - pattern: \"curl * | bash\"\n";
         let m = CommandsManifest::from_yaml(ok).expect("valid manifest parses");
         assert_eq!(m.dangerous.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_allowed_name_is_rejected() {
+        // CodeRabbit R11 #5: two `allowed[]` entries sharing a `name` make
+        // `commands run <name>` / `match_allowed` order-dependent. The load must
+        // FAIL with a clear error rather than silently pick the first.
+        let dup = "allowed:\n  - name: build\n    command: npm run build\n  - name: build\n    command: make\n";
+        let err = CommandsManifest::from_yaml(dup)
+            .expect_err("a duplicate allowed[].name must be a parse error");
+        match err {
+            ManifestError::Parse(msg) => {
+                assert!(
+                    msg.contains("duplicate allowed[].name") && msg.contains("build"),
+                    "error must name the duplicate, got: {msg}"
+                );
+            }
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+        // Distinct names still parse (no false positive).
+        let ok = "allowed:\n  - name: build\n    command: npm run build\n  - name: test\n    command: npm test\n";
+        let m = CommandsManifest::from_yaml(ok).expect("distinct names parse");
+        assert_eq!(m.allowed.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_dangerous_pattern_is_rejected() {
+        // CodeRabbit R11 #5: a duplicated dangerous glob is pure redundancy and
+        // almost always a copy-paste mistake — reject it at load.
+        let dup = "dangerous:\n  - pattern: \"curl * | bash\"\n  - pattern: \"curl * | bash\"\n    action: warn\n";
+        let err = CommandsManifest::from_yaml(dup)
+            .expect_err("a duplicate dangerous[].pattern must be a parse error");
+        assert!(
+            matches!(&err, ManifestError::Parse(msg) if msg.contains("duplicate dangerous[].pattern")),
+            "got {err:?}"
+        );
+        // Distinct patterns still parse.
+        let ok = "dangerous:\n  - pattern: \"curl * | bash\"\n  - pattern: \"rm -rf *\"\n";
+        let m = CommandsManifest::from_yaml(ok).expect("distinct patterns parse");
+        assert_eq!(m.dangerous.len(), 2);
     }
 
     #[test]

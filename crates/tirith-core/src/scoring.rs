@@ -53,6 +53,35 @@ fn severity_base(sev: Severity) -> u32 {
 /// Flat contribution for each finding beyond the first.
 const ADDITIONAL_FINDING_WEIGHT: u32 = 5;
 
+/// `true` for **note-only** Info findings that annotate a command without being
+/// an independent risk signal. These must NOT inflate the additive
+/// `additional_findings` factor: a verified/unverified command-card note, or a
+/// "this command is not catalogued" manifest note, is metadata about the
+/// command, not a second problem with it (CodeRabbit R11 #3).
+///
+/// Scope: only the rules whose DOCUMENTED semantics are "Info, never changes the
+/// action, pure annotation". Concretely:
+///   * [`RuleId::CommandCardVerified`] — "this command matched a trusted card".
+///   * [`RuleId::CommandCardUnverified`] — "a card was referenced but could not
+///     be verified" (remote URL / bad sig / unreadable). Info note, not a claim.
+///   * [`RuleId::RepoCommandUnknown`] — "not listed in `.tirith/commands.yaml`".
+///     Info annotation; the suppressible "you ran something uncatalogued" note.
+///
+/// Deliberately NOT note-only (these ARE real signals and stay counted):
+///   * `CommandCardMismatch` (High) — the command differs from a trusted card.
+///   * `RepoCommandDangerousPattern` (High/Medium) — a dangerous-glob match.
+///   * `CanaryTokenTouched` (High) — a planted honeytoken was touched; a strong
+///     detection, not an annotation.
+///   * `AnomalyFirstTimeInThisRepo` / `AnomalyRareInBaseline` (Info) — these are
+///     baseline NOVELTY signals (a new/rare pattern is mildly risk-relevant), a
+///     different class from card/manifest metadata, so they keep their +5.
+fn is_note_only_rule(rule: RuleId) -> bool {
+    matches!(
+        rule,
+        RuleId::CommandCardVerified | RuleId::CommandCardUnverified | RuleId::RepoCommandUnknown
+    )
+}
+
 /// Contribution when a threat-intel finding corroborates other findings.
 const THREAT_INTEL_CORROBORATION_WEIGHT: u32 = 5;
 
@@ -436,16 +465,25 @@ pub fn score_findings(findings: &[Finding]) -> ScoreBreakdown {
         detail: base_detail,
     });
 
-    // Factor 2 — additional findings. Each finding past the first adds +5.
-    let extra = findings.len().saturating_sub(1) as u32;
+    // Factor 2 — additional findings. Each finding past the first adds +5, but
+    // note-only Info annotations (verified/unverified card, uncatalogued-command
+    // note) are EXCLUDED from the count: they are metadata about the command, not
+    // a second independent problem, so they must not inflate the score
+    // (CodeRabbit R11 #3). Base severity already ignores them too — they are all
+    // Info (0 base) — so a verdict carrying only such a note scores exactly the
+    // same as one carrying none.
+    let substantive = findings
+        .iter()
+        .filter(|f| !is_note_only_rule(f.rule_id))
+        .count();
+    let extra = substantive.saturating_sub(1) as u32;
     let extra_points = extra * ADDITIONAL_FINDING_WEIGHT;
-    let extra_detail = match findings.len() {
+    let extra_detail = match substantive {
         0 | 1 => format!(
-            "{} finding(s) — no additional-finding points (the first finding is already counted by base severity).",
-            findings.len()
+            "{substantive} substantive finding(s) — no additional-finding points (the first is already counted by base severity; note-only card/manifest annotations are excluded)."
         ),
         n => format!(
-            "{n} findings total; {extra} beyond the first × {ADDITIONAL_FINDING_WEIGHT} points each = {extra_points}."
+            "{n} substantive findings; {extra} beyond the first × {ADDITIONAL_FINDING_WEIGHT} points each = {extra_points} (note-only card/manifest annotations excluded)."
         ),
     };
     factors.push(ScoreFactor {
@@ -581,6 +619,52 @@ mod tests {
         assert_eq!(b.factors[0].points, 70);
         assert_eq!(b.factors[1].id, "additional_findings");
         assert_eq!(b.factors[1].points, 10);
+    }
+
+    #[test]
+    fn note_only_card_findings_do_not_change_score() {
+        // CodeRabbit R11 #3: a note-only Info finding (verified/unverified card,
+        // uncatalogued-command note) must NOT inflate the additive score. A
+        // verdict carrying ONLY such a note scores the same as an empty one (0),
+        // and adding one alongside real findings does not bump the count.
+        for note in [
+            RuleId::CommandCardVerified,
+            RuleId::CommandCardUnverified,
+            RuleId::RepoCommandUnknown,
+        ] {
+            // (a) Lone note → identical to no findings at all (score 0).
+            let lone = score_findings(&[finding(note, Severity::Info)]);
+            assert_eq!(lone.score, 0, "a lone {note:?} note must score 0");
+            assert!(lone.verify());
+
+            // (b) A real High finding + the note scores the SAME as the High
+            // finding alone — the note adds no additional-finding points.
+            let without = score_findings(&[finding(RuleId::PlainHttpToSink, Severity::High)]);
+            let with = score_findings(&[
+                finding(RuleId::PlainHttpToSink, Severity::High),
+                finding(note, Severity::Info),
+            ]);
+            assert_eq!(
+                with.score, without.score,
+                "{note:?} must not change the score (with={}, without={})",
+                with.score, without.score
+            );
+            assert_eq!(with.score, 70, "High alone is 70; the note adds nothing");
+            assert!(with.verify());
+        }
+    }
+
+    #[test]
+    fn canary_touched_is_counted_not_note_only() {
+        // Contrast: CanaryTokenTouched (High) is a REAL signal, not a note. A
+        // High finding alongside it scores 70 base + 5 additional = 75, proving
+        // the canary is still counted toward the additive factor.
+        let b = score_findings(&[
+            finding(RuleId::CanaryTokenTouched, Severity::High),
+            finding(RuleId::PlainHttpToSink, Severity::High),
+        ]);
+        assert_eq!(b.score, 75, "canary-touched must still count as a finding");
+        assert!(b.verify());
     }
 
     #[test]

@@ -32,13 +32,18 @@ use super::{confirm, write_json_stdout};
 /// the `--json` surface parseable on the FATAL branches of start/stop/report
 /// (e.g. an unwritable state dir) instead of leaking plain stderr a JSON
 /// consumer cannot parse (CodeRabbit R7 #5). Mirrors `cli::canary::emit_error`.
-/// Callers keep their existing exit codes — this only changes the rendering.
-fn emit_error(json: bool, ctx: &str, msg: &str) {
+///
+/// Returns `false` when the JSON write itself failed (broken pipe / truncated
+/// output) so a `--json` caller can surface that as a distinct write-failure exit
+/// instead of pairing a semantic exit code with no JSON delivered (CodeRabbit R11
+/// #6). Human mode always returns `true` — the stderr line is best-effort.
+fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
-        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"));
+        write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
         eprintln!("{ctx}: {msg}");
+        true
     }
 }
 
@@ -125,7 +130,12 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            emit_error(json, "tirith incident start", &e.to_string());
+            // A failed JSON write surfaces as the write-failure exit (2),
+            // distinct from the semantic fatal exit (1), so a piped consumer
+            // never reads a clean error record that was truncated mid-write.
+            if !emit_error(json, "tirith incident start", &e.to_string()) {
+                return 2;
+            }
             1
         }
     }
@@ -166,8 +176,9 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             // Route the fatal "--yes required" branch through the JSON-error path
             // so `incident stop --json` stays parseable (CodeRabbit R8 #6); a plain
             // stderr line here left the `--json` surface non-parseable. Exit code
-            // unchanged (2).
-            emit_error(
+            // is 2 whether or not the JSON write itself succeeds (a failed write is
+            // already the write-failure exit, also 2), so the bool is moot here.
+            let _ = emit_error(
                 json,
                 "tirith incident stop",
                 "--yes required in JSON mode to confirm",
@@ -222,7 +233,11 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            emit_error(json, "tirith incident stop", &e);
+            // A failed JSON write surfaces as the write-failure exit (2), distinct
+            // from the semantic fatal exit (1).
+            if !emit_error(json, "tirith incident stop", &e) {
+                return 2;
+            }
             1
         }
     }
@@ -344,7 +359,11 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
                 0
             }
             Err(e) => {
-                emit_error(json, "tirith incident report", &e);
+                // A failed JSON write surfaces as the write-failure exit (2),
+                // distinct from the semantic fatal exit (1).
+                if !emit_error(json, "tirith incident report", &e) {
+                    return 2;
+                }
                 1
             }
         },
@@ -401,11 +420,19 @@ fn write_report_file(path: &std::path::Path, body: &str) -> Result<(), String> {
     // but keeps its old (possibly group/other-readable) mode. Re-assert 0600
     // explicitly so an incident report — which may carry repo-internal paths /
     // hostnames — is never left world-readable (mirrors audit.rs's post-open
-    // chmod). Best-effort: a chmod failure must not abort the report write.
+    // chmod).
+    //
+    // PROPAGATE the chmod result (CodeRabbit R11 #7): dropping it let
+    // `incident report --out` report SUCCESS while leaving a world-readable file
+    // full of repo-internal paths/hostnames. We chmod BEFORE writing the body (the
+    // open already truncated the old content to empty), so a chmod failure aborts
+    // the write — sensitive content is never placed into a file we could not lock
+    // down. The error is surfaced; the command returns non-zero.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))?;
     }
     f.write_all(body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))

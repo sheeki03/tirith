@@ -1,10 +1,114 @@
 //! Utility helpers shared across the core crate.
 
+use std::fs::File;
 use std::io::BufRead;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Why [`open_regular_capped`] refused to hand back a usable reader. Each caller
+/// maps these onto its own surface (corrupt / unverified / silent-empty).
+#[derive(Debug)]
+pub enum OpenRegularError {
+    /// The path does not exist (`ENOENT`). Callers that treat "absent" specially
+    /// (an empty store, no incident flag) branch on this.
+    NotFound,
+    /// The path was opened, but an `fstat` of the OPEN fd says it is not a
+    /// regular file (FIFO / device / socket / directory). Reading it could block
+    /// or stream forever, so it is refused.
+    NotRegularFile,
+    /// A regular file whose `fstat` size exceeds the caller's cap. Refused before
+    /// any bytes are read so an oversized file cannot exhaust memory.
+    TooLarge,
+    /// Any other open / stat / read failure (permission denied, I/O error, a
+    /// post-open TOCTOU grow past the cap).
+    Io(std::io::Error),
+}
+
+/// Open `path` and return its handle ONLY when it is a regular file no larger
+/// than `cap` bytes — closing the metadata→open TOCTOU that a plain
+/// `metadata(path)` + `open(path)` leaves open (CodeRabbit R11 #1/#2).
+///
+/// ## Why this is race-free
+///
+/// The naive guard stats the PATH, then opens the PATH. Between the two an
+/// attacker can swap the path to a FIFO/device, so the open/read still blocks on
+/// a special file. Here we open FIRST, then `fstat` the OPEN fd (`File::metadata`
+/// stats the inode behind the descriptor we hold, not the path) — the inode we
+/// check is exactly the inode we will read.
+///
+/// ## Why opening a FIFO does not block (unix)
+///
+/// We pass `O_NONBLOCK` via `custom_flags`. `open(2)` on a FIFO opened read-only
+/// with `O_NONBLOCK` returns IMMEDIATELY (success, no writer required) instead of
+/// blocking until a writer appears; we then `fstat` it, see it is not a regular
+/// file, and drop it without ever reading. On a regular file `O_NONBLOCK` is a
+/// no-op for reads (regular files are always "ready"), so the subsequent read is
+/// unaffected. Symlinks are FOLLOWED (a symlink to a regular file is fine; a
+/// symlink to a FIFO/device is rejected by the post-open `fstat`) — matching the
+/// pre-existing `metadata`-follows-symlinks behaviour of every read site.
+///
+/// On non-unix there is no FIFO open-blocking semantics to defend against, so we
+/// open plainly and `fstat` the open handle (still race-free: we check the inode
+/// we hold, not the path).
+pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularError> {
+    let open_result = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                // O_NONBLOCK: a FIFO with no writer would otherwise block the
+                // open forever. With it, the open returns immediately and the
+                // fstat below rejects the FIFO before any read.
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new().read(true).open(path)
+        }
+    };
+    let file = match open_result {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OpenRegularError::NotFound)
+        }
+        Err(e) => return Err(OpenRegularError::Io(e)),
+    };
+    // fstat the OPEN fd — NOT the path. This is the inode we will read, so a
+    // swap after our open cannot substitute a special file.
+    let meta = file.metadata().map_err(OpenRegularError::Io)?;
+    if !meta.is_file() {
+        return Err(OpenRegularError::NotRegularFile);
+    }
+    if meta.len() > cap {
+        return Err(OpenRegularError::TooLarge);
+    }
+    Ok(file)
+}
+
+/// Read at most `cap` bytes from a regular file at `path`, race-free.
+///
+/// Wraps [`open_regular_capped`] (so FIFOs/devices/oversized files are refused
+/// without blocking or unbounded allocation) and then reads through a
+/// `take(cap + 1)` so a TOCTOU grow BETWEEN the `fstat` and the read is caught:
+/// if the handle delivers more than `cap` bytes the read is rejected as
+/// [`OpenRegularError::TooLarge`] rather than buffered. Shared by the
+/// command-card read, the incident-flag read, and the baseline-salt read.
+pub fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
+    use std::io::Read as _;
+    let file = open_regular_capped(path, cap)?;
+    let mut buf = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(OpenRegularError::Io)?;
+    if buf.len() as u64 > cap {
+        return Err(OpenRegularError::TooLarge);
+    }
+    Ok(buf)
+}
 
 /// Read a line-oriented store, returning the TRIMMED, non-empty lines.
 ///
@@ -32,42 +136,36 @@ use std::time::{Duration, Instant};
 /// lines we can (callers degrade gracefully), but emit a ONE-LINE stderr
 /// diagnostic so the operator is warned rather than the failure being silent.
 ///
-/// ## Special files (CodeRabbit R9 #C)
+/// ## Special files (CodeRabbit R9 #C, hardened R11 #1)
 ///
 /// The canary/taint stores are read on the hot path; a store path an attacker
-/// could point at a FIFO/device would BLOCK `BufRead::lines()` forever. We
-/// `stat` first and refuse to read anything that is not a regular file (a
-/// diagnostic + empty), so the hot path never blocks on a special file. No byte
-/// cap is applied: the stores are legitimately multi-MiB (baseline holds up to
-/// `MAX_ENTRIES`) and are bounded by compaction, so capping would silently drop
-/// live entries.
+/// could point at a FIFO/device would BLOCK `BufRead::lines()` forever. We go
+/// through the shared, race-free [`open_regular_capped`] helper — it opens with
+/// `O_NONBLOCK` and `fstat`s the OPEN fd, so a FIFO/device is refused (a
+/// diagnostic + empty) WITHOUT the metadata→open TOCTOU a separate `stat`+`open`
+/// leaves. `metadata`/`fstat` follow symlinks, so a symlink to a FIFO/device is
+/// correctly rejected too. No byte cap is applied (`u64::MAX`): the stores are
+/// legitimately multi-MiB (baseline holds up to `MAX_ENTRIES`) and are bounded by
+/// compaction, so capping would silently drop live entries.
 pub fn read_store_lines(path: &Path) -> Vec<String> {
-    // `stat` first: distinguish truly-absent (silent empty) from
-    // present-but-unreadable / non-regular (warn). `metadata` follows symlinks,
-    // so a symlink to a FIFO/device is correctly rejected by `is_file()`.
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => {
-            // Present but NOT a regular file (FIFO/device/socket/dir). Reading it
-            // could block the hot path forever — refuse, warn, return empty.
+    // `open_regular_capped` opens-then-fstats (race-free) and distinguishes:
+    //   NotFound       → truly absent: empty, no diagnostic (common first use).
+    //   NotRegularFile → FIFO/device/socket/dir: warn + empty (never block).
+    //   Io             → present-but-unreadable (permissions, etc.): warn + empty.
+    // `cap == u64::MAX` so the size gate never trips for a legitimately large
+    // store; `TooLarge` is therefore unreachable here but handled for totality.
+    let file = match open_regular_capped(path, u64::MAX) {
+        Ok(f) => f,
+        Err(OpenRegularError::NotFound) => return Vec::new(),
+        Err(OpenRegularError::NotRegularFile) => {
             warn_store_unreadable(path, "not a regular file");
             return Vec::new();
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Legitimately absent → empty, no diagnostic (the common first-use case).
+        Err(OpenRegularError::TooLarge) => {
+            warn_store_unreadable(path, "exceeds read cap");
             return Vec::new();
         }
-        Err(e) => {
-            warn_store_unreadable(path, &e.to_string());
-            return Vec::new();
-        }
-    }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        // Raced from regular-file to gone between stat and open → treat as absent.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            // Present-but-unreadable (e.g. permissions): warn, don't fail silent.
+        Err(OpenRegularError::Io(e)) => {
             warn_store_unreadable(path, &e.to_string());
             return Vec::new();
         }
@@ -280,6 +378,130 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
         }
     }
     dp[m][n]
+}
+
+#[cfg(test)]
+mod open_regular_tests {
+    use super::{open_regular_capped, read_regular_capped, read_store_lines, OpenRegularError};
+    use tempfile::tempdir;
+
+    #[test]
+    fn regular_file_within_cap_reads() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("ok.bin");
+        std::fs::write(&p, b"hello").unwrap();
+        let bytes = read_regular_capped(&p, 1024).expect("regular file reads");
+        assert_eq!(bytes, b"hello");
+        // The handle-returning form opens it too.
+        assert!(open_regular_capped(&p, 1024).is_ok());
+    }
+
+    #[test]
+    fn oversized_regular_file_is_rejected_before_read() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        // One byte over the cap. The fstat size gate must reject it.
+        std::fs::write(&p, vec![b'x'; 1025]).unwrap();
+        assert!(matches!(
+            read_regular_capped(&p, 1024),
+            Err(OpenRegularError::TooLarge)
+        ));
+        assert!(matches!(
+            open_regular_capped(&p, 1024),
+            Err(OpenRegularError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn exactly_cap_bytes_is_accepted() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("exact.bin");
+        std::fs::write(&p, vec![b'y'; 1024]).unwrap();
+        let bytes = read_regular_capped(&p, 1024).expect("exactly cap is fine");
+        assert_eq!(bytes.len(), 1024);
+    }
+
+    #[test]
+    fn absent_path_is_not_found() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("nope.bin");
+        assert!(matches!(
+            read_regular_capped(&p, 1024),
+            Err(OpenRegularError::NotFound)
+        ));
+        assert!(matches!(
+            open_regular_capped(&p, 1024),
+            Err(OpenRegularError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn directory_is_not_regular_file() {
+        let dir = tempdir().unwrap();
+        // The temp dir itself is a directory — opening it as a "regular file"
+        // must be rejected by the fstat (cross-platform: a dir is never a file).
+        match open_regular_capped(dir.path(), 1024) {
+            Err(OpenRegularError::NotRegularFile) => {}
+            // Some platforms refuse to `open` a directory for reading at all,
+            // surfacing an Io error instead — also acceptable (still not handed
+            // back as a readable regular file, still no block).
+            Err(OpenRegularError::Io(_)) => {}
+            other => panic!("a directory must not open as a regular file, got {other:?}"),
+        }
+    }
+
+    /// R11 #1: a FIFO at a store path must NOT hang `read_store_lines`. The
+    /// shared helper opens with O_NONBLOCK and rejects the FIFO via the post-open
+    /// fstat, so the store reads as EMPTY and returns promptly. A regression to a
+    /// blocking read would HANG here (caught by the suite timeout). Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_store_does_not_hang_and_reads_empty() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("store.fifo");
+        let c_path = CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // Must complete promptly; a blocking read on the FIFO would hang.
+        assert!(
+            read_store_lines(&fifo).is_empty(),
+            "a FIFO store must read as empty, not block"
+        );
+        // And the helper itself rejects it as non-regular (no block).
+        assert!(matches!(
+            open_regular_capped(&fifo, u64::MAX),
+            Err(OpenRegularError::NotRegularFile)
+        ));
+    }
+
+    /// R11 #1: a symlink pointing at a FIFO must also be rejected — `fstat` on the
+    /// open fd follows the symlink to the FIFO inode and refuses it — without
+    /// blocking. Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_fifo_does_not_hang() {
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let real_fifo = dir.path().join("real.fifo");
+        let c_path = CString::new(real_fifo.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        let link = dir.path().join("link.fifo");
+        std::os::unix::fs::symlink(&real_fifo, &link).unwrap();
+        assert!(
+            read_store_lines(&link).is_empty(),
+            "a symlink-to-FIFO store must read as empty, not block"
+        );
+        assert!(matches!(
+            read_regular_capped(&link, 4096),
+            Err(OpenRegularError::NotRegularFile)
+        ));
+    }
 }
 
 #[cfg(test)]

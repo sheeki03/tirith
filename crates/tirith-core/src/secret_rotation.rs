@@ -253,7 +253,19 @@ pub static PROVIDERS: &[Provider] = &[
         // service key, SSH key, or unrelated PEM uses it) and would misroute
         // every bare private key to GCP. We keep only GCP-distinctive shapes:
         // the `AIza` API-key prefix and the service-account JSON `type` field.
-        key_prefix_shapes: &["AIza", "\"type\": \"service_account\""],
+        //
+        // BOTH the spaced and MINIFIED `type` shapes are listed (CodeRabbit R11
+        // #8): a service-account key file is commonly stored minified (no spaces
+        // after the colon), and the substring scan is literal on spacing — without
+        // the minified form a `{"type":"service_account",...}` record would not
+        // attribute. (Case is already handled — `match_provider` lowercases both
+        // sides.) The minified shape is longer, so when both match it wins the
+        // longest-match tie-break, still routing to gcp.
+        key_prefix_shapes: &[
+            "AIza",
+            "\"type\": \"service_account\"",
+            "\"type\":\"service_account\"",
+        ],
         last_verified: LAST_VERIFIED,
     },
     Provider {
@@ -601,6 +613,24 @@ mod tests {
         assert_eq!(
             match_provider("{\"type\": \"service_account\", \"project_id\": \"x\"}")
                 .map(|p| p.provider),
+            Some("gcp")
+        );
+    }
+
+    #[test]
+    fn minified_service_account_json_attributes_to_gcp() {
+        // CodeRabbit R11 #8: a MINIFIED service-account record (no spaces after
+        // the colon — the common on-disk shape) must attribute to gcp. The substr
+        // scan is literal on spacing, so the minified shape has to be listed too.
+        assert_eq!(
+            match_provider("{\"type\":\"service_account\",\"project_id\":\"x\"}")
+                .map(|p| p.provider),
+            Some("gcp"),
+            "a minified service-account JSON must attribute to gcp"
+        );
+        // Case-insensitive too (redacted text may alter case).
+        assert_eq!(
+            match_provider("{\"TYPE\":\"SERVICE_ACCOUNT\"}").map(|p| p.provider),
             Some("gcp")
         );
     }
