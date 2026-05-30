@@ -2543,9 +2543,20 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     );
     fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
 
+    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
+    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
+    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
+    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
+    // same `dir` guard so cleanup stays tied to it.
+    let policy_root = dir.path().join("policy-root");
+    fs::create_dir_all(policy_root.join(".tirith")).unwrap();
+    fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
     let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
     }
 
     // Build a Paste context with the given clipboard-source tri-state. `raw_bytes`
@@ -2576,6 +2587,10 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_STATE_HOME", v),
             None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match prev_policy_root {
+            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
+            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
         }
     }
 
@@ -2666,9 +2681,20 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     );
     fs::write(tirith_state.join("clipboard_source.json"), disk_record_json).unwrap();
 
+    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
+    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
+    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
+    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
+    // same `dir` guard so cleanup stays tied to it.
+    let policy_root = dir.path().join("policy-root");
+    fs::create_dir_all(policy_root.join(".tirith")).unwrap();
+    fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
     let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
     }
 
     // The IN-MEMORY record handed to the engine: SAME (matching) content hash, so
@@ -2711,6 +2737,10 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_STATE_HOME", v),
             None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match prev_policy_root {
+            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
+            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
         }
     }
 
@@ -2785,9 +2815,20 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
         "precondition: no sidecar on disk"
     );
 
+    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
+    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
+    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
+    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
+    // same `dir` guard so cleanup stays tied to it.
+    let policy_root = dir.path().join("policy-root");
+    fs::create_dir_all(policy_root.join(".tirith")).unwrap();
+    fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
+
     let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    let prev_policy_root = std::env::var_os("TIRITH_POLICY_ROOT");
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+        std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
     }
 
     let analyze_paste = |state: ClipboardSourceState| {
@@ -2832,6 +2873,10 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_STATE_HOME", v),
             None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match prev_policy_root {
+            Some(v) => std::env::set_var("TIRITH_POLICY_ROOT", v),
+            None => std::env::remove_var("TIRITH_POLICY_ROOT"),
         }
     }
 

