@@ -12117,3 +12117,215 @@ fn paste_with_source_no_companion_file_is_graceful_noop() {
         "paste_source_mismatch must not fire without a companion record; got:\n{parsed}"
     );
 }
+
+// ===========================================================================
+// M12 ch2/ch3 — visual-audit + browser (host + install-extension)
+// ===========================================================================
+//
+// Isolation mirrors the canary / incident helpers: `XDG_STATE_HOME` carries the
+// `state_dir()` (where `tirith browser host` writes `clipboard_source.json`) and
+// `APPDATA`/`LOCALAPPDATA` pin it on Windows (etcetera resolves state/data dirs
+// from `%APPDATA%` there, not the XDG vars).
+
+/// `tirith visual-audit --non-interactive --pairs critical` must run headless,
+/// read NO stdin, and exit 0 — the documented CI-safe invocation.
+#[test]
+fn visual_audit_non_interactive_critical_exits_zero() {
+    let cfg = tempfile::tempdir().expect("config tempdir");
+    let out = tirith()
+        .args([
+            "visual-audit",
+            "--non-interactive",
+            "--pairs",
+            "critical",
+            "--json",
+        ])
+        // Isolate config_dir() so the result write (if any) never touches the
+        // real home; the non-interactive path records nothing, but we pin it
+        // for hygiene on every platform.
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .env("APPDATA", cfg.path())
+        .env("LOCALAPPDATA", cfg.path())
+        // Critically: no stdin is provided (inherited /dev/null under the test
+        // harness). A correct --non-interactive path must not block on a read.
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run tirith visual-audit");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "headless visual-audit must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // --json emits the result; every selected pair is skipped in this mode.
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("visual-audit --json must be parseable: {e}"));
+    let total = parsed["pairs_total"].as_u64().expect("pairs_total");
+    assert!(total > 0, "critical subset must present at least one pair");
+    assert_eq!(
+        parsed["skipped"].as_u64(),
+        Some(total),
+        "non-interactive mode records every pair as skipped; got:\n{parsed}"
+    );
+    assert_eq!(parsed["distinguishable"].as_u64(), Some(0));
+    assert_eq!(parsed["indistinguishable"].as_u64(), Some(0));
+}
+
+/// `tirith browser install-extension --json` (dry-run) emits the manifest with
+/// the host name, stdio transport, and the chrome-extension origin, and exits 0
+/// without writing anything.
+#[test]
+fn browser_install_extension_json_dry_run_emits_manifest() {
+    let out = tirith()
+        .args([
+            "browser",
+            "install-extension",
+            "--extension-id",
+            "abcdefghijklmnopabcdefghijklmnop",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run tirith browser install-extension");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dry-run install-extension must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("install-extension --json must be parseable: {e}"));
+    assert_eq!(parsed["host_name"], "sh.tirith.browser");
+    assert_eq!(parsed["written"], false, "dry-run must not write");
+    // The embedded manifest body parses and carries the required fields.
+    let manifest_str = parsed["manifest"].as_str().expect("manifest string");
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest_str).expect("manifest is valid JSON");
+    assert_eq!(manifest["name"], "sh.tirith.browser");
+    assert_eq!(manifest["type"], "stdio");
+    assert_eq!(
+        manifest["allowed_origins"][0],
+        "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"
+    );
+    // The path field is the resolved tirith exe (non-empty).
+    assert!(
+        manifest["path"]
+            .as_str()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false),
+        "manifest path must name the tirith executable; got:\n{manifest}"
+    );
+}
+
+/// `tirith browser host` fed one well-formed native-messaging frame on stdin
+/// (4-byte native-order length prefix + UTF-8 JSON) must write a
+/// `clipboard_source.json` that round-trips as a `ClipboardSourceRecord`, into
+/// the isolated state dir. Exits 0 on EOF.
+#[test]
+fn browser_host_writes_clipboard_source_from_frame() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().expect("state tempdir");
+
+    let body = br#"{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"deadbeefcafe","source_url":"https://docs.example.com/install","source_title":"Install Guide","hidden_text_detected":false}"#;
+    // Native-order u32 length prefix, matching `u32::from_ne_bytes` in the host.
+    let mut frame = (body.len() as u32).to_ne_bytes().to_vec();
+    frame.extend_from_slice(body);
+
+    let mut child = tirith()
+        .args(["browser", "host"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith browser host");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(&frame)
+        .expect("write frame to host stdin");
+    // Dropping stdin (via take + write_all + end of scope) closes the pipe →
+    // the host sees EOF and exits 0 after persisting the record.
+
+    let out = child.wait_with_output().expect("host wait");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "host must exit 0 on clean EOF; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The host wrote state_dir()/clipboard_source.json. state_dir() is
+    // $XDG_STATE_HOME/tirith on Unix; on Windows etcetera resolves it under the
+    // APPDATA/LOCALAPPDATA tree we pinned. Read via the library helper so the
+    // path resolution matches production exactly — but since the env is process
+    // local to the child, locate the file directly under the isolated root.
+    let unix_path = state.path().join("tirith").join("clipboard_source.json");
+    let raw = std::fs::read(&unix_path).unwrap_or_else(|e| {
+        panic!(
+            "clipboard_source.json must exist at {}: {e}",
+            unix_path.display()
+        )
+    });
+    let record: tirith_core::clipboard::ClipboardSourceRecord =
+        serde_json::from_slice(&raw).expect("written file round-trips as ClipboardSourceRecord");
+    assert_eq!(record.content_sha256, "deadbeefcafe");
+    assert_eq!(record.source_url, "https://docs.example.com/install");
+    assert_eq!(record.source_title, "Install Guide");
+    assert!(!record.hidden_text_detected);
+
+    // The host also acked the frame on stdout (a length-prefixed {"ok":true}).
+    assert!(
+        !out.stdout.is_empty(),
+        "host should write an ack frame to stdout"
+    );
+}
+
+/// `tirith browser host` fed GARBAGE (a valid-length frame whose body is not a
+/// valid record) must NOT write `clipboard_source.json`, and still exit 0 on
+/// EOF (a bad frame is dropped, not fatal).
+#[test]
+fn browser_host_drops_invalid_frame_without_writing() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().expect("state tempdir");
+
+    let body = b"this is not a clipboard source record";
+    let mut frame = (body.len() as u32).to_ne_bytes().to_vec();
+    frame.extend_from_slice(body);
+
+    let mut child = tirith()
+        .args(["browser", "host"])
+        .env("XDG_STATE_HOME", state.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith browser host");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(&frame)
+        .expect("write garbage frame");
+
+    let out = child.wait_with_output().expect("host wait");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a dropped (schema-invalid) frame is not fatal; host exits 0 on EOF; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No file written: garbage never lands on disk.
+    let unix_path = state.path().join("tirith").join("clipboard_source.json");
+    assert!(
+        !unix_path.exists(),
+        "an invalid frame must not write clipboard_source.json"
+    );
+}

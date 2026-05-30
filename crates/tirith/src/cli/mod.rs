@@ -466,6 +466,8 @@ pub mod audit;
 pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
+pub mod browser;
+pub mod browser_host;
 pub mod canary;
 pub mod check;
 pub mod checkpoint;
@@ -521,6 +523,7 @@ pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;
 pub mod view;
+pub mod visual_audit;
 pub mod warnings;
 pub mod why;
 pub mod yaml;

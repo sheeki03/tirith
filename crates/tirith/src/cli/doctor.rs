@@ -1070,6 +1070,33 @@ struct CompatReport {
     /// PowerShell hook health. Absent on hosts without `pwsh` on PATH.
     #[serde(skip_serializing_if = "Option::is_none")]
     powershell_compat: Option<PsCompatInfo>,
+    /// M12 ch2 — summary of the last `tirith visual-audit` run. Absent when the
+    /// operator has never run a visual audit (the result file does not exist).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visual_audit: Option<VisualAuditCompatInfo>,
+}
+
+/// M12 ch2 — visual-audit summary for `tirith doctor --compat`.
+///
+/// Reported when `config_dir()/visual-audit-result.json` exists and is readable;
+/// absent otherwise (mirrors the `powershell_compat` "no signal at all" gating
+/// via the outer `Option`). The result is INHERENTLY LOCAL — `terminal` records
+/// the `$TERM` the audit ran under so a reader knows it describes this machine's
+/// rendering only. This is a diagnostic surface; it never gates behavior.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+struct VisualAuditCompatInfo {
+    /// RFC-3339 timestamp the recorded audit ran.
+    audited_at: String,
+    /// The `$TERM` value at audit time (may be empty if it was unset).
+    terminal: String,
+    /// Total pairs presented in the recorded run.
+    pairs_total: usize,
+    /// Pairs the operator marked distinguishable.
+    distinguishable: usize,
+    /// Pairs the operator marked INDISTINGUISHABLE (a local rendering risk).
+    indistinguishable: usize,
+    /// Pairs skipped (or all pairs, for a `--non-interactive` recording).
+    skipped: usize,
 }
 
 /// Build the compat report from the shared `gather_info()` state plus
@@ -1079,6 +1106,7 @@ fn gather_compat() -> CompatReport {
     let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
     let shell_tools = detect_shell_tool_conflicts(profile.as_deref());
     let powershell_compat = gather_ps_compat(&info.detected_shell);
+    let visual_audit = gather_visual_audit_compat();
 
     CompatReport {
         version: info.version,
@@ -1102,7 +1130,32 @@ fn gather_compat() -> CompatReport {
         threat_db: info.threat_db,
         shell_tools,
         powershell_compat,
+        visual_audit,
     }
+}
+
+/// M12 ch2 — read the last `tirith visual-audit` result from
+/// `config_dir()/visual-audit-result.json` and summarize it for the compat
+/// report. FAIL-SAFE: a missing, unreadable, oversized, or unparseable file
+/// yields `None` (no `visual_audit` key in the JSON / no section in the human
+/// report) — never a panic. Reads through the shared, race-free
+/// `read_regular_capped` helper so a result path swapped for a FIFO / device
+/// cannot hang `doctor`.
+fn gather_visual_audit_compat() -> Option<VisualAuditCompatInfo> {
+    let path = tirith_core::policy::config_dir()?.join("visual-audit-result.json");
+    // 64 KiB is far more than a genuine result (a timestamp + counts + ~20
+    // per-pair entries) needs; anything larger is treated as unreadable.
+    let bytes = tirith_core::util::read_regular_capped(&path, 64 * 1024).ok()?;
+    let result: crate::cli::visual_audit::VisualAuditResult =
+        serde_json::from_slice(&bytes).ok()?;
+    Some(VisualAuditCompatInfo {
+        audited_at: result.audited_at,
+        terminal: result.terminal,
+        pairs_total: result.pairs_total,
+        distinguishable: result.distinguishable,
+        indistinguishable: result.indistinguishable,
+        skipped: result.skipped,
+    })
 }
 
 /// Detect PowerShell hook compatibility for the `tirith doctor --compat` report.
@@ -1928,6 +1981,35 @@ fn format_compat_human(r: &CompatReport) -> String {
         // until shell hook files carry a `# tirith-hook-version:` tag.
     }
 
+    // Visual-audit summary — only emitted when the operator has run
+    // `tirith visual-audit` at least once (the result file exists). Same gating
+    // as the JSON field. The recorded answers describe only the terminal the
+    // audit ran under, so the `TERM` is shown alongside.
+    if let Some(va) = &r.visual_audit {
+        line("");
+        line("--- Visual audit (local terminal/font) ---");
+        let term = if va.terminal.is_empty() {
+            "(unset)"
+        } else {
+            va.terminal.as_str()
+        };
+        line(&format!("  recorded TERM:         {term}"));
+        line(&format!("  audited at:            {}", va.audited_at));
+        line(&format!("  pairs presented:       {}", va.pairs_total));
+        line(&format!("  distinguishable:       {}", va.distinguishable));
+        line(&format!(
+            "  indistinguishable:     {}{}",
+            va.indistinguishable,
+            if va.indistinguishable > 0 {
+                " (local rendering risk)"
+            } else {
+                ""
+            }
+        ));
+        line(&format!("  skipped:               {}", va.skipped));
+        line("  NOTE: describes this terminal + font only; not portable.");
+    }
+
     out
 }
 
@@ -2513,7 +2595,7 @@ fn reset_safe_mode() -> i32 {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::{with_fake_env, EnvGuard};
+    use crate::cli::test_harness::{with_fake_env, EnvGuard, ENV_LOCK};
 
     fn first_kiro(tools: &[DetectedTool]) -> Option<&DetectedTool> {
         tools.iter().find(|t| t.name == "kiro")
@@ -3193,6 +3275,7 @@ mod tests {
             threat_db: None,
             shell_tools: Vec::new(),
             powershell_compat: None,
+            visual_audit: None,
         }
     }
 
@@ -3329,6 +3412,113 @@ mod tests {
         assert!(
             out.contains("unknown (probe failed or timed out)"),
             "PSReadLine None branch must render 'unknown (probe failed or timed out)'; got:\n{out}"
+        );
+    }
+
+    // ── Visual-audit compat (M12 ch2) ─────────────────────────────────
+    //
+    // `gather_visual_audit_compat` reads `config_dir()/visual-audit-result.json`
+    // (driven by `XDG_CONFIG_HOME` on Unix via etcetera). These tests isolate
+    // `XDG_CONFIG_HOME` under `ENV_LOCK` so they don't race other env-mutating
+    // tests, and synthesize the result file directly (no live audit run).
+
+    /// A synthesized result file is read and summarized, fields intact.
+    #[test]
+    fn gather_visual_audit_compat_reads_synthesized_result() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().expect("config tempdir");
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", cfg.path());
+        // etcetera's config_dir() == $XDG_CONFIG_HOME, and tirith appends
+        // `tirith/`. Write the result where `config_dir()` will look.
+        let tirith_cfg = cfg.path().join("tirith");
+        std::fs::create_dir_all(&tirith_cfg).expect("mkdir tirith config");
+        std::fs::write(
+            tirith_cfg.join("visual-audit-result.json"),
+            r#"{
+                "audited_at": "2026-05-30T12:00:00+00:00",
+                "terminal": "xterm-256color",
+                "pairs_total": 12,
+                "distinguishable": 9,
+                "indistinguishable": 2,
+                "skipped": 1,
+                "results": []
+            }"#,
+        )
+        .expect("write result");
+
+        let info = gather_visual_audit_compat().expect("result file present → Some");
+        assert_eq!(info.terminal, "xterm-256color");
+        assert_eq!(info.pairs_total, 12);
+        assert_eq!(info.distinguishable, 9);
+        assert_eq!(info.indistinguishable, 2);
+        assert_eq!(info.skipped, 1);
+        assert_eq!(info.audited_at, "2026-05-30T12:00:00+00:00");
+    }
+
+    /// No result file → `None` (fail-safe), and the human report omits the
+    /// visual-audit section entirely.
+    #[test]
+    fn gather_visual_audit_compat_absent_is_none() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().expect("config tempdir");
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", cfg.path());
+        // No file written → None.
+        assert!(
+            gather_visual_audit_compat().is_none(),
+            "absent result file must fail-safe to None"
+        );
+
+        let mut report = compat_report_for("zsh", None);
+        report.visual_audit = None;
+        let out = format_compat_human(&report);
+        assert!(
+            !out.contains("Visual audit"),
+            "no visual-audit section should appear when the field is None; got:\n{out}"
+        );
+    }
+
+    /// A present-but-malformed result file → `None` (never a panic).
+    #[test]
+    fn gather_visual_audit_compat_malformed_is_none() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().expect("config tempdir");
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", cfg.path());
+        let tirith_cfg = cfg.path().join("tirith");
+        std::fs::create_dir_all(&tirith_cfg).expect("mkdir tirith config");
+        std::fs::write(
+            tirith_cfg.join("visual-audit-result.json"),
+            b"this is not json",
+        )
+        .expect("write malformed");
+        assert!(
+            gather_visual_audit_compat().is_none(),
+            "malformed result file must fail-safe to None"
+        );
+    }
+
+    /// When the field IS present, the human report renders the section with the
+    /// local-only caveat and the indistinguishable-risk hint.
+    #[test]
+    fn compat_human_renders_visual_audit_section() {
+        let mut report = compat_report_for("zsh", None);
+        report.visual_audit = Some(VisualAuditCompatInfo {
+            audited_at: "2026-05-30T12:00:00+00:00".to_string(),
+            terminal: "screen".to_string(),
+            pairs_total: 20,
+            distinguishable: 17,
+            indistinguishable: 3,
+            skipped: 0,
+        });
+        let out = format_compat_human(&report);
+        assert!(out.contains("Visual audit"), "section header; got:\n{out}");
+        assert!(out.contains("recorded TERM:"), "TERM line; got:\n{out}");
+        assert!(
+            out.contains("local rendering risk"),
+            "indistinguishable>0 must render the risk hint; got:\n{out}"
+        );
+        assert!(
+            out.contains("not portable"),
+            "local-only caveat must be present; got:\n{out}"
         );
     }
 }

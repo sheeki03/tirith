@@ -2437,6 +2437,129 @@ Examples:
         #[command(subcommand)]
         action: IncidentAction,
     },
+
+    /// Audit how well YOUR terminal + font tells confusable glyphs apart (M12 ch2)
+    #[command(after_help = "\
+Renders pairs of visually-confusable glyphs (Latin vs Cyrillic / Greek, fullwidth
+forms, math-alphanumeric letters, a zero-width space, a right-to-left override)
+and asks whether you can tell each pair apart IN YOUR TERMINAL AND FONT.
+
+The result is INHERENTLY LOCAL: whether two glyphs look identical depends on your
+terminal emulator + font + rendering stack, so the recorded answer describes only
+THIS machine and is not portable. tirith's homograph / confusable detection fires
+regardless of how your terminal renders these — this audit measures the other
+half: your own ability to notice an attack visually.
+
+Results are saved to config_dir()/visual-audit-result.json:
+  {audited_at, terminal: <$TERM>, pairs_total, distinguishable,
+   indistinguishable, skipped, results: [{name, codepoints, verdict}]}
+
+Flags:
+  --non-interactive   never prompt (CI-safe); records every pair as skipped, exit 0
+  --pairs critical     the high-signal subset (default)
+  --pairs all          every pair
+  --json               also emit the result as JSON on stdout
+
+Interactive prompting requires a TTY on stdin. A non-TTY run without
+--non-interactive prints a note and exits 0 (it does not block on a read).
+
+Examples:
+  tirith visual-audit
+  tirith visual-audit --pairs all
+  tirith visual-audit --non-interactive --pairs critical
+  tirith visual-audit --json")]
+    VisualAudit {
+        /// Skip all prompting (CI-safe); record every selected pair as skipped.
+        #[arg(long)]
+        non_interactive: bool,
+        /// Pair subset: `critical` (default) or `all`.
+        #[arg(long)]
+        pairs: Option<String>,
+        /// Also emit the result as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Browser companion: native-messaging host + extension manifest install (M12 ch3)
+    #[command(after_help = "\
+tirith pairs with a companion browser extension (shipped from a SEPARATE repo)
+that records where clipboard content was copied from, so the `paste_source_mismatch`
+rule can flag a paste whose source host differs from where the command runs.
+
+Subcommands:
+  host                native-messaging host. Chrome spawns this; it reads
+                      length-prefixed JSON frames on stdin, validates each
+                      against the clipboard-source schema, and writes
+                      state-dir/clipboard_source.json atomically. Untrusted
+                      input: frames are size-capped (256 KiB) and schema-checked
+                      before any write. Not meant to be run by hand.
+  install-extension   write the per-OS Chrome Native Messaging Host manifest
+                      (sh.tirith.browser.json) so the extension can launch the
+                      host. Dry-run by default (prints the manifest + path);
+                      --apply writes it. Windows uses a registry key — guidance
+                      is printed there rather than writing the registry.
+
+Because the extension is not yet published its Chrome id is unknown; pass
+--extension-id <id> or a clearly-marked placeholder is used.
+
+Examples:
+  tirith browser install-extension
+  tirith browser install-extension --apply
+  tirith browser install-extension --extension-id abcdefghijklmnopabcdefghijklmnop --apply
+  tirith browser install-extension --json")]
+    Browser {
+        #[command(subcommand)]
+        action: BrowserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrowserAction {
+    /// Run the Chrome native-messaging host (spawned by the extension, not by hand)
+    ///
+    /// Hidden from the top-level `--help` listing — Chrome's native-messaging
+    /// layer invokes this with stdin/stdout wired to the extension. It reads
+    /// 4-byte-length-prefixed UTF-8 JSON frames, validates each against the
+    /// clipboard-source schema, and writes `state-dir/clipboard_source.json`
+    /// atomically. Incoming frames are capped at 256 KiB.
+    #[command(hide = true)]
+    Host,
+
+    /// Write the per-OS Chrome Native Messaging Host manifest (dry-run unless --apply)
+    #[command(
+        name = "install-extension",
+        after_help = "\
+Writes the Chrome Native Messaging Host manifest (sh.tirith.browser.json) that
+lets the companion extension launch `tirith browser host`. Without --apply the
+manifest + target path are printed (dry-run). With --apply the manifest is
+written to the per-OS NativeMessagingHosts directory:
+  macOS: ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/
+  Linux: ~/.config/google-chrome/NativeMessagingHosts/
+  Windows: registry-based — guidance is printed, the registry is NOT modified.
+
+The extension id authorizes which extension may connect; pass --extension-id
+<id> (a real id is 32 letters a–p) or a clearly-marked placeholder is used.
+The write is idempotent.
+
+Examples:
+  tirith browser install-extension
+  tirith browser install-extension --apply
+  tirith browser install-extension --extension-id abcdefghijklmnopabcdefghijklmnop --apply
+  tirith browser install-extension --json"
+    )]
+    InstallExtension {
+        /// Chrome extension id allowed to connect (32 letters a–p). Defaults to
+        /// a documented placeholder when omitted.
+        #[arg(long)]
+        extension_id: Option<String>,
+        /// Actually write the manifest (creating the directory). Without this
+        /// flag the manifest is printed for inspection.
+        #[arg(long)]
+        apply: bool,
+        /// Emit a JSON envelope instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7150,6 +7273,24 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::incident::report(out, json)
             }
+        },
+
+        // M12 ch2 — local terminal/font confusability self-audit. CLI-only; no
+        // new RuleId. `--non-interactive --pairs critical` is headless-CI safe.
+        Commands::VisualAudit {
+            non_interactive,
+            pairs,
+            json,
+        } => cli::visual_audit::run(non_interactive, pairs, json),
+
+        // M12 ch3 — browser companion: native-messaging host + manifest install.
+        Commands::Browser { action } => match action {
+            BrowserAction::Host => cli::browser_host::run(),
+            BrowserAction::InstallExtension {
+                extension_id,
+                apply,
+                json,
+            } => cli::browser::install_extension(extension_id, apply, json),
         },
 
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.
