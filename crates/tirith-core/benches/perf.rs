@@ -65,7 +65,7 @@ fn bench_full_analysis_clean(c: &mut Criterion) {
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: None,
-                clipboard_source: None,
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -87,7 +87,7 @@ fn bench_full_analysis_url(c: &mut Criterion) {
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: None,
-                clipboard_source: None,
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -109,7 +109,7 @@ fn bench_full_analysis_complex(c: &mut Criterion) {
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: None,
-                clipboard_source: None,
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -134,7 +134,7 @@ fn bench_paste_analysis(c: &mut Criterion) {
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: None,
-                clipboard_source: None,
+                clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             };
             black_box(engine::analyze(&ctx));
         })

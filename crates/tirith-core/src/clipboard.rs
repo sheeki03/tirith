@@ -46,7 +46,12 @@ use thiserror::Error;
 /// a bool); 64 KiB is far more than a genuine record needs, so anything larger
 /// is treated as unreadable (→ `None`) rather than buffered. Mirrors the
 /// incident-flag / command-card read caps.
-const SOURCE_READ_CAP: u64 = 64 * 1024;
+///
+/// Public so the browser native-messaging host (`tirith browser host`) can reject
+/// a record whose serialized form would exceed what this READER will later accept
+/// — otherwise a 64–256 KiB record passes the host's wire-frame cap, is written,
+/// and is then unreadable by the paste-provenance path.
+pub const SOURCE_READ_CAP: u64 = 64 * 1024;
 
 /// One record written by the companion browser extension (M12 ch1) each time it
 /// sets the system clipboard. tirith reads (never writes) this file to attribute
@@ -74,6 +79,38 @@ pub struct ClipboardSourceRecord {
     /// selection (a risk signal the rule escalates on).
     #[serde(default)]
     pub hidden_text_detected: bool,
+}
+
+/// Tri-state describing what a caller knows about the companion clipboard-source
+/// record, threaded through [`crate::engine::AnalysisContext::clipboard_source`].
+///
+/// The earlier `Option<ClipboardSourceRecord>` collapsed two DISTINCT states into
+/// `None`: "the caller never tried to read the sidecar" and "the caller read it
+/// and found nothing usable". That ambiguity reopened the G1 TOCTOU window — when
+/// `tirith paste --with-source` read the file, found nothing, and set `None`, the
+/// engine would STILL re-read the file from disk, so a sidecar written between the
+/// two reads could fire `PasteSourceMismatch` while the CLI displayed "no source".
+/// The tri-state makes the caller's intent explicit:
+///
+/// * [`Unread`](ClipboardSourceState::Unread) — the caller did NOT consult the
+///   sidecar (e.g. plain `tirith paste`). The engine may read it once itself.
+/// * [`AbsentOrInvalid`](ClipboardSourceState::AbsentOrInvalid) — the caller
+///   DEFINITIVELY tried (`--with-source`) and found no usable record. The engine
+///   must NOT re-read disk: the caller already decided there is no source, so the
+///   finding and the CLI display cannot disagree.
+/// * [`Loaded`](ClipboardSourceState::Loaded) — the caller read a usable record
+///   and hands the SAME in-memory copy to the engine, so the
+///   `paste_source_mismatch` finding and the displayed attribution agree
+///   byte-for-byte.
+#[derive(Debug, Clone, Default)]
+pub enum ClipboardSourceState {
+    /// The caller never consulted the sidecar; the engine may read it once.
+    #[default]
+    Unread,
+    /// The caller tried and found no usable record; the engine must not re-read.
+    AbsentOrInvalid,
+    /// The caller loaded this record and passes it through unchanged.
+    Loaded(ClipboardSourceRecord),
 }
 
 /// Default on-disk path of the companion record: `state_dir()/clipboard_source.json`.
@@ -290,5 +327,18 @@ mod tests {
         assert!(!source_file_nonempty_at(&path));
         std::fs::write(&path, b"{}").unwrap();
         assert!(source_file_nonempty_at(&path));
+    }
+
+    /// The tri-state defaults to `Unread` — the safe "caller never looked"
+    /// state, so every `AnalysisContext` built without explicitly addressing the
+    /// clipboard sidecar lets the engine read it once itself (the historical
+    /// plain-`tirith paste` behavior). `AbsentOrInvalid` / `Loaded` are set ONLY
+    /// by a caller that definitively consulted the sidecar.
+    #[test]
+    fn clipboard_source_state_defaults_to_unread() {
+        assert!(matches!(
+            ClipboardSourceState::default(),
+            ClipboardSourceState::Unread
+        ));
     }
 }

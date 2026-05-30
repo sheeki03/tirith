@@ -42,15 +42,27 @@ pub struct AnalysisContext {
     /// `None` when no `--card` flag was passed. A `# tirith-card:` shell
     /// comment in `input` is a SEPARATE channel discovered during analysis.
     pub card_ref: Option<String>,
-    /// M12 ch1 — the companion clipboard-source record (G1 TOCTOU fix). When the
-    /// caller (`tirith paste`) has already read `clipboard_source.json` from disk
-    /// — e.g. to display it under `--with-source` — it sets the SAME in-memory
-    /// record here so the `paste_source_mismatch` rule and the displayed
-    /// attribution agree byte-for-byte. A fast copy-paste-copy can otherwise swap
-    /// the file between two independent reads. `None` (the default) means the
-    /// engine reads the record itself from `state_dir()/clipboard_source.json`.
+    /// M12 ch1 — the companion clipboard-source record (G1 TOCTOU fix), as a
+    /// tri-state so the engine can tell "caller never looked" apart from "caller
+    /// looked and found nothing":
+    ///
+    /// * [`Unread`](crate::clipboard::ClipboardSourceState::Unread) (the default)
+    ///   — the caller did NOT consult the sidecar (plain `tirith paste`); the
+    ///   engine reads `state_dir()/clipboard_source.json` once itself.
+    /// * [`AbsentOrInvalid`](crate::clipboard::ClipboardSourceState::AbsentOrInvalid)
+    ///   — the caller (`tirith paste --with-source`) DEFINITIVELY tried and found
+    ///   no usable record; the engine must NOT re-read disk (closing the TOCTOU a
+    ///   collapsed `None` reopened — a sidecar written between the CLI's read and
+    ///   the engine's would otherwise fire `paste_source_mismatch` while the CLI
+    ///   showed "no source").
+    /// * [`Loaded`](crate::clipboard::ClipboardSourceState::Loaded) — the caller
+    ///   read the record and hands the SAME in-memory copy here, so the
+    ///   `paste_source_mismatch` rule and the displayed attribution agree
+    ///   byte-for-byte (a fast copy-paste-copy can otherwise swap the file between
+    ///   two independent reads).
+    ///
     /// Paste context only; ignored elsewhere.
-    pub clipboard_source: Option<crate::clipboard::ClipboardSourceRecord>,
+    pub clipboard_source: crate::clipboard::ClipboardSourceState,
 }
 
 /// Check if a VAR=VALUE word is `TIRITH=0`, stripping optional surrounding quotes
@@ -1991,12 +2003,22 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // companion `clipboard_source.json` exist whose recorded content hash matches
     // this paste?), not a regex/byte signal. A pasted install command that is
     // otherwise tier-1-clean would fast-exit before the provenance scan ran (the
-    // tier-1 gating bug class — see CLAUDE.md). Force past the fast-exit ONLY when
-    // the companion file is non-empty: a single `metadata()` stat, so a machine
-    // without the companion browser extension pays nothing. Paste context only —
-    // the rule is paste-specific. Mirrors `canary_triggered`.
+    // tier-1 gating bug class — see CLAUDE.md). Force past the fast-exit when the
+    // caller already handed us a `Loaded` record, OR (only when the caller never
+    // looked, `Unread`) when the companion file is non-empty: a single
+    // `metadata()` stat, so a machine without the companion browser extension pays
+    // nothing. For `AbsentOrInvalid` the caller DEFINITIVELY found no usable record
+    // — we must neither stat nor re-read disk (that would reopen the G1 TOCTOU the
+    // tri-state closes). Paste context only — the rule is paste-specific. Mirrors
+    // `canary_triggered`.
     let paste_source_triggered = ctx.scan_context == ScanContext::Paste
-        && (ctx.clipboard_source.is_some() || crate::clipboard::source_file_nonempty());
+        && match ctx.clipboard_source {
+            crate::clipboard::ClipboardSourceState::Loaded(_) => true,
+            crate::clipboard::ClipboardSourceState::Unread => {
+                crate::clipboard::source_file_nonempty()
+            }
+            crate::clipboard::ClipboardSourceState::AbsentOrInvalid => false,
+        };
 
     // M11 ch1 — a `--card <path>` sidecar flag is not a regex/byte signal, so a
     // clean-looking command (`curl … | sh` already trips tier-1, but a bare
@@ -2541,14 +2563,22 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // scanned, not `analyzed_input` (which is the prelude-stripped command for
         // Exec; in Paste the `Cow` borrows unchanged, so they are equal here).
         if ctx.scan_context == ScanContext::Paste {
-            // G1 TOCTOU — read the companion record ONCE. Prefer the caller-
-            // supplied in-memory record (`tirith paste --with-source` sets it so
-            // the displayed `clipboard_source` and this finding cannot disagree
-            // after a fast copy-paste-copy); otherwise read it from disk here.
-            let rec = ctx
-                .clipboard_source
-                .clone()
-                .or_else(crate::clipboard::read_source_record);
+            // G1 TOCTOU — resolve the companion record from the tri-state, reading
+            // disk AT MOST once and ONLY when the caller never looked:
+            //   * Loaded(rec)    → use the caller's in-memory record, so the
+            //                      displayed `clipboard_source` and this finding
+            //                      cannot disagree after a fast copy-paste-copy;
+            //   * Unread         → read `state_dir()/clipboard_source.json` once;
+            //   * AbsentOrInvalid→ the caller DEFINITIVELY found no usable record;
+            //                      do NOT re-read disk (re-reading is what reopened
+            //                      the TOCTOU when both states were `None`).
+            let rec = match &ctx.clipboard_source {
+                crate::clipboard::ClipboardSourceState::Loaded(rec) => Some(rec.clone()),
+                crate::clipboard::ClipboardSourceState::Unread => {
+                    crate::clipboard::read_source_record()
+                }
+                crate::clipboard::ClipboardSourceState::AbsentOrInvalid => None,
+            };
             if let Some(rec) = rec {
                 findings.extend(crate::rules::paste_provenance::check_with_record(
                     &ctx.input, ctx.shell, &findings, &policy, &rec,
@@ -2879,7 +2909,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -3320,7 +3350,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         }
     }
 
@@ -3339,7 +3369,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         }
     }
 
@@ -3358,7 +3388,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         }
     }
 

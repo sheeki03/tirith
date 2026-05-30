@@ -135,14 +135,21 @@ non-zero rather than guessing where the next frame starts.
 
 ## Installing the host manifest
 
-`tirith browser install-extension` writes the manifest into Chrome's per-OS
-`NativeMessagingHosts` directory:
+`tirith browser install-extension` writes the manifest into the selected
+browser's per-OS `NativeMessagingHosts` directory. `--browser <chrome|chromium|brave|edge>`
+(default `chrome`) selects which one — each Chromium-family browser keeps its own
+directory, so installing to the wrong vendor leaves the manifest silently
+unfound. The macOS/Linux directories are (all hold `sh.tirith.browser.json`):
 
-| OS      | Manifest location                                                                   |
-| ------- | ----------------------------------------------------------------------------------- |
-| macOS   | `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/sh.tirith.browser.json` |
-| Linux   | `~/.config/google-chrome/NativeMessagingHosts/sh.tirith.browser.json`               |
-| Windows | registry key (see below) — the command prints guidance and does NOT write it        |
+| Browser  | macOS (`~/Library/Application Support/…`)             | Linux (`~/.config/…`)                  |
+| -------- | ----------------------------------------------------- | -------------------------------------- |
+| chrome   | `Google/Chrome/NativeMessagingHosts`                  | `google-chrome/NativeMessagingHosts`   |
+| chromium | `Chromium/NativeMessagingHosts`                       | `chromium/NativeMessagingHosts`        |
+| brave    | `BraveSoftware/Brave-Browser/NativeMessagingHosts`    | `BraveSoftware/Brave-Browser/NativeMessagingHosts` |
+| edge     | `Microsoft Edge/NativeMessagingHosts`                 | `microsoft-edge/NativeMessagingHosts`  |
+
+On **Windows** every browser is registry-based (see below) — the command prints
+guidance per browser and does NOT write the registry.
 
 The manifest body is:
 
@@ -170,14 +177,24 @@ a note that the real ID is required before the host will accept a connection.
 
 ### Windows
 
-On Windows, Chrome discovers a native-messaging host via a **registry key**
-rather than a directory drop. `tirith browser install-extension` does not modify
-the registry; it prints the manifest body and tells you to:
+On Windows, Chromium-family browsers discover a native-messaging host via a
+**registry key** rather than a directory drop. `tirith browser install-extension`
+does not modify the registry; it prints the manifest body and tells you to:
 
 1. Save the manifest to a file (e.g. `%LOCALAPPDATA%\tirith\sh.tirith.browser.json`).
-2. Create the key
-   `HKCU\Software\Google\Chrome\NativeMessagingHosts\sh.tirith.browser` with its
-   default value set to that file's path.
+2. Create the key `HKCU\<root>\sh.tirith.browser` with its default value set to
+   that file's path, where `<root>` is the registry root for the `--browser` you
+   selected:
+
+   | Browser  | Registry root (`HKCU\…`)                                |
+   | -------- | ------------------------------------------------------- |
+   | chrome   | `Software\Google\Chrome\NativeMessagingHosts`           |
+   | chromium | `Software\Chromium\NativeMessagingHosts`                |
+   | brave    | `Software\BraveSoftware\Brave-Browser\NativeMessagingHosts` |
+   | edge     | `Software\Microsoft\Edge\NativeMessagingHosts`          |
+
+   (The printed guidance fills in the root for the browser you passed, so
+   `--browser edge` names the Edge key, not Chrome's.)
 
 ## Examples
 

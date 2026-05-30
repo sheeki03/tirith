@@ -259,7 +259,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         };
 
         // Interactive prelude — show description, prompt before revealing

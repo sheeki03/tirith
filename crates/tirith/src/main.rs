@@ -7302,9 +7302,12 @@ fn run() {
                 json,
             } => match browser.parse::<cli::browser::Browser>() {
                 Ok(browser) => cli::browser::install_extension(extension_id, browser, apply, json),
+                // An invalid `--browser` value is an argument-validation (usage)
+                // error → exit 2, consistent with the other CLI validation paths
+                // (e.g. `share` / `redact` audience parsing), not a runtime failure.
                 Err(e) => {
                     eprintln!("tirith browser install-extension: {e}");
-                    1
+                    2
                 }
             },
         },

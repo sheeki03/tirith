@@ -36,7 +36,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     engine::analyze(&ctx)
 }
@@ -565,7 +565,7 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     engine::analyze(&ctx)
 }

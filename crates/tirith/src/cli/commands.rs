@@ -655,7 +655,7 @@ fn analyze_command(
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     engine::analyze_returning_policy(&ctx)
 }

@@ -62,13 +62,38 @@ pub fn run(
         }
     });
 
-    // M12 ch1 — G1 TOCTOU fix: read the companion clipboard-source record ONCE
-    // here and feed the SAME in-memory record to BOTH the engine (which fires
-    // `paste_source_mismatch`) and the `--with-source` display below. Previously
-    // the engine read `clipboard_source.json` and `resolve_source_attribution`
-    // read it AGAIN, so a fast copy-paste-copy could make the displayed
-    // `clipboard_source` disagree with the finding. One read closes that window.
-    let clipboard_source = tirith_core::clipboard::read_source_record();
+    // M12 ch1 — G1 TOCTOU fix, completed with the tri-state. ONLY `--with-source`
+    // consults the companion `clipboard_source.json`, and it reads it EXACTLY
+    // ONCE: the same in-memory record feeds BOTH the engine (which fires
+    // `paste_source_mismatch`) and the `--with-source` display below. The result
+    // is mapped to a `ClipboardSourceState` so the engine can tell "the CLI tried
+    // and found nothing" (`AbsentOrInvalid`) apart from "the CLI never looked"
+    // (`Unread`):
+    //
+    //   * `--with-source` + record found → `Loaded(rec)`; the engine uses this
+    //     exact record, so the displayed `clipboard_source` and the finding can
+    //     never disagree after a fast copy-paste-copy.
+    //   * `--with-source` + nothing found → `AbsentOrInvalid`; the engine must NOT
+    //     re-read disk. Previously this collapsed to `None`, and the engine then
+    //     re-read the file — so a sidecar WRITTEN between the CLI's read and the
+    //     engine's could fire `paste_source_mismatch` while the CLI showed "no
+    //     source". The tri-state closes that window.
+    //   * no `--with-source` → `Unread`; the CLI did not consult the sidecar and
+    //     does not display it, so the engine reads it once itself (the historical
+    //     plain-`tirith paste` behavior, unchanged).
+    let display_record = if with_source {
+        tirith_core::clipboard::read_source_record()
+    } else {
+        None
+    };
+    let clipboard_source_state = if with_source {
+        match display_record.clone() {
+            Some(rec) => tirith_core::clipboard::ClipboardSourceState::Loaded(rec),
+            None => tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        }
+    } else {
+        tirith_core::clipboard::ClipboardSourceState::Unread
+    };
 
     let ctx = AnalysisContext {
         input,
@@ -84,7 +109,7 @@ pub fn run(
         is_config_override: false,
         clipboard_html,
         card_ref: None,
-        clipboard_source: clipboard_source.clone(),
+        clipboard_source: clipboard_source_state,
     };
 
     // PR #121 fix-list item 18 (mirrors `install.rs:760` / `check.rs`):
@@ -158,7 +183,7 @@ pub fn run(
         let source_attribution = if with_source {
             Some(resolve_source_attribution(
                 &ctx.input,
-                clipboard_source.as_ref(),
+                display_record.as_ref(),
             ))
         } else {
             None
@@ -174,7 +199,7 @@ pub fn run(
         // note to stderr (the structured keys live in `--json`). Graceful when no
         // source was recorded for this paste.
         if with_source {
-            match resolve_source_attribution(&ctx.input, clipboard_source.as_ref()) {
+            match resolve_source_attribution(&ctx.input, display_record.as_ref()) {
                 serde_json::Value::Null => {
                     eprintln!("tirith paste: no clipboard source recorded for this paste");
                 }

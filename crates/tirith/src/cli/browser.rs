@@ -77,6 +77,21 @@ impl Browser {
             Browser::Edge => "edge",
         }
     }
+
+    /// The Windows registry root under which this browser looks for native-
+    /// messaging host keys (`HKCU\<root>\<HOST_NAME>`). Each Chromium-family
+    /// browser uses its own vendor sub-tree, mirroring the per-browser
+    /// `NativeMessagingHosts` directories [`manifest_path`] targets on
+    /// macOS/Linux — so `--browser edge` no longer points the operator at the
+    /// Chrome key.
+    fn windows_registry_root(self) -> &'static str {
+        match self {
+            Browser::Chrome => "Software\\Google\\Chrome\\NativeMessagingHosts",
+            Browser::Chromium => "Software\\Chromium\\NativeMessagingHosts",
+            Browser::Brave => "Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts",
+            Browser::Edge => "Software\\Microsoft\\Edge\\NativeMessagingHosts",
+        }
+    }
 }
 
 /// `true` when `id` is a well-formed Chrome extension ID: exactly 32 characters,
@@ -183,7 +198,7 @@ pub fn install_extension(
                     "extension_id": extension_id,
                     "extension_id_is_placeholder": is_placeholder,
                     "manifest": manifest,
-                    "note": windows_guidance(&exe),
+                    "note": windows_guidance(&exe, browser),
                 });
                 if !write_json_stdout(
                     &env,
@@ -194,7 +209,7 @@ pub fn install_extension(
             } else {
                 eprintln!(
                     "tirith browser install-extension: {}",
-                    windows_guidance(&exe)
+                    windows_guidance(&exe, browser)
                 );
                 eprintln!("tirith browser install-extension: manifest body to register:");
                 println!("{manifest}");
@@ -270,11 +285,8 @@ pub fn install_extension(
     // ---- --apply: write the manifest (idempotent) --------------------------
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "tirith browser install-extension: failed to create {}: {e}",
-                parent.display()
-            );
-            return 1;
+            let msg = format!("failed to create {}: {e}", parent.display());
+            return apply_failure(json, platform, browser, &path, &msg);
         }
     }
 
@@ -285,11 +297,8 @@ pub fn install_extension(
         if let Err(e) =
             super::write_file_atomic(&path, manifest.as_bytes(), /*overwrite=*/ true)
         {
-            eprintln!(
-                "tirith browser install-extension: failed to write {}: {e}",
-                path.display()
-            );
-            return 1;
+            let msg = format!("failed to write {}: {e}", path.display());
+            return apply_failure(json, platform, browser, &path, &msg);
         }
     }
 
@@ -330,6 +339,39 @@ pub fn install_extension(
         }
     }
     0
+}
+
+/// Emit an apply-time (`--apply`) write failure and return the non-zero exit
+/// code. When `json` is set this writes the SAME parseable error envelope the
+/// early error paths use (`platform` / `browser` / `host_name` / `written:false`
+/// / `error`), additionally carrying the `manifest_path` we were writing to (the
+/// path is known here, unlike the HOME-unresolvable early path). Keeps
+/// `install-extension --json --apply` machine-readable on `create_dir_all` /
+/// `write_file_atomic` errors instead of printing plain text.
+fn apply_failure(
+    json: bool,
+    platform: &str,
+    browser: Browser,
+    path: &std::path::Path,
+    msg: &str,
+) -> i32 {
+    if json {
+        let env = serde_json::json!({
+            "platform": platform,
+            "browser": browser.as_str(),
+            "host_name": HOST_NAME,
+            "manifest_path": path.display().to_string(),
+            "written": false,
+            "error": msg,
+        });
+        let _ = write_json_stdout(
+            &env,
+            "tirith browser install-extension: failed to write JSON output",
+        );
+    } else {
+        eprintln!("tirith browser install-extension: {msg}");
+    }
+    1
 }
 
 /// Build the native messaging host manifest JSON for the given executable path
@@ -427,13 +469,15 @@ fn manifest_path(browser: Browser) -> Option<PathBuf> {
 }
 
 /// Guidance text printed on Windows, where the host is registered via a registry
-/// key rather than a directory drop.
-fn windows_guidance(exe: &str) -> String {
+/// key rather than a directory drop. The registry root is per-browser (G2/N4):
+/// `--browser edge` names the Edge sub-tree, not Chrome's.
+fn windows_guidance(exe: &str, browser: Browser) -> String {
+    let root = browser.windows_registry_root();
     format!(
         "on Windows, register the native messaging host via the registry rather than a file drop. \
          Save the manifest body below to a file (e.g. %LOCALAPPDATA%\\tirith\\{HOST_NAME}.json), \
          then create the key \
-         HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{HOST_NAME} with its default value \
+         HKCU\\{root}\\{HOST_NAME} with its default value \
          set to that file's path. The host executable is: {exe}"
     )
 }
@@ -498,14 +542,42 @@ mod tests {
         );
     }
 
-    /// Windows guidance names the registry key and the host executable so a
-    /// Windows operator can register it manually.
+    /// Windows guidance names the (Chrome) registry key and the host executable
+    /// so a Windows operator can register it manually.
     #[test]
     fn windows_guidance_mentions_registry_and_exe() {
-        let g = windows_guidance("C:\\tools\\tirith.exe");
+        let g = windows_guidance("C:\\tools\\tirith.exe", Browser::Chrome);
         assert!(g.contains("HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts"));
         assert!(g.contains(HOST_NAME));
         assert!(g.contains("C:\\tools\\tirith.exe"));
+    }
+
+    /// N4 — `--browser` is honored in the Windows guidance: Edge guidance names
+    /// the EDGE registry root (not Chrome's), so an Edge user is pointed at the
+    /// key Edge actually reads. Brave / Chromium likewise carry their own roots.
+    #[test]
+    fn windows_guidance_honors_browser_registry_root() {
+        let edge = windows_guidance("C:\\tools\\tirith.exe", Browser::Edge);
+        assert!(
+            edge.contains("HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts"),
+            "Edge guidance must name the Edge registry root; got: {edge}"
+        );
+        assert!(
+            !edge.contains("Google\\Chrome"),
+            "Edge guidance must NOT point at the Chrome root; got: {edge}"
+        );
+
+        let brave = windows_guidance("C:\\tools\\tirith.exe", Browser::Brave);
+        assert!(
+            brave.contains("HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts"),
+            "Brave guidance must name the Brave registry root; got: {brave}"
+        );
+
+        let chromium = windows_guidance("C:\\tools\\tirith.exe", Browser::Chromium);
+        assert!(
+            chromium.contains("HKCU\\Software\\Chromium\\NativeMessagingHosts"),
+            "Chromium guidance must name the Chromium registry root; got: {chromium}"
+        );
     }
 
     /// On the file-drop platforms the manifest path ends in the host filename

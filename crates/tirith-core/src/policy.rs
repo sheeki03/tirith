@@ -2509,7 +2509,7 @@ mod tests {
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: None,
-                clipboard_source: None,
+                clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             };
             let v = analyze(&ctx);
             assert!(

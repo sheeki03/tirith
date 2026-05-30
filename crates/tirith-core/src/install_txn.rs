@@ -360,7 +360,7 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;

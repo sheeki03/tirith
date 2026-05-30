@@ -119,7 +119,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let verdict = engine::analyze(&ctx);
 

@@ -38,13 +38,27 @@
 
 use std::io::{Read, Write};
 
+use tirith_core::clipboard::SOURCE_READ_CAP;
+
 /// Hard cap on a single incoming frame: 256 KiB. The companion record is a tiny
 /// JSON object (timestamp, sha256 hex, URL, title, bool) — far under this. The
 /// cap exists so a hostile / desynced length prefix cannot make us allocate an
 /// arbitrary buffer. Mirrors the 64 KiB read cap on the file side
-/// (`tirith_core::clipboard::SOURCE_READ_CAP`) with generous headroom for the
-/// wire form.
+/// ([`SOURCE_READ_CAP`]) with generous headroom for the wire form.
 pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
+
+/// `true` when a re-serialized record (`serde_json::to_vec_pretty`) is small
+/// enough that the FILE-side reader ([`tirith_core::clipboard::read_source_record`],
+/// capped at [`SOURCE_READ_CAP`]) will accept it. The wire-frame cap
+/// ([`MAX_FRAME_BYTES`], 256 KiB) is larger than the read cap (64 KiB), so a
+/// record in that 64–256 KiB band would pass the frame check, be written, then be
+/// silently UNREADABLE — we refuse to persist it. `read_regular_capped` rejects a
+/// file STRICTLY larger than the cap (it reads `cap + 1` and fails if it gets that
+/// many), so a serialized form of exactly `SOURCE_READ_CAP` bytes is still
+/// readable; the boundary here matches (`<=`).
+fn serialized_fits_read_cap(bytes: &[u8]) -> bool {
+    bytes.len() as u64 <= SOURCE_READ_CAP
+}
 
 /// Outcome of attempting to read one native-messaging frame from a reader.
 #[derive(Debug)]
@@ -208,6 +222,20 @@ pub fn run() -> i32 {
                         // the engine reads. Pretty-printed to match the M12 ch1
                         // on-disk form.
                         match serde_json::to_vec_pretty(&record) {
+                            Ok(bytes) if !serialized_fits_read_cap(&bytes) => {
+                                // The wire-frame cap (256 KiB) is the first-line
+                                // defense, but the FILE-side reader caps at
+                                // `SOURCE_READ_CAP` (64 KiB): a 64–256 KiB record
+                                // would be ack'd ok, written, then be UNREADABLE by
+                                // the paste-provenance path. Reject it here so we
+                                // never persist a record the consumer can't read
+                                // back. Ack false; nothing touches disk.
+                                eprintln!(
+                                    "tirith browser host: dropped a record whose serialized form ({} bytes) exceeds the {SOURCE_READ_CAP}-byte read cap",
+                                    bytes.len()
+                                );
+                                let _ = write_ack(&mut stdout, false);
+                            }
                             Ok(bytes) => {
                                 if let Err(e) = persist(&out_path, &bytes) {
                                     eprintln!(
@@ -423,6 +451,56 @@ mod tests {
         let reserialized = serde_json::to_vec_pretty(&rec).unwrap();
         let back = parse_record(&reserialized).expect("reserialized record parses");
         assert_eq!(back, rec);
+    }
+
+    /// A schema-VALID record whose re-serialized (pretty) form exceeds the file-
+    /// side read cap (`SOURCE_READ_CAP`, 64 KiB) is rejected by
+    /// `serialized_fits_read_cap`, so the host never persists a record the
+    /// paste-provenance reader can't read back. The oversized record is still a
+    /// genuine `ClipboardSourceRecord` (it parses), proving the rejection is about
+    /// SIZE, not schema. A normal record fits.
+    #[test]
+    fn oversized_serialized_record_is_rejected_before_persist() {
+        // A valid record with a `source_title` large enough that the pretty-printed
+        // serialization clears the 64 KiB read cap.
+        let big_title = "A".repeat(SOURCE_READ_CAP as usize + 1);
+        let record = tirith_core::clipboard::ClipboardSourceRecord {
+            updated_at: "2026-05-30T00:00:00Z".to_string(),
+            content_sha256: "abc123".to_string(),
+            source_url: "https://docs.example.com/install".to_string(),
+            source_title: big_title,
+            hidden_text_detected: false,
+        };
+        // It round-trips through the wire framing as a VALID record (schema-clean),
+        // so the only reason to drop it is the read-cap check.
+        let wire = frame(serde_json::to_vec(&record).unwrap().as_slice());
+        let mut cursor = std::io::Cursor::new(wire.clone());
+        let FrameRead::Frame(payload) = read_frame(&mut cursor) else {
+            panic!("oversized-but-valid record must still frame");
+        };
+        let parsed = parse_record(&payload).expect("the record is schema-valid");
+
+        // The re-serialized (pretty) form is what the host would write — it exceeds
+        // the read cap, so the host must NOT persist it.
+        let serialized = serde_json::to_vec_pretty(&parsed).unwrap();
+        assert!(
+            serialized.len() as u64 > SOURCE_READ_CAP,
+            "test setup: serialized form must exceed the read cap"
+        );
+        assert!(
+            !serialized_fits_read_cap(&serialized),
+            "an oversized serialized record must be rejected before persist"
+        );
+
+        // A normal record fits and would be persisted.
+        let small = serde_json::to_vec_pretty(
+            &parse_record(VALID_JSON.as_bytes()).expect("VALID_JSON parses"),
+        )
+        .unwrap();
+        assert!(
+            serialized_fits_read_cap(&small),
+            "a genuine small record must pass the read-cap check"
+        );
     }
 
     /// The ack frame is itself a valid native-messaging frame whose body is the

@@ -12222,6 +12222,23 @@ fn browser_install_extension_json_dry_run_emits_manifest() {
     );
 }
 
+/// An invalid `--browser` value is an argument-validation (usage) error, so
+/// `tirith browser install-extension --browser <bogus>` exits 2 (not 1),
+/// consistent with the other CLI validation paths.
+#[test]
+fn browser_install_extension_invalid_browser_exits_2() {
+    let out = tirith()
+        .args(["browser", "install-extension", "--browser", "safari"])
+        .output()
+        .expect("failed to run tirith browser install-extension");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an invalid --browser must exit 2 (usage); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `tirith browser host` fed one well-formed native-messaging frame on stdin
 /// (4-byte native-order length prefix + UTF-8 JSON) must write a
 /// `clipboard_source.json` that round-trips as a `ClipboardSourceRecord`, into

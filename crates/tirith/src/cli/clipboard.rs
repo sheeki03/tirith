@@ -781,7 +781,7 @@ fn analyze_as_paste(input: &str) -> tirith_core::verdict::Verdict {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
-        clipboard_source: None,
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
     let mut verdict = engine::analyze(&ctx);
     // Apply paranoia filter against the active policy so the clipboard
