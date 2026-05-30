@@ -428,9 +428,17 @@ impl StoreLock {
             if e.kind() != std::io::ErrorKind::Unsupported {
                 return Err(e);
             }
-            // Unsupported: best-effort. Try once more (non-blocking) in case the
-            // backend supports try-locking, but never hard-fail on Unsupported.
-            let _ = file.try_lock_exclusive();
+            // Unsupported blocking lock: best-effort. Try once more (non-blocking)
+            // in case the backend supports try-locking — if that SUCCEEDS we hold
+            // the lock (released by `Drop`). A non-`Unsupported` error here is still
+            // a real lock failure and must fail loudly (CodeRabbit R13e), per the
+            // "only Unsupported → unlocked" contract above; only a SECOND
+            // `Unsupported` degrades to running unlocked.
+            if let Err(e2) = file.try_lock_exclusive() {
+                if e2.kind() != std::io::ErrorKind::Unsupported {
+                    return Err(e2);
+                }
+            }
         }
         Ok(StoreLock { file })
     }

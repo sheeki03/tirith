@@ -1800,7 +1800,12 @@ fn test_lab_corpus_reaches_tier3() {
         });
 
         let raw_bytes = match (scenario.raw_bytes.as_slice(), scan_context) {
-            ([], ScanContext::Paste) => Some(scenario.input.as_bytes().to_vec()),
+            // Mirror `run_fixture`'s fallback (CodeRabbit R13e): default the raw
+            // bytes from the input for BOTH Paste and FileScan, so lab-corpus
+            // file-scan scenarios exercise the same byte path as the main harness.
+            ([], ScanContext::Paste | ScanContext::FileScan) => {
+                Some(scenario.input.as_bytes().to_vec())
+            }
             ([], _) => None,
             (bytes, _) => Some(bytes.to_vec()),
         };
