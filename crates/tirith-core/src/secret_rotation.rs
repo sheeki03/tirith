@@ -308,8 +308,11 @@ pub static PROVIDERS: &[Provider] = &[
         // #8): a service-account key file is commonly stored minified (no spaces
         // after the colon), and the substring scan is literal on spacing — without
         // the minified form a `{"type":"service_account",...}` record would not
-        // attribute. (Case is already handled — `match_provider` lowercases both
-        // sides.) The minified shape is longer, so when both match it wins the
+        // attribute. These are listed in their REAL lowercase form: tier-1 is now
+        // matched case-sensitively (CodeRabbit R13d), and a genuine GCP key file
+        // always uses lowercase JSON keys, so case-sensitive matching catches every
+        // real key while avoiding word-false-matches on short prefixes elsewhere.
+        // The minified shape is longer, so when both match it wins the
         // longest-match tie-break, still routing to gcp.
         key_prefix_shapes: &[
             "AIza",
@@ -383,26 +386,42 @@ pub fn match_provider(finding_text: &str) -> Option<&'static Provider> {
     // lowercase BOTH the haystack and each shape before comparing. The
     // longest-match (then table-order) tie-break is preserved — lengths are
     // unchanged by ASCII-lowercasing, so `sk-ant-api` still beats `sk-`.
-    let haystack = finding_text.to_ascii_lowercase();
-    // TIER-1: real value shapes. A match here wins outright over any marker.
-    match_longest(&haystack, |p| p.key_prefix_shapes)
-        // TIER-2: env-var/config-key NAME markers, only when no value shape hit.
-        .or_else(|| match_longest(&haystack, |p| p.env_name_markers))
+    let lower = finding_text.to_ascii_lowercase();
+    // TIER-1: real value shapes, matched CASE-SENSITIVELY against the ORIGINAL
+    // text. A match here wins outright over any marker.
+    match_longest(finding_text, |p| p.key_prefix_shapes, true)
+        // TIER-2: env-var/config-key NAME markers, CASE-INSENSITIVE (pre-lowered
+        // haystack + lowered shapes), only when no value shape hit anywhere.
+        .or_else(|| match_longest(&lower, |p| p.env_name_markers, false))
 }
 
-/// Longest-match (table-order tie-break) of `lowercase_haystack` against the
-/// shape set `shapes_of(p)` for each provider. Shared by both tiers of
-/// [`match_provider`]; `lowercase_haystack` is pre-lowercased by the caller.
+/// Longest-match (table-order tie-break) of `haystack` against the shape set
+/// `shapes_of(p)` for each provider. Shared by both tiers of [`match_provider`].
+///
+/// `case_sensitive` (CodeRabbit R13d): TIER-1 value shapes pass `true` and the
+/// ORIGINAL text, so a fixed-case credential prefix (`AKIA`/`ASIA` upper,
+/// `ghp_`/`sk-…`/`"type": "service_account"` lower) cannot be matched by an
+/// ordinary word in the wrong case (e.g. "asia" → AWS `ASIA`). TIER-2 NAME markers
+/// pass `false` AND a pre-lowercased haystack; the shapes are lowered here so an
+/// env-var name in any case (`AWS_SECRET_ACCESS_KEY=`) still attributes.
 fn match_longest(
-    lowercase_haystack: &str,
+    haystack: &str,
     shapes_of: impl Fn(&'static Provider) -> &'static [&'static str],
+    case_sensitive: bool,
 ) -> Option<&'static Provider> {
     PROVIDERS
         .iter()
         .filter_map(|p| {
             shapes_of(p)
                 .iter()
-                .filter(|shape| lowercase_haystack.contains(&shape.to_ascii_lowercase()))
+                .copied()
+                .filter(|shape| {
+                    if case_sensitive {
+                        haystack.contains(*shape)
+                    } else {
+                        haystack.contains(&shape.to_ascii_lowercase())
+                    }
+                })
                 .map(|shape| shape.len())
                 .max()
                 .map(|best| (p, best))
@@ -786,33 +805,61 @@ mod tests {
             Some("gcp"),
             "a minified service-account JSON must attribute to gcp"
         );
-        // Case-insensitive too (redacted text may alter case).
+        // A real GCP key file always uses lowercase JSON keys; tier-1 value shapes
+        // are matched case-sensitively (CodeRabbit R13d), so an artificially
+        // UPPERCASED structural variant (never a real key) does NOT attribute to
+        // gcp via the value shape. GCP has no env-name marker, so it falls through
+        // to None — acceptable, since this is not a real credential.
         assert_eq!(
             match_provider("{\"TYPE\":\"SERVICE_ACCOUNT\"}").map(|p| p.provider),
-            Some("gcp")
+            None
         );
     }
 
     #[test]
-    fn match_provider_is_case_insensitive() {
-        // F5 (Minor): redacted audit text may upper-case an env-var name. An
-        // UPPERCASE `AWS_SECRET_ACCESS_KEY=` must still attribute to aws.
+    fn env_name_markers_are_case_insensitive() {
+        // F5 (Minor): redacted audit text may upper-case an env-var NAME. An
+        // UPPERCASE `AWS_SECRET_ACCESS_KEY=` (no value shape survives) must still
+        // attribute to aws via the case-insensitive TIER-2 name marker.
         assert_eq!(
             match_provider("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIexample").map(|p| p.provider),
             Some("aws"),
-            "uppercase AWS_SECRET_ACCESS_KEY must route to aws"
+            "uppercase AWS_SECRET_ACCESS_KEY must route to aws via the tier-2 name marker"
         );
-        // Mixed case of a shorter shape also matches.
+        // A real lowercase value prefix still matches tier-1 (case-sensitive).
         assert_eq!(
             match_provider("NPM_TOKEN env: npm_AbCdEf").map(|p| p.provider),
             Some("npm")
         );
-        // Case-insensitivity must NOT broaden the longest-match tie-break: an
-        // uppercase Anthropic key still beats OpenAI's `sk-`.
+        // An uppercased `SK-ANT-API03` is NOT a real Anthropic value (those are
+        // lowercase), so tier-1 misses — but the `ANTHROPIC_API_KEY` name marker
+        // (tier-2, case-insensitive) still routes it correctly to anthropic.
         assert_eq!(
             match_provider("ANTHROPIC_API_KEY=SK-ANT-API03-REDACTED").map(|p| p.provider),
             Some("anthropic"),
-            "uppercased sk-ant-api must still win over sk-"
+            "the ANTHROPIC_API_KEY name marker routes an uppercased value to anthropic"
+        );
+    }
+
+    #[test]
+    fn tier1_value_shapes_are_case_sensitive_no_word_false_match() {
+        // CodeRabbit R13d: AWS's short alpha prefix `ASIA` (STS) must NOT match the
+        // ordinary word "asia" in unrelated text. Tier-1 is case-sensitive, so a
+        // real `ASIA…`/`AKIA…` (uppercase) attributes while a lowercase word does
+        // not misroute to AWS.
+        assert!(
+            match_provider("deploy the service to the asia-pacific region").is_none(),
+            "the word 'asia' must not match AWS's `ASIA` value prefix"
+        );
+        assert!(
+            match_provider("the username nakia logged in").is_none(),
+            "the 'akia' inside 'nakia' must not match AWS's `AKIA` value prefix"
+        );
+        // A genuine uppercase AWS prefix still attributes.
+        assert_eq!(
+            match_provider("ASIAEXAMPLE0000TEMPCRED").map(|p| p.provider),
+            Some("aws"),
+            "a real uppercase ASIA… STS prefix must still route to aws"
         );
     }
 
