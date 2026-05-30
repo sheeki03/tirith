@@ -393,7 +393,12 @@ pub fn invalidate_cache() {
 /// `session_warnings.rs`. The `.lock` file is a zero-byte sentinel: never read
 /// or written, only locked, and left in place between calls (creating and
 /// deleting it per-call would itself race).
-struct StoreLock {
+///
+/// `pub(crate)` so the generic `<store>.lock` guard is reusable by other
+/// JSONL-store mutators (CodeRabbit R13f — `baseline::record_at` serializes its
+/// append + compaction with it). It locks any `store` path, nothing
+/// canary-specific.
+pub(crate) struct StoreLock {
     file: std::fs::File,
 }
 
@@ -403,7 +408,7 @@ impl StoreLock {
     /// advisory locking is unsupported on the platform/filesystem we proceed
     /// WITHOUT it (best-effort — never worse than the pre-lock behavior, and the
     /// atomic rename in [`rewrite_store_lines`] still prevents torn files).
-    fn acquire(store: &Path) -> std::io::Result<Self> {
+    pub(crate) fn acquire(store: &Path) -> std::io::Result<Self> {
         if let Some(parent) = store.parent() {
             std::fs::create_dir_all(parent)?;
         }

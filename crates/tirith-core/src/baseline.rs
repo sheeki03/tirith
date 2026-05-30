@@ -652,7 +652,17 @@ pub fn lookup_at(store: &Path, key: &PatternKey) -> SeenCount {
 /// Record `key` as a new observation in the store at `store`. Appends one line,
 /// then compacts (window-prune + cap-evict) when the line count crosses the
 /// trigger so the file stays bounded.
+///
+/// CROSS-PROCESS LOCK (CodeRabbit R13f): the append + (conditional) compaction is
+/// held under the shared [`crate::canary::StoreLock`] for the whole sequence.
+/// Without it, two concurrent `record_at` calls could race so that one process's
+/// compaction (a rewrite from a snapshot read before the other's append) silently
+/// drops that append — permanently undercounting the baseline. Records only happen
+/// on a detection-rule firing while `baseline_enabled`, so lock contention is low.
+/// On a platform without advisory locking the guard degrades to best-effort and
+/// the atomic rewrite still prevents torn files.
 pub fn record_at(store: &Path, key: PatternKey) -> std::io::Result<()> {
+    let _lock = crate::canary::StoreLock::acquire(store)?;
     let obs = key.into_observation();
     append_observation(store, &obs)?;
     if line_count(store) > COMPACT_TRIGGER {

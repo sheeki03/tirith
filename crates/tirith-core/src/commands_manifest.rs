@@ -580,10 +580,20 @@ pub fn invalidate_cache() {
 /// walk, leaving the present-but-not-a-regular-file case to the hardened
 /// [`CommandsManifest::load_from_path`] (round-17 `read_regular_capped`), which
 /// fail-SAFELY surfaces it as a parse error rather than "no manifest, walk on".
-/// A truly absent path (`symlink_metadata` errors with `NotFound` or otherwise)
-/// is NOT present, so the walk continues up to the `.git` boundary as before.
+///
+/// FAIL-SAFE on stat errors (CodeRabbit R13f, sibling of the incident/taint cache
+/// reads): only a genuine `NotFound` means absent. ANY OTHER `symlink_metadata`
+/// error (`EACCES`, a symlink loop, an I/O fault) means the entry is PRESENT but
+/// unstattable — treat it as present so discovery stops here and surfaces the
+/// unloadable manifest, rather than stepping over it (which would silently drop
+/// the repo-manifest note AND `dangerous[]` enforcement for a manifest that is
+/// really there).
 fn manifest_path_present(candidate: &Path) -> bool {
-    candidate.symlink_metadata().is_ok()
+    match candidate.symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 /// Resolve the path of `.tirith/commands.yaml` for `cwd`, mirroring policy
@@ -1237,6 +1247,34 @@ allowed:
     /// coerced all three to `false`; the fix uses `symlink_metadata`. Unix-only
     /// (needs `mkfifo`/symlink); a `.git` marker bounds the walk-up so the probe
     /// can never escape into a real ancestor `.tirith/commands.yaml`.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_path_present_treats_stat_errors_as_present_not_absent() {
+        // CodeRabbit R13f: only a genuine NotFound is "absent". Any OTHER
+        // symlink_metadata error (EACCES, ENOTDIR, symlink loop) means a
+        // present-but-unstattable entry, which must read as PRESENT so discovery
+        // surfaces the unloadable manifest rather than silently walking past it.
+        let dir = tempfile::tempdir().unwrap();
+        // Genuinely absent → false.
+        assert!(!manifest_path_present(&dir.path().join("nope.yaml")));
+        // A path UNDER a regular file yields ENOTDIR (a non-NotFound stat error) →
+        // must read as present.
+        let not_a_dir = dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(
+            manifest_path_present(&not_a_dir.join("commands.yaml")),
+            "an ENOTDIR (present-but-unstattable) path must read as present"
+        );
+        // A real file and a dangling symlink both lstat-succeed → present.
+        assert!(manifest_path_present(&not_a_dir));
+        let link = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
+        assert!(
+            manifest_path_present(&link),
+            "a dangling symlink lstat-succeeds → present"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn present_but_broken_manifest_is_not_silently_skipped() {

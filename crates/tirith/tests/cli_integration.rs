@@ -11017,6 +11017,48 @@ fn canary_list_and_status_warn_on_unreadable_store() {
     }
 }
 
+/// CodeRabbit R13f: on the `--json` surface an incomplete canary-store read must
+/// FAIL (non-zero + an `error` object), not emit a partial array/object with exit
+/// 0 — a stdout-only consumer cannot see the stderr warning the human path prints.
+/// Unix-only (needs `mkfifo` to force an incomplete read).
+#[cfg(unix)]
+#[test]
+fn canary_list_and_status_json_fail_on_unreadable_store() {
+    use std::ffi::CString;
+
+    for sub in ["list", "status"] {
+        let state = tempfile::tempdir().expect("tempdir");
+        let store_dir = state.path().join("tirith");
+        fs::create_dir_all(&store_dir).unwrap();
+        let store = store_dir.join("canaries.jsonl");
+        let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        let out = canary_tirith(state.path())
+            .args(["canary", sub, "--json"])
+            .output()
+            .unwrap_or_else(|e| panic!("canary {sub} --json on a FIFO store: {e}"));
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "`canary {sub} --json` against an unreadable store must NOT report success; stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`canary {sub} --json` store-error must emit parseable JSON on stdout, got err {e}; stdout:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert!(
+            v.get("error").is_some(),
+            "`canary {sub} --json` incomplete read must carry an `error` field, got: {v}"
+        );
+    }
+}
+
 /// CodeRabbit R18 #5: `tirith taint list` builds its output from `parse_store`,
 /// which returns a partial prefix when the store cannot be read to EOF. A SILENT
 /// truncation would hide taints from the listing with no operator signal, so an

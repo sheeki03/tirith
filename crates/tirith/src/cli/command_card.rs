@@ -425,6 +425,27 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         }
     };
 
+    // Reject an oversized download BEFORE reading/parsing it (CodeRabbit R13f).
+    // Every card READ (engine hot path, sign, verify) refuses bodies above
+    // `CARD_READ_CAP` (64 KiB), so a 64 KiB–10 MiB card would cache "successfully"
+    // yet never be readable back — a confusing dead cache entry. Gating on the
+    // downloader's reported size here drops the temp (no cache file written) and
+    // skips the wasted full read + JSON parse for content we would only reject.
+    if dl.size > CARD_READ_CAP {
+        if !emit_error(
+            json,
+            "tirith command-card fetch",
+            &format!(
+                "downloaded card is {} bytes, exceeding the {CARD_READ_CAP}-byte read cap; \
+                 not caching (it could never be read back)",
+                dl.size
+            ),
+        ) {
+            return 2;
+        }
+        return 1;
+    }
+
     let bytes = match std::fs::read(tmp.path()) {
         Ok(b) => b,
         Err(e) => {
@@ -439,31 +460,13 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         }
     };
     // Validate it is a card before caching — refuse to cache arbitrary content.
+    // (Size was already gated against `CARD_READ_CAP` above, off the downloader's
+    // reported size, so `bytes` here is always within the cap.)
     if Card::from_json(&bytes).is_err() {
         if !emit_error(
             json,
             "tirith command-card fetch",
             "downloaded content is not a valid command card (JSON parse failed)",
-        ) {
-            return 2;
-        }
-        return 1;
-    }
-    // Reject anything larger than the read cap BEFORE caching (CodeRabbit R22 #2).
-    // The downloader's 10 MiB limit is far above `CARD_READ_CAP` (64 KiB), and
-    // every card READ (engine hot path, sign, verify) refuses bodies above the
-    // cap — so a 64 KiB–10 MiB card would cache "successfully" yet never be
-    // readable back: a confusing dead cache entry. Refuse it here so the temp is
-    // dropped (no cache file written) and the operator gets a clear error.
-    if bytes.len() as u64 > CARD_READ_CAP {
-        if !emit_error(
-            json,
-            "tirith command-card fetch",
-            &format!(
-                "downloaded card is {} bytes, exceeding the {CARD_READ_CAP}-byte read cap; \
-                 not caching (it could never be read back)",
-                bytes.len()
-            ),
         ) {
             return 2;
         }

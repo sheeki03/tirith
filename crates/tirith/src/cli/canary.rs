@@ -113,6 +113,20 @@ pub fn list(json: bool) -> i32 {
     // never shown as if it were the whole store.
     let (entries, complete) = canary::list_complete();
     if !complete {
+        // On the JSON surface a partial list must NOT look authoritative: a
+        // stdout-only consumer never sees the stderr warning, so FAIL (CodeRabbit
+        // R13f) instead of emitting a partial array with exit 0. The human path
+        // warns and still shows the partial view — a person can judge it.
+        if json {
+            if !emit_error(
+                json,
+                "tirith canary list",
+                "the canary store could not be read completely; refusing to emit a partial list",
+            ) {
+                return 2;
+            }
+            return 1;
+        }
         eprintln!(
             "tirith canary list: warning: the canary store could not be read \
              completely; the list below may be partial."
@@ -149,6 +163,19 @@ pub fn status(json: bool) -> i32 {
     // authoritative status.
     let (entries, complete) = canary::list_complete();
     if !complete {
+        // JSON surface must not report partial counts as authoritative (see
+        // `list`, CodeRabbit R13f): fail rather than emit numbers a stdout-only
+        // consumer would trust. The human path warns and shows the partial counts.
+        if json {
+            if !emit_error(
+                json,
+                "tirith canary status",
+                "the canary store could not be read completely; refusing to report partial counts",
+            ) {
+                return 2;
+            }
+            return 1;
+        }
         eprintln!(
             "tirith canary status: warning: the canary store could not be read \
              completely; the counts below may be partial."
