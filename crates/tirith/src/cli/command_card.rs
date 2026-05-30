@@ -13,6 +13,39 @@ use std::path::Path;
 use tirith_core::command_card::{
     self, Card, CardError, CardSignature, VerifyFailure, SECRET_KEY_LEN,
 };
+use tirith_core::util::{read_regular_capped, OpenRegularError};
+
+/// Read cap for a card JSON file in `sign`/`verify`. A command card is small
+/// (a command string, a few domains, a signature); 64 KiB is far more than a
+/// genuine card needs. Matches the engine hot-path `CARD_READ_CAP` so the CLI
+/// and the analysis path refuse the same oversized files. Routing through
+/// [`read_regular_capped`] also closes the read-guard class: a FIFO/device at
+/// `card_path` cannot block the open (it is opened `O_NONBLOCK` and rejected by
+/// an `fstat` of the open fd) and an oversized file cannot allocate unbounded.
+const CARD_READ_CAP: u64 = 64 * 1024;
+
+/// Read cap for the ed25519 secret-key file in `sign`. A 32-byte key, even
+/// hex- or base64-encoded with trailing whitespace, is well under 4 KiB; a
+/// larger file is rejected as malformed. Reading through [`read_regular_capped`]
+/// keeps a FIFO/device `--key` path from blocking the open and bounds the read.
+const SECRET_KEY_READ_CAP: u64 = 4096;
+
+/// Render an [`OpenRegularError`] from the hardened reader as a human message,
+/// prefixed with `what` (e.g. `"read card.json"`). Keeps the FIFO/device and
+/// oversized cases legible instead of a bare `io::Error`. `cap` is the byte cap
+/// the read used, so the oversized message reports the limit that tripped.
+fn describe_open_error(what: &str, path: &str, cap: u64, e: &OpenRegularError) -> String {
+    match e {
+        OpenRegularError::NotFound => format!("{what} {path}: no such file"),
+        OpenRegularError::NotRegularFile => {
+            format!("{what} {path}: not a regular file (refusing a FIFO/device/socket)")
+        }
+        OpenRegularError::TooLarge => {
+            format!("{what} {path}: file is larger than the {cap}-byte cap")
+        }
+        OpenRegularError::Io(io) => format!("{what} {path}: {io}"),
+    }
+}
 
 /// `tirith command-card create` — build an unsigned card and print it as JSON.
 ///
@@ -126,13 +159,17 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
         }
     };
 
-    let bytes = match std::fs::read(card_path) {
+    // Hardened, capped read of the card path (CodeRabbit R17 #1): route through
+    // `read_regular_capped` so a FIFO/device cannot block the open and an
+    // oversized file cannot allocate unbounded — same guard the engine hot path
+    // (`read_card_bytes_guarded`) already applies to a `--card` reference.
+    let bytes = match read_regular_capped(Path::new(card_path), CARD_READ_CAP) {
         Ok(b) => b,
         Err(e) => {
             if !emit_error(
                 json,
                 "tirith command-card sign",
-                &format!("read {card_path}: {e}"),
+                &describe_open_error("read", card_path, CARD_READ_CAP, &e),
             ) {
                 return 2;
             }
@@ -217,13 +254,16 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
 pub fn verify(card_path: &str, json: bool) -> i32 {
     // For every fatal-error branch below: a broken-pipe JSON write returns 2
     // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
-    let bytes = match std::fs::read(card_path) {
+    // Hardened, capped read of the card path (CodeRabbit R17 #1): a FIFO/device
+    // at `card_path` cannot block and an oversized file cannot allocate
+    // unbounded — mirrors `sign` above and the engine hot-path guard.
+    let bytes = match read_regular_capped(Path::new(card_path), CARD_READ_CAP) {
         Ok(b) => b,
         Err(e) => {
             if !emit_error(
                 json,
                 "tirith command-card verify",
-                &format!("read {card_path}: {e}"),
+                &describe_open_error("read", card_path, CARD_READ_CAP, &e),
             ) {
                 return 2;
             }
@@ -462,7 +502,36 @@ pub fn fetch(url: &str, json: bool) -> i32 {
 /// Read a 32-byte ed25519 secret key from a file (raw 32 bytes, hex, or
 /// base64).
 fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
-    let raw = std::fs::read(path).map_err(CardError::Io)?;
+    // Hardened, capped read (CodeRabbit R17 #1): the `--key` path is
+    // operator-supplied, so a FIFO/device there would otherwise block the open
+    // and a huge file would allocate unbounded. `read_regular_capped` opens
+    // `O_NONBLOCK`, fstats the open fd, and caps at `SECRET_KEY_READ_CAP`. Map
+    // the open errors onto the existing `CardError` surface: a missing/I/O case
+    // is `Io`; a non-regular/oversized file is a `BadKey` (it is not a usable
+    // key file regardless of why the read refused it).
+    let raw = match read_regular_capped(path, SECRET_KEY_READ_CAP) {
+        Ok(b) => b,
+        Err(OpenRegularError::Io(e)) => return Err(CardError::Io(e)),
+        Err(OpenRegularError::NotFound) => {
+            return Err(CardError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{}: no such key file", path.display()),
+            )))
+        }
+        Err(OpenRegularError::NotRegularFile) => {
+            return Err(CardError::BadKey(format!(
+                "key file {} is not a regular file (refusing a FIFO/device/socket)",
+                path.display()
+            )))
+        }
+        Err(OpenRegularError::TooLarge) => {
+            return Err(CardError::BadKey(format!(
+                "key file {} exceeds the {SECRET_KEY_READ_CAP}-byte cap; \
+                 expected a 32-byte ed25519 key (raw, hex, or base64)",
+                path.display()
+            )))
+        }
+    };
     if raw.len() == SECRET_KEY_LEN {
         let mut k = [0u8; SECRET_KEY_LEN];
         k.copy_from_slice(&raw);

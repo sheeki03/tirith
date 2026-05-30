@@ -166,6 +166,92 @@ mod write_json_tests {
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
         assert_eq!(entries[0], path);
     }
+
+    /// CodeRabbit R17 #4: `write_file_atomic` through a SYMLINK must update the
+    /// link's TARGET, not replace the symlink with a regular file. `persist`
+    /// renames onto the destination, so without resolving the symlink first the
+    /// link would be clobbered; the fix canonicalizes a symlinked destination and
+    /// writes through to the real file. Unix-only (`std::os::unix::fs::symlink`).
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_through_symlink_updates_target_not_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The real config lives in a SEPARATE subdir to prove the temp file is
+        // placed next to the resolved target (same filesystem), not next to the
+        // link — a cross-directory symlink would otherwise break atomicity.
+        let target_dir = dir.path().join("real");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("config.yaml");
+        std::fs::write(&target, b"old: true\n").unwrap();
+
+        let link = dir.path().join("config.yaml");
+        symlink(&target, &link).unwrap();
+
+        // Write through the symlink.
+        super::write_file_atomic(&link, b"new: true\n").unwrap();
+
+        // The TARGET now holds the new content...
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new: true\n");
+        // ...and the symlink is INTACT (still a symlink pointing at the target),
+        // not replaced by a regular file.
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "the destination must remain a symlink, not be clobbered by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            target,
+            "the symlink must still point at the original target"
+        );
+        // Reading through the link yields the updated content.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new: true\n");
+
+        // No temp file left dangling in EITHER directory (it was renamed into the
+        // target dir, consuming it).
+        for d in [dir.path(), target_dir.as_path()] {
+            let extra: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p != &link && p != &target && p != &target_dir)
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "no temp file left behind in {d:?}: {extra:?}"
+            );
+        }
+    }
+
+    /// A DANGLING symlink (target missing) falls back to the pre-existing
+    /// behavior: `write_file_atomic` renames onto the link path. The resulting
+    /// path holds the content and is a regular file (the dangling link is
+    /// replaced) — `canonicalize` cannot resolve a missing target, so the
+    /// write-through path is correctly NOT taken. Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_dangling_symlink_falls_back() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_target = dir.path().join("does-not-exist.yaml");
+        let link = dir.path().join("config.yaml");
+        symlink(&missing_target, &link).unwrap();
+
+        super::write_file_atomic(&link, b"data: 1\n").unwrap();
+
+        // The link path now holds the content as a REGULAR file (fallback path).
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data: 1\n");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "a dangling symlink falls back to a regular-file write at the link path"
+        );
+    }
 }
 
 /// Write `contents` to `path` atomically: a sibling temp file in the same
@@ -181,8 +267,20 @@ mod write_json_tests {
 /// the new directory entry is itself crash-durable. Used by the operator-facing
 /// config writers (`commands init`, `policy init`, `output wrap` shell-profile
 /// edits) — files the operator relies on, NOT regenerable caches.
+///
+/// SYMLINK DESTINATIONS (CodeRabbit R17 #4): `persist` renames the temp file
+/// ONTO the destination, which would replace a *symlinked* config file with the
+/// regular temp file — clobbering the link instead of updating its target. So if
+/// `path` is a symlink to an EXISTING target we resolve it (`canonicalize`) and
+/// write THROUGH to the resolved target, leaving the symlink intact. The temp
+/// file is created in the RESOLVED target's directory so the rename stays atomic
+/// (same filesystem). A non-symlink, a dangling symlink, or an unresolvable
+/// target falls back to renaming onto `path` as before.
 pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    let dir = path
+    // Resolve a symlinked destination to its real target so we write THROUGH the
+    // link rather than replacing it; non-symlinks resolve to themselves.
+    let dest = resolve_atomic_dest(path);
+    let dir = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::PathBuf::from)
@@ -197,13 +295,33 @@ pub(crate) fn write_file_atomic(path: &std::path::Path, contents: &[u8]) -> std:
     // contents, never a truncated file.
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    // `persist()` renames the temp over `path` but does not fsync the containing
+    tmp.persist(&dest).map_err(|e| e.error)?;
+    // `persist()` renames the temp over `dest` but does not fsync the containing
     // directory. fsync the parent so the new name→inode entry survives a crash.
     // The persist already succeeded, so a dir-fsync failure is LOGGED, not
     // propagated (R13 #5). Best-effort, no-op on non-Unix (no directory fsync).
-    tirith_core::util::fsync_parent_dir_logged(path, "atomic file write");
+    tirith_core::util::fsync_parent_dir_logged(&dest, "atomic file write");
     Ok(())
+}
+
+/// Resolve the EFFECTIVE rename target for [`write_file_atomic`]. When `path` is
+/// a symlink to an existing target, returns the canonicalized target so the
+/// write goes THROUGH the link (the symlink itself is preserved); otherwise (a
+/// regular path, a missing path, or a dangling/unresolvable symlink) returns
+/// `path` unchanged so the caller renames onto it as before.
+fn resolve_atomic_dest(path: &std::path::Path) -> std::path::PathBuf {
+    match std::fs::symlink_metadata(path) {
+        // A symlink whose target resolves: write through to the real file.
+        // `canonicalize` follows every link in the chain and requires the final
+        // target to exist — a dangling symlink errors here and falls back to
+        // `path` (replacing the dangling link with a regular file, which is the
+        // pre-existing behavior).
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        // Not a symlink (regular file/dir/absent): rename onto `path` directly.
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Suggest the closest match from a list of candidates using Levenshtein distance.

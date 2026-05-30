@@ -360,11 +360,40 @@ pub fn run(name: &str, json: bool) -> i32 {
     }
 
     if json {
-        // The single combined object for an allow / warn-proceed run. Emitted
-        // BEFORE the spawn so a failed JSON write aborts BEFORE the command runs:
-        // a piped consumer that asked for `--json` and saw a truncated record
-        // must not have the command silently run anyway. Exit 2 (distinct from a
-        // command's own exit code) signals the harness I/O failure.
+        // SPAWN FIRST, then emit the single JSON document reflecting the ACTUAL
+        // outcome (CodeRabbit R17 #3). Previously a `running:true` object was
+        // written BEFORE the spawn, so a spawn failure (no such shell, ENOMEM,
+        // …) still reported `running:true` to a machine consumer even though the
+        // command never started. Now:
+        //   * spawn FAILS  → one object with `running:false` + the spawn `error`.
+        //   * spawn OK     → one object with `running:true`, THEN wait for exit.
+        let spawned = match spawn_shell_command_json(&command) {
+            Ok(s) => s,
+            Err(e) => {
+                // The command never started: emit ONE `running:false` object
+                // carrying the spawn error. A failed JSON write breaks the
+                // single-object contract (the consumer never received the
+                // record), so report the write failure (exit 2) instead of the
+                // semantic spawn-failure code (1) via `json_refusal_exit_code`.
+                let wrote = emit_run_json(
+                    name,
+                    &command,
+                    &verdict,
+                    &policy.dlp_custom_patterns,
+                    /* running */ false,
+                    /* refused */ false,
+                    Some(&format!("failed to spawn command: {e}")),
+                );
+                return json_refusal_exit_code(wrote, 1);
+            }
+        };
+
+        // The spawn succeeded — the command IS running. Emit the single
+        // `running:true` object. The round-9/15 abort-on-write-failure contract
+        // is preserved: if THIS write fails, a `--json` consumer saw a truncated
+        // record and must not have the command silently run to completion, so we
+        // KILL + reap the (already-spawned) child and report the write failure
+        // (exit 2) rather than waiting on it.
         if !emit_run_json(
             name,
             &command,
@@ -374,28 +403,32 @@ pub fn run(name: &str, json: bool) -> i32 {
             /* refused */ false,
             None,
         ) {
+            spawned.kill_and_reap();
             return 2;
+        }
+
+        // One JSON document is on stdout; wait for the child and return its exit
+        // code. A wait failure (extremely rare — the child is already running)
+        // keeps stdout a single document by reporting only to stderr.
+        match spawned.wait() {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("tirith commands run: failed to wait on command: {e}");
+                1
+            }
         }
     } else {
         eprintln!("Running allowed command '{name}': {command}");
-    }
-
-    match run_shell_command(&command, json) {
-        Ok(code) => code,
-        Err(e) => {
-            // The combined object (running:true) was already written to stdout;
-            // a spawn failure now reports ONLY to stderr so stdout stays a single
-            // JSON document. Human mode already routes through emit_error→stderr.
-            if json {
-                eprintln!("tirith commands run: failed to spawn command: {e}");
-            } else {
+        match run_shell_command_human(&command) {
+            Ok(code) => code,
+            Err(e) => {
                 emit_error(
                     json,
                     "tirith commands run",
                     &format!("failed to spawn command: {e}"),
                 );
+                1
             }
-            1
         }
     }
 }
@@ -537,9 +570,10 @@ pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
 }
 
 /// The [`ShellType`](tirith_core::tokenize::ShellType) the safety re-check must
-/// tokenize with: it MUST match the shell `run_shell_command` actually executes
-/// (`cmd /C` on Windows, `$SHELL -c` → POSIX elsewhere). Analyzing a command
-/// with the wrong shell can mis-tokenize pipes/operators and miss findings.
+/// tokenize with: it MUST match the shell `build_shell_command` actually
+/// executes (`cmd /C` on Windows, a deterministic POSIX `/bin/sh -c` elsewhere).
+/// Analyzing a command with the wrong shell can mis-tokenize pipes/operators and
+/// miss findings.
 #[cfg(windows)]
 const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Cmd;
 #[cfg(not(windows))]
@@ -586,10 +620,8 @@ fn analyze_command(command: &str, cwd: Option<&str>) -> tirith_core::verdict::Ve
 /// sees the command's output, but tirith's stdout stays pure JSON. The child's
 /// own stderr is inherited in both modes. In human mode the child inherits stdout
 /// normally (output goes straight to the terminal, unchanged).
-fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
-    use std::process::Stdio;
-
-    let mut cmd = if cfg!(windows) {
+fn build_shell_command(command: &str) -> Command {
+    if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(command);
         c
@@ -599,16 +631,57 @@ fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
         let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
-    };
+    }
+}
 
-    if !json {
-        // Human mode: child inherits stdout/stderr; behavior unchanged.
-        return Ok(cmd.status()?.code().unwrap_or(128));
+/// A successfully-spawned `commands run --json` child plus its stdout-pump
+/// thread. Separating SPAWN from WAIT (CodeRabbit R17 #3) lets the caller emit
+/// the single JSON document only AFTER it knows the spawn succeeded — so a
+/// spawn failure is reported as `running:false`+`error`, never a misleading
+/// `running:true`. The child is left RUNNING; [`SpawnedJsonChild::wait`]
+/// (success) or [`SpawnedJsonChild::kill_and_reap`] (JSON-write failure) drives
+/// it to completion.
+struct SpawnedJsonChild {
+    child: std::process::Child,
+    pump: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SpawnedJsonChild {
+    /// Wait for the child to exit and join the stdout pump, returning the child's
+    /// exit code (128 if killed by a signal with no code).
+    fn wait(mut self) -> std::io::Result<i32> {
+        let status = self.child.wait()?;
+        if let Some(h) = self.pump.take() {
+            // Join the pump so all child output is flushed to stderr before we
+            // return (and the thread never outlives the process). The child has
+            // exited, so its stdout pipe is at EOF and the copy completes.
+            let _ = h.join();
+        }
+        Ok(status.code().unwrap_or(128))
     }
 
-    // JSON mode: pipe the child's stdout and copy it to OUR stderr on a helper
-    // thread (so a large output cannot deadlock by filling the pipe), keeping
-    // tirith's stdout a single JSON document. The child's stderr is inherited.
+    /// Best-effort kill + reap when the single-JSON-document write FAILED after
+    /// the spawn (CodeRabbit R17 #3). The round-9/15 contract is that a `--json`
+    /// consumer who saw a truncated record must NOT have the command silently run
+    /// to completion; since the child is already spawned we kill it and reap it
+    /// (and join the pump) so it cannot outlive tirith.
+    fn kill_and_reap(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(h) = self.pump.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Spawn `command` for the JSON path with its stdout PIPED to a helper thread
+/// that copies it to tirith's stderr (so a large output cannot deadlock by
+/// filling the pipe, and tirith's stdout stays a single JSON document). The
+/// child's stderr is inherited. Returns the running child + pump on success; the
+/// spawn error otherwise (the caller maps it to a `running:false` JSON object).
+fn spawn_shell_command_json(command: &str) -> std::io::Result<SpawnedJsonChild> {
+    use std::process::Stdio;
+    let mut cmd = build_shell_command(command);
     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let mut child = cmd.spawn()?;
     let pump = child.stdout.take().map(|mut out| {
@@ -620,14 +693,13 @@ fn run_shell_command(command: &str, json: bool) -> std::io::Result<i32> {
             pump_stdout_draining(&mut out, &mut std::io::stderr());
         })
     });
-    let status = child.wait()?;
-    if let Some(h) = pump {
-        // Join the pump so all child output is flushed to stderr before we return
-        // (and the thread never outlives the process). The child has exited, so
-        // its stdout pipe is at EOF and the copy completes promptly.
-        let _ = h.join();
-    }
-    Ok(status.code().unwrap_or(128))
+    Ok(SpawnedJsonChild { child, pump })
+}
+
+/// Human-mode run: the child inherits stdout/stderr; spawn+wait combined.
+/// Returns the child's exit code (128 if killed by a signal with no code).
+fn run_shell_command_human(command: &str) -> std::io::Result<i32> {
+    Ok(build_shell_command(command).status()?.code().unwrap_or(128))
 }
 
 /// Forward everything `reader` (the child's stdout) produces to `writer`
@@ -702,7 +774,7 @@ mod tests {
     #[test]
     fn run_shell_matches_execution_platform() {
         // F7: the `commands run` safety re-check must tokenize with the SAME
-        // shell family `run_shell_command` executes: `cmd /C` on Windows, and a
+        // shell family `build_shell_command` executes: `cmd /C` on Windows, and a
         // deterministic POSIX `/bin/sh -c` (NOT `$SHELL -c`, which could be
         // fish/csh) elsewhere. A mismatch (e.g. analyze-as-Posix but run-as-fish)
         // can mis-tokenize and miss findings.
@@ -714,7 +786,7 @@ mod tests {
 
     /// F7: the resolved execution shell must match `RUN_SHELL`'s family even when
     /// `$SHELL` points at a non-POSIX shell. We can't easily introspect the
-    /// `Command` built by the private `run_shell_command`, so we pin the
+    /// `Command` built by the private `build_shell_command`, so we pin the
     /// invariant: on non-Windows the analysis is Posix AND execution is hardwired
     /// to `/bin/sh` (a POSIX shell), independent of `$SHELL`. This is a
     /// compile-time/structural guarantee — the function no longer reads `$SHELL`.
@@ -841,6 +913,56 @@ mod tests {
             "got: {refusal}"
         );
         assert!(refusal.contains("deploy --token"), "got: {refusal}");
+    }
+
+    /// CodeRabbit R17 #3: a `commands run --json` SPAWN FAILURE must surface as a
+    /// single object with `running:false` + an `error` — NEVER the
+    /// success-shaped `running:true`. The `run()` JSON branch now spawns FIRST
+    /// and, on a spawn `Err`, emits exactly this object (the
+    /// "shell could not be executed" path). A genuine spawn failure needs the
+    /// system shell (`/bin/sh` / `cmd`) to be unspawnable, which is not portably
+    /// forcible at the integration level, so we pin the machine-readable contract
+    /// at the pure `build_run_json` seam the branch uses (mirroring the
+    /// `json_block_refusal_message_redacts_command` seam test). The companion
+    /// integration test `commands_run_json_nonzero_command_still_reports_running`
+    /// proves the inverse: a shell that DID spawn but whose command exits
+    /// non-zero still (correctly) reports `running:true`.
+    #[test]
+    fn run_json_spawn_failure_reports_not_running_with_error() {
+        use super::build_run_json;
+        use tirith_core::verdict::{Timings, Verdict};
+
+        let verdict = Verdict::allow_fast(1, Timings::default());
+        // Exactly the fields the spawn-failure branch passes to `emit_run_json`.
+        let v = build_run_json(
+            "deploy",
+            "deploy --now",
+            &verdict,
+            &[],
+            /* running */ false,
+            /* refused */ false,
+            Some("failed to spawn command: No such file or directory (os error 2)"),
+        );
+
+        assert_eq!(
+            v["running"],
+            serde_json::Value::Bool(false),
+            "a spawn failure must report running:false, got: {v}"
+        );
+        assert_eq!(
+            v["refused"],
+            serde_json::Value::Bool(false),
+            "a spawn failure is not a policy refusal, got: {v}"
+        );
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("failed to spawn")),
+            "a spawn failure must carry the spawn error string, got: {v}"
+        );
+        // Still a single, fully-shaped object a machine consumer can parse.
+        assert_eq!(v["name"], "deploy");
+        assert!(v["findings"].as_array().is_some(), "got: {v}");
     }
 
     /// CodeRabbit R15 #4: the `commands run --json` stdout→stderr pump must KEEP

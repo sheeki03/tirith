@@ -164,6 +164,16 @@ pub struct ManifestOutcome {
 
 const MANIFEST_FILENAME: &str = "commands.yaml";
 
+/// Upper bound on the bytes read from `.tirith/commands.yaml`. The manifest is a
+/// list of allowed/dangerous command strings; 256 KiB is far more than a genuine
+/// one needs (thousands of entries). The file is REPO-controlled and read on the
+/// exec hot path, so the read goes through [`crate::util::read_regular_capped`]:
+/// a FIFO/device at the path cannot block the open and an oversized file cannot
+/// allocate unbounded — both are mapped to a fail-safe parse error (CodeRabbit
+/// R17 #1, read-guard class). Mirrors the engine card / incident-flag / salt
+/// reads that already use the hardened reader.
+const MANIFEST_READ_CAP: u64 = 256 * 1024;
+
 impl CommandsManifest {
     /// Parse a manifest from YAML text.
     ///
@@ -212,8 +222,40 @@ impl CommandsManifest {
     }
 
     /// Load the manifest from a specific file path.
+    ///
+    /// HARDENED READ (CodeRabbit R17 #1, read-guard class): the path is
+    /// REPO-controlled and read on the exec hot path (via [`Self::discover`]), so
+    /// a plain `std::fs::read_to_string` would BLOCK on a FIFO/device pointed at
+    /// the path, or allocate unbounded on a huge file. Route through
+    /// [`crate::util::read_regular_capped`] (opens `O_NONBLOCK`, fstats the open
+    /// fd, caps at [`MANIFEST_READ_CAP`]). A non-regular / oversized / non-UTF-8
+    /// file maps to a [`ManifestError::Parse`] — fail-SAFE, because the hot-path
+    /// caller treats any error as "no usable manifest" and never as permissive.
     pub fn load_from_path(path: &Path) -> Result<Self, ManifestError> {
-        let text = std::fs::read_to_string(path).map_err(ManifestError::Io)?;
+        let bytes = match crate::util::read_regular_capped(path, MANIFEST_READ_CAP) {
+            Ok(b) => b,
+            Err(crate::util::OpenRegularError::NotFound) => {
+                return Err(ManifestError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}: no such manifest file", path.display()),
+                )))
+            }
+            Err(crate::util::OpenRegularError::Io(e)) => return Err(ManifestError::Io(e)),
+            Err(crate::util::OpenRegularError::NotRegularFile) => {
+                return Err(ManifestError::Parse(format!(
+                    "{} is not a regular file (refusing a FIFO/device/socket)",
+                    path.display()
+                )))
+            }
+            Err(crate::util::OpenRegularError::TooLarge) => {
+                return Err(ManifestError::Parse(format!(
+                    "{} exceeds the {MANIFEST_READ_CAP}-byte manifest read cap",
+                    path.display()
+                )))
+            }
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|e| ManifestError::Parse(format!("manifest is not valid UTF-8: {e}")))?;
         Self::from_yaml(&text)
     }
 
@@ -1057,5 +1099,42 @@ allowed:
         assert_eq!(after.allowed[0].command, "cmd-b");
 
         invalidate_cache();
+    }
+
+    /// CodeRabbit R17 #1 (read-guard class): `load_from_path` is on the exec hot
+    /// path and reads a REPO-controlled `.tirith/commands.yaml`. A FIFO/device at
+    /// that path must be REJECTED promptly (a fail-safe parse error) — NOT block
+    /// the open forever waiting for a writer, which a plain `read_to_string`
+    /// would. Unix-only (needs `mkfifo`); cannot hang — the hardened reader's
+    /// `O_NONBLOCK` open returns immediately on a FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn load_from_path_on_fifo_does_not_hang_and_errors() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.yaml");
+        let c_path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
+        // SAFETY: a single libc mkfifo with a valid C string and a standard mode.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+
+        // Must return promptly with an error (a blocking read would hang here).
+        let err = CommandsManifest::load_from_path(&path);
+        assert!(
+            err.is_err(),
+            "a FIFO manifest path must error, not be parsed (or block)"
+        );
+        // And the FIFO is left intact (the read never consumed/replaced it).
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the manifest path must be left as the FIFO it was"
+        );
     }
 }

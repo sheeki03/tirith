@@ -175,9 +175,18 @@ pub fn status(json: bool) -> i32 {
 
 /// `tirith canary prune <id>` — remove one canary by id (prompts unless --yes).
 pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
-    // Show what we are about to remove so the confirmation is informed.
-    let existing = canary::list().into_iter().find(|e| e.id == id);
-    if existing.is_none() {
+    // Read the store COMPLETENESS-AWARE (CodeRabbit R17 #2): a lenient
+    // `canary::list()` degrades a present-but-unreadable/incomplete store to an
+    // empty/partial view, so the old "nothing to prune" pre-check could exit 0
+    // "success" against a store that is actually UNREADABLE. We only treat
+    // "id absent" as a genuine no-op when the store was read to COMPLETION; an
+    // INCOMPLETE read falls through to the strict `prune_at` core below (which
+    // aborts on an incomplete read and reports the real failure) rather than
+    // short-circuiting. A truly-empty *resolvable* store is `complete == true`
+    // with no entries, so its genuine "nothing to prune" UX is preserved.
+    let (entries, complete) = canary::list_complete();
+    let existing = entries.into_iter().find(|e| e.id == id);
+    if complete && existing.is_none() {
         if json {
             if !write_json_stdout(
                 &PruneOut {
@@ -195,7 +204,10 @@ pub fn prune(id: &str, yes: bool, json: bool) -> i32 {
         return 0;
     }
 
-    if !json && !confirm(&format!("Prune canary {id}?"), yes) {
+    // Confirm only when we have a concrete entry to remove (an informed prompt).
+    // On an INCOMPLETE read `existing` is `None` but we still fall through here:
+    // skip the (meaningless) prompt and let `prune_at` surface the read failure.
+    if existing.is_some() && !json && !confirm(&format!("Prune canary {id}?"), yes) {
         println!("Aborted — canary left in place.");
         return 0;
     }

@@ -614,11 +614,36 @@ pub fn list_at(store: &Path) -> Vec<CanaryEntry> {
     parse_store(store).0
 }
 
+/// Like [`list_at`] but also reports whether the store was read to COMPLETION
+/// (`(entries, complete)`). `complete == false` means the read stopped on a
+/// present-but-unreadable store (FIFO/device/oversized/permission/I/O) or a
+/// mid-file fault, so `entries` is NOT a faithful image and an "empty" result is
+/// NOT proof the store is empty (CodeRabbit R17 #2). The CLI `prune` uses this so
+/// it cannot mistake an UNREADABLE store for "nothing to prune": a lenient
+/// [`list_at`] would degrade such a store to an empty/partial view and report a
+/// false success. An ABSENT store is genuinely empty and returns
+/// `(vec![], true)`.
+pub fn list_at_complete(store: &Path) -> (Vec<CanaryEntry>, bool) {
+    parse_store(store)
+}
+
 /// Production entry point: list every recorded canary in the default store.
 pub fn list() -> Vec<CanaryEntry> {
     match store_path() {
         Some(p) => list_at(&p),
         None => Vec::new(),
+    }
+}
+
+/// Production entry point for [`list_at_complete`] against the default store.
+/// Returns `(entries, complete)`. When the store path cannot be resolved at all
+/// the state dir is unknown — treated as `complete == false` (an unresolved
+/// store is NOT a proven-empty one) so the CLI does not report a false
+/// "nothing to prune".
+pub fn list_complete() -> (Vec<CanaryEntry>, bool) {
+    match store_path() {
+        Some(p) => list_at_complete(&p),
+        None => (Vec::new(), false),
     }
 }
 

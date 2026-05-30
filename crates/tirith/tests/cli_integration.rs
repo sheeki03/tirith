@@ -9102,6 +9102,110 @@ fn command_card_sign_json_fatal_error_is_parseable_nonzero() {
     );
 }
 
+/// Run `tirith <args>` (stdin nulled) and return its `Output`, FAILING the test
+/// rather than hanging if the process does not exit within `secs`. Used by the
+/// FIFO read-guard test below: a regression to a blocking `std::fs::read` of the
+/// card path would otherwise hang the whole suite, so we bound the wait on a
+/// helper thread and panic on timeout (the child is killed by `tempdir`/process
+/// teardown). Unix-only (the only place `mkfifo` is exercised).
+#[cfg(unix)]
+fn run_tirith_bounded(args: &[&std::ffi::OsStr], secs: u64) -> std::process::Output {
+    use std::sync::mpsc;
+    let child = tirith()
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tirith");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(result) => result.expect("wait_with_output"),
+        Err(_) => panic!(
+            "tirith {args:?} did not exit within {secs}s — a blocking read of a \
+             FIFO card path regressed the hardened capped reader"
+        ),
+    }
+}
+
+/// CodeRabbit R17 #1 (read-guard class): `command-card sign` and `verify` must
+/// read the card path through the hardened capped reader, so a FIFO/device at
+/// `card_path` is REJECTED promptly (clear error, non-zero exit) rather than
+/// blocking the open forever waiting for a writer. Before the fix both used a
+/// plain `std::fs::read`, which blocks on a FIFO with no writer.
+///
+/// Unix-only (needs `mkfifo`); cannot hang — `run_tirith_bounded` bounds the
+/// wait and the fix's `O_NONBLOCK` open returns immediately on a FIFO anyway.
+#[cfg(unix)]
+#[test]
+fn command_card_sign_verify_on_fifo_path_does_not_hang() {
+    use std::ffi::CString;
+
+    let work = tempfile::tempdir().unwrap();
+    let fifo = work.path().join("card.fifo");
+    let c_path = CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: a single libc mkfifo with a valid C string and a standard mode.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        eprintln!("skipping: mkfifo unsupported here");
+        return;
+    }
+
+    // A throwaway key file so `sign` reaches the card read (the key is read
+    // FIRST; give it 32 bytes so `read_secret_key` succeeds and the card read is
+    // what would block on the FIFO).
+    let key = work.path().join("ed25519-priv.bin");
+    fs::write(&key, [0u8; 32]).unwrap();
+
+    let oss = |s: &std::path::Path| s.as_os_str().to_owned();
+
+    // sign: must not hang; must exit non-zero with a clear (non-empty) error.
+    let sign = run_tirith_bounded(
+        &[
+            std::ffi::OsStr::new("command-card"),
+            std::ffi::OsStr::new("sign"),
+            std::ffi::OsStr::new("--key"),
+            &oss(&key),
+            &oss(&fifo),
+        ],
+        20,
+    );
+    assert_ne!(
+        sign.status.code(),
+        Some(0),
+        "sign on a FIFO card path must fail, not succeed; stderr:\n{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&sign.stderr).contains("tirith command-card sign"),
+        "sign must report a clear error, got stderr:\n{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    // verify: same — prompt, non-zero, clear error.
+    let verify = run_tirith_bounded(
+        &[
+            std::ffi::OsStr::new("command-card"),
+            std::ffi::OsStr::new("verify"),
+            &oss(&fifo),
+        ],
+        20,
+    );
+    assert_ne!(
+        verify.status.code(),
+        Some(0),
+        "verify on a FIFO card path must fail, not succeed; stderr:\n{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stderr).contains("tirith command-card verify"),
+        "verify must report a clear error, got stderr:\n{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
 /// Regression (CRITICAL): a card carried via a `# tirith-card: <path>` COMMENT
 /// (not the `--card` sidecar) must VERIFY when its signed `command` matches the
 /// real command on the following line. The marker line is transport metadata
@@ -10388,6 +10492,81 @@ fn canary_create_json_store_error_is_machine_readable() {
     );
 }
 
+/// CodeRabbit R17 #2: `canary prune` must NOT report a false "nothing to prune"
+/// success against a present-but-UNREADABLE store. The old pre-check decided
+/// "nothing to prune" from the lenient `canary::list()`, which degrades an
+/// unreadable/incomplete store to an empty view — so prune would exit 0 even
+/// though the store could not be read. The fix reads completeness-aware and lets
+/// the strict `prune_at` core (which aborts on an incomplete read) report the
+/// real failure.
+///
+/// Here the store path is a FIFO (reported incomplete by the hardened reader),
+/// so `prune --json --yes` must FAIL (non-zero, parseable error) rather than
+/// succeed with `{pruned:false, removed:0}`. Unix-only (needs `mkfifo`); cannot
+/// hang — the reader's `O_NONBLOCK` open returns immediately on a FIFO.
+#[cfg(unix)]
+#[test]
+fn canary_prune_does_not_falsely_succeed_on_unreadable_store() {
+    use std::ffi::CString;
+
+    let state = tempfile::tempdir().expect("tempdir");
+    // The store lives at `<XDG_STATE_HOME>/tirith/canaries.jsonl`.
+    let store_dir = state.path().join("tirith");
+    fs::create_dir_all(&store_dir).unwrap();
+    let store = store_dir.join("canaries.jsonl");
+    let c_path = CString::new(store.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: a single libc mkfifo with a valid C string and a standard mode.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        eprintln!("skipping: mkfifo unsupported here");
+        return;
+    }
+
+    // `--yes` so the JSON-mode confirmation gate is satisfied and we reach the
+    // strict prune core. Against the FIFO store this must report the read
+    // failure, NOT a clean "nothing to prune".
+    let out = canary_tirith(state.path())
+        .args(["canary", "prune", "deadbeef0000", "--json", "--yes"])
+        .output()
+        .expect("canary prune --json --yes on a FIFO store");
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "prune against an unreadable store must NOT report success; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The `--json` surface stays parseable and carries an `error` (not a
+    // {pruned:false} success record).
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "prune store-error --json must emit parseable JSON on stdout, got err {e}; stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        v.get("error").and_then(|e| e.as_str()).is_some(),
+        "an unreadable-store prune must carry an `error`, not a success record, got: {v}"
+    );
+    assert!(
+        v.get("pruned").is_none() || v["pruned"] == serde_json::Value::Bool(false),
+        "must not claim a successful prune against an unreadable store, got: {v}"
+    );
+
+    // The store path is left exactly as-is (still a FIFO) — never truncated into
+    // a regular file by a rewrite from a partial image.
+    assert!(
+        {
+            use std::os::unix::fs::FileTypeExt;
+            std::fs::symlink_metadata(&store)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        },
+        "the unreadable store must not be replaced by a regular file"
+    );
+}
+
 // ── M11 ch2: `tirith commands` CLI (PR #130 review batch B) ──────────────
 //
 // These drive the `tirith commands list|run` CLI. The manifest is discovered
@@ -10757,6 +10936,59 @@ fn commands_run_json_emits_single_object_when_blocked() {
     assert!(
         ids.iter().any(|id| id == "curl_pipe_shell"),
         "the blocking finding must be embedded in the single object, got ids: {ids:?}"
+    );
+}
+
+/// CodeRabbit R17 #3 (companion to the spawn-failure seam test): a
+/// `commands run --json` whose shell DID spawn but whose command exits NON-ZERO
+/// must still report `running:true` (the command ran; it just failed) and return
+/// the child's exit code. This pins the spawn-vs-exit distinction the restructure
+/// introduced: `running` reflects whether the shell SPAWNED, not whether the
+/// command succeeded. A genuine SPAWN failure (`running:false`) needs the system
+/// shell to be unspawnable, which is not portably forcible here — the
+/// `running:false` shape is pinned at the `run_json_spawn_failure_reports_not_running_with_error`
+/// unit seam. POSIX-shell only (`exit 3`), so `#[cfg(unix)]`.
+#[cfg(unix)]
+#[test]
+fn commands_run_json_nonzero_command_still_reports_running() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // `exit 3` is clean to the analyzer (Allow) — the shell spawns and runs it,
+    // then the command exits 3. Writes nothing to stdout, so stdout stays
+    // exactly tirith's one JSON object.
+    write_root_manifest(
+        root.path(),
+        "allowed:\n  - name: fail\n    command: \"exit 3\"\n",
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", "fail", "--json"])
+        .output()
+        .expect("commands run fail --json");
+
+    // The child's exit code is propagated (the command RAN and exited 3).
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a spawned command's non-zero exit code is propagated; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be exactly ONE JSON object, parse failed ({e}); stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["name"], "fail");
+    assert_eq!(v["action"], "allow");
+    // The shell SPAWNED, so `running` is true even though the command failed.
+    assert_eq!(
+        v["running"], true,
+        "a command that spawned (then exited non-zero) must report running:true, got: {v}"
+    );
+    assert_eq!(v["refused"], false);
+    assert!(
+        v["error"].is_null(),
+        "a spawned-then-failed command is not a spawn error, got: {v}"
     );
 }
 
