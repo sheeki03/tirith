@@ -260,8 +260,9 @@ impl CommandsManifest {
     }
 
     /// Cheap existence probe for the tier-1 force-past gate: does a
-    /// `.tirith/commands.yaml` exist for `cwd`? A single `is_file()` stat per
-    /// candidate, mirroring [`crate::taint::store_nonempty`]. When this is
+    /// `.tirith/commands.yaml` exist for `cwd`? A single `symlink_metadata` stat
+    /// per candidate (see [`manifest_path_present`]), mirroring
+    /// [`crate::taint::store_nonempty`]. When this is
     /// `false` the engine never reads the manifest, so a repo without one pays
     /// nothing past the stat. See [`discover_manifest_path`].
     pub fn exists_for(cwd: Option<&str>) -> bool {
@@ -282,8 +283,9 @@ impl CommandsManifest {
     /// mirroring [`crate::incident`] / [`crate::canary`] — so a repeated check
     /// in the same repo re-reads + re-parses the YAML at most once per 5s (and
     /// re-parses immediately if the file's mtime changes). Path resolution
-    /// (`discover_manifest_path`, a few `is_file()` stats) still runs each call;
-    /// it is cheap and `cwd`-dependent, so it is intentionally not cached.
+    /// (`discover_manifest_path`, a few `symlink_metadata` stats) still runs
+    /// each call; it is cheap and `cwd`-dependent, so it is intentionally not
+    /// cached.
     pub fn discover(cwd: Option<&str>) -> Result<Option<Self>, ManifestError> {
         match discover_manifest_path(cwd) {
             Some(path) => cached_load(&path).map(Some),
@@ -519,13 +521,33 @@ pub fn invalidate_cache() {
     *guard = None;
 }
 
+/// Does a path ENTRY exist at `candidate` — even if it is a symlink, directory,
+/// or FIFO?
+///
+/// CodeRabbit R19 #1: presence detection must NOT use `Path::is_file()`. That
+/// FOLLOWS symlinks and coerces metadata/IO failures + non-regular entries (a
+/// directory, FIFO, dangling symlink) to `false`, so a PRESENT-but-broken
+/// `.tirith/commands.yaml` would be read as ABSENT — the discovery walk would
+/// step right over it and the suppression-bounded note + dangerous-glob
+/// enforcement would both silently vanish. Use `symlink_metadata` instead (it
+/// does NOT traverse the final symlink): any extant entry — regular file,
+/// directory, FIFO, even a dangling symlink — counts as PRESENT and STOPS the
+/// walk, leaving the present-but-not-a-regular-file case to the hardened
+/// [`CommandsManifest::load_from_path`] (round-17 `read_regular_capped`), which
+/// fail-SAFELY surfaces it as a parse error rather than "no manifest, walk on".
+/// A truly absent path (`symlink_metadata` errors with `NotFound` or otherwise)
+/// is NOT present, so the walk continues up to the `.git` boundary as before.
+fn manifest_path_present(candidate: &Path) -> bool {
+    candidate.symlink_metadata().is_ok()
+}
+
 /// Resolve the path of `.tirith/commands.yaml` for `cwd`, mirroring policy
 /// discovery: `TIRITH_POLICY_ROOT/.tirith/commands.yaml` first, then walk up
 /// from `cwd` to the `.git` boundary.
 fn discover_manifest_path(cwd: Option<&str>) -> Option<PathBuf> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         let candidate = PathBuf::from(&root).join(".tirith").join(MANIFEST_FILENAME);
-        if candidate.is_file() {
+        if manifest_path_present(&candidate) {
             return Some(candidate);
         }
     }
@@ -535,7 +557,7 @@ fn discover_manifest_path(cwd: Option<&str>) -> Option<PathBuf> {
     let mut current = start.as_path();
     loop {
         let candidate = current.join(".tirith").join(MANIFEST_FILENAME);
-        if candidate.is_file() {
+        if manifest_path_present(&candidate) {
             return Some(candidate);
         }
         // `.git` may be a directory or a file (worktrees); `.exists()` handles
@@ -1136,5 +1158,79 @@ allowed:
                 .is_fifo(),
             "the manifest path must be left as the FIFO it was"
         );
+    }
+
+    /// CodeRabbit R19 #1: a PRESENT-but-not-a-regular-file `.tirith/commands.yaml`
+    /// (a directory, a FIFO, or a dangling symlink) must be treated as PRESENT —
+    /// discovery STOPS there and `discover` surfaces a parse error — NOT silently
+    /// skipped as if no manifest existed (which would drop the suppression-bounded
+    /// note AND the dangerous-glob enforcement). Old `is_file()` presence detection
+    /// coerced all three to `false`; the fix uses `symlink_metadata`. Unix-only
+    /// (needs `mkfifo`/symlink); a `.git` marker bounds the walk-up so the probe
+    /// can never escape into a real ancestor `.tirith/commands.yaml`.
+    #[cfg(unix)]
+    #[test]
+    fn present_but_broken_manifest_is_not_silently_skipped() {
+        use std::ffi::CString;
+
+        // A non-broken control: with NO `.tirith/commands.yaml` and a `.git`
+        // boundary, discovery finds nothing (returns absent) — the baseline the
+        // three broken kinds must differ from.
+        let absent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(absent.path().join(".git")).unwrap();
+        let absent_cwd = absent.path().to_str().unwrap();
+        assert!(
+            discover_manifest_path(Some(absent_cwd)).is_none(),
+            "a repo with no manifest must discover as absent"
+        );
+        assert!(
+            CommandsManifest::discover(Some(absent_cwd))
+                .unwrap()
+                .is_none(),
+            "no manifest must yield Ok(None), not an error"
+        );
+
+        // Helper: build an isolated repo whose `.tirith/` exists, run `setup`
+        // to create the broken `commands.yaml` entry, then assert PRESENCE
+        // (discovery stops here) and that `discover` surfaces an Err.
+        fn assert_present_and_errors(setup: impl FnOnce(&Path)) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+            let tdir = dir.path().join(".tirith");
+            std::fs::create_dir_all(&tdir).unwrap();
+            setup(&tdir.join(MANIFEST_FILENAME));
+
+            let cwd = dir.path().to_str().unwrap();
+            let found = discover_manifest_path(Some(cwd));
+            assert!(
+                found.is_some(),
+                "a present-but-broken manifest entry must STOP discovery (be PRESENT), not be skipped"
+            );
+            invalidate_cache();
+            assert!(
+                CommandsManifest::discover(Some(cwd)).is_err(),
+                "a present-but-broken manifest must surface a (fail-safe) error, not Ok(None)"
+            );
+            invalidate_cache();
+        }
+
+        // (a) the manifest path is a DIRECTORY.
+        assert_present_and_errors(|p| std::fs::create_dir_all(p).unwrap());
+
+        // (b) the manifest path is a DANGLING SYMLINK (target does not exist).
+        assert_present_and_errors(|p| {
+            std::os::unix::fs::symlink("/nonexistent-tirith-target", p).unwrap();
+        });
+
+        // (c) the manifest path is a FIFO.
+        assert_present_and_errors(|p| {
+            let c_path = CString::new(p.as_os_str().to_str().unwrap()).unwrap();
+            // SAFETY: a single libc mkfifo with a valid C string and standard mode.
+            assert_eq!(
+                unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+                0,
+                "mkfifo must succeed for this test"
+            );
+        });
     }
 }

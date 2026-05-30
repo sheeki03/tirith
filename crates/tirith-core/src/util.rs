@@ -445,9 +445,16 @@ pub fn run_shell_with_timeout(
 #[cfg(unix)]
 #[must_use = "a dir-fsync failure should be logged or propagated, not silently dropped"]
 pub fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
-    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    match path.parent() {
+        // A single-component relative destination (e.g. `commands.yaml`) has
+        // `Path::parent() == Some("")`: its containing directory IS the current
+        // working directory, so fsync `.` rather than skipping — otherwise the
+        // required directory fsync is silently dropped (CodeRabbit R19 #2).
+        Some(parent) if parent.as_os_str().is_empty() => {
+            std::fs::File::open(Path::new("."))?.sync_all()
+        }
         Some(parent) => std::fs::File::open(parent)?.sync_all(),
-        // No parent (or empty parent): nothing to fsync — vacuously durable.
+        // No parent (root, e.g. `/`): nothing to fsync — vacuously durable.
         None => Ok(()),
     }
 }
@@ -784,5 +791,32 @@ mod store_line_tests {
             ],
             "trimmed variant must still strip whitespace for the parse path"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fsync_parent_dir_tests {
+    use super::fsync_parent_dir;
+    use std::path::Path;
+
+    #[test]
+    fn single_component_relative_path_fsyncs_cwd() {
+        // CodeRabbit R19 #2: a single-component relative destination (e.g.
+        // `commands.yaml`) has `Path::parent() == Some("")`. The old
+        // `.filter(|p| !p.as_os_str().is_empty())` DROPPED that and returned
+        // `Ok(())`, SKIPPING the required directory fsync. The fix treats an
+        // empty parent as the current directory (`.`) and fsyncs it, so a
+        // relative single-component publish is still made durable. The test
+        // process always has an openable cwd, so this must SUCCEED (and never
+        // panic) — proving we now fsync `.` rather than skipping.
+        fsync_parent_dir(Path::new("commands.yaml"))
+            .expect("single-component relative path must fsync the cwd, not skip");
+    }
+
+    #[test]
+    fn root_path_with_no_parent_is_noop_ok() {
+        // The genuine no-parent case (`/` has `parent() == None`) stays a
+        // vacuous `Ok(())` no-op — there is no containing directory to fsync.
+        fsync_parent_dir(Path::new("/")).expect("a path with no parent is a vacuous Ok no-op");
     }
 }

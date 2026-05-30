@@ -66,9 +66,21 @@ pub fn create(
     // card whose `command` is unusable (and would never match a real command).
     // Both the explicit-flag and prompt paths now reject a blank/whitespace-only
     // value with the same validation error (JSON-aware under `--json`).
+    //
+    // CodeRabbit R19 #3: only fall back to the interactive prompt when stdin IS a
+    // terminal. `prompt` reads a line from stdin, so in a NON-interactive run
+    // (piped / no TTY) the old unconditional `prompt(...)` either blocked or
+    // silently CONSUMED piped data and attested the WRONG command. With no
+    // `--command` and a non-tty stdin we instead emit the same required-`--command`
+    // error below (exit 2, JSON-aware) without touching stdin. (This presenter's
+    // prompt path predates the `TIRITH_INTERACTIVE` override, so the gate is on
+    // `is_terminal(stdin)` — the actual stream `prompt` reads.)
     let command = match command {
         Some(c) => c,
-        None => prompt("command the card attests to").unwrap_or_default(),
+        None if is_terminal::is_terminal(std::io::stdin()) => {
+            prompt("command the card attests to").unwrap_or_default()
+        }
+        None => String::new(),
     };
     if command.trim().is_empty() {
         // A broken-pipe JSON write returns 2 anyway (the error never reached the

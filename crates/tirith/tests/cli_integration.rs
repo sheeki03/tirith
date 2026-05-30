@@ -8984,6 +8984,84 @@ fn command_card_create_rejects_whitespace_only_command() {
     );
 }
 
+/// CodeRabbit R19 #3: `command-card create` with NO `--command` and a
+/// NON-INTERACTIVE (piped, non-tty) stdin must FAIL with the required-`--command`
+/// error (exit 2, parseable JSON under `--json`) — it must NOT fall through to the
+/// TTY prompt, which would either block or silently CONSUME the piped bytes and
+/// attest the WRONG command. Cross-platform: a piped stdin is non-tty on every
+/// platform, so `is_terminal(stdin)` is false and the prompt is skipped.
+#[test]
+fn command_card_create_no_command_noninteractive_rejects_without_consuming_stdin() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // A payload that, if the prompt path wrongly consumed it, would become the
+    // attested command and surface in a card on stdout. We assert it never does.
+    const PIPED: &str = "rm -rf / # attacker-controlled stdin line";
+
+    // Human mode: exit 2, stderr explains the failure, NO card on stdout, and the
+    // piped payload is not echoed anywhere.
+    let mut child = tirith()
+        .args(["command-card", "create"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn create (no --command, piped stdin)");
+    // Write+close stdin so even a regression that DID read stdin cannot hang.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(PIPED.as_bytes())
+        .unwrap();
+    let human = child.wait_with_output().expect("wait create (human)");
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "no --command on a non-tty stdin must be rejected with exit 2, stderr:\n{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("non-empty --command is required"),
+        "human stderr must explain the validation failure, got: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        human.stdout.is_empty(),
+        "no card may be emitted, and the piped payload must not be attested; stdout: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    // JSON mode: a parseable `{"error": ...}` on stdout (NOT a card), and the
+    // error message must be the required-`--command` one — never the piped line.
+    let mut child = tirith()
+        .args(["command-card", "create", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn create --json (no --command, piped stdin)");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(PIPED.as_bytes())
+        .unwrap();
+    let json = child.wait_with_output().expect("wait create (json)");
+    assert_eq!(json.status.code(), Some(2), "JSON mode also exits 2");
+    let v: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("error JSON on stdout under --json");
+    assert_eq!(
+        v["error"], "a non-empty --command is required",
+        "JSON error must be the required-command message (not a card, not the piped line), got: {v}"
+    );
+    assert!(
+        v.get("command").is_none(),
+        "the rejection must not produce a card object with the piped line as command: {v}"
+    );
+}
+
 /// CodeRabbit R9 #J: an invalid `--expires` under `--json` must emit a parseable
 /// `{"error": ...}` object on stdout, not a bare stderr line.
 #[test]
@@ -10847,6 +10925,17 @@ fn read_audit_log_for(root: &std::path::Path) -> String {
     fs::read_to_string(&log).unwrap_or_default()
 }
 
+// UNIX-ONLY (CodeRabbit R19 #0): both this and
+// `commands_run_noninteractive_proceed_writes_run_audit` assert on an audit
+// log WRITTEN BY A `tirith` SUBPROCESS, then read back. That subprocess-write
+// path is currently broken on Windows — `append_to_audit_log` creates the file
+// but the `fs2` exclusive lock / write on a Windows append-only handle fails,
+// leaving a 0-byte log — a PRE-EXISTING limitation in `audit.rs` (the same
+// reason `commands_run_audit_applies_operator_dlp_patterns` below is already
+// `#[cfg(unix)]`-gated). The decline case passes vacuously on Windows (empty
+// log), but it shares the identical subprocess-audit-write dependency, so it is
+// gated too for correctness/consistency.
+#[cfg(unix)]
 #[test]
 fn commands_run_interactive_warn_decline_writes_no_run_audit() {
     use std::io::Write as _;
@@ -10884,6 +10973,12 @@ fn commands_run_interactive_warn_decline_writes_no_run_audit() {
     );
 }
 
+// UNIX-ONLY (CodeRabbit R19 #0): asserts on a subprocess-WRITTEN audit log; the
+// Windows audit-write path is broken (0-byte log via `fs2` lock/write on an
+// append-only handle) — see the gate note on
+// `commands_run_interactive_warn_decline_writes_no_run_audit` above and the
+// pre-existing `commands_run_audit_applies_operator_dlp_patterns`.
+#[cfg(unix)]
 #[test]
 fn commands_run_noninteractive_proceed_writes_run_audit() {
     // The inverse of the decline case: a non-interactive proceed
