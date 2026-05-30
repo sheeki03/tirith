@@ -259,7 +259,11 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
-            clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            // AbsentOrInvalid, not Unread (CodeRabbit R6): `tirith lab` is
+            // deterministic, so it must NEVER read the ambient
+            // `clipboard_source.json` sidecar — `AbsentOrInvalid` tells the engine
+            // there is definitively no source and to skip the disk read.
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         };
 
         // Interactive prelude — show description, prompt before revealing
