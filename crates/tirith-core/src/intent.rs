@@ -427,6 +427,7 @@ pub fn command_signals(command: &str, shell: ShellType) -> Vec<CommandSignal> {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 

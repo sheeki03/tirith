@@ -12001,6 +12001,12 @@ fn paste_with_source_attributes_and_flags_high_mismatch_with_pipe() {
     );
     fs::write(tirith_state.join("clipboard_source.json"), source_json).unwrap();
 
+    // Windows env isolation: the child resolves `state_dir()` from
+    // `%APPDATA%`/`%LOCALAPPDATA%` (etcetera), NOT the XDG vars, so they MUST
+    // point at the SAME tempdir the fixture lives under (`state`), or on Windows
+    // the child would never see `clipboard_source.json`. The audit write the
+    // non-Allow paste verdict makes also lands under this tree — fine for an
+    // isolated tempdir. (On Unix `XDG_STATE_HOME` drives the resolution.)
     let mut child = tirith()
         .args([
             "paste",
@@ -12012,8 +12018,8 @@ fn paste_with_source_attributes_and_flags_high_mismatch_with_pipe() {
         ])
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_DATA_HOME", data.path())
-        .env("APPDATA", data.path())
-        .env("LOCALAPPDATA", data.path())
+        .env("APPDATA", state.path())
+        .env("LOCALAPPDATA", state.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -12285,16 +12291,20 @@ fn browser_host_writes_clipboard_source_from_frame() {
     );
 }
 
-/// `tirith browser host` fed GARBAGE (a valid-length frame whose body is not a
-/// valid record) must NOT write `clipboard_source.json`, and still exit 0 on
-/// EOF (a bad frame is dropped, not fatal).
+/// `tirith browser host` fed a SCHEMA-INVALID frame — well-formed JSON that is
+/// missing a required field (`content_sha256` / `source_url`) — must NOT write
+/// `clipboard_source.json`, and still exit 0 on EOF (a bad frame is dropped, not
+/// fatal). Using valid-but-incomplete JSON (rather than plain text) exercises the
+/// schema-validation path in `parse_record`, not merely the JSON-parse failure.
 #[test]
 fn browser_host_drops_invalid_frame_without_writing() {
     use std::io::Write;
 
     let state = tempfile::tempdir().expect("state tempdir");
 
-    let body = b"this is not a clipboard source record";
+    // Valid JSON, but missing the required `content_sha256` and `source_url`
+    // fields — parses as JSON yet fails to deserialize into ClipboardSourceRecord.
+    let body = br#"{"updated_at":"2026-05-30T00:00:00Z","source_title":"Install"}"#;
     let mut frame = (body.len() as u32).to_ne_bytes().to_vec();
     frame.extend_from_slice(body);
 

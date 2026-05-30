@@ -42,6 +42,15 @@ pub struct AnalysisContext {
     /// `None` when no `--card` flag was passed. A `# tirith-card:` shell
     /// comment in `input` is a SEPARATE channel discovered during analysis.
     pub card_ref: Option<String>,
+    /// M12 ch1 — the companion clipboard-source record (G1 TOCTOU fix). When the
+    /// caller (`tirith paste`) has already read `clipboard_source.json` from disk
+    /// — e.g. to display it under `--with-source` — it sets the SAME in-memory
+    /// record here so the `paste_source_mismatch` rule and the displayed
+    /// attribution agree byte-for-byte. A fast copy-paste-copy can otherwise swap
+    /// the file between two independent reads. `None` (the default) means the
+    /// engine reads the record itself from `state_dir()/clipboard_source.json`.
+    /// Paste context only; ignored elsewhere.
+    pub clipboard_source: Option<crate::clipboard::ClipboardSourceRecord>,
 }
 
 /// Check if a VAR=VALUE word is `TIRITH=0`, stripping optional surrounding quotes
@@ -1986,8 +1995,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // the companion file is non-empty: a single `metadata()` stat, so a machine
     // without the companion browser extension pays nothing. Paste context only —
     // the rule is paste-specific. Mirrors `canary_triggered`.
-    let paste_source_triggered =
-        ctx.scan_context == ScanContext::Paste && crate::clipboard::source_file_nonempty();
+    let paste_source_triggered = ctx.scan_context == ScanContext::Paste
+        && (ctx.clipboard_source.is_some() || crate::clipboard::source_file_nonempty());
 
     // M11 ch1 — a `--card <path>` sidecar flag is not a regex/byte signal, so a
     // clean-looking command (`curl … | sh` already trips tier-1, but a bare
@@ -2532,9 +2541,19 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
         // scanned, not `analyzed_input` (which is the prelude-stripped command for
         // Exec; in Paste the `Cow` borrows unchanged, so they are equal here).
         if ctx.scan_context == ScanContext::Paste {
-            findings.extend(crate::rules::paste_provenance::check(
-                &ctx.input, &findings, &policy,
-            ));
+            // G1 TOCTOU — read the companion record ONCE. Prefer the caller-
+            // supplied in-memory record (`tirith paste --with-source` sets it so
+            // the displayed `clipboard_source` and this finding cannot disagree
+            // after a fast copy-paste-copy); otherwise read it from disk here.
+            let rec = ctx
+                .clipboard_source
+                .clone()
+                .or_else(crate::clipboard::read_source_record);
+            if let Some(rec) = rec {
+                findings.extend(crate::rules::paste_provenance::check_with_record(
+                    &ctx.input, ctx.shell, &findings, &policy, &rec,
+                ));
+            }
         }
 
         let env_findings = crate::rules::environment::check(&crate::rules::environment::RealEnv);
@@ -2860,6 +2879,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -3300,6 +3320,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         }
     }
 
@@ -3318,6 +3339,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         }
     }
 
@@ -3336,6 +3358,7 @@ mod tests {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         }
     }
 

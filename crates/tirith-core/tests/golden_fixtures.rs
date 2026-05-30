@@ -96,6 +96,7 @@ fn run_fixture(fixture: &Fixture) {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -1634,6 +1635,7 @@ fn test_tier1_does_not_gate_findings() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1681,6 +1683,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -1839,6 +1842,7 @@ fn test_lab_corpus_reaches_tier3() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -1960,6 +1964,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2034,6 +2039,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2110,6 +2116,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2165,6 +2172,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2222,6 +2230,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2290,6 +2299,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2355,6 +2365,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2434,6 +2445,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
         engine::analyze(&ctx)
     };

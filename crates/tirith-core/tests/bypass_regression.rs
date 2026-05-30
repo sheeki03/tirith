@@ -35,6 +35,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     engine::analyze(&ctx)
 }

@@ -62,6 +62,14 @@ pub fn run(
         }
     });
 
+    // M12 ch1 — G1 TOCTOU fix: read the companion clipboard-source record ONCE
+    // here and feed the SAME in-memory record to BOTH the engine (which fires
+    // `paste_source_mismatch`) and the `--with-source` display below. Previously
+    // the engine read `clipboard_source.json` and `resolve_source_attribution`
+    // read it AGAIN, so a fast copy-paste-copy could make the displayed
+    // `clipboard_source` disagree with the finding. One read closes that window.
+    let clipboard_source = tirith_core::clipboard::read_source_record();
+
     let ctx = AnalysisContext {
         input,
         shell: shell_type,
@@ -76,6 +84,7 @@ pub fn run(
         is_config_override: false,
         clipboard_html,
         card_ref: None,
+        clipboard_source: clipboard_source.clone(),
     };
 
     // PR #121 fix-list item 18 (mirrors `install.rs:760` / `check.rs`):
@@ -147,7 +156,10 @@ pub fn run(
         // a `clipboard_source: null` so a scripted caller can tell "no source
         // recorded" apart from a missing flag.
         let source_attribution = if with_source {
-            Some(resolve_source_attribution(&ctx.input))
+            Some(resolve_source_attribution(
+                &ctx.input,
+                clipboard_source.as_ref(),
+            ))
         } else {
             None
         };
@@ -162,7 +174,7 @@ pub fn run(
         // note to stderr (the structured keys live in `--json`). Graceful when no
         // source was recorded for this paste.
         if with_source {
-            match resolve_source_attribution(&ctx.input) {
+            match resolve_source_attribution(&ctx.input, clipboard_source.as_ref()) {
                 serde_json::Value::Null => {
                     eprintln!("tirith paste: no clipboard source recorded for this paste");
                 }
@@ -186,9 +198,17 @@ pub fn run(
 /// recorded source / the hash does not match / the extension isn't installed —
 /// so `--with-source` always emits a `clipboard_source` key and a scripted
 /// caller can distinguish "matched source" from "no source recorded".
-fn resolve_source_attribution(input: &str) -> serde_json::Value {
+///
+/// G1 TOCTOU fix: the `record` is the SAME one already read once at the top of
+/// `run` and handed to the engine, so the displayed attribution and the
+/// `paste_source_mismatch` finding can never disagree. We do NOT re-read
+/// `clipboard_source.json` here.
+fn resolve_source_attribution(
+    input: &str,
+    record: Option<&tirith_core::clipboard::ClipboardSourceRecord>,
+) -> serde_json::Value {
     use sha2::{Digest, Sha256};
-    let Some(record) = tirith_core::clipboard::read_source_record() else {
+    let Some(record) = record else {
         return serde_json::Value::Null;
     };
     let digest = Sha256::digest(input.as_bytes());
@@ -231,7 +251,14 @@ fn write_paste_json(
     let mut value: serde_json::Value = match serde_json::from_slice(&buf) {
         Ok(v) => v,
         Err(_) => {
-            return std::io::stdout().lock().write_all(&buf);
+            // Unreachable in practice (our own serializer always emits valid
+            // JSON), but if it ever happened we must still emit newline-
+            // terminated output for line-oriented consumers. `write_json` already
+            // appended a trailing newline to `buf`; flush it, then guarantee
+            // termination explicitly rather than relying on that invariant.
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&buf)?;
+            return writeln!(stdout);
         }
     };
     if let Some(obj) = value.as_object_mut() {

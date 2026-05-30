@@ -334,8 +334,7 @@ pub fn run(non_interactive: bool, pairs: Option<String>, json: bool) -> i32 {
     );
     eprintln!();
 
-    let mut results: Vec<PairResult> = Vec::with_capacity(selected.len());
-    for (idx, pair) in selected.iter().enumerate() {
+    let results = collect_verdicts(&selected, |idx, pair| {
         eprintln!(
             "  ({}/{}) {} — {}",
             idx + 1,
@@ -345,23 +344,8 @@ pub fn run(non_interactive: bool, pairs: Option<String>, json: bool) -> i32 {
         );
         eprintln!("      reference (ASCII):  [{}]", pair.ascii);
         eprintln!("      candidate:          [{}]", pair.confusable);
-        let verdict = match prompt_verdict("      distinguishable? [y/n/skip]") {
-            Some(v) => v,
-            None => {
-                // EOF / unreadable stdin mid-loop: stop prompting, record the
-                // rest as skipped so the result stays well-formed.
-                eprintln!(
-                    "tirith visual-audit: input closed; recording remaining pairs as skipped."
-                );
-                VERDICT_SKIPPED.to_string()
-            }
-        };
-        results.push(PairResult {
-            name: pair.name.to_string(),
-            codepoints: pair.codepoints.to_string(),
-            verdict,
-        });
-    }
+        prompt_verdict("      distinguishable? [y/n/skip]")
+    });
 
     let result = tally(&term, results);
     finish(result, json, /*persist=*/ true)
@@ -465,6 +449,51 @@ fn print_human_summary(result: &VisualAuditResult) {
     }
     eprintln!();
     eprintln!("  This result describes only this machine and is not portable.");
+}
+
+/// Drive the per-pair prompt loop. `prompt(idx, pair)` returns the operator's
+/// verdict for one pair, or `None` on EOF / unreadable stdin.
+///
+/// Once `prompt` returns `None` we set an `input_closed` flag and record EVERY
+/// remaining pair as skipped WITHOUT calling `prompt` again — a closed stdin
+/// stays closed, so re-prompting would just spin returning `None` (and, for a
+/// real terminal, spam the same prompt for each remaining pair). The result is
+/// always well-formed: one [`PairResult`] per selected pair, in order.
+///
+/// Factored out (taking the prompt as a closure) so a mid-audit EOF can be
+/// exercised in a unit test without driving real stdin.
+fn collect_verdicts<F>(selected: &[&'static ConfusablePair], mut prompt: F) -> Vec<PairResult>
+where
+    F: FnMut(usize, &ConfusablePair) -> Option<String>,
+{
+    let mut results: Vec<PairResult> = Vec::with_capacity(selected.len());
+    let mut input_closed = false;
+    for (idx, pair) in selected.iter().enumerate() {
+        let verdict = if input_closed {
+            // stdin already closed earlier this run — do not prompt again.
+            VERDICT_SKIPPED.to_string()
+        } else {
+            match prompt(idx, pair) {
+                Some(v) => v,
+                None => {
+                    // EOF / unreadable stdin mid-loop: stop prompting for the
+                    // rest of this run; record everything remaining as skipped so
+                    // the result stays well-formed.
+                    input_closed = true;
+                    eprintln!(
+                        "tirith visual-audit: input closed; recording remaining pairs as skipped."
+                    );
+                    VERDICT_SKIPPED.to_string()
+                }
+            }
+        };
+        results.push(PairResult {
+            name: pair.name.to_string(),
+            codepoints: pair.codepoints.to_string(),
+            verdict,
+        });
+    }
+    results
 }
 
 /// Prompt on stderr, read one line from stdin, and map the answer to a verdict
@@ -597,6 +626,70 @@ mod tests {
             result.distinguishable + result.indistinguishable + result.skipped,
             result.pairs_total
         );
+    }
+
+    /// Mid-audit EOF: once the prompt closure returns `None`, NO further prompts
+    /// are issued and every remaining pair is recorded as skipped. We answer the
+    /// first two pairs, then "close" stdin — the closure must not be called for
+    /// pair index ≥ 2, and the tail is all skipped. Guards the regression where
+    /// the loop kept calling `prompt_verdict` after EOF.
+    #[test]
+    fn collect_verdicts_stops_prompting_after_eof() {
+        let (selected, _) = select_pairs(Some("all"));
+        assert!(
+            selected.len() >= 3,
+            "need several pairs to exercise the tail"
+        );
+
+        let mut calls = 0usize;
+        let results = collect_verdicts(&selected, |idx, _pair| {
+            calls += 1;
+            match idx {
+                0 => Some(VERDICT_DISTINGUISHABLE.to_string()),
+                1 => Some(VERDICT_INDISTINGUISHABLE.to_string()),
+                // From the third pair on, stdin is "closed": return None. The
+                // loop must NOT call us again after this.
+                _ => None,
+            }
+        });
+
+        // The closure was called for pairs 0, 1, and once more (which returned
+        // None) — and NEVER again, even though more pairs remain.
+        assert_eq!(
+            calls, 3,
+            "prompt must be called exactly 3 times (2 answers + 1 EOF), not once per remaining pair"
+        );
+        // The result is well-formed: one entry per selected pair, in order.
+        assert_eq!(results.len(), selected.len());
+        assert_eq!(results[0].verdict, VERDICT_DISTINGUISHABLE);
+        assert_eq!(results[1].verdict, VERDICT_INDISTINGUISHABLE);
+        for r in &results[2..] {
+            assert_eq!(
+                r.verdict, VERDICT_SKIPPED,
+                "every pair after EOF must be skipped"
+            );
+        }
+
+        // And the tally partitions cleanly.
+        let tallied = tally("xterm-256color", results);
+        assert_eq!(tallied.distinguishable, 1);
+        assert_eq!(tallied.indistinguishable, 1);
+        assert_eq!(tallied.skipped, selected.len() - 2);
+        assert_eq!(tallied.pairs_total, selected.len());
+    }
+
+    /// The all-answers path (no EOF): the closure is called once per pair and
+    /// each answer is recorded — the complement of the EOF test above.
+    #[test]
+    fn collect_verdicts_records_every_answer_when_stdin_stays_open() {
+        let (selected, _) = select_pairs(Some("critical"));
+        let mut calls = 0usize;
+        let results = collect_verdicts(&selected, |_idx, _pair| {
+            calls += 1;
+            Some(VERDICT_DISTINGUISHABLE.to_string())
+        });
+        assert_eq!(calls, selected.len(), "every pair must be prompted");
+        assert!(results.iter().all(|r| r.verdict == VERDICT_DISTINGUISHABLE));
     }
 
     /// The answer→verdict mapping is the parser the interactive loop relies on.

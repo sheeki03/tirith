@@ -21,7 +21,7 @@ tirith does not (and cannot) observe your browser by itself. A **companion
 browser extension** (shipped from a separate repository) writes a small JSON
 record every time it sets the system clipboard, at:
 
-```
+```text
 <state-dir>/clipboard_source.json
 ```
 

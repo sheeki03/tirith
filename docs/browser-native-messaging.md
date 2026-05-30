@@ -16,7 +16,7 @@ The TypeScript extension is out of scope here.
 
 ## The two ends
 
-```
+```text
   Chrome extension  --(native messaging, stdio)-->  tirith browser host
         (separate repo)                                    |
                                                            v
@@ -35,7 +35,7 @@ tirith only ever **reads** the record file from the engine side; the host is the
 Chrome's native messaging framing is a length-prefixed stream on stdin/stdout.
 Each message is:
 
-```
+```text
   [ 4-byte length prefix ][ N bytes of UTF-8 JSON ]
 ```
 
@@ -48,7 +48,7 @@ Each message is:
 The host writes a tiny acknowledgement frame back per message, using the same
 framing:
 
-```
+```json
   {"ok":true}    — the record was validated and persisted
   {"ok":false}   — the frame was rejected (bad schema) or the write failed
 ```
@@ -57,7 +57,7 @@ framing:
 
 The native-messaging host is named:
 
-```
+```text
   sh.tirith.browser
 ```
 
@@ -99,7 +99,7 @@ recorded source, so no attribution is made.
 
 On a valid frame the host writes the validated record to:
 
-```
+```text
   <state-dir>/clipboard_source.json
 ```
 

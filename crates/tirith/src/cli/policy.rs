@@ -703,6 +703,7 @@ fn test_command(command: &str, json: bool) -> i32 {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let mut verdict = engine::analyze(&ctx);

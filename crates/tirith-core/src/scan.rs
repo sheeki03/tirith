@@ -183,6 +183,7 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -244,6 +245,7 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);

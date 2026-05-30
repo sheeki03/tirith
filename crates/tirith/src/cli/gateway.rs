@@ -680,6 +680,7 @@ fn handle_guarded_call(
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
         let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });
@@ -934,6 +935,7 @@ fn handle_guarded_notification(
             is_config_override: false,
             clipboard_html: None,
             card_ref: None,
+            clipboard_source: None,
         };
         let _ = tx.send(engine::analyze_returning_policy(&ctx));
     });

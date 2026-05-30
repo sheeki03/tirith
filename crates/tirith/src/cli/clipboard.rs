@@ -720,7 +720,10 @@ pub fn watch(json: bool) -> i32 {
                 continue;
             }
             Err(_) => {
-                last_mtime = Some(mtime);
+                // Transient clipboard read failure (e.g. the selection is held by
+                // another app this instant). Do NOT advance `last_mtime`: the same
+                // source record should be retried on the next poll rather than
+                // permanently skipped after one transient error.
                 continue;
             }
         };
@@ -778,6 +781,7 @@ fn analyze_as_paste(input: &str) -> tirith_core::verdict::Verdict {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
     let mut verdict = engine::analyze(&ctx);
     // Apply paranoia filter against the active policy so the clipboard

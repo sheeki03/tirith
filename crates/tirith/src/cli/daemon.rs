@@ -234,6 +234,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let mut verdict = engine::analyze(&ctx);

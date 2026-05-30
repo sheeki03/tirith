@@ -24,6 +24,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         is_config_override: false,
         clipboard_html: None,
         card_ref: None,
+        clipboard_source: None,
     };
 
     let verdict = engine::analyze(&ctx);

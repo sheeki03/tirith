@@ -2532,26 +2532,35 @@ enum BrowserAction {
 Writes the Chrome Native Messaging Host manifest (sh.tirith.browser.json) that
 lets the companion extension launch `tirith browser host`. Without --apply the
 manifest + target path are printed (dry-run). With --apply the manifest is
-written to the per-OS NativeMessagingHosts directory:
-  macOS: ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/
-  Linux: ~/.config/google-chrome/NativeMessagingHosts/
+written to the per-OS NativeMessagingHosts directory (the targeted path is
+always printed). --browser selects the Chromium-family browser:
+  chrome (default): macOS ~/Library/Application Support/Google/Chrome/...
+                    Linux ~/.config/google-chrome/...
+  chromium:         .../Chromium/...        Linux ~/.config/chromium/...
+  brave:            .../BraveSoftware/Brave-Browser/...
+  edge:             .../Microsoft Edge/...  Linux ~/.config/microsoft-edge/...
   Windows: registry-based — guidance is printed, the registry is NOT modified.
 
 The extension id authorizes which extension may connect; pass --extension-id
-<id> (a real id is 32 letters a–p) or a clearly-marked placeholder is used.
-The write is idempotent.
+<id> (a real id is 32 letters a–p) or a clearly-marked placeholder is used. A
+malformed id is rejected. The write is idempotent.
 
 Examples:
   tirith browser install-extension
   tirith browser install-extension --apply
+  tirith browser install-extension --browser brave --apply
   tirith browser install-extension --extension-id abcdefghijklmnopabcdefghijklmnop --apply
   tirith browser install-extension --json"
     )]
     InstallExtension {
         /// Chrome extension id allowed to connect (32 letters a–p). Defaults to
-        /// a documented placeholder when omitted.
+        /// a documented placeholder when omitted. A malformed id is rejected.
         #[arg(long)]
         extension_id: Option<String>,
+        /// Which Chromium-family browser's NativeMessagingHosts directory to
+        /// target: chrome (default), chromium, brave, or edge.
+        #[arg(long, default_value = "chrome")]
+        browser: String,
         /// Actually write the manifest (creating the directory). Without this
         /// flag the manifest is printed for inspection.
         #[arg(long)]
@@ -7288,9 +7297,16 @@ fn run() {
             BrowserAction::Host => cli::browser_host::run(),
             BrowserAction::InstallExtension {
                 extension_id,
+                browser,
                 apply,
                 json,
-            } => cli::browser::install_extension(extension_id, apply, json),
+            } => match browser.parse::<cli::browser::Browser>() {
+                Ok(browser) => cli::browser::install_extension(extension_id, browser, apply, json),
+                Err(e) => {
+                    eprintln!("tirith browser install-extension: {e}");
+                    1
+                }
+            },
         },
 
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.

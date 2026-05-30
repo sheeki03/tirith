@@ -149,6 +149,7 @@ pub fn run(
                     is_config_override: false,
                     clipboard_html: None,
                     card_ref: card.clone(),
+                    clipboard_source: None,
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -166,6 +167,7 @@ pub fn run(
                 is_config_override: false,
                 clipboard_html: None,
                 card_ref: card.clone(),
+                clipboard_source: None,
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -183,6 +185,7 @@ pub fn run(
             is_config_override: false,
             clipboard_html: None,
             card_ref: card.clone(),
+            clipboard_source: None,
         };
         let (v, p) = engine::analyze_returning_policy(&ctx);
         (v, Some(p))
