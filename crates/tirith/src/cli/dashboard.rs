@@ -433,6 +433,39 @@ fn serve_loop(server: &tiny_http::Server, token: &str, issued_at: DateTime<Utc>)
     }
 }
 
+/// Apply the response-hardening header set to `response` and return it.
+///
+/// Every response we emit — 200, 401, AND 403 — carries the same headers so the
+/// hardening cannot drift between the success and error paths (M13 PR #132
+/// finding D6-3). `Cache-Control: no-store` keeps even an unauthorized response
+/// out of any browser/proxy cache; the strict CSP, `nosniff`, and
+/// `no-referrer` apply browser hardening regardless of status.
+///
+/// `Header::from_bytes` only fails on a non-ASCII header name/value, which none
+/// of these are, so the `if let Ok(..)` is best-effort and never drops a header
+/// in practice.
+fn with_security_headers(
+    mut response: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    for (name, value) in [
+        ("Content-Type", "text/html; charset=utf-8"),
+        // Defense in depth for the report itself — it has no scripts, but
+        // a strict CSP makes that explicit and blocks any injected one.
+        (
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        ),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Cache-Control", "no-store"),
+    ] {
+        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(h);
+        }
+    }
+    response
+}
+
 /// Authorize + respond to one request. Pulls the `Host` header and `token` query
 /// param, calls [`authorize`], and emits 200 (HTML) / 401 / 403 accordingly.
 ///
@@ -459,15 +492,20 @@ fn handle_request(mut request: tiny_http::Request, token: &str, issued_at: DateT
 
     // Reject unauthorized / forbidden requests immediately, WITHOUT reading the
     // body — a pre-auth client cannot grow our memory or keep the handler busy.
+    // The error responses carry the SAME hardening headers as the 200 path (see
+    // `with_security_headers`) so an unauthorized reply is never cacheable and
+    // never misses the browser hardening.
     if decision != Decision::Ok {
-        let _ = match decision {
-            Decision::Unauthorized => request.respond(
-                tiny_http::Response::from_string("401 Unauthorized").with_status_code(401),
-            ),
-            Decision::Forbidden => request
-                .respond(tiny_http::Response::from_string("403 Forbidden").with_status_code(403)),
+        let response = match decision {
+            Decision::Unauthorized => {
+                tiny_http::Response::from_string("401 Unauthorized").with_status_code(401)
+            }
+            Decision::Forbidden => {
+                tiny_http::Response::from_string("403 Forbidden").with_status_code(403)
+            }
             Decision::Ok => unreachable!("handled above"),
         };
+        let _ = request.respond(with_security_headers(response));
         return;
     }
 
@@ -500,25 +538,8 @@ fn handle_request(mut request: tiny_http::Request, token: &str, issued_at: DateT
     // escapes every value (see core).
     let snapshot = build_snapshot();
     let html = dashboard::render_html(&snapshot);
-    let mut response = tiny_http::Response::from_string(html);
-    // Best-effort content-type + hardening headers. `from_bytes` only
-    // fails on a non-ASCII header name/value, which these are not.
-    for (name, value) in [
-        ("Content-Type", "text/html; charset=utf-8"),
-        // Defense in depth for the report itself — it has no scripts, but
-        // a strict CSP makes that explicit and blocks any injected one.
-        (
-            "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'",
-        ),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Referrer-Policy", "no-referrer"),
-        ("Cache-Control", "no-store"),
-    ] {
-        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response = response.with_header(h);
-        }
-    }
+    // Same hardening header set as the 401/403 paths (see `with_security_headers`).
+    let response = with_security_headers(tiny_http::Response::from_string(html));
     let _ = request.respond(response);
 }
 
@@ -746,21 +767,31 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
 
-    /// Send a raw HTTP/1.1 GET with an explicit `Host` header and read the
-    /// status line back. Returns the numeric status code.
-    fn raw_get_status(port: u16, target: &str, host: &str) -> u16 {
+    /// Send a raw HTTP/1.1 GET with an explicit `Host` header and read the FULL
+    /// response back as `(status_code, raw_text)`. The raw text includes the
+    /// header block so a caller can assert on response headers.
+    fn raw_get_response(port: u16, target: &str, host: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let req = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).expect("write request");
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).expect("read response");
-        let text = String::from_utf8_lossy(&buf);
+        let text = String::from_utf8_lossy(&buf).into_owned();
         // Status line: "HTTP/1.1 <code> <reason>".
-        let line = text.lines().next().unwrap_or_default();
-        line.split_whitespace()
+        let status = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
             .nth(1)
             .and_then(|c| c.parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        (status, text)
+    }
+
+    /// Convenience wrapper that returns just the numeric status code.
+    fn raw_get_status(port: u16, target: &str, host: &str) -> u16 {
+        raw_get_response(port, target, host).0
     }
 
     #[test]
@@ -811,6 +842,63 @@ mod tests {
             401,
             "a wrong token must be rejected 401"
         );
+
+        handle.join().expect("server thread");
+    }
+
+    // -----------------------------------------------------------------------
+    // M13 PR #132 finding D6-3 — the hardening header set is applied to the
+    // 401 (wrong token) and 403 (foreign Host) responses too, not just 200.
+    // An unauthorized response must still be uncacheable (`Cache-Control:
+    // no-store`) and carry the strict CSP / nosniff / no-referrer headers so
+    // the hardening cannot drift between the success and error paths.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn unauthorized_responses_carry_hardening_headers() {
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let issued = Utc::now();
+
+        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind 127.0.0.1:0");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+
+        // Handle exactly two requests: one 401, one 403.
+        let tok = token.to_string();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                match server.recv() {
+                    Ok(req) => handle_request(req, &tok, issued),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Assert a response's header block carries every hardening header,
+        // case-insensitively (HTTP header names are case-insensitive).
+        fn assert_hardened(status: u16, text: &str, expected_status: u16, label: &str) {
+            assert_eq!(status, expected_status, "{label}: wrong status");
+            let lower = text.to_ascii_lowercase();
+            for needle in [
+                "cache-control: no-store",
+                "content-security-policy: default-src 'none'; style-src 'unsafe-inline'",
+                "x-content-type-options: nosniff",
+                "referrer-policy: no-referrer",
+            ] {
+                assert!(
+                    lower.contains(needle),
+                    "{label}: response missing header `{needle}`\nfull response: {text:?}"
+                );
+            }
+        }
+
+        // 401 — loopback Host, wrong token.
+        let (status, text) = raw_get_response(port, "/?token=wrong", &format!("127.0.0.1:{port}"));
+        assert_hardened(status, &text, 401, "401 wrong-token response");
+
+        // 403 — foreign Host (DNS-rebinding guard), even with a good token.
+        let (status, text) =
+            raw_get_response(port, &format!("/?token={token}"), "evil.example.com");
+        assert_hardened(status, &text, 403, "403 foreign-Host response");
 
         handle.join().expect("server thread");
     }

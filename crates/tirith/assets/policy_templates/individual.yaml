@@ -60,8 +60,7 @@ scan:
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
 # Enforcement is active on every analysis path: `tirith check`, `paste`,
 # `install`, `ecosystem scan`, and all MCP `tools/call_check_*` handlers.
-# The interactive `TIRITH=0` bypass currently skips `agent_rules`;
-# revisit in M5.
+# Note: the interactive `TIRITH=0` bypass currently skips `agent_rules`.
 # agent_rules:
 #   allow:
 #     - kind: agent

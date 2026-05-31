@@ -296,46 +296,75 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
     hosts
 }
 
-/// Summarize the discovered policy using a STRICT load that surfaces a broken
-/// policy file rather than masking it as benign defaults.
+/// Summarize the EFFECTIVE policy the engine enforces, while still surfacing a
+/// broken LOCAL policy file rather than masking it as benign defaults.
 ///
-/// `Policy::discover` WARN-defaults on a parse failure — a malformed
-/// `.tirith/policy.yaml` would silently render as paranoia `1` / `open` /
-/// `0 custom rules`, i.e. a fail-OPEN dashboard that hides the fact that policy
-/// loading failed (CodeRabbit M13 PR #132 R5-1). On a security dashboard that
-/// is dangerous. So we mirror the strict-load idiom `tirith policy validate` /
-/// `tirith rule validate` use: locate the local policy file, read it, and parse
-/// it with [`crate::policy::Policy::try_parse_yaml`] (which returns `Err`
-/// instead of warn-and-defaulting).
+/// # Two concerns, two mechanisms
 ///
-/// * No local policy file → the genuine built-in defaults (NOT an error; this
-///   is the common fresh-install case).
-/// * File present + parses → the parsed summary.
-/// * File present + unparseable → an `error`-bearing summary with numeric
-///   fields left `None`, so the renderer can say "policy: unavailable — <err>"
-///   instead of a fake default.
+/// 1. **Counts must match what `analyze()` actually enforces.** The engine does
+///    NOT enforce the bare local `policy.yaml`: in `engine::analyze_inner` it
+///    builds the effective policy as
+///    `Policy::discover(cwd)` (local resolution + optional remote replacement +
+///    incident `apply_runtime_overrides`) followed by the read-only overlay
+///    helpers `load_user_lists()`, `load_org_lists(cwd)` and
+///    `load_trust_entries(cwd)`. Those overlays APPEND to `allowlist`,
+///    `allowlist_rules` and `blocklist` (user/org flat-file lists + non-expired
+///    `trust.json` entries). Summarizing only the strict local parse (round 5)
+///    UNDER-reports the active allow/block counts versus enforcement (CodeRabbit
+///    M13 PR #132 R6-1). So we reproduce that exact sequence here for the COUNTS.
 ///
-/// This is the local-only resolution (the same `discover_local_policy_path`
-/// every other strict CLI path uses); remote-policy fetch / runtime overrides
-/// are out of scope for the snapshot, and the concern here is specifically a
-/// malformed on-disk policy file presenting as safe defaults.
+/// 2. **A broken local file must NOT read as safe defaults.** `Policy::discover`
+///    fails CLOSED on an unparseable named file (it returns a block-everything
+///    policy, not the open default) — but it does so SILENTLY for the dashboard:
+///    a malformed `.tirith/policy.yaml` would render as a populated summary with
+///    no indication that the operator's real policy never loaded. On a security
+///    dashboard that is the fail-open lie this representation exists to prevent
+///    (CodeRabbit M13 PR #132 R5-1). So we ADDITIONALLY do a STRICT local parse
+///    (the same `discover_local_policy_path` + [`crate::policy::Policy::try_parse_yaml`]
+///    idiom `tirith policy validate` uses) purely to DETECT a broken local file
+///    and set the `error` state.
+///
+/// # Resulting states
+///
+/// * Broken LOCAL policy file → `error` populated, numeric fields `None`, `path`
+///   set (the hard-error state; takes precedence — counts are meaningless when
+///   the operator's file did not load).
+/// * No local policy file → the effective defaults + overlays (NOT an error;
+///   the common fresh-install case). `path` is `None` only when discovery found
+///   no file at all.
+/// * Valid local policy file → the EFFECTIVE summary (local parse + overlays),
+///   `error` `None`.
+///
+/// Overlay application is non-fatal: each `load_*` helper is itself read-only and
+/// degrades internally (a corrupt overlay source is skipped with a diagnostic,
+/// never a panic), so the strict local parse is the only hard-error state.
 fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
-    let Some(path) = crate::policy::discover_local_policy_path(cwd) else {
-        // No policy file anywhere — these are the genuine built-in defaults,
-        // which is a legitimate state, not an error.
-        return policy_summary_from(&crate::policy::Policy::default(), None);
-    };
-
-    let path_str = path.display().to_string();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return policy_summary_error(path_str, format!("cannot read: {e}")),
-    };
-
-    match crate::policy::Policy::try_parse_yaml(&content) {
-        Ok(policy) => policy_summary_from(&policy, Some(path_str)),
-        Err(e) => policy_summary_error(path_str, e),
+    // (1) Strict local parse FIRST — this is the ONLY hard-error state. A
+    // present-but-unparseable local file must surface as "unavailable" instead
+    // of any populated summary (which `Policy::discover`'s fail-closed default
+    // would otherwise silently present).
+    if let Some(path) = crate::policy::discover_local_policy_path(cwd) {
+        let path_str = path.display().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                if let Err(e) = crate::policy::Policy::try_parse_yaml(&content) {
+                    return policy_summary_error(path_str, e);
+                }
+            }
+            Err(e) => return policy_summary_error(path_str, format!("cannot read: {e}")),
+        }
     }
+
+    // (2) Local file parsed (or there is none): build the EFFECTIVE policy the
+    // same way `engine::analyze_inner` does, so the surfaced counts match what
+    // is actually enforced (discover + the read-only overlay helpers). Each
+    // overlay is internally non-fatal (read-only, degrades on a corrupt source).
+    let mut policy = crate::policy::Policy::discover(cwd);
+    policy.load_user_lists();
+    policy.load_org_lists(cwd);
+    policy.load_trust_entries(cwd);
+
+    policy_summary_from(&policy, policy.path.clone())
 }
 
 /// Build a populated [`PolicySummary`] from a successfully-loaded policy.
@@ -1187,6 +1216,123 @@ mod tests {
         assert!(summary.path.is_some());
 
         // Restore isolation env to unset so later tests start clean.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[test]
+    fn build_policy_summary_counts_include_effective_overlays() {
+        // CodeRabbit M13 PR #132 R6-1: the dashboard must summarize the EFFECTIVE
+        // policy `engine::analyze_inner` enforces — i.e. the local parse PLUS the
+        // read-only overlay helpers (`load_user_lists` + `load_org_lists` +
+        // `load_trust_entries`) that APPEND user/org flat-file lists and
+        // non-expired `trust.json` entries to the allow/block lists. Summarizing
+        // only the strict local parse (round 5) UNDER-reports those counts.
+        //
+        // Here a local policy declares ONE allowlist entry; overlays add a user
+        // allowlist line, an org blocklist line, and two trust entries (one
+        // flat → allowlist, one rule-scoped → allowlist_rules). The effective
+        // counts must reflect ALL of them, not just the single local entry. A
+        // broken LOCAL file is still the hard-error state (asserted at the end).
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all tirith-core tests.
+        unsafe {
+            std::env::remove_var("TIRITH_POLICY_ROOT");
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
+            // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith`;
+            // point it at an isolated dir we populate, so the developer's real
+            // user config is never read AND our user-overlay files are seen.
+            std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
+        }
+
+        // A valid local policy with exactly one (flat) allowlist entry.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        std::fs::write(
+            repo.path().join(".tirith/policy.yaml"),
+            "paranoia: 2\nallowlist:\n  - https://local.example.com\n",
+        )
+        .unwrap();
+
+        // User-scope overlay: a flat allowlist line (`load_user_lists`).
+        let user_tirith = isolated_config.path().join("tirith");
+        std::fs::create_dir_all(&user_tirith).unwrap();
+        std::fs::write(user_tirith.join("allowlist"), "https://user.example.com\n").unwrap();
+        // User-scope trust store: one flat entry (→ allowlist) + one rule-scoped
+        // entry (→ allowlist_rules), both permanent (`load_trust_entries`).
+        let trust = serde_json::json!({
+            "version": 1,
+            "entries": [
+                {"pattern": "https://trust-flat.example.com", "added": "x", "source": "s"},
+                {"pattern": "https://trust-rule.example.com", "added": "x", "source": "s",
+                 "rule_id": "plain_http"}
+            ]
+        });
+        std::fs::write(
+            user_tirith.join("trust.json"),
+            serde_json::to_string(&trust).unwrap(),
+        )
+        .unwrap();
+
+        // Org-scope overlay: a repo `.tirith/blocklist` line (`load_org_lists`).
+        std::fs::write(
+            repo.path().join(".tirith/blocklist"),
+            "https://blocked.example.com\n",
+        )
+        .unwrap();
+
+        let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+
+        // No error — the local file parsed.
+        assert!(
+            summary.error.is_none(),
+            "a valid local policy + overlays is not an error: {summary:?}"
+        );
+        assert_eq!(summary.paranoia, Some(2), "local paranoia is preserved");
+
+        // allowlist = 1 local + 1 user flat-file + 1 flat trust entry = 3.
+        // (Round 5's strict-local-only parse would have reported just 1.)
+        assert_eq!(
+            summary.allowlist_count,
+            Some(3),
+            "allowlist must include the user flat-file + flat trust overlays: {summary:?}"
+        );
+        // allowlist_rules = 1 rule-scoped trust entry.
+        assert_eq!(
+            summary.allowlist_rules_count,
+            Some(1),
+            "rule-scoped trust entries must count toward allowlist_rules: {summary:?}"
+        );
+        // blocklist = 1 org flat-file line.
+        assert_eq!(
+            summary.blocklist_count,
+            Some(1),
+            "blocklist must include the org flat-file overlay: {summary:?}"
+        );
+
+        // A BROKEN local file is still the hard-error state even though overlays
+        // exist — counts are meaningless when the operator's file did not load.
+        std::fs::write(
+            repo.path().join(".tirith/policy.yaml"),
+            "paranoia: [unterminated\n",
+        )
+        .unwrap();
+        let broken = build_policy_summary(Some(repo.path().to_str().unwrap()));
+        assert!(
+            broken.error.is_some(),
+            "a broken LOCAL file must still surface the error state: {broken:?}"
+        );
+        assert!(
+            broken.allowlist_count.is_none(),
+            "numeric fields must be None when the local file failed to load: {broken:?}"
+        );
+
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
         }

@@ -181,16 +181,26 @@ pub fn build_dsl_backing(
     if scan_context != ScanContext::FileScan {
         let segments = crate::tokenize::tokenize(analyzed_input, shell);
         for pkg in crate::rules::threatintel::extract_packages(&segments) {
+            // `DslBacking` owns LOWERCASED package names (see the struct doc).
+            // Case-insensitive ecosystems (PyPI normalizes names to lowercase;
+            // the threat-DB / popular indexes store lowercase) would otherwise
+            // make `package.name_matches` and `package.reputation` casing-
+            // dependent — matching `requests` but missing `Requests` (CodeRabbit
+            // M13 PR #132 R6-2). Lowercase before BOTH the reputation lookup and
+            // storage so the DSL view matches the documented contract.
+            let name = pkg.name.to_lowercase();
             let reputation =
-                package_reputation(pkg.ecosystem, &pkg.name, pkg.version.as_deref(), threat_db);
-            packages.push((pkg.ecosystem.to_string(), pkg.name, reputation));
+                package_reputation(pkg.ecosystem, &name, pkg.version.as_deref(), threat_db);
+            packages.push((pkg.ecosystem.to_string(), name, reputation));
         }
     }
     for u in extracted {
         if let crate::parse::UrlLike::DockerRef { image, .. } = &u.parsed {
+            // Same lowercased-name contract as the install-package branch above.
+            let image = image.to_lowercase();
             let reputation =
-                package_reputation(crate::threatdb::Ecosystem::Docker, image, None, threat_db);
-            packages.push(("docker".to_string(), image.clone(), reputation));
+                package_reputation(crate::threatdb::Ecosystem::Docker, &image, None, threat_db);
+            packages.push(("docker".to_string(), image, reputation));
         }
     }
 
@@ -3218,6 +3228,48 @@ mod tests {
                 &ctx_nodb
             ),
             "no-DB: no package may be reported as malicious"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 R6-2: `DslBacking` is documented to own
+    /// LOWERCASED package names, so `package.name_matches` (and the reputation
+    /// lookups) stay casing-insensitive for case-insensitive ecosystems. Before
+    /// the fix the loop stored `pkg.name` / Docker `image` verbatim, so a
+    /// lowercase pattern matched `requests` but MISSED `Requests`. This pins
+    /// that a lowercase pattern matches an UPPERCASED package name in the input
+    /// — for both an install package and a Docker image ref.
+    #[test]
+    fn test_build_dsl_backing_lowercases_package_names() {
+        use crate::custom_rule_dsl::{evaluate, WhenClause};
+
+        // (1) Install package: PyPI normalizes names to lowercase, so `Requests`
+        // and `requests` are the same package. A lowercase `^requests$` pattern
+        // must match the uppercased input.
+        let cmd = "pip install Requests";
+        let extracted = extract::extract_urls(cmd, ShellType::Posix);
+        let backing = build_dsl_backing(cmd, ShellType::Posix, ScanContext::Exec, &extracted, None);
+        let ctx = backing.as_eval_context(None, None);
+        assert!(
+            evaluate(
+                &WhenClause::PackageNameMatches("^requests$".to_string()),
+                &ctx
+            ),
+            "a lowercase `^requests$` pattern must match the uppercased `Requests` package"
+        );
+
+        // (2) Docker image ref: a `MyOrg/App` image must be lowercased so a
+        // lowercase `^myorg/app$` pattern matches it.
+        let dcmd = "docker pull MyOrg/App:latest";
+        let dextracted = extract::extract_urls(dcmd, ShellType::Posix);
+        let dbacking =
+            build_dsl_backing(dcmd, ShellType::Posix, ScanContext::Exec, &dextracted, None);
+        let dctx = dbacking.as_eval_context(None, None);
+        assert!(
+            evaluate(
+                &WhenClause::PackageNameMatches("^myorg/app$".to_string()),
+                &dctx
+            ),
+            "a lowercase `^myorg/app$` pattern must match the uppercased `MyOrg/App` image"
         );
     }
 
