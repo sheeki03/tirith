@@ -1,0 +1,7 @@
+# M13: assets embedded into the binary via include_str! must be byte-identical
+# across platforms. Force LF so a Windows checkout (core.autocrlf=true on the
+# GitHub Actions windows runners) cannot rewrite the embedded bytes — otherwise
+# `policy init` would emit CRLF YAML on Windows and break the
+# byte-identical-to-shipping guarantee for the policy templates.
+crates/tirith/assets/policy_templates/*.yaml text eol=lf
+crates/tirith-core/assets/dashboard/template.html text eol=lf
