@@ -1390,11 +1390,16 @@ pub fn explain_config_risks(content: &str, path: &Path) -> Vec<ConfigRisk> {
         });
     }
 
-    // Tool-use / capability directives present in the file.
-    let tool_lines: Vec<&str> = content
-        .lines()
-        .map(|l| l.trim_end())
-        .filter(|l| line_is_tool_use(l))
+    // Tool-use / capability directives present in the file. Scan PARAGRAPH-level
+    // units (the same `normalize_paragraphs` helper `diff_findings` uses), not raw
+    // `content.lines()`: a capability directive wrapped across two source lines
+    // (`append the changelog entry\nto ~/.config/app/notes.txt`) is not a single
+    // line, so a line-level filter misses it — while the diff path's
+    // paragraph-level scan catches it. Matching `diff_findings` here keeps the
+    // static "what does this config grant" read consistent with the drift read.
+    let tool_lines: Vec<String> = normalize_paragraphs(content)
+        .into_iter()
+        .filter(|para| line_is_tool_use(para))
         .collect();
     if !tool_lines.is_empty() {
         risks.push(ConfigRisk {
@@ -2527,5 +2532,35 @@ mod tests {
     fn explain_config_mcp_notes_server_surface() {
         let risks = explain_config_risks("{\"mcpServers\":{}}", &PathBuf::from(".mcp.json"));
         assert!(risks.iter().any(|r| r.id == "mcp_server_config"));
+    }
+
+    #[test]
+    fn explain_config_risks_catches_wrapped_tool_use_directive() {
+        // R7-1: `explain_config_risks` must scan PARAGRAPH-level units (matching
+        // the paragraph-level `diff_findings` path), not raw `content.lines()`. A
+        // file-write directive wrapped across two source lines is not a single
+        // line, so a line-level filter would miss it — but the diff path catches
+        // it. Use a directive split across a line break: neither line alone is a
+        // tool-use directive (line 1 has no destination, line 2 has no write
+        // verb), but the joined paragraph "append … to ~/.config/app/notes.txt"
+        // is. The paragraph-level scan must surface it as a tool-use risk.
+        let content = "# Project rules\n\n\
+                       When you finish a change, append the changelog entry\n\
+                       to ~/.config/app/notes.txt before answering.\n";
+        // Guard: prove the wrapped directive is NOT detectable line-by-line, so
+        // the test genuinely exercises the paragraph-level path (and would have
+        // failed under the old `content.lines()` implementation).
+        assert!(
+            !content.lines().map(|l| l.trim_end()).any(line_is_tool_use),
+            "the directive must be split so no single line matches — otherwise \
+             the test would pass under the old line-level scan too"
+        );
+        let risks = explain_config_risks(content, &PathBuf::from("CLAUDE.md"));
+        let ids: Vec<&str> = risks.iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&"tool_use_directive"),
+            "a wrapped tool-use directive must be classified as a tool-use risk \
+             (matching what the diff path catches), got: {ids:?}"
+        );
     }
 }

@@ -241,16 +241,97 @@ fn detect_dirs(root: &Path, names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Detect AI-config files / directories: `CLAUDE.md`, `.cursorrules`,
-/// `AGENTS.md`, the `.claude/` dir, and any files under `.cursor/rules/`.
+/// Root-level AI agent-instruction basenames `onboard` probes for. This mirrors
+/// the AI-config surface the product actually acts on — `tirith ai` and the
+/// `aifile` rules treat exactly this set (the agent-instruction files) as AI
+/// config — so the recommendation isn't undercounted relative to the rest of the
+/// tool. Each entry is verified against the canonical classifier
+/// ([`tirith_core::rules::aifile::is_ai_config_file`]) at construction time by
+/// `detect_ai_config`, and `ai_config_basenames_are_canonical` pins that
+/// agreement so this list can't drift from the product's notion.
+///
+/// MCP server configs (`.mcp.json` / `mcp.json` / `mcp_settings.json`) are
+/// DELIBERATELY excluded here — they are counted separately as MCP configs
+/// (`detect_mcp_configs`) and feed the recommendation through `mcp_config_count`,
+/// so listing them here too would double-count.
+const AI_CONFIG_BASENAMES: &[&str] = &[
+    // Anthropic / Claude.
+    "CLAUDE.md",
+    // OpenAI / generic agents.
+    "AGENTS.md",
+    "AGENTS.override.md",
+    // Cursor.
+    ".cursorrules",
+    ".cursorignore",
+    // Cline / Roo.
+    ".clinerules",
+    ".roorules",
+    // Windsurf / Goose.
+    ".windsurfrules",
+    ".goosehints",
+    // GitHub Copilot.
+    "copilot-instructions.md",
+    // Gemini / Qwen.
+    "GEMINI.md",
+    "QWEN.md",
+    // llms.txt convention.
+    "llms.txt",
+    "llms-full.txt",
+];
+
+/// Detect AI-config files / directories. Covers the same agent-instruction
+/// surface `tirith ai` / the `aifile` rules treat as AI config — not just the
+/// original `CLAUDE.md` / `.cursorrules` / `AGENTS.md` trio — so a repo using
+/// `copilot-instructions.md`, `.clinerules` (incl. themed `.clinerules-*` /
+/// `.roorules-*`), `llms.txt`, `.cursorignore`, etc. is not undercounted and the
+/// auto recommendation doesn't wrongly drop below `ai-agent-heavy`:
+///
+///  - the [`AI_CONFIG_BASENAMES`] root-level files (each gated through the
+///    canonical [`tirith_core::rules::aifile::is_ai_config_file`] so the set
+///    stays anchored to what the product acts on);
+///  - `.github/copilot-instructions.md` (Copilot's repo-scoped location);
+///  - themed `.clinerules-<theme>` / `.roorules-<mode>` variants at the root
+///    (discovered via `read_dir`, same as the product's themed-rules match);
+///  - the `.claude/` dir, and any entry under `.cursor/rules/`.
 fn detect_ai_config(root: &Path) -> Vec<String> {
+    use tirith_core::rules::aifile;
+
     let mut found = Vec::new();
 
-    for name in ["CLAUDE.md", ".cursorrules", "AGENTS.md"] {
-        if root.join(name).is_file() {
-            found.push(name.to_string());
+    // Root-level agent-instruction files, anchored to the canonical classifier.
+    for name in AI_CONFIG_BASENAMES {
+        let path = root.join(name);
+        // `is_ai_config_file` is the product's canonical AI-config predicate;
+        // gating on it keeps this detector from drifting from what the rest of
+        // the tool treats as AI config.
+        if path.is_file() && aifile::is_ai_config_file(&path) {
+            found.push((*name).to_string());
         }
     }
+
+    // Copilot's repo-scoped instructions live under `.github/`.
+    let gh_copilot = root.join(".github").join("copilot-instructions.md");
+    if gh_copilot.is_file() {
+        found.push(".github/copilot-instructions.md".to_string());
+    }
+
+    // Themed Cline / Roo rules: `.clinerules-<theme>` / `.roorules-<mode>` at the
+    // repo root. The product recognises these as agent-instruction files too, so
+    // glob them via `read_dir` rather than enumerating themes.
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let lower = name.to_ascii_lowercase();
+            if (lower.starts_with(".clinerules-") || lower.starts_with(".roorules-"))
+                && entry.path().is_file()
+                && aifile::is_ai_config_file(&entry.path())
+            {
+                found.push(name.into_owned());
+            }
+        }
+    }
+
     if root.join(".claude").is_dir() {
         found.push(".claude/".to_string());
     }
@@ -716,5 +797,86 @@ mod tests {
         );
         assert_eq!(done.len(), 1);
         assert!(done[0].contains("already set up"));
+    }
+
+    /// R7-5: every basename in [`AI_CONFIG_BASENAMES`] must be recognised by the
+    /// product's canonical AI-config classifier. This pins the onboard detector's
+    /// list to what the rest of the tool (`tirith ai` / the `aifile` rules)
+    /// actually treats as AI config, so the two can't silently diverge.
+    #[test]
+    fn ai_config_basenames_are_canonical() {
+        use tirith_core::rules::aifile;
+        for name in AI_CONFIG_BASENAMES {
+            assert!(
+                aifile::is_ai_config_file(Path::new(name)),
+                "{name:?} is in AI_CONFIG_BASENAMES but is NOT recognised by the canonical \
+                 is_ai_config_file — the onboard detector has drifted from the product's set"
+            );
+        }
+    }
+
+    /// R7-5: the AI-config detector must cover the broader supported surface, not
+    /// just `CLAUDE.md` / `.cursorrules` / `AGENTS.md`. A repo using
+    /// `copilot-instructions.md` + `.clinerules` (incl. a themed `.clinerules-*`)
+    /// must be detected as AI config and, with 2+ such files, push the AUTO
+    /// recommendation to `ai-agent-heavy` (previously these were undercounted and
+    /// the recommendation wrongly dropped below `ai-agent-heavy`).
+    #[test]
+    fn detect_ai_config_recognizes_broader_signals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // None of these three is in the original CLAUDE.md/.cursorrules/AGENTS.md
+        // trio, so the pre-R7-5 detector would have counted ZERO of them.
+        std::fs::write(root.join("copilot-instructions.md"), "# copilot\n").unwrap();
+        std::fs::write(root.join(".clinerules"), "rules\n").unwrap();
+        std::fs::write(root.join(".clinerules-security"), "themed\n").unwrap();
+
+        let found = detect_ai_config(root);
+        assert!(
+            found.iter().any(|f| f == "copilot-instructions.md"),
+            "copilot-instructions.md must be detected as AI config, got: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f == ".clinerules"),
+            ".clinerules must be detected as AI config, got: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f == ".clinerules-security"),
+            "themed .clinerules-* must be detected as AI config, got: {found:?}"
+        );
+
+        // The broadened count (>= 2) drives the AUTO recommendation to
+        // ai-agent-heavy — the behavioural payoff of the fix.
+        let (template, _why) = recommend_template(&RecommendationSignals {
+            mode: None,
+            ai_config_count: found.len(),
+            mcp_config_count: 0,
+            ci_detected: false,
+        });
+        assert_eq!(
+            template,
+            PolicyTemplate::AiAgentHeavy,
+            "a repo with multiple broader AI-config signals must recommend ai-agent-heavy"
+        );
+    }
+
+    /// R7-5: `.github/copilot-instructions.md` (Copilot's repo-scoped location) is
+    /// also a recognised AI-config signal.
+    #[test]
+    fn detect_ai_config_finds_github_copilot_instructions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(
+            root.join(".github").join("copilot-instructions.md"),
+            "# copilot\n",
+        )
+        .unwrap();
+
+        let found = detect_ai_config(root);
+        assert!(
+            found.iter().any(|f| f == ".github/copilot-instructions.md"),
+            ".github/copilot-instructions.md must be detected, got: {found:?}"
+        );
     }
 }

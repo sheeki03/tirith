@@ -13162,6 +13162,68 @@ fn rule_validate_agent_kind_empty_context_exits_zero() {
 }
 
 #[test]
+fn rule_validate_pattern_too_long_exits_one() {
+    // CodeRabbit M13 round-7 R7-7: `compile_rules` drops a regex rule whose
+    // pattern exceeds the 1024-char cap, so `rule validate` must FLAG it (exit 1)
+    // — otherwise validate passes a rule the engine silently skips.
+    let long = "a".repeat(1025);
+    let policy = format!(
+        r#"custom_rules:
+  - id: too-long
+    pattern: "{long}"
+    severity: high
+    title: "over the cap"
+    context: [exec]
+"#
+    );
+    let (_tmp, proj) = rule_project(&policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a >1024-char pattern must fail validate (R7-7)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("too-long") && stderr.contains("too long"),
+        "error should name the rule + the length cap; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_regex_empty_context_exits_one() {
+    // CodeRabbit M13 round-7 R7-7: `compile_rules` drops a regex rule with no
+    // valid contexts (a dead rule — unlike a context-agnostic DSL rule, a regex
+    // rule has no required-trigger notion to synthesize an executable set from),
+    // so `rule validate` must FLAG it (exit 1).
+    let policy = r#"custom_rules:
+  - id: regex-no-ctx
+    pattern: "foo"
+    severity: high
+    title: "no context"
+    context: []
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a regex rule with empty context must fail validate (R7-7)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("regex-no-ctx") && stderr.contains("no valid contexts"),
+        "error should name the rule + the no-contexts reason; got: {stderr}"
+    );
+}
+
+#[test]
 fn rule_validate_bogus_context_not_double_reported() {
     // Round-3 R3-9: a `context: [bogus]` rule must be reported ONCE as an unknown
     // context, NOT also as "no valid context"/"not covered" (the dropped token
@@ -13296,6 +13358,27 @@ fn rule_explain_json_has_when_tree() {
 }
 
 #[test]
+fn rule_explain_low_severity_effective_action_is_warn() {
+    // CodeRabbit M13 round-7 R7-8: `action_for_severity` must mirror the
+    // engine's `action_from_findings`, which maps a single Low finding to WARN
+    // (not Allow). `flag-env-file-scan` is severity: low, so `rule explain` must
+    // report its effective action as "warn" — otherwise it understates the rule.
+    let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "explain", "--rule", "flag-env-file-scan", "--json"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["severity"], serde_json::json!("LOW"));
+    assert_eq!(
+        v["effective_action"],
+        serde_json::json!("warn"),
+        "a Low-severity rule must report effective_action=warn (R7-8), matching action_from_findings; got: {v}"
+    );
+}
+
+#[test]
 fn rule_test_file_path_predicate_fires() {
     let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
     let out = tirith_in_proj(&proj)
@@ -13313,6 +13396,56 @@ fn rule_test_file_path_predicate_fires() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(v["context"], serde_json::json!("file"));
     assert_eq!(v["fires"], serde_json::json!(true), ".env path should fire");
+}
+
+#[test]
+fn rule_test_multi_context_file_path_rule_fires() {
+    // CodeRabbit M13 round-7 R7-6: a `file.path_matches` rule declared for BOTH
+    // `[exec, file]` must report FIRING when tested with a matching path. The old
+    // `rule test` forced the single preferred context (exec), where the engine
+    // never populates the scanned file path, so this rule wrongly reported
+    // not-firing — even though the engine fires it during FileScan at runtime.
+    // `rule test` must now evaluate across all compiled contexts and fire if it
+    // matches in any (here: FileScan).
+    let policy = r#"custom_rules:
+  - id: env-multi-ctx
+    when:
+      file.path_matches: '(^|/)\.env(\.|$)'
+    severity: low
+    title: "env file in exec or file context"
+    context: [exec, file]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "env-multi-ctx",
+            "--input",
+            "config/.env",
+            "--json",
+        ])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "multi-context test should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["fires"],
+        serde_json::json!(true),
+        "a [exec, file] file.path_matches rule must FIRE for a matching path (R7-6); got: {v}"
+    );
+    // It fires in the FileScan context — the one whose backing supplies the path.
+    assert_eq!(
+        v["context"],
+        serde_json::json!("file"),
+        "the rule must fire (and report) in its file context"
+    );
 }
 
 #[test]

@@ -11,6 +11,15 @@ fn tirith() -> Command {
 }
 
 /// Verify a subcommand's --help contains an "Examples:" section with expected content.
+///
+/// The expected-substring check is WHITESPACE-NORMALIZED on both sides: clap
+/// line-wraps long example strings at a terminal-width-dependent column, so a raw
+/// substring match on a long expected string (e.g. a full `tirith … | sh`
+/// example) can false-fail in CI when the wrap lands mid-phrase. Collapsing runs
+/// of whitespace to single spaces on both the captured stdout and the expected
+/// substring makes the match wrap-insensitive while still requiring every word in
+/// order. The structural "Examples:" header check stays a raw match (a single,
+/// unsplittable token).
 fn assert_help_has_examples(args: &[&str], expected_substring: &str) {
     let out = tirith().args(args).output().expect("failed to run tirith");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -18,9 +27,14 @@ fn assert_help_has_examples(args: &[&str], expected_substring: &str) {
         stdout.contains("Examples:"),
         "{args:?} --help should contain Examples section, got:\n{stdout}"
     );
+    let stdout_normalized: String = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected_normalized: String = expected_substring
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        stdout.contains(expected_substring),
-        "{args:?} --help should contain {expected_substring:?}, got:\n{stdout}"
+        stdout_normalized.contains(&expected_normalized),
+        "{args:?} --help should contain {expected_substring:?} (whitespace-normalized), got:\n{stdout}"
     );
 }
 

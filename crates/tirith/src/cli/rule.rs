@@ -47,21 +47,21 @@ fn declared_contexts(rule: &CustomRule) -> Vec<ScanContext> {
         .collect()
 }
 
-/// Pick the [`ScanContext`] to evaluate a `--input` in, from a rule's COMPILED
-/// contexts. Prefer exec, then paste, then file — the order the engine would
-/// reach the rule in for a typed command. Operates on the compiled context list
-/// (the post-`compile_rules` view) so `rule test` evaluates in the same context
-/// the engine would, not a context the rule declared but compilation dropped.
-fn scan_context_for_shell_input(contexts: &[ScanContext]) -> ScanContext {
-    if contexts.contains(&ScanContext::Exec) {
-        ScanContext::Exec
-    } else if contexts.contains(&ScanContext::Paste) {
-        ScanContext::Paste
-    } else if contexts.contains(&ScanContext::FileScan) {
-        ScanContext::FileScan
-    } else {
-        ScanContext::Exec
-    }
+/// The rule's COMPILED contexts in a deterministic preference order — exec,
+/// then paste, then file (the order the engine would reach the rule in for a
+/// typed command). `rule test` evaluates the rule in EACH of these and fires if
+/// it matches in any (CodeRabbit M13 round-7 R7-6): a multi-context rule (e.g.
+/// `file.path_matches` declared `[exec, file]`) fires during FileScan at
+/// runtime, so testing only the single preferred context (exec) wrongly
+/// reported not-firing. Operating on the COMPILED list (post-`compile_rules`)
+/// keeps `rule test` in step with what the engine actually runs — a context the
+/// rule declared but compilation dropped is not tried, and a context-agnostic
+/// rule's synthesized executable set is honored.
+fn ordered_eval_contexts(contexts: &[ScanContext]) -> Vec<ScanContext> {
+    [ScanContext::Exec, ScanContext::Paste, ScanContext::FileScan]
+        .into_iter()
+        .filter(|c| contexts.contains(c))
+        .collect()
 }
 
 /// `tirith rule test --rule <id> --input <s>` — evaluate one custom rule
@@ -99,32 +99,59 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
     };
 
     let shell_type = resolve_shell(shell);
-    let context = scan_context_for_shell_input(&rule.contexts);
-
-    let (fires, kind) = match &rule.matcher {
-        CompiledMatcher::When(when) => {
-            // DSL rule: build the eval context exactly as the engine does.
-            let backing = tirith_core::engine::dsl_backing_for_input(input, shell_type, context);
-            // `cwd_in` is evaluated against the process cwd (what the engine
-            // sees); `file.path_matches` against `--input` treated as a path in
-            // FileScan.
-            let cwd = std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            let file_path = if context == ScanContext::FileScan {
-                Some(input.to_string())
-            } else {
-                None
-            };
-            let eval_ctx = backing.as_eval_context(cwd.as_deref(), file_path.as_deref());
-            (custom_rule_dsl::evaluate(when, &eval_ctx), "when")
+    // Evaluate the rule across ALL of its compiled contexts and fire if it
+    // matches in ANY (CodeRabbit M13 round-7 R7-6). The old code forced a single
+    // preferred context (always exec when present), so a `file.path_matches`
+    // rule declared `[exec, file]` was tested in Exec — where the engine never
+    // populates the file path — and reported not-firing even though the engine
+    // fires it during FileScan. Iterating the compiled contexts mirrors the
+    // engine, which reaches the rule in each context it declares.
+    let kind = if rule.is_dsl() { "when" } else { "pattern" };
+    let mut fires = false;
+    // The context to REPORT: the one the rule fired in, or — if it never fires —
+    // the first context tried (deterministic preference order below).
+    let mut reported_context = None;
+    for context in ordered_eval_contexts(&rule.contexts) {
+        let matched = match &rule.matcher {
+            CompiledMatcher::When(when) => {
+                // DSL rule: build the eval context exactly as the engine does
+                // for THIS context (`build_dsl_backing` extracts different facts
+                // per context — e.g. the file path only in FileScan).
+                let backing =
+                    tirith_core::engine::dsl_backing_for_input(input, shell_type, context);
+                // `cwd_in` is evaluated against the process cwd (what the engine
+                // sees); `file.path_matches` against `--input` treated as a path
+                // in FileScan.
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let file_path = if context == ScanContext::FileScan {
+                    Some(input.to_string())
+                } else {
+                    None
+                };
+                let eval_ctx = backing.as_eval_context(cwd.as_deref(), file_path.as_deref());
+                custom_rule_dsl::evaluate(when, &eval_ctx)
+            }
+            CompiledMatcher::Regex(re) => {
+                // Regex rule: match against the input, mirroring the engine's
+                // `rules::custom::check`. The regex is already compiled+validated
+                // and context-independent, so any declared context matches alike.
+                re.is_match(input)
+            }
+        };
+        if reported_context.is_none() {
+            reported_context = Some(context);
         }
-        CompiledMatcher::Regex(re) => {
-            // Regex rule: match against the input, mirroring the engine's
-            // `rules::custom::check`. The regex is already compiled+validated.
-            (re.is_match(input), "pattern")
+        if matched {
+            fires = true;
+            reported_context = Some(context);
+            break;
         }
-    };
+    }
+    // `compile_rules` guarantees a non-empty context set for any rule it kept, so
+    // the loop always runs at least once; fall back to Exec only defensively.
+    let context = reported_context.unwrap_or(ScanContext::Exec);
 
     if json {
         let v = serde_json::json!({
@@ -203,6 +230,35 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
         }
 
         if let Some(pattern) = &rule.pattern {
+            // Mirror `compile_rules` exactly so `rule validate` never passes a
+            // rule the engine silently drops (CodeRabbit M13 round-7 R7-7).
+            // compile_rules drops a regex rule for, in order: no valid context,
+            // pattern over the 1024-char cap, or invalid regex syntax.
+            //
+            // (a) No valid contexts. A regex rule has no required-trigger notion
+            // to synthesize an executable set from (that fallback is for
+            // context-agnostic DSL rules — R7-2), so an empty parsed context set
+            // is a dead rule and compile_rules drops it. We skip this when a
+            // context token was INVALID: that is already reported above, and a
+            // bogus-only context list would otherwise be double-reported (same
+            // discipline as the DSL coverage check — R3-9).
+            let parsed = declared_contexts(rule);
+            if parsed.is_empty() && !has_invalid_context {
+                errors.push(RuleError {
+                    rule: rule.id.clone(),
+                    message:
+                        "no valid contexts (regex rule needs at least one of: exec, paste, file)"
+                            .to_string(),
+                });
+            }
+            // (b) Pattern length cap (1024 chars) — the engine's hard limit.
+            if pattern.len() > 1024 {
+                errors.push(RuleError {
+                    rule: rule.id.clone(),
+                    message: format!("pattern too long ({} chars, max 1024)", pattern.len()),
+                });
+            }
+            // (c) Regex must compile.
             if let Err(e) = regex::Regex::new(pattern) {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
@@ -495,14 +551,20 @@ fn action_name(a: Action) -> &'static str {
 }
 
 /// Mirror [`tirith_core::verdict::action_from_findings`]'s severity→action map
-/// for a single finding's severity (Critical/High → block, Medium → warn,
-/// Low/Info → allow), so `explain` reports the action the rule actually drives.
+/// for a single finding's severity (Critical/High → block, Medium/Low → warn,
+/// Info → allow), so `explain` reports the action the rule actually drives.
+///
+/// `Low` maps to `Warn`, NOT `Allow`: the engine's `action_from_findings`
+/// treats a single `Low` finding as `Warn` (Medium and Low share the `Warn`
+/// arm there). Returning `Allow` here previously understated low-severity rules
+/// — `rule explain` would claim a Low rule allows when the engine actually
+/// warns (CodeRabbit M13 round-7 R7-8).
 fn action_for_severity(sev: tirith_core::verdict::Severity) -> Action {
     use tirith_core::verdict::Severity;
     match sev {
         Severity::Critical | Severity::High => Action::Block,
-        Severity::Medium => Action::Warn,
-        Severity::Low | Severity::Info => Action::Allow,
+        Severity::Medium | Severity::Low => Action::Warn,
+        Severity::Info => Action::Allow,
     }
 }
 
@@ -594,5 +656,71 @@ fn leaf_value_json(leaf: &WhenClause) -> serde_json::Value {
             serde_json::json!(reputation_name(r))
         }
         WhenClause::All(_) | WhenClause::Any(_) | WhenClause::Not(_) => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+
+    /// Build a minimal finding carrying just a severity, for `action_from_findings`.
+    fn finding(severity: Severity) -> Finding {
+        Finding {
+            rule_id: RuleId::CustomRuleMatch,
+            severity,
+            title: "t".into(),
+            description: "d".into(),
+            evidence: vec![Evidence::Text { detail: "x".into() }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: Some("r".into()),
+        }
+    }
+
+    #[test]
+    fn action_for_severity_low_is_warn() {
+        // CodeRabbit M13 round-7 R7-8: Low must map to Warn (not Allow), matching
+        // the engine's `action_from_findings`.
+        assert_eq!(action_for_severity(Severity::Low), Action::Warn);
+        assert_eq!(action_for_severity(Severity::Info), Action::Allow);
+    }
+
+    #[test]
+    fn action_for_severity_matches_action_from_findings() {
+        // The whole point of R7-8: this helper must agree with the engine's
+        // severity->action map for a SINGLE finding of each severity, so `rule
+        // explain` reports the action the engine actually drives.
+        use tirith_core::verdict::action_from_findings;
+        for sev in [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
+            assert_eq!(
+                action_for_severity(sev),
+                action_from_findings(&[finding(sev)]),
+                "action_for_severity({sev:?}) must match action_from_findings for a single {sev:?} finding"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_eval_contexts_preserves_preference_and_membership() {
+        // R7-6: the eval order is exec, paste, file — filtered to the rule's
+        // compiled contexts (so a multi-context rule is tried in each).
+        assert_eq!(
+            ordered_eval_contexts(&[ScanContext::FileScan, ScanContext::Exec]),
+            vec![ScanContext::Exec, ScanContext::FileScan],
+            "must keep exec-before-file order regardless of declared order"
+        );
+        assert_eq!(
+            ordered_eval_contexts(&[ScanContext::Paste]),
+            vec![ScanContext::Paste]
+        );
+        assert!(ordered_eval_contexts(&[]).is_empty());
     }
 }

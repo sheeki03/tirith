@@ -852,6 +852,25 @@ fn snapshot_status(json: bool) -> i32 {
     0
 }
 
+/// Exit-code policy for an un-scannable file during `snapshot --update`
+/// (CodeRabbit M13 PR #132 R7-3). A `None` scan means the file could not be
+/// analyzed, so it must never be recorded; the whole update aborts non-zero.
+/// Mirrors the surrounding `emit_error` convention: emit the operator error,
+/// then return 2 when the `--json` write itself failed (broken pipe), else 1.
+fn snapshot_scan_failed_code(json: bool, file: &Path) -> i32 {
+    if !emit_error(
+        json,
+        "tirith ai snapshot",
+        &format!(
+            "failed to scan {}: file could not be analyzed",
+            file.display()
+        ),
+    ) {
+        return 2;
+    }
+    1
+}
+
 /// Re-scan the AI-config files and record a fresh snapshot.
 fn snapshot_update(force: bool, json: bool) -> i32 {
     let root = repo_root();
@@ -894,15 +913,24 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         };
         let pre_hash = tirith_core::clipboard::content_sha256_hex(content.as_bytes());
 
-        if let Some(result) = tirith_core::scan::scan_single_file(f) {
-            for finding in &result.findings {
-                if finding.severity >= Severity::High {
-                    blocking.push((
-                        rel_key(&root, f),
-                        finding.severity,
-                        finding.rule_id.to_string(),
-                    ));
-                }
+        // A `None` scan is a HARD failure, not a silent skip (CodeRabbit M13 PR
+        // #132 R7-3). `scan_single_file` returns `None` when the file could not be
+        // analyzed (metadata/read error, or it exceeds the scan size cap). We must
+        // NOT record an un-scanned file into the trusted baseline — blessing a file
+        // whose risk was never assessed would defeat the whole point of the
+        // snapshot. Abort the entire update so the operator fixes the unreadable
+        // file and re-runs, rather than recording a partial, half-validated set.
+        let result = match tirith_core::scan::scan_single_file(f) {
+            Some(r) => r,
+            None => return snapshot_scan_failed_code(json, f),
+        };
+        for finding in &result.findings {
+            if finding.severity >= Severity::High {
+                blocking.push((
+                    rel_key(&root, f),
+                    finding.severity,
+                    finding.rule_id.to_string(),
+                ));
             }
         }
 
@@ -1165,5 +1193,27 @@ mod tests {
         let path = dir.path().join("small.txt");
         std::fs::write(&path, "hello\nworld\n").expect("write");
         assert_eq!(read_text(&path).expect("read"), "hello\nworld\n");
+    }
+
+    // CodeRabbit M13 PR #132 R7-3: a `None` scan during `snapshot --update` is a
+    // HARD failure — the file is never recorded and the update aborts non-zero.
+    //
+    // Forcing `scan_single_file` to return `None` *after* the preceding
+    // `read_text` already succeeded is a genuine TOCTOU race (both read the same
+    // bytes), so it can't be triggered deterministically from a fixture. Instead
+    // we pin the load-bearing decision directly: the abort path returns a
+    // non-zero exit following the surrounding `emit_error` convention (1 in human
+    // mode, where the stderr write always succeeds; 2 is reserved for a failed
+    // `--json` stdout write / broken pipe). The `match … { None => return … }`
+    // arm in `snapshot_update` routes through this helper, so a non-zero return
+    // here is exactly "abort the update, record nothing".
+    #[test]
+    fn snapshot_scan_failed_aborts_nonzero_human_mode() {
+        let code = snapshot_scan_failed_code(false, Path::new("/repo/.cursorrules"));
+        assert_eq!(
+            code, 1,
+            "an un-scannable file must abort `snapshot --update` with a non-zero exit"
+        );
+        assert_ne!(code, 0, "a None scan must never be treated as success");
     }
 }

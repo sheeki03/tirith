@@ -30,7 +30,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tirith_core::dashboard::{self, DashboardSnapshot, HookSummary};
@@ -39,6 +39,24 @@ use tirith_core::dashboard::{self, DashboardSnapshot, HookSummary};
 /// rejected 401 regardless of whether the token value matches — a browser tab
 /// left open overnight cannot keep reading the dashboard.
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
+
+/// `true` once a monotonic `elapsed` has reached the hard token TTL.
+///
+/// This is the AUTHORITATIVE, clock-jump-resistant TTL check (CodeRabbit M13 PR
+/// #132 R7-4). The wall-clock TTL inside [`authorize`] is bypassable by setting
+/// the system clock BACKWARDS — `Utc::now() - issued_at` shrinks, so a token
+/// could outlive the 1h bound. A monotonic [`Instant`] never runs backwards
+/// (it is not tied to wall-clock), so an elapsed-based gate cannot be defeated
+/// that way.
+///
+/// DUAL-LAYER BY DESIGN: we keep BOTH checks. `authorize()`'s wall-clock TTL
+/// stays as defense-in-depth (and to keep its pure unit tests intact); this
+/// monotonic gate is layered in FRONT of it as the enforcement that actually
+/// upholds the ≤1h invariant under an adversarial clock. Whichever fires first
+/// expires the token.
+fn mono_ttl_expired(elapsed: Duration) -> bool {
+    elapsed >= TOKEN_TTL
+}
 
 /// How long the accept loop blocks per `recv_timeout` before re-checking the
 /// token TTL / shutdown. Keeps the loop responsive to TTL expiry without busy
@@ -368,6 +386,10 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
 
     let url = format!("http://127.0.0.1:{actual_port}/?token={token}");
     let issued_at = Utc::now();
+    // Monotonic issue instant — the authoritative, clock-jump-resistant TTL
+    // reference (see `mono_ttl_expired`). Captured alongside the wall-clock
+    // `issued_at` so the two TTL layers share the same logical issue time.
+    let issued_mono = Instant::now();
 
     if json {
         #[derive(serde::Serialize)]
@@ -402,7 +424,7 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         println!("never written to disk. Press Ctrl-C to stop.");
     }
 
-    serve_loop(&server, &token, issued_at);
+    serve_loop(&server, &token, issued_at, issued_mono);
     0
 }
 
@@ -413,17 +435,28 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
 /// elapsed there is nothing useful left to serve, so the loop exits and the
 /// process returns (the token can never be revived). SIGINT terminates the
 /// process directly.
-fn serve_loop(server: &tiny_http::Server, token: &str, issued_at: DateTime<Utc>) {
-    let ttl = chrono::Duration::from_std(TOKEN_TTL).unwrap_or_else(|_| chrono::Duration::hours(1));
+///
+/// TTL is enforced with a MONOTONIC [`Instant`] (`issued_mono`) — see
+/// `mono_ttl_expired`. This is clock-jump-resistant: moving the system clock
+/// backwards cannot keep the server alive past the hard 1h bound. The
+/// wall-clock TTL inside [`authorize`] remains as a second, defense-in-depth
+/// layer (and keeps its pure unit tests meaningful).
+fn serve_loop(
+    server: &tiny_http::Server,
+    token: &str,
+    issued_at: DateTime<Utc>,
+    issued_mono: Instant,
+) {
     loop {
         // Stop accepting once the token has expired — every request would 401.
-        if Utc::now().signed_duration_since(issued_at) >= ttl {
+        // Monotonic check: immune to a backward wall-clock jump.
+        if mono_ttl_expired(issued_mono.elapsed()) {
             eprintln!("tirith dashboard serve: token expired; stopping.");
             return;
         }
 
         match server.recv_timeout(ACCEPT_POLL) {
-            Ok(Some(request)) => handle_request(request, token, issued_at),
+            Ok(Some(request)) => handle_request(request, token, issued_at, issued_mono),
             Ok(None) => continue, // timeout tick — re-check TTL
             Err(e) => {
                 eprintln!("tirith dashboard serve: accept error: {e}");
@@ -474,7 +507,23 @@ fn with_security_headers(
 /// query parameter, so an unauthenticated client can never make us read (and
 /// buffer) an unbounded body pre-auth. Only after a successful authorize do we
 /// drain a BOUNDED amount of the body so the connection can be reused cleanly.
-fn handle_request(mut request: tiny_http::Request, token: &str, issued_at: DateTime<Utc>) {
+fn handle_request(
+    mut request: tiny_http::Request,
+    token: &str,
+    issued_at: DateTime<Utc>,
+    issued_mono: Instant,
+) {
+    // AUTHORITATIVE TTL gate, checked FIRST (CodeRabbit M13 PR #132 R7-4). A
+    // monotonic `Instant` cannot be wound back by a system-clock change, so an
+    // expired token 401s here even if the wall-clock TTL inside `authorize`
+    // were defeated by a backward clock jump. We respond before touching the
+    // body, with the same hardening headers as every other response.
+    if mono_ttl_expired(issued_mono.elapsed()) {
+        let response = tiny_http::Response::from_string("401 Unauthorized").with_status_code(401);
+        let _ = request.respond(with_security_headers(response));
+        return;
+    }
+
     let host_header = request
         .headers()
         .iter()
@@ -663,6 +712,26 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // R7-4 (CodeRabbit M13 PR #132) — the AUTHORITATIVE TTL is monotonic and so
+    // cannot be defeated by a backward wall-clock jump. `mono_ttl_expired` is a
+    // pure function of an elapsed `Duration`, so we can pin both edges of the
+    // boundary deterministically (no sleeping, no real clock). The wall-clock
+    // `authorize()` TTL tests above stay green as the defense-in-depth layer.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn mono_ttl_expired_at_and_past_the_boundary() {
+        // Fresh / mid-window → not expired.
+        assert!(!mono_ttl_expired(Duration::from_secs(0)));
+        assert!(!mono_ttl_expired(TOKEN_TTL - Duration::from_secs(1)));
+        // Exactly at the TTL is expired (the bound is inclusive, matching
+        // `authorize`'s `age >= ttl`).
+        assert!(mono_ttl_expired(TOKEN_TTL));
+        // Past the TTL is expired.
+        assert!(mono_ttl_expired(TOKEN_TTL + Duration::from_secs(1)));
+        assert!(mono_ttl_expired(TOKEN_TTL * 5));
+    }
+
     #[test]
     fn authorize_host_checked_before_ttl_and_token() {
         // A foreign Host with an expired token + wrong token still reports 403
@@ -799,6 +868,7 @@ mod tests {
         // A fixed token + fresh issue time so the TTL never expires mid-test.
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
         let issued = Utc::now();
+        let issued_mono = Instant::now();
 
         let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("bind 127.0.0.1:0");
@@ -812,7 +882,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..3 {
                 match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued),
+                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
                     Err(_) => break,
                 }
             }
@@ -857,6 +927,7 @@ mod tests {
     fn unauthorized_responses_carry_hardening_headers() {
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
         let issued = Utc::now();
+        let issued_mono = Instant::now();
 
         let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("bind 127.0.0.1:0");
@@ -867,7 +938,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..2 {
                 match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued),
+                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
                     Err(_) => break,
                 }
             }
@@ -923,6 +994,7 @@ mod tests {
 
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
         let issued = Utc::now();
+        let issued_mono = Instant::now();
 
         let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("bind 127.0.0.1:0");
@@ -931,7 +1003,7 @@ mod tests {
         let tok = token.to_string();
         let handle = std::thread::spawn(move || {
             if let Ok(req) = server.recv() {
-                handle_request(req, &tok, issued);
+                handle_request(req, &tok, issued, issued_mono);
             }
         });
 
