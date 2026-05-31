@@ -279,32 +279,51 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
             // (`mcp.tool` and `agent.kind` — neither signal is wired into the
             // scan context). Same rejection `policy validate` applies —
             // CodeRabbit M13 round-3 R3-3 (`mcp.tool`) + round-8 R8-1
-            // (`agent.kind`; use `agent_rules` for per-agent control).
-            if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
+            // (`agent.kind`; use `agent_rules` for per-agent control). Done FIRST
+            // so an `agent.kind`/`mcp.tool` clause never reaches the
+            // satisfiable-context check (its set is empty by construction).
+            let unsupported = custom_rule_dsl::clause_uses_unsupported_predicate(when);
+            if let Some(reason) = unsupported {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
                     message: reason.to_string(),
                 });
             }
-            // Tier-1 invariant: the declared context must cover the clause's
-            // required trigger groups. Only emit this when the declared context
-            // tokens are VALID. This matches
-            // `policy_validate::validate_custom_rules` (R3-9): we no longer
-            // special-case the empty declared set, and we skip the check on an
-            // invalid context (already reported above) to avoid double-reporting.
-            // (Unsupported predicates like `agent.kind`/`mcp.tool` are already
-            // rejected just above — R8-1/R3-3.)
-            let declared = declared_contexts(rule);
-            let required = custom_rule_dsl::required_triggers(when);
-            if !has_invalid_context && !required.is_satisfied_by(&declared) {
+            // Per-clause satisfiability + coverage (CodeRabbit M13 round-9 R9-1),
+            // routed through the SAME `satisfiable_contexts` the engine's
+            // `compile_rules` and `policy validate` use, so all three classify a
+            // rule identically. `satisfiable_contexts` intersects children for
+            // `all`, unions for `any`, and passes through `not`.
+            //   (1) An EMPTY set means the clause mixes facts from contexts that
+            //       never co-occur in a single scan (e.g. `all(command.*,
+            //       file.*)`) — it can never match. Reject as unsatisfiable,
+            //       independent of declared context. Skipped when the clause used
+            //       an unsupported predicate (reported just above — its empty set
+            //       would otherwise double-report).
+            //   (2) Otherwise the declared context must intersect the satisfiable
+            //       set. Only emit when context tokens are VALID (R3-9: a dropped
+            //       bogus token would otherwise look like an uncovered context),
+            //       and the predicate is supported.
+            let satisfiable = custom_rule_dsl::satisfiable_contexts(when);
+            if unsupported.is_none() && satisfiable.is_empty() {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
-                    message: format!(
-                        "when-clause needs context [{}] not covered by declared context {:?}",
-                        required.describe_unmet(&declared),
-                        rule.context
-                    ),
+                    message: "when-clause needs facts from contexts that never co-occur in a \
+                              single scan (e.g. command + file) — it can never match"
+                        .to_string(),
                 });
+            } else if unsupported.is_none() && !has_invalid_context {
+                let declared = declared_contexts(rule);
+                if !satisfiable.intersects_declared(&declared) {
+                    errors.push(RuleError {
+                        rule: rule.id.clone(),
+                        message: format!(
+                            "when-clause can only be evaluated in context [{}], not covered by declared context {:?}",
+                            satisfiable.describe(),
+                            rule.context
+                        ),
+                    });
+                }
             }
         }
     }

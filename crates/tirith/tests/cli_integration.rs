@@ -13147,6 +13147,107 @@ fn rule_validate_paste_command_predicate_exits_zero() {
 }
 
 #[test]
+fn rule_validate_all_command_and_file_is_unsatisfiable() {
+    // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` mixes facts from
+    // contexts that never co-occur in a single scan (command facts live in
+    // exec/paste, the file path only in FileScan), so the INTERSECTION of the
+    // two satisfiable sets is empty — the rule can NEVER match. `rule validate`
+    // must REJECT it (exit 1) regardless of the declared context. The old
+    // leaf-flatten wrongly ACCEPTED this for `context: [exec, file]`.
+    let policy = r#"custom_rules:
+  - id: impossible-and
+    when:
+      all:
+        - command.uses_sudo: true
+        - file.path_matches: '\.env$'
+    severity: high
+    title: "command AND file — impossible"
+    context: [exec, file]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "all(command, file) is unsatisfiable and must be rejected (R9-1); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("impossible-and") && stderr.contains("never co-occur"),
+        "error must name the rule + explain the never-co-occurring contexts; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_validate_any_command_or_file_accepted_under_exec_and_under_file() {
+    // CodeRabbit M13 round-9 R9-1: `any(command.*, file.*)` is evaluable wherever
+    // EITHER branch is — the UNION {exec, paste, file}. So it must be ACCEPTED for
+    // `context: [exec]` (command branch is live there) AND for `context: [file]`
+    // (file branch is live there). The old leaf-flatten wrongly REJECTED `[exec]`.
+    for ctx in ["[exec]", "[file]"] {
+        let policy = format!(
+            r#"custom_rules:
+  - id: either-or
+    when:
+      any:
+        - command.uses_sudo: true
+        - file.path_matches: '\.env$'
+    severity: medium
+    title: "command OR file — evaluable in either"
+    context: {ctx}
+"#
+        );
+        let (_tmp, proj) = rule_project(&policy);
+        let out = tirith_in_proj(&proj)
+            .args(["rule", "validate"])
+            .output()
+            .expect("run tirith");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "any(command, file) must validate under context {ctx} (R9-1); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn rule_validate_single_command_rule_requires_exec_or_paste() {
+    // R9-1 coherence: a single `command.*` rule is still evaluable ONLY in
+    // exec/paste, so declaring `context: [file]` (the one non-co-occurring
+    // context) must be REJECTED — the satisfiable set {exec, paste} does not
+    // intersect [file].
+    let policy = r#"custom_rules:
+  - id: cmd-file-only
+    when:
+      command.uses_sudo: true
+    severity: high
+    title: "command rule under file only"
+    context: [file]
+"#;
+    let (_tmp, proj) = rule_project(policy);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "validate"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "single command.* rule under [file] must be rejected (R9-1); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cmd-file-only") && stderr.contains("exec or paste"),
+        "error must name the rule + the evaluable contexts (exec or paste); got: {stderr}"
+    );
+}
+
+#[test]
 fn rule_validate_agent_kind_is_rejected_as_unsupported() {
     // CodeRabbit M13 round-8 R8-1: `agent.kind` reads a `DslEvalContext` field
     // the engine hard-codes to `None`, so it can never match — `rule validate`

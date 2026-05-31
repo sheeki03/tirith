@@ -176,36 +176,58 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             // scan context, so the rule would validate+load yet never match).
             // CodeRabbit M13 round-3 R3-3 (`mcp.tool`) + round-8 R8-1
             // (`agent.kind`; use `agent_rules` for per-agent control instead).
-            if let Some(reason) = crate::custom_rule_dsl::clause_uses_unsupported_predicate(when) {
+            // Done FIRST so an `agent.kind`/`mcp.tool` clause never reaches the
+            // satisfiable-context check below (its set would be empty).
+            let unsupported = crate::custom_rule_dsl::clause_uses_unsupported_predicate(when);
+            if let Some(reason) = unsupported {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!("custom_rules.{}: {reason}", rule.id),
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             }
-            // Trigger-coverage is ALWAYS validated against the declared
-            // contexts (CodeRabbit M13 finding D): an empty declared set cannot
-            // satisfy a non-empty required set, so a rule with `context: []` and
-            // a `command.*`/`url.*`/`package.*`/`file.*` predicate is a silent
-            // no-op and must be rejected — the previous `!declared.is_empty()`
-            // guard let it through. We DO skip this check when a context value
-            // was invalid: that's already reported above as its own issue, and
-            // emitting a coverage error too would double-report the same typo
-            // (the unknown token is dropped by `parse_declared_contexts`, which
-            // would otherwise look like an unmet requirement).
-            let declared = parse_declared_contexts(&rule.context);
-            let required = crate::custom_rule_dsl::required_triggers(when);
-            if !has_invalid_context && !required.is_satisfied_by(&declared) {
+            // Per-clause satisfiability + coverage (CodeRabbit M13 round-9 R9-1).
+            // `satisfiable_contexts` computes the scan contexts in which the WHOLE
+            // clause can be evaluated — `all` intersects children, `any` unions,
+            // `not` is the child's set — so combinators keep their semantics. Two
+            // independent failures:
+            //   (1) An EMPTY satisfiable set means the clause needs facts from
+            //       contexts that never co-occur in a single scan (e.g. command +
+            //       file via `all`) — it can NEVER match. Reject as unsatisfiable,
+            //       independent of the declared context. Skip only when the clause
+            //       used an unsupported predicate (already reported just above;
+            //       that predicate's empty set would otherwise double-report).
+            //   (2) Otherwise the declared context must intersect the satisfiable
+            //       set (`declared ∩ satisfiable ≠ ∅`) — at least one declared
+            //       context can evaluate the clause. An empty `context: []` here
+            //       has no intersection and is rejected (CodeRabbit M13 finding D).
+            //       Skipped when a context token was INVALID (reported above; the
+            //       dropped token would otherwise look like an uncovered context).
+            let satisfiable = crate::custom_rule_dsl::satisfiable_contexts(when);
+            if unsupported.is_none() && satisfiable.is_empty() {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!(
-                        "custom_rules.{}: when-clause needs context [{}] not covered by declared context {:?}",
-                        rule.id,
-                        required.describe_unmet(&declared),
-                        rule.context
+                        "custom_rules.{}: when-clause needs facts from contexts that never \
+                         co-occur in a single scan (e.g. command + file) — it can never match",
+                        rule.id
                     ),
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
+            } else if unsupported.is_none() && !has_invalid_context {
+                let declared = parse_declared_contexts(&rule.context);
+                if !satisfiable.intersects_declared(&declared) {
+                    issues.push(PolicyIssue {
+                        level: IssueLevel::Error,
+                        message: format!(
+                            "custom_rules.{}: when-clause can only be evaluated in context [{}], not covered by declared context {:?}",
+                            rule.id,
+                            satisfiable.describe(),
+                            rule.context
+                        ),
+                        field: Some(format!("custom_rules.{}.when", rule.id)),
+                    });
+                }
             }
         }
     }
@@ -1161,6 +1183,65 @@ custom_rules:
             !issues.iter().any(|i| i.message.contains("paste-cmd")
                 && i.message.contains("not covered by declared context")),
             "paste + command.* rule must be accepted (round-3 R3-1): {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_all_command_and_file_is_unsatisfiable() {
+        // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` mixes facts from
+        // contexts that never co-occur in a single scan (command -> exec/paste,
+        // file -> FileScan), so its satisfiable set is the EMPTY intersection. It
+        // can never match and must be rejected with the dedicated
+        // "never co-occur" message -- NOT the generic coverage message -- even
+        // though the rule declares BOTH contexts. The old leaf-flatten accepted
+        // both-contexts here.
+        let yaml = r#"
+custom_rules:
+  - id: impossible-and
+    when:
+      all:
+        - command.uses_sudo: true
+        - file.path_matches: '\.env$'
+    title: "command AND file"
+    context: [exec, file]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("impossible-and")
+                && i.message.contains("never co-occur")),
+            "all(command, file) must be rejected as unsatisfiable: {issues:?}"
+        );
+        // The dedicated message replaces the coverage message -- no double-report.
+        assert!(
+            !issues.iter().any(|i| i.message.contains("impossible-and")
+                && i.message.contains("not covered by declared context")),
+            "unsatisfiable clause must NOT also emit a coverage error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_dsl_rule_any_command_or_file_accepted_under_single_context() {
+        // CodeRabbit M13 round-9 R9-1: `any(command.*, file.*)` is evaluable
+        // wherever EITHER branch is (the UNION), so a single-context rule is
+        // covered by whichever branch is live there and must be ACCEPTED. The old
+        // leaf-flatten rejected it. Cover the command-branch context.
+        let yaml = r#"
+custom_rules:
+  - id: either-or
+    when:
+      any:
+        - command.uses_sudo: true
+        - file.path_matches: '\.env$'
+    title: "command OR file"
+    context: [paste]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("either-or")
+                && (i.message.contains("not covered by declared context")
+                    || i.message.contains("never co-occur"))),
+            "any(command, file) under a single context must be accepted (R9-1): {issues:?}"
         );
     }
 

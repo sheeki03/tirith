@@ -301,9 +301,9 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
 ///
 /// # Two concerns, two mechanisms
 ///
-/// 1. **Counts must match what `analyze()` actually enforces.** The engine does
-///    NOT enforce the bare local `policy.yaml`: in `engine::analyze_inner` it
-///    builds the effective policy as
+/// 1. **Counts must match what `analyze()` actually enforces — but OFFLINE.**
+///    The engine does NOT enforce the bare local `policy.yaml`: in
+///    `engine::analyze_inner` it builds the effective policy as
 ///    `Policy::discover(cwd)` (local resolution + optional remote replacement +
 ///    incident `apply_runtime_overrides`) followed by the read-only overlay
 ///    helpers `load_user_lists()`, `load_org_lists(cwd)` and
@@ -311,7 +311,16 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
 ///    `allowlist_rules` and `blocklist` (user/org flat-file lists + non-expired
 ///    `trust.json` entries). Summarizing only the strict local parse (round 5)
 ///    UNDER-reports the active allow/block counts versus enforcement (CodeRabbit
-///    M13 PR #132 R6-1). So we reproduce that exact sequence here for the COUNTS.
+///    M13 PR #132 R6-1). So we reproduce that sequence here for the COUNTS — but
+///    via `Policy::discover_local_only(cwd)` rather than `Policy::discover`,
+///    because the dashboard is a local, offline reporting surface whose embedded
+///    report promises it "makes no network calls". `discover` would fetch the
+///    REMOTE policy whenever a policy server is configured (env or local file);
+///    `discover_local_only` mirrors `discover`'s LOCAL behavior (local file +
+///    incident overrides) while skipping every remote-fetch branch, so a render
+///    can never hit the network (CodeRabbit M13 PR #132 R9-2). The local file +
+///    user/org/trust overlays is the effective LOCAL policy, with zero I/O off
+///    the box.
 ///
 /// 2. **A broken local file must NOT read as safe defaults.** `Policy::discover`
 ///    fails CLOSED on an unparseable named file (it returns a block-everything
@@ -355,11 +364,19 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
         }
     }
 
-    // (2) Local file parsed (or there is none): build the EFFECTIVE policy the
-    // same way `engine::analyze_inner` does, so the surfaced counts match what
-    // is actually enforced (discover + the read-only overlay helpers). Each
-    // overlay is internally non-fatal (read-only, degrades on a corrupt source).
-    let mut policy = crate::policy::Policy::discover(cwd);
+    // (2) Local file parsed (or there is none): build the EFFECTIVE LOCAL
+    // policy the same way `engine::analyze_inner` does, so the surfaced counts
+    // match what is actually enforced (local discovery + the read-only overlay
+    // helpers). We use `discover_local_only` rather than `discover` so the
+    // dashboard NEVER makes a network call: `discover` would invoke
+    // `fetch_remote_policy` whenever `TIRITH_SERVER_URL`+`TIRITH_API_KEY` (or
+    // the local file's `policy_server_url`/`policy_server_api_key`) are set, but
+    // the embedded report promises it "makes no network calls" and is a local,
+    // offline reporting surface (CodeRabbit M13 PR #132 R9-2). The local-only
+    // path still applies the incident-mode runtime overrides (a local concern).
+    // Each overlay is internally non-fatal (read-only, degrades on a corrupt
+    // source).
+    let mut policy = crate::policy::Policy::discover_local_only(cwd);
     policy.load_user_lists();
     policy.load_org_lists(cwd);
     policy.load_trust_entries(cwd);
@@ -1344,6 +1361,71 @@ mod tests {
 
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[test]
+    fn build_policy_summary_never_fetches_remote_with_server_env_set() {
+        // CodeRabbit M13 PR #132 R9-2: the dashboard is a local, offline
+        // reporting surface (its embedded report states it "makes no network
+        // calls"). `build_policy_summary` must therefore reflect the LOCAL
+        // effective policy WITHOUT a remote fetch, even when a policy server is
+        // configured via `TIRITH_SERVER_URL` + `TIRITH_API_KEY` (or the local
+        // file). It must complete (no hang / network error) and surface local
+        // data — never a fetched / fail-closed remote result.
+        //
+        // The control: the local file sets `policy_fetch_fail_mode: closed` and
+        // the env names an UNREACHABLE server. `Policy::discover` would, with
+        // this exact setup, fail closed and yield `paranoia: None` (the error
+        // state). Observing the LOCAL `paranoia: 3` instead proves no fetch
+        // branch ran — `build_policy_summary` took the offline path.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isolated_config = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_ENV_LOCK across all tirith-core tests.
+        unsafe {
+            std::env::remove_var("TIRITH_POLICY_ROOT");
+            std::env::set_var("XDG_CONFIG_HOME", isolated_config.path());
+            // A bogus, unreachable policy server. If the dashboard ever called
+            // `fetch_remote_policy`, this would (best case) flip the summary to
+            // the fail-closed/error state and (worst case) hang on a connect.
+            std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+            std::env::set_var("TIRITH_API_KEY", "bogus-key");
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
+        std::fs::write(
+            repo.path().join(".tirith/policy.yaml"),
+            "paranoia: 3\nfail_mode: closed\npolicy_fetch_fail_mode: closed\n",
+        )
+        .unwrap();
+
+        // Must return promptly and reflect the LOCAL policy — no remote fetch.
+        let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
+
+        assert!(
+            summary.error.is_none(),
+            "offline discovery must NOT surface a network/fetch error: {summary:?}"
+        );
+        assert_eq!(
+            summary.paranoia,
+            Some(3),
+            "the LOCAL paranoia must be reflected; a remote fetch would have \
+             failed closed and yielded None: {summary:?}"
+        );
+        assert_eq!(
+            summary.fail_mode.as_deref(),
+            Some("closed"),
+            "the LOCAL fail_mode must be reflected, not a fetched/remote value: {summary:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
         }
     }
 

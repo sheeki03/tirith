@@ -126,6 +126,8 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             // `mcp.tool`): the engine hard-codes their backing field to `None`,
             // so the rule could never match. Don't pretend to run a dead rule
             // (CodeRabbit M13 round-8 R8-1). Both validators reject it outright.
+            // Done before the satisfiability check so an unsupported predicate's
+            // empty satisfiable set isn't reported as an "unsatisfiable" clause.
             if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
                 eprintln!(
                     "tirith: warning: custom rule '{}' {reason}, skipping",
@@ -133,30 +135,37 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
                 );
                 continue;
             }
-            // A regex-free DSL rule still needs a declared context that covers
-            // its predicates' required trigger groups. With `agent.kind` now
-            // skipped above, no remaining supported predicate is context-agnostic
-            // (`mcp.tool` is also skipped), so the round-7 "synthesize an
-            // executable set for an empty-required clause" branch is gone: an
-            // empty declared context here is a dead rule. Drop it (matching the
-            // regex path and `tirith rule validate`).
-            if declared.is_empty() {
+            // Per-clause satisfiability + coverage (CodeRabbit M13 round-9 R9-1).
+            // `satisfiable_contexts` is the set of scan contexts in which the
+            // WHOLE clause can be evaluated — `all` intersects children, `any`
+            // unions, `not` is the child's set — so combinators stay sound.
+            //
+            // (1) An EMPTY satisfiable set means the clause mixes facts from
+            //     contexts that never co-occur in a single scan (e.g. `all(
+            //     command.*, file.*)`) — it can NEVER match. Drop it as a dead
+            //     rule (fail-open on the hot path); both validators reject it.
+            //     This also covers `declared.is_empty()` for any real predicate:
+            //     an empty declared set has no intersection with a non-empty
+            //     satisfiable set, so the coverage check below drops it.
+            let satisfiable = custom_rule_dsl::satisfiable_contexts(when);
+            if satisfiable.is_empty() {
                 eprintln!(
-                    "tirith: warning: custom rule '{}' has no valid contexts, skipping",
+                    "tirith: warning: custom rule '{}' when-clause needs facts from contexts that never co-occur in a single scan (e.g. command + file), skipping",
                     rule.id
                 );
                 continue;
             }
-            // Tier-1 invariant: the declared context must cover the clause's
-            // required trigger groups, or the predicates can never see their
-            // data. Skip (fail-open) on the hot path; `tirith rule validate`
-            // reports this as a hard error.
-            let required = custom_rule_dsl::required_triggers(when);
-            if !required.is_satisfied_by(&declared) {
+            // (2) The declared context must intersect the satisfiable set, or the
+            //     predicates can never see their data in any context the rule
+            //     runs. Skip (fail-open) on the hot path; `tirith rule validate`
+            //     reports this as a hard error. An empty declared context here is
+            //     a dead rule (no intersection) and is dropped, matching the regex
+            //     path and `tirith rule validate`.
+            if !satisfiable.intersects_declared(&declared) {
                 eprintln!(
-                    "tirith: warning: custom rule '{}' when-clause needs context [{}] not covered by its declared context, skipping",
+                    "tirith: warning: custom rule '{}' when-clause can only be evaluated in context [{}] not covered by its declared context, skipping",
                     rule.id,
-                    required.describe_unmet(&declared)
+                    satisfiable.describe()
                 );
                 continue;
             }
@@ -485,6 +494,55 @@ mod tests {
             0,
             "command.* rule with empty context has unmet triggers and must be dropped"
         );
+    }
+
+    #[test]
+    fn test_compile_all_command_and_file_is_dropped_as_unsatisfiable() {
+        // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` mixes facts from
+        // contexts that never co-occur in a single scan, so the intersection of
+        // its leaves' satisfiable sets is empty — the clause can never match.
+        // `compile_rules` must DROP it even when BOTH contexts are declared
+        // (the old leaf-flatten kept it for `[exec, file]`), matching `rule
+        // validate`'s rejection.
+        let rule = make_dsl_rule(
+            "impossible-and",
+            WhenClause::All(vec![
+                WhenClause::CommandUsesSudo(true),
+                WhenClause::FilePathMatches(r"\.env$".into()),
+            ]),
+            &["exec", "file"],
+        );
+        let compiled = compile_rules(&[rule]);
+        assert_eq!(
+            compiled.len(),
+            0,
+            "all(command, file) is unsatisfiable and must be dropped even with both contexts declared"
+        );
+    }
+
+    #[test]
+    fn test_compile_any_command_or_file_compiles_under_either_context() {
+        // R9-1: `any(command.*, file.*)` is evaluable wherever EITHER branch is
+        // (the union {exec, paste, file}), so it COMPILES under `[exec]` (command
+        // branch) AND under `[file]` (file branch). The old leaf-flatten dropped
+        // the `[exec]` case as "uncovered".
+        for ctx in [&["exec"][..], &["file"][..]] {
+            let rule = make_dsl_rule(
+                "either-or",
+                WhenClause::Any(vec![
+                    WhenClause::CommandUsesSudo(true),
+                    WhenClause::FilePathMatches(r"\.env$".into()),
+                ]),
+                ctx,
+            );
+            let compiled = compile_rules(&[rule]);
+            assert_eq!(
+                compiled.len(),
+                1,
+                "any(command, file) must compile under context {ctx:?} (R9-1)"
+            );
+            assert!(compiled[0].is_dsl());
+        }
     }
 
     #[test]

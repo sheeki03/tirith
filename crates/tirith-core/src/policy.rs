@@ -1348,6 +1348,36 @@ impl Policy {
         p
     }
 
+    /// Discover the EFFECTIVE policy **offline** — the LOCAL half of
+    /// [`Self::discover`] with ZERO network access.
+    ///
+    /// This mirrors [`Self::discover`]'s local behavior exactly — local file
+    /// resolution ([`Self::discover_local`]) plus the incident-mode
+    /// [`Self::apply_runtime_overrides`] merge — but DELIBERATELY SKIPS the
+    /// entire remote branch ([`Self::discover_resolved`]): no
+    /// `TIRITH_SERVER_URL` / `TIRITH_API_KEY` env probe, no `policy_server_url`
+    /// from the local file, and no
+    /// [`crate::policy_client::fetch_remote_policy`] call. As a result it can
+    /// never hang, fail, or leak over the network.
+    ///
+    /// Use this from local, offline reporting surfaces (e.g. `tirith
+    /// dashboard`, whose embedded report promises it "makes no network calls" —
+    /// CodeRabbit M13 PR #132 R9-2) where the surfaced policy must reflect what
+    /// the engine enforces LOCALLY without the side effect of a remote fetch.
+    /// For the hot enforcement path (which DOES honor a configured policy
+    /// server) keep using [`Self::discover`].
+    ///
+    /// Note this returns the *bare local* effective policy: the read-only
+    /// overlay helpers ([`Self::load_user_lists`], [`Self::load_org_lists`],
+    /// [`Self::load_trust_entries`]) are NOT applied here — callers that want
+    /// the full effective local picture apply them on the returned policy, the
+    /// same way `engine::analyze_inner` does.
+    pub fn discover_local_only(cwd: Option<&str>) -> Self {
+        let mut p = Self::discover_local(cwd);
+        p.apply_runtime_overrides();
+        p
+    }
+
     /// The local/remote resolution body for [`Self::discover`], WITHOUT the
     /// incident-override merge. Split out so the override is applied exactly
     /// once on the final resolved policy regardless of which remote-fetch
@@ -2347,6 +2377,68 @@ custom_rules:
 
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+    }
+
+    #[test]
+    fn discover_local_only_ignores_policy_server_and_never_fetches() {
+        // CodeRabbit M13 PR #132 R9-2: the offline discovery path must NEVER
+        // make a remote fetch, even when a policy server is configured via BOTH
+        // env (`TIRITH_SERVER_URL` + `TIRITH_API_KEY`) AND the local file
+        // (`policy_server_url` / `policy_server_api_key`). It must return the
+        // bare LOCAL policy with incident overrides applied — not a fetched,
+        // cached, or fail-closed remote result.
+        //
+        // The control is the existing `discover` behavior: with the SAME setup
+        // (`policy_fetch_fail_mode: closed` + an unreachable server),
+        // `discover` fails closed (path `"fail-closed"`, fail_mode `Closed`,
+        // bypass disabled). So observing the LOCAL values here proves no fetch
+        // branch ran — `discover_local_only` never touched the network.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        // Local file also names a (different, equally unreachable) server, so we
+        // additionally prove the file-level `policy_server_url` is ignored.
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "fail_mode: open\n\
+             policy_fetch_fail_mode: closed\n\
+             allow_bypass_env_noninteractive: true\n\
+             policy_server_url: http://127.0.0.1:1\n\
+             policy_server_api_key: file-key\n\
+             paranoia: 3\n",
+        )
+        .unwrap();
+
+        // Env-configured server too — the other source `discover_resolved`
+        // would honor. Both must be ignored by the offline path.
+        let _url = EnvVarGuard::set("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        let _key = EnvVarGuard::set("TIRITH_API_KEY", "env-key");
+
+        let policy = Policy::discover_local_only(Some(dir.path().to_str().unwrap()));
+
+        // No fetch happened: we got the LOCAL file, not "remote:" / "fail-closed".
+        assert!(
+            policy
+                .path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("policy.yaml")),
+            "offline discovery must return the LOCAL policy file, got {:?}",
+            policy.path
+        );
+        assert_eq!(
+            policy.fail_mode,
+            FailMode::Open,
+            "local fail_mode must be preserved (a fetch+fail-closed would flip it)"
+        );
+        assert!(
+            policy.allow_bypass_env_noninteractive,
+            "local bypass flag must be preserved (fail-closed would clear it)"
+        );
+        assert_eq!(policy.paranoia, 3, "local paranoia must be preserved");
     }
 
     /// Snapshot an env var on construction and restore it on `Drop`.

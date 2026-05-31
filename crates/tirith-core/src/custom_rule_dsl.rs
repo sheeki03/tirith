@@ -358,146 +358,223 @@ pub struct DslEvalContext<'a> {
     pub mcp_tool: Option<&'a str>,
 }
 
-/// The set of [`ScanContext`]s a clause's predicates need to be meaningful.
+/// The set of [`ScanContext`]s in which a clause CAN be fully evaluated — i.e.
+/// every fact the clause references is populated by [`build_dsl_backing`] for
+/// that context. This is the clause's **satisfiable-context set** (CodeRabbit
+/// M13 round-9 R9-1).
 ///
-/// Drives the tier-1 validation invariant: a DSL rule's declared `context:`
-/// (its trigger group) must COVER this set, or the rule's predicates can never
-/// see the data they reference and the rule is rejected.
+/// Drives the tier-1 validation invariant. The old `RequiredTriggerSet`
+/// flattened every leaf's context family into one conjunction-of-disjunctions,
+/// which was unsound for combinators:
 ///
-/// `url.*` needs Exec OR Paste (URLs are extracted in both), so it contributes
-/// BOTH and a rule declaring either one satisfies it. `command.*` and
-/// `package.*` likewise need Exec OR Paste: `build_dsl_backing` populates the
-/// pipeline/sudo/cwd and package facts for every non-`FileScan` context, so a
-/// `[paste]` command/package rule sees its data at runtime (CodeRabbit M13
-/// round-3 R3-1). FileScan never populates those, so it is excluded.
-/// `file.path_matches` needs FileScan. `mcp.tool` and `agent.kind` are both
-/// rejected by the validators (no MCP-tool / agent-kind signal is wired in —
-/// round-3 R3-3, round-8 R8-1), so their requirement here is never consulted for
-/// a loaded rule: `mcp.tool`'s FileScan group is the placeholder for when that
-/// signal lands, and `agent.kind` contributes nothing (it would never constrain
-/// the trigger group).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RequiredTriggerSet {
-    /// Each inner group is a DISJUNCTION: the rule's contexts must intersect it.
-    /// The outer Vec is a CONJUNCTION across predicate families. An empty outer
-    /// Vec means "no context constraint" (only reachable for an `agent.kind`
-    /// clause, which the validators reject before it can load).
-    /// Inner groups are deduped and kept small (<= 3 contexts) — a `Vec` rather
-    /// than a `BTreeSet` because `ScanContext` is intentionally not `Ord`.
-    pub groups: Vec<Vec<ScanContext>>,
+/// * `all(command.uses_sudo, file.path_matches)` was wrongly ACCEPTED for
+///   `context: [exec, file]` — but NO single scan populates BOTH command facts
+///   and a file path, so the rule could never fire (a dead rule).
+/// * `any(command.uses_sudo, file.path_matches)` was wrongly REJECTED for
+///   `context: [exec]` — but the `command.*` branch IS evaluable there.
+///
+/// The set is now computed PER CLAUSE so combinators compose correctly:
+/// * leaf → the contexts where that fact exists (`command.*`/`url.*`/`package.*`
+///   → {Exec, Paste}; `file.path_matches` → {FileScan}).
+/// * `all(children)` → INTERSECTION (the whole AND can only be evaluated where
+///   EVERY child can).
+/// * `any(children)` → UNION (the OR is evaluable wherever ANY child is).
+/// * `not(child)` → the child's set (negation doesn't change evaluability).
+///
+/// `agent.kind` and `mcp.tool` contribute the EMPTY set (no scan context wires
+/// up their signal), but they are rejected up front by
+/// [`clause_uses_unsupported_predicate`] BEFORE this is ever consulted for a
+/// loaded rule — so a loaded rule never sees their empty contribution. Their
+/// empty set here only matters as the identity for `any`/`not` composition.
+///
+/// An empty `all`/`any` combinator needs no facts and so is evaluable in EVERY
+/// context (the universal set) — a degenerate case that keeps a vacuous clause
+/// from being mislabeled unsatisfiable.
+///
+/// Validity then has two parts (see `policy_validate` / `rule validate` /
+/// [`crate::rules::custom::compile_rules`], which all route through here):
+/// 1. An EMPTY satisfiable set means the clause needs facts from contexts that
+///    never co-occur in a single scan (e.g. `command.*` AND `file.*`) — it can
+///    never match and is rejected as UNSATISFIABLE.
+/// 2. Otherwise the rule is valid iff the DECLARED context set intersects the
+///    satisfiable set (`declared ∩ satisfiable ≠ ∅`): at least one declared
+///    context can actually evaluate the clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextSet {
+    exec: bool,
+    paste: bool,
+    file: bool,
 }
 
-impl RequiredTriggerSet {
-    fn push(&mut self, ctxs: &[ScanContext]) {
-        let group: Vec<ScanContext> = ctxs.to_vec();
-        // Dedupe by set-equality (order-insensitive) so `[Exec, Paste]` is not
-        // recorded twice.
-        let already = self
-            .groups
-            .iter()
-            .any(|g| g.len() == group.len() && group.iter().all(|c| g.contains(c)));
-        if !already {
-            self.groups.push(group);
+impl ContextSet {
+    /// The empty set — no context can evaluate the clause.
+    pub const EMPTY: ContextSet = ContextSet {
+        exec: false,
+        paste: false,
+        file: false,
+    };
+    /// The universal set — every context can evaluate the clause (used as the
+    /// `all`-intersection identity and for fact-free vacuous combinators).
+    pub const ALL: ContextSet = ContextSet {
+        exec: true,
+        paste: true,
+        file: true,
+    };
+
+    fn from_contexts(ctxs: &[ScanContext]) -> ContextSet {
+        let mut s = ContextSet::EMPTY;
+        for c in ctxs {
+            s.insert(*c);
+        }
+        s
+    }
+
+    fn insert(&mut self, c: ScanContext) {
+        match c {
+            ScanContext::Exec => self.exec = true,
+            ScanContext::Paste => self.paste = true,
+            ScanContext::FileScan => self.file = true,
         }
     }
 
-    /// `true` when `declared` satisfies every required group (each group shares
-    /// at least one context with `declared`). A rule with no groups is always
-    /// satisfied.
-    pub fn is_satisfied_by(&self, declared: &[ScanContext]) -> bool {
-        self.groups
-            .iter()
-            .all(|grp| grp.iter().any(|c| declared.contains(c)))
+    fn contains(&self, c: ScanContext) -> bool {
+        match c {
+            ScanContext::Exec => self.exec,
+            ScanContext::Paste => self.paste,
+            ScanContext::FileScan => self.file,
+        }
     }
 
-    /// Human-readable description of the unmet requirement(s), for error text.
-    pub fn describe_unmet(&self, declared: &[ScanContext]) -> String {
-        let unmet: Vec<String> = self
-            .groups
-            .iter()
-            .filter(|grp| !grp.iter().any(|c| declared.contains(c)))
-            .map(|grp| {
-                let names: Vec<&str> = grp.iter().map(scan_context_name).collect();
-                names.join(" or ")
-            })
-            .collect();
-        unmet.join(", then ")
+    /// Set INTERSECTION (used to compose `all`).
+    fn intersect(self, other: ContextSet) -> ContextSet {
+        ContextSet {
+            exec: self.exec && other.exec,
+            paste: self.paste && other.paste,
+            file: self.file && other.file,
+        }
+    }
+
+    /// Set UNION (used to compose `any`).
+    fn union(self, other: ContextSet) -> ContextSet {
+        ContextSet {
+            exec: self.exec || other.exec,
+            paste: self.paste || other.paste,
+            file: self.file || other.file,
+        }
+    }
+
+    /// `true` when no context can evaluate the clause (UNSATISFIABLE — needs
+    /// facts from contexts that never co-occur in a single scan).
+    pub fn is_empty(&self) -> bool {
+        !self.exec && !self.paste && !self.file
+    }
+
+    /// `true` when the rule's DECLARED contexts share at least one context with
+    /// this satisfiable set — i.e. at least one declared context can actually
+    /// evaluate the clause. (`declared ∩ satisfiable ≠ ∅`.)
+    pub fn intersects_declared(&self, declared: &[ScanContext]) -> bool {
+        declared.iter().any(|c| self.contains(*c))
+    }
+
+    /// The contexts in this set, in a stable order, as lowercase names — for
+    /// error text (e.g. "exec or paste").
+    fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.exec {
+            v.push("exec");
+        }
+        if self.paste {
+            v.push("paste");
+        }
+        if self.file {
+            v.push("file");
+        }
+        v
+    }
+
+    /// Human-readable description of the contexts that CAN evaluate this clause,
+    /// for the coverage-error text (e.g. "exec or paste").
+    pub fn describe(&self) -> String {
+        let names = self.names();
+        if names.is_empty() {
+            // Unsatisfiable clauses are reported via their own dedicated message,
+            // never through this coverage path, so this is defensive only.
+            "(no scan context)".to_string()
+        } else {
+            names.join(" or ")
+        }
     }
 }
 
-fn scan_context_name(c: &ScanContext) -> &'static str {
-    match c {
-        ScanContext::Exec => "exec",
-        ScanContext::Paste => "paste",
-        ScanContext::FileScan => "file",
-    }
-}
-
-/// Derive the [`RequiredTriggerSet`] a clause needs from its leaf predicates.
+/// Compute the [`ContextSet`] in which a clause can be FULLY evaluated — the set
+/// of scan contexts where every fact the clause references is populated.
 ///
-/// Logical combinators (`all`/`any`/`not`) just union their children's
-/// requirements — a clause spanning families needs all of them. (`any` is a
-/// disjunction at *eval* time, but a child predicate still needs its data
-/// extracted to be evaluable, so the trigger requirement is a union here too —
-/// the conservative, correct choice for the tier-1 invariant.)
-pub fn required_triggers(clause: &WhenClause) -> RequiredTriggerSet {
-    let mut set = RequiredTriggerSet::default();
-    collect_required(clause, &mut set);
-    set
-}
-
-fn collect_required(clause: &WhenClause, set: &mut RequiredTriggerSet) {
+/// Combinators compose by set algebra so `all`/`any`/`not` keep their proper
+/// semantics (CodeRabbit M13 round-9 R9-1):
+/// * `all(children)` → INTERSECTION (evaluable only where EVERY child is).
+/// * `any(children)` → UNION (evaluable wherever ANY child is).
+/// * `not(child)` → the child's set (negation doesn't change evaluability).
+///
+/// An empty `all`/`any` (no children, fact-free and vacuous) yields the
+/// universal set — it can be evaluated anywhere. `agent.kind` / `mcp.tool` yield
+/// the empty set, but they are rejected by [`clause_uses_unsupported_predicate`]
+/// before this is consulted for a loaded rule.
+pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
     use ScanContext::{Exec, FileScan, Paste};
     match clause {
-        WhenClause::All(cs) | WhenClause::Any(cs) => {
-            for c in cs {
-                collect_required(c, set);
+        // INTERSECTION: an empty `all` is vacuously true and fact-free, so it is
+        // evaluable in every context (intersection identity = universal set).
+        WhenClause::All(cs) => cs
+            .iter()
+            .map(satisfiable_contexts)
+            .fold(ContextSet::ALL, ContextSet::intersect),
+        // UNION: an empty `any` is vacuously false and fact-free; treat it as
+        // evaluable in every context too (rather than the empty union identity,
+        // which would mislabel it unsatisfiable). Real `any` clauses always have
+        // children, so this only guards the degenerate empty case.
+        WhenClause::Any(cs) => {
+            if cs.is_empty() {
+                ContextSet::ALL
+            } else {
+                cs.iter()
+                    .map(satisfiable_contexts)
+                    .fold(ContextSet::EMPTY, ContextSet::union)
             }
         }
-        WhenClause::Not(c) => collect_required(c, set),
+        WhenClause::Not(c) => satisfiable_contexts(c),
 
-        // `command.*` needs Exec OR Paste. The engine's `build_dsl_backing`
+        // `command.*` is evaluable in Exec OR Paste. `build_dsl_backing`
         // populates `pipeline_targets`, `uses_sudo`, AND `cwd` for EVERY
-        // non-`FileScan` context — i.e. both Exec and Paste (FileScan is the only
-        // branch that genuinely lacks command facts). So a `context: [paste]`
-        // command rule DOES see its data at runtime and must validate; the
-        // round-1/2 narrowing to `[Exec]` wrongly rejected it (CodeRabbit M13
-        // round-3 R3-1). It still must NOT include FileScan — that branch never
-        // extracts command facts, so a `context: [file]` command rule stays a
-        // rejected dead rule.
+        // non-`FileScan` context (CodeRabbit M13 round-3 R3-1); FileScan never
+        // extracts command facts.
         WhenClause::CommandHasPipelineTo(_)
         | WhenClause::CommandUsesSudo(_)
-        | WhenClause::CommandCwdIn(_) => set.push(&[Exec, Paste]),
+        | WhenClause::CommandCwdIn(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
+        // `url.*` is evaluable in Exec OR Paste (URLs are extracted in both).
         WhenClause::UrlHost(_)
         | WhenClause::UrlHostMatches(_)
         | WhenClause::UrlScheme(_)
         | WhenClause::UrlReputation(_)
-        | WhenClause::UrlDomainNotIn(_) => set.push(&[Exec, Paste]),
+        | WhenClause::UrlDomainNotIn(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
-        // `package.*` needs Exec OR Paste. `build_dsl_backing` extracts package
-        // facts off a typed/pasted command line for EVERY non-`FileScan` context
-        // (both Exec and Paste — see engine.rs), so a `context: [paste]` package
-        // rule sees its data and must validate (CodeRabbit M13 round-3 R3-1).
-        // FileScan is excluded: that branch never populates
-        // `DslEvalContext::packages`, so a `context: [file]` package rule would
-        // pass validation yet be dead at runtime — keep rejecting that mismatch.
+        // `package.*` is evaluable in Exec OR Paste — `build_dsl_backing`
+        // extracts package facts off the command line for every non-`FileScan`
+        // context (round-3 R3-1); FileScan never populates `packages`.
         WhenClause::PackageEcosystem(_)
         | WhenClause::PackageNameMatches(_)
-        | WhenClause::PackageReputation(_) => set.push(&[Exec, Paste]),
+        | WhenClause::PackageReputation(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
-        WhenClause::FilePathMatches(_) => set.push(&[FileScan]),
+        // `file.path_matches` is evaluable only in FileScan (the only context
+        // that sets `file_path`).
+        WhenClause::FilePathMatches(_) => ContextSet::from_contexts(&[FileScan]),
 
-        // `mcp.tool` is rejected up-front by the validators (no MCP-tool signal
-        // is wired into any scan context yet — CodeRabbit M13 round-3 R3-3), so
-        // this trigger group is never actually consulted for a loaded rule. We
-        // keep a FileScan requirement here (the eventual MCP-lockfile home) for
-        // when the signal lands and the rejection is lifted.
-        WhenClause::McpTool(_) => set.push(&[FileScan]),
-
-        // `agent.kind` is rejected by the validators (round-8 R8-1), so this is
-        // never consulted for a loaded rule; it contributes no trigger group.
-        WhenClause::AgentKind(_) => {}
+        // `mcp.tool` / `agent.kind`: no scan context wires up their signal, so
+        // their satisfiable set is EMPTY. Both are rejected up front by
+        // `clause_uses_unsupported_predicate` (round-3 R3-3 / round-8 R8-1)
+        // BEFORE this is consulted for a loaded rule; the empty set here only
+        // serves as the identity for `any`/`not` composition.
+        WhenClause::McpTool(_) | WhenClause::AgentKind(_) => ContextSet::EMPTY,
     }
 }
 
@@ -790,13 +867,18 @@ mod tests {
             validate_regexes(when).unwrap_or_else(|e| panic!("rule '{}' bad regex: {e}", rule.id));
 
             let declared = parse_test_contexts(&rule.context);
-            let required = required_triggers(when);
+            let satisfiable = satisfiable_contexts(when);
             assert!(
-                required.is_satisfied_by(&declared),
-                "rule '{}' context {:?} does not cover required triggers [{}]",
+                !satisfiable.is_empty(),
+                "rule '{}' clause is unsatisfiable (needs facts from contexts that never co-occur)",
+                rule.id
+            );
+            assert!(
+                satisfiable.intersects_declared(&declared),
+                "rule '{}' context {:?} cannot evaluate the clause (evaluable in: {})",
                 rule.id,
                 rule.context,
-                required.describe_unmet(&declared)
+                satisfiable.describe()
             );
         }
 
@@ -958,31 +1040,32 @@ any:
     }
 
     #[test]
-    fn test_required_triggers_command_needs_exec_or_paste() {
+    fn test_satisfiable_command_needs_exec_or_paste() {
         // CodeRabbit M13 round-3 R3-1: `command.*` predicates evaluate on BOTH
         // exec and paste input (`build_dsl_backing` fills pipeline/sudo/cwd for
         // every non-FileScan context), so a `[paste]` command rule must validate.
         // FileScan still does not (it never extracts command facts).
         let clause = WhenClause::CommandUsesSudo(true);
-        let req = required_triggers(&clause);
-        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
-        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
-        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
+        let sat = satisfiable_contexts(&clause);
+        assert!(!sat.is_empty());
+        assert!(sat.intersects_declared(&[ScanContext::Exec]));
+        assert!(sat.intersects_declared(&[ScanContext::Paste]));
+        assert!(!sat.intersects_declared(&[ScanContext::FileScan]));
     }
 
     #[test]
-    fn test_required_triggers_url_needs_exec_or_paste() {
+    fn test_satisfiable_url_needs_exec_or_paste() {
         let clause = WhenClause::UrlReputation(Reputation::Unknown);
-        let req = required_triggers(&clause);
-        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
-        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
-        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
+        let sat = satisfiable_contexts(&clause);
+        assert!(sat.intersects_declared(&[ScanContext::Exec]));
+        assert!(sat.intersects_declared(&[ScanContext::Paste]));
+        assert!(!sat.intersects_declared(&[ScanContext::FileScan]));
     }
 
     #[test]
-    fn test_required_triggers_package_needs_exec_or_paste() {
+    fn test_satisfiable_package_needs_exec_or_paste() {
         // Regression (CodeRabbit M13 round-1 finding A + round-3 R3-1):
-        // `package.*` must be satisfied by Exec OR Paste — the engine's
+        // `package.*` is evaluable in Exec OR Paste — the engine's
         // `build_dsl_backing` extracts package facts off the command line for
         // every non-FileScan context (both exec and paste), so a `[paste]`
         // package rule sees its data at runtime and must validate. FileScan is
@@ -994,51 +1077,110 @@ any:
             WhenClause::PackageNameMatches("^left-pad$".to_string()),
             WhenClause::PackageReputation(Reputation::Malicious),
         ] {
-            let req = required_triggers(&clause);
+            let sat = satisfiable_contexts(&clause);
             assert!(
-                req.is_satisfied_by(&[ScanContext::Exec]),
-                "package predicate must be satisfied by exec: {clause:?}"
+                sat.intersects_declared(&[ScanContext::Exec]),
+                "package predicate must be evaluable in exec: {clause:?}"
             );
             assert!(
-                req.is_satisfied_by(&[ScanContext::Paste]),
-                "package predicate must be satisfied by paste (round-3 R3-1): {clause:?}"
+                sat.intersects_declared(&[ScanContext::Paste]),
+                "package predicate must be evaluable in paste (round-3 R3-1): {clause:?}"
             );
             assert!(
-                !req.is_satisfied_by(&[ScanContext::FileScan]),
-                "package predicate must NOT be satisfied by file (no package facts there): {clause:?}"
+                !sat.intersects_declared(&[ScanContext::FileScan]),
+                "package predicate must NOT be evaluable in file (no package facts there): {clause:?}"
             );
         }
     }
 
     #[test]
-    fn test_required_triggers_file_needs_filescan() {
+    fn test_satisfiable_file_needs_filescan() {
         let clause = WhenClause::FilePathMatches(r"\.env$".to_string());
-        let req = required_triggers(&clause);
-        assert!(req.is_satisfied_by(&[ScanContext::FileScan]));
-        assert!(!req.is_satisfied_by(&[ScanContext::Exec]));
+        let sat = satisfiable_contexts(&clause);
+        assert!(sat.intersects_declared(&[ScanContext::FileScan]));
+        assert!(!sat.intersects_declared(&[ScanContext::Exec]));
     }
 
     #[test]
-    fn test_required_triggers_spanning_clause_needs_all() {
-        // command.* (exec) AND file.* (filescan) -> a rule must declare both.
+    fn test_satisfiable_all_command_and_file_is_empty_unsatisfiable() {
+        // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` is UNSATISFIABLE —
+        // NO single scan populates BOTH command facts and a file path, so the
+        // INTERSECTION of {Exec, Paste} and {FileScan} is empty. The old flatten
+        // wrongly ACCEPTED this for `context: [exec, file]` (a dead rule).
         let clause = WhenClause::All(vec![
             WhenClause::CommandUsesSudo(true),
             WhenClause::FilePathMatches(r"x".to_string()),
         ]);
-        let req = required_triggers(&clause);
-        assert!(!req.is_satisfied_by(&[ScanContext::Exec]));
-        assert!(!req.is_satisfied_by(&[ScanContext::FileScan]));
-        assert!(req.is_satisfied_by(&[ScanContext::Exec, ScanContext::FileScan]));
+        let sat = satisfiable_contexts(&clause);
+        assert!(
+            sat.is_empty(),
+            "all(command, file) must be unsatisfiable (empty intersection), got {sat:?}"
+        );
+        // Even declaring both contexts cannot rescue it — no single scan has both.
+        assert!(!sat.intersects_declared(&[ScanContext::Exec, ScanContext::FileScan]));
     }
 
     #[test]
-    fn test_required_triggers_agent_kind_unconstrained() {
-        let clause = WhenClause::AgentKind("claude-code".to_string());
-        let req = required_triggers(&clause);
-        // No groups -> satisfied by any single context.
-        assert!(req.is_satisfied_by(&[ScanContext::Exec]));
-        assert!(req.is_satisfied_by(&[ScanContext::Paste]));
-        assert!(req.is_satisfied_by(&[ScanContext::FileScan]));
+    fn test_satisfiable_any_command_or_file_is_union() {
+        // CodeRabbit M13 round-9 R9-1: `any(command.*, file.*)` is evaluable
+        // wherever EITHER branch is — the UNION {Exec, Paste, FileScan}. The old
+        // flatten wrongly REJECTED this for `context: [exec]` even though the
+        // command branch is evaluable there. It must be ACCEPTED for `[exec]` AND
+        // for `[file]`.
+        let clause = WhenClause::Any(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::FilePathMatches(r"\.env$".to_string()),
+        ]);
+        let sat = satisfiable_contexts(&clause);
+        assert!(!sat.is_empty());
+        assert!(
+            sat.intersects_declared(&[ScanContext::Exec]),
+            "any(command, file) must be evaluable under [exec] (command branch)"
+        );
+        assert!(
+            sat.intersects_declared(&[ScanContext::Paste]),
+            "any(command, file) must be evaluable under [paste] (command branch)"
+        );
+        assert!(
+            sat.intersects_declared(&[ScanContext::FileScan]),
+            "any(command, file) must be evaluable under [file] (file branch)"
+        );
+    }
+
+    #[test]
+    fn test_satisfiable_not_preserves_child_set() {
+        // `not(child)` keeps the child's evaluability — negation only flips the
+        // verdict, it doesn't change which context has the facts.
+        let clause = WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"x".to_string())));
+        let sat = satisfiable_contexts(&clause);
+        assert!(sat.intersects_declared(&[ScanContext::FileScan]));
+        assert!(!sat.intersects_declared(&[ScanContext::Exec]));
+    }
+
+    #[test]
+    fn test_satisfiable_all_within_one_family_intersects_to_that_family() {
+        // `all(command.*, command.*)` and `all(command.*, url.*)` both stay in
+        // {Exec, Paste}: the intersection of two {Exec, Paste} sets is itself
+        // {Exec, Paste}, so a `[exec]` rule is accepted (regression for the
+        // 7-rule fixture rules 1-4 and 7, which are intra-{exec,paste} `all`s).
+        let clause = WhenClause::All(vec![
+            WhenClause::CommandUsesSudo(true),
+            WhenClause::UrlReputation(Reputation::Unknown),
+        ]);
+        let sat = satisfiable_contexts(&clause);
+        assert!(sat.intersects_declared(&[ScanContext::Exec]));
+        assert!(sat.intersects_declared(&[ScanContext::Paste]));
+        assert!(!sat.intersects_declared(&[ScanContext::FileScan]));
+    }
+
+    #[test]
+    fn test_satisfiable_agent_kind_is_empty() {
+        // `agent.kind` / `mcp.tool` have an EMPTY satisfiable set (no scan wires
+        // up their signal). They are rejected by
+        // `clause_uses_unsupported_predicate` BEFORE this is consulted for a
+        // loaded rule, so the empty set only serves as the any/not identity.
+        assert!(satisfiable_contexts(&WhenClause::AgentKind("claude-code".to_string())).is_empty());
+        assert!(satisfiable_contexts(&WhenClause::McpTool("read_file".to_string())).is_empty());
     }
 
     #[test]
