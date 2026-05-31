@@ -2427,6 +2427,49 @@ Examples:
         action: RepoCommandsAction,
     },
 
+    /// AI-config drift + risk surface for an agent's repo (M13 ch5)
+    #[command(after_help = "\
+`tirith ai` watches the AI-config surface a coding agent reads and acts on —
+CLAUDE.md, AGENTS.md, .cursorrules, .claude/*, .cursor/rules/*, .mcp.json — for
+drift and risk. It runs the AI-config subset of the shipping scan engine and
+diffs the current tree against a last-known-safe snapshot.
+
+Subcommands:
+  scan                  run the `ai-agent-repo` scan profile over the repo's
+                        AI-config files (reuses `tirith scan`; no new engine)
+  diff                  compare each AI-config file to the snapshot at
+                        <state-dir>/ai_config_snapshot.json and report added /
+                        removed instructions + any AiConfig* findings
+  quarantine <file>     COPY a (suspected-poisoned) config into
+                        ~/.cache/tirith/quarantine/ — the ORIGINAL IS UNTOUCHED
+                        by default; --move opts into deleting the original
+                        (prompts unless --yes)
+  explain-config <file> identify which AI tool a config configures (CLAUDE.md →
+                        Claude, .cursorrules/.cursor → Cursor, AGENTS.md →
+                        generic, .mcp.json → MCP) and what it grants
+  snapshot [--update]   show the snapshot state, or (--update) re-scan + record
+                        a fresh snapshot (refuses to bless a High+ state unless
+                        --force)
+
+Two diff-only rules can fire from `tirith ai diff` (never the exec/scan hot
+path): ai_config_hidden_instruction_added and ai_config_tool_use_escalation,
+both High. They reuse the shipping hidden-content detection and NORMALIZE both
+sides before diffing, so a pure Markdown reformat is not a finding.
+
+Examples:
+  tirith ai scan
+  tirith ai diff
+  tirith ai diff --json
+  tirith ai quarantine .cursorrules
+  tirith ai quarantine .cursorrules --move --yes
+  tirith ai explain-config CLAUDE.md
+  tirith ai snapshot
+  tirith ai snapshot --update")]
+    Ai {
+        #[command(subcommand)]
+        action: AiAction,
+    },
+
     /// Plant honeytoken / canary tokens (local-first, opt-in callback) (M11 ch3)
     #[command(after_help = "\
 A canary is a deliberately-synthetic, clearly-fake secret-shaped token you plant
@@ -2903,6 +2946,131 @@ Examples:
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
         /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AiAction {
+    /// Run the `ai-agent-repo` scan profile over the repo's AI-config files
+    #[command(after_help = "\
+Runs the AI-config subset of the shipping scan engine — the `ai-agent-repo`
+built-in profile — over the current repository's AI-config files. This is a thin
+wrapper over `tirith scan --profile ai-agent-repo`; no new detection is added.
+Exit code follows the profile's `fail_on` (high).
+
+Examples:
+  tirith ai scan
+  tirith ai scan --json")]
+    Scan {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Diff the repo's AI-config files against the last-known-safe snapshot
+    #[command(after_help = "\
+Compares each current AI-config file to the snapshot recorded at
+<state-dir>/ai_config_snapshot.json and reports added / removed instruction
+lines plus any AI-config drift findings (ai_config_hidden_instruction_added,
+ai_config_tool_use_escalation). Both sides are NORMALIZED before diffing, so a
+pure Markdown reformat is not reported as drift. If no snapshot exists, says so
+and suggests `tirith ai snapshot --update`. Exits 1 when a drift rule fired.
+
+Examples:
+  tirith ai diff
+  tirith ai diff --json")]
+    Diff {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Isolate a suspected-poisoned AI-config file (COPY by default)
+    #[command(after_help = "\
+v1 DEFAULT IS COPY: the file is COPIED to
+~/.cache/tirith/quarantine/<timestamp>-<sha256>-<basename> and the ORIGINAL IS
+LEFT UNTOUCHED; the restore command is printed. Pass --move to opt into the
+destructive variant (copy, then DELETE the original) — which prompts for
+confirmation unless --yes, and refuses non-interactively without --yes.
+
+Examples:
+  tirith ai quarantine .cursorrules
+  tirith ai quarantine CLAUDE.md --json
+  tirith ai quarantine .cursorrules --move --yes")]
+    Quarantine {
+        /// Path to the AI-config file to quarantine.
+        file: String,
+        /// Opt into the DESTRUCTIVE variant: copy, then remove the original.
+        /// Prompts for confirmation unless --yes; refuses non-interactively
+        /// without --yes. Without this flag the original is left untouched.
+        #[arg(long = "move")]
+        r#move: bool,
+        /// Confirm the destructive --move without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Explain which AI tool a config file configures and what it grants
+    #[command(after_help = "\
+Identifies which AI tool a config file configures (CLAUDE.md → Claude,
+.cursorrules / .cursor/rules → Cursor, AGENTS.md → generic, .mcp.json → MCP) and
+prints the capabilities / risks its CONTENT grants — hidden instructions,
+tool-use / network / file-write directives, MCP server-launch surface. Reuses
+the shipping aifile detection for the risk signals.
+
+Examples:
+  tirith ai explain-config CLAUDE.md
+  tirith ai explain-config .mcp.json --json")]
+    ExplainConfig {
+        /// Path to the AI-config file to explain.
+        file: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show the AI-config snapshot, or (--update) record a fresh one
+    #[command(after_help = "\
+Without --update: shows the current snapshot's path, age, and file count.
+With --update: re-scans the AI-config files and records a fresh snapshot at
+<state-dir>/ai_config_snapshot.json, written atomically. --update REFUSES to
+snapshot if the scan finds any High+ issue (so you do not bless a compromised
+state) unless --force is also passed.
+
+Examples:
+  tirith ai snapshot
+  tirith ai snapshot --json
+  tirith ai snapshot --update
+  tirith ai snapshot --update --force")]
+    Snapshot {
+        /// Re-scan the AI-config files and record a fresh snapshot.
+        #[arg(long)]
+        update: bool,
+        /// With --update, record the snapshot even when High+ issues are found
+        /// (otherwise --update refuses to bless a compromised state).
+        #[arg(long)]
+        force: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
@@ -5879,6 +6047,17 @@ described under `tirith agent allow`).
 payload (`agent`, `mcp`, `ci`, `ide`) — a tool filter on `human` or
 `gateway` matches nothing and is rejected up-front.
 
+Per-agent semantic predicates (M13 ch5, OPTIONAL):
+  --filesystem-write <repo_only|home|everywhere>  the write scope the agent is
+                                                  expected to stay within
+  --network <warn|block|allow>                    how the agent's network use
+                                                  should be treated
+  --secrets-access <block|allow>                  whether the agent may read
+                                                  secrets
+These are ADVISORY metadata recorded ON the emitted matcher (they do not change
+which origins it matches — matching stays on `(kind, name)`). When supplied they
+are rendered into the snippet and round-trip through `Policy::load`.
+
 Exit codes:
   0  the matcher is valid; the snippet was printed.
   1  the matcher is invalid, or the JSON output could not be written.
@@ -5887,6 +6066,8 @@ Exit codes:
 Examples:
   tirith agent block --kind agent --tool untrusted-tool \"curl|bash\"
   tirith agent block --kind mcp --tool sketchy-server \"*\"
+  tirith agent block --kind agent --tool codex \"sudo *\"
+  tirith agent block --kind agent --tool codex \"*\" --filesystem-write repo_only --network block --secrets-access block
   tirith agent block --kind agent --tool untrusted-tool \"*\" --format json")]
     Block {
         /// Origin kind: human, agent, mcp, gateway, ci, ide
@@ -5903,6 +6084,18 @@ Examples:
         /// into the matcher itself (the engine schema matches only on
         /// `(kind, name)` today).
         command_pattern: String,
+        /// M13 ch5 — per-agent filesystem-write scope predicate
+        /// (repo_only|home|everywhere). Advisory metadata recorded on the matcher.
+        #[arg(long = "filesystem-write")]
+        filesystem_write: Option<String>,
+        /// M13 ch5 — per-agent network predicate (warn|block|allow). Advisory
+        /// metadata recorded on the matcher.
+        #[arg(long)]
+        network: Option<String>,
+        /// M13 ch5 — per-agent secrets-access predicate (block|allow). Advisory
+        /// metadata recorded on the matcher.
+        #[arg(long = "secrets-access")]
+        secrets_access: Option<String>,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6384,11 +6577,22 @@ fn run() {
                 kind,
                 payload,
                 command_pattern,
+                filesystem_write,
+                network,
+                secrets_access,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::agent::block(&kind, payload.as_deref(), &command_pattern, json)
+                cli::agent::block(
+                    &kind,
+                    payload.as_deref(),
+                    &command_pattern,
+                    filesystem_write.as_deref(),
+                    network.as_deref(),
+                    secrets_access.as_deref(),
+                    json,
+                )
             }
             AgentAction::Current { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -7488,6 +7692,39 @@ fn run() {
         },
 
         // M11 ch3 — honeytoken / canary (`tirith canary ...`).
+        Commands::Ai { action } => match action {
+            AiAction::Scan { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ai::scan(json)
+            }
+            AiAction::Diff { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ai::diff(json)
+            }
+            AiAction::Quarantine {
+                file,
+                r#move,
+                yes,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ai::quarantine(&file, r#move, yes, json)
+            }
+            AiAction::ExplainConfig { file, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ai::explain_config(&file, json)
+            }
+            AiAction::Snapshot {
+                update,
+                force,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::ai::snapshot(update, force, json)
+            }
+        },
         Commands::Canary { action } => match action {
             CanaryAction::Create {
                 kind,

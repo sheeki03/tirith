@@ -520,6 +520,166 @@ pub struct AgentMatcher {
     /// `policy_validate.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// M13 ch5 — OPTIONAL per-agent semantic predicate: the filesystem-write
+    /// scope this agent is expected to stay within. Advisory metadata an
+    /// operator declares alongside a matcher (emitted by `tirith agent block
+    /// --filesystem-write …`); it does NOT change which origins a matcher
+    /// matches (matching stays on `kind` + `name`). `#[serde(default)]` so every
+    /// pre-M13 matcher loads unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_write: Option<FilesystemWriteScope>,
+    /// M13 ch5 — OPTIONAL per-agent semantic predicate: how this agent's network
+    /// access should be treated. Advisory metadata (emitted by `tirith agent
+    /// block --network …`). Does not affect matching. `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkPredicate>,
+    /// M13 ch5 — OPTIONAL per-agent semantic predicate: whether this agent may
+    /// read secrets. Advisory metadata (emitted by `tirith agent block
+    /// --secrets-access …`). Does not affect matching. `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_access: Option<SecretsAccessPredicate>,
+}
+
+impl Default for AgentMatcher {
+    /// A matcher defaulting to `kind: human` with no `name` and no semantic
+    /// predicates. Exists so callers can use `..Default::default()` to fill the
+    /// M13 ch5 predicate fields without restating them; every real construction
+    /// site sets `kind` explicitly, so the `Human` default is never load-bearing.
+    fn default() -> Self {
+        Self {
+            kind: AgentOriginKind::Human,
+            name: None,
+            filesystem_write: None,
+            network: None,
+            secrets_access: None,
+        }
+    }
+}
+
+impl AgentMatcher {
+    /// Construct a matcher with the given `kind` + optional `name` and NO
+    /// semantic predicates (the pre-M13 shape). The M13 ch5 predicate fields
+    /// default to `None`; set them via the struct fields directly or with
+    /// [`AgentMatcher::with_predicates`] when emitting from `tirith agent block`.
+    pub fn new(kind: AgentOriginKind, name: Option<String>) -> Self {
+        Self {
+            kind,
+            name,
+            filesystem_write: None,
+            network: None,
+            secrets_access: None,
+        }
+    }
+
+    /// Construct a matcher carrying the M13 ch5 semantic predicates.
+    pub fn with_predicates(
+        kind: AgentOriginKind,
+        name: Option<String>,
+        filesystem_write: Option<FilesystemWriteScope>,
+        network: Option<NetworkPredicate>,
+        secrets_access: Option<SecretsAccessPredicate>,
+    ) -> Self {
+        Self {
+            kind,
+            name,
+            filesystem_write,
+            network,
+            secrets_access,
+        }
+    }
+}
+
+/// M13 ch5 — filesystem-write scope predicate on an [`AgentMatcher`]. The
+/// declared scope an agent is expected to write within.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemWriteScope {
+    /// Writes confined to the current repository working tree.
+    RepoOnly,
+    /// Writes allowed anywhere under the user's home directory.
+    Home,
+    /// Writes allowed anywhere on the filesystem.
+    Everywhere,
+}
+
+/// M13 ch5 — network-access predicate on an [`AgentMatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPredicate {
+    /// Network access is permitted.
+    Allow,
+    /// Network access should be surfaced (warned) but not blocked.
+    Warn,
+    /// Network access should be blocked.
+    Block,
+}
+
+/// M13 ch5 — secrets-access predicate on an [`AgentMatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretsAccessPredicate {
+    /// Reading secrets is permitted.
+    Allow,
+    /// Reading secrets should be blocked.
+    Block,
+}
+
+impl FilesystemWriteScope {
+    /// Parse from the CLI `--filesystem-write <v>` argument value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "repo_only" | "repo-only" | "repo" => Some(Self::RepoOnly),
+            "home" => Some(Self::Home),
+            "everywhere" | "all" => Some(Self::Everywhere),
+            _ => None,
+        }
+    }
+    /// The canonical snake_case string (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoOnly => "repo_only",
+            Self::Home => "home",
+            Self::Everywhere => "everywhere",
+        }
+    }
+}
+
+impl NetworkPredicate {
+    /// Parse from the CLI `--network <v>` argument value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "warn" => Some(Self::Warn),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+    /// The canonical snake_case string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Warn => "warn",
+            Self::Block => "block",
+        }
+    }
+}
+
+impl SecretsAccessPredicate {
+    /// Parse from the CLI `--secrets-access <v>` argument value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+    /// The canonical snake_case string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Block => "block",
+        }
+    }
 }
 
 /// Closed enum mirroring the [`AgentOrigin`] discriminator.
@@ -2255,15 +2415,18 @@ mod tests {
                     AgentMatcher {
                         kind: AgentOriginKind::Agent,
                         name: Some("claude-code".to_string()),
+                        ..Default::default()
                     },
                     AgentMatcher {
                         kind: AgentOriginKind::Human,
                         name: None,
+                        ..Default::default()
                     },
                 ],
                 deny: vec![AgentMatcher {
                     kind: AgentOriginKind::Mcp,
                     name: Some("untrusted-client".to_string()),
+                    ..Default::default()
                 }],
             },
             ..Default::default()
@@ -2312,6 +2475,91 @@ mod tests {
     }
 
     #[test]
+    fn agent_matcher_without_predicates_loads_unchanged() {
+        // M13 ch5: a pre-M13 matcher (kind + name only) must still load, with the
+        // three new predicate fields defaulting to None.
+        let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      name: untrusted-tool\n";
+        let policy: Policy = serde_yaml::from_str(yaml).expect("pre-M13 matcher parse");
+        let m = &policy.agent_rules.deny[0];
+        assert_eq!(m.kind, AgentOriginKind::Agent);
+        assert_eq!(m.name.as_deref(), Some("untrusted-tool"));
+        assert_eq!(m.filesystem_write, None);
+        assert_eq!(m.network, None);
+        assert_eq!(m.secrets_access, None);
+    }
+
+    #[test]
+    fn agent_matcher_semantic_predicates_round_trip() {
+        // M13 ch5: a matcher carrying the three semantic predicates round-trips
+        // through `Policy::load` (serialize → YAML → deserialize) byte-for-byte
+        // in value. This is the acceptance check that the new predicates persist.
+        let matcher = AgentMatcher::with_predicates(
+            AgentOriginKind::Agent,
+            Some("codex".to_string()),
+            Some(FilesystemWriteScope::RepoOnly),
+            Some(NetworkPredicate::Block),
+            Some(SecretsAccessPredicate::Block),
+        );
+        let policy = Policy {
+            agent_rules: AgentRules {
+                allow: vec![],
+                deny: vec![matcher.clone()],
+            },
+            ..Default::default()
+        };
+        // Serialize the whole policy and re-parse it (the `Policy::load` path).
+        let yaml = serde_yaml::to_string(&policy).expect("serialize");
+        // The snake_case enum values must appear in the emitted YAML.
+        assert!(yaml.contains("filesystem_write: repo_only"), "yaml: {yaml}");
+        assert!(yaml.contains("network: block"), "yaml: {yaml}");
+        assert!(yaml.contains("secrets_access: block"), "yaml: {yaml}");
+        let reparsed: Policy = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(
+            reparsed.agent_rules.deny[0], matcher,
+            "the predicate-carrying matcher must round-trip unchanged"
+        );
+        // And `tirith policy validate` must not flag the new fields as unknown.
+        let issues = crate::policy_validate::validate(&yaml);
+        assert!(
+            !issues.iter().any(|i| i
+                .field
+                .as_deref()
+                .map(|f| f.contains("filesystem_write")
+                    || f.contains("network")
+                    || f.contains("secrets_access"))
+                .unwrap_or(false)),
+            "the M13 semantic predicate fields must not be reported as unknown: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn agent_predicate_parsers_accept_documented_values() {
+        assert_eq!(
+            FilesystemWriteScope::parse("repo_only"),
+            Some(FilesystemWriteScope::RepoOnly)
+        );
+        assert_eq!(
+            FilesystemWriteScope::parse("repo-only"),
+            Some(FilesystemWriteScope::RepoOnly)
+        );
+        assert_eq!(
+            FilesystemWriteScope::parse("EVERYWHERE"),
+            Some(FilesystemWriteScope::Everywhere)
+        );
+        assert_eq!(FilesystemWriteScope::parse("nonsense"), None);
+        assert_eq!(
+            NetworkPredicate::parse("warn"),
+            Some(NetworkPredicate::Warn)
+        );
+        assert_eq!(NetworkPredicate::parse("nope"), None);
+        assert_eq!(
+            SecretsAccessPredicate::parse("block"),
+            Some(SecretsAccessPredicate::Block)
+        );
+        assert_eq!(SecretsAccessPredicate::parse("warn"), None);
+    }
+
+    #[test]
     fn agent_decision_unspecified_when_rules_empty() {
         let policy = Policy::default();
         let origin = AgentOrigin::agent("claude-code", None).unwrap();
@@ -2323,6 +2571,7 @@ mod tests {
         let allow_matcher = AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: None,
+            ..Default::default()
         };
         let policy = Policy {
             agent_rules: AgentRules {
@@ -2356,6 +2605,7 @@ mod tests {
         let allow_matcher = AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("claude-code".to_string()),
+            ..Default::default()
         };
         let policy = Policy {
             agent_rules: AgentRules {
@@ -2389,10 +2639,12 @@ mod tests {
         let allow_matcher = AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: None,
+            ..Default::default()
         };
         let deny_matcher = AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("bad-actor".to_string()),
+            ..Default::default()
         };
         let policy = Policy {
             agent_rules: AgentRules {
@@ -2431,10 +2683,12 @@ mod tests {
                     AgentMatcher {
                         kind: AgentOriginKind::Human,
                         name: Some("xyz".to_string()),
+                        ..Default::default()
                     },
                     AgentMatcher {
                         kind: AgentOriginKind::Gateway,
                         name: Some("xyz".to_string()),
+                        ..Default::default()
                     },
                 ],
                 deny: vec![],
@@ -2459,14 +2713,17 @@ mod tests {
         let mcp_matcher = AgentMatcher {
             kind: AgentOriginKind::Mcp,
             name: Some("Cursor".to_string()),
+            ..Default::default()
         };
         let ci_matcher = AgentMatcher {
             kind: AgentOriginKind::Ci,
             name: Some("github-actions".to_string()),
+            ..Default::default()
         };
         let ide_matcher = AgentMatcher {
             kind: AgentOriginKind::Ide,
             name: Some("vscode".to_string()),
+            ..Default::default()
         };
         let policy = Policy {
             agent_rules: AgentRules {
@@ -2609,6 +2866,7 @@ mod tests {
         let allow_matcher = AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("claude-code".to_string()),
+            ..Default::default()
         };
         let with_rules = Policy {
             agent_rules: AgentRules {
@@ -2616,6 +2874,7 @@ mod tests {
                 deny: vec![AgentMatcher {
                     kind: AgentOriginKind::Mcp,
                     name: None,
+                    ..Default::default()
                 }],
             },
             ..Default::default()

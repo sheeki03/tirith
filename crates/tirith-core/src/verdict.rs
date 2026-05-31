@@ -942,6 +942,41 @@ pub enum RuleId {
     /// host is NOT in `policy.allowed_install_domains`, or an OSC 8 hyperlink in
     /// the paste renders a visible URL whose host differs from its actual target.
     PasteSourceMismatch,
+
+    // AI-config drift rules (M13 ch5). An AI-config file (`CLAUDE.md`,
+    // `AGENTS.md`, `.cursorrules`, `.cursor/rules/*`, `.claude/*`, …) is the
+    // instruction surface a coding agent reads and acts on. These fire ONLY
+    // from `tirith ai diff` (`crate::rules::aifile::diff_findings`), which
+    // compares each current AI-config file to the last-known-safe snapshot at
+    // `state_dir()/ai_config_snapshot.json`. They are DIFF-triggered, never
+    // produced by the engine's `analyze` pipeline or the `tirith scan` FileScan
+    // path, so — exactly like [`PasteSourceMismatch`], `canary_token_touched`,
+    // and the M11 command-card/manifest rules — they carry no PATTERN_TABLE
+    // entry and live in `EXTERNALLY_TRIGGERED_RULES`. Detection reuses the
+    // existing `agent_instruction_hidden` hidden-content / invisible-text logic
+    // in `aifile.rs`; the diff layer NORMALIZES both sides (trims trailing
+    // whitespace, collapses blank-line runs) so a Markdown reformat alone is not
+    // a finding. Covered by unit tests in `aifile.rs` plus a CLI integration
+    // test that plants a snapshot + a changed file.
+    /// M13 ch5 — `tirith ai diff` found a NEW instruction line added to an
+    /// AI-config file since the last-known-safe snapshot: either an added line
+    /// that carries hidden / invisible-text content (the
+    /// `agent_instruction_hidden` shape — an HTML comment or visually-hidden
+    /// element carrying a directive), or a newly-added imperative directive
+    /// line. High severity — a fresh hidden instruction in the file an agent
+    /// trusts is the prompt-injection / config-poisoning shape this diff exists
+    /// to surface. Only lines PRESENT IN THE NEW FILE BUT NOT THE SNAPSHOT fire;
+    /// a line removed since the snapshot never fires this rule.
+    AiConfigHiddenInstructionAdded,
+    /// M13 ch5 — `tirith ai diff` found a NEW or ESCALATED tool-use directive
+    /// added to an AI-config file since the last-known-safe snapshot: a newly-
+    /// added instruction to run / exec / spawn a shell, make a network call, or
+    /// write files (e.g. a new `run:` / `exec`/`shell` directive, a `curl`/`wget`
+    /// network instruction, or a file-write directive that was not in the
+    /// snapshot). High severity — silently widening what the agent is told it may
+    /// do is an escalation of the config's blast radius. Like
+    /// `AiConfigHiddenInstructionAdded`, only ADDED lines fire.
+    AiConfigToolUseEscalation,
 }
 
 impl fmt::Display for RuleId {

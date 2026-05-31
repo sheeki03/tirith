@@ -765,6 +765,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "canary_token_touched",
     // Paste-provenance rule (M12 ch1)
     "paste_source_mismatch",
+    // AI-config drift rules (M13 ch5)
+    "ai_config_hidden_instruction_added",
+    "ai_config_tool_use_escalation",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1117,6 +1120,19 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // integration test that writes a `clipboard_source.json` into an isolated
     // `XDG_STATE_HOME`, following the M11 canary runtime-state pattern.
     "paste_source_mismatch",
+    // M13 ch5 — AI-config drift rules fire ONLY from `tirith ai diff`
+    // (`crate::rules::aifile::diff_findings`), which compares each current
+    // AI-config file to the last-known-safe snapshot at
+    // `state_dir()/ai_config_snapshot.json`. The static golden-fixture runner
+    // drives `engine::analyze` (and `analyze_output`) only — it never runs a
+    // snapshot diff — so a text fixture cannot drive these rules: the trigger is
+    // a snapshot-vs-current diff, not input content alone. They are
+    // diff-triggered (not PATTERN_TABLE), exactly like `paste_source_mismatch`
+    // and `canary_token_touched`. Covered by unit tests for the diff producers
+    // in `crates/tirith-core/src/rules/aifile.rs` plus CLI integration tests
+    // that plant a snapshot + a changed file under an isolated `XDG_STATE_HOME`.
+    "ai_config_hidden_instruction_added",
+    "ai_config_tool_use_escalation",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1382,6 +1398,8 @@ rule_id_variant_registry! {
     CanaryTokenTouched,
     // Paste-provenance rule (M12 ch1)
     PasteSourceMismatch,
+    // AI-config drift rules (M13 ch5)
+    AiConfigHiddenInstructionAdded, AiConfigToolUseEscalation,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the actual RuleId enum.

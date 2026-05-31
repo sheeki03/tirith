@@ -398,7 +398,12 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CanaryTokenTouched
         // M12 ch1 — paste provenance. A companion-file content-hash match plus a
         // URL-host comparison; not a threat-DB indicator match.
-        | RuleId::PasteSourceMismatch => false,
+        | RuleId::PasteSourceMismatch
+        // M13 ch5 — AI-config drift rules. A snapshot-vs-current diff of an
+        // AI-config file's hidden-content / tool-use directives; structural, not
+        // a threat-DB indicator match.
+        | RuleId::AiConfigHiddenInstructionAdded
+        | RuleId::AiConfigToolUseEscalation => false,
     }
 }
 

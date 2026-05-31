@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 
 use tirith_core::agent_origin::AgentOrigin;
 use tirith_core::audit_aggregator;
-use tirith_core::policy::{self, AgentMatcher, AgentOriginKind};
+use tirith_core::policy::{
+    self, AgentMatcher, AgentOriginKind, FilesystemWriteScope, NetworkPredicate,
+    SecretsAccessPredicate,
+};
 
 // ===========================================================================
 // shared helpers
@@ -896,7 +899,7 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         return 1;
     }
 
-    let matcher = AgentMatcher { kind, name };
+    let matcher = AgentMatcher::new(kind, name);
 
     let snippet = render_allow_snippet(&matcher);
 
@@ -954,15 +957,27 @@ fn render_allow_snippet(m: &AgentMatcher) -> String {
 /// the operator has a record of what the deny rule is meant to cover when
 /// the schema is later extended.
 ///
-/// Schema honesty: the codebase's [`AgentMatcher`] does not carry
-/// `command`, `action`, or `payload` fields. The deny semantic is purely
-/// structural — any matcher listed under `agent_rules.deny` forces a
-/// `Block`, beating any allow entry. Emitting an unsupported `action:
-/// block` / `command:` line would either be silently dropped by serde
-/// (`deny_unknown_fields` is not currently set on `AgentMatcher`) or
-/// reject the policy at load. Either way it would mislead an operator;
-/// this command renders only the fields the engine consumes today.
-pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json: bool) -> i32 {
+/// Schema honesty: the codebase's [`AgentMatcher`] carries `kind`, `name`, and
+/// (M13 ch5) the optional semantic predicates `filesystem_write` / `network` /
+/// `secrets_access`. The deny semantic is purely structural — any matcher listed
+/// under `agent_rules.deny` forces a `Block`, beating any allow entry. The M13
+/// ch5 predicates are ADVISORY metadata the operator declares alongside the
+/// matcher (they do NOT change which origins a matcher matches, which stays on
+/// `(kind, name)`); when supplied via `--filesystem-write` / `--network` /
+/// `--secrets-access` they are rendered into the snippet so the operator's intent
+/// is recorded in the policy and round-trips through `Policy::load`. The
+/// `command_pattern` positional is captured but NOT folded into the matcher; it
+/// is rendered as a YAML comment beside the snippet.
+#[allow(clippy::too_many_arguments)]
+pub fn block(
+    kind_str: &str,
+    payload: Option<&str>,
+    command_pattern: &str,
+    filesystem_write: Option<&str>,
+    network: Option<&str>,
+    secrets_access: Option<&str>,
+    json: bool,
+) -> i32 {
     let Some(kind) = AgentOriginKind::parse(kind_str) else {
         report_error(
             json,
@@ -1009,7 +1024,55 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
         return 1;
     }
 
-    let matcher = AgentMatcher { kind, name };
+    // M13 ch5 — parse the optional semantic predicates. An unrecognized value
+    // is a hard error (with the valid set) rather than a silently-dropped flag.
+    let filesystem_write = match filesystem_write {
+        Some(v) => match FilesystemWriteScope::parse(v) {
+            Some(s) => Some(s),
+            None => {
+                report_error(
+                    json,
+                    "tirith agent block",
+                    &format!(
+                        "unknown --filesystem-write {v:?} (valid: repo_only, home, everywhere)"
+                    ),
+                );
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let network = match network {
+        Some(v) => match NetworkPredicate::parse(v) {
+            Some(s) => Some(s),
+            None => {
+                report_error(
+                    json,
+                    "tirith agent block",
+                    &format!("unknown --network {v:?} (valid: warn, block, allow)"),
+                );
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let secrets_access = match secrets_access {
+        Some(v) => match SecretsAccessPredicate::parse(v) {
+            Some(s) => Some(s),
+            None => {
+                report_error(
+                    json,
+                    "tirith agent block",
+                    &format!("unknown --secrets-access {v:?} (valid: block, allow)"),
+                );
+                return 1;
+            }
+        },
+        None => None,
+    };
+
+    let matcher =
+        AgentMatcher::with_predicates(kind, name, filesystem_write, network, secrets_access);
     let snippet = render_block_snippet(&matcher, command_pattern);
 
     if json {
@@ -1071,6 +1134,19 @@ fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
     s.push_str(&format!("    - kind: {}\n", m.kind.as_str()));
     if let Some(t) = m.name.as_deref() {
         s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
+    }
+    // M13 ch5 — the optional semantic predicates. Each enum's `as_str()` is the
+    // exact snake_case serde representation, so the emitted snippet round-trips
+    // through `Policy::load`. The values come from a closed enum (not free-form
+    // operator input), so they need no `yaml_safe_scalar` escaping.
+    if let Some(fw) = m.filesystem_write {
+        s.push_str(&format!("      filesystem_write: {}\n", fw.as_str()));
+    }
+    if let Some(net) = m.network {
+        s.push_str(&format!("      network: {}\n", net.as_str()));
+    }
+    if let Some(sa) = m.secrets_access {
+        s.push_str(&format!("      secrets_access: {}\n", sa.as_str()));
     }
     s
 }
@@ -2052,6 +2128,7 @@ mod tests {
         let snippet = render_allow_snippet(&AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("claude-code".to_string()),
+            ..Default::default()
         });
         let yaml = format!("agent_rules:\n  allow:\n{snippet}");
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("snippet parses");
@@ -2071,6 +2148,7 @@ mod tests {
         let snippet = render_allow_snippet(&AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("ev\x1b[31mil".to_string()),
+            ..Default::default()
         });
         assert!(!snippet.contains('\x1b'));
         let yaml = format!("agent_rules:\n  allow:\n{snippet}");

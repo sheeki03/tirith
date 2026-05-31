@@ -1166,6 +1166,7 @@ mod tests {
                 deny: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Human,
                     name: None,
+                    ..Default::default()
                 }],
             },
             ..Default::default()
@@ -1178,6 +1179,7 @@ mod tests {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Human,
                     name: None,
+                    ..Default::default()
                 }],
                 deny: vec![],
             },
@@ -1337,6 +1339,7 @@ mod tests {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
                     name: Some("claude-code".to_string()),
+                    ..Default::default()
                 }],
                 deny: vec![],
             },
@@ -1432,6 +1435,7 @@ mod tests {
                 allow: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
                     name: Some("nobody".to_string()),
+                    ..Default::default()
                 }],
                 deny: vec![],
             },
@@ -1473,6 +1477,7 @@ mod tests {
                 deny: vec![crate::policy::AgentMatcher {
                     kind: crate::policy::AgentOriginKind::Agent,
                     name: Some("claude-code".to_string()),
+                    ..Default::default()
                 }],
             },
             ..Default::default()

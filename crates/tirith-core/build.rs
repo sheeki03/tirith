@@ -1304,6 +1304,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // content-hash match; no PATTERN_TABLE entry (the trigger is not a regex on
     // the input), category "clipboard".
     ("paste_source_mismatch", "PasteSourceMismatch"),
+    // AI-config drift rules (M13 ch5). Diff-triggered by `tirith ai diff`
+    // against the last-known-safe snapshot; no PATTERN_TABLE entry (the trigger
+    // is a snapshot-vs-current diff, not a regex on the input), category
+    // "aifile".
+    (
+        "ai_config_hidden_instruction_added",
+        "AiConfigHiddenInstructionAdded",
+    ),
+    ("ai_config_tool_use_escalation", "AiConfigToolUseEscalation"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1339,6 +1348,9 @@ const VALID_CATEGORIES: &[&str] = &[
     "command_card",
     "commands_manifest",
     "canary",
+    // M13 ch5 — AI-config drift rules (`ai_config_hidden_instruction_added`,
+    // `ai_config_tool_use_escalation`), emitted by `tirith ai diff`.
+    "aifile",
 ];
 
 #[derive(Deserialize)]

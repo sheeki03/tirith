@@ -461,6 +461,7 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 }
 
 pub mod agent;
+pub mod ai;
 pub mod aliases;
 pub mod audit;
 pub mod baseline;

@@ -688,7 +688,14 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     // operator's intended block never fired. The lists below mirror
     // `policy.rs::AgentRules` and `policy.rs::AgentMatcher`.
     let known_agent_rules_fields = ["allow", "deny"];
-    let known_agent_matcher_fields = ["kind", "name"];
+    // `kind` + `name` (pre-M13) plus the M13 ch5 optional semantic predicates.
+    let known_agent_matcher_fields = [
+        "kind",
+        "name",
+        "filesystem_write",
+        "network",
+        "secrets_access",
+    ];
 
     // Parse as generic YAML value to check top-level keys
     if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) {
