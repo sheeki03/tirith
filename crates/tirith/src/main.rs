@@ -560,10 +560,15 @@ Examples:
         ai_agent_heavy: bool,
         /// Perform the recommended SAFE actions (with per-step stdin
         /// confirmation). Refuses to act when not an interactive terminal.
-        #[arg(long)]
+        ///
+        /// Mutually exclusive with `--json`: `--apply` prints interactive prompts
+        /// and may invoke `tirith init`, whose output would corrupt the JSON
+        /// document. clap rejects the combination at parse time with a usage error
+        /// (exit 2) (CodeRabbit M13 PR #132 R12-7).
+        #[arg(long, conflicts_with = "json")]
         apply: bool,
         /// Emit the detection report + recommendation as JSON.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "apply")]
         json: bool,
     },
 

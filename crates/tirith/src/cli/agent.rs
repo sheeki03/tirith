@@ -24,10 +24,13 @@ use std::path::{Path, PathBuf};
 
 use tirith_core::agent_origin::AgentOrigin;
 use tirith_core::audit_aggregator;
-use tirith_core::policy::{
-    self, AgentMatcher, AgentOriginKind, FilesystemWriteScope, NetworkPredicate,
-    SecretsAccessPredicate,
-};
+// NOTE: `FilesystemWriteScope` / `NetworkPredicate` / `SecretsAccessPredicate`
+// are intentionally NOT imported here. `agent block` no longer mints those
+// predicates (R12-2: agent_rules matching is kind+name only, so emitting them is
+// a footgun); the flags are gated and rejected. The `AgentMatcher` struct still
+// carries the fields and `Policy::load` still parses them in `tirith_core` for
+// forward-compat, so hand-written policies round-trip unchanged.
+use tirith_core::policy::{self, AgentMatcher, AgentOriginKind};
 
 // ===========================================================================
 // shared helpers
@@ -1024,56 +1027,26 @@ pub fn block(
         return 1;
     }
 
-    // M13 ch5 — parse the optional semantic predicates. An unrecognized value
-    // is a hard error (with the valid set) rather than a silently-dropped flag.
-    let filesystem_write = match filesystem_write {
-        Some(v) => match FilesystemWriteScope::parse(v) {
-            Some(s) => Some(s),
-            None => {
-                report_error(
-                    json,
-                    "tirith agent block",
-                    &format!(
-                        "unknown --filesystem-write {v:?} \
-                         (valid: repo_only, repo-only, repo, home, everywhere, all)"
-                    ),
-                );
-                return 1;
-            }
-        },
-        None => None,
-    };
-    let network = match network {
-        Some(v) => match NetworkPredicate::parse(v) {
-            Some(s) => Some(s),
-            None => {
-                report_error(
-                    json,
-                    "tirith agent block",
-                    &format!("unknown --network {v:?} (valid: warn, block, allow)"),
-                );
-                return 1;
-            }
-        },
-        None => None,
-    };
-    let secrets_access = match secrets_access {
-        Some(v) => match SecretsAccessPredicate::parse(v) {
-            Some(s) => Some(s),
-            None => {
-                report_error(
-                    json,
-                    "tirith agent block",
-                    &format!("unknown --secrets-access {v:?} (valid: block, allow)"),
-                );
-                return 1;
-            }
-        },
-        None => None,
-    };
+    // M13 ch5 / R12-2 — GATE the semantic predicate flags. `agent_rules` matching
+    // is `(kind, name)` ONLY (see `escalation::apply_agent_rules`), so a snippet
+    // carrying `filesystem_write` / `network` / `secrets_access` would LOOK
+    // conditional but actually deny EVERY command for that origin — a silent
+    // footgun. Until the engine matcher honors these predicates, refuse to emit
+    // them (CodeRabbit M13 PR #132 R12-2). The `AgentMatcher` struct still carries
+    // the fields and `Policy::load` still parses them, so hand-written policies
+    // keep round-tripping for forward-compat; only `agent block` stops minting
+    // them.
+    if filesystem_write.is_some() || network.is_some() || secrets_access.is_some() {
+        report_error(
+            json,
+            "tirith agent block",
+            "--filesystem-write/--network/--secrets-access are not enforced by \
+             agent_rules matching yet (matching is kind+name only); omit them",
+        );
+        return 1;
+    }
 
-    let matcher =
-        AgentMatcher::with_predicates(kind, name, filesystem_write, network, secrets_access);
+    let matcher = AgentMatcher::new(kind, name);
     let snippet = render_block_snippet(&matcher, command_pattern);
 
     if json {
@@ -1136,19 +1109,11 @@ fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
     if let Some(t) = m.name.as_deref() {
         s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
     }
-    // M13 ch5 — the optional semantic predicates. Each enum's `as_str()` is the
-    // exact snake_case serde representation, so the emitted snippet round-trips
-    // through `Policy::load`. The values come from a closed enum (not free-form
-    // operator input), so they need no `yaml_safe_scalar` escaping.
-    if let Some(fw) = m.filesystem_write {
-        s.push_str(&format!("      filesystem_write: {}\n", fw.as_str()));
-    }
-    if let Some(net) = m.network {
-        s.push_str(&format!("      network: {}\n", net.as_str()));
-    }
-    if let Some(sa) = m.secrets_access {
-        s.push_str(&format!("      secrets_access: {}\n", sa.as_str()));
-    }
+    // R12-2: `agent block` no longer emits the M13 ch5 semantic predicates
+    // (`filesystem_write` / `network` / `secrets_access`). The engine matcher is
+    // `(kind, name)` only, so emitting a predicate would silently widen the deny
+    // to ALL commands for the origin. The flags are gated/rejected upstream in
+    // [`block`], so the matcher reaching here never carries a predicate.
     s
 }
 

@@ -14269,10 +14269,49 @@ fn ai_snapshot_update_refuses_high_findings_without_force() {
 }
 
 #[test]
-fn ai_agent_block_emits_semantic_predicates() {
-    // M13 ch5: `tirith agent block` with the semantic predicate flags emits a
-    // deny snippet carrying them, and the snippet round-trips (parses as YAML
-    // with the predicate fields present).
+fn ai_agent_block_rejects_semantic_predicate_flags() {
+    // R12-2 (was `ai_agent_block_emits_semantic_predicates`): the M13 ch5
+    // predicate flags are NOT enforced by `agent_rules` matching (which is
+    // kind+name only), so emitting them would silently widen the deny to ALL
+    // commands for the origin. `tirith agent block` now REJECTS them with a
+    // "not enforced yet" message instead of minting an unenforced snippet.
+    for flag in [
+        ["--filesystem-write", "repo_only"],
+        ["--network", "block"],
+        ["--secrets-access", "block"],
+    ] {
+        let out = tirith()
+            .args([
+                "agent", "block", "--kind", "agent", "--tool", "codex", "sudo *",
+            ])
+            .args(flag)
+            .output()
+            .expect("run tirith");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "predicate flag {flag:?} must be rejected (exit 1)"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not enforced by")
+                && stderr.contains("agent_rules")
+                && stderr.contains("kind+name"),
+            "rejection must explain predicates are not enforced yet; flag {flag:?}, got: {stderr}"
+        );
+        // No snippet was emitted (nothing on stdout to paste).
+        assert!(
+            out.stdout.is_empty(),
+            "a rejected predicate flag must not emit a snippet; flag {flag:?}, stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn ai_agent_block_rejects_predicate_flags_in_json_mode() {
+    // R12-2: the rejection is honored in --json mode too (a machine-readable
+    // error envelope, not a snippet).
     let out = tirith()
         .args([
             "agent",
@@ -14284,40 +14323,17 @@ fn ai_agent_block_emits_semantic_predicates() {
             "sudo *",
             "--filesystem-write",
             "repo_only",
-            "--network",
-            "block",
-            "--secrets-access",
-            "block",
             "--json",
         ])
         .output()
         .expect("run tirith");
-    assert!(out.status.success(), "agent block should succeed");
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    let snippet = v["snippet"].as_str().expect("snippet");
+    assert_eq!(out.status.code(), Some(1), "must be rejected with exit 1");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("rejection must be a JSON envelope");
+    let err = v["error"].as_str().expect("error string");
     assert!(
-        snippet.contains("filesystem_write: repo_only"),
-        "snippet: {snippet}"
-    );
-    assert!(snippet.contains("network: block"), "snippet: {snippet}");
-    assert!(
-        snippet.contains("secrets_access: block"),
-        "snippet: {snippet}"
-    );
-    // The matcher object also carries the predicates.
-    assert_eq!(
-        v["matcher"]["filesystem_write"],
-        serde_json::json!("repo_only")
-    );
-
-    // The emitted snippet parses as a valid agent_rules.deny block.
-    let yaml = format!("agent_rules:\n  deny:\n{snippet}");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("snippet parses");
-    let matcher = &parsed["agent_rules"]["deny"][0];
-    assert_eq!(matcher["kind"], serde_yaml::Value::String("agent".into()));
-    assert_eq!(
-        matcher["network"],
-        serde_yaml::Value::String("block".into())
+        err.contains("not enforced by") && err.contains("kind+name"),
+        "JSON error must explain predicates are not enforced yet; got: {err}"
     );
 }
 
@@ -14345,11 +14361,16 @@ fn ai_agent_block_still_round_trips_without_predicates() {
 }
 
 // ---------------------------------------------------------------------------
-// M13 PR #132 finding H — `--filesystem-write` error lists ALL accepted aliases
+// R12-2 — the predicate gate runs BEFORE value parsing
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ai_agent_block_bad_filesystem_write_lists_all_aliases() {
+fn ai_agent_block_predicate_gate_precedes_value_parsing() {
+    // R12-2 (supersedes the old finding-H alias-enumeration test): `agent block`
+    // now gates `--filesystem-write` up front (it's not enforced by agent_rules
+    // matching), so even a would-be-invalid value never reaches per-value
+    // validation. The rejection is the generic "not enforced yet" message, NOT an
+    // alias list — proving the gate short-circuits before parsing the value.
     let out = tirith()
         .args([
             "agent",
@@ -14364,23 +14385,17 @@ fn ai_agent_block_bad_filesystem_write_lists_all_aliases() {
         ])
         .output()
         .expect("run tirith");
-    assert_eq!(out.status.code(), Some(1), "an invalid value must exit 1");
+    assert_eq!(out.status.code(), Some(1), "predicate flag must exit 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The message must enumerate every alias FilesystemWriteScope::parse accepts,
-    // not just the canonical three.
-    for alias in [
-        "repo_only",
-        "repo-only",
-        "repo",
-        "home",
-        "everywhere",
-        "all",
-    ] {
-        assert!(
-            stderr.contains(alias),
-            "error must list the `{alias}` alias; got: {stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("not enforced by") && stderr.contains("kind+name"),
+        "must be the gate's not-enforced message, not value validation; got: {stderr}"
+    );
+    // The old alias enumeration is gone — the value is never parsed.
+    assert!(
+        !stderr.contains("everywhere"),
+        "the gate must short-circuit before per-value alias validation; got: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -14678,27 +14693,22 @@ fn onboard_json_and_apply_combo_is_rejected() {
         .env_remove("TIRITH_POLICY_ROOT")
         .output()
         .expect("run tirith");
+    // R12-7: `--apply` and `--json` are now declared `conflicts_with` each other
+    // on the clap `Onboard` variant, so the combination is rejected at PARSE time
+    // with a clap usage error (exit 2) — superseding the old round-5 runtime JSON
+    // envelope (exit 1), which was removed as unreachable.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "--json + --apply must be rejected with exit 1"
+        Some(2),
+        "--json + --apply must be a clap usage error (exit 2); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    // The caller asked for --json, so the rejection must be machine-readable:
-    // a parseable {schema_version, error} envelope on stdout, NOT raw stderr
-    // text (CodeRabbit M13 round-5 D5-4).
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "stdout must be parseable JSON; err={e}; got: {}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
-    assert_eq!(v["schema_version"], serde_json::json!(1));
-    let err = v["error"].as_str().expect("error must be a JSON string");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("--json") && err.contains("--apply"),
-        "the JSON error must explain the rejected combination; got: {err}"
+        stderr.contains("--json") && stderr.contains("--apply"),
+        "the clap usage error must name the conflicting flags; got: {stderr}"
     );
-    // It must NOT have written a policy (no apply happened).
+    // clap rejects before any handler runs — nothing was written.
     assert!(!dir.path().join(".tirith/policy.yaml").exists());
 }
 

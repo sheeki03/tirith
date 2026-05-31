@@ -132,27 +132,11 @@ struct TirithState {
 ///   SAFE actions with per-step stdin confirmation (refuses non-interactively).
 /// * `json` — emit the detection + recommendation as a JSON object.
 pub fn run(mode: Option<&str>, apply: bool, json: bool) -> i32 {
-    // `--json` and `--apply` are mutually exclusive: `apply_actions` prints
-    // interactive prompts and may invoke `tirith init`, whose output would
-    // corrupt the JSON document. Reject the combination up front (M13 PR #132
-    // finding L) rather than emitting valid JSON followed by non-JSON noise.
-    //
-    // The caller asked for `--json`, so the rejection itself must be
-    // machine-readable: emit the same `{schema_version, error}` envelope the
-    // other `--json` surfaces use (CodeRabbit M13 round-5 D5-4) rather than raw
-    // stderr text automation can't parse. A failed write exits non-zero (2),
-    // matching the success path's broken-pipe contract.
-    if json && apply {
-        let err = serde_json::json!({
-            "schema_version": ONBOARD_SCHEMA_VERSION,
-            "error": "--json and --apply cannot be combined \
-                      (--apply prints interactive prompts that would corrupt the JSON output)",
-        });
-        if !crate::cli::write_json_stdout(&err, "tirith onboard: failed to write JSON output") {
-            return 2;
-        }
-        return 1;
-    }
+    // `--json` and `--apply` are mutually exclusive — they're declared
+    // `conflicts_with` each other on the `Onboard` clap variant, so the
+    // combination is rejected at parse time with a usage error (exit 2) and never
+    // reaches this function. (The earlier runtime `if json && apply` rejection was
+    // removed as unreachable — CodeRabbit M13 PR #132 R12-7.)
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd_str = cwd.display().to_string();
@@ -408,9 +392,25 @@ fn home_base() -> Option<PathBuf> {
     let env_home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
 
     env_home
-        .filter(|h| !h.is_empty())
+        // A RELATIVE `$HOME` / `%USERPROFILE%` (e.g. `HOME=.`) would make the
+        // home-relative MCP scan probe a cwd-relative `.codeium/...`, fabricating
+        // an MCP signal that biases the recommendation. Only honor an ABSOLUTE
+        // override; anything relative falls back to `home::home_dir()` (CodeRabbit
+        // M13 PR #132 R12-5).
+        .filter(|h| !h.is_empty() && Path::new(h).is_absolute())
         .map(PathBuf::from)
         .or_else(home::home_dir)
+        // `home::home_dir()` itself can return `Some("")` on some runners when
+        // ...but `home::home_dir()` can ALSO yield a non-absolute path: on some
+        // runners an empty `$HOME` makes it return `Some("")` (MSRV CI: Rust 1.83
+        // / Linux), and on Unix it reads `$HOME` directly, so a RELATIVE override
+        // like `HOME=.` comes back verbatim instead of being skipped. Either case
+        // would make `detect_mcp_configs` probe a cwd-relative `.codeium/...` and
+        // fabricate an MCP signal. A single final guard — the home base must be
+        // ABSOLUTE (which also rules out the empty path) — closes BOTH the R12-5
+        // relative-home hole and the MSRV empty-path failure, regardless of which
+        // source (env or `home_dir()`) produced the value.
+        .filter(|p| p.is_absolute())
 }
 
 /// Detect MCP config files: the repo-local surface joined onto `root`, plus the
@@ -622,6 +622,21 @@ fn fmt_list(items: &[String]) -> String {
 /// overwrites an existing `.tirith/policy.yaml` without confirmation.
 fn apply_actions(report: &OnboardReport) -> i32 {
     println!();
+
+    // Idempotency: if the hook AND policy are already present there is no
+    // mutating step to perform, so `--apply` is a no-op REGARDLESS of TTY. Report
+    // success and return BEFORE the non-interactive refusal — otherwise a piped /
+    // CI `tirith onboard --apply` on an already-configured repo would exit 1 and
+    // masquerade as a failure even though it had nothing to do (CodeRabbit M13
+    // PR #132 R12-6). The refusal (return 1, below) then only fires when there is
+    // actually work to do non-interactively.
+    let needs_hook = !report.tirith.hook_installed;
+    let needs_policy = !report.tirith.policy_present;
+    if !needs_hook && !needs_policy {
+        println!("tirith onboard: no actions applied.");
+        return 0;
+    }
+
     if !is_tty_pair() {
         // Non-interactive: do NOT silently perform destructive actions. This is a
         // refusal to do the requested work, so it exits NON-ZERO (M13 PR #132
@@ -831,6 +846,64 @@ mod tests {
         assert!(done[0].contains("already set up"));
     }
 
+    /// Build a minimal [`OnboardReport`] for `apply_actions` tests, varying only
+    /// the install state that drives the idempotency / refusal decision.
+    fn report_with_state(hook_installed: bool, policy_present: bool) -> OnboardReport {
+        OnboardReport {
+            schema_version: ONBOARD_SCHEMA_VERSION,
+            cwd: ".".to_string(),
+            repo_root: None,
+            requested_mode: "auto".to_string(),
+            detected_shell: "bash".to_string(),
+            ide_configs: vec![],
+            ai_config_files: vec![],
+            package_managers: vec![],
+            lockfiles: vec![],
+            ci_detected: false,
+            mcp_configs: vec![],
+            tirith: TirithState {
+                hook_installed,
+                policy_present,
+                policy_path: policy_present.then(|| "/repo/.tirith/policy.yaml".to_string()),
+            },
+            recommended_template: "individual".to_string(),
+            recommendation_reason: "test".to_string(),
+            next_actions: vec!["do a thing".to_string()],
+        }
+    }
+
+    /// R12-6: a non-interactive `--apply` on an already-configured repo (hook AND
+    /// policy present) is a NO-OP, so `apply_actions` returns 0 — it must NOT hit
+    /// the non-interactive refusal (exit 1) when there is nothing to do. Under the
+    /// test harness stdin/stderr are not a TTY, so this exercises exactly the
+    /// piped/CI path the finding is about: idempotent `--apply` must look like a
+    /// success, not a failure.
+    #[test]
+    fn apply_actions_noop_when_already_configured_returns_zero() {
+        let report = report_with_state(true, true);
+        assert_eq!(
+            apply_actions(&report),
+            0,
+            "an already-configured repo has nothing to apply — must exit 0 even non-interactively"
+        );
+    }
+
+    /// R12-6 (the converse): when there IS a mutating step to perform (hook
+    /// missing), a non-interactive `apply_actions` still refuses and returns 1.
+    /// Pairs with the no-op test to prove the no-op short-circuit fires ONLY when
+    /// nothing is needed.
+    #[test]
+    fn apply_actions_noninteractive_with_work_returns_one() {
+        // Policy present but hook missing → a real step remains, so the
+        // non-interactive refusal must fire (exit 1).
+        let report = report_with_state(false, true);
+        assert_eq!(
+            apply_actions(&report),
+            1,
+            "a non-interactive --apply with work to do must refuse (exit 1)"
+        );
+    }
+
     /// R7-5: every basename in [`AI_CONFIG_BASENAMES`] must be recognised by the
     /// product's canonical AI-config classifier. This pins the onboard detector's
     /// list to what the rest of the tool (`tirith ai` / the `aifile` rules)
@@ -958,6 +1031,8 @@ mod tests {
     /// R11-3: [`home_base`] must resolve from the `$HOME` / `%USERPROFILE%` env,
     /// NOT the OS passwd entry, so the home-relative MCP scan is isolatable on
     /// every OS (incl. macOS, where `home::home_dir()` can prefer `getpwuid_r`).
+    /// This also covers the ABSOLUTE half of R12-5: an absolute temp `HOME` is
+    /// honored and returned verbatim.
     #[test]
     fn home_base_resolves_from_env() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -967,6 +1042,46 @@ mod tests {
             Some(dir.path().to_path_buf()),
             "home_base must honor the HOME/USERPROFILE env override"
         );
+    }
+
+    /// R12-5: a RELATIVE `$HOME` / `%USERPROFILE%` (e.g. `HOME=.`) must NOT be
+    /// returned — it would make the home-relative MCP scan probe a cwd-relative
+    /// `.codeium/...` and fabricate an MCP signal. `home_base` falls back to
+    /// `home::home_dir()` instead, and never echoes back the relative path.
+    #[test]
+    fn home_base_rejects_relative_home() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        // A clearly-relative override on every OS.
+        std::env::set_var("HOME", "relative-home");
+        std::env::set_var("USERPROFILE", "relative-home");
+
+        let base = home_base();
+
+        // Restore before asserting so a failure can't leak the relative env.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        // It must not echo back the relative override...
+        assert_ne!(
+            base.as_deref(),
+            Some(Path::new("relative-home")),
+            "home_base must not return a relative HOME/USERPROFILE override"
+        );
+        // ...and whatever it falls back to must be absolute (or absent).
+        if let Some(p) = &base {
+            assert!(
+                p.is_absolute(),
+                "home_base fallback must be absolute, got {p:?}"
+            );
+        }
     }
 
     /// R11-3: an EMPTY `HOME`/`USERPROFILE` must be treated as unset (mirroring

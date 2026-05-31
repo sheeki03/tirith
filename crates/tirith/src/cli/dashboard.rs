@@ -313,9 +313,24 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
     }
 }
 
-/// Write `html` to `path`, creating parent dirs, with 0600 perms on Unix (the
-/// report may carry repo-internal hostnames / paths even after redaction —
-/// mirrors `incident report --out`).
+/// Write `html` to `path`, creating parent dirs. The report may carry
+/// repo-internal hostnames / paths even after redaction, so it should be
+/// "private by default" (mirrors `incident report --out`).
+///
+/// Platform split (M13 PR #132 finding R12-3):
+///
+/// * **Unix** — the file is created and re-chmodded to `0600` so only the owner
+///   can read it, regardless of any pre-existing world-readable file at `path`.
+/// * **Non-Unix (Windows)** — `std` has no portable equivalent of `chmod 0600`
+///   without an extra crate, so we do NOT apply an explicit restriction. We do
+///   NOT fail closed: the default destination (`%USERPROFILE%\Documents`) is
+///   already user-private via the inherited NTFS ACL, and failing the write
+///   would needlessly break a valid export. Instead we emit a one-line stderr
+///   WARNING so the user knows the file's protection relies on the directory's
+///   inherited permissions on this platform — relevant if they later move it
+///   somewhere shared. (A restrictive DACL applied via the Windows API is a
+///   possible future enhancement; it is intentionally out of scope here to
+///   avoid adding a dependency.)
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -346,7 +361,24 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
             .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))?;
     }
     f.write_all(html.as_bytes())
-        .map_err(|e| format!("write {}: {e}", path.display()))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+
+    // On platforms without Unix file modes we could not apply an explicit
+    // owner-only restriction (see the doc comment above). Warn — to stderr so
+    // `--json` / piped stdout stays uncorrupted — that the file's access
+    // restriction relies on the OS directory permissions here.
+    #[cfg(not(unix))]
+    {
+        eprintln!(
+            "tirith dashboard export: WARNING: on this platform the report at {} \
+             is not restricted to your user account explicitly; its protection \
+             relies on the directory's inherited permissions. Move it somewhere \
+             only you can read if you copy it elsewhere.",
+            path.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// `tirith dashboard serve [--port <p>] [--json]`.
@@ -505,10 +537,16 @@ fn with_security_headers(
 /// Authorization is decided BEFORE the request body is touched (M13 PR #132
 /// finding K): the decision derives only from the `Host` header + the `token`
 /// query parameter, so an unauthenticated client can never make us read (and
-/// buffer) an unbounded body pre-auth. Only after a successful authorize do we
-/// drain a BOUNDED amount of the body so the connection can be reused cleanly.
+/// buffer) an unbounded body pre-auth.
+///
+/// We never read the request body at all — not even on the authorized path
+/// (M13 PR #132 finding R12-4). This is a read-only GET surface; there is
+/// nothing to consume. A post-auth blocking drain would let a client holding a
+/// valid token trickle a body slowly and stall this single-threaded serve loop,
+/// so once authorized we respond immediately. `tiny_http` discards any unread
+/// body and tears the connection down cleanly when the `Request` drops.
 fn handle_request(
-    mut request: tiny_http::Request,
+    request: tiny_http::Request,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
@@ -558,33 +596,14 @@ fn handle_request(
         return;
     }
 
-    // Authorized: drain a BOUNDED slice of the body so the connection can be
-    // reused cleanly. We ignore the contents entirely (this is a read-only GET
-    // surface); the cap means even an authorized client cannot stream us an
-    // unbounded body. Anything beyond the cap is left unread (the response is
-    // sent regardless).
-    const MAX_DRAIN: usize = 64 * 1024; // 64 KiB — generous for any legit GET body
-    {
-        // `as_reader()` yields `&mut dyn Read` (a trait object), so the `Sized`
-        // combinators (`take`/`by_ref`) don't apply. Drain manually with a fixed
-        // buffer, stopping at the cap, so even an authorized client can't stream
-        // us an unbounded body. Anything past the cap is left unread; the
-        // response is sent regardless.
-        let reader = request.as_reader();
-        let mut buf = [0u8; 8 * 1024];
-        let mut drained = 0usize;
-        while drained < MAX_DRAIN {
-            match reader.read(&mut buf) {
-                Ok(0) => break,        // EOF
-                Ok(n) => drained += n, // discard the bytes; we only need to drain
-                Err(_) => break,       // best-effort drain
-            }
-        }
-    }
-
-    // Authorized (Decision::Ok) — the only path that reaches here. Re-render
-    // fresh each request so a long-lived tab reflects new activity. The render
-    // escapes every value (see core).
+    // Authorized (Decision::Ok) — the only path that reaches here. We do NOT
+    // read the request body: this is a read-only GET surface, and a blocking
+    // post-auth drain would let a valid-token client trickle a body slowly and
+    // stall this single-threaded serve loop (M13 PR #132 finding R12-4).
+    // Respond immediately; `tiny_http` discards any unread body on drop.
+    //
+    // Re-render fresh each request so a long-lived tab reflects new activity.
+    // The render escapes every value (see core).
     let snapshot = build_snapshot();
     let html = dashboard::render_html(&snapshot);
     // Same hardening header set as the 401/403 paths (see `with_security_headers`).
@@ -1047,5 +1066,107 @@ mod tests {
         );
 
         handle.join().expect("server thread");
+    }
+
+    // -----------------------------------------------------------------------
+    // M13 PR #132 finding R12-4 — an authorized request is answered WITHOUT a
+    // pre-response body-drain loop. The deleted drain blocked the
+    // single-threaded serve loop inside `reader.read()`; removing it means the
+    // handler responds as soon as it has authorized, never looping over the
+    // request body.
+    //
+    // We assert the observable contract for the two request shapes the surface
+    // actually sees: (1) a plain authorized GET with no body — what a browser
+    // sends — and (2) an authorized request carrying a COMPLETE body (the case
+    // the old drain claimed to "consume for connection reuse"). Both must come
+    // back 200 promptly. A bounded read timeout turns a regression (a
+    // re-introduced blocking drain) into a hard timeout failure here rather
+    // than a hang. Each request is served by its own freshly-bound server so
+    // the `Connection: close` teardown of one cannot interact with the next.
+    //
+    // (We deliberately do NOT test a never-completed oversized body: tiny_http
+    // 0.12's own `Request::respond` blocks reconciling an unread lazy body for
+    // HTTP framing regardless of our code, so that shape is a property of the
+    // dependency, not of the drain we removed.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn authorized_request_is_served_without_body_drain() {
+        use std::time::Duration as StdDuration;
+
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+
+        // Serve exactly one forged request through the real `handle_request`
+        // path and return its numeric status. A fresh issue time keeps the TTL
+        // open; a bounded client read timeout means a regression fails fast.
+        fn serve_one(token: &str, raw_request: &str) -> u16 {
+            let issued = Utc::now();
+            let issued_mono = Instant::now();
+            let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("bind 127.0.0.1:0");
+            let port = server.server_addr().to_ip().expect("ip addr").port();
+
+            let tok = token.to_string();
+            let handle = std::thread::spawn(move || {
+                if let Ok(req) = server.recv() {
+                    handle_request(req, &tok, issued, issued_mono);
+                }
+            });
+
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            // The forged request carries a `{port}` placeholder for the Host.
+            let req = raw_request.replace("{port}", &port.to_string());
+            stream.write_all(req.as_bytes()).expect("write request");
+            stream.flush().expect("flush");
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(10)))
+                .expect("set read timeout");
+
+            // Read just the first chunk (the status line arrives in the first
+            // packet). We do NOT drain to EOF: a re-introduced blocking drain
+            // would delay the status line itself, so observing it promptly is
+            // the regression signal. The bounded timeout caps any hang.
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let status = text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            handle.join().expect("server thread");
+            status
+        }
+
+        // 1. Plain authorized GET, no body — the canonical browser request.
+        let get = "GET /?token={token} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Connection: close\r\n\r\n"
+            .replace("{token}", token);
+        assert_eq!(
+            serve_one(token, &get),
+            200,
+            "an authorized GET with no body must be served 200 promptly"
+        );
+
+        // 2. Authorized request with a COMPLETE (Content-Length-matching) body —
+        //    the case the deleted drain claimed to consume. With the drain gone
+        //    the handler must still respond 200 and must not block on the body.
+        let body = "ignored-body-bytes";
+        let post = format!(
+            "POST /?token={token} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{{port}}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n\
+             {body}",
+            body.len()
+        );
+        assert_eq!(
+            serve_one(token, &post),
+            200,
+            "an authorized request with a complete body must still be served 200"
+        );
     }
 }
