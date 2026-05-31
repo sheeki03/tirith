@@ -550,39 +550,128 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         return 0;
     }
 
-    // Always COPY the bytes into quarantine first (atomic write).
-    if let Err(e) = write_file_atomic(&dest, &content, true) {
-        if !emit_error(
-            json,
-            "tirith ai quarantine",
-            &format!("failed to write quarantine copy {}: {e}", dest.display()),
-        ) {
-            return 2;
-        }
-        return 1;
-    }
-
     let mut moved = false;
     if do_move {
-        // Destructive variant: remove the original now that the copy is durable.
-        if let Err(e) = std::fs::remove_file(&src) {
-            // The copy succeeded but the original could not be removed — report
-            // honestly: the file IS quarantined (a copy exists) but the original
-            // remains. Exit 1, not a silent success.
+        // DESTRUCTIVE variant. Prefer an ATOMIC `rename` so there is NO
+        // read→write→delete window (CodeRabbit M13 PR #132 R10-4): a concurrent
+        // edit between our earlier `read` and a later `remove_file` would
+        // otherwise discard the newer bytes (quarantine keeps the stale copy we
+        // read; the original is gone). `rename` moves the inode atomically, so
+        // whatever bytes the file holds at the instant of the move land in
+        // quarantine and the source vanishes in the same operation.
+        match std::fs::rename(&src, &dest) {
+            Ok(()) => {
+                moved = true;
+            }
+            Err(e) if is_cross_device(&e) => {
+                // `rename` cannot cross filesystems (e.g. quarantine on a
+                // different mount than the source). Fall back to copy-then-delete,
+                // but CLOSE the TOCTOU: write the bytes we already read, then
+                // re-read + re-hash the source IMMEDIATELY before deleting it, and
+                // ABORT the delete if it changed since our initial read.
+                if let Err(e) = write_file_atomic(&dest, &content, true) {
+                    if !emit_error(
+                        json,
+                        "tirith ai quarantine",
+                        &format!("failed to write quarantine copy {}: {e}", dest.display()),
+                    ) {
+                        return 2;
+                    }
+                    return 1;
+                }
+                // Re-read the source as late as possible (just before the delete)
+                // and compare its hash to the bytes we quarantined. A mismatch
+                // means the file was edited after our first read; deleting now
+                // would lose the newer content, so we keep the original and fail.
+                match std::fs::read(&src) {
+                    Ok(current) => {
+                        let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
+                        if current_sha != sha {
+                            if !emit_error(
+                                json,
+                                "tirith ai quarantine",
+                                &format!(
+                                    "{} changed on disk after it was read; refusing to delete the \
+                                     original (the quarantine copy at {} is now stale). Re-run to \
+                                     quarantine the current contents.",
+                                    src.display(),
+                                    dest.display()
+                                ),
+                            ) {
+                                return 2;
+                            }
+                            return 1;
+                        }
+                    }
+                    Err(e) => {
+                        // Could not re-read to confirm the bytes are unchanged —
+                        // do NOT delete blindly. The copy exists; the original
+                        // stays. Exit non-zero, not a silent success.
+                        if !emit_error(
+                            json,
+                            "tirith ai quarantine",
+                            &format!(
+                                "copied to {} but could not re-read {} to confirm it was unchanged \
+                                 before deleting; left the original in place: {e}",
+                                dest.display(),
+                                src.display()
+                            ),
+                        ) {
+                            return 2;
+                        }
+                        return 1;
+                    }
+                }
+                if let Err(e) = std::fs::remove_file(&src) {
+                    // The copy succeeded but the original could not be removed —
+                    // report honestly: the file IS quarantined (a copy exists) but
+                    // the original remains. Exit 1, not a silent success.
+                    if !emit_error(
+                        json,
+                        "tirith ai quarantine",
+                        &format!(
+                            "copied to {} but could not remove the original {}: {e}",
+                            dest.display(),
+                            src.display()
+                        ),
+                    ) {
+                        return 2;
+                    }
+                    return 1;
+                }
+                moved = true;
+            }
+            Err(e) => {
+                // A non-cross-device rename failure (permissions, source vanished,
+                // …). Report it; the original is untouched and no copy was made.
+                if !emit_error(
+                    json,
+                    "tirith ai quarantine",
+                    &format!(
+                        "failed to move {} into quarantine at {}: {e}",
+                        src.display(),
+                        dest.display()
+                    ),
+                ) {
+                    return 2;
+                }
+                return 1;
+            }
+        }
+    } else {
+        // COPY default (round-1, non-`--move`): write the bytes into quarantine
+        // atomically and leave the original UNTOUCHED. No delete window exists
+        // here, so this path is unaffected by the TOCTOU fix above.
+        if let Err(e) = write_file_atomic(&dest, &content, true) {
             if !emit_error(
                 json,
                 "tirith ai quarantine",
-                &format!(
-                    "copied to {} but could not remove the original {}: {e}",
-                    dest.display(),
-                    src.display()
-                ),
+                &format!("failed to write quarantine copy {}: {e}", dest.display()),
             ) {
                 return 2;
             }
             return 1;
         }
-        moved = true;
     }
 
     // Copy the quarantine copy (dest) back to the original location (src).
@@ -627,6 +716,26 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     println!("Restore with:");
     println!("  {restore_cmd}");
     0
+}
+
+/// Whether a `std::fs::rename` error means the source and destination are on
+/// DIFFERENT filesystems (so an atomic rename is impossible and the caller must
+/// fall back to copy-then-delete). We match the raw OS error code rather than
+/// `ErrorKind::CrossesDevices` because that `ErrorKind` was only stabilized in
+/// Rust 1.85 and this crate's MSRV is 1.83. `EXDEV` (18 on Linux/macOS) is the
+/// POSIX cross-device code; `ERROR_NOT_SAME_DEVICE` (17) is the Windows
+/// equivalent.
+fn is_cross_device(err: &std::io::Error) -> bool {
+    match err.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) => code == libc::EXDEV,
+        #[cfg(windows)]
+        // ERROR_NOT_SAME_DEVICE = 17.
+        Some(code) => code == 17,
+        #[cfg(not(any(unix, windows)))]
+        Some(_) => false,
+        None => false,
+    }
 }
 
 /// Quarantine store directory: `~/.cache/tirith/quarantine`.

@@ -47,7 +47,19 @@ fn tirith_in_proj(proj: &std::path::Path) -> Command {
 /// `TIRITH_INTERACTIVE=1` would flip the `.output()`-based non-interactive
 /// `onboard`/`apply` tests into interactive behavior (CodeRabbit M13 PR #132
 /// R8-4).
+///
+/// `PATH` is pointed at an EMPTY bin dir (CodeRabbit M13 PR #132 R10-8):
+/// `onboard` runs package-manager detection over `PATH` (`detect_package_managers`
+/// → `path_audit::which_all`), so a globally-installed tool on the runner's PATH
+/// could otherwise leak into detection and make the recommendation host-dependent.
+/// The recommendation tests assert on file-based signals only; an empty PATH keeps
+/// them deterministic regardless of what the CI host has installed.
 fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Command {
+    let empty_bin = home.join("empty-bin");
+    // Best-effort: create the empty bin dir so PATH resolution finds nothing
+    // there. (If creation races/exists, detection still finds no package
+    // managers, which is the point.)
+    let _ = fs::create_dir_all(&empty_bin);
     let mut c = tirith();
     c.current_dir(proj)
         .env_remove("TIRITH_POLICY_ROOT")
@@ -57,7 +69,8 @@ fn tirith_onboard_isolated(proj: &std::path::Path, home: &std::path::Path) -> Co
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("APPDATA", home.join("appdata"))
-        .env("LOCALAPPDATA", home.join("localappdata"));
+        .env("LOCALAPPDATA", home.join("localappdata"))
+        .env("PATH", &empty_bin);
     c
 }
 
@@ -13089,6 +13102,72 @@ fn rule_test_unknown_rule_exits_one() {
     assert_eq!(out.status.code(), Some(1), "unknown rule id should exit 1");
 }
 
+/// CodeRabbit M13 PR #132 R10-6 — a policy with two custom rules sharing an id
+/// is ambiguous; `rule test`/`rule explain` must NOT silently pick the first
+/// match. They fail fast (exit 1) with a "multiple custom rules" message that
+/// points at `tirith rule validate`.
+const RULE_DUPLICATE_ID_POLICY: &str = r#"custom_rules:
+  - id: dup-rule
+    when:
+      url.scheme: http
+    severity: medium
+    title: "first dup"
+    context: [exec]
+  - id: dup-rule
+    when:
+      url.scheme: https
+    severity: low
+    title: "second dup"
+    context: [exec]
+"#;
+
+#[test]
+fn rule_test_duplicate_id_exits_nonzero_with_message() {
+    let (_tmp, proj) = rule_project(RULE_DUPLICATE_ID_POLICY);
+    let out = tirith_in_proj(&proj)
+        .args([
+            "rule",
+            "test",
+            "--rule",
+            "dup-rule",
+            "--input",
+            "curl http://x",
+        ])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "duplicate rule id should exit 1, not silently pick the first match"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multiple custom rules named 'dup-rule'")
+            && stderr.contains("tirith rule validate"),
+        "error must report the duplicate and point at validate; got: {stderr}"
+    );
+}
+
+#[test]
+fn rule_explain_duplicate_id_exits_nonzero_with_message() {
+    let (_tmp, proj) = rule_project(RULE_DUPLICATE_ID_POLICY);
+    let out = tirith_in_proj(&proj)
+        .args(["rule", "explain", "--rule", "dup-rule"])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "duplicate rule id should exit 1, not silently explain the first match"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multiple custom rules named 'dup-rule'")
+            && stderr.contains("tirith rule validate"),
+        "error must report the duplicate and point at validate; got: {stderr}"
+    );
+}
+
 #[test]
 fn rule_validate_context_mismatch_exits_one() {
     // A command.* predicate declared under `file` context: the FileScan path
@@ -13979,6 +14058,65 @@ fn ai_quarantine_move_with_yes_removes_original() {
         copies.len(),
         1,
         "the quarantine copy must remain after a move"
+    );
+}
+
+/// CodeRabbit M13 PR #132 R10-4 — `--move` must move ATOMICALLY (no
+/// read/write/delete window): on a stable file the original is gone and the
+/// quarantine copy holds the EXACT original bytes. (The same-filesystem path
+/// uses `std::fs::rename`; this asserts the end state either way.)
+#[test]
+fn ai_quarantine_move_with_yes_moves_atomically_preserving_content() {
+    const BODY: &str = "Follow the style guide.\nLine two.\n";
+    let repo = ai_repo(&[(".cursorrules", BODY)]);
+    let cache = tempfile::tempdir().expect("cache");
+    let out = tirith_in_proj(repo.path())
+        .args([
+            "ai",
+            "quarantine",
+            ".cursorrules",
+            "--move",
+            "--yes",
+            "--json",
+        ])
+        .env("XDG_CACHE_HOME", cache.path())
+        .env("APPDATA", cache.path())
+        .env("LOCALAPPDATA", cache.path())
+        .output()
+        .expect("run tirith");
+    assert!(out.status.success(), "--move --yes should succeed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["moved"], serde_json::json!(true));
+    assert_eq!(v["original_untouched"], serde_json::json!(false));
+
+    // The original is GONE (the move was atomic — the inode left `src`).
+    assert!(
+        !repo.path().join(".cursorrules").exists(),
+        "--move --yes must remove the original"
+    );
+
+    // Exactly one quarantine copy, and it holds the ORIGINAL bytes verbatim
+    // (an atomic rename preserves content; a copy fallback re-reads the same
+    // stable bytes — either way the content must match).
+    let qdir = cache.path().join("tirith/quarantine");
+    let copies: Vec<_> = fs::read_dir(&qdir)
+        .expect("quarantine dir exists")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(copies.len(), 1, "exactly one quarantine copy after a move");
+    let moved_content = fs::read_to_string(copies[0].path()).expect("read quarantine copy");
+    assert_eq!(
+        moved_content, BODY,
+        "the quarantine copy must hold the exact original bytes after an atomic move"
+    );
+    // The JSON's quarantined_to path must point at that copy.
+    let dest = v["quarantined_to"].as_str().expect("quarantined_to string");
+    assert_eq!(
+        std::path::Path::new(dest)
+            .canonicalize()
+            .expect("dest canonicalize"),
+        copies[0].path().canonicalize().expect("copy canonicalize"),
+        "quarantined_to must name the written quarantine copy"
     );
 }
 

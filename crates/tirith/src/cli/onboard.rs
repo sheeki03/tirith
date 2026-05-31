@@ -585,9 +585,10 @@ fn fmt_list(items: &[String]) -> String {
 
 /// `--apply`: perform the recommended SAFE actions with per-step stdin
 /// confirmation. Refuses to act when stdin/stderr are not a TTY (a piped or CI
-/// invocation): it prints what it WOULD do and returns 0 without mutating
-/// anything. Only invokes existing safe operations (`policy init`, `init`); it
-/// never overwrites an existing `.tirith/policy.yaml` without confirmation.
+/// invocation): it prints what it WOULD do and returns exit code 1 without
+/// mutating anything (a non-interactive `--apply` must not look like a success).
+/// Only invokes existing safe operations (`policy init`, `init`); it never
+/// overwrites an existing `.tirith/policy.yaml` without confirmation.
 fn apply_actions(report: &OnboardReport) -> i32 {
     println!();
     if !is_tty_pair() {

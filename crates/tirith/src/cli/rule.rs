@@ -83,10 +83,21 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
         Err(code) => return code,
     };
 
-    // Does the rule exist in the policy at all? Distinguish "unknown id" from
-    // "declared but dropped by compilation (invalid)".
-    if !policy.custom_rules.iter().any(|r| r.id == rule_id) {
+    // Does the rule exist in the policy at all, and UNAMBIGUOUSLY? Distinguish
+    // three cases: 0 matches → "unknown id"; >1 matches → an ambiguous policy
+    // where silently picking the first match would be misleading (CodeRabbit M13
+    // PR #132 R10-6); exactly 1 → proceed. (`validate` reports duplicate ids, so
+    // point the operator there.)
+    let count = policy
+        .custom_rules
+        .iter()
+        .filter(|r| r.id == rule_id)
+        .count();
+    if count == 0 {
         return emit_not_found("test", rule_id, &policy, json);
+    }
+    if count > 1 {
+        return emit_duplicate_rule("test", rule_id, count, json);
     }
 
     // Compile exactly as the engine does, then locate the COMPILED rule. If it
@@ -374,6 +385,20 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
         Ok(pair) => pair,
         Err(code) => return code,
     };
+    // Reject an ambiguous policy: with duplicate ids `.find()` would silently
+    // explain the FIRST match, hiding the others (CodeRabbit M13 PR #132 R10-6).
+    // 0 → not found; >1 → fail fast and point at `validate`; exactly 1 → proceed.
+    let count = policy
+        .custom_rules
+        .iter()
+        .filter(|r| r.id == rule_id)
+        .count();
+    if count == 0 {
+        return emit_not_found("explain", rule_id, &policy, json);
+    }
+    if count > 1 {
+        return emit_duplicate_rule("explain", rule_id, count, json);
+    }
     let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
@@ -520,6 +545,35 @@ fn emit_not_found(cmd: &str, rule_id: &str, policy: &Policy, json: bool) -> i32 
             eprintln!("    {}", r.id);
         }
     }
+    1
+}
+
+/// The policy declares MORE THAN ONE custom rule with this id, so selecting
+/// "the rule" is ambiguous — `test`/`explain` must not silently pick the first
+/// match (CodeRabbit M13 PR #132 R10-6). Fail fast and point at
+/// `tirith rule validate`, which reports the duplicate. Exit 1.
+fn emit_duplicate_rule(cmd: &str, rule_id: &str, count: usize, json: bool) -> i32 {
+    let msg = format!(
+        "multiple custom rules named '{rule_id}' ({count} found); \
+         the rule to {cmd} is ambiguous — run `tirith rule validate`"
+    );
+    if json {
+        let v = serde_json::json!({
+            "rule": rule_id,
+            "error": msg,
+            "duplicate_count": count,
+        });
+        // A broken pipe must surface as a write failure (exit 2), consistent with
+        // the success paths — not be misreported as the duplicate error (exit 1).
+        if !write_json_stdout(
+            &v,
+            &format!("tirith rule {cmd}: failed to write JSON output"),
+        ) {
+            return 2;
+        }
+        return 1;
+    }
+    eprintln!("tirith rule {cmd}: {msg}");
     1
 }
 

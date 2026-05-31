@@ -1074,10 +1074,31 @@ fn line_is_tool_use(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
 
     // Run / exec / shell-spawn directives: a `run:` / `exec:` / `shell:` config
-    // key, or an imperative "run"/"execute" verb followed by a command-ish token.
+    // key, or an imperative `run`/`exec`/`execute`/`spawn`/`invoke` verb followed
+    // by a COMMAND-SHAPED token. "Command-shaped" is one of four precise signals,
+    // chosen to fire on real command-execution directives WITHOUT firing on the
+    // English prose these verbs also begin (CodeRabbit M13 round-10 R10-2):
+    //   (1) a quote / path-char / known shell / script file (`run "..."`,
+    //       `run ./build.sh`, `exec bash`) — the round-1/2 set, unchanged;
+    //   (2) a CURATED known CLI tool name (`run cargo test`, `execute git diff`,
+    //       `invoke npm ci`) — a small closed list of real binaries, so a generic
+    //       English noun (`the tests`, `the plan`, `it again`) is NOT mistaken for
+    //       a command. Tokens that double as common English words (`go`, `make`,
+    //       `node`) are deliberately EXCLUDED from this arm so `go to the store` /
+    //       `make sure to …` stay benign; they still fire via arm (3) when they
+    //       carry a real flag (`make -j`);
+    //   (3) ANY token IMMEDIATELY followed by a `-flag` / `--flag` (`exec make
+    //       -j`, `run foo --bar`) — a flag glued to the next token (no space after
+    //       the dash) is a strong command signal that prose lacks.
+    // `regex` has no lookahead, so the exclusion of common filler (the / a / this /
+    // it / them / your / again / …) is encoded POSITIVELY: a token only matches
+    // when it is quoted/path-shaped, a curated tool, or carries a real flag. A
+    // bare `run the tests` matches none of these and is left as generic directive
+    // drift (the safe under-match for a High-severity rule — over-broadening it
+    // causes alert fatigue).
     static RUN_EXEC: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
-            r#"(?i)(?:^|\s)(?:run|exec|shell|command|cmd)\s*[:=]|(?:^|\b)(?:run|execute|spawn|invoke)\s+(?:the\s+)?(?:["'`/.]|sh\b|bash\b|zsh\b|cmd\b|powershell\b|pwsh\b|\w+\.(?:sh|py|ps1|js|rb))"#,
+            r#"(?i)(?:^|\s)(?:run|exec|shell|command|cmd)\s*[:=]|(?:^|\b)(?:run|exec|execute|spawn|invoke)\s+(?:the\s+)?(?:["'`/.]|sh\b|bash\b|zsh\b|cmd\b|powershell\b|pwsh\b|\w+\.(?:sh|py|ps1|js|rb)|(?:cargo|git|npm|npx|pnpm|yarn|pip|pip3|uv|deno|bun|python|python3|rake|gradle|mvn|docker|podman|kubectl|terraform|ansible|curl|wget|ssh|scp|rsync)\b|[\w.-]+\s+--?\w)"#,
         )
         .unwrap()
     });
@@ -1102,15 +1123,18 @@ fn line_is_tool_use(line: &str) -> bool {
     //    `to`/`into`/`onto` preposition AND a destination that is either a
     //    PATH-LIKE token — an absolute `/path`, a `~/` home path, a `./` or `../`
     //    relative path, a `$VAR/` expansion, or a Windows drive (`C:\…` / `C:/…`)
-    //    — OR a BARE repo-local FILENAME WITH AN EXTENSION (`Cargo.toml`,
-    //    `package.json`, `.env.local`). The extension is what distinguishes a
-    //    file destination from a non-file noun: `memory` / `stdout` carry no dot
-    //    and so still do not match (R5);
+    //    — OR a BARE repo-local FILENAME that is either a single leading-dot
+    //    dotfile (`.env`, `.gitignore`, `.npmrc`) OR an extension-bearing name
+    //    (`Cargo.toml`, `package.json`, `.env.local`). A leading dot OR an
+    //    extension is what distinguishes a file destination from a non-file noun:
+    //    `memory` / `stdout` carry neither and so still do not match (R5 +
+    //    CodeRabbit M13 round-10 R10-3);
     //  - a shell redirection (`>`/`>>`) into the SAME destination set — a path-ish
-    //    token or a bare extension-bearing filename (`echo x > out.txt`).
+    //    token, a leading-dot dotfile, or a bare extension-bearing filename
+    //    (`echo x > out.txt`, `echo x > .gitignore`).
     static FILE_WRITE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
-            r#"(?i)(?:write|append|overwrite|save|echo)\b.*?\b(?:to|into|onto)\s+(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|\.?[\w-]+(?:\.[\w.-]+)+)|>>?\s*(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|\.?[\w-]+(?:\.[\w.-]+)+)"#,
+            r#"(?i)(?:write|append|overwrite|save|echo)\b.*?\b(?:to|into|onto)\s+(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+))|>>?\s*(?:~/|\./|\.\./|/|\$\w+[/\\]|[a-z]:[\\/]|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+))"#,
         )
         .unwrap()
     });
@@ -2147,6 +2171,61 @@ mod tests {
     }
 
     #[test]
+    fn run_exec_fires_on_bare_curated_cli_directives() {
+        // CodeRabbit M13 round-10 R10-2: a bare imperative `run`/`exec`/`execute`/
+        // `invoke` followed by a real CLI tool is a command-execution capability,
+        // but the old RUN_EXEC only matched quoted/path/shell/script-shaped tokens,
+        // so `run cargo test` registered only as generic directive drift. A
+        // curated known-tool name, a path/script token, or a glued `-flag` must now
+        // promote it to a tool-use directive.
+        assert!(line_is_tool_use("run cargo test"), "`run cargo test`");
+        assert!(line_is_tool_use("execute git diff"), "`execute git diff`");
+        assert!(line_is_tool_use("invoke npm ci"), "`invoke npm ci`");
+        assert!(line_is_tool_use("run ./build.sh"), "`run ./build.sh`");
+        assert!(
+            line_is_tool_use("exec make -j"),
+            "`exec make -j` (flag arm)"
+        );
+    }
+
+    #[test]
+    fn run_exec_does_not_fire_on_imperative_english_prose() {
+        // R10-2 FALSE-POSITIVE GUARD: these verbs also begin ordinary English
+        // sentences. `regex` has no lookahead, so the exclusion of filler nouns is
+        // encoded positively (curated tool / path / glued flag). A bare verb + a
+        // plain English noun must stay BENIGN so a High-severity tool-use rule does
+        // not fire on prose (alert fatigue).
+        assert!(!line_is_tool_use("run the tests"), "`run the tests`");
+        assert!(!line_is_tool_use("execute the plan"), "`execute the plan`");
+        assert!(
+            !line_is_tool_use("invoke the function"),
+            "`invoke the function`"
+        );
+        assert!(!line_is_tool_use("run it again"), "`run it again`");
+        // The English-ambiguous tokens that were kept OUT of the curated arm stay
+        // benign when used as plain verbs (they still fire with a real flag).
+        assert!(!line_is_tool_use("go to the store"), "`go to the store`");
+        assert!(
+            !line_is_tool_use("make sure to test"),
+            "`make sure to test`"
+        );
+    }
+
+    #[test]
+    fn explain_config_risks_surfaces_bare_curated_cli_directive() {
+        // R10-2 applies to BOTH entry points: `explain_config_risks` and
+        // `diff_findings` share `line_is_tool_use`. Prove a bare `run cargo test`
+        // directive is classified as a tool-use risk through the explain path.
+        let content = "# Project rules\n\nBefore answering, run cargo test in the repo root.\n";
+        let risks = explain_config_risks(content, &PathBuf::from("CLAUDE.md"));
+        let ids: Vec<&str> = risks.iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&"tool_use_directive"),
+            "a bare curated-CLI `run cargo test` directive must surface as a tool-use risk, got: {ids:?}"
+        );
+    }
+
+    #[test]
     fn diff_reflowed_tool_use_directive_does_not_fire_but_new_one_does() {
         // R3-4: the AiConfigToolUseEscalation branch scanned the LINE-level
         // `added` set, so reflowing an EXISTING tool-use instruction across a
@@ -2273,6 +2352,48 @@ mod tests {
         assert!(line_is_tool_use("save the file to /tmp/x"));
         assert!(line_is_tool_use("append to ~/.bashrc"));
         assert!(line_is_tool_use("write config to ./out.json"));
+    }
+
+    #[test]
+    fn file_write_directive_matches_single_component_dotfiles() {
+        // CodeRabbit M13 round-10 R10-3: a single-component dotfile (`.env`,
+        // `.gitignore`, `.npmrc`) is a common repo-local write destination, but the
+        // old bare-filename alternation required a SECOND `.` segment, so these
+        // never matched. A single leading-dot filename must now fire in BOTH the
+        // `to|into|onto` branch and the `>`/`>>` redirection branch.
+        assert!(
+            line_is_tool_use("write to .env"),
+            "`write to .env` (single-component dotfile) must fire"
+        );
+        assert!(
+            line_is_tool_use("echo x > .gitignore"),
+            "`echo x > .gitignore` (redirection into a dotfile) must fire"
+        );
+        assert!(
+            line_is_tool_use("append to .npmrc"),
+            "`append to .npmrc` (single-component dotfile) must fire"
+        );
+
+        // The round-2/3 cases still fire under the extended alternation.
+        assert!(
+            line_is_tool_use("append to Cargo.toml"),
+            "round-3 extension-bearing filename must still fire"
+        );
+        assert!(
+            line_is_tool_use("save the file to /tmp/x"),
+            "round-2 absolute-path destination must still fire"
+        );
+        assert!(
+            line_is_tool_use("append to ~/.bashrc"),
+            "round-2 ~/ home-path destination must still fire"
+        );
+
+        // STILL excluded: a non-file noun with neither a leading dot nor an
+        // extension must not fire even after a write verb + preposition.
+        assert!(
+            !line_is_tool_use("save notes to memory"),
+            "`save notes to memory` has no dot/slash destination and must not fire"
+        );
     }
 
     #[test]

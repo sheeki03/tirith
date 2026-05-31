@@ -579,7 +579,8 @@ calls and embeds NO external resources or tracking.
 
 Subcommands:
   export [--out <path>]   write the HTML report.
-                          default: ~/Documents/tirith-dashboard-<date>.html
+                          default: <documents-dir>/tirith-dashboard-<date>.html
+                          (<documents-dir> is your Documents folder, resolved per-OS)
                           --out .          -> ./dashboard.html
                           --out <dir>      -> <dir>/dashboard.html
                           --out <file>     -> exactly that file
@@ -2672,10 +2673,11 @@ Examples:
 enum DashboardAction {
     /// Write the HTML security report to a file
     #[command(after_help = "\
-Default output is ~/Documents/tirith-dashboard-<date>.html. `--out .` writes
-./dashboard.html; `--out <dir>` writes <dir>/dashboard.html; any other `--out`
-value is the exact file path. On Unix the file is created 0600. `--json` prints a
-small machine-readable result (path written, byte count, and the snapshot).
+Default output is <documents-dir>/tirith-dashboard-<date>.html (<documents-dir> is
+your Documents folder, resolved per-OS). `--out .` writes ./dashboard.html;
+`--out <dir>` writes <dir>/dashboard.html; any other `--out` value is the exact
+file path. On Unix the file is created 0600. `--json` prints a small
+machine-readable result (path written, byte count, and the snapshot).
 
 Examples:
   tirith dashboard export
@@ -2683,8 +2685,9 @@ Examples:
   tirith dashboard export --out /tmp/sec.html
   tirith dashboard export --json")]
     Export {
-        /// Output path. Omit for ~/Documents/tirith-dashboard-<date>.html; `.`
-        /// or a directory writes dashboard.html there; else the exact file.
+        /// Output path. Omit for <documents-dir>/tirith-dashboard-<date>.html
+        /// (your Documents folder, resolved per-OS); `.` or a directory writes
+        /// dashboard.html there; else the exact file.
         #[arg(long)]
         out: Option<String>,
         /// Emit a machine-readable result (path, bytes, snapshot) as JSON.

@@ -515,10 +515,18 @@ impl ContextSet {
 /// * `any(children)` → UNION (evaluable wherever ANY child is).
 /// * `not(child)` → the child's set (negation doesn't change evaluability).
 ///
-/// An empty `all`/`any` (no children, fact-free and vacuous) yields the
-/// universal set — it can be evaluated anywhere. `agent.kind` / `mcp.tool` yield
-/// the empty set, but they are rejected by [`clause_uses_unsupported_predicate`]
-/// before this is consulted for a loaded rule.
+/// Empty combinators follow their `evaluate` truth value, not just the set
+/// identity, so a dead clause is reported as such:
+/// * An empty `all` is vacuously TRUE in `evaluate`, so it yields the universal
+///   set (it can be evaluated anywhere) — the intersection identity coincides.
+/// * An empty `any` is vacuously FALSE in `evaluate` (it can never match), so it
+///   yields the EMPTY set — the union identity — and is rejected as
+///   unsatisfiable rather than mislabeled runnable (CodeRabbit M13 round-10
+///   R10-1).
+///
+/// `agent.kind` / `mcp.tool` yield the empty set, but they are rejected by
+/// [`clause_uses_unsupported_predicate`] before this is consulted for a loaded
+/// rule.
 pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
     use ScanContext::{Exec, FileScan, Paste};
     match clause {
@@ -528,19 +536,19 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
             .iter()
             .map(satisfiable_contexts)
             .fold(ContextSet::ALL, ContextSet::intersect),
-        // UNION: an empty `any` is vacuously false and fact-free; treat it as
-        // evaluable in every context too (rather than the empty union identity,
-        // which would mislabel it unsatisfiable). Real `any` clauses always have
-        // children, so this only guards the degenerate empty case.
-        WhenClause::Any(cs) => {
-            if cs.is_empty() {
-                ContextSet::ALL
-            } else {
-                cs.iter()
-                    .map(satisfiable_contexts)
-                    .fold(ContextSet::EMPTY, ContextSet::union)
-            }
-        }
+        // UNION: an empty `any` is the union identity (EMPTY). It is also
+        // VACUOUSLY FALSE in `evaluate` (`[].iter().any(..)` is `false`), so it
+        // can never match in any context — a dead rule. Returning EMPTY here makes
+        // the satisfiability check reject/drop it (consistent with the round-9
+        // empty-satisfiable-set rejection), rather than mislabeling it runnable.
+        // Real `any` clauses always have children, so this only guards the
+        // degenerate empty case (CodeRabbit M13 round-10 R10-1). Contrast `all`:
+        // an empty `all` is vacuously TRUE in `evaluate`, so its identity (ALL)
+        // is correct above.
+        WhenClause::Any(cs) => cs
+            .iter()
+            .map(satisfiable_contexts)
+            .fold(ContextSet::EMPTY, ContextSet::union),
         WhenClause::Not(c) => satisfiable_contexts(c),
 
         // `command.*` is evaluable in Exec OR Paste. `build_dsl_backing`
@@ -1144,6 +1152,56 @@ any:
         assert!(
             sat.intersects_declared(&[ScanContext::FileScan]),
             "any(command, file) must be evaluable under [file] (file branch)"
+        );
+    }
+
+    #[test]
+    fn test_satisfiable_empty_any_is_unsatisfiable() {
+        // CodeRabbit M13 round-10 R10-1: a degenerate empty `any: []` is VACUOUSLY
+        // FALSE in `evaluate` (`[].iter().any(..)` is `false`), so it can never
+        // match — a dead rule. `satisfiable_contexts` must return EMPTY so the
+        // validators/compile reject/drop it as unsatisfiable, consistent with the
+        // round-9 empty-satisfiable-set rejection.
+        let any_empty = WhenClause::Any(vec![]);
+        let sat = satisfiable_contexts(&any_empty);
+        assert!(
+            sat.is_empty(),
+            "empty `any: []` must be unsatisfiable (EMPTY set), got {sat:?}"
+        );
+        // No declared context can rescue it — it is dead everywhere.
+        assert!(!sat.intersects_declared(&[
+            ScanContext::Exec,
+            ScanContext::Paste,
+            ScanContext::FileScan,
+        ]));
+        // And the satisfiability verdict matches `evaluate`: an empty `any` is
+        // false on a fully-empty context (it would be false on ANY context).
+        assert!(
+            !evaluate(&any_empty, &DslEvalContext::default()),
+            "empty `any` must evaluate to false"
+        );
+    }
+
+    #[test]
+    fn test_satisfiable_empty_all_is_universal_and_vacuously_true() {
+        // CodeRabbit M13 round-10 R10-1 (companion check): an empty `all: []` is
+        // VACUOUSLY TRUE in `evaluate` (`[].iter().all(..)` is `true`), so the
+        // intersection identity (ALL) is the correct satisfiable set — it is
+        // evaluable in every context. This contrasts with empty `any` above and
+        // must be left as-is.
+        let all_empty = WhenClause::All(vec![]);
+        let sat = satisfiable_contexts(&all_empty);
+        assert!(
+            !sat.is_empty(),
+            "empty `all: []` must be satisfiable (universal set), got {sat:?}"
+        );
+        assert!(sat.intersects_declared(&[ScanContext::Exec]));
+        assert!(sat.intersects_declared(&[ScanContext::Paste]));
+        assert!(sat.intersects_declared(&[ScanContext::FileScan]));
+        // The satisfiability verdict matches `evaluate`: an empty `all` is true.
+        assert!(
+            evaluate(&all_empty, &DslEvalContext::default()),
+            "empty `all` must evaluate to true (vacuous)"
         );
     }
 
