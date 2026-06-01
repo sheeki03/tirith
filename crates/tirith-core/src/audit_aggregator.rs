@@ -143,7 +143,7 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     let reader = std::io::BufReader::new(file);
-    Ok(parse_log_from_reader(reader, Some(path)))
+    parse_log_from_reader(reader, Some(path))
 }
 
 /// Parse JSONL audit-log lines streamed from `reader` into records.
@@ -156,14 +156,18 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
 /// `source` is only used to label the warning; pass `None` when there is no
 /// meaningful path to name.
 ///
-/// A line that cannot be read at all (an I/O error mid-stream — e.g. invalid
-/// UTF-8, a truncated read) is treated exactly like a malformed JSON line: it is
-/// skipped, counted in `skipped_lines`, and warned about. This keeps a single
-/// bad byte sequence from aborting the whole read, matching the lenient posture
-/// of the whole-file path (where `read_to_string` would itself reject invalid
-/// UTF-8 with an I/O error — `read_log`'s former behavior — but a valid file
-/// parses identically line-for-line).
-pub fn parse_log_from_reader(reader: impl BufRead, source: Option<&Path>) -> ReadLogResult {
+/// A read I/O error mid-stream is TERMINAL — the loop stops and returns `Err`,
+/// matching the former whole-file contract (`read_to_string` rejected such a
+/// file with an I/O error). This is NOT a skippable line: a non-advancing error
+/// (e.g. `EISDIR` when `path` is a directory — `File::open` succeeds on a
+/// directory on Unix, then every read returns the same error WITHOUT advancing
+/// the position) would otherwise spin forever. (A successfully-read line that is
+/// merely malformed JSON is still skipped + counted by `parse_log_line`; only an
+/// unreadable byte stream is fatal.)
+pub fn parse_log_from_reader(
+    reader: impl BufRead,
+    source: Option<&Path>,
+) -> Result<ReadLogResult, String> {
     let mut records = Vec::new();
     let mut skipped_lines = 0usize;
     for (idx, line) in reader.lines().enumerate() {
@@ -171,15 +175,17 @@ pub fn parse_log_from_reader(reader: impl BufRead, source: Option<&Path>) -> Rea
         match line {
             Ok(line) => parse_log_line(&line, line_num, source, &mut records, &mut skipped_lines),
             Err(e) => {
-                warn_malformed_line(line_num, source, &e);
-                skipped_lines += 1;
+                let where_ = source
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<audit log>".to_string());
+                return Err(format!("Failed to read {where_}: {e}"));
             }
         }
     }
-    ReadLogResult {
+    Ok(ReadLogResult {
         records,
         skipped_lines,
-    }
+    })
 }
 
 /// Parse JSONL audit-log `content` (already read into memory) into records.
@@ -1253,6 +1259,25 @@ mod tests {
         assert_eq!(
             streamed_json, whole_json,
             "streaming read_log must yield byte-identical records to whole-file parse"
+        );
+    }
+
+    #[test]
+    fn read_log_on_a_directory_errs_without_hanging() {
+        // Regression (M13 PR #132): `File::open` SUCCEEDS on a directory on Unix,
+        // then every read returns `EISDIR` WITHOUT advancing the position — so a
+        // streaming loop that treats a read I/O error as a skippable line spins
+        // forever (it hung `secret_triage_json_fatal_error_is_parseable_json` for
+        // ~20 min on the Linux/macOS CI runners; Windows passed because opening a
+        // directory as a file fails outright). The fix makes a read I/O error
+        // TERMINAL. The test COMPLETING is the proof it no longer hangs; we also
+        // assert `Err` so the former `read_to_string` "read failure → Err"
+        // contract is preserved on every platform (callers like `secret triage`
+        // rely on that fatal-error path).
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(
+            read_log(dir.path()).is_err(),
+            "read_log on a directory must return Err (not hang, not Ok)"
         );
     }
 
