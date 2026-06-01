@@ -1215,24 +1215,16 @@ mod tests {
     /// `home::home_dir()` instead, and never echoes back the relative path.
     #[test]
     fn home_base_rejects_relative_home() {
+        // Hold the crate-wide lock and override BOTH vars via `EnvGuard` so the
+        // relative env can't leak into a sibling test even if an assertion
+        // below panics — the guards restore on Drop. Capture `home_base()`
+        // while the lock is held and the env is in the intended state.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
         // A clearly-relative override on every OS.
-        std::env::set_var("HOME", "relative-home");
-        std::env::set_var("USERPROFILE", "relative-home");
+        let _home = EnvGuard::set("HOME", Path::new("relative-home"));
+        let _userprofile = EnvGuard::set("USERPROFILE", Path::new("relative-home"));
 
         let base = home_base();
-
-        // Restore before asserting so a failure can't leak the relative env.
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
 
         // It must not echo back the relative override...
         assert_ne!(
@@ -1258,22 +1250,15 @@ mod tests {
     /// path) or `None`, never `Some("")`.
     #[test]
     fn home_base_treats_empty_env_as_unset() {
+        // Hold the crate-wide lock and override BOTH vars to empty via
+        // `EnvGuard` so the empty env can't leak into a sibling test even if an
+        // assertion below panics — the guards restore on Drop. Capture
+        // `home_base()` while the lock is held and the env is empty.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        std::env::set_var("HOME", "");
-        std::env::set_var("USERPROFILE", "");
+        let _home = EnvGuard::set("HOME", Path::new(""));
+        let _userprofile = EnvGuard::set("USERPROFILE", Path::new(""));
 
         let base = home_base();
-        // Restore before asserting so a failure can't leak empty env into siblings.
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
 
         assert_ne!(
             base.as_deref(),

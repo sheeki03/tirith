@@ -18,8 +18,10 @@ allow_bypass_env_noninteractive: false
 # this means a warn cannot be silently passed through.
 strict_warn: true
 
-# Escalate the most common remote-execution rules to CRITICAL so they are
-# unmistakable in CI logs.
+# Escalate common remote-execution rules so they stand out in CI logs. The most
+# dangerous patterns — plaintext-HTTP-to-sink and curl|wget piped straight to a
+# shell — are raised to CRITICAL; shortened_url and pipe_to_interpreter are
+# raised to HIGH (still elevated, but a notch below the outright curl|sh case).
 severity_overrides:
   shortened_url: HIGH
   plain_http_to_sink: CRITICAL
