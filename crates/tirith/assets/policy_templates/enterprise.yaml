@@ -18,8 +18,11 @@ allow_bypass_env_noninteractive: false
 # Require explicit acknowledgement for warn findings.
 strict_warn: true
 
-# Escalate the highest-risk remote-execution, registry, and supply-chain rules
-# so they are unmistakable in logs and force a block.
+# Raise the severity (risk) of the highest-risk remote-execution, registry, and
+# supply-chain rules so they are unmistakable in logs and reports. NOTE:
+# severity_overrides only escalate severity — they do NOT by themselves force a
+# block. The action_overrides block below (shortened_url, curl_pipe_shell,
+# wget_pipe_shell) is what forces those rules to block.
 severity_overrides:
   shortened_url: HIGH
   plain_http_to_sink: CRITICAL

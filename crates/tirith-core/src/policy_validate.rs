@@ -132,18 +132,10 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             });
         }
 
-        // Validate the regex compiles (only for a regex rule).
-        if let Some(pattern) = &rule.pattern {
-            if let Err(e) = regex::Regex::new(pattern) {
-                issues.push(PolicyIssue {
-                    level: IssueLevel::Error,
-                    message: format!("custom_rules.{}: invalid regex '{}': {e}", rule.id, pattern),
-                    field: Some(format!("custom_rules.{}.pattern", rule.id)),
-                });
-            }
-        }
-
-        // Validate contexts (shared by both rule shapes).
+        // Validate contexts (shared by both rule shapes). Run BEFORE the regex
+        // checks so `has_invalid_context` is set and the regex empty-context
+        // check below can skip a list that only had bogus tokens (already
+        // reported here) — same double-report discipline `rule validate` uses.
         let valid_contexts = ["exec", "paste", "file"];
         let mut has_invalid_context = false;
         for ctx in &rule.context {
@@ -156,6 +148,58 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                         rule.id, ctx
                     ),
                     field: Some(format!("custom_rules.{}.context", rule.id)),
+                });
+            }
+        }
+
+        // Validate a REGEX rule by mirroring `rules::custom::compile_rules`
+        // EXACTLY, in the SAME ORDER, so `policy validate` never green-lights a
+        // regex rule the engine silently DROPS at runtime (CodeRabbit M13). The
+        // engine drops a regex rule for, in order: (1) no valid contexts after
+        // filtering, (2) pattern over the 1024-CHAR cap, (3) invalid regex
+        // syntax. The earlier "validate the regex compiles" block ran first and
+        // checked only (3); (1) and (2) were missing, so a rule with an empty
+        // context set or an over-cap pattern validated as "valid" yet never ran.
+        if let Some(pattern) = &rule.pattern {
+            // (1) No valid contexts. A regex rule has no required-trigger notion
+            //     to synthesize an executable set from, so an empty filtered
+            //     context set is a dead rule that `compile_rules` drops. Skip
+            //     when a token was INVALID (already reported above; a bogus-only
+            //     list would otherwise double-report — same discipline as the
+            //     DSL coverage check and `rule validate`).
+            let parsed = parse_declared_contexts(&rule.context);
+            if parsed.is_empty() && !has_invalid_context {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!(
+                        "custom_rules.{}: no valid contexts (regex rule needs at least one of: exec, paste, file)",
+                        rule.id
+                    ),
+                    field: Some(format!("custom_rules.{}.context", rule.id)),
+                });
+            }
+            // (2) Pattern length cap. Measure in CHARACTERS, not UTF-8 BYTES, to
+            //     mirror `compile_rules` / `check_regex` (CodeRabbit M13
+            //     round-26): a multibyte pattern must not trip the cap early or
+            //     report a misleading byte count.
+            if pattern.chars().count() > 1024 {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!(
+                        "custom_rules.{}: pattern too long ({} chars, max 1024)",
+                        rule.id,
+                        pattern.chars().count()
+                    ),
+                    field: Some(format!("custom_rules.{}.pattern", rule.id)),
+                });
+            }
+            // (3) Regex must compile. Done LAST (after the cap) so the same
+            //     ordering as `compile_rules` is preserved.
+            if let Err(e) = regex::Regex::new(pattern) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Error,
+                    message: format!("custom_rules.{}: invalid regex '{}': {e}", rule.id, pattern),
+                    field: Some(format!("custom_rules.{}.pattern", rule.id)),
                 });
             }
         }
@@ -1023,6 +1067,112 @@ custom_rules:
 "#;
         let issues = validate(yaml);
         assert!(issues.iter().any(|i| i.message.contains("invalid regex")));
+    }
+
+    #[test]
+    fn test_custom_regex_rule_empty_context_rejected() {
+        // CodeRabbit M13 round-27 (outside-diff): `policy validate` must mirror
+        // `compile_rules`, which DROPS a regex rule whose filtered context set is
+        // empty. An explicit `context: []` (serde does NOT default it) filters to
+        // the empty set, so the engine never runs the rule — `policy validate`
+        // must report this as an Error instead of green-lighting it. (An OMITTED
+        // `context:` defaults to [exec, paste] and is NOT affected — see
+        // `test_custom_rule_bad_regex`, which omits context and only flags the
+        // regex.)
+        let yaml = r#"
+custom_rules:
+  - id: regex-empty-ctx
+    pattern: "internal\\.corp"
+    title: "Test rule"
+    context: []
+"#;
+        let issues = validate(yaml);
+        let issue = issues.iter().find(|i| {
+            i.level == IssueLevel::Error
+                && i.message.contains("regex-empty-ctx")
+                && i.message.contains("no valid contexts")
+        });
+        assert!(
+            issue.is_some(),
+            "regex rule with empty context must be rejected (mirrors compile_rules): {issues:?}"
+        );
+        assert_eq!(
+            issue.unwrap().field.as_deref(),
+            Some("custom_rules.regex-empty-ctx.context"),
+            "field must point at the rule's context: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_regex_rule_pattern_too_long_rejected() {
+        // CodeRabbit M13 round-27: `compile_rules` drops a regex `pattern` over
+        // the 1024-CHAR cap, so `policy validate` must flag it as an Error.
+        // 1025 single-byte chars trips the cap unambiguously (the engine uses
+        // `pattern.chars().count()`, not byte length — round-26).
+        let pattern = "a".repeat(1025);
+        let yaml = format!(
+            "custom_rules:\n  - id: too-long\n    pattern: \"{pattern}\"\n    title: \"Test rule\"\n    context: [exec]\n"
+        );
+        let issues = validate(&yaml);
+        let issue = issues.iter().find(|i| {
+            i.level == IssueLevel::Error
+                && i.message.contains("too-long")
+                && i.message.contains("pattern too long")
+                && i.message.contains("1025 chars")
+                && i.message.contains("max 1024")
+        });
+        assert!(
+            issue.is_some(),
+            "regex rule with a >1024-char pattern must be rejected: {issues:?}"
+        );
+        assert_eq!(
+            issue.unwrap().field.as_deref(),
+            Some("custom_rules.too-long.pattern"),
+            "field must point at the rule's pattern: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_regex_rule_multibyte_pattern_under_char_cap_accepted() {
+        // CodeRabbit M13 round-26 + round-27: the 1024 cap counts CHARACTERS, not
+        // UTF-8 BYTES. A multibyte pattern that is <=1024 CHARS but >1024 BYTES
+        // must be ACCEPTED (it would be wrongly dropped by a byte-length cap),
+        // proving `policy validate` uses `pattern.chars().count()` like the
+        // engine. 'é' (U+00E9) is 2 bytes; 600 of them is 600 chars / 1200 bytes
+        // — under the 1024-CHAR cap, over a 1024-BYTE one. A repeated literal is
+        // a cheap, valid regex (no pathological backtracking in debug).
+        let pattern = "é".repeat(600);
+        assert_eq!(pattern.chars().count(), 600, "600 chars");
+        assert!(pattern.len() > 1024, "but >1024 bytes");
+        let yaml = format!(
+            "custom_rules:\n  - id: multibyte-ok\n    pattern: \"{pattern}\"\n    title: \"Test rule\"\n    context: [exec]\n"
+        );
+        let issues = validate(&yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("multibyte-ok")
+                && (i.message.contains("pattern too long")
+                    || i.message.contains("invalid regex")
+                    || i.message.contains("no valid contexts"))),
+            "a <=1024-CHAR multibyte pattern (>1024 bytes) must be ACCEPTED: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_regex_rule_valid_still_passes() {
+        // Sanity: a valid regex rule with a real context and a sane pattern must
+        // produce no error after the round-27 gating was added.
+        let yaml = r#"
+custom_rules:
+  - id: valid-regex
+    pattern: "internal\\.corp"
+    title: "Test rule"
+    context: [exec]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.level == IssueLevel::Error),
+            "a valid regex rule must produce no errors: {issues:?}"
+        );
     }
 
     #[test]

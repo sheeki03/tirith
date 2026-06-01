@@ -78,7 +78,7 @@ fn ordered_eval_contexts(contexts: &[ScanContext]) -> Vec<ScanContext> {
 /// `.tirith/policy.yaml` surfaces a parse error, not a misleading "no rule
 /// named …" (R10).
 pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
-    let (policy, _source) = match load_policy_strict("test", None) {
+    let (policy, _source) = match load_policy_strict("test", None, json) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -206,7 +206,7 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
     // per-rule validator below that is meant to report that rule-level problem
     // (with the rule id, continuing to check the rest). CodeRabbit M13 PR #132
     // round-24.
-    let (yaml, source) = match load_policy_raw("validate", path) {
+    let (yaml, source) = match load_policy_raw("validate", path, json) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -295,10 +295,13 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
                 });
             }
             // (b) Pattern length cap (1024 chars) — the engine's hard limit.
-            if pattern.len() > 1024 {
+            if pattern.chars().count() > 1024 {
                 errors.push(RuleError {
                     rule: rule.id.clone(),
-                    message: format!("pattern too long ({} chars, max 1024)", pattern.len()),
+                    message: format!(
+                        "pattern too long ({} chars, max 1024)",
+                        pattern.chars().count()
+                    ),
                 });
             }
             // (c) Regex must compile.
@@ -431,7 +434,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     // (non-zero exit) instead of warn-defaulting to an empty policy that would
     // misreport every rule as "no custom rule named …" (CodeRabbit M13 round-2
     // R10).
-    let (policy, _source) = match load_policy_strict("explain", None) {
+    let (policy, _source) = match load_policy_strict("explain", None, json) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -559,32 +562,72 @@ struct RuleError {
     message: String,
 }
 
+/// Emit a policy-load failure (read or parse error) honoring the command's
+/// output mode, then return the exit code (always 1). In `--json` mode this
+/// MUST emit a structured JSON error object rather than plain-text stderr — a
+/// failed path must not hand a machine consumer non-JSON while exit-1 says
+/// "error" (tirith's JSON contract: every byte of `--json` output is JSON, and
+/// the exit code stays authoritative). The shape reuses the SAME `{ source,
+/// valid: false, error }` object `validate`'s own parse-error path already
+/// produces, so all of `rule`'s load-stage errors look identical to a consumer.
+/// In human mode it keeps the existing plain-text `eprintln!`. CodeRabbit M13
+/// PR #132 round-27 F1.
+///
+/// A JSON write failure (broken pipe) returns exit 2, matching the success
+/// paths' broken-pipe handling, rather than the load-error code 1.
+fn emit_load_error(cmd: &str, source: &str, error: &str, json: bool) -> i32 {
+    if json {
+        let v = load_error_json(source, error);
+        if !write_json_stdout(
+            &v,
+            &format!("tirith rule {cmd}: failed to write JSON output"),
+        ) {
+            return 2;
+        }
+        return 1;
+    }
+    eprintln!("tirith rule {cmd}: {source}: {error}");
+    1
+}
+
+/// The structured JSON error object emitted for a load-stage failure in
+/// `--json` mode — factored out of [`emit_load_error`] so its exact shape is
+/// unit-testable without capturing stdout. Mirrors `validate`'s parse-error
+/// JSON: `{ source, valid: false, error }`.
+fn load_error_json(source: &str, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        "valid": false,
+        "error": error,
+    })
+}
+
 /// Resolve a `rule` subcommand's policy SOURCE: from `--path` (the file
 /// itself) or the discovered local policy. Returns `(raw-yaml, source-label)`,
-/// or `Err(exit_code)` after printing a file-read error. No YAML/shape parsing
+/// or `Err(exit_code)` after emitting a file-read error in the command's
+/// output mode (`json`-aware — see [`emit_load_error`]). No YAML/shape parsing
 /// happens here — that is the caller's choice (strict vs lenient), so the two
 /// load helpers below can share one I/O path.
 ///
 /// A missing policy file is NOT an error: it yields an empty document
 /// (`String::new()`) labeled `<no policy file>`, which both parsers treat as
 /// the zero-custom-rule default (matches the shipping/no-policy case).
-fn read_policy_source(cmd: &str, path: Option<&str>) -> Result<(String, String), i32> {
+fn read_policy_source(cmd: &str, path: Option<&str>, json: bool) -> Result<(String, String), i32> {
     if let Some(p) = path {
         match std::fs::read_to_string(p) {
             Ok(s) => Ok((s, p.to_string())),
-            Err(e) => {
-                eprintln!("tirith rule {cmd}: cannot read {p}: {e}");
-                Err(1)
-            }
+            Err(e) => Err(emit_load_error(cmd, p, &format!("cannot read: {e}"), json)),
         }
     } else {
         match tirith_core::policy::discover_local_policy_path(None) {
             Some(found) => match std::fs::read_to_string(&found) {
                 Ok(s) => Ok((s, found.display().to_string())),
-                Err(e) => {
-                    eprintln!("tirith rule {cmd}: cannot read {}: {e}", found.display());
-                    Err(1)
-                }
+                Err(e) => Err(emit_load_error(
+                    cmd,
+                    &found.display().to_string(),
+                    &format!("cannot read: {e}"),
+                    json,
+                )),
             },
             None => Ok((String::new(), "<no policy file>".to_string())),
         }
@@ -606,20 +649,20 @@ fn read_policy_source(cmd: &str, path: Option<&str>) -> Result<(String, String),
 /// for the rule-level problems (e.g. both `pattern:` and `when:`) the strict
 /// shape gate would reject up front, so it loads via [`load_policy_raw`]
 /// instead (CodeRabbit M13 PR #132 round-24).
-fn load_policy_strict(cmd: &str, path: Option<&str>) -> Result<(Policy, String), i32> {
-    let (yaml, source) = read_policy_source(cmd, path)?;
+fn load_policy_strict(cmd: &str, path: Option<&str>, json: bool) -> Result<(Policy, String), i32> {
+    let (yaml, source) = read_policy_source(cmd, path, json)?;
     // An empty document (no policy file) is the zero-custom-rule default.
     if yaml.is_empty() {
         return Ok((Policy::default(), source));
     }
     // try_parse_yaml surfaces a parse error rather than warn-and-defaulting,
     // so a malformed `when:` is reported as exit 1 with the YAML location.
+    // In `--json` mode the error is a structured object, not plain stderr
+    // (CodeRabbit M13 PR #132 round-27 F1) — same `{ source, valid: false,
+    // error }` shape `validate`'s own parse-error path uses.
     match Policy::try_parse_yaml(&yaml) {
         Ok(policy) => Ok((policy, source)),
-        Err(e) => {
-            eprintln!("tirith rule {cmd}: {source}: {e}");
-            Err(1)
-        }
+        Err(e) => Err(emit_load_error(cmd, &source, &e.to_string(), json)),
     }
 }
 
@@ -637,8 +680,8 @@ fn load_policy_strict(cmd: &str, path: Option<&str>) -> Result<(Policy, String),
 /// `validate` never reached its own validator. Returning the raw YAML lets
 /// `validate` do its OWN structural parse (without the shape gate) and run the
 /// per-rule loop. (CodeRabbit M13 PR #132 round-24.)
-fn load_policy_raw(cmd: &str, path: Option<&str>) -> Result<(String, String), i32> {
-    read_policy_source(cmd, path)
+fn load_policy_raw(cmd: &str, path: Option<&str>, json: bool) -> Result<(String, String), i32> {
+    read_policy_source(cmd, path, json)
 }
 
 /// Structurally parse policy YAML for `validate` WITHOUT the strict
@@ -1028,6 +1071,98 @@ mod tests {
         );
     }
 
+    /// CodeRabbit M13 PR #132 round-27 F1: in `--json` mode a policy LOAD
+    /// failure (missing/unreadable file) must emit a STRUCTURED JSON error
+    /// object (NOT plain-text stderr) so a machine consumer reading stdout
+    /// never gets non-JSON while the exit code claims "error". This pins the
+    /// exact shape the shared load-error helper builds (`{ source, valid:
+    /// false, error }`) — the SAME shape `validate`'s parse-error path already
+    /// produces — and proves it round-trips as valid JSON carrying the error
+    /// field. `emit_load_error` writes THIS value via `write_json_stdout` (the
+    /// same stdout writer every other `--json` path in this file uses), so
+    /// verifying the value here proves the bytes on stdout are valid JSON
+    /// without an FD-capture race against the parallel test harness.
+    #[test]
+    fn load_error_json_is_structured_and_carries_error_field() {
+        let v = load_error_json("/no/such/policy.yaml", "cannot read: not found");
+        // Round-trips as valid JSON (a string consumer could parse it).
+        let s = serde_json::to_string(&v).expect("load-error JSON must serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("load-error output must be parseable JSON, not text");
+        assert_eq!(
+            parsed["valid"],
+            serde_json::Value::Bool(false),
+            "a load failure must report valid: false"
+        );
+        assert!(
+            parsed["error"].is_string(),
+            "JSON load error must carry a string `error` field, got: {parsed}"
+        );
+        assert!(
+            parsed["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot read")),
+            "the `error` field must surface the read-failure detail, got: {parsed}"
+        );
+        assert!(
+            parsed["source"].is_string(),
+            "JSON load error must carry the `source` label, got: {parsed}"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 round-27 F1, end-to-end: `validate --json` on a
+    /// MISSING `--path` must exit NON-ZERO (the exit code stays authoritative).
+    /// Combined with `load_error_json_is_structured_and_carries_error_field`
+    /// (the JSON shape) and `validate_json_missing_path_routes_through_load_error`
+    /// (the JSON branch is the one taken), this covers the contract: a `--json`
+    /// load failure exits non-zero AND emits structured JSON, never plain text.
+    /// Exit-code-only here keeps it deterministic under the parallel harness (no
+    /// process-wide stdout FD capture, which races with libtest's own output).
+    #[test]
+    fn validate_json_missing_path_exits_nonzero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist-policy.yaml");
+        let missing = missing.to_string_lossy().into_owned();
+        assert_eq!(
+            super::validate(Some(&missing), true),
+            1,
+            "validate --json on a missing path must exit non-zero (exit code authoritative)"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 round-27 F1, routing: prove the JSON branch is the
+    /// one a missing/unreadable file takes — `emit_load_error(json=true)` returns
+    /// 1 (after writing the JSON object to stdout) and `emit_load_error(json=false)`
+    /// returns 1 (after the plain-text `eprintln!`). Both exit 1, but only the
+    /// JSON arm produces the structured object asserted above. This is the
+    /// deterministic, race-free stand-in for capturing process stdout: it drives
+    /// the SAME helper `read_policy_source`/`load_policy_strict` call on failure.
+    #[test]
+    fn validate_json_missing_path_routes_through_load_error() {
+        // JSON arm: exit 1 (the object went to stdout via write_json_stdout).
+        assert_eq!(
+            emit_load_error(
+                "validate",
+                "/no/such/policy.yaml",
+                "cannot read: nope",
+                true
+            ),
+            1,
+            "the JSON load-error arm must exit 1"
+        );
+        // Human arm: exit 1 (plain text to stderr) — kept for the non-JSON path.
+        assert_eq!(
+            emit_load_error(
+                "validate",
+                "/no/such/policy.yaml",
+                "cannot read: nope",
+                false
+            ),
+            1,
+            "the human load-error arm must also exit 1"
+        );
+    }
+
     // round-24 companion: truly-malformed YAML must STILL make `validate` exit
     // non-zero — lenient loading defers the shape gate, it does NOT swallow
     // unparseable input. `parse_policy_lenient` returns Err, and the command
@@ -1080,6 +1215,35 @@ mod tests {
         assert!(
             policy_validate_has_coverage_error(yaml, "no-ctx-file"),
             "policy validate must AGREE: it reports the coverage error for the file rule"
+        );
+    }
+
+    #[test]
+    fn validate_multibyte_pattern_under_char_cap_accepted() {
+        // CodeRabbit M13 round-27: the 1024 pattern cap counts CHARACTERS, not
+        // UTF-8 bytes — consistent with compile_rules / check_regex / policy
+        // validate. A 600-char multibyte pattern is 1200 bytes but well under the
+        // 1024-CHAR cap, so `rule validate` must ACCEPT it; the old byte-length
+        // check (`pattern.len()`) would have wrongly rejected it.
+        let pat = "é".repeat(600); // 600 chars / 1200 bytes
+        let yaml = format!(
+            "custom_rules:\n  - id: mb-pat\n    pattern: \"{pat}\"\n    title: \"multibyte pattern\"\n    context: [exec]\n"
+        );
+        assert_eq!(
+            rule_validate_exit(&yaml),
+            0,
+            "a <=1024-CHAR multibyte pattern (>1024 bytes) must validate OK"
+        );
+
+        // A pattern over 1024 CHARACTERS is still rejected.
+        let too_long = "a".repeat(1025);
+        let yaml2 = format!(
+            "custom_rules:\n  - id: long-pat\n    pattern: \"{too_long}\"\n    title: \"too long\"\n    context: [exec]\n"
+        );
+        assert_eq!(
+            rule_validate_exit(&yaml2),
+            1,
+            "a >1024-CHAR pattern must be rejected by rule validate"
         );
     }
 

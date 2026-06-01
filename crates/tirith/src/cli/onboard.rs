@@ -1148,12 +1148,16 @@ mod tests {
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     struct HomeGuard {
-        // Field order matters for Drop: the `EnvGuard`s must restore the env
-        // vars BEFORE the lock is released, so they precede `_lock` (Rust drops
-        // struct fields in declaration order).
-        _home: EnvGuard,
-        _userprofile: EnvGuard,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        // Teardown order is enforced EXPLICITLY by the `Drop` impl below
+        // (env guards dropped before the lock), NOT by field-declaration
+        // order — so a future reorder of these fields can't silently let
+        // another test observe a restored-but-still-locked or
+        // unlocked-but-not-yet-restored env. Each field is an `Option` so
+        // `drop` can `.take()` and drop them one at a time in the order it
+        // chooses; `home`/`userprofile` are always `Some` for a live guard.
+        home: Option<EnvGuard>,
+        userprofile: Option<EnvGuard>,
+        lock: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
     impl HomeGuard {
@@ -1166,10 +1170,25 @@ mod tests {
             let home = EnvGuard::set("HOME", dir);
             let userprofile = EnvGuard::set("USERPROFILE", dir);
             Self {
-                _home: home,
-                _userprofile: userprofile,
-                _lock: lock,
+                home: Some(home),
+                userprofile: Some(userprofile),
+                lock: Some(lock),
             }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // ORDER: restore the env vars FIRST (drop both `EnvGuard`s), THEN
+            // release the crate-wide lock. Dropping each `.take()`n value at
+            // the end of its `let` statement makes the sequence explicit and
+            // refactor-proof — it no longer depends on field-declaration order.
+            // Any field left `None` (already taken) is simply a no-op drop.
+            drop(self.home.take());
+            drop(self.userprofile.take());
+            // Lock released LAST so no other env-mutating test can acquire it
+            // and observe HOME/USERPROFILE before they've been restored above.
+            drop(self.lock.take());
         }
     }
 
