@@ -1072,15 +1072,10 @@ mod tests {
     /// round-trips into the real `Policy` struct, not just the validator.
     #[test]
     fn all_templates_deserialize_into_policy() {
-        for t in [
-            PolicyTemplate::Individual,
-            PolicyTemplate::CiStrict,
-            PolicyTemplate::AiAgentHeavy,
-            PolicyTemplate::OssMaintainer,
-            PolicyTemplate::Startup,
-            PolicyTemplate::Enterprise,
-            PolicyTemplate::McpStrict,
-        ] {
+        // Iterate `PolicyTemplate::ALL` (the single source of truth, R20) rather
+        // than a hand-maintained list, so a newly-added template is automatically
+        // covered by this deserialize check (CodeRabbit M13 PR #132 round-21).
+        for t in PolicyTemplate::ALL {
             let body = t.body();
             let parsed: Result<tirith_core::policy::Policy, _> = serde_yaml::from_str(body);
             assert!(

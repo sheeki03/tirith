@@ -5902,6 +5902,71 @@ Examples:
     },
 }
 
+/// M13 ch5 — closed value set for `tirith agent block --filesystem-write`.
+/// Mirrors [`tirith_core::policy::FilesystemWriteScope`] (and its `parse`
+/// alias set) so an invalid spelling is rejected at clap PARSE time (exit 2)
+/// instead of reaching the handler. The canonical value name is `repo_only`
+/// (the serde / `after_help` spelling); `repo-only` and `repo` are accepted
+/// aliases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum FilesystemWriteArg {
+    #[value(name = "repo_only", alias = "repo-only", alias = "repo")]
+    RepoOnly,
+    Home,
+    #[value(alias = "all")]
+    Everywhere,
+}
+
+impl FilesystemWriteArg {
+    /// The canonical snake_case spelling — identical to the value
+    /// [`tirith_core::policy::FilesystemWriteScope::parse`] accepts, so the
+    /// downstream string-typed `cli::agent::block` handler sees exactly what it
+    /// did before this flag was given a typed value set.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoOnly => "repo_only",
+            Self::Home => "home",
+            Self::Everywhere => "everywhere",
+        }
+    }
+}
+
+/// M13 ch5 — closed value set for `tirith agent block --network`. Mirrors
+/// [`tirith_core::policy::NetworkPredicate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum NetworkArg {
+    Warn,
+    Block,
+    Allow,
+}
+
+impl NetworkArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Block => "block",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+/// M13 ch5 — closed value set for `tirith agent block --secrets-access`.
+/// Mirrors [`tirith_core::policy::SecretsAccessPredicate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SecretsAccessArg {
+    Block,
+    Allow,
+}
+
+impl SecretsAccessArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Allow => "allow",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AgentAction {
     /// List recent audit-log sessions grouped by agent origin
@@ -6099,17 +6164,18 @@ Examples:
         command_pattern: String,
         /// M13 ch5 — per-agent filesystem-write scope predicate. Accepted
         /// values: repo_only (aliases: repo-only, repo), home, everywhere
-        /// (alias: all). Advisory metadata recorded on the matcher.
-        #[arg(long = "filesystem-write")]
-        filesystem_write: Option<String>,
+        /// (alias: all). Advisory metadata recorded on the matcher. Typed as a
+        /// `ValueEnum`, so an unknown spelling is rejected at parse time (exit 2).
+        #[arg(long = "filesystem-write", value_enum)]
+        filesystem_write: Option<FilesystemWriteArg>,
         /// M13 ch5 — per-agent network predicate (warn|block|allow). Advisory
         /// metadata recorded on the matcher.
-        #[arg(long)]
-        network: Option<String>,
+        #[arg(long, value_enum)]
+        network: Option<NetworkArg>,
         /// M13 ch5 — per-agent secrets-access predicate (block|allow). Advisory
         /// metadata recorded on the matcher.
-        #[arg(long = "secrets-access")]
-        secrets_access: Option<String>,
+        #[arg(long = "secrets-access", value_enum)]
+        secrets_access: Option<SecretsAccessArg>,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6598,13 +6664,19 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
+                // The flags are typed `ValueEnum`s now, so clap already rejected
+                // any unknown spelling at parse time (exit 2). `cli::agent::block`
+                // still takes `Option<&str>` and rejects these on PRESENCE
+                // (`is_some()` — they are not enforced by `agent_rules` matching
+                // yet), so map each present variant back to its canonical string;
+                // the rejection semantics are byte-identical to the old path.
                 cli::agent::block(
                     &kind,
                     payload.as_deref(),
                     &command_pattern,
-                    filesystem_write.as_deref(),
-                    network.as_deref(),
-                    secrets_access.as_deref(),
+                    filesystem_write.map(FilesystemWriteArg::as_str),
+                    network.map(NetworkArg::as_str),
+                    secrets_access.map(SecretsAccessArg::as_str),
                     json,
                 )
             }

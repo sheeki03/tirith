@@ -217,13 +217,43 @@ pub fn build_dsl_backing(
             // specific tag/digest could never surface via `package.reputation`
             // (CodeRabbit M13 PR #132 R17-4). Tags are case-sensitive, so they are
             // threaded verbatim (unlike the lowercased image name).
-            let version = tag.as_deref().or(digest.as_deref());
-            let reputation = package_reputation(
+            //
+            // A ref can carry BOTH (`image:1.2@sha256:…`). `check_package` keys the
+            // lookup only by `(ecosystem, name)` and string-matches `version`
+            // against the record's affected-versions list, so it can consult ONE
+            // identifier per call. The old `tag.or(digest)` therefore DROPPED the
+            // digest whenever a tag was present, so a digest-keyed entry could not
+            // surface (CodeRabbit M13 PR #132 R21). We probe BOTH: the tag first
+            // (preserving the existing tag-keyed match) and, if that is not a
+            // malicious hit, the digest — malicious wins. The `Known`/`Unknown`/
+            // `NoDb` states are version-INDEPENDENT (`is_popular_package` ignores
+            // the version), so the primary probe is authoritative for them and the
+            // digest re-probe only ever UPGRADES an absent/known package to
+            // malicious. When only one of tag/digest is present this collapses to
+            // the single-identifier lookup (no behavior change).
+            let primary = tag.as_deref().or(digest.as_deref());
+            let mut reputation = package_reputation(
                 crate::threatdb::Ecosystem::Docker,
                 &image,
-                version,
+                primary,
                 threat_db,
             );
+            // Re-probe under the digest only when a tag was the primary AND the
+            // primary missed the malicious index — so we never regress a tag hit,
+            // but a digest-keyed record is still found.
+            if reputation != crate::custom_rule_dsl::PkgReputation::Malicious {
+                if let (Some(d), true) = (digest.as_deref(), tag.is_some()) {
+                    let by_digest = package_reputation(
+                        crate::threatdb::Ecosystem::Docker,
+                        &image,
+                        Some(d),
+                        threat_db,
+                    );
+                    if by_digest == crate::custom_rule_dsl::PkgReputation::Malicious {
+                        reputation = by_digest;
+                    }
+                }
+            }
             packages.push(("docker".to_string(), image, reputation));
         }
     }
@@ -3366,6 +3396,91 @@ mod tests {
         assert!(
             !is_malicious("docker pull evil/img"),
             "untagged evil/img must NOT match a version-specific DB entry"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132 R21: a Docker ref can carry BOTH a tag and a digest
+    /// (`image:1.2@sha256:…`). `check_package` keys the lookup by `(ecosystem,
+    /// name)` and string-matches the single `version` arg against the record's
+    /// affected-versions list, so the old `tag.or(digest)` DROPPED the digest
+    /// whenever a tag was present — a digest-keyed threat-DB entry could never
+    /// surface. The fix probes both identifiers (tag first, digest as fallback,
+    /// malicious wins). This pins all three directions:
+    ///   * digest-keyed entry surfaces even though a tag is present (the bug),
+    ///   * a tag-keyed entry still surfaces with a digest also present (no regress),
+    ///   * a ref whose tag AND digest both miss is not flagged.
+    #[test]
+    fn test_build_dsl_backing_docker_ref_digest_not_dropped() {
+        use crate::custom_rule_dsl::{evaluate, Reputation, WhenClause};
+        use crate::threatdb::{Confidence, Ecosystem, ThreatDb, ThreatDbWriter, ThreatSource};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        // Two DB records for the SAME image but keyed to different version strings:
+        // one keyed to a digest, one keyed to a tag. `check_package` matches a
+        // record only when the threaded `version` string is in its affected list,
+        // so each record requires its own identifier to surface.
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        // `digestonly/img` is malicious ONLY at the digest (no tag in its list).
+        writer.add_package(
+            Ecosystem::Docker,
+            "digestonly/img",
+            &[digest],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        // `tagonly/img` is malicious ONLY at tag `1.0` (no digest in its list).
+        writer.add_package(
+            Ecosystem::Docker,
+            "tagonly/img",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build threat db");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load threat db");
+
+        let is_malicious = |cmd: &str| {
+            let extracted = extract::extract_urls(cmd, ShellType::Posix);
+            let backing = build_dsl_backing(
+                cmd,
+                ShellType::Posix,
+                ScanContext::Exec,
+                &extracted,
+                Some(&db),
+            );
+            let ctx = backing.as_eval_context(None, None);
+            evaluate(&WhenClause::PackageReputation(Reputation::Malicious), &ctx)
+        };
+
+        // THE BUG: a ref with BOTH a tag and the malicious digest must surface as
+        // malicious. The old `tag.or(digest)` passed only the tag (`1.2`), which is
+        // NOT in the digest-keyed record, so the entry was dropped.
+        assert!(
+            is_malicious(&format!("docker pull digestonly/img:1.2@{digest}")),
+            "a digest-keyed DB entry must surface even when the ref also carries a tag"
+        );
+        // A ref pinned by digest ALONE must also surface (single-identifier path).
+        assert!(
+            is_malicious(&format!("docker pull digestonly/img@{digest}")),
+            "a digest-only ref must surface the digest-keyed entry"
+        );
+        // NO REGRESSION: a tag-keyed entry must still surface when the ref also
+        // carries an (unrelated) digest — the tag probe runs first.
+        assert!(
+            is_malicious(&format!("docker pull tagonly/img:1.0@{digest}")),
+            "a tag-keyed entry must still surface when a digest is also present"
+        );
+        // A ref whose tag and digest BOTH miss must NOT be flagged.
+        assert!(
+            !is_malicious("docker pull digestonly/img:9.9@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "a ref whose tag and digest both miss must not be flagged"
         );
     }
 

@@ -422,15 +422,30 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     // the raw entry. The duplicate-id / not-found checks above already ran against
     // the raw policy, so reaching here means exactly one entry carries this id.
     let compiled = compile_rules(&policy.custom_rules);
-    if !compiled.iter().any(|r| r.id == rule_id) {
-        return emit_invalid_rule("explain", rule_id, json);
-    }
+    let compiled_rule = match compiled.iter().find(|r| r.id == rule_id) {
+        Some(r) => r,
+        // Absent from the compiled set → the engine would drop it; report that
+        // rather than describe a rule that never runs.
+        None => return emit_invalid_rule("explain", rule_id, json),
+    };
     let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
             return emit_not_found("explain", rule_id, &policy, json);
         }
     };
+
+    // The CLAMPED runtime contexts the engine actually evaluates this rule in
+    // (`compile_rules` intersects declared ∩ satisfiable). `explain` must report
+    // THESE, not `rule.context` (the originally-declared list) — otherwise it
+    // advertises contexts the rule will never be evaluated in. E.g. a
+    // `file.path_matches` rule declared `[exec, file]` compiles to `[file]`
+    // only. CodeRabbit M13 PR #132 round-21.
+    let runtime_contexts: Vec<&'static str> = compiled_rule
+        .contexts
+        .iter()
+        .map(|c| scan_context_name(*c))
+        .collect();
 
     // Effective action: a rule's declared `action:` is recorded metadata; the
     // engine derives the effective action from `severity` (a Critical finding
@@ -445,7 +460,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
             "severity": rule.severity.to_string(),
             "declared_action": rule.action.map(action_name),
             "effective_action": action_name(effective),
-            "context": rule.context,
+            "context": runtime_contexts,
             "title": rule.title,
             "description": rule.description,
             "pattern": rule.pattern,
@@ -474,7 +489,7 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
             action_name(effective)
         ),
     }
-    println!("  context:  {}", rule.context.join(", "));
+    println!("  context:  {}", runtime_contexts.join(", "));
     println!();
     if let Some(pattern) = &rule.pattern {
         println!("  matcher:  regex");
@@ -930,6 +945,64 @@ mod tests {
         assert_ne!(
             code, 0,
             "explain must reject an engine-dropped rule non-zero, matching `test`"
+        );
+    }
+
+    // CodeRabbit M13 PR #132 round-21: `explain` must report the CLAMPED runtime
+    // contexts (`compile_rules`'s declared ∩ satisfiable), NOT the originally
+    // declared `context:` list — otherwise it advertises contexts the rule is
+    // never evaluated in. A `file.path_matches` clause is satisfiable only in
+    // FileScan, so declaring it for `[exec, file]` clamps to `[file]` alone. This
+    // pins the exact transformation `explain`'s JSON/human output now reads from
+    // (`compiled_rule.contexts` mapped via `scan_context_name`), proving the
+    // clamped set is strictly smaller than the declared set.
+    #[test]
+    fn explain_reports_clamped_runtime_contexts_not_declared() {
+        let yaml = "custom_rules:\n  - id: file-rule-broad-decl\n    when:\n      file.path_matches: '\\.env$'\n    title: \"file rule declared exec+file\"\n    context: [exec, file]\n";
+        let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
+
+        // The rule as DECLARED carries both contexts.
+        let declared = policy
+            .custom_rules
+            .iter()
+            .find(|r| r.id == "file-rule-broad-decl")
+            .expect("declared rule present");
+        assert_eq!(
+            declared.context,
+            vec!["exec".to_string(), "file".to_string()],
+            "fixture must declare both exec and file so the clamp is observable"
+        );
+
+        // The COMPILED rule — exactly what `explain` now renders from — is clamped
+        // by `compile_rules` to the satisfiable intersection, i.e. file only.
+        let compiled = compile_rules(&policy.custom_rules);
+        let compiled_rule = compiled
+            .iter()
+            .find(|r| r.id == "file-rule-broad-decl")
+            .expect("compile_rules must keep the file rule (it has a satisfiable context)");
+        let runtime_contexts: Vec<&'static str> = compiled_rule
+            .contexts
+            .iter()
+            .map(|c| scan_context_name(*c))
+            .collect();
+
+        assert_eq!(
+            runtime_contexts,
+            vec!["file"],
+            "explain must report the CLAMPED set [file], not the declared [exec, file]"
+        );
+        // And the clamped set is STRICTLY smaller than the declared set — the
+        // precise regression (rendering declared contexts the rule never runs in).
+        assert!(
+            runtime_contexts.len() < declared.context.len(),
+            "clamped runtime contexts ({runtime_contexts:?}) must be strictly smaller than \
+             declared ({:?})",
+            declared.context
+        );
+        assert!(
+            !runtime_contexts.contains(&"exec"),
+            "exec was declared but is not satisfiable for file.path_matches, so explain must \
+             not advertise it"
         );
     }
 }

