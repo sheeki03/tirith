@@ -14946,6 +14946,35 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 
     let mut stdin = child.stdin.take().expect("server stdin");
     let stdout = child.stdout.take().expect("server stdout");
+    let stderr = child.stderr.take().expect("server stderr");
+    // Drain stderr on a background thread. The child's stderr is a piped OS
+    // buffer; if the server writes enough (tower-lsp logs, or the `log_message`
+    // path's `catch_unwind` errors) and nobody reads it, the buffer fills and
+    // the child BLOCKS on the stderr write — wedging the whole lifecycle. Read
+    // it to EOF into a shared buffer so writes never block, and so we can
+    // surface the captured stderr if an assertion below fails. The thread ends
+    // on EOF (when the child exits and its stderr closes); we join it at the
+    // end of the test.
+    let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stderr_drain = {
+        let stderr_buf = Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => return, // EOF: child's stderr closed
+                    Ok(n) => stderr_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    Err(_) => return, // pipe error → stop draining
+                }
+            }
+        })
+    };
+    // Render whatever stderr we've captured so far, for failure messages.
+    let stderr_so_far = {
+        let stderr_buf = Arc::clone(&stderr_buf);
+        move || String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned()
+    };
     // Share ownership of the process so the watchdog (below) can `kill()` a hung
     // server on timeout instead of leaking it. The waiter thread gets a clone of
     // the Arc; the parent keeps `child_arc` to kill+reap on the timeout branch.
@@ -15148,19 +15177,32 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
     match erx.recv_timeout(Duration::from_secs(20)) {
         Ok(status) => {
             let status = status.expect("wait on tirith lsp");
+            // The child has exited, so its stderr is closed: the drain thread
+            // sees EOF and finishes. Join it (no leak) and surface any captured
+            // stderr if the exit code is wrong.
+            let _ = stderr_drain.join();
             assert_eq!(
                 status.code(),
                 Some(0),
-                "tirith lsp must exit cleanly (rc 0) after shutdown+exit; got {status:?}"
+                "tirith lsp must exit cleanly (rc 0) after shutdown+exit; got {status:?}\nstderr:\n{}",
+                stderr_so_far()
             );
         }
         Err(_) => {
             // Timed out: the server hung. Kill it so we don't leak the process
             // into CI, then reap it, before failing the test.
-            let mut guard = child_arc.lock().unwrap();
-            let _ = guard.kill(); // ignore: it may have just exited
-            let _ = guard.wait(); // reap the (now-dead) child
-            panic!("LSP server did not exit within 20s of `exit` — transport shutdown regressed")
+            {
+                let mut guard = child_arc.lock().unwrap();
+                let _ = guard.kill(); // ignore: it may have just exited
+                let _ = guard.wait(); // reap the (now-dead) child
+            }
+            // The child is now dead → stderr closed → the drain thread EOFs.
+            // Join it and include whatever it captured in the failure message.
+            let _ = stderr_drain.join();
+            panic!(
+                "LSP server did not exit within 20s of `exit` — transport shutdown regressed\nstderr:\n{}",
+                stderr_so_far()
+            )
         }
     }
 }

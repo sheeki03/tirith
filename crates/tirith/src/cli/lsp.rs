@@ -485,9 +485,11 @@ fn end_position(text: &str) -> Position {
 /// UTF-16 code-unit column, per the LSP spec — `Position.character` counts
 /// UTF-16 code units, NOT bytes or Unicode scalar values).
 ///
-/// An offset past the end of `text` clamps to the end position; an offset that
-/// lands inside a multi-byte char snaps back to that char's start (counting it
-/// as not-yet-passed).
+/// An offset past the end of `text` clamps to the end position. An offset that
+/// lands inside a multi-byte char counts that whole containing char as already
+/// passed: the column is advanced by the char's full `len_utf16()`, so the
+/// returned position is the char-boundary column just PAST the containing char
+/// (never a fractional / mid-surrogate-pair column).
 pub fn byte_offset_to_position(text: &str, byte_offset: usize) -> Position {
     let offset = byte_offset.min(text.len());
     let mut line = 0u32;
