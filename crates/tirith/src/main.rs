@@ -564,7 +564,8 @@ Examples:
         /// Mutually exclusive with `--json`: `--apply` prints interactive prompts
         /// and may invoke `tirith init`, whose output would corrupt the JSON
         /// document. clap rejects the combination at parse time with a usage error
-        /// (exit 2) (CodeRabbit M13 PR #132 R12-7).
+        /// (exit 2).
+        // Internal: CodeRabbit M13 PR #132 R12-7 (kept out of `--help`).
         #[arg(long, conflicts_with = "json")]
         apply: bool,
         /// Emit the detection report + recommendation as JSON.
@@ -2447,7 +2448,7 @@ Subcommands:
                         <state-dir>/ai_config_snapshot.json and report added /
                         removed instructions + any AiConfig* findings
   quarantine <file>     COPY a (suspected-poisoned) config into
-                        ~/.cache/tirith/quarantine/ — the ORIGINAL IS UNTOUCHED
+                        <cache-dir>/tirith/quarantine/ — the ORIGINAL IS UNTOUCHED
                         by default; --move opts into deleting the original
                         (prompts unless --yes)
   explain-config <file> identify which AI tool a config configures (CLAUDE.md →
@@ -3004,7 +3005,7 @@ Examples:
     /// Isolate a suspected-poisoned AI-config file (COPY by default)
     #[command(after_help = "\
 v1 DEFAULT IS COPY: the file is COPIED to
-~/.cache/tirith/quarantine/<timestamp>-<sha256>-<basename> and the ORIGINAL IS
+<cache-dir>/tirith/quarantine/<timestamp>-<sha256>-<basename> and the ORIGINAL IS
 LEFT UNTOUCHED; the restore command is printed. Pass --move to opt into the
 destructive variant (copy, then DELETE the original) — which prompts for
 confirmation unless --yes, and refuses non-interactively without --yes.
@@ -3022,8 +3023,8 @@ Examples:
         #[arg(long = "move")]
         r#move: bool,
         /// Confirm the destructive --move without an interactive prompt.
-        /// Meaningless without --move, so clap requires it (M13 PR #132
-        /// finding O).
+        /// Meaningless without --move, so clap requires it.
+        // Internal: M13 PR #132 finding O (kept out of `--help`).
         #[arg(long, requires = "move")]
         yes: bool,
         /// Output format (default: human)
@@ -3075,8 +3076,8 @@ Examples:
         update: bool,
         /// With --update, record the snapshot even when High+ issues are found
         /// (otherwise --update refuses to bless a compromised state).
-        /// Meaningless without --update, so clap requires it (M13 PR #132
-        /// finding O).
+        /// Meaningless without --update, so clap requires it.
+        // Internal: M13 PR #132 finding O (kept out of `--help`).
         #[arg(long, requires = "update")]
         force: bool,
         /// Output format (default: human)

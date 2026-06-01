@@ -477,6 +477,29 @@ fn help_intend_documents_exit_codes() {
     );
 }
 
+/// CodeRabbit M13 PR #132 R20 (F6): the AI-quarantine help must describe the
+/// quarantine store with a PLATFORM-NEUTRAL placeholder (`<cache-dir>/…`), not
+/// the Linux-only `~/.cache/…` literal (macOS uses ~/Library/Caches, Windows
+/// uses %LOCALAPPDATA%). Pin BOTH help surfaces that mention the path — the
+/// `ai` parent subcommand list and the `ai quarantine` detail — so a future
+/// edit can't silently reintroduce the OS-specific path.
+#[test]
+fn help_ai_quarantine_path_is_platform_neutral() {
+    for args in [&["ai", "--help"][..], &["ai", "quarantine", "--help"][..]] {
+        let out = tirith().args(args).output().expect("failed to run tirith");
+        assert!(out.status.success(), "{args:?} --help should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("<cache-dir>/tirith/quarantine"),
+            "{args:?} --help must use the platform-neutral <cache-dir>/tirith/quarantine path, got:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("~/.cache/tirith/quarantine"),
+            "{args:?} --help must NOT hardcode the Linux-only ~/.cache/tirith/quarantine path, got:\n{stdout}"
+        );
+    }
+}
+
 #[test]
 fn help_root_lists_subcommands() {
     let out = tirith().args(["--help"]).output().unwrap();

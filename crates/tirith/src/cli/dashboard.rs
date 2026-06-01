@@ -445,8 +445,33 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         println!("never written to disk. Press Ctrl-C to stop.");
     }
 
-    serve_loop(&server, &token, issued_at, issued_mono);
-    0
+    // A server that cannot accept connections must NOT report success
+    // (CodeRabbit M13 PR #132 R20). The TTL-expiry exit is a normal end-of-life
+    // (exit 0); a genuine accept/recv ERROR is fatal (non-zero).
+    loop_outcome_exit_code(serve_loop(&server, &token, issued_at, issued_mono))
+}
+
+/// Why [`serve_loop`] returned. `TtlExpired` is the EXPECTED end-of-life (the
+/// token's TTL elapsed and the loop polled it out — `recv_timeout`'s timeout
+/// branch is part of this normal flow, not a failure). `AcceptError` is a
+/// genuine `recv`/accept failure (channel disconnected, IO error) — the server
+/// can no longer serve, so it is fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopOutcome {
+    /// The token TTL elapsed; nothing useful is left to serve. Success.
+    TtlExpired,
+    /// The accept socket failed (not a timeout tick). Fatal.
+    AcceptError,
+}
+
+/// Map a [`LoopOutcome`] to the process exit code: a clean TTL expiry is
+/// success (0); an accept/recv error is fatal (1) so a dashboard that could
+/// never (or no longer) accept connections does not masquerade as a success.
+fn loop_outcome_exit_code(outcome: LoopOutcome) -> i32 {
+    match outcome {
+        LoopOutcome::TtlExpired => 0,
+        LoopOutcome::AcceptError => 1,
+    }
 }
 
 /// The blocking accept loop. Re-renders the snapshot per request (cheap; keeps
@@ -467,21 +492,27 @@ fn serve_loop(
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
-) {
+) -> LoopOutcome {
     loop {
         // Stop accepting once the token has expired — every request would 401.
-        // Monotonic check: immune to a backward wall-clock jump.
+        // Monotonic check: immune to a backward wall-clock jump. This is the
+        // normal end-of-life, NOT a failure.
         if mono_ttl_expired(issued_mono.elapsed()) {
             eprintln!("tirith dashboard serve: token expired; stopping.");
-            return;
+            return LoopOutcome::TtlExpired;
         }
 
         match server.recv_timeout(ACCEPT_POLL) {
             Ok(Some(request)) => handle_request(request, token, issued_at, issued_mono),
-            Ok(None) => continue, // timeout tick — re-check TTL
+            // `Ok(None)` is the EXPECTED timeout tick (the TTL poll); keep looping
+            // so the next iteration re-checks the TTL. It is never fatal.
+            Ok(None) => continue,
+            // A genuine recv/accept ERROR (channel disconnected, IO error) means
+            // the server can no longer accept connections. Surface it as fatal so
+            // `serve()` exits non-zero rather than reporting a false success.
             Err(e) => {
                 eprintln!("tirith dashboard serve: accept error: {e}");
-                return;
+                return LoopOutcome::AcceptError;
             }
         }
     }
@@ -603,6 +634,27 @@ fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CodeRabbit M13 PR #132 R20: `serve_loop` must distinguish a clean TTL
+    // expiry (success) from a fatal accept/recv error — a server that can no
+    // longer accept connections must NOT exit 0. Pin the smallest decision
+    // point: the outcome→exit-code mapping. A `recv_timeout` TIMEOUT tick
+    // (`Ok(None)`) never reaches this mapping — it `continue`s the loop — so the
+    // only two terminal outcomes are TtlExpired (0) and AcceptError (non-zero).
+    #[test]
+    fn loop_outcome_exit_code_maps_ttl_to_success_and_error_to_failure() {
+        assert_eq!(
+            loop_outcome_exit_code(LoopOutcome::TtlExpired),
+            0,
+            "a clean TTL expiry is the normal end-of-life and must exit 0"
+        );
+        let err_code = loop_outcome_exit_code(LoopOutcome::AcceptError);
+        assert_ne!(
+            err_code, 0,
+            "an accept/recv error must NOT report success (exit 0)"
+        );
+        assert_eq!(err_code, 1, "the fatal accept-error exit code is 1");
+    }
 
     fn token() -> &'static str {
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"

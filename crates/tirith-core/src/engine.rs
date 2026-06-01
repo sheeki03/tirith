@@ -2418,10 +2418,16 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // M13 ch4 — the scanned file path as a `&str`, used by the custom-rule DSL
     // `file.path_matches` predicate (FileScan context). Held here so the
     // borrow outlives the DSL eval context built later in the custom-rule block.
+    //
+    // Back-slashes are normalized to `/` so the predicate is PLATFORM-INDEPENDENT:
+    // DSL `file.path_matches` regexes are written with `/` separators (e.g.
+    // `(^|/)\.env(\.|$)`), so without this a Windows path like `C:\repo\.env`
+    // would never match (CodeRabbit M13 round-20 engine.rs:2418-2424). Mirrors the
+    // `\`→`/` normalization the FileScan path already applies in cli/rule.rs.
     let file_path_str: Option<String> = ctx
         .file_path
         .as_deref()
-        .map(|p| p.to_string_lossy().into_owned());
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
 
     if ctx.scan_context == ScanContext::FileScan {
         // FileScan runs byte-scan + configfile/codefile/rendered rules only.
@@ -3394,6 +3400,66 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, crate::verdict::RuleId::BidiControls)),
             "should detect bidi controls in exec context"
+        );
+    }
+
+    #[test]
+    fn test_dsl_file_path_matches_normalizes_backslashes() {
+        // CodeRabbit M13 round-20 engine.rs:2418-2424: the `file.path_matches`
+        // DSL predicate must be PLATFORM-INDEPENDENT. DSL regexes use `/`
+        // separators (here `(^|/)\.env(\.|$)`), so a Windows-style backslash path
+        // (`C:\repo\.env`) must be normalized to `/` before the regex runs — else
+        // the predicate would silently miss every Windows path.
+        let dir = tempfile::tempdir().unwrap();
+        // `.git` marks the repo root so `Policy::discover` stops walking here.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        std::fs::write(
+            tirith_dir.join("policy.yaml"),
+            // Mirror fixture rule #6 (flag-env-file-scan): a FileScan-context DSL
+            // rule keyed on a `/`-anchored `.env` regex.
+            "custom_rules:\n  \
+             - id: flag-env-file-scan\n    \
+             when:\n      \
+             file.path_matches: '(^|/)\\.env(\\.|$)'\n    \
+             severity: low\n    \
+             title: \"Scanned a .env-style secrets file\"\n    \
+             context: [file]\n",
+        )
+        .unwrap();
+
+        // FileScan a backslash-separated Windows path. `.into()` would keep the
+        // backslashes; the engine's `replace('\\', "/")` is what makes the
+        // `(^|/)` anchor match `…/.env`.
+        let ctx = AnalysisContext {
+            input: "SECRET=xyz\n".to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::FileScan,
+            raw_bytes: None,
+            interactive: false,
+            cwd: Some(dir.path().display().to_string()),
+            file_path: Some(std::path::PathBuf::from(r"C:\repo\.env")),
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        };
+        let verdict = analyze(&ctx);
+        assert!(
+            verdict.findings.iter().any(|f| matches!(
+                f.rule_id,
+                crate::verdict::RuleId::CustomRuleMatch
+            ) && f.custom_rule_id.as_deref()
+                == Some("flag-env-file-scan")),
+            "the `file.path_matches` DSL rule must fire on the backslash path \
+             `C:\\repo\\.env` after `\\`→`/` normalization; findings: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.custom_rule_id))
+                .collect::<Vec<_>>()
         );
     }
 

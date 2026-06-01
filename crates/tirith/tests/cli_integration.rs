@@ -14641,7 +14641,10 @@ fn ai_snapshot_records_bytes_that_were_scanned() {
         .map(|e| e.path())
         .find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().starts_with("ai_config_snapshot-"))
+                .map(|n| {
+                    let name = n.to_string_lossy();
+                    name.starts_with("ai_config_snapshot-") && name.ends_with(".json")
+                })
                 .unwrap_or(false)
         })
         .expect("a per-repo snapshot file must exist");

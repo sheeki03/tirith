@@ -336,15 +336,23 @@ pub fn diff(json: bool) -> i32 {
     );
     println!();
     for d in &diffs {
-        println!("  {} [{}]", d.path, d.status);
+        // Every displayed field below is AI-config-derived (path basenames, the
+        // instruction line bodies, finding titles) and is sanitized so a hostile
+        // config cannot inject terminal escapes into our output (R20).
+        println!("  {} [{}]", sanitize_display(&d.path), d.status);
         for line in &d.added_instructions {
-            println!("    + {line}");
+            println!("    + {}", sanitize_display(line));
         }
         for line in &d.removed_instructions {
-            println!("    - {line}");
+            println!("    - {}", sanitize_display(line));
         }
         for f in &d.findings {
-            println!("    !! {} ({}): {}", f.rule_id, f.severity, f.title);
+            println!(
+                "    !! {} ({}): {}",
+                f.rule_id,
+                f.severity,
+                sanitize_display(&f.title)
+            );
         }
         println!();
     }
@@ -426,6 +434,31 @@ fn truncate_line(s: &str) -> String {
     }
     let cut: String = s.chars().take(MAX).collect();
     format!("{cut}…")
+}
+
+/// Neutralize one untrusted string before printing it to the terminal in HUMAN
+/// mode (CodeRabbit M13 PR #132 R20 — raw terminal passthrough).
+///
+/// Everything `tirith ai` displays in human mode — diff line bodies, file paths
+/// (whose basenames are attacker-controlled), finding titles, `explain-config`
+/// risk detail — is derived from the very AI-config files tirith analyzes. A
+/// malicious config containing ANSI/CSI/OSC escape or other control sequences
+/// could otherwise spoof or rewrite terminal output the moment we `println!` it.
+/// Run every such field through tirith's own output sanitizer — the same
+/// `output_filter` the MCP gateway and `tirith paste` apply — which strips
+/// ANSI/OSC/APC/DCS escape sequences, bare CR, other C0 controls (except `\t`),
+/// DEL, and zero-width characters (tirith must never itself emit the terminal
+/// injection it exists to detect). Tabs/newlines that the sanitizer legitimately
+/// keeps are then flattened to spaces so a single display field stays on one
+/// line (callers already control line structure).
+fn sanitize_display(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
+    let cleaned = String::from_utf8(out).unwrap_or_default();
+    cleaned
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect()
 }
 
 /// The per-file read cap (10 MiB), matching the scan engine's per-file cap so a
@@ -546,16 +579,18 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         )
     {
         // `confirm` returns false in TWO distinct situations and we must NOT
-        // conflate them (CodeRabbit M13 PR #132 R3-7):
-        //   1. We COULD prompt (stderr is a TTY) and the operator answered "no"
-        //      → an intentional abort; the original is kept and exit 0 is success.
-        //   2. We COULD NOT prompt (no TTY) and `--yes` was not given → nothing
-        //      was confirmed; returning 0 here would make a no-op look successful
-        //      to a non-interactive caller. Fail non-zero (exit 2), matching the
-        //      JSON branch.
+        // conflate them (CodeRabbit M13 PR #132 R3-7 / R20):
+        //   1. We COULD prompt (an interactive answer was possible) and the
+        //      operator answered "no" → an intentional abort; the original is kept
+        //      and exit 0 is success.
+        //   2. We COULD NOT prompt and `--yes` was not given → nothing was
+        //      confirmed; returning 0 here would make a no-op look successful to a
+        //      non-interactive caller. Fail non-zero (exit 2), matching the JSON
+        //      branch.
         // `--yes` short-circuits `confirm` to true, so reaching this block always
-        // means `--yes` was absent; the only question is whether a TTY existed.
-        let could_prompt = is_terminal::is_terminal(std::io::stderr());
+        // means `--yes` was absent; the only question is whether an interactive
+        // confirmation was actually possible.
+        let could_prompt = confirmation_possible();
         if json || !could_prompt {
             let _ = emit_error(
                 json,
@@ -784,21 +819,39 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         return 0;
     }
 
+    // `src` is a user-supplied arg and `dest` embeds the (attacker-controllable)
+    // source basename, so sanitize both before printing (R20). `restore_cmd` is
+    // already shell-quoted by `restore_command`, which neutralizes the same
+    // bytes for shell-paste safety.
+    let src_disp = sanitize_display(&src.display().to_string());
+    let dest_disp = sanitize_display(&dest.display().to_string());
     if moved {
-        println!("Moved {} into quarantine.", src.display());
-        println!("  quarantine copy: {}", dest.display());
+        println!("Moved {src_disp} into quarantine.");
+        println!("  quarantine copy: {dest_disp}");
         println!("  the original was REMOVED.");
     } else {
-        println!(
-            "Copied {} into quarantine (original UNTOUCHED).",
-            src.display()
-        );
-        println!("  quarantine copy: {}", dest.display());
+        println!("Copied {src_disp} into quarantine (original UNTOUCHED).");
+        println!("  quarantine copy: {dest_disp}");
     }
     println!();
     println!("Restore with:");
     println!("  {restore_cmd}");
     0
+}
+
+/// Whether an interactive confirmation could ACTUALLY have been obtained
+/// (CodeRabbit M13 PR #132 R20 — wrong stream for the interactivity check).
+///
+/// [`super::confirm`] writes its prompt to **stderr** but reads the answer from
+/// **stdin** (`std::io::stdin().read_line`). The decision of whether `confirm`'s
+/// `false` means "operator declined" vs "no prompt was possible" must therefore
+/// key off the stream the ANSWER comes from — stdin. We require BOTH: stdin a
+/// TTY (an answer can be read) AND stderr a TTY (the prompt is visible). Keying
+/// off stderr alone (the old bug) treated a stdin-piped/EOF run with a TTY
+/// stderr as a deliberate "no" (exit 0), when in fact no confirmation was ever
+/// possible — that case must fail non-zero instead.
+fn confirmation_possible() -> bool {
+    is_terminal::is_terminal(std::io::stdin()) && is_terminal::is_terminal(std::io::stderr())
 }
 
 /// Whether a `std::fs::rename` error means the source and destination are on
@@ -955,12 +1008,15 @@ pub fn explain_config(file: &str, json: bool) -> i32 {
         return 0;
     }
 
+    // `path` is a user-supplied arg and `r.detail` embeds raw snippets lifted
+    // from the (untrusted) config content, so both are sanitized before display
+    // (R20). `t.label()` and `r.id` are fixed internal strings, left as-is.
+    let display_path = sanitize_display(&path.display().to_string());
     match tool {
-        Some(t) => println!("{} configures {}.", path.display(), t.label()),
+        Some(t) => println!("{display_path} configures {}.", t.label()),
         None => {
             println!(
-                "{} is not a recognised AI-config file — showing any content risks found.",
-                path.display()
+                "{display_path} is not a recognised AI-config file — showing any content risks found."
             );
         }
     }
@@ -970,7 +1026,7 @@ pub fn explain_config(file: &str, json: bool) -> i32 {
     } else {
         println!("Capabilities / risks this config grants or signals:");
         for r in &risks {
-            println!("  - [{}] {}", r.id, r.detail);
+            println!("  - [{}] {}", r.id, sanitize_display(&r.detail));
         }
     }
     0
@@ -1030,10 +1086,12 @@ fn snapshot_status(json: bool) -> i32 {
 
     match snap {
         Some(s) => {
+            // `root` is read back from the on-disk snapshot (a repo path); sanitize
+            // it before display for the same reason as the other AI-derived fields.
             println!("AI-config snapshot:");
             println!("  path:       {path_str}");
             println!("  recorded:   {}", s.updated_at);
-            println!("  root:       {}", s.root);
+            println!("  root:       {}", sanitize_display(&s.root));
             println!("  files:      {}", s.files.len());
             println!();
             println!("Compare the current tree against it with `tirith ai diff`.");
@@ -1285,6 +1343,69 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CodeRabbit M13 PR #132 R20: every untrusted, AI-config-derived string that
+    // `tirith ai` prints in human mode is routed through `sanitize_display`,
+    // which must strip raw terminal-control bytes so a hostile config cannot
+    // spoof terminal output. Assert the load-bearing property directly: a field
+    // carrying a CSI colour escape (`\x1b[31m…`) is rendered with NO raw ESC
+    // (0x1B) byte, while the visible text survives.
+    #[test]
+    fn sanitize_display_strips_terminal_escapes() {
+        let hostile = "\x1b[31mFAKE ALERT\x1b[0m drop tables";
+        let safe = sanitize_display(hostile);
+        assert!(
+            !safe.contains('\u{1b}'),
+            "sanitized output must contain no raw ESC byte, got: {safe:?}"
+        );
+        // The CSI sequences are gone but the human-readable payload remains.
+        assert!(
+            safe.contains("FAKE ALERT") && safe.contains("drop tables"),
+            "visible text must survive sanitization, got: {safe:?}"
+        );
+        assert!(
+            !safe.contains("[31m") && !safe.contains("[0m"),
+            "the CSI bodies must be consumed with the ESC, got: {safe:?}"
+        );
+
+        // A bare OSC sequence (used for e.g. clipboard write / title spoofing) is
+        // also fully removed — ESC, the `]…`, and the BEL terminator.
+        let osc = "before\x1b]0;pwned\x07after";
+        let safe_osc = sanitize_display(osc);
+        assert!(
+            !safe_osc.contains('\u{1b}') && !safe_osc.contains('\u{7}'),
+            "OSC escape + BEL terminator must be stripped, got: {safe_osc:?}"
+        );
+        assert!(
+            safe_osc.contains("before") && safe_osc.contains("after"),
+            "text around the OSC sequence must survive, got: {safe_osc:?}"
+        );
+
+        // Embedded newlines/tabs (which the underlying filter keeps) are flattened
+        // to spaces so one display field stays on a single line.
+        let multiline = "line1\nline2\tcol";
+        assert_eq!(sanitize_display(multiline), "line1 line2 col");
+    }
+
+    // CodeRabbit M13 PR #132 R20: the `--move` confirmation gate must key its
+    // "could we prompt?" decision off the stream `confirm` reads the ANSWER from
+    // (stdin), not just stderr. The predicate is the conjunction stdin-TTY AND
+    // stderr-TTY, so the only deterministic assertion in a unit test (cargo runs
+    // tests with BOTH stdin and stderr piped, i.e. not TTYs) is that it returns
+    // `false` here — exactly the non-interactive case that must fail non-zero
+    // (exit 2) rather than be mistaken for a deliberate "no" (exit 0). A full
+    // TTY-vs-EOF end-to-end check is not unit-testable without a pty, so we pin
+    // the decision seam itself: in a non-interactive context confirmation is
+    // impossible, which is what routes `quarantine --move` (without `--yes`) to
+    // the emit_error + return 2 branch.
+    #[test]
+    fn confirmation_impossible_without_a_tty() {
+        assert!(
+            !confirmation_possible(),
+            "with stdin/stderr piped (the cargo-test default, no TTY), an interactive \
+             confirmation must be reported impossible so the no-TTY branch fails non-zero"
+        );
+    }
 
     // CodeRabbit M13 round-2 R7: the quarantine restore hint must be OS-aware.
     // R15-ai.rs:780: the command must include a literal `--` before the path

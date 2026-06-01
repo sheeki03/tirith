@@ -413,6 +413,18 @@ pub fn explain(rule_id: &str, json: bool) -> i32 {
     if count > 1 {
         return emit_duplicate_rule("explain", rule_id, count, json);
     }
+    // Gate `explain` through the SAME `compile_rules` step `test` uses (CodeRabbit
+    // M13 PR #132 R20). `compile_rules` clamps contexts, rejects unsupported
+    // predicates (e.g. `agent.kind`), and dedups — so a rule the engine would
+    // drop must NOT be described as if it were live. If the named rule is absent
+    // from the compiled set it is invalid and would be skipped by the engine;
+    // report that (matching `test`'s `emit_invalid_rule`) instead of rendering
+    // the raw entry. The duplicate-id / not-found checks above already ran against
+    // the raw policy, so reaching here means exactly one entry carries this id.
+    let compiled = compile_rules(&policy.custom_rules);
+    if !compiled.iter().any(|r| r.id == rule_id) {
+        return emit_invalid_rule("explain", rule_id, json);
+    }
     let rule = match policy.custom_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r,
         None => {
@@ -889,6 +901,35 @@ mod tests {
         assert!(
             !policy_validate_has_coverage_error(yaml, "file-ctx-file"),
             "policy validate must AGREE: no coverage error for the explicit-[file] rule"
+        );
+    }
+
+    // CodeRabbit M13 PR #132 R20: `rule explain` must route through the SAME
+    // `compile_rules` gate `rule test` uses, so it can never DESCRIBE a rule the
+    // engine would drop (and that `test`/`validate` reject). `agent.kind` is an
+    // unsupported predicate — `compile_rules` skips any rule using it — so a
+    // policy whose only rule uses `agent.kind` compiles to the EMPTY set, which
+    // is exactly the condition `explain`'s gate keys off to return
+    // `emit_invalid_rule` (the same path `test` takes). Pin both halves of that
+    // gate: (1) the rule is dropped by `compile_rules`, and (2) the explain-side
+    // rejection is non-zero — matching `test`.
+    #[test]
+    fn explain_rejects_unsupported_predicate_rule_via_compile_gate() {
+        let yaml = "custom_rules:\n  - id: agent-kind-only\n    when:\n      agent.kind: aider\n    title: \"unsupported predicate rule\"\n";
+        let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
+        // (1) `compile_rules` drops the `agent.kind` rule, so it is absent from
+        // the compiled set — the precise condition `explain`'s new gate detects.
+        let compiled = compile_rules(&policy.custom_rules);
+        assert!(
+            !compiled.iter().any(|r| r.id == "agent-kind-only"),
+            "compile_rules must drop the agent.kind rule (unsupported predicate)"
+        );
+        // (2) Given that absence, `explain` returns `emit_invalid_rule`, the SAME
+        // rejection `test` uses — a non-zero exit, never a render of the raw entry.
+        let code = emit_invalid_rule("explain", "agent-kind-only", true);
+        assert_ne!(
+            code, 0,
+            "explain must reject an engine-dropped rule non-zero, matching `test`"
         );
     }
 }

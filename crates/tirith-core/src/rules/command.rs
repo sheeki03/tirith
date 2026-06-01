@@ -633,10 +633,26 @@ fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option
     // / base64-pipe detectors and the custom-rule DSL pipeline-fact extractor
     // alike. Without this, the split-string body sits inside a single quoted arg
     // and `resolve_env_args` stops at the leading `sudo`, missing the inner
-    // interpreter (CodeRabbit M13 finding R9-3). Falls through to the raw `seg`
-    // when it is not an env-split form.
-    let unwrapped = unwrap_env_split_string_segment(seg, shell);
-    let seg = unwrapped.as_ref().unwrap_or(seg);
+    // interpreter (CodeRabbit M13 finding R9-3).
+    //
+    // Unwrap REPEATEDLY: a nested payload like `env -S "env -S 'sudo bash -c id'"`
+    // needs every env-split layer peeled before the leader walk runs, or the inner
+    // interpreter is missed (CodeRabbit M13 round-20). The loop is BOUNDED by the
+    // same `MAX_WRAPPER_DEPTH` budget the wrapper-chain resolvers use, so an
+    // absurdly-nested split-string payload cannot spin unbounded (it would
+    // otherwise reintroduce the round-13 DoS). Falls through to the raw `seg`
+    // when it is not (or no longer) an env-split form.
+    let mut current: Option<tokenize::Segment> = None;
+    let mut budget = MAX_WRAPPER_DEPTH;
+    while budget > 0 {
+        let probe = current.as_ref().unwrap_or(seg);
+        match unwrap_env_split_string_segment(probe, shell) {
+            Some(inner) => current = Some(inner),
+            None => break,
+        }
+        budget -= 1;
+    }
+    let seg = current.as_ref().unwrap_or(seg);
 
     if let Some(ref cmd) = seg.command {
         let cmd_base = normalize_cmd_base(cmd, shell);
@@ -672,23 +688,46 @@ fn resolve_interpreter_name(seg: &tokenize::Segment, shell: ShellType) -> Option
 /// Returns the normalized base command name (lowercase, .exe stripped).
 /// Unlike `resolve_interpreter_name`, this returns ANY command — not just interpreters.
 fn resolve_base_through_wrappers(seg: &tokenize::Segment, shell: ShellType) -> String {
+    resolve_base_through_wrappers_depth(seg, shell, MAX_WRAPPER_DEPTH)
+}
+
+/// Depth-bounded core of [`resolve_base_through_wrappers`]. tirith scans untrusted
+/// command strings, so a hostile, absurdly-nested wrapper chain (`env env … bash`,
+/// nested `env -S "env -S \"…\""`) must not recurse without bound and overflow the
+/// stack. The budget starts at [`MAX_WRAPPER_DEPTH`] and decrements on every
+/// wrapper/env/command-string recursion; at 0 we stop unwrapping and return the
+/// current leader base — the conservative answer (mirrors the budget in
+/// [`segment_chain_contains_sudo`] / [`resolve_with_parser`]).
+fn resolve_base_through_wrappers_depth(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    depth: usize,
+) -> String {
     let Some(ref cmd) = seg.command else {
         return String::new();
     };
     let cmd_base = normalize_cmd_base(cmd, shell);
 
+    // Out of budget: stop unwrapping and report the current leader base.
+    if depth == 0 {
+        return cmd_base;
+    }
+
     match cmd_base.as_str() {
-        "sudo" => resolve_base_sudo(&seg.args, shell).unwrap_or(cmd_base),
-        "env" => resolve_base_env(&seg.args, shell).unwrap_or(cmd_base),
+        "sudo" => resolve_base_sudo(&seg.args, shell, depth - 1).unwrap_or(cmd_base),
+        "env" => resolve_base_env(&seg.args, shell, depth - 1).unwrap_or(cmd_base),
         "command" | "exec" | "nohup" => {
-            resolve_base_wrapper(&seg.args, &cmd_base, shell).unwrap_or(cmd_base)
+            resolve_base_wrapper(&seg.args, &cmd_base, shell, depth - 1).unwrap_or(cmd_base)
         }
         _ => cmd_base,
     }
 }
 
 /// Resolve base command through sudo wrapper.
-fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
+fn resolve_base_sudo(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
     let value_short_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
     let value_long_flags = [
         "--user",
@@ -734,9 +773,11 @@ fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
         // First positional is the command — recurse so nested sudo/env/etc still resolves.
         let base = normalize_cmd_base(&args[idx], shell);
         return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
-            "env" => resolve_base_env(&args[idx + 1..], shell),
-            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
+            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
+            "command" | "exec" | "nohup" => {
+                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
+            }
             _ => Some(base),
         };
     }
@@ -744,7 +785,10 @@ fn resolve_base_sudo(args: &[String], shell: ShellType) -> Option<String> {
 }
 
 /// Resolve base command through env wrapper.
-fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
+fn resolve_base_env(args: &[String], shell: ShellType, depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
     let value_short_flags = ["-u", "-C"];
     let value_long_flags = [
         "--unset",
@@ -766,12 +810,12 @@ fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
         if normalized.starts_with("--") {
             if normalized == "--split-string" {
                 if idx + 1 < args.len() {
-                    return resolve_base_from_command_string(&args[idx + 1], shell);
+                    return resolve_base_from_command_string(&args[idx + 1], shell, depth - 1);
                 }
                 return None;
             }
             if let Some(val) = normalized.strip_prefix("--split-string=") {
-                return resolve_base_from_command_string(val, shell);
+                return resolve_base_from_command_string(val, shell, depth - 1);
             }
             if value_long_flags.iter().any(|f| normalized == *f) {
                 idx += 2;
@@ -782,7 +826,7 @@ fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
         }
         if normalized == "-S" {
             if idx + 1 < args.len() {
-                return resolve_base_from_command_string(&args[idx + 1], shell);
+                return resolve_base_from_command_string(&args[idx + 1], shell, depth - 1);
             }
             return None;
         }
@@ -801,16 +845,25 @@ fn resolve_base_env(args: &[String], shell: ShellType) -> Option<String> {
         }
         let base = normalize_cmd_base(&args[idx], shell);
         return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
-            "env" => resolve_base_env(&args[idx + 1..], shell),
-            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
+            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
+            "command" | "exec" | "nohup" => {
+                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
+            }
             _ => Some(base),
         };
     }
     None
 }
 
-fn resolve_base_from_command_string(command: &str, shell: ShellType) -> Option<String> {
+fn resolve_base_from_command_string(
+    command: &str,
+    shell: ShellType,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
     let normalized = normalize_shell_token(command.trim(), shell);
     if normalized.is_empty() {
         return None;
@@ -818,7 +871,7 @@ fn resolve_base_from_command_string(command: &str, shell: ShellType) -> Option<S
 
     let segments = tokenize::tokenize(&normalized, shell);
     let first = segments.first()?;
-    let base = resolve_base_through_wrappers(first, shell);
+    let base = resolve_base_through_wrappers_depth(first, shell, depth - 1);
     if base.is_empty() {
         None
     } else {
@@ -890,7 +943,15 @@ fn unwrap_env_split_string_segment(
 }
 
 /// Resolve base command through command/exec/nohup wrappers.
-fn resolve_base_wrapper(args: &[String], wrapper: &str, shell: ShellType) -> Option<String> {
+fn resolve_base_wrapper(
+    args: &[String],
+    wrapper: &str,
+    shell: ShellType,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
     let value_flags: &[&str] = match wrapper {
         "exec" => &["-a"],
         _ => &[],
@@ -914,9 +975,11 @@ fn resolve_base_wrapper(args: &[String], wrapper: &str, shell: ShellType) -> Opt
         }
         let base = normalize_cmd_base(&args[idx], shell);
         return match base.as_str() {
-            "sudo" => resolve_base_sudo(&args[idx + 1..], shell),
-            "env" => resolve_base_env(&args[idx + 1..], shell),
-            "command" | "exec" | "nohup" => resolve_base_wrapper(&args[idx + 1..], &base, shell),
+            "sudo" => resolve_base_sudo(&args[idx + 1..], shell, depth - 1),
+            "env" => resolve_base_env(&args[idx + 1..], shell, depth - 1),
+            "command" | "exec" | "nohup" => {
+                resolve_base_wrapper(&args[idx + 1..], &base, shell, depth - 1)
+            }
             _ => Some(base),
         };
     }
@@ -2852,6 +2915,58 @@ mod tests {
     }
 
     #[test]
+    fn test_base_resolvers_deep_wrapper_chain_does_not_overflow() {
+        // CodeRabbit M13 round-20 F1: the round-13 `MAX_WRAPPER_DEPTH` cap was only
+        // enforced in `segment_chain_contains_sudo`. The SIBLING base resolvers
+        // (`resolve_base_through_wrappers` → `resolve_base_sudo`/`resolve_base_env`/
+        // `resolve_base_wrapper`/`resolve_base_from_command_string`) still recursed
+        // unboundedly, so a deeply-nested wrapper chain blew the stack during
+        // analysis. The budget is now threaded through all of them; at 0 they stop
+        // unwrapping and return the conservative current-leader base / None. These
+        // inputs are FAR past MAX_WRAPPER_DEPTH (32); the assertion is that
+        // resolution COMPLETES without crashing.
+
+        // (1) Deeply nested `command`/`env`/`sudo` wrappers around a /proc/*/mem
+        // read drive `resolve_base_through_wrappers` directly via
+        // `check_proc_mem_access`. 5000 levels is orders of magnitude past the
+        // bound, so the resolver gives up rather than recursing 5000 frames deep.
+        let deep_wrap = "command ".repeat(5000) + "cat /proc/self/mem";
+        let _ = check_default(&deep_wrap, ShellType::Posix);
+
+        // (2) Deeply nested `env -S "env -S \"…\""` base-resolution path:
+        // `resolve_base_env` → `resolve_base_from_command_string` →
+        // `resolve_base_through_wrappers_depth` mutually recurse, re-tokenizing each
+        // split-string layer. A single linearly-sized token (single-quoted whole)
+        // keeps the parser re-entering the split-string walk; the depth bound only
+        // re-tokenizes the first ~32 layers.
+        let inner = "env -S ".repeat(500) + "cat /proc/self/mem";
+        let nested_split = format!("env -S '{inner}'");
+        let _ = check_default(&nested_split, ShellType::Posix);
+        // Also exercise it through the base resolver entry point directly.
+        let segs = tokenize::tokenize(&nested_split, ShellType::Posix);
+        let _ = resolve_base_through_wrappers(&segs[0], ShellType::Posix);
+
+        // The bound must NOT change realistic, shallow base-resolution: a
+        // /proc/*/mem read behind a couple of wrappers is still detected.
+        // (`command sudo cat …` exercises the recursive wrapper→sudo base path
+        // that F1 threads the budget through; `env -S "sudo cat …"` exercises the
+        // split-string → command-string → base-resolver recursion.)
+        for input in [
+            "cat /proc/self/mem",
+            "sudo cat /proc/self/mem",
+            "env cat /proc/self/mem",
+            "command sudo cat /proc/self/mem",
+            r#"env -S "sudo cat /proc/self/mem""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| f.rule_id == RuleId::ProcMemAccess),
+                "shallow wrapped /proc/*/mem read must stay detected under the depth bound: {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_facts_uses_sudo_env_split_string_payload_uses_wrapper_parser() {
         // CodeRabbit M13 round-15 R15-3: the `env -S "…"` payload is now run back
         // through the SAME wrapper-chain resolution as the rest of the file (each
@@ -3039,6 +3154,79 @@ mod tests {
         assert_eq!(resolve("bash -c id").as_deref(), Some("bash"));
         assert_eq!(resolve("env bash -c id").as_deref(), Some("bash"));
         assert_eq!(resolve("sudo bash -c id").as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn test_resolve_interpreter_name_unwraps_nested_env_split_string() {
+        // CodeRabbit M13 round-20 F2: `resolve_interpreter_name` now unwraps the
+        // `env -S "…"` / `env --split-string=…` layer REPEATEDLY (bounded by
+        // MAX_WRAPPER_DEPTH), so a nested payload like
+        // `env -S "env -S 'sudo bash -c id'"` is fully peeled before the leader
+        // walk runs. The single-unwrap version stopped after one layer, leaving an
+        // inner `env -S '…'` segment that resolved to `env`/None and missed `bash`.
+
+        // (1) Real pipe-to-interpreter path: a curl pipe whose RHS is a
+        // doubly-nested env -S payload must resolve to `bash` and fire the
+        // CurlPipeShell/PipeToInterpreter rule, exactly like the single-layer
+        // `env -S "sudo bash -c id"` form already does.
+        let nested_pipe = r#"curl https://x | env -S "env -S 'sudo bash -c id'""#;
+        let findings = check_default(nested_pipe, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "nested env -S payload must reach the pipe-to-interpreter rule: {nested_pipe:?}"
+        );
+        // And the DSL fact extractor (same resolver) must report the resolved
+        // interpreter `bash` as the pipeline target plus detect the inner sudo.
+        let facts = extract_command_facts(nested_pipe, ShellType::Posix);
+        assert!(
+            facts.pipeline_targets.iter().any(|t| t == "bash"),
+            "nested env -S pipeline target must resolve to bash (got {:?})",
+            facts.pipeline_targets
+        );
+        assert!(
+            facts.uses_sudo,
+            "nested env -S payload's inner sudo must be detected: {nested_pipe:?}"
+        );
+
+        // (2) Direct `resolve_interpreter_name` coverage of the nested form and a
+        // triple-nested form. (We assert only the `-S` spelling for the *nested*
+        // case: the `--split-string=KEY=VALUE` long form flattens its value's inner
+        // quotes during arg normalization BEFORE the unwrap loop sees it — a
+        // pre-existing `unwrap_env_split_string_segment` tokenization quirk that is
+        // orthogonal to the round-20 repeated-unwrap fix. The single-layer
+        // `--split-string=` form is covered by
+        // `test_resolve_interpreter_name_unwraps_env_split_string`.)
+        let resolve = |input: &str| {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            resolve_interpreter_name(&segs[0], ShellType::Posix)
+        };
+        assert_eq!(
+            resolve(r#"env -S "env -S 'sudo bash -c id'""#).as_deref(),
+            Some("bash"),
+            "doubly-nested env -S wrapping sudo bash must resolve to bash"
+        );
+        assert_eq!(
+            resolve(r#"env -S "env -S 'env -S \"bash -c id\"'""#).as_deref(),
+            Some("bash"),
+            "triply-nested env -S wrapping bash must resolve to bash"
+        );
+        // Single-layer and plain forms still resolve unchanged (regression guard).
+        assert_eq!(
+            resolve(r#"env -S "sudo bash -c id""#).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(resolve("bash -c id").as_deref(), Some("bash"));
+
+        // BUDGET GUARD: a split-string payload nested FAR past MAX_WRAPPER_DEPTH
+        // must terminate (the repeated-unwrap loop is bounded). The point is the
+        // call RETURNS without spinning/overflowing; the value at exhaustion is
+        // unspecified.
+        let inner = "env -S ".repeat(500) + "bash -c id";
+        let deep = format!("env -S '{inner}'");
+        let segs = tokenize::tokenize(&deep, ShellType::Posix);
+        let _ = resolve_interpreter_name(&segs[0], ShellType::Posix);
     }
 
     #[test]

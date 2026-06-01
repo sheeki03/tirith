@@ -196,6 +196,34 @@ pub enum PolicyTemplate {
 }
 
 impl PolicyTemplate {
+    /// Every template variant, in the canonical display order. The single source
+    /// of truth for "which templates exist" (CodeRabbit M13 PR #132 R20): the
+    /// `--template` help list is BUILT from this via [`canonical_name`], so
+    /// adding or renaming a variant can never leave the help string stale.
+    ///
+    /// [`canonical_name`]: PolicyTemplate::canonical_name
+    pub const ALL: &'static [PolicyTemplate] = &[
+        Self::Individual,
+        Self::CiStrict,
+        Self::AiAgentHeavy,
+        Self::OssMaintainer,
+        Self::Startup,
+        Self::Enterprise,
+        Self::McpStrict,
+    ];
+
+    /// The comma-separated list of canonical template names for help / error
+    /// text, derived from [`ALL`] so it stays in lock-step with the enum.
+    ///
+    /// [`ALL`]: PolicyTemplate::ALL
+    fn names_csv() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| t.canonical_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Parse a `--template` value. Returns `None` for an unrecognized name.
     ///
     /// `personal` is accepted as an ALIAS for `individual`: `personal` is the
@@ -255,10 +283,9 @@ pub fn init(force: bool, minimal: bool, template: Option<&str>) -> i32 {
             Some(t) => Some(t),
             None => {
                 eprintln!("tirith policy init: unknown template '{name}'");
-                eprintln!(
-                    "  valid templates: individual, ci-strict, ai-agent-heavy, \
-                     oss-maintainer, startup, enterprise, mcp-strict"
-                );
+                // Derived from `PolicyTemplate::ALL` so this list can never drift
+                // from the actual variants (R20).
+                eprintln!("  valid templates: {}", PolicyTemplate::names_csv());
                 eprintln!("  ('personal' is accepted as an alias of 'individual')");
                 return 1;
             }
@@ -885,6 +912,36 @@ mod tests {
     #[test]
     fn individual_template_validates() {
         assert_template_valid("individual", TEMPLATE_INDIVIDUAL);
+    }
+
+    // CodeRabbit M13 PR #132 R20: the `--template` help/error list is DERIVED
+    // from `PolicyTemplate::ALL` via `canonical_name`, not hand-maintained, so it
+    // can never drift from the actual variants. Assert the derived CSV contains
+    // every canonical name AND that every name in it round-trips through `parse`
+    // back to a variant (so a stale/typo'd entry can't sneak in).
+    #[test]
+    fn template_names_csv_covers_every_variant() {
+        let csv = PolicyTemplate::names_csv();
+        for t in PolicyTemplate::ALL {
+            let name = t.canonical_name();
+            assert!(
+                csv.split(", ").any(|n| n == name),
+                "names_csv ({csv:?}) must list the canonical name {name:?} for {t:?}"
+            );
+        }
+        // Every comma-separated entry is a real, parseable canonical name.
+        for entry in csv.split(", ") {
+            assert!(
+                PolicyTemplate::parse(entry).is_some(),
+                "names_csv entry {entry:?} must parse back to a PolicyTemplate variant"
+            );
+        }
+        // The count matches: no duplicates, no extras.
+        assert_eq!(
+            csv.split(", ").count(),
+            PolicyTemplate::ALL.len(),
+            "names_csv must have exactly one entry per variant"
+        );
     }
 
     #[test]

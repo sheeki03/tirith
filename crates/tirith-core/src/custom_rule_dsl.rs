@@ -199,68 +199,138 @@ impl Serialize for WhenClause {
     }
 }
 
-impl<'de> Deserialize<'de> for WhenClause {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ClauseVisitor;
+/// Maximum nesting depth of a `when:` clause tree, enforced DURING
+/// deserialization. The `all`/`any`/`not` combinators recurse, so a hostile
+/// repo-local `.tirith/policy.yaml` with deeply-nested `{not: {not: {not: …}}}`
+/// could otherwise stack-overflow `policy validate` / `rule validate` while
+/// deserializing untrusted input (DoS). 64 is comfortably above any real rule
+/// (the env-`-S` wrapper cap is 32) yet far below a depth that would exhaust the
+/// stack. The root clause is depth 1; each combinator's children are one deeper.
+/// (CodeRabbit M13 round-20 custom_rule_dsl.rs:202-264.)
+const MAX_CLAUSE_DEPTH: usize = 64;
 
-        impl<'de> Visitor<'de> for ClauseVisitor {
-            type Value = WhenClause;
+/// A [`DeserializeSeed`] that threads the current nesting depth through the
+/// recursive `all`/`any`/`not` cases so the [`MAX_CLAUSE_DEPTH`] bound is
+/// enforced as the tree is built (not after — by which point the recursion has
+/// already run and possibly overflowed the stack). Each combinator deserializes
+/// its children with `depth + 1`; leaf predicates do not recurse.
+struct ClauseSeed {
+    depth: usize,
+}
 
+impl<'de> de::DeserializeSeed<'de> for ClauseSeed {
+    type Value = WhenClause;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        if self.depth > MAX_CLAUSE_DEPTH {
+            return Err(de::Error::custom(format!(
+                "when-clause nesting too deep (max {MAX_CLAUSE_DEPTH})"
+            )));
+        }
+        deserializer.deserialize_map(ClauseVisitor { depth: self.depth })
+    }
+}
+
+/// Deserializes a `Vec<WhenClause>` (the `all` / `any` children) such that each
+/// element carries the parent's `depth` — i.e. the children are one level deeper
+/// than the combinator node itself.
+struct ClauseVecSeed {
+    depth: usize,
+}
+
+impl<'de> de::DeserializeSeed<'de> for ClauseVecSeed {
+    type Value = Vec<WhenClause>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct VecVisitor {
+            depth: usize,
+        }
+        impl<'de> Visitor<'de> for VecVisitor {
+            type Value = Vec<WhenClause>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a single-key when-clause mapping (e.g. `url.scheme: https`)")
+                f.write_str("a sequence of when-clause nodes")
             }
-
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<WhenClause, M::Error> {
-                let key: String = map
-                    .next_key()?
-                    .ok_or_else(|| de::Error::custom("when-clause must have exactly one key"))?;
-
-                // Helper macros to deserialize the value as a concrete type.
-                macro_rules! val {
-                    ($t:ty) => {{
-                        let v: $t = map.next_value()?;
-                        v
-                    }};
+            fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                let mut out = Vec::new();
+                while let Some(clause) = seq.next_element_seed(ClauseSeed { depth: self.depth })? {
+                    out.push(clause);
                 }
-
-                let clause = match key.as_str() {
-                    "all" => WhenClause::All(val!(Vec<WhenClause>)),
-                    "any" => WhenClause::Any(val!(Vec<WhenClause>)),
-                    "not" => WhenClause::Not(Box::new(val!(WhenClause))),
-                    "command.has_pipeline_to" => {
-                        WhenClause::CommandHasPipelineTo(val!(Vec<String>))
-                    }
-                    "command.uses_sudo" => WhenClause::CommandUsesSudo(val!(bool)),
-                    "command.cwd_in" => WhenClause::CommandCwdIn(val!(Vec<String>)),
-                    "url.host" => WhenClause::UrlHost(val!(String)),
-                    "url.host_matches" => WhenClause::UrlHostMatches(val!(String)),
-                    "url.scheme" => WhenClause::UrlScheme(val!(String)),
-                    "url.reputation" => WhenClause::UrlReputation(val!(Reputation)),
-                    "url.domain_not_in" => WhenClause::UrlDomainNotIn(val!(Vec<String>)),
-                    "package.ecosystem" => WhenClause::PackageEcosystem(val!(String)),
-                    "package.name_matches" => WhenClause::PackageNameMatches(val!(String)),
-                    "package.reputation" => WhenClause::PackageReputation(val!(Reputation)),
-                    "file.path_matches" => WhenClause::FilePathMatches(val!(String)),
-                    "agent.kind" => WhenClause::AgentKind(val!(String)),
-                    "mcp.tool" => WhenClause::McpTool(val!(String)),
-                    other => {
-                        return Err(de::Error::custom(format!(
-                            "unknown when-clause predicate: '{other}'"
-                        )))
-                    }
-                };
-
-                // Reject a second key — a clause node is exactly one predicate.
-                if map.next_key::<String>()?.is_some() {
-                    return Err(de::Error::custom(
-                        "when-clause node must have exactly one key (wrap multiple in `all:`/`any:`)",
-                    ));
-                }
-                Ok(clause)
+                Ok(out)
             }
         }
+        deserializer.deserialize_seq(VecVisitor { depth: self.depth })
+    }
+}
 
-        deserializer.deserialize_map(ClauseVisitor)
+/// The map visitor for a single clause node. Carries `depth` so its recursive
+/// `all`/`any`/`not` values are deserialized at `depth + 1` (see [`ClauseSeed`]).
+struct ClauseVisitor {
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for ClauseVisitor {
+    type Value = WhenClause;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a single-key when-clause mapping (e.g. `url.scheme: https`)")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<WhenClause, M::Error> {
+        let key: String = map
+            .next_key()?
+            .ok_or_else(|| de::Error::custom("when-clause must have exactly one key"))?;
+
+        // Helper macro to deserialize the value as a concrete (non-recursive) type.
+        macro_rules! val {
+            ($t:ty) => {{
+                let v: $t = map.next_value()?;
+                v
+            }};
+        }
+        // Depth at which this node's CHILDREN live (one deeper than this node).
+        let child_depth = self.depth + 1;
+
+        let clause = match key.as_str() {
+            "all" => WhenClause::All(map.next_value_seed(ClauseVecSeed { depth: child_depth })?),
+            "any" => WhenClause::Any(map.next_value_seed(ClauseVecSeed { depth: child_depth })?),
+            "not" => WhenClause::Not(Box::new(
+                map.next_value_seed(ClauseSeed { depth: child_depth })?,
+            )),
+            "command.has_pipeline_to" => WhenClause::CommandHasPipelineTo(val!(Vec<String>)),
+            "command.uses_sudo" => WhenClause::CommandUsesSudo(val!(bool)),
+            "command.cwd_in" => WhenClause::CommandCwdIn(val!(Vec<String>)),
+            "url.host" => WhenClause::UrlHost(val!(String)),
+            "url.host_matches" => WhenClause::UrlHostMatches(val!(String)),
+            "url.scheme" => WhenClause::UrlScheme(val!(String)),
+            "url.reputation" => WhenClause::UrlReputation(val!(Reputation)),
+            "url.domain_not_in" => WhenClause::UrlDomainNotIn(val!(Vec<String>)),
+            "package.ecosystem" => WhenClause::PackageEcosystem(val!(String)),
+            "package.name_matches" => WhenClause::PackageNameMatches(val!(String)),
+            "package.reputation" => WhenClause::PackageReputation(val!(Reputation)),
+            "file.path_matches" => WhenClause::FilePathMatches(val!(String)),
+            "agent.kind" => WhenClause::AgentKind(val!(String)),
+            "mcp.tool" => WhenClause::McpTool(val!(String)),
+            other => {
+                return Err(de::Error::custom(format!(
+                    "unknown when-clause predicate: '{other}'"
+                )))
+            }
+        };
+
+        // Reject a second key — a clause node is exactly one predicate.
+        if map.next_key::<String>()?.is_some() {
+            return Err(de::Error::custom(
+                "when-clause node must have exactly one key (wrap multiple in `all:`/`any:`)",
+            ));
+        }
+        Ok(clause)
+    }
+}
+
+impl<'de> Deserialize<'de> for WhenClause {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The root clause is depth 1; the bound is enforced inside [`ClauseSeed`].
+        de::DeserializeSeed::deserialize(ClauseSeed { depth: 1 }, deserializer)
     }
 }
 
@@ -863,19 +933,22 @@ fn looks_like_windows_path(s: &str) -> bool {
 }
 
 /// `true` only when `s` is an ABSOLUTE Windows path: a drive letter + `:`
-/// followed by a separator (slash/backslash) OR end-of-string (`C:/…`, `c:\…`,
-/// bare `C:`), or a leading `//` UNC / double-separator root. Unlike
-/// [`looks_like_windows_path`], this rejects drive-RELATIVE forms like
-/// `C:relative` (a path relative to the drive's current directory), which are
-/// NOT absolute and must not be treated as root-contained (CodeRabbit M13
-/// round-19 custom_rule_dsl.rs:884-891).
+/// followed by a separator (slash/backslash) — `C:/…`, `c:\…` — or a leading
+/// `//` UNC / double-separator root. Unlike [`looks_like_windows_path`], this
+/// rejects drive-RELATIVE forms: BOTH a bare `C:` and `C:relative` are relative
+/// to the drive's current directory in Windows path semantics (Rust's
+/// `Path::new("C:").is_absolute()` is `false`), so neither is absolute and
+/// neither may be treated as root-contained (CodeRabbit M13 round-20
+/// custom_rule_dsl.rs:872-879, correcting the round-19 fix that wrongly accepted
+/// bare `C:`).
 fn is_windows_absolute_path(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Drive letter root: `X:` then a separator, or `X:` at end of string.
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        // (Back-slashes are normalized to `/` before this is reached, but accept
-        // both so the helper is correct independent of that pre-pass.)
-        return bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\';
+    // Drive-letter ROOT requires a drive letter, `:`, AND a separator — a bare
+    // `C:` (len == 2) or `C:relative` (no separator at byte 2) is drive-relative,
+    // NOT absolute. (Back-slashes are normalized to `/` before this is reached,
+    // but accept both so the helper is correct independent of that pre-pass.)
+    if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return bytes[2] == b'/' || bytes[2] == b'\\';
     }
     // UNC / double-separator root (already back-slash-normalized to `/`).
     s.starts_with("//")
@@ -1123,6 +1196,49 @@ any:
             reputation: Reputation::Known,
         });
         assert!(evaluate(&clause, &ctx3));
+    }
+
+    #[test]
+    fn test_deeply_nested_clause_is_rejected_with_depth_error() {
+        // CodeRabbit M13 round-20 custom_rule_dsl.rs:202-264 (DoS): the recursive
+        // `not`/`all`/`any` cases must be depth-bounded DURING deserialization so a
+        // hostile repo-local policy cannot stack-overflow `policy validate`.
+        // Build `not: { not: { not: ... { url.scheme: https } } }` nested well past
+        // the cap, as flow-style YAML.
+        let over = MAX_CLAUSE_DEPTH + 5;
+        let mut yaml = String::new();
+        for _ in 0..over {
+            yaml.push_str("not: {");
+        }
+        yaml.push_str("url.scheme: https");
+        for _ in 0..over {
+            yaml.push('}');
+        }
+        let err = serde_yaml::from_str::<WhenClause>(&yaml)
+            .expect_err("a clause nested past the cap must be REJECTED, not parsed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nesting too deep"),
+            "expected the depth error, got: {msg}"
+        );
+
+        // A tree AT the cap still parses. The root clause is depth 1 and each
+        // `not:` wrapper is its own clause NODE, so K wrappers occupy depths
+        // 1..=K and the innermost leaf node (`url.scheme: …`) is at depth K+1.
+        // The deepest node must satisfy `depth <= MAX_CLAUSE_DEPTH`, so the
+        // boundary is K+1 == MAX_CLAUSE_DEPTH, i.e. (MAX_CLAUSE_DEPTH - 1)
+        // wrappers around the leaf. That case must be ACCEPTED.
+        let at_cap_wrappers = MAX_CLAUSE_DEPTH - 1;
+        let mut ok = String::new();
+        for _ in 0..at_cap_wrappers {
+            ok.push_str("not: {");
+        }
+        ok.push_str("url.scheme: https");
+        for _ in 0..at_cap_wrappers {
+            ok.push('}');
+        }
+        serde_yaml::from_str::<WhenClause>(&ok)
+            .expect("a clause nested exactly at the cap must still parse");
     }
 
     // CodeRabbit M13 round-4 N5: `*_matches` predicates compile their regex
@@ -1564,20 +1680,27 @@ any:
 
     #[test]
     fn test_path_is_under_root_sentinel_rejects_drive_relative() {
-        // CodeRabbit M13 round-19 custom_rule_dsl.rs:884-891: the old root
-        // sentinel used `looks_like_windows_path`, which also matches drive-
-        // RELATIVE forms (`C:relative` — relative to the drive's current dir, NOT
-        // absolute), so a non-absolute path was wrongly treated as root-contained.
-        // Drive-letter ABSOLUTES still count:
+        // CodeRabbit M13 round-20 custom_rule_dsl.rs:872-879 (correcting round-19):
+        // the root sentinel must treat ONLY genuinely-absolute Windows paths as
+        // root-contained. `C:/x` / `C:\x` (drive + separator) are absolute; a bare
+        // `C:` and `C:relative` are drive-RELATIVE (relative to the drive's current
+        // dir) and must NOT be root-contained.
+        // Drive-letter ABSOLUTES (with a separator) count:
         assert!(
             path_is_under("C:/x", "/"),
             "drive-letter absolute (with separator) is root-contained"
         );
         assert!(
-            path_is_under("C:", "/"),
-            "bare drive root `C:` is an absolute root and is root-contained"
+            path_is_under(r"C:\x", "/"),
+            "drive-letter absolute (back-slash) is root-contained"
         );
-        // But a drive-RELATIVE path is NOT absolute, so NOT root-contained:
+        // Bare `C:` is drive-RELATIVE (NOT absolute) — round-20 correction:
+        assert!(
+            !path_is_under("C:", "/"),
+            "bare drive `C:` (no separator) is drive-relative, NOT absolute, so \
+             NOT root-contained"
+        );
+        // And `C:relative` is likewise drive-RELATIVE, so NOT root-contained:
         assert!(
             !path_is_under("C:relative", "/"),
             "drive-relative `C:relative` (no separator after the colon) is NOT \
@@ -1592,21 +1715,26 @@ any:
 
     #[test]
     fn test_is_windows_absolute_path() {
-        // Drive-letter ABSOLUTES (separator or end-of-string).
+        // Drive-letter ABSOLUTES require a SEPARATOR after the colon.
         assert!(is_windows_absolute_path("C:/x"));
         assert!(is_windows_absolute_path(r"C:\x"));
-        assert!(is_windows_absolute_path("C:")); // bare drive root
         assert!(is_windows_absolute_path("c:/x")); // lower-case drive letter
                                                    // UNC / double-separator root.
         assert!(is_windows_absolute_path("//host/share"));
+        // Round-20 correction: a bare `C:` (drive + colon, no separator) is
+        // drive-RELATIVE in Windows path semantics (`Path::new("C:").is_absolute()`
+        // is false), so it is NOT absolute.
+        assert!(!is_windows_absolute_path("C:"));
         // Drive-RELATIVE (no separator after colon) is NOT absolute.
         assert!(!is_windows_absolute_path("C:relative"));
         // POSIX and bare-relative inputs are not Windows-absolute.
         assert!(!is_windows_absolute_path("/home/x")); // POSIX absolute, handled by `starts_with('/')`
         assert!(!is_windows_absolute_path("relative"));
         assert!(!is_windows_absolute_path(""));
-        // `looks_like_windows_path` is the LOOSER check and DOES match drive-
-        // relative — confirming why the strict variant is needed for the sentinel.
+        // `looks_like_windows_path` is the LOOSER check and DOES match BOTH bare
+        // `C:` and `C:relative` — confirming why the strict variant is needed for
+        // the sentinel.
+        assert!(looks_like_windows_path("C:"));
         assert!(looks_like_windows_path("C:relative"));
     }
 
