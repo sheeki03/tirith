@@ -189,13 +189,13 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             //     here would be wasted work (and a perf risk on a pathological
             //     pattern) AND could push a redundant second issue. The `else if`
             //     guarantees `Regex::new` runs only for an under-cap pattern.
-            if pattern.chars().count() > 1024 {
+            let pattern_chars = pattern.chars().count();
+            if pattern_chars > 1024 {
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!(
-                        "custom_rules.{}: pattern too long ({} chars, max 1024)",
-                        rule.id,
-                        pattern.chars().count()
+                        "custom_rules.{}: pattern too long ({pattern_chars} chars, max 1024)",
+                        rule.id
                     ),
                     field: Some(format!("custom_rules.{}.pattern", rule.id)),
                 });
