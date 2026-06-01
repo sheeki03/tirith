@@ -292,11 +292,14 @@ pub fn any_dsl_rules(compiled: &[CompiledCustomRule]) -> bool {
     compiled.iter().any(|r| r.is_dsl())
 }
 
-/// `true` when the policy carries at least one DSL (`when:`) custom rule that
-/// (a) would actually COMPILE — it has a `when:` clause and uses no unsupported
-/// predicate (`agent.kind` / `mcp.tool`, which [`compile_rules`] always drops) —
-/// AND (b) keys on a SEMANTIC fact the tier-1 fast gate cannot observe
-/// ([`custom_rule_dsl::clause_has_tier1_invisible_predicate`]).
+/// `true` when, FOR THE GIVEN scan context `ctx`, the policy carries at least one
+/// DSL (`when:`) custom rule that (a) would actually COMPILE — it has a `when:`
+/// clause and uses no unsupported predicate (`agent.kind` / `mcp.tool`, which
+/// [`compile_rules`] always drops) — AND (b) keys on a SEMANTIC fact the tier-1
+/// fast gate cannot observe ([`custom_rule_dsl::clause_has_tier1_invisible_predicate`])
+/// — AND (c) WOULD ACTUALLY RUN in `ctx`, i.e. `ctx` is in the rule's resolved
+/// runtime contexts (`declared ∩ satisfiable`), the SAME clamp `compile_rules`
+/// stores as the rule's [`CompiledCustomRule::contexts`].
 ///
 /// # The tier-1 gating bug this prevents (see CLAUDE.md)
 ///
@@ -308,26 +311,51 @@ pub fn any_dsl_rules(compiled: &[CompiledCustomRule]) -> bool {
 /// DSL rules. The engine calls this BEFORE the fast-exit and, when it returns
 /// `true`, forces past the early return so [`check_dsl`] runs for this input.
 ///
+/// # Why CONTEXT-AWARE (CodeRabbit M13 PR #132)
+///
+/// The force-past only buys anything in the context where the rule can FIRE. A
+/// FILE-scoped rule (`file.path_matches`, `context: [file]`) keys on a fact only
+/// the FileScan path populates; `compile_rules` clamps its runtime contexts to
+/// `{file}`, so [`check_dsl`] never evaluates it in Exec/Paste. A
+/// context-AGNOSTIC gate would nonetheless force EVERY Exec/Paste command past
+/// the fast-exit for such a rule — defeating the fast-exit for unrelated input
+/// AND forcing continuation for a rule `compile_rules` would DROP from that
+/// context. Restricting to rules whose resolved runtime contexts INCLUDE `ctx`
+/// keeps the gate in exact lockstep with compile-time context dropping: the gate
+/// forces continuation iff the rule both compiles AND would run in `ctx`.
+///
 /// # Performance
 ///
 /// This runs on the sub-millisecond tier-1 hot path, so it does the CHEAPEST
 /// possible work: an O(rules) scan over the (typically empty/tiny) raw
-/// `custom_rules` list, recursing each `when:` clause tree. It compiles NO regex
-/// and builds NO [`DslEvalContext`] / backing — it only inspects the clause
-/// SHAPE. A policy with no semantic DSL rule pays just the empty-slice scan, so
-/// the common case is unchanged.
+/// `custom_rules` list, recursing each `when:` clause tree, and SHORT-CIRCUITS on
+/// the first forcing rule. It compiles NO regex and builds NO [`DslEvalContext`]
+/// / backing — it only inspects the clause SHAPE plus the cheap context algebra.
+/// A policy with no semantic DSL rule pays just the empty-slice scan, so the
+/// common case is unchanged.
 ///
 /// Operates on the RAW [`CustomRule`]s (not [`CompiledCustomRule`]s) so the
 /// engine can consult it BEFORE the (more expensive) `compile_rules` pass that
-/// today runs only past the fast-exit. The "uses no unsupported predicate" guard
-/// keeps it in lockstep with `compile_rules`: a rule this returns `true` for is
-/// exactly one `compile_rules` would keep and `check_dsl` could fire, so the gate
-/// never forces continuation for a rule that would be dropped as dead anyway.
-pub fn any_semantic_only_dsl_rules(rules: &[CustomRule]) -> bool {
+/// today runs only past the fast-exit. Reusing [`parse_contexts`] +
+/// [`custom_rule_dsl::resolve_runtime_contexts`] — the exact `declared` source and
+/// clamp helper `compile_rules` uses — keeps it in lockstep with `compile_rules`:
+/// a rule this returns `true` for is exactly one `compile_rules` would keep, run
+/// in `ctx`, and `check_dsl` could fire — so the gate never forces continuation
+/// for a rule that would be dropped (as dead, or as not running in `ctx`) anyway.
+pub fn any_semantic_only_dsl_rules_for_context(rules: &[CustomRule], ctx: ScanContext) -> bool {
     rules.iter().any(|rule| match &rule.when {
         Some(clause) => {
+            // (a) compiles (not a dead agent.kind / mcp.tool rule) AND
+            // (b) keys on a tier-1-invisible fact AND
+            // (c) actually runs in `ctx` — resolved through the SAME
+            //     `parse_contexts` + `resolve_runtime_contexts` clamp
+            //     `compile_rules` uses, so the gate can't drift from compile-time
+            //     context dropping. Ordered cheapest-first; the clamp is last so a
+            //     dead / tier-1-visible rule skips it.
             custom_rule_dsl::clause_uses_unsupported_predicate(clause).is_none()
                 && clause_has_tier1_invisible_predicate(clause)
+                && custom_rule_dsl::resolve_runtime_contexts(&parse_contexts(rule), clause)
+                    .contains(&ctx)
         }
         None => false,
     })
@@ -529,31 +557,35 @@ mod tests {
     fn test_any_semantic_only_dsl_rules_classification() {
         // Tier-1 gating guard (CodeRabbit M13 PR #132): the engine consults this
         // BEFORE the fast-exit to decide whether a semantic-only DSL rule must
-        // force continuation.
+        // force continuation IN THE CURRENT CONTEXT. This test fixes the context to
+        // Exec and varies the clause; `test_any_semantic_only_dsl_rules_is_context_aware`
+        // varies the context for a fixed clause.
 
-        // A `command.uses_sudo` rule references a tier-1-invisible predicate -> true.
+        // A `command.uses_sudo` rule (declared `[exec]`) references a
+        // tier-1-invisible predicate and runs in Exec -> true.
         let sudo = make_dsl_rule("sudo", WhenClause::CommandUsesSudo(true), &["exec"]);
         assert!(
-            any_semantic_only_dsl_rules(&[sudo]),
-            "a command.uses_sudo DSL rule is semantic-only and must force continuation"
+            any_semantic_only_dsl_rules_for_context(&[sudo], ScanContext::Exec),
+            "a command.uses_sudo DSL rule is semantic-only and must force continuation in Exec"
         );
 
-        // A `file.path_matches` rule is also tier-1-invisible -> true.
+        // A `file.path_matches` rule declared `[file]` is tier-1-invisible AND runs
+        // in FileScan -> true when asked about FileScan.
         let file_rule = make_dsl_rule(
             "file",
             WhenClause::FilePathMatches(r"\.env$".into()),
             &["file"],
         );
         assert!(
-            any_semantic_only_dsl_rules(&[file_rule]),
-            "a file.path_matches DSL rule is semantic-only"
+            any_semantic_only_dsl_rules_for_context(&[file_rule], ScanContext::FileScan),
+            "a file.path_matches DSL rule is semantic-only and runs in FileScan"
         );
 
         // A REGEX rule (no `when:`) is NOT a DSL rule -> false (regex matching runs
         // only past the gate; tier-1 already covers what regex rules need or not).
         let regex = make_rule("regex", r"internal\.corp", &["exec"]);
         assert!(
-            !any_semantic_only_dsl_rules(&[regex]),
+            !any_semantic_only_dsl_rules_for_context(&[regex], ScanContext::Exec),
             "a regex-only custom rule must not force continuation"
         );
 
@@ -565,15 +597,14 @@ mod tests {
             &["exec"],
         );
         assert!(
-            !any_semantic_only_dsl_rules(&[agent]),
+            !any_semantic_only_dsl_rules_for_context(&[agent], ScanContext::Exec),
             "an agent.kind-only DSL rule is dead and must not force continuation"
         );
 
-        // But a real predicate BURIED with a dead one inside `all:` still forces
-        // continuation (the rule compiles to nothing only if the dead predicate is
-        // present — which compile_rules drops — but the gate errs toward running;
-        // here `command.uses_sudo` alone would compile if the dead one were
-        // removed, and the classifier returns true because a real leaf exists).
+        // A clause mixing a real predicate with a dead one inside `all:`. The
+        // clause uses an unsupported predicate, so the helper returns FALSE (it
+        // would be dropped by compile_rules anyway, keeping the gate in lockstep:
+        // it never forces continuation for a rule that can't fire).
         let mixed = make_dsl_rule(
             "mixed",
             WhenClause::All(vec![
@@ -582,18 +613,112 @@ mod tests {
             ]),
             &["exec"],
         );
-        // The clause uses an unsupported predicate, so `any_semantic_only_dsl_rules`
-        // returns FALSE (it would be dropped by compile_rules anyway — the gate
-        // stays in lockstep and never forces continuation for a rule that can't
-        // fire).
         assert!(
-            !any_semantic_only_dsl_rules(&[mixed]),
+            !any_semantic_only_dsl_rules_for_context(&[mixed], ScanContext::Exec),
             "a clause containing an unsupported predicate is dropped by compile_rules, \
              so the gate must not force continuation for it"
         );
 
         // Empty rule set -> false (the common hot path).
-        assert!(!any_semantic_only_dsl_rules(&[]));
+        assert!(!any_semantic_only_dsl_rules_for_context(
+            &[],
+            ScanContext::Exec
+        ));
+    }
+
+    /// CONTEXT-AWARENESS guard (CodeRabbit M13 PR #132). The SAME clause forces
+    /// continuation ONLY in a context where the rule would actually RUN, i.e. the
+    /// gate's per-rule decision matches the runtime contexts `compile_rules` clamps
+    /// to (`declared` intersect `satisfiable`). A FILE-scoped `file.path_matches`
+    /// rule must force continuation in FileScan but NOT in Exec/Paste (where
+    /// `check_dsl` would never evaluate it), and a command rule declared `[exec]`
+    /// must force in Exec but not Paste.
+    #[test]
+    fn test_any_semantic_only_dsl_rules_is_context_aware() {
+        // A `file.path_matches` rule declared `[file]`. `compile_rules` clamps its
+        // runtime contexts to {file}, so the gate must force only in FileScan.
+        let file_rule = make_dsl_rule(
+            "file-only",
+            WhenClause::FilePathMatches(r"\.env$".into()),
+            &["file"],
+        );
+        // Sanity: this is exactly what compile_rules stores as the rule's runtime
+        // contexts, proving the gate reuses the same clamp helper. `parse_contexts`
+        // turns the declared `["file"]` into `[FileScan]`, the same input
+        // `compile_rules` feeds the clamp.
+        assert_eq!(
+            custom_rule_dsl::resolve_runtime_contexts(
+                &parse_contexts(&file_rule),
+                file_rule.when.as_ref().unwrap()
+            ),
+            vec![ScanContext::FileScan],
+            "compile_rules clamps a [file] file.path_matches rule to FileScan only"
+        );
+        assert!(
+            any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&file_rule),
+                ScanContext::FileScan
+            ),
+            "a [file] file.path_matches rule forces continuation in FileScan (it runs there)"
+        );
+        assert!(
+            !any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&file_rule),
+                ScanContext::Exec
+            ),
+            "a [file] file.path_matches rule must NOT force continuation in Exec \
+             (check_dsl never evaluates it there)"
+        );
+        assert!(
+            !any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&file_rule),
+                ScanContext::Paste
+            ),
+            "a [file] file.path_matches rule must NOT force continuation in Paste"
+        );
+
+        // A `command.cwd_in` rule declared `[exec]` runs only in Exec.
+        let cmd_exec = make_dsl_rule(
+            "cwd-exec",
+            WhenClause::CommandCwdIn(vec!["/tmp".to_string()]),
+            &["exec"],
+        );
+        assert!(
+            any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&cmd_exec),
+                ScanContext::Exec
+            ),
+            "an [exec] command.cwd_in rule forces continuation in Exec"
+        );
+        assert!(
+            !any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&cmd_exec),
+                ScanContext::Paste
+            ),
+            "an [exec]-declared command.cwd_in rule must NOT force continuation in Paste \
+             (it is not declared there)"
+        );
+
+        // A `command.cwd_in` rule declared `[exec, paste]` runs in BOTH.
+        let cmd_both = make_dsl_rule(
+            "cwd-both",
+            WhenClause::CommandCwdIn(vec!["/tmp".to_string()]),
+            &["exec", "paste"],
+        );
+        assert!(
+            any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&cmd_both),
+                ScanContext::Exec
+            ),
+            "an [exec, paste] command.cwd_in rule forces continuation in Exec"
+        );
+        assert!(
+            any_semantic_only_dsl_rules_for_context(
+                std::slice::from_ref(&cmd_both),
+                ScanContext::Paste
+            ),
+            "an [exec, paste] command.cwd_in rule forces continuation in Paste"
+        );
     }
 
     #[test]

@@ -123,10 +123,29 @@ pub struct ReadLogResult {
 }
 
 /// Read and parse all records from a JSONL audit log.
+///
+/// This is the file-reading entry: it slurps the whole file via
+/// `std::fs::read_to_string` (following symlinks, no size cap) and hands the
+/// content to [`parse_log`]. Callers that have already read the log through a
+/// hardened/capped reader (e.g. the offline dashboard, which must not block on a
+/// FIFO or OOM on an attacker-influenced path) should call [`parse_log`]
+/// directly with the bounded content instead of `read_log`.
 pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    Ok(parse_log(&content, Some(path)))
+}
 
+/// Parse JSONL audit-log `content` (already read into memory) into records.
+///
+/// Split out of [`read_log`] so a caller that reads the log through a hardened,
+/// size-capped reader can reuse the EXACT same parse + malformed-line accounting
+/// without `read_log`'s unbounded `std::fs::read_to_string`. Malformed lines are
+/// skipped (with a one-line stderr warning) and counted in
+/// [`ReadLogResult::skipped_lines`], identical to the historical `read_log`
+/// behavior. `source` is only used to label the warning; pass `None` when there
+/// is no meaningful path to name.
+pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     let mut records = Vec::new();
     let mut skipped_lines = 0usize;
     for (line_num, line) in content.lines().enumerate() {
@@ -137,19 +156,25 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
         match serde_json::from_str::<AuditRecord>(line) {
             Ok(record) => records.push(record),
             Err(e) => {
-                eprintln!(
-                    "tirith: warning: skipping malformed audit line {} in {}: {e}",
-                    line_num + 1,
-                    path.display()
-                );
+                match source {
+                    Some(path) => eprintln!(
+                        "tirith: warning: skipping malformed audit line {} in {}: {e}",
+                        line_num + 1,
+                        path.display()
+                    ),
+                    None => eprintln!(
+                        "tirith: warning: skipping malformed audit line {}: {e}",
+                        line_num + 1
+                    ),
+                }
                 skipped_lines += 1;
             }
         }
     }
-    Ok(ReadLogResult {
+    ReadLogResult {
         records,
         skipped_lines,
-    })
+    }
 }
 
 /// Parse an RFC 3339 timestamp, falling back to lexicographic comparison on failure.

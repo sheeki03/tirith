@@ -2277,17 +2277,26 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
     // command (e.g. a benign `whoami` under a watched `command.cwd_in` directory)
     // would otherwise fast-exit at tier-1 before the custom-rule block ran (the
     // tier-1 gating bug class — see CLAUDE.md, the dotfile-overwrite bug). Force
-    // past the fast-exit when the policy carries a DSL rule whose clause
-    // references a tier-1-invisible predicate AND would actually compile
-    // (`any_semantic_only_dsl_rules` also excludes the always-dropped
-    // `agent.kind`/`mcp.tool` rules). The check is a CHEAP O(rules) clause-shape
-    // scan over the (usually empty) `custom_rules` list already loaded into
-    // `gate_partial` — NO regex compile and NO `DslEvalContext` build — so a
-    // policy with no semantic DSL rule pays nothing. Applies to Exec AND Paste (a
-    // DSL command rule is satisfiable in both); FileScan never fast-exits, so it
-    // needs no force-past. Mirrors `canary_triggered`.
+    // past the fast-exit when the policy carries a DSL rule whose clause (a)
+    // references a tier-1-invisible predicate, (b) would actually compile
+    // (excludes the always-dropped `agent.kind`/`mcp.tool` rules), AND (c) would
+    // actually RUN in the CURRENT context — `ctx.scan_context` must be in the
+    // rule's resolved runtime contexts (`declared ∩ satisfiable`, the SAME clamp
+    // `compile_rules` stores). Without (c) a FILE-scoped `file.path_matches` rule
+    // would force every Exec/Paste command past the fast-exit even though
+    // `check_dsl` never runs it there — defeating the fast-exit AND drifting from
+    // compile-time context dropping. The check is a CHEAP O(rules) clause-shape +
+    // context-algebra scan over the (usually empty) `custom_rules` list already
+    // loaded into `gate_partial`, short-circuiting on the first forcing rule — NO
+    // regex compile and NO `DslEvalContext` build — so a policy with no applicable
+    // semantic DSL rule pays nothing. `gate_partial` is `Some` only for Exec /
+    // Paste (FileScan never fast-exits via `tier1_scan`, so it needs no
+    // force-past). Mirrors `canary_triggered`.
     let custom_dsl_triggered = match &gate_partial {
-        Some(partial) => crate::rules::custom::any_semantic_only_dsl_rules(&partial.custom_rules),
+        Some(partial) => crate::rules::custom::any_semantic_only_dsl_rules_for_context(
+            &partial.custom_rules,
+            ctx.scan_context,
+        ),
         None => false,
     };
 
@@ -3664,6 +3673,30 @@ mod tests {
         std::fs::write(dir.join(".tirith").join("policy.yaml"), yaml).unwrap();
     }
 
+    /// Render a filesystem path as a YAML scalar safe to embed in a
+    /// `command.cwd_in` list AND that MATCHES at runtime on every platform
+    /// (CodeRabbit M13 PR #132, Windows CI fix).
+    ///
+    /// Two problems this solves:
+    ///   1. PARSE: on Windows a temp `cwd` is e.g.
+    ///      `C:\Users\RUNNER~1\AppData\Local\Temp\...`. In a YAML DOUBLE-quoted
+    ///      scalar `\U`/`\A`/`\L`/… are escape sequences, so the policy fails to
+    ///      parse ("did not find expected hexadecimal number") and the DSL rule
+    ///      never loads. SINGLE-quoted YAML does NOT process backslash escapes, so
+    ///      we emit a single-quoted scalar (doubling any embedded `'` per the YAML
+    ///      single-quote rule).
+    ///   2. MATCH: `command.cwd_in` compares via `path_is_under`, which normalizes
+    ///      the runtime candidate `C:\...` to `C:/...` (forward slashes). So the
+    ///      embedded value must ALSO be forward-slashed or the comparison misses.
+    ///
+    /// On Linux/macOS there are no backslashes and `'` is rare in a tempdir path,
+    /// so this is identity (plus the surrounding quotes), keeping behavior there
+    /// unchanged.
+    fn yaml_single_quoted_cwd(cwd: &std::path::Path) -> String {
+        let normalized = cwd.display().to_string().replace('\\', "/");
+        format!("'{}'", normalized.replace('\'', "''"))
+    }
+
     /// THE GATING GUARD. A semantic-only DSL rule must FIRE on input that trips NO
     /// tier-1 regex/byte pattern and would otherwise fast-exit before the
     /// custom-rule block ran. The `custom_dsl_triggered` force-past keeps the
@@ -3701,14 +3734,20 @@ mod tests {
         // CWD, not the command text, so a benign `whoami` cannot trip tier-1 yet
         // the clause matches — isolating the force-past.
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().display().to_string();
+        // SINGLE-quote + forward-slash the cwd scalar (CodeRabbit M13 PR #132,
+        // Windows CI fix): a double-quoted YAML scalar treats a Windows path's
+        // `\U`/`\A`/… as escape sequences and fails to parse, so the rule would
+        // never load on Windows. `yaml_single_quoted_cwd` emits a parse-safe,
+        // forward-slashed value that `path_is_under`'s normalization matches on
+        // every platform; on POSIX it is identity.
+        let cwd_scalar = yaml_single_quoted_cwd(dir.path());
         write_custom_rules_policy(
             dir.path(),
             &format!(
                 "custom_rules:\n  \
                  - id: flag-cwd\n    \
                  when:\n      \
-                 command.cwd_in: [\"{cwd}\"]\n    \
+                 command.cwd_in: [{cwd_scalar}]\n    \
                  severity: high\n    \
                  title: \"Command run under a watched directory\"\n    \
                  context: [exec]\n"
@@ -3762,14 +3801,16 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().display().to_string();
+        // SINGLE-quote + forward-slash the cwd scalar — see the exec-context test
+        // above (CodeRabbit M13 PR #132, Windows CI fix).
+        let cwd_scalar = yaml_single_quoted_cwd(dir.path());
         write_custom_rules_policy(
             dir.path(),
             &format!(
                 "custom_rules:\n  \
                  - id: flag-cwd-paste\n    \
                  when:\n      \
-                 command.cwd_in: [\"{cwd}\"]\n    \
+                 command.cwd_in: [{cwd_scalar}]\n    \
                  severity: high\n    \
                  title: \"Pasted under a watched directory\"\n    \
                  context: [paste]\n"
