@@ -723,22 +723,6 @@ struct QuickDoctorInfo {
     hook_active: bool,
 }
 
-/// Map the hook-exported `TIRITH_STATUS` to the cross-codebase `protection_mode`
-/// vocabulary. Identical to `prompt_status::detect_protection_mode` (kept in
-/// sync deliberately so the doctor quick path and `tirith prompt-status` report
-/// the same mode for the same `TIRITH_STATUS`): `blocks` → `guarded`,
-/// `warn-only`/`degraded` verbatim, `off`/empty/absent → `off`, any other value
-/// passed through unchanged for forward compatibility.
-fn protection_mode_from_status(status: Option<&str>) -> String {
-    match status {
-        Some("blocks") => "guarded".to_string(),
-        Some("warn-only") => "warn-only".to_string(),
-        Some("degraded") => "degraded".to_string(),
-        Some("off") | Some("") | None => "off".to_string(),
-        Some(other) => other.to_string(),
-    }
-}
-
 /// Gather ONLY the three cheap fields the quick status path needs. This is the
 /// unit-testable seam: it must touch nothing expensive — no audit-log read
 /// (`check_detection_gaps`), no threat-DB deserialize (`gather_threat_db_info`),
@@ -757,7 +741,10 @@ fn gather_quick_info() -> QuickDoctorInfo {
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
         .filter(|s| !s.is_empty());
-    let protection_mode = protection_mode_from_status(tirith_status.as_deref());
+    // Shared single-source-of-truth mapping with `tirith prompt-status` so the
+    // two surfaces never drift (see `cli::prompt_status::protection_mode_from_status`).
+    let protection_mode =
+        crate::cli::prompt_status::protection_mode_from_status(tirith_status.as_deref());
 
     let cwd = std::env::current_dir()
         .ok()
@@ -3714,11 +3701,13 @@ mod tests {
     // `TIRITH_STATUS` under the held `ENV_LOCK` so machine-level values can't
     // leak into the assertions.
 
-    /// `protection_mode_from_status` uses the SAME mapping as
-    /// `prompt_status::detect_protection_mode` (`blocks` → `guarded`, others
-    /// verbatim, `off`/empty/absent → `off`, unknown passed through).
+    /// The `doctor --quick` protection-mode mapping is the SAME shared
+    /// function as `tirith prompt-status` uses
+    /// (`cli::prompt_status::protection_mode_from_status`): `blocks` → `guarded`,
+    /// others verbatim, `off`/empty/absent → `off`, unknown passed through.
     #[test]
     fn protection_mode_from_status_maps_known_and_unknown() {
+        use crate::cli::prompt_status::protection_mode_from_status;
         assert_eq!(protection_mode_from_status(Some("blocks")), "guarded");
         assert_eq!(protection_mode_from_status(Some("warn-only")), "warn-only");
         assert_eq!(protection_mode_from_status(Some("degraded")), "degraded");
@@ -3730,6 +3719,35 @@ mod tests {
             protection_mode_from_status(Some("futureValue")),
             "futureValue"
         );
+    }
+
+    /// Guard against a future re-divergence between the two protection-mode
+    /// entry points. `tirith doctor --quick` (via `gather_quick_info`) and
+    /// `tirith prompt-status` (via `detect_protection_mode`) BOTH derive
+    /// `protection_mode` from the same `TIRITH_STATUS` env var; they now share
+    /// `prompt_status::protection_mode_from_status`, so for any given status
+    /// value the two surfaces must report an identical mode. We assert that by
+    /// setting `TIRITH_STATUS` and comparing `doctor`'s quick output against
+    /// `prompt_status`'s wrapper for each representative input.
+    #[test]
+    fn doctor_quick_and_prompt_status_agree_on_protection_mode() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Capture + restore the ambient `TIRITH_STATUS` on Drop; we overwrite it
+        // per-iteration below under the held lock.
+        let _status_guard = EnvGuard::remove("TIRITH_STATUS");
+
+        for status in ["blocks", "warn-only", "degraded", "off", "", "futureValue"] {
+            // SAFETY: serialized via ENV_LOCK above; restored by the guard.
+            unsafe {
+                std::env::set_var("TIRITH_STATUS", status);
+            }
+            let doctor_mode = gather_quick_info().protection_mode;
+            let prompt_mode = crate::cli::prompt_status::protection_mode_for_test();
+            assert_eq!(
+                doctor_mode, prompt_mode,
+                "doctor --quick and prompt-status disagree for TIRITH_STATUS={status:?}"
+            );
+        }
     }
 
     /// The quick JSON has EXACTLY the documented field set — the four keys

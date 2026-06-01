@@ -22,12 +22,35 @@ from a rule that already ships and is reachable today via the named context.
 
 ## Profiles
 
-| profile               | which files                                                                 | scan context(s)        | rule families surfaced                                                        |
-| --------------------- | --------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------- |
-| **AI-config**         | `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, anything under `.claude/` / `.cursor/`, MCP server configs | `FileScan` **and** `Paste` | hidden agent instructions, invisible/non-ASCII config smuggling, prompt-injection indicators, the terminal byte-scan deception family, **and** suspicious install URLs (homograph / punycode / plain-HTTP / `curl \| sh`) embedded in the file |
-| **Markdown install doc** | `README.md`, `INSTALL.md`, `INSTALLATION.md`, `getting-started.md`, and friends (a curated set — **not** every `.md`) | `Paste`                | pipe-to-shell install lines, plain-HTTP / insecure-TLS / shortened URLs, homograph / punycode / raw-IP / look-alike-TLD hostnames |
-| **Source code**       | a curated source-extension set (`.rs`, `.py`, `.ts`, `.go`, `.sh`, …)        | `Paste`                | trojan-source homoglyphs (confusable / bidi / zero-width / Unicode-tags / variation-selector / invisible-whitespace / Hangul-filler) and hard-coded credentials |
-| **Log file**          | the `.log` extension                                                         | `Paste`                | terminal byte-scan + prompt-injection over the raw bytes (best-effort — see the limitation below) |
+| profile               | which files                                                                 | scan context(s)        | rule families surfaced                                       |
+| --------------------- | --------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------ |
+| **AI-config**         | `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, anything under `.claude/` / `.cursor/`, MCP server configs | `FileScan` **and** `Paste` | See [AI-config rule families](#ai-config-rule-families)       |
+| **Markdown install doc** | `README.md`, `INSTALL.md`, `INSTALLATION.md`, `getting-started.md`, and friends (a curated set — **not** every `.md`) | `Paste`                | See [Markdown install doc rule families](#markdown-install-doc-rule-families) |
+| **Source code**       | a curated source-extension set (`.rs`, `.py`, `.ts`, `.go`, `.sh`, …)        | `Paste`                | See [Source code rule families](#source-code-rule-families)  |
+| **Log file**          | the `.log` extension                                                         | `Paste`                | See [Log file rule families](#log-file-rule-families)        |
+
+### AI-config rule families
+
+- hidden agent instructions
+- invisible/non-ASCII config smuggling
+- prompt-injection indicators
+- the terminal byte-scan deception family
+- **and** suspicious install URLs (homograph / punycode / plain-HTTP / `curl | sh`) embedded in the file
+
+### Markdown install doc rule families
+
+- pipe-to-shell install lines
+- plain-HTTP / insecure-TLS / shortened URLs
+- homograph / punycode / raw-IP / look-alike-TLD hostnames
+
+### Source code rule families
+
+- trojan-source homoglyphs (confusable / bidi / zero-width / Unicode-tags / variation-selector / invisible-whitespace / Hangul-filler)
+- hard-coded credentials
+
+### Log file rule families
+
+- terminal byte-scan + prompt-injection over the raw bytes (best-effort — see the limitation below)
 
 ### Routing precedence
 
@@ -89,10 +112,22 @@ Severities map as: Critical / High → `Error`, Medium → `Warning`, Low →
 
 | limitation                          | detail                                                                                                                                                                                                 |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Log-file diagnostics are partial** | The M7 `output_*` rules (OSC-52 clipboard writes, fake prompts, hidden text in terminal output, hyperlink mismatch, title manipulation, …) fire **only** through `engine::analyze_output`, never through the `engine::analyze` path the LSP per-document loop uses. So a `.log` file surfaces only the terminal byte-scan + prompt-injection subset that `analyze` produces in `Paste`. A LogFile-aware client that wants the true `output_*` diagnostics must route the buffer through `analyze_output` and apply the same retain allow-set; the LSP server does not do this in v1 because forcing a second, divergent analysis path for one file type was judged more fragile than documenting the gap. |
+| **Log-file diagnostics are partial** | See [Log-file diagnostics are partial](#log-file-diagnostics-are-partial) below.                                                                                                                                                                                                       |
 | **AI-config drift is out of scope**  | The drift rules `ai_config_hidden_instruction_added` / `ai_config_tool_use_escalation` compare a file against a last-known-safe **snapshot** (`tirith ai diff`). They cannot fire on a single in-editor buffer with no snapshot to diff against, so the LSP never produces them (they remain in the AI-config retain set only so a future snapshot-aware client keeps them if present). |
 | **Whole-document ranges**            | As above — findings without byte-offset evidence are reported against the whole document rather than a precise span.                                                                                    |
 | **No quick-fixes / code actions**    | v1 publishes diagnostics only. It does not offer code actions, hovers, or completions.                                                                                                                  |
+
+### Log-file diagnostics are partial
+
+The M7 `output_*` rules (OSC-52 clipboard writes, fake prompts, hidden text in
+terminal output, hyperlink mismatch, title manipulation, …) fire **only**
+through `engine::analyze_output`, never through the `engine::analyze` path the
+LSP per-document loop uses. So a `.log` file surfaces only the terminal
+byte-scan + prompt-injection subset that `analyze` produces in `Paste`. A
+LogFile-aware client that wants the true `output_*` diagnostics must route the
+buffer through `analyze_output` and apply the same retain allow-set; the LSP
+server does not do this in v1 because forcing a second, divergent analysis path
+for one file type was judged more fragile than documenting the gap.
 
 ## Running it
 

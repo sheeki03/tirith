@@ -282,21 +282,45 @@ fn refresh_status() -> Status {
 
 /// Read `TIRITH_STATUS` and map shell-hook values to prompt-status terms.
 ///
+/// Thin env-reading wrapper over [`protection_mode_from_status`] — the pure
+/// mapping lives there so `tirith doctor --quick` can share it (see
+/// `cli::doctor::gather_quick_info`) and the two surfaces can never drift.
+fn detect_protection_mode() -> String {
+    protection_mode_from_status(std::env::var("TIRITH_STATUS").ok().as_deref())
+}
+
+/// Map a hook-exported `TIRITH_STATUS` value to the cross-codebase
+/// `protection_mode` vocabulary. The single source of truth for this mapping,
+/// shared by `tirith prompt-status` (via [`detect_protection_mode`]) and
+/// `tirith doctor --quick` (via `cli::doctor`) so both report the same mode
+/// for the same status. Documented in `docs/prompt-integration.md`.
+///
 /// | shell hook value | prompt label  |
 /// |------------------|---------------|
 /// | `blocks`         | `guarded`     |
 /// | `warn-only`      | `warn-only`   |
 /// | `degraded`       | `degraded`    |
-/// | `off` / unset    | `off`         |
+/// | `off` / `""` / absent | `off`    |
 /// | (other)          | (verbatim)    |
-fn detect_protection_mode() -> String {
-    match std::env::var("TIRITH_STATUS").ok().as_deref() {
+pub(crate) fn protection_mode_from_status(status: Option<&str>) -> String {
+    match status {
         Some("blocks") => "guarded".into(),
         Some("warn-only") => "warn-only".into(),
         Some("degraded") => "degraded".into(),
         Some("off") | Some("") | None => "off".into(),
         Some(other) => other.to_string(),
     }
+}
+
+/// Test-only: exercise the real env-reading `detect_protection_mode` so the
+/// cross-module agreement test in `cli::doctor` compares the genuine
+/// `prompt-status` entry point (not just the shared pure mapping) against
+/// `doctor --quick`. Reachable across the `cli` module because it is
+/// `pub(crate)`. The caller is responsible for setting `TIRITH_STATUS` under
+/// the shared env lock.
+#[cfg(test)]
+pub(crate) fn protection_mode_for_test() -> String {
+    detect_protection_mode()
 }
 
 /// Resolve the cache file path. Preference order:
