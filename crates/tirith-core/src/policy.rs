@@ -2397,6 +2397,24 @@ custom_rules:
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        // Isolate from ambient runtime state (CodeRabbit M13 PR #132 round-25
+        // policy.rs:2396-2421). `discover_local_only` walks up using
+        // `TIRITH_POLICY_ROOT` and then runs `apply_runtime_overrides()`, whose
+        // incident check reads `state_dir()` (driven by `XDG_STATE_HOME`). An
+        // inherited `TIRITH_POLICY_ROOT` could redirect discovery away from our
+        // tempdir, and a real active-incident flag in the developer's state dir
+        // would flip `fail_mode` to Closed and clear the bypass flag — making
+        // the assertions below non-hermetic. Unset the root and point the state
+        // dir at a fresh empty tempdir (no flag → no incident → overrides are a
+        // no-op), matching the EnvVarGuard-under-TEST_ENV_LOCK idiom used by the
+        // sibling incident tests in this module.
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let state = tempfile::tempdir().unwrap();
+        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        // Drop any incident-flag cache loaded by an earlier test so the lookup
+        // re-reads against our isolated (empty) state dir.
+        crate::incident::invalidate_cache();
+
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".tirith");
         std::fs::create_dir_all(&policy_dir).unwrap();

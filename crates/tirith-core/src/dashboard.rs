@@ -1445,7 +1445,7 @@ mod tests {
                 && summary.allowlist_count.is_none(),
             "numeric fields must be None when the policy did not load: {summary:?}"
         );
-        let err = summary.error.unwrap();
+        let err = summary.error.as_deref().unwrap();
         // On Unix, opening a directory succeeds and the fstat-based regular-file
         // check produces the "not a regular file" message. On Windows, `File::open`
         // on a directory fails at open time with an OS error — also fail-closed,
@@ -1502,7 +1502,7 @@ mod tests {
             "an oversized policy file must be rejected (fail-closed error), \
              not buffered and parsed: {summary:?}"
         );
-        let err = summary.error.unwrap();
+        let err = summary.error.as_deref().unwrap();
         assert!(
             err.contains("exceeds read cap"),
             "the error should explain the size rejection; got {err:?}"

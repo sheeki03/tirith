@@ -1042,9 +1042,15 @@ fn normalize_for_lexical_path_match(s: &str) -> String {
 fn path_is_under(path: &str, base: &str) -> bool {
     let path = normalize_for_lexical_path_match(path);
     let base = normalize_for_lexical_path_match(base);
-    let path = path.trim_end_matches('/');
-    let base = base.trim_end_matches('/');
-    if base.is_empty() {
+    // Trim the BASE only to detect the root sentinel `cwd_in: ["/"]` (which
+    // trims to empty). The absolute-path check below MUST run on the UNTRIMMED
+    // `path`: trailing-slash trimming turns a bare drive ROOT `c:/` into `c:`,
+    // and `is_windows_absolute_path("c:")` is FALSE (round-20 requires a
+    // separator after the drive colon), so trimming the PATH first would make
+    // `cwd_in: ["/"]` fail to root-contain `C:/` (CodeRabbit M13 round-25
+    // custom_rule_dsl.rs:1042).
+    let base_trimmed = base.trim_end_matches('/');
+    if base_trimmed.is_empty() {
         // `cwd_in: ["/"]` — the root sentinel contains every ABSOLUTE path. After
         // `normalize_for_lexical_path_match` a POSIX absolute and a `//`-rooted
         // UNC share both start with `/`, and a Windows drive path is `c:/…`. An
@@ -1053,12 +1059,17 @@ fn path_is_under(path: &str, base: &str) -> bool {
         // `is_windows_absolute_path` (NOT `looks_like_windows_path`, which also
         // matches drive-RELATIVE `c:rel`) so a non-absolute path is never treated
         // as root-contained (CodeRabbit M13 round-19 custom_rule_dsl.rs:884-891).
-        return path.starts_with('/') || is_windows_absolute_path(path);
+        // `path` is the UNTRIMMED normalized form so a bare-root `C:/`/`C:\` is
+        // still recognized as absolute.
+        return path.starts_with('/') || is_windows_absolute_path(&path);
     }
-    if path == base {
+    // Non-root base: trim the path too for the prefix comparison (so
+    // `/home/user/` and `/home/user` match).
+    let path = path.trim_end_matches('/');
+    if path == base_trimmed {
         return true;
     }
-    path.strip_prefix(base)
+    path.strip_prefix(base_trimmed)
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
@@ -1951,6 +1962,74 @@ any:
         assert!(
             !path_is_under("relative", "/"),
             "bare relative path is not root-contained"
+        );
+    }
+
+    #[test]
+    fn test_path_is_under_root_sentinel_untrimmed_bare_roots() {
+        // CodeRabbit M13 round-25 custom_rule_dsl.rs:1042: the root-sentinel
+        // empty-base absolute check must run on the UNTRIMMED normalized values.
+        // Trailing-slash trimming would turn a bare drive ROOT `C:/` into `C:`,
+        // which `is_windows_absolute_path` correctly rejects (drive-relative) —
+        // so trimming BEFORE the sentinel check wrongly excluded `C:/` and `C:\`.
+        // TRUE cases — absolute forms, including bare roots WITH a trailing
+        // separator (the regression):
+        assert!(path_is_under("/x", "/"), "POSIX absolute is root-contained");
+        assert!(
+            path_is_under("/", "/"),
+            "bare POSIX root `/` is root-contained"
+        );
+        assert!(
+            path_is_under("C:/", "/"),
+            "bare Windows drive ROOT `C:/` (trailing slash) is absolute and \
+             root-contained — the round-25 regression"
+        );
+        assert!(
+            path_is_under("C:/x", "/"),
+            "Windows drive absolute `C:/x` is root-contained"
+        );
+        assert!(
+            path_is_under(r"C:\", "/"),
+            "bare Windows drive ROOT `C:\\` (back-slash) is absolute and \
+             root-contained — the round-25 regression"
+        );
+        // FALSE cases — drive-RELATIVE and bare-relative are NOT root-contained:
+        assert!(
+            !path_is_under("C:", "/"),
+            "bare drive `C:` (no separator) is drive-relative, NOT root-contained"
+        );
+        assert!(
+            !path_is_under("foo/bar", "/"),
+            "bare relative path is NOT root-contained"
+        );
+    }
+
+    #[test]
+    fn test_path_is_under_non_root_base_unaffected_by_reorder() {
+        // CodeRabbit M13 round-25: the empty-base reorder must NOT change
+        // non-root prefix matching. A real `cwd_in: ["/home/user"]` still
+        // contains its descendants but not a sibling-prefix sharer.
+        assert!(
+            path_is_under("/home/user/x", "/home/user"),
+            "descendant of a real base still matches"
+        );
+        assert!(
+            path_is_under("/home/user", "/home/user"),
+            "the base itself still matches"
+        );
+        assert!(
+            !path_is_under("/home/other", "/home/user"),
+            "a sibling under a different leaf is NOT under the base"
+        );
+        // Trailing-slash on either side still matches (trimmed for the prefix
+        // compare AFTER the sentinel check).
+        assert!(
+            path_is_under("/home/user/", "/home/user"),
+            "trailing-slash path still matches the base"
+        );
+        assert!(
+            path_is_under("/home/user/x", "/home/user/"),
+            "trailing-slash base still matches a descendant"
         );
     }
 

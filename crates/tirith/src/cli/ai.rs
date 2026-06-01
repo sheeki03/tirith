@@ -571,8 +571,13 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     // collision-free (same basename + same one-second ts + same short sha), and
     // the atomic write below uses no-clobber semantics, so resolve a fresh slot
     // up front rather than risk overwriting a DIFFERENT prior quarantine copy
-    // (CodeRabbit M13 PR #132 R22 — evidence loss).
-    let mut dest = unique_dest(&qdir, &format!("{ts}-{short_sha}-{basename}"));
+    // (CodeRabbit M13 PR #132 R22 — evidence loss). The COPY path uses this
+    // directly (its `write_file_atomic(.., overwrite=false)` publish is itself an
+    // atomic no-clobber, so the `.exists()` probe staying advisory is fine). The
+    // `--move` path instead ATOMICALLY RESERVES its slot via `reserve_dest` (R25)
+    // because `std::fs::rename` overwrites and would otherwise race the probe.
+    let dest_base = format!("{ts}-{short_sha}-{basename}");
+    let mut dest = unique_dest(&qdir, &dest_base);
 
     // --move requires confirmation (it deletes the original). Decide this BEFORE
     // copying so a refused move does not leave a stray quarantine copy.
@@ -613,13 +618,42 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
 
     let mut moved = false;
     if do_move {
+        // ATOMICALLY RESERVE the destination before renaming (CodeRabbit M13 PR
+        // #132 R25). `unique_dest` above is only an advisory `.exists()` probe;
+        // `std::fs::rename` OVERWRITES its target on both Unix and Windows, so a
+        // concurrent quarantine run creating the same `<ts>-<short_sha>-<basename>`
+        // slot in the probe→rename window could be clobbered by — or could clobber
+        // — this move (evidence loss). `reserve_dest` claims the slot with
+        // `create_new` (atomic no-clobber) and re-picks on a race, so after it
+        // returns we EXCLUSIVELY own an (empty) placeholder at `dest`; the rename
+        // below merely replaces a file we already hold. Reserve only on the move
+        // path that has passed the confirm gate, so a refused `--move` leaves no
+        // stray placeholder. On exhaustion this fails non-zero (no panic).
+        match reserve_dest(&qdir, &dest_base) {
+            Ok(reserved) => dest = reserved,
+            Err(e) => {
+                if !emit_error(
+                    json,
+                    "tirith ai quarantine",
+                    &format!(
+                        "could not reserve a quarantine slot under {}: {e}",
+                        qdir.display()
+                    ),
+                ) {
+                    return 2;
+                }
+                return 1;
+            }
+        }
         // DESTRUCTIVE variant. Prefer an ATOMIC `rename` so there is NO
         // read→write→delete window (CodeRabbit M13 PR #132 R10-4): a concurrent
         // edit between our earlier `read` and a later `remove_file` would
         // otherwise discard the newer bytes (quarantine keeps the stale copy we
         // read; the original is gone). `rename` moves the inode atomically, so
         // whatever bytes the file holds at the instant of the move land in
-        // quarantine and the source vanishes in the same operation.
+        // quarantine and the source vanishes in the same operation. It replaces
+        // the placeholder `reserve_dest` reserved (which we own), so no concurrent
+        // run can have taken `dest` out from under us.
         match std::fs::rename(&src, &dest) {
             Ok(()) => {
                 moved = true;
@@ -629,10 +663,13 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 // different mount than the source). Fall back to copy-then-delete,
                 // but CLOSE the TOCTOU: write the bytes we already read, then
                 // re-read + re-hash the source IMMEDIATELY before deleting it, and
-                // ABORT the delete if it changed since our initial read. No-clobber
-                // (`overwrite=false`) so a colliding prior quarantine copy is never
-                // silently overwritten (R22 — `dest` was chosen by `unique_dest`).
-                if let Err(e) = write_file_atomic(&dest, &content, false) {
+                // ABORT the delete if it changed since our initial read. We
+                // overwrite (`overwrite=true`) the placeholder `reserve_dest`
+                // exclusively reserved for us — NOT a stranger's copy — so this
+                // cannot clobber a colliding prior quarantine entry (a concurrent
+                // run's `create_new` for the same slot would have failed and it
+                // would have re-picked).
+                if let Err(e) = write_file_atomic(&dest, &content, true) {
                     if !emit_error(
                         json,
                         "tirith ai quarantine",
@@ -756,13 +793,40 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 let actual_sha = tirith_core::clipboard::content_sha256_hex(&moved_bytes);
                 if actual_sha != sha {
                     let new_short = actual_sha[..actual_sha.len().min(16)].to_string();
-                    // Non-clobbering recomputed-hash name too: another quarantine
-                    // may already occupy `<ts>-<new_short>-<basename>` (R22). `dest`
-                    // currently holds our moved bytes and exists, so `unique_dest`
-                    // skips it and any other live entry, returning a fresh slot.
-                    let corrected = unique_dest(&qdir, &format!("{ts}-{new_short}-{basename}"));
-                    // Atomic in-quarantine rename to the recomputed-hash name.
-                    // Both paths share `qdir`, so this never crosses devices.
+                    // ATOMICALLY RESERVE the recomputed-hash slot (CodeRabbit M13
+                    // PR #132 R25). Like the move above, this `std::fs::rename`
+                    // overwrites its target, so reserving with `create_new` (rather
+                    // than only an advisory `unique_dest` probe) closes the
+                    // probe→rename TOCTOU: another quarantine run can neither clobber
+                    // nor be clobbered by this in-store rename. `reserve_dest` always
+                    // returns a slot distinct from `dest` (which still holds our
+                    // moved bytes), so the rename never targets the file it moves
+                    // from. On reservation failure we fail non-zero — the original
+                    // is already gone, but the bytes remain at `dest` under its
+                    // provisional name (still hash-honest about the disk contents).
+                    let corrected =
+                        match reserve_dest(&qdir, &format!("{ts}-{new_short}-{basename}")) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                if !emit_error(
+                                    json,
+                                    "tirith ai quarantine",
+                                    &format!(
+                                        "moved {} to {} but could not reserve its \
+                                     recomputed-hash name under {}: {e}",
+                                        src.display(),
+                                        dest.display(),
+                                        qdir.display()
+                                    ),
+                                ) {
+                                    return 2;
+                                }
+                                return 1;
+                            }
+                        };
+                    // Atomic in-quarantine rename to the recomputed-hash name,
+                    // replacing the placeholder we just reserved. Both paths share
+                    // `qdir`, so this never crosses devices.
                     if corrected != dest {
                         if let Err(e) = std::fs::rename(&dest, &corrected) {
                             if !emit_error(
@@ -930,6 +994,67 @@ fn unique_dest(qdir: &Path, base_name: &str) -> PathBuf {
         }
     }
     first
+}
+
+/// Maximum number of times [`reserve_dest`] re-picks a quarantine slot when a
+/// concurrent run grabs the candidate between the probe and the atomic reserve.
+/// Bounded so a pathological store (or an adversary spamming quarantine names)
+/// cannot loop forever; on exhaustion we surface a clean error rather than spin.
+const RESERVE_MAX_RETRIES: u32 = 64;
+
+/// ATOMICALLY reserve a fresh quarantine slot inside `qdir` for a `base_name`
+/// (`<ts>-<short_sha>-<basename>`), returning the reserved path. The `--move`
+/// path then `rename`s the source onto the placeholder we own here — closing the
+/// TOCTOU between [`unique_dest`]'s advisory `.exists()` probe and the rename
+/// (CodeRabbit M13 PR #132 R25). `std::fs::rename` OVERWRITES its destination on
+/// both Unix and Windows, so a name picked only by `.exists()` could be clobbered
+/// (or could clobber) a DIFFERENT quarantine copy that a concurrent run created
+/// in the probe→rename window — evidence loss either way.
+///
+/// We close the gap by atomically claiming the candidate with
+/// `OpenOptions::create_new(true)`, which fails with [`AlreadyExists`] if the path
+/// exists at the instant of the `open` (the cross-platform atomic no-clobber
+/// primitive — `O_EXCL` on Unix, `CREATE_NEW` on Windows). On a race we re-pick
+/// via [`unique_dest`] and retry, bounded by [`RESERVE_MAX_RETRIES`]; on
+/// exhaustion we return the last `AlreadyExists` error so the caller fails
+/// non-zero (never a panic). The returned placeholder is a zero-byte file the
+/// caller now exclusively owns: the subsequent `rename` replaces it (the source
+/// inode lands at the reserved name), and the EXDEV copy-then-delete fallback
+/// overwrites it (safe — the reservation already proved exclusivity, so
+/// `overwrite=true` there cannot clobber a stranger's copy).
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+fn reserve_dest(qdir: &Path, base_name: &str) -> std::io::Result<PathBuf> {
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..RESERVE_MAX_RETRIES {
+        let candidate = unique_dest(qdir, base_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            // Claimed the slot atomically; we now own this (empty) placeholder.
+            Ok(_file) => return Ok(candidate),
+            // A concurrent run grabbed this exact slot between the `unique_dest`
+            // probe and our `open`. Re-pick (it will now skip the freshly-taken
+            // name) and retry.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            // A different failure (permissions, the dir vanished, …) is not a
+            // race we can win by retrying — surface it immediately.
+            Err(e) => return Err(e),
+        }
+    }
+    // Exhausted retries: every candidate kept being taken out from under us.
+    // Return a clean error (not a panic) so the caller exits non-zero.
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a free quarantine slot after repeated collisions",
+        )
+    }))
 }
 
 /// The user's cache base dir (`$XDG_CACHE_HOME` or `~/.cache`). `XDG_CACHE_HOME`
@@ -1748,6 +1873,120 @@ mod tests {
             unique_dest(dir.path(), base),
             dir.path().join(format!("{base}-2")),
             "with base and `-1` taken, the next free slot is `<base>-2`"
+        );
+    }
+
+    // CodeRabbit M13 PR #132 R25 (TOCTOU): `reserve_dest` must ATOMICALLY claim a
+    // free slot — skipping any already-occupied name AND actually creating the
+    // placeholder file it returns (so the subsequent `rename` replaces a path we
+    // own, not one a concurrent run could still grab). Deterministic core of the
+    // no-clobber-on-move guarantee; the end-to-end test below depends on timing to
+    // ALSO exercise a same-`<ts>` collision, so pin the reservation here.
+    #[test]
+    fn reserve_dest_atomically_claims_a_free_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = "20260101T000000Z-deadbeefdeadbeef-.cursorrules";
+
+        // First reservation takes the un-suffixed base and CREATES it (the
+        // placeholder must exist on disk afterward — that is what makes the claim
+        // atomic rather than advisory).
+        let r0 = reserve_dest(dir.path(), base).expect("first reserve");
+        assert_eq!(r0, dir.path().join(base));
+        assert!(
+            r0.exists(),
+            "reserve_dest must create the placeholder it returns, got missing: {r0:?}"
+        );
+
+        // The base is now occupied by our placeholder, so the next reservation
+        // must skip past it to `<base>-1` (and create that one too).
+        let r1 = reserve_dest(dir.path(), base).expect("second reserve");
+        assert_eq!(
+            r1,
+            dir.path().join(format!("{base}-1")),
+            "with the base reserved, the next slot must be `<base>-1`"
+        );
+        assert_ne!(r0, r1, "two reservations must yield distinct paths");
+        assert!(r1.exists(), "the second placeholder must also be created");
+    }
+
+    // CodeRabbit M13 PR #132 R25 (TOCTOU evidence loss on `--move`): a `--move`
+    // whose computed destination ALREADY EXISTS must NOT clobber that pre-existing
+    // file. `std::fs::rename` overwrites on both Unix and Windows, so without the
+    // atomic `reserve_dest` reservation the move would silently destroy a prior
+    // quarantine entry sitting at the same `<ts>-<short_sha>-<basename>` slot. We
+    // pre-seed a SENTINEL at the exact base path the move will compute (with
+    // distinct bytes, so a clobber is detectable), then move a real source. The
+    // moved file must land at a DISTINCT path and the sentinel's bytes must be
+    // intact.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_move_does_not_clobber_existing_dest() {
+        let cache = tempfile::tempdir().expect("cache home");
+        let work = tempfile::tempdir().expect("work dir");
+        let src = work.path().join(".cursorrules");
+        let body = b"# real config being moved\nrun: ./build.sh\n";
+        std::fs::write(&src, body).expect("write src");
+
+        let _guard = CacheHomeGuard::set(cache.path());
+
+        // Reconstruct the destination base name EXACTLY as `quarantine` derives it
+        // (`<ts>-<short_sha>-<basename>`). `ts` has one-second granularity and is
+        // sampled microseconds before the call below, so it matches in practice;
+        // the durable assertions hold even if a second boundary intervenes.
+        let qdir = cache.path().join("tirith").join("quarantine");
+        create_quarantine_dir(&qdir).expect("create qdir");
+        let sha = tirith_core::clipboard::content_sha256_hex(body);
+        let short_sha = &sha[..sha.len().min(16)];
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let base = format!("{ts}-{short_sha}-.cursorrules");
+
+        // Pre-seed a SENTINEL with DIFFERENT bytes at the computed base path.
+        let sentinel = qdir.join(&base);
+        let sentinel_bytes = b"PRE-EXISTING QUARANTINE EVIDENCE - MUST NOT BE CLOBBERED";
+        std::fs::write(&sentinel, sentinel_bytes).expect("seed sentinel");
+
+        // Move the real source. `--move --yes` skips the confirm prompt.
+        let code = quarantine(
+            src.to_str().unwrap(),
+            /*do_move*/ true,
+            /*yes*/ true,
+            true,
+        );
+        assert_eq!(
+            code, 0,
+            "the --move must still succeed (landing at a fresh slot)"
+        );
+
+        // The original was moved away.
+        assert!(!src.exists(), "the source must be removed after --move");
+
+        // The sentinel's bytes are INTACT — the move did not overwrite it.
+        assert_eq!(
+            std::fs::read(&sentinel).expect("sentinel still exists"),
+            sentinel_bytes,
+            "the pre-existing quarantine file must NOT be clobbered by --move"
+        );
+
+        // Two distinct files now live in the store: the sentinel and the moved
+        // copy (at a DISTINCT, suffixed path). The moved copy holds `body`.
+        let entries: Vec<PathBuf> = std::fs::read_dir(&qdir)
+            .expect("quarantine dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "sentinel + moved copy must coexist (a clobber would leave 1): {entries:?}"
+        );
+        let moved_copy = entries
+            .iter()
+            .find(|p| **p != sentinel)
+            .expect("a distinct moved copy must exist alongside the sentinel");
+        assert_eq!(
+            std::fs::read(moved_copy).expect("read moved copy"),
+            body,
+            "the moved copy must hold the source bytes at its distinct path"
         );
     }
 
