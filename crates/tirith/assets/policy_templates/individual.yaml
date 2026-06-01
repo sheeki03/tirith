@@ -48,7 +48,7 @@ scan:
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # `tirith agent sessions` shows which AgentOrigin variants you see in
 # practice; `tirith agent policy init` scaffolds this block. A `deny`
 # match forces the verdict to Block and appends an
@@ -61,9 +61,9 @@ scan:
 #     - kind: agent
 #       name: claude-code
 
-# Package-policy section — M6 ch7. Thresholds and actions for the
+# Package-policy section. Thresholds and actions for the
 # package-reputation signals (newer-than-days, low downloads, OSV CVSS,
-# typosquat distance, repo-mismatch cap). Defaults preserve the M6 ch6
+# typosquat distance, repo-mismatch cap). Defaults preserve the baseline
 # behavior; uncomment a knob to tighten one signal.
 # package_policy:
 #   block_not_found: false                    # block on registry HTTP 404 (--online only)

@@ -796,22 +796,6 @@ fn comment_body_is_directive(body: &str) -> bool {
     DIRECTIVE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Extract HTML elements that are visually hidden — `hidden` attribute,
-/// `aria-hidden="true"`, or a `style="…display:none…"` (or `visibility:hidden`
-/// / `opacity:0`). Returns `(line, element_snippet)` for each.
-///
-/// `<svg aria-hidden>` and screen-reader-only / icon elements are common,
-/// benign a11y patterns and are excluded — matching `rendered.rs`'s carve-out.
-///
-/// Each hit is `(line, opening_tag, inner_text)`: the 1-based line of the opening
-/// tag, the opening tag itself (e.g. `<div hidden>`), and the element's INNER TEXT
-/// — the raw bytes between the opening tag and its matching `</tag>` close (or, if
-/// the element is never closed, the rest of the document). The inner text lets the
-/// diff path key an element on its CONTENT, not just its opening tag, so an
-/// attacker who keeps the same hidden `<div …>` wrapper but rewrites the inner text
-/// into a directive (`<div hidden>note</div>` → `<div hidden>RUN: …</div>`) is
-/// still seen as drift (CodeRabbit M13 round-22 aifile.rs:1062-1066).
-///
 /// Whether an opening-tag `snippet` carries a `class` attribute whose
 /// whitespace-split TOKEN LIST contains an a11y-benign whole token (`icon` or
 /// `sr-only`, case-insensitive). Used by [`hidden_html_elements`]'s carve-out
@@ -856,6 +840,21 @@ fn class_has_a11y_token(snippet: &str) -> bool {
     false
 }
 
+/// Extract HTML elements that are visually hidden — `hidden` attribute,
+/// `aria-hidden="true"`, or a `style="…display:none…"` (or `visibility:hidden`
+/// / `opacity:0`).
+///
+/// `<svg aria-hidden>` and screen-reader-only / icon elements are common,
+/// benign a11y patterns and are excluded — matching `rendered.rs`'s carve-out.
+///
+/// Each hit is `(line, opening_tag, inner_text)`: the 1-based line of the opening
+/// tag, the opening tag itself (e.g. `<div hidden>`), and the element's INNER TEXT
+/// — the raw bytes between the opening tag and its matching `</tag>` close (or, if
+/// the element is never closed, the rest of the document). The inner text lets the
+/// diff path key an element on its CONTENT, not just its opening tag, so an
+/// attacker who keeps the same hidden `<div …>` wrapper but rewrites the inner text
+/// into a directive (`<div hidden>note</div>` → `<div hidden>RUN: …</div>`) is
+/// still seen as drift (CodeRabbit M13 round-22 aifile.rs:1062-1066).
 fn hidden_html_elements(input: &str) -> Vec<(usize, String, String)> {
     use once_cell::sync::Lazy;
     use regex::Regex;

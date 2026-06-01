@@ -1181,6 +1181,52 @@ mod tests {
     }
 
     #[test]
+    fn expand_template_edge_cases() {
+        // Adjacent markers `{{A}}{{B}}` are each substituted independently in one
+        // left-to-right pass.
+        assert_eq!(
+            expand_template(
+                "{{A}}{{B}}",
+                &[("{{A}}", "x".into()), ("{{B}}", "y".into())]
+            ),
+            "xy",
+            "adjacent markers each expand once"
+        );
+
+        // An unterminated `{{` (no closing `}}`) is emitted verbatim as literal
+        // template text — never treated as a marker.
+        assert_eq!(
+            expand_template("pre {{UNCLOSED", &[("{{UNCLOSED}}", "z".into())]),
+            "pre {{UNCLOSED",
+            "unterminated marker is literal trailing text"
+        );
+
+        // An UNKNOWN marker (not in `subs`) passes through unchanged.
+        assert_eq!(
+            expand_template("a {{UNKNOWN}} b", &[("{{KNOWN}}", "v".into())]),
+            "a {{UNKNOWN}} b",
+            "unknown marker is passed through verbatim"
+        );
+
+        // Security property (single pass, no re-expansion): a substituted VALUE
+        // that itself contains a marker is emitted verbatim and is NEVER re-scanned
+        // — the boundary that stops template/XSS injection via snapshot content.
+        // `{{A}}`'s value contains `{{B}}`, which must NOT be expanded even though
+        // `{{B}}` is a known marker.
+        assert_eq!(
+            expand_template(
+                "{{A}}",
+                &[
+                    ("{{A}}", "{{B}}".into()),
+                    ("{{B}}", "SHOULD_NOT_APPEAR".into())
+                ]
+            ),
+            "{{B}}",
+            "a marker inside a substituted value is NOT re-expanded (single pass)"
+        );
+    }
+
+    #[test]
     fn unavailable_sections_render_gracefully() {
         // A fully-empty snapshot (no audit log, no threat DB) must still render a
         // complete document with the documented "unavailable" affordances.

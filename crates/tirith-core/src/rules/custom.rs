@@ -567,6 +567,79 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_clamps_union_any_to_declared_subset() {
+        // The Any-union analogue of the not(file)-in-exec clamp
+        // (`test_not_file_path_matches_no_false_positive_in_exec`): an
+        // `any(command.*, file.*)` clause is satisfiable in {Exec, Paste,
+        // FileScan} (the union of its branches), but `compile_rules` must clamp
+        // the stored runtime contexts to `declared ∩ satisfiable`. So a rule
+        // declared `[exec]` runs ONLY in Exec (not FileScan), and one declared
+        // `[file]` runs ONLY in FileScan (not Exec) — even though the clause as a
+        // whole is satisfiable in both.
+        let make = |contexts: &[&str]| {
+            make_dsl_rule(
+                "any-clamp",
+                WhenClause::Any(vec![
+                    WhenClause::CommandUsesSudo(true),
+                    WhenClause::FilePathMatches(r"\.env$".into()),
+                ]),
+                contexts,
+            )
+        };
+
+        // Declared `[exec]`: clamps to {Exec}. The command branch is live in
+        // Exec; the file branch's fact (file_path) is absent there but the union
+        // still fires via the sudo branch. In FileScan the rule is clamped out.
+        let exec_compiled = compile_rules(&[make(&["exec"])]);
+        assert_eq!(exec_compiled.len(), 1, "any-union declared [exec] compiles");
+        assert_eq!(
+            exec_compiled[0].contexts,
+            vec![ScanContext::Exec],
+            "declared [exec] ∩ satisfiable {{exec, paste, file}} = {{exec}}"
+        );
+        let exec_ctx = DslEvalContext {
+            uses_sudo: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_dsl(&exec_ctx, ScanContext::Exec, &exec_compiled).len(),
+            1,
+            "any(command, file) declared [exec] must FIRE in Exec"
+        );
+        // Same backing, FileScan context: clamped out, so it must NOT fire even
+        // though the file branch could be satisfiable in FileScan generally.
+        let scan_env = DslEvalContext {
+            file_path: Some("/repo/.env"),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_dsl(&scan_env, ScanContext::FileScan, &exec_compiled).len(),
+            0,
+            "any(command, file) declared [exec] must be ABSENT in FileScan (clamped out)"
+        );
+
+        // Symmetric: declared `[file]` clamps to {FileScan}. Fires in FileScan
+        // via the file branch; absent in Exec.
+        let file_compiled = compile_rules(&[make(&["file"])]);
+        assert_eq!(file_compiled.len(), 1, "any-union declared [file] compiles");
+        assert_eq!(
+            file_compiled[0].contexts,
+            vec![ScanContext::FileScan],
+            "declared [file] ∩ satisfiable {{exec, paste, file}} = {{file}}"
+        );
+        assert_eq!(
+            check_dsl(&scan_env, ScanContext::FileScan, &file_compiled).len(),
+            1,
+            "any(command, file) declared [file] must FIRE in FileScan"
+        );
+        assert_eq!(
+            check_dsl(&exec_ctx, ScanContext::Exec, &file_compiled).len(),
+            0,
+            "any(command, file) declared [file] must be ABSENT in Exec (clamped out)"
+        );
+    }
+
+    #[test]
     fn test_compile_regex_rule_empty_context_dropped() {
         // Coherence guard for R7-2/R7-7: a REGEX rule with no valid contexts is
         // a dead rule (no required-trigger notion to synthesize a set from) and

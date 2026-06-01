@@ -57,7 +57,7 @@ scan:
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # `tirith agent sessions` shows which AgentOrigin variants you see in
 # practice; `tirith agent policy init` scaffolds this block. A `deny`
 # match forces the verdict to Block and appends an
@@ -68,7 +68,7 @@ scan:
 #     - kind: agent
 #       name: claude-code
 
-# Package-policy section — M6 ch7. A startup pulling dependencies quickly
+# Package-policy section. A startup pulling dependencies quickly
 # benefits from a light dep-reputation gate: warn on brand-new / low-download
 # packages, block obvious typosquats. Tighten further as the team matures.
 # package_policy:

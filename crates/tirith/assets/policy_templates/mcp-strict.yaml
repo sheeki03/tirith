@@ -68,7 +68,7 @@ scan:
   #   my-trusted-server:
   #     - read_only
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # An MCP-heavy environment benefits from per-origin policy: declare the MCP
 # clients you expect and deny the rest by review. A `deny` match forces the
 # verdict to Block and appends an `agent_denied_by_policy` finding; `deny`
@@ -82,7 +82,7 @@ scan:
 #     - kind: mcp
 #       name: untrusted-client
 
-# Package-policy section — M6 ch7. An MCP-driven workflow that also installs
+# Package-policy section. An MCP-driven workflow that also installs
 # packages benefits from the same supply-chain gates the enterprise template
 # enables. Uncomment to opt in.
 # package_policy:

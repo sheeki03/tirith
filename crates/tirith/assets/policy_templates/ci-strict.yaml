@@ -53,7 +53,7 @@ scan:
   # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # A CI policy that wants to declare which callers are expected can list
 # them here. A `deny` match forces the verdict to Block and appends an
 # `agent_denied_by_policy` finding; `deny` beats any matching `allow`.
@@ -69,7 +69,7 @@ scan:
 #     - kind: ci
 #       name: github-actions
 
-# Package-policy section — M6 ch7. CI baseline tightens several knobs:
+# Package-policy section. CI baseline tightens several knobs:
 # strict environments typically want the block-on-not-found / install-script
 # / aggregate-score elevations on by default. Uncomment to opt in.
 # package_policy:

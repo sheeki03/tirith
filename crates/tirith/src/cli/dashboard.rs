@@ -371,6 +371,24 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Bind the `serve` HTTP listener to the IPv4 LOOPBACK interface only —
+/// `127.0.0.1:<port>`, or `127.0.0.1:0` (an OS-assigned ephemeral port) when
+/// `port` is `None`. NEVER `0.0.0.0` or any non-loopback interface: the
+/// dashboard exposes a local-only security snapshot and must not be reachable
+/// off-host.
+///
+/// Factored out of [`serve`] so the "binds loopback exclusively" invariant is
+/// unit-testable against the PRODUCTION bind (the integration test binds its own
+/// listener, which would not catch a regression here). Returns `tiny_http`'s own
+/// boxed error on bind failure — `serve` maps it to its `cannot bind …` message
+/// + non-zero exit (M13 PR #132 finding F2).
+fn bind_loopback(
+    port: Option<u16>,
+) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let bind_addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
+    tiny_http::Server::http(bind_addr)
+}
+
 /// `tirith dashboard serve [--port <p>] [--json]`.
 ///
 /// Binds `127.0.0.1:<port>` (or an OS-assigned ephemeral port when `--port` is
@@ -386,10 +404,11 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
     };
 
     // Loopback ONLY. The literal IP is never `0.0.0.0` — we never bind a
-    // non-loopback interface.
+    // non-loopback interface. The bind itself is factored into `bind_loopback`
+    // so a unit test can pin the "binds 127.0.0.1 exclusively" contract against
+    // the PRODUCTION code path (M13 PR #132 finding F2).
     let bind_port = port.unwrap_or(0);
-    let bind_addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
-    let server = match tiny_http::Server::http(bind_addr) {
+    let server = match bind_loopback(port) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith dashboard serve: cannot bind 127.0.0.1:{bind_port}: {e}");
@@ -655,6 +674,75 @@ mod tests {
             "an accept/recv error must NOT report success (exit 0)"
         );
         assert_eq!(err_code, 1, "the fatal accept-error exit code is 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // M13 PR #132 finding F2 — the PRODUCTION bind helper `bind_loopback`
+    // binds 127.0.0.1 EXCLUSIVELY (never 0.0.0.0), for both an explicit port
+    // and the ephemeral `:0` case. The end-to-end `serve_loopback_*` test below
+    // binds its OWN listener, so it would not catch a regression in the bind
+    // address chosen by `serve` itself; this pins that contract on the real
+    // helper `serve` calls.
+    // -----------------------------------------------------------------------
+
+    /// Assert a freshly-bound `bind_loopback` server's local address is the IPv4
+    /// loopback `127.0.0.1` specifically — loopback AND not `0.0.0.0`.
+    fn assert_bound_loopback(server: &tiny_http::Server, label: &str) {
+        let addr = server
+            .server_addr()
+            .to_ip()
+            .expect("bound socket has an IP");
+        assert!(
+            addr.ip().is_loopback(),
+            "{label}: bind address {} must be loopback",
+            addr.ip()
+        );
+        assert_eq!(
+            addr.ip(),
+            std::net::Ipv4Addr::LOCALHOST,
+            "{label}: bind address must be 127.0.0.1 exactly, not {} (e.g. 0.0.0.0)",
+            addr.ip()
+        );
+    }
+
+    #[test]
+    fn bind_loopback_ephemeral_binds_127_0_0_1() {
+        // `None` → ephemeral `127.0.0.1:0`; the OS assigns a non-zero port but
+        // the IP must still be the IPv4 loopback, never 0.0.0.0.
+        let server = bind_loopback(None).expect("ephemeral loopback bind must succeed");
+        assert_bound_loopback(&server, "bind_loopback(None)");
+        // An ephemeral bind resolves to a concrete non-zero port.
+        let port = server.server_addr().to_ip().unwrap().port();
+        assert_ne!(port, 0, "an ephemeral bind must resolve to a concrete port");
+    }
+
+    #[test]
+    fn bind_loopback_explicit_port_is_honored_and_loopback() {
+        // Prove `bind_loopback(Some(port))` (a) BINDS LOOPBACK and (b) HONORS the
+        // explicit port — without the (inherently racy under the parallel harness)
+        // "free a port then re-bind that exact number" dance, which collides with
+        // every other ephemeral bind churning in sibling tests.
+        //
+        // Hold a live ephemeral loopback server on a known port P, then attempt a
+        // SECOND `bind_loopback(Some(P))`. It MUST fail with AddrInUse: that proves
+        // the helper actually attempted to bind the EXPLICIT port P (had it ignored
+        // the arg, or bound `0.0.0.0:0` / an ephemeral port, the second bind would
+        // have succeeded). The IP half is pinned by the ephemeral test above and by
+        // the held server's own loopback address asserted here. This is fully
+        // deterministic — P stays occupied for the whole window, so there is no
+        // freed-port race for a sibling test to win.
+        let held = bind_loopback(None).expect("hold a loopback server");
+        assert_bound_loopback(&held, "held loopback server");
+        let port = held.server_addr().to_ip().unwrap().port();
+
+        let second = bind_loopback(Some(port));
+        assert!(
+            second.is_err(),
+            "binding the explicit, already-held port {port} must fail (proves the explicit \
+             port is honored, not silently replaced with an ephemeral/0.0.0.0 bind)"
+        );
+        // `held` stays alive until here so `port` cannot be reused mid-test.
+        drop(held);
     }
 
     fn token() -> &'static str {

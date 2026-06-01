@@ -113,7 +113,7 @@ scan:
   # High-severity drift finding. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # An agent-heavy environment benefits most from per-origin policy.
 # `tirith agent sessions` shows which agents have invoked tirith;
 # `tirith agent policy init` scaffolds this block from observed
@@ -135,7 +135,7 @@ scan:
 #     - kind: agent
 #       name: untrusted-agent
 
-# Package-policy section — M6 ch7. AI-agent environments benefit from
+# Package-policy section. AI-agent environments benefit from
 # tight package-reputation gates: agents are most likely to hallucinate
 # package names that don't exist, or to grab brand-new packages without
 # vetting. Recommended thresholds below.

@@ -61,7 +61,7 @@ scan:
   # smuggling a new MCP tool past the lockfile. See `tirith mcp policy init`.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # An enterprise typically declares the callers it expects (CI provider, the
 # sanctioned coding agent) and denies everything else by review. A `deny`
 # match forces the verdict to Block and appends an `agent_denied_by_policy`
@@ -75,7 +75,7 @@ scan:
 #     - kind: agent
 #       name: claude-code
 
-# Package-policy section — M6 ch7. UNLIKE the other templates, the enterprise
+# Package-policy section. UNLIKE the other templates, the enterprise
 # template ships this block ACTIVE (uncommented) with strict defaults: an
 # enterprise wants supply-chain gates enforced out of the box, not opt-in.
 # Tune the thresholds to your risk tolerance.

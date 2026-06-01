@@ -200,13 +200,16 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
 /// offending rule id + reason). Cross-references `tirith policy validate` for
 /// whole-file checks.
 pub fn validate(path: Option<&str>, json: bool) -> i32 {
-    // Load the RAW YAML — NOT a strict-parsed Policy. The strict loader runs
-    // the pattern-XOR-when shape gate (`Policy::try_parse_yaml`) which fails the
+    // Read the RAW YAML SOURCE directly — NOT a strict-parsed Policy. `validate`
+    // reads raw (no strict parse) BY DESIGN: the strict loader runs the
+    // pattern-XOR-when shape gate (`Policy::try_parse_yaml`) which fails the
     // whole parse on the first both/neither rule, short-circuiting the very
     // per-rule validator below that is meant to report that rule-level problem
-    // (with the rule id, continuing to check the rest). CodeRabbit M13 PR #132
-    // round-24.
-    let (yaml, source) = match load_policy_raw("validate", path, json) {
+    // (with the rule id, continuing to check the rest). `test`/`explain` instead
+    // need a fully-parsed Policy, so they use `load_policy_strict`; `validate`
+    // reads via `read_policy_source` and runs its OWN lenient (gate-free) parse
+    // below. CodeRabbit M13 PR #132 round-24.
+    let (yaml, source) = match read_policy_source("validate", path, json) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -647,8 +650,9 @@ fn read_policy_source(cmd: &str, path: Option<&str>, json: bool) -> Result<(Stri
 ///
 /// `validate` does NOT use this: it must reach its own per-rule validator even
 /// for the rule-level problems (e.g. both `pattern:` and `when:`) the strict
-/// shape gate would reject up front, so it loads via [`load_policy_raw`]
-/// instead (CodeRabbit M13 PR #132 round-24).
+/// shape gate would reject up front, so it reads the raw source via
+/// [`read_policy_source`] and runs its own lenient parse instead (CodeRabbit M13
+/// PR #132 round-24).
 fn load_policy_strict(cmd: &str, path: Option<&str>, json: bool) -> Result<(Policy, String), i32> {
     let (yaml, source) = read_policy_source(cmd, path, json)?;
     // An empty document (no policy file) is the zero-custom-rule default.
@@ -664,24 +668,6 @@ fn load_policy_strict(cmd: &str, path: Option<&str>, json: bool) -> Result<(Poli
         Ok(policy) => Ok((policy, source)),
         Err(e) => Err(emit_load_error(cmd, &source, &e.to_string(), json)),
     }
-}
-
-/// Load the policy LENIENTLY for `validate`: read the source and return the raw
-/// YAML text + source label, deferring all parsing to the per-rule validator.
-/// Returns `Err(exit_code)` only on a file-READ failure — never on YAML/shape
-/// content (that is `validate`'s job to report per-rule).
-///
-/// Why `validate` cannot use the strict loader: [`Policy::try_parse_yaml`]
-/// enforces the pattern-XOR-when shape gate for every rule and fails the WHOLE
-/// parse on the first offender (policy.rs). That is exactly the RULE-LEVEL
-/// problem [`validate`]'s friendly per-rule validator is meant to report (with
-/// the offending rule id, and continuing to check the rest). Strict-parsing
-/// first would short-circuit that with a generic deserialize error, so
-/// `validate` never reached its own validator. Returning the raw YAML lets
-/// `validate` do its OWN structural parse (without the shape gate) and run the
-/// per-rule loop. (CodeRabbit M13 PR #132 round-24.)
-fn load_policy_raw(cmd: &str, path: Option<&str>, json: bool) -> Result<(String, String), i32> {
-    read_policy_source(cmd, path, json)
 }
 
 /// Structurally parse policy YAML for `validate` WITHOUT the strict

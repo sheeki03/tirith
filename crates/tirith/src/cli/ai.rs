@@ -196,11 +196,45 @@ pub fn scan(json: bool) -> i32 {
 // `tirith ai diff`
 // ===========================================================================
 
+/// How a tracked AI-config file changed between the snapshot and disk. The
+/// `#[serde(rename_all = "lowercase")]` keeps the JSON wire string byte-identical
+/// to the previous stringly-typed values (`"modified"` / `"added"` / `"removed"`)
+/// while making the producer in [`diff`] exhaustive (M13 PR #132 finding F3).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DiffStatus {
+    /// Present in BOTH the snapshot and on disk, with differing content.
+    Modified,
+    /// Absent from the snapshot, present on disk now.
+    Added,
+    /// Present in the snapshot, gone from disk now.
+    Removed,
+}
+
+impl DiffStatus {
+    /// The lowercase label — the SAME string the field serializes to and the
+    /// human-mode `[modified]` / `[added]` / `[removed]` tag prints, so the enum
+    /// changes neither the JSON wire nor the human output.
+    fn as_str(self) -> &'static str {
+        match self {
+            DiffStatus::Modified => "modified",
+            DiffStatus::Added => "added",
+            DiffStatus::Removed => "removed",
+        }
+    }
+}
+
+impl std::fmt::Display for DiffStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One file's diff result for JSON output.
 #[derive(Debug, Serialize)]
 struct FileDiff {
     path: String,
-    status: &'static str,
+    status: DiffStatus,
     added_instructions: Vec<String>,
     removed_instructions: Vec<String>,
     findings: Vec<tirith_core::verdict::Finding>,
@@ -273,9 +307,10 @@ pub fn diff(json: bool) -> i32 {
             .unwrap_or_default();
         let new = match current_by_key.get(key) {
             // A file present on disk that we cannot read (I/O error or over the
-            // size cap) must NOT be treated as empty — that would fabricate a
-            // "removed"/"modified" diff for a file that is simply unreadable.
-            // Surface the error and exit non-zero instead (M13 PR #132 finding J).
+            // size cap) must NOT be treated as empty — that would fabricate an
+            // "added"/"modified" diff (a present-on-disk file is never "removed")
+            // for a file that is simply unreadable. Surface the error and exit
+            // non-zero instead (M13 PR #132 finding J).
             Some(path) => match read_text(path) {
                 Ok(content) => content,
                 Err(e) => {
@@ -301,11 +336,11 @@ pub fn diff(json: bool) -> i32 {
         }
 
         let status = if existed_before && exists_now {
-            "modified"
+            DiffStatus::Modified
         } else if exists_now {
-            "added"
+            DiffStatus::Added
         } else {
-            "removed"
+            DiffStatus::Removed
         };
 
         let added = added_removed(&old, &new);

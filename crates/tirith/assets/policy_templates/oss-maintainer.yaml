@@ -60,7 +60,7 @@ scan:
   # Per-server allowed tools — see `tirith mcp policy init` to scaffold.
   # mcp_allowed_tools: {}
 
-# Per-agent governance — M4 item 8 (enforcement).
+# Per-agent governance (enforcement).
 # `tirith agent sessions` shows which AgentOrigin variants you see in
 # practice; `tirith agent policy init` scaffolds this block. A `deny`
 # match forces the verdict to Block and appends an
@@ -69,7 +69,7 @@ scan:
 #   allow:
 #     - kind: human
 
-# Package-policy section — M6 ch7. A maintainer benefits from surfacing
+# Package-policy section. A maintainer benefits from surfacing
 # brand-new and low-reputation dependencies that show up in a contributor's
 # branch. The block-on-typosquat / install-script knobs below are the
 # highest-value ones to enable; uncomment to opt in.

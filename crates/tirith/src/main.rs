@@ -516,7 +516,7 @@ Examples:
         prompt_status: bool,
     },
 
-    /// Detect your environment and recommend a tirith setup (M13 ch1)
+    /// Detect your environment and recommend a tirith setup
     #[command(
         after_help = "\
 Scans the current repo for the signals that should shape your tirith setup —
@@ -573,7 +573,7 @@ Examples:
         json: bool,
     },
 
-    /// Local security dashboard: export an HTML report or serve it on loopback (M13 ch3)
+    /// Local security dashboard: export an HTML report or serve it on loopback
     #[command(after_help = "\
 Builds a LOCAL-ONLY security snapshot from your audit log (7-day window), policy,
 threat DB, trust store, canaries, and shell-hook state, then either writes it as a
@@ -2434,7 +2434,7 @@ Examples:
         action: RepoCommandsAction,
     },
 
-    /// AI-config drift + risk surface for an agent's repo (M13 ch5)
+    /// AI-config drift + risk surface for an agent's repo
     #[command(after_help = "\
 `tirith ai` watches the AI-config surface a coding agent reads and acts on —
 CLAUDE.md, AGENTS.md, .cursorrules, .claude/*, .cursor/rules/*, .mcp.json — for

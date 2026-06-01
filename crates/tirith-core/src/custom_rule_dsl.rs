@@ -70,7 +70,7 @@
 //!   known-popular package the DB vouches for, and `unknown` for a package the
 //!   DB lists in neither index — so `unknown` stays reachable with a DB loaded.
 //! * **`package.*`** — packages come from [`crate::rules::threatintel::extract_packages`]
-//!   (install/add commands: pip/npm/yarn/pnpm/bun/npx/cargo/gem/go/composer/dotnet),
+//!   (install/add commands: pip (incl. `uv`)/npm/yarn/pnpm/bun/npx/cargo/gem/go/composer/dotnet),
 //!   plus Docker image refs surfaced as the `docker` ecosystem. A command with
 //!   no recognized install leader yields no packages, so `package.*` is `false`.
 
@@ -142,8 +142,8 @@ pub enum WhenClause {
     /// `agent.kind: <k>` — parsed but REJECTED at validate (no agent-kind signal
     /// is wired into the scan context; use `agent_rules`). See module docs.
     AgentKind(String),
-    /// `mcp.tool: <t>` — the current MCP tool equals `<t>` (v1: only when a
-    /// caller sets it; see module docs).
+    /// `mcp.tool: <t>` — parsed but REJECTED at validate (no MCP-tool signal is
+    /// wired into any scan context, so it can never match). See module docs.
     McpTool(String),
 }
 
@@ -2077,6 +2077,10 @@ any:
         assert!(is_windows_absolute_path("c:/x")); // lower-case drive letter
                                                    // UNC / double-separator root.
         assert!(is_windows_absolute_path("//host/share"));
+        // Extended-length / verbatim prefix `\\?\C:\x`: callers backslash-normalize
+        // to `//?/C:/x` before this check, where the leading `//` UNC arm catches it
+        // (treated as absolute). Pass the already-normalized `/`-form as callers do.
+        assert!(is_windows_absolute_path("//?/C:/x"));
         // Round-20 correction: a bare `C:` (drive + colon, no separator) is
         // drive-RELATIVE in Windows path semantics (`Path::new("C:").is_absolute()`
         // is false), so it is NOT absolute.
