@@ -1,86 +1,57 @@
 //! M14 (IDE Extensions) — per-file-type LSP analysis profiles.
 //!
-//! The LSP server (a separate binary) opens a document, decides what KIND of
-//! file it is, analyzes the buffer through [`crate::engine::analyze`] in a
-//! chosen [`ScanContext`], and then POST-FILTERS the resulting
-//! [`crate::verdict::Verdict::findings`] down to the diagnostics that make sense
-//! for that file type. There is NO engine-side rule-category toggle: every rule
-//! that the chosen [`ScanContext`] can fire runs, and this module's job is to
-//! describe two things per file type —
+//! The LSP server analyzes a buffer through [`crate::engine::analyze`] in a
+//! chosen [`ScanContext`], then POST-FILTERS the findings to the diagnostics
+//! that fit the file type. There is no engine-side rule toggle; this module
+//! describes, per file type:
+//!   1. [`contexts_for`] — the ordered [`ScanContext`]s to analyze in (selects
+//!      WHICH rule families run). Most profiles use one ([`scan_context_for`] is
+//!      the one-context accessor); [`LspProfile::AiConfig`] uses TWO because its
+//!      signal families live in different branches of `engine::analyze`. The
+//!      server runs `analyze` per context and UNIONs the findings.
+//!   2. [`retains`] — the per-profile [`RuleId`] allow-set kept in diagnostics.
 //!
-//!   1. [`contexts_for`] — the ORDERED list of [`ScanContext`]s to analyze the
-//!      buffer in (this selects WHICH rule families even run on the hot path).
-//!      Most profiles use a single context ([`scan_context_for`] is the
-//!      one-context convenience accessor over it); [`LspProfile::AiConfig`] uses
-//!      TWO ([`ScanContext::FileScan`] **and** [`ScanContext::Paste`]) because
-//!      its two signal families live in DIFFERENT branches of `engine::analyze`
-//!      (see [`contexts_for`] for the empirical rationale). The LSP server runs
-//!      `analyze` once per context and UNIONs the findings before filtering.
-//!   2. [`retains`] — the per-profile allow-set of [`RuleId`]s to KEEP in the
-//!      diagnostics (the post-filter applied to the unioned `verdict.findings`).
+//! No new [`RuleId`] for M14 — every id below is a shipping variant.
 //!
-//! This crate adds NO new [`RuleId`] for M14 — every id named below is a
-//! shipping variant, reachable today via the documented context.
-//!
-//! ## Routing precedence ([`profile_for_path`])
-//!
-//! Routing is by FILENAME first, then by EXTENSION. The precedence, highest to
-//! lowest, is:
-//!
-//!   1. **AI-config** — wins over everything else, so a `CLAUDE.md` routes to
-//!      [`LspProfile::AiConfig`] (NOT [`LspProfile::MarkdownInstallDoc`]), and a
-//!      file under `.claude/` / `.cursor/rules/` routes to `AiConfig` regardless
-//!      of its extension. Detected by the crate's canonical
-//!      [`crate::rules::aifile::is_ai_config_file`] (directory-aware: `.claude/*`,
-//!      `.cursor/*`, MCP server configs, the agent-instruction basename set).
-//!   2. **Markdown install doc** — a curated set of install-documentation
-//!      markdown filenames (`README.md`, `INSTALL.md`, …). NOT every `.md`.
-//!   3. **Source code** — a curated source-extension set.
-//!   4. **Log file** — the `.log` extension.
-//!   5. else `None` — the safe default: the LSP surfaces NO diagnostics for an
-//!      unrecognised file type rather than guessing.
+//! Routing precedence ([`profile_for_path`]), filename then extension:
+//!   1. AI-config — wins over all, so `CLAUDE.md` and `.claude/`/`.cursor/rules/`
+//!      files route here (via [`crate::rules::aifile::is_ai_config_file`]),
+//!      regardless of extension.
+//!   2. Markdown install doc — a curated filename set, NOT every `.md`.
+//!   3. Source code — a curated extension set.
+//!   4. Log file — the `.log` extension.
+//!   5. else `None` — no diagnostics for an unrecognised type.
 
 use std::path::Path;
 
-// `ScanContext` is defined in `crate::extract` (the engine re-imports it
-// privately). This is the canonical public path and the type the engine's own
-// public `analyze` / `build_dsl_backing` signatures take.
+// `ScanContext` lives in `crate::extract`; this is its canonical public path and
+// the type the engine's `analyze` / `build_dsl_backing` signatures take.
 use crate::extract::ScanContext;
 use crate::verdict::RuleId;
 
-/// The per-file-type LSP analysis profile.
-///
-/// Each variant maps to a [`ScanContext`] ([`scan_context_for`]) and a
-/// [`RuleId`] allow-set ([`retains`]).
+/// The per-file-type LSP analysis profile. Each maps to a [`ScanContext`]
+/// ([`scan_context_for`]) and a [`RuleId`] allow-set ([`retains`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspProfile {
-    /// `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.claude/*`, `.cursor/rules/*`,
-    /// MCP server configs, … — the instruction surface a coding agent reads.
-    /// Surfaces the STATIC hidden-instruction / invisible-unicode config rules.
+    /// Agent-instruction surface (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`,
+    /// `.claude/*`, MCP configs, …). Surfaces static hidden-instruction /
+    /// invisible-unicode config rules.
     AiConfig,
-    /// `README.md` / `INSTALL.md` / `docs/install.md` and friends — install
-    /// documentation whose fenced code blocks carry `curl | sh` install lines.
-    /// Surfaces URL/transport/hostname + command-shape (pipe-to-shell) rules.
+    /// Install docs (`README.md`, `INSTALL.md`, …) whose fenced blocks carry
+    /// `curl | sh` lines. Surfaces URL/transport/hostname + command-shape rules.
     MarkdownInstallDoc,
-    /// A source file (`.rs`, `.py`, `.ts`, …). Surfaces Unicode-confusable /
-    /// bidi / zero-width terminal rules plus credential leaks.
+    /// A source file. Surfaces confusable/bidi/zero-width terminal rules plus
+    /// credential leaks.
     SourceCode,
-    /// A `.log` file — captured command output. Analyzed through the M7 OUTPUT
-    /// FIREWALL ([`crate::engine::analyze_output`]), the semantically-correct
-    /// analyzer for an output stream, so the `output_*` direction rules (OSC 52
-    /// clipboard writes, fake prompts, hidden text, hyperlink mismatch, …)
-    /// actually surface. The LSP server signals this routing via
-    /// [`uses_output_analysis`]; [`contexts_for`] / [`scan_context_for`] are not
-    /// consulted for this profile (it does not take the per-context `analyze`
-    /// path). See [`retains`] for the allow-set.
+    /// A `.log` (captured command output). Analyzed via the M7 OUTPUT FIREWALL
+    /// ([`crate::engine::analyze_output`]) so the `output_*` rules fire; the
+    /// server signals this via [`uses_output_analysis`], and [`contexts_for`] /
+    /// [`scan_context_for`] are not consulted. See [`retains`].
     LogFile,
 }
 
-/// Curated install-documentation markdown FILENAMES (lowercased, basename only).
-///
-/// Deliberately NOT "every `.md`": a project's `CHANGELOG.md` or design notes
-/// should not be analyzed for `curl | sh` install lines. Only the files that
-/// conventionally hold copy-paste install instructions are routed here.
+/// Curated install-doc markdown basenames (lowercased). NOT every `.md`: only
+/// files that conventionally hold copy-paste install instructions route here.
 const INSTALL_DOC_BASENAMES: &[&str] = &[
     "readme.md",
     "install.md",
@@ -90,30 +61,21 @@ const INSTALL_DOC_BASENAMES: &[&str] = &[
     "getting_started.md",
 ];
 
-/// Curated source-code EXTENSIONS (lowercased, no dot).
-///
-/// Source files are analyzed for invisible-unicode / confusable homoglyph
-/// trojan-source attacks and hard-coded credentials. The set is intentionally
-/// finite (no "treat anything that looks like code" heuristic) so routing is
-/// predictable. Shell-script extensions are included because a homoglyph or a
-/// hidden credential in a checked-in `*.sh` is the same threat.
+/// Curated source-code extensions (lowercased, no dot). Analyzed for
+/// invisible-unicode / confusable trojan-source and hard-coded credentials.
+/// Finite (no "looks like code" heuristic) for predictable routing; shell
+/// extensions included since a homoglyph/credential in a `*.sh` is the same threat.
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "rb", "java", "kt", "c", "cc", "cpp",
     "cxx", "h", "hpp", "hh", "cs", "php", "swift", "scala", "sh", "bash", "zsh", "fish", "ps1",
 ];
 
-/// Route a path to its LSP analysis profile, or `None` when the file type is
-/// not one the LSP analyzes.
-///
-/// Precedence (see the module doc): AI-config (filename + directory) wins over
-/// markdown-install-doc, which wins over the extension-based source/log routing.
-/// A `CLAUDE.md` is therefore `AiConfig`, not `MarkdownInstallDoc`.
+/// Route a path to its LSP analysis profile, or `None` when not analyzed.
+/// Precedence (module doc): AI-config > markdown-install-doc > extension-based
+/// source/log. `CLAUDE.md` is therefore `AiConfig`, not `MarkdownInstallDoc`.
 pub fn profile_for_path(path: &Path) -> Option<LspProfile> {
-    // 1. AI-config wins over everything. The canonical detector is
-    //    directory-aware (`.claude/*`, `.cursor/*`) and basename-aware
-    //    (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, MCP configs, …), so a
-    //    `CLAUDE.md` (which is also Markdown) routes here, not to the install-doc
-    //    profile.
+    // 1. AI-config wins. The canonical detector is directory- and basename-aware,
+    //    so `CLAUDE.md` (also Markdown) routes here, not to install-doc.
     if crate::rules::aifile::is_ai_config_file(path) {
         return Some(LspProfile::AiConfig);
     }
@@ -136,164 +98,105 @@ pub fn profile_for_path(path: &Path) -> Option<LspProfile> {
         if SOURCE_EXTENSIONS.contains(&ext_lower.as_str()) {
             return Some(LspProfile::SourceCode);
         }
-        // `.log` only — a `*.log.1` rotated file keeps its `.log.1` extension, so
-        // it does not match here (kept narrow on purpose).
+        // `.log` only — a rotated `*.log.1` keeps `.log.1`, so it doesn't match (narrow).
         if ext_lower == "log" {
             return Some(LspProfile::LogFile);
         }
     }
 
-    // 5. Safe default: no diagnostics for an unrecognised file type.
+    // 5. Safe default: no diagnostics for an unrecognised type.
     None
 }
 
-/// The [`ScanContext`] in which to analyze a buffer for a given profile.
+/// The [`ScanContext`] to analyze a buffer in, chosen so the profile's rule
+/// families actually fire on the [`crate::engine::analyze`] hot path:
 ///
-/// The context is chosen so that the profile's desired rule families ACTUALLY
-/// FIRE on the [`crate::engine::analyze`] hot path (verified against the
-/// tier-1/2/3 dispatch in `engine.rs`):
+/// * [`LspProfile::AiConfig`] → [`ScanContext::FileScan`] (PRIMARY; see
+///   [`contexts_for`] for the second context). The static AI-config rules
+///   (`AgentInstructionHidden`, `ConfigInvisibleUnicode`/`ConfigNonAscii`, the
+///   terminal byte-scan family) run ONLY in `FileScan`; Exec/Paste never invoke
+///   those file scanners. (Drift rules are diff-triggered, so can't fire on one
+///   buffer — see [`retains`].) But a suspicious URL in a `CLAUDE.md` body fires
+///   nothing in `FileScan`, so this profile also analyzes in Paste ([`contexts_for`]).
 ///
-/// * [`LspProfile::AiConfig`] → [`ScanContext::FileScan`] (its PRIMARY context;
-///   see [`contexts_for`] for the SECOND context this profile also analyzes in).
-///   The static AI-config rules — `AgentInstructionHidden` (hidden HTML-comment /
-///   visually-hidden directives), `ConfigInvisibleUnicode` / `ConfigNonAscii`
-///   (config-file invisible / non-ASCII content), and the terminal byte-scan
-///   hidden / bidi / zero-width family — run ONLY in the `FileScan` branch of
-///   `engine::analyze` (`configfile::check` + `aifile::check` +
-///   `terminal::check_bytes`). Exec / Paste never invoke those file-content
-///   scanners. (The AI-config DRIFT rules `AiConfigHiddenInstructionAdded` /
-///   `AiConfigToolUseEscalation` are diff-triggered against a snapshot and so
-///   CANNOT fire on a single buffer — see the limitation note on [`retains`].)
-///   The catch (verified empirically — see [`contexts_for`]): a SUSPICIOUS URL
-///   sitting in a `CLAUDE.md` body (e.g. a `curl http://punycode-host | sh`
-///   install line an agent might fetch) fires NOTHING in `FileScan` — the
-///   URL/transport/hostname rules live in the Exec/Paste branch only. So this
-///   profile is the one case that analyzes in TWO contexts ([`contexts_for`]).
+/// * [`LspProfile::MarkdownInstallDoc`] → [`ScanContext::Paste`]. URL/transport/
+///   hostname and command-shape rules run only in Exec/Paste, not `FileScan`.
+///   Paste over Exec because a README is pasted-like prose: Exec strips a
+///   `# tirith-card:` prelude and runs hot-path guards meaningless for docs,
+///   while Paste's tier-1 regex is a superset of Exec's (nothing gated out).
 ///
-/// * [`LspProfile::MarkdownInstallDoc`] → [`ScanContext::Paste`]. URL /
-///   transport / hostname rules (`extract_urls` → `hostname`/`transport`/
-///   `path`/`ecosystem::check`) and command-shape rules (`command::check` →
-///   `PipeToInterpreter` / `CurlPipeShell` / …) run only in the Exec / Paste
-///   branch — NOT in `FileScan`, which is the key reason a doc cannot be
-///   analyzed as a file here. `Paste` is chosen over `Exec` because a README is
-///   pasted-like prose, not a typed command: `Exec` strips a leading
-///   `# tirith-card:` prelude and runs hot-path guards (taint / command-card /
-///   commands-manifest / blast-radius) that are meaningless for documentation,
-///   while `Paste` runs the URL + command-shape rules cleanly. (`Paste`'s
-///   tier-1 regex is a superset of `Exec`'s, so nothing is gated out.)
+/// * [`LspProfile::SourceCode`] → [`ScanContext::Paste`]. Paste runs
+///   `terminal::check_bytes` over the full byte buffer (every terminal rule),
+///   while Exec filters to the invisible-char subset; `credential::check` fires
+///   in both.
 ///
-/// * [`LspProfile::SourceCode`] → [`ScanContext::Paste`]. The Unicode-confusable
-///   / bidi / zero-width terminal family and the credential detector both fire
-///   in Paste: `Paste` runs `terminal::check_bytes` over the FULL raw byte
-///   buffer (every terminal rule), whereas `Exec` filters the byte-scan down to
-///   the invisible-char subset and drops ANSI / control. `credential::check`
-///   fires in both Exec and Paste (it only no-ops for `FileScan`).
-///
-/// * [`LspProfile::LogFile`] → [`ScanContext::Paste`]. NOTE: the LogFile profile
-///   does NOT actually take the per-context `analyze` path — a `.log` buffer is
-///   captured command output, so the LSP server routes it through the M7 OUTPUT
-///   FIREWALL ([`crate::engine::analyze_output`]) instead, where the `output_*`
-///   direction rules live (they fire ONLY from `analyze_output`, never from
-///   `engine::analyze`). The server selects that path via
-///   [`uses_output_analysis`]. The `Paste` value returned here is therefore only
-///   a harmless default for the one-context accessor; it is not consulted for
-///   this profile. See [`retains`] for the (output-direction) allow-set.
+/// * [`LspProfile::LogFile`] → [`ScanContext::Paste`], but a `.log` does NOT take
+///   the per-context path — it routes through the M7 OUTPUT FIREWALL
+///   ([`crate::engine::analyze_output`]) where the `output_*` rules live (via
+///   [`uses_output_analysis`]). This value is only a harmless default for the
+///   one-context accessor; see [`retains`].
 pub fn scan_context_for(profile: LspProfile) -> ScanContext {
-    // The first (primary) element of `contexts_for` — single source of truth so
-    // the one-context accessor can never drift from the multi-context list.
+    // First element of `contexts_for` — single source of truth so the
+    // one-context accessor can't drift from the multi-context list.
     contexts_for(profile)[0]
 }
 
-/// The ORDERED list of [`ScanContext`]s to analyze a buffer in for a given
-/// profile. The LSP server runs [`crate::engine::analyze`] once PER context and
-/// UNIONs the resulting findings, then applies [`retains`].
+/// The ordered [`ScanContext`]s to analyze a buffer in. The server runs
+/// [`crate::engine::analyze`] once per context, UNIONs the findings, applies
+/// [`retains`].
 ///
-/// Every profile EXCEPT [`LspProfile::AiConfig`] returns exactly one context
-/// (the same value [`scan_context_for`] yields). `AiConfig` returns TWO:
-///
-/// 1. [`ScanContext::FileScan`] — the static AI-config / hidden-instruction
-///    scanners (`configfile::check`, `aifile::check`, `terminal::check_bytes`)
-///    run ONLY in this branch of `engine::analyze`.
-/// 2. [`ScanContext::Paste`] — the URL / transport / hostname rules
-///    (`extract_urls` → `hostname`/`transport`/`path`/`ecosystem::check`) and
-///    command-shape rules run ONLY in the Exec/Paste branch, NEVER in
-///    `FileScan`.
-///
-/// Both are needed because a `CLAUDE.md` is at once an instruction surface (the
-/// first signal) and a place where a poisoned `curl http://punycode-host | sh`
-/// install URL can hide (the second signal). Verified empirically: a plain
-/// suspicious URL in a `CLAUDE.md` body produces ZERO findings under `FileScan`
-/// alone, and a hidden-HTML-comment directive produces ZERO findings under
-/// `Paste` alone — so neither single context covers the AI-config threat model.
-/// `Paste` rather than `Exec` covers the URL half, for the same reasons
-/// documented on [`scan_context_for`] for the other Paste profiles: no
-/// command-card prelude stripping, no taint or blast-radius hot-path guards, and
-/// a tier-1 regex that is a superset of `Exec`'s.
-///
-/// The post-filter [`retains`] keeps only the AiConfig-relevant ids from the
-/// union, so the extra Paste-only findings a config buffer can incidentally trip
-/// (e.g. `hidden_multiline`, the bare `pipe_to_interpreter` on a prose line) are
-/// dropped — only the genuine AI-config signals and the suspicious-URL families
-/// survive.
+/// Every profile except [`LspProfile::AiConfig`] returns one context (= what
+/// [`scan_context_for`] yields). `AiConfig` returns TWO: [`ScanContext::FileScan`]
+/// (the static config / hidden-instruction scanners run only here) and
+/// [`ScanContext::Paste`] (URL/transport/hostname + command-shape rules run only
+/// in Exec/Paste). Both are needed and verified empirically: a suspicious URL in
+/// a `CLAUDE.md` produces zero findings under FileScan alone, and a hidden-comment
+/// directive zero under Paste alone. Paste over Exec for the same reasons as the
+/// other Paste profiles ([`scan_context_for`]). The [`retains`] post-filter drops
+/// the incidental Paste-only noise.
 pub fn contexts_for(profile: LspProfile) -> &'static [ScanContext] {
     match profile {
         // BOTH branches — the only multi-context profile (see fn doc).
         LspProfile::AiConfig => &[ScanContext::FileScan, ScanContext::Paste],
         LspProfile::MarkdownInstallDoc => &[ScanContext::Paste],
         LspProfile::SourceCode => &[ScanContext::Paste],
-        // LogFile does NOT take the per-context `analyze` path (see
-        // `uses_output_analysis`); this value is an unused harmless default kept
-        // only so the one-context accessor (`scan_context_for`) stays total.
+        // LogFile does NOT take this path (see `uses_output_analysis`); an unused
+        // harmless default so the one-context accessor stays total.
         LspProfile::LogFile => &[ScanContext::Paste],
     }
 }
 
-/// Whether the LSP server should analyze this profile's buffer through the M7
-/// OUTPUT FIREWALL ([`crate::engine::analyze_output`]) instead of the per-context
-/// [`crate::engine::analyze`] path that [`contexts_for`] drives.
+/// Whether to analyze this profile via the M7 OUTPUT FIREWALL
+/// ([`crate::engine::analyze_output`]) instead of the [`contexts_for`] +
+/// [`crate::engine::analyze`] path.
 ///
-/// `true` ONLY for [`LspProfile::LogFile`]: a `.log` buffer is captured command
-/// output, and the `output_*` direction rules ([`retains`] for the list) fire
-/// ONLY from `analyze_output`, never from `engine::analyze` in any
-/// [`ScanContext`]. Every other profile analyzes via `analyze` (`false`), so for
-/// them [`contexts_for`] selects the rule families and this returns `false`.
-///
-/// The two paths are mutually exclusive: when this is `true` the server runs
-/// `analyze_output` ONCE and ignores [`contexts_for`]; when `false` it runs the
-/// `contexts_for` + `analyze` union. Both apply the same [`retains`] allow-set.
+/// `true` ONLY for [`LspProfile::LogFile`]: a `.log` is captured output, and the
+/// `output_*` rules fire only from `analyze_output`. The paths are mutually
+/// exclusive (`true` → run `analyze_output` once, ignore [`contexts_for`]); both
+/// apply the same [`retains`] allow-set.
 pub fn uses_output_analysis(profile: LspProfile) -> bool {
     matches!(profile, LspProfile::LogFile)
 }
 
-/// Whether a `rule_id` is RETAINED in the diagnostics for a given profile — the
-/// post-filter the LSP server applies to `verdict.findings`.
-///
-/// Each list is curated (not "everything the context can fire") so the LSP shows
-/// only the diagnostics that are meaningful for that file type. Every id named
-/// here is a real, shipping [`RuleId`] variant — this function compile-checks
-/// the allow-sets.
+/// Whether `rule_id` is RETAINED in diagnostics for a profile — the post-filter
+/// over `verdict.findings`. Each list is curated (not "everything the context can
+/// fire"); every id is a real shipping [`RuleId`], so this compile-checks the sets.
 pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
     match profile {
-        // AI-config files: the STATIC hidden-instruction / invisible-content
-        // rules reachable in `FileScan`, PLUS the suspicious-URL families that
-        // only fire in the `Paste` half of this profile's two-context analysis
-        // (see `contexts_for`). The union is filtered by this allow-set, so the
-        // extra Paste-only noise (`hidden_multiline`, a bare prose-line
-        // `pipe_to_interpreter`, …) is dropped while the genuine signals stay.
+        // AI-config: the static hidden-instruction / invisible-content rules from
+        // `FileScan`, PLUS the suspicious-URL families from the Paste half (see
+        // `contexts_for`). The allow-set drops the incidental Paste-only noise.
         LspProfile::AiConfig => matches!(
             rule_id,
-            // Hidden directive in an agent-instruction file (HTML comment /
-            // visually-hidden element). The primary AI-config signal.
+            // Hidden directive in an agent-instruction file. Primary AI-config signal.
             RuleId::AgentInstructionHidden
-            // Config-file invisible / non-ASCII smuggling (`configfile::check`).
+            // Config-file invisible / non-ASCII smuggling.
             | RuleId::ConfigInvisibleUnicode
             | RuleId::ConfigNonAscii
-            // Visible prompt-injection / suspicious indicators in a config file.
+            // Visible prompt-injection / suspicious indicators.
             | RuleId::ConfigInjection
             | RuleId::ConfigSuspiciousIndicator
-            // The terminal byte-scan invisible/deception family that
-            // `terminal::check_bytes` fires in the FileScan branch — the same
-            // smuggling channels, surfaced on the config buffer.
+            // Terminal byte-scan invisible/deception family (FileScan branch).
             | RuleId::BidiControls
             | RuleId::ZeroWidthChars
             | RuleId::UnicodeTags
@@ -302,12 +205,9 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             | RuleId::InvisibleWhitespace
             | RuleId::HangulFiller
             | RuleId::ConfusableText
-            // Suspicious URL embedded in the config body — an agent that reads a
-            // poisoned `CLAUDE.md` may FETCH the URL, so a homograph/punycode/
-            // raw-IP host, a plain-HTTP or shortened install URL, or a
-            // `curl … | sh` install line in the file IS an AI-config diagnostic.
-            // These fire only in the `Paste` context (`contexts_for` runs it for
-            // AiConfig); identical family to `MarkdownInstallDoc`'s allow-set.
+            // Suspicious URL in the config body — an agent reading a poisoned
+            // `CLAUDE.md` may FETCH it. Fire only in Paste (`contexts_for`);
+            // identical family to `MarkdownInstallDoc`'s allow-set.
             | RuleId::PipeToInterpreter
             | RuleId::CurlPipeShell
             | RuleId::WgetPipeShell
@@ -324,30 +224,28 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             | RuleId::ConfusableDomain
             | RuleId::RawIpUrl
             | RuleId::LookalikeTld
-            // AI-config DRIFT rules — reachable only via `tirith ai diff`, NOT a
-            // single-buffer `analyze` (see the limitation in the fn doc). Listed
-            // so an `analyze_output`/diff-aware LSP keeps them if present.
+            // AI-config DRIFT rules — only via `tirith ai diff`, not a single
+            // buffer (see fn doc). Listed so a diff-aware LSP keeps them.
             | RuleId::AiConfigHiddenInstructionAdded
             | RuleId::AiConfigToolUseEscalation
         ),
 
-        // Markdown install docs: URL/transport + command-shape rules that fire on
-        // the fenced install commands.
+        // Markdown install docs: URL/transport + command-shape rules on the
+        // fenced install commands.
         LspProfile::MarkdownInstallDoc => matches!(
             rule_id,
-            // Command-shape: pipe-to-shell install lines (`curl … | sh`).
+            // Command-shape: pipe-to-shell (`curl … | sh`).
             RuleId::PipeToInterpreter
             | RuleId::CurlPipeShell
             | RuleId::WgetPipeShell
             | RuleId::HttpiePipeShell
             | RuleId::XhPipeShell
-            // Transport family: plain HTTP / insecure TLS / shortened URLs.
+            // Transport: plain HTTP / insecure TLS / shortened URLs.
             | RuleId::PlainHttpToSink
             | RuleId::SchemelessToSink
             | RuleId::InsecureTlsFlags
             | RuleId::ShortenedUrl
-            // Hostname family: homograph / punycode / mixed-script / confusable
-            // / userinfo-trick / raw-IP domains in install URLs.
+            // Hostname: homograph/punycode/mixed-script/confusable/userinfo/raw-IP.
             | RuleId::NonAsciiHostname
             | RuleId::PunycodeDomain
             | RuleId::MixedScriptInLabel
@@ -357,8 +255,7 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             | RuleId::LookalikeTld
         ),
 
-        // Source code: Unicode-confusable / bidi / zero-width (trojan-source)
-        // plus hard-coded credentials.
+        // Source code: confusable/bidi/zero-width (trojan-source) + credentials.
         LspProfile::SourceCode => matches!(
             rule_id,
             // Trojan-source / homoglyph terminal family.
@@ -376,12 +273,9 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             | RuleId::PrivateKeyExposed
         ),
 
-        // Log files: the M7 output-direction rules. These fire ONLY via
-        // `engine::analyze_output` (never `engine::analyze`), so the LSP server
-        // routes a `.log` buffer through that output-firewall path —
-        // `uses_output_analysis(LogFile)` is `true` — and applies this allow-set
-        // to the resulting findings. (A `.log` IS captured command output, so
-        // the output firewall is the semantically-correct analyzer.)
+        // Log files: M7 output-direction rules, which fire only via
+        // `engine::analyze_output` (the output firewall, `uses_output_analysis`
+        // is `true`) — the correct analyzer for captured command output.
         LspProfile::LogFile => matches!(
             rule_id,
             RuleId::OutputOsc52ClipboardWrite
@@ -414,8 +308,7 @@ mod tests {
             profile_for_path(Path::new(".cursorrules")),
             Some(LspProfile::AiConfig)
         );
-        // Directory-aware: a file under `.cursor/rules/` is AI-config regardless
-        // of its `.md` extension.
+        // Directory-aware: `.cursor/rules/*` is AI-config regardless of extension.
         assert_eq!(
             profile_for_path(Path::new(".cursor/rules/style.md")),
             Some(LspProfile::AiConfig)
@@ -428,7 +321,7 @@ mod tests {
 
     #[test]
     fn ai_config_wins_over_markdown_install_doc() {
-        // A `CLAUDE.md` is both AI-config and Markdown; AI-config must win.
+        // `CLAUDE.md` is both AI-config and Markdown; AI-config wins.
         assert_eq!(
             profile_for_path(Path::new("CLAUDE.md")),
             Some(LspProfile::AiConfig)
@@ -453,7 +346,7 @@ mod tests {
             profile_for_path(Path::new("docs/installation.md")),
             Some(LspProfile::MarkdownInstallDoc)
         );
-        // A non-install `.md` is NOT routed (not every markdown file).
+        // A non-install `.md` is NOT routed.
         assert_eq!(profile_for_path(Path::new("CHANGELOG.md")), None);
         assert_eq!(profile_for_path(Path::new("docs/architecture.md")), None);
     }
@@ -479,7 +372,7 @@ mod tests {
             profile_for_path(Path::new("var/log/app.log")),
             Some(LspProfile::LogFile)
         );
-        // Rotated `*.log.1` keeps a `.1` extension → not matched (narrow on purpose).
+        // Rotated `*.log.1` keeps `.1` → not matched (narrow).
         assert_eq!(profile_for_path(Path::new("app.log.1")), None);
     }
 
@@ -493,7 +386,7 @@ mod tests {
 
     #[test]
     fn scan_context_for_returns_documented_context() {
-        // The one-context accessor returns the PRIMARY context of each profile.
+        // The accessor returns each profile's PRIMARY context.
         assert_eq!(
             scan_context_for(LspProfile::AiConfig),
             ScanContext::FileScan
@@ -508,9 +401,8 @@ mod tests {
 
     #[test]
     fn contexts_for_ai_config_is_filescan_then_paste() {
-        // AiConfig is the ONLY multi-context profile: FileScan (static config /
-        // hidden-instruction scanners) THEN Paste (URL/transport/hostname). The
-        // order is load-bearing (`scan_context_for` returns element 0).
+        // AiConfig is the only multi-context profile: FileScan THEN Paste. Order
+        // is load-bearing (`scan_context_for` returns element 0).
         assert_eq!(
             contexts_for(LspProfile::AiConfig),
             &[ScanContext::FileScan, ScanContext::Paste]
@@ -524,8 +416,7 @@ mod tests {
 
     #[test]
     fn contexts_for_single_context_profiles() {
-        // Every non-AiConfig profile analyzes in exactly ONE context, identical
-        // to `scan_context_for`.
+        // Every non-AiConfig profile analyzes in exactly one context.
         for p in [
             LspProfile::MarkdownInstallDoc,
             LspProfile::SourceCode,
@@ -551,13 +442,11 @@ mod tests {
             RuleId::ConfigInvisibleUnicode
         ));
         assert!(retains(LspProfile::AiConfig, RuleId::BidiControls));
-        // A suspicious-URL / command-shape rule IS retained for AI-config: an
-        // agent reading a poisoned config may fetch a `curl … | sh` install URL,
-        // so these (surfaced via the Paste half of `contexts_for`) are kept.
+        // Suspicious-URL / command-shape rules ARE retained (the Paste half).
         assert!(retains(LspProfile::AiConfig, RuleId::CurlPipeShell));
         assert!(retains(LspProfile::AiConfig, RuleId::PunycodeDomain));
         assert!(retains(LspProfile::AiConfig, RuleId::PlainHttpToSink));
-        // A credential rule is NOT an AI-config diagnostic (source-code only).
+        // Credential rules are NOT AI-config diagnostics (source-code only).
         assert!(!retains(LspProfile::AiConfig, RuleId::HighEntropySecret));
         assert!(!retains(LspProfile::AiConfig, RuleId::CredentialInText));
     }
@@ -593,8 +482,7 @@ mod tests {
         assert!(retains(LspProfile::SourceCode, RuleId::BidiControls));
         assert!(retains(LspProfile::SourceCode, RuleId::CredentialInText));
         assert!(retains(LspProfile::SourceCode, RuleId::PrivateKeyExposed));
-        // A command-shape rule must NOT be retained for source code (the
-        // load-bearing out-of-profile negative case).
+        // A command-shape rule must NOT be retained for source code.
         assert!(!retains(LspProfile::SourceCode, RuleId::CurlPipeShell));
         assert!(!retains(LspProfile::SourceCode, RuleId::PipeToInterpreter));
     }
@@ -613,9 +501,8 @@ mod tests {
 
     #[test]
     fn uses_output_analysis_is_logfile_only() {
-        // LogFile is the ONLY profile analyzed via the output firewall
-        // (`analyze_output`); every other profile takes the per-context
-        // `analyze` path.
+        // LogFile is the only profile via the output firewall; others take the
+        // per-context `analyze` path.
         assert!(uses_output_analysis(LspProfile::LogFile));
         for p in [
             LspProfile::AiConfig,

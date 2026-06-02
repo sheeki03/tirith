@@ -1,41 +1,24 @@
 //! IaC operational-context rules (M8 ch3).
 //!
-//! These rules fire when the parsed command's leader is an IaC CLI
-//! (`terraform`, `pulumi`, `tofu` / OpenTofu). The PATTERN_TABLE entry
-//! `iac_cmd` (`\b(?:terraform|pulumi|tofu)\b`) is the tier-1 gate for
-//! the exec context. The rules themselves split into:
+//! Fire when the parsed command leader is an IaC CLI (`terraform`, `pulumi`,
+//! `tofu`). Tier-1 gate: PATTERN_TABLE entry `iac_cmd`. The rules are:
 //!
-//! 1. **`IacApplyWithoutPlan`** (High, gated by `iac_require_plan_before_apply`)
-//!    — `terraform apply` (or `pulumi up`, `tofu apply`) with no plan-file
-//!    positional argument, where the operator has opted into the
-//!    plan-before-apply gate via policy.
-//! 2. **`IacApplyAutoApprove`** (Medium) — `terraform apply -auto-approve`,
-//!    `pulumi up --yes`, `tofu apply -auto-approve` outside of a
-//!    production-labeled context. Footgun even in dev, but does not warrant
-//!    a Block default.
-//! 3. **`IacApplyAutoApproveProd`** (High) — same shape as #2, but the
-//!    active context is labeled `critical` / `production` / `prod` /
-//!    `live` / `p0` / `p1`. The combination is a documented anti-pattern.
-//! 4. **`IacDestroyProd`** (High) — `terraform destroy` / `pulumi destroy`
-//!    / `tofu destroy` against a labeled-prod context.
-//! 5. **`IacPlanHashMismatch`** (High, gated by `iac_require_plan_before_apply`)
-//!    — `terraform apply tfplan` (positional plan file) where the file's
-//!    SHA-256 does not match any recorded hash in
-//!    `state_dir()/iac_plans/`. Either the plan was tampered with after
-//!    `iac check-plan` recorded it, or the plan was never checked.
+//! 1. `IacApplyWithoutPlan` (High, gated by `iac_require_plan_before_apply`) —
+//!    apply with no plan-file positional.
+//! 2. `IacApplyAutoApprove` (Medium) — apply with auto-approve outside a
+//!    production-labeled context.
+//! 3. `IacApplyAutoApproveProd` (High) — #2 against a critical/prod context.
+//! 4. `IacDestroyProd` (High) — destroy against a labeled-prod context.
+//! 5. `IacPlanHashMismatch` (High, gated by `iac_require_plan_before_apply`) —
+//!    apply against a plan file whose SHA-256 is not recorded in
+//!    `state_dir()/iac_plans/`.
 //!
-//! `IacPlanHighRiskChanges` is NOT fired from this module — it is emitted
-//! by the `tirith iac check-plan` CLI path when the parsed plan contains
-//! high-risk resource changes. See `iac_plan.rs` for the parser.
+//! `IacPlanHighRiskChanges` is emitted by the `iac check-plan` CLI path, not
+//! here (see `iac_plan.rs`).
 //!
-//! ## Detection guard
-//!
-//! Detection short-circuits when the parsed leader is not an IaC CLI.
-//! For the production-context rules, we additionally require the M8 ch1
-//! `context_detect::detect_all()` result + an operator-labeled context
-//! (`policy.context_labels`). The `context_guard_enabled` switch
-//! ALSO gates the prod-only rules — it is the shared operator switch
-//! across all M8 chunks.
+//! Detection short-circuits when the leader is not an IaC CLI. The prod-context
+//! rules additionally require `context_guard_enabled` + an operator-labeled
+//! context (`policy.context_labels`).
 
 use std::path::PathBuf;
 
@@ -46,8 +29,7 @@ use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// IaC tool detected by the rule. Mirrors `iac_plan::PlanTool` but is
-/// constructed from the parsed command leader, not from a plan file.
+/// IaC tool detected from the parsed command leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IacTool {
     Terraform,
@@ -65,9 +47,8 @@ impl IacTool {
     }
 }
 
-/// Run the IaC rules over the parsed command. Returns at most a small
-/// number of findings (the prod-context rule and the apply-gate rule
-/// can both fire on the same input).
+/// Run the IaC rules over the parsed command (the prod-context rule and the
+/// apply-gate rule can both fire on the same input).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     let segments = tokenize::tokenize(input, shell);
     let Some(seg) = segments.first() else {
@@ -91,12 +72,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         .map(|a| strip_outer_quotes(a).to_string())
         .collect();
 
-    // Positional argument shape:
-    //   terraform apply [flags] [plan_file?]
-    //   pulumi up [flags]
-    //   tofu apply [flags] [plan_file?]
-    //   terraform destroy [flags]
-    //   pulumi destroy [flags]
+    // Shape: <tool> <apply|up|destroy> [flags] [plan_file?]
     let (verb, post_verb) = match locate_verb(tool, &args) {
         Some(p) => p,
         None => return Vec::new(),
@@ -112,10 +88,8 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     let auto_approve = has_auto_approve(tool, post_verb);
     let plan_file = positional_plan_file(post_verb);
 
-    // Production-context detection. The M8 ch1 `context_guard_enabled`
-    // switch and labels file gate the prod-aware rules. The non-prod
-    // rules (auto-approve, apply-without-plan, hash-mismatch) fire
-    // regardless of context detection.
+    // Prod-context detection gates the prod-aware rules only; the others fire
+    // regardless.
     let prod_context = if policy.context_guard_enabled && !policy.context_labels.is_empty() {
         find_prod_context(policy)
     } else {
@@ -179,7 +153,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         ));
     }
 
-    // Plan-before-apply gate. Only fires when the operator has opted in.
+    // Plan-before-apply gate (opt-in).
     if is_apply && policy.iac_require_plan_before_apply {
         match plan_file {
             None => {
@@ -208,11 +182,8 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                     Ok(bytes) => {
                         let sha = iac_plan::sha256_hex(&bytes);
                         let status = iac_plan::plan_hash_status(&sha);
-                        // We treat both "NotRecorded" and
-                        // "StateDirUnresolved" as evidence the apply must
-                        // pause — fail closed (PR-127 review #14). The
-                        // evidence text differentiates so the operator
-                        // can fix the right thing.
+                        // Both NotRecorded and StateDirUnresolved fail closed
+                        // (PR-127 review #14); the evidence text differentiates.
                         if !matches!(status, iac_plan::PlanHashStatus::Recorded) {
                             let detail = match status {
                                 iac_plan::PlanHashStatus::StateDirUnresolved => format!(
@@ -244,8 +215,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                         }
                     }
                     Err(e) => {
-                        // Couldn't open the plan file — emit the mismatch
-                        // finding anyway because the apply will fail too.
+                        // Couldn't open the plan file — emit the mismatch anyway.
                         findings.push(make_finding(
                             RuleId::IacPlanHashMismatch,
                             Severity::High,
@@ -273,9 +243,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     findings
 }
 
-/// Look up the active provider's context label. Returns `Some(label)`
-/// when the active provider context is in `policy.context_labels` with
-/// a critical / production criticality. `None` otherwise.
+/// `Some(label)` when an active provider context is labeled critical/prod.
 fn find_prod_context(policy: &Policy) -> Option<String> {
     let detection = context_detect::detect_all();
     for provider in [
@@ -303,9 +271,7 @@ enum IacVerb {
     Destroy,
 }
 
-/// Locate the verb position. Skips global flags (`-chdir=...`, `-help`,
-/// `-no-color`, etc.) that come BEFORE the verb. Returns the slice
-/// AFTER the verb so positional/flag detection works downstream.
+/// Locate the verb, skipping global flags before it; returns the slice after.
 fn locate_verb(tool: IacTool, args: &[String]) -> Option<(IacVerb, &[String])> {
     for (i, arg) in args.iter().enumerate() {
         if arg.starts_with('-') {
@@ -323,8 +289,8 @@ fn locate_verb(tool: IacTool, args: &[String]) -> Option<(IacVerb, &[String])> {
     None
 }
 
-/// Detect the auto-approve flag in the post-verb args. Terraform /
-/// OpenTofu use `-auto-approve`; Pulumi uses `--yes` / `-y`.
+/// Detect the auto-approve flag (`-auto-approve` for terraform/tofu, `--yes` /
+/// `-y` for pulumi).
 fn has_auto_approve(tool: IacTool, post_verb: &[String]) -> bool {
     match tool {
         IacTool::Terraform | IacTool::Tofu => post_verb.iter().any(|a| {
@@ -338,9 +304,8 @@ fn has_auto_approve(tool: IacTool, post_verb: &[String]) -> bool {
     }
 }
 
-/// Locate the first positional argument that looks like a plan-file
-/// path (post-verb, not a flag, not a `KEY=VAL` shape). Returns
-/// `None` for `terraform apply` (no positional after the verb).
+/// Locate the first post-verb positional that looks like a plan-file path (not
+/// a flag, not `KEY=VAL`); `None` when there is none.
 fn positional_plan_file(post_verb: &[String]) -> Option<String> {
     let mut iter = post_verb.iter();
     while let Some(arg) = iter.next() {
@@ -359,9 +324,7 @@ fn positional_plan_file(post_verb: &[String]) -> Option<String> {
             return None;
         }
         if arg.starts_with('-') {
-            // Skip flag values — terraform's `-var-file=foo` is glued,
-            // `-target=res` is glued, so plain `-flag value` form is
-            // rare. We err on the side of skipping bare flags only.
+            // Terraform flag values are glued (`-target=res`), so skip bare flags.
             continue;
         }
         if arg.contains('=') {
@@ -538,7 +501,6 @@ mod tests {
 
     #[test]
     fn check_tofu_apply_with_no_args_does_not_fire() {
-        // No auto-approve, no plan-before-apply policy → no finding.
         let policy = Policy::default();
         let findings = check("tofu apply", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -580,8 +542,7 @@ mod tests {
 
     #[test]
     fn check_terraform_apply_tfplan_no_policy_no_finding() {
-        // No policy gate AND no auto-approve → no finding for a clean
-        // apply against a plan file.
+        // No policy gate and no auto-approve → a clean apply yields nothing.
         let policy = Policy::default();
         let findings = check("terraform apply tfplan", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -633,13 +594,11 @@ mod tests {
         );
     }
 
-    // Use the unused `BTreeMap` import to keep the helper.
     #[allow(dead_code)]
     fn _force_btreemap_use() -> BTreeMap<String, String> {
         BTreeMap::new()
     }
 
-    // Use the unused policy_with_prod_label helper in a focused test.
     #[test]
     fn policy_helper_builds_labeled_aws() {
         let p = policy_with_prod_label("aws", "prod");

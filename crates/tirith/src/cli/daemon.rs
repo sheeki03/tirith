@@ -35,7 +35,7 @@ fn pid_path() -> PathBuf {
         .join("daemon.pid")
 }
 
-/// Wire protocol: one DaemonRequest per line (newline-delimited JSON).
+/// Wire protocol: one DaemonRequest per newline-delimited JSON line.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonRequest {
     pub command: String,
@@ -46,7 +46,7 @@ pub struct DaemonRequest {
     pub shell: Option<String>,
     #[serde(default)]
     pub interactive: bool,
-    /// Client-side TIRITH=0 bypass request (carried from the invoking env).
+    /// Client-side TIRITH=0 bypass request from the invoking env.
     #[serde(default)]
     pub bypass_requested: bool,
 }
@@ -80,16 +80,15 @@ pub struct DaemonResponse {
     /// Action AFTER enrichment but BEFORE paranoia.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_action: Option<String>,
-    /// M11 ch2 — the repo-command-manifest `allowed[]` entry name this command
-    /// matched (if any), carried so the client can annotate the audit context.
-    /// The daemon DOES evaluate the manifest (it runs the full `engine::analyze`),
-    /// so this is populated from the analyzed verdict rather than dropped.
+    /// M11 ch2 — the manifest `allowed[]` entry this command matched, for the
+    /// client's audit context. The daemon runs the full `engine::analyze`, so
+    /// this is populated from the verdict.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub manifest_allowed_match: Option<String>,
 }
 
-/// Try to connect to the daemon and run a check. Returns `None` if the daemon
-/// is unavailable (caller should fall back to local analysis).
+/// Connect to the daemon and run a check; `None` if unavailable (caller falls
+/// back to local analysis).
 #[cfg(unix)]
 pub fn try_daemon_check(
     input: &str,
@@ -188,8 +187,8 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         _ => ScanContext::Exec,
     };
 
-    // Match the local engine fast-path: when bypass is honored we short-circuit
-    // at tier 2 with no findings/URLs and zero timings (no analysis ran).
+    // Match the local engine fast-path: an honored bypass short-circuits at
+    // tier 2 with no findings/URLs and zero timings.
     if req.bypass_requested {
         let policy = tirith_core::policy::Policy::discover(req.cwd.as_deref());
         let bypass_allowed = if req.interactive {
@@ -251,17 +250,16 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     // Daemon-only: network-aware enrichment is too slow for the sync path.
     enrich_with_network_checks(&mut verdict.findings);
 
-    // Enrichment may have added higher-severity findings, so recompute action.
+    // Enrichment may add higher-severity findings; recompute the action.
     verdict.action = upgraded_action_from_findings(&verdict.findings, verdict.action);
 
-    // Snapshot AFTER enrichment but BEFORE paranoia filtering so the client
-    // receives the full detection set (ADR-13).
+    // Snapshot after enrichment, before paranoia filtering (ADR-13).
     let raw_findings = Some(verdict.findings.clone());
     let raw_action_str = Some(format!("{:?}", verdict.action));
 
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // Capture before `verdict.findings` is moved into the response below.
+    // Capture before `verdict.findings` is moved below.
     let manifest_allowed_match = verdict.manifest_allowed_match.clone();
 
     DaemonResponse {
@@ -281,14 +279,13 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
     }
 }
 
-/// Run network checks on findings that reference URLs and add enrichment.
-///
-/// This is only called in the daemon path where latency is acceptable.
+/// Run network checks on URL-referencing findings (daemon path only, where
+/// latency is acceptable).
 #[cfg(unix)]
 fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
     let mut new_findings = Vec::new();
 
-    // Resolve shortened URLs inline and surface blocklist hits on destinations.
+    // Resolve shortened URLs and surface blocklist hits on destinations.
     for finding in findings.iter_mut() {
         if finding.rule_id != RuleId::ShortenedUrl {
             continue;
@@ -304,7 +301,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
                 finding.description =
                     format!("{} — resolves to: {}", finding.description, resolved);
 
-                // Run DNS blocklist on the resolved destination's host.
+                // DNS blocklist on the resolved destination's host.
                 if let Some(host) = extract_host_from_url(&resolved) {
                     let blocklist_hits = network::check_dns_blocklist(&host);
                     if !blocklist_hits.is_empty() {
@@ -329,7 +326,7 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
         }
     }
 
-    // Also run DNS blocklist on every URL host in any finding.
+    // DNS blocklist on every URL host in any finding.
     let mut checked_hosts = std::collections::HashSet::new();
     for finding in findings.iter() {
         for evidence in &finding.evidence {
@@ -388,7 +385,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Clean up any stale socket from a previous unclean shutdown.
+    // Clean up a stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(sock);
 
     if let Err(e) = std::fs::write(pid, std::process::id().to_string()) {
@@ -447,22 +444,20 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
 
         tokio::pin!(shutdown);
 
-        // Periodic threat DB update. Uses its own timer independent of the
-        // per-CLI-process UPDATE_ATTEMPTED guard, and coordinates with concurrent
+        // Periodic threat DB update: own timer, coordinating with concurrent
         // `tirith check` processes via the same lockfile + next-check-at state.
         let threatdb_update_handle = tokio::spawn(async {
-            // Initial delay so daemon stabilizes before the first check.
+            // Initial delay so the daemon stabilizes first.
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             loop {
-                // spawn_blocking because the check does filesystem I/O.
+                // spawn_blocking — the check does filesystem I/O.
                 let should_spawn =
                     tokio::task::spawn_blocking(daemon_should_spawn_update)
                         .await
                         .unwrap_or(false);
 
                 if should_spawn {
-                    // Detached child so the daemon doesn't block on download,
-                    // matching the check.rs path.
+                    // Detached child so the daemon doesn't block on the download.
                     let _ = tokio::task::spawn_blocking(|| {
                         if let Ok(exe) = std::env::current_exe() {
                             let _ = std::process::Command::new(exe)
@@ -492,7 +487,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                         Ok((stream, _addr)) => {
                             tokio::spawn(async move {
                                 let (reader, mut writer) = stream.into_split();
-                                // Cap request size to 1 MiB to prevent OOM from malicious clients.
+                                // Cap request size to 1 MiB (OOM guard).
                                 let mut buf_reader = BufReader::new(reader.take(1024 * 1024));
                                 let mut line = String::new();
 
@@ -504,8 +499,8 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
 
                                 let resp = match serde_json::from_str::<DaemonRequest>(line.trim()) {
                                     Ok(req) => {
-                                        // Engine + network checks block, so offload
-                                        // to spawn_blocking to keep accept loop responsive.
+                                        // Engine + network checks block — offload so
+                                        // the accept loop stays responsive.
                                         tokio::task::spawn_blocking(move || handle_request(&req))
                                             .await
                                             .unwrap_or_else(|_| DaemonResponse {
@@ -553,8 +548,8 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
     exit
 }
 
-/// Check whether a background threat DB update should be spawned.
-/// Called from the daemon's periodic timer task (blocking context).
+/// Whether a background threat DB update should be spawned (called from the
+/// daemon's periodic timer, blocking context).
 #[cfg(unix)]
 fn daemon_should_spawn_update() -> bool {
     let policy = tirith_core::policy::Policy::discover(None);
@@ -581,7 +576,7 @@ fn daemon_should_spawn_update() -> bool {
         }
     }
 
-    // Dedup against recent spawns from other processes (30s window).
+    // Dedup against recent spawns from other processes (30s).
     let spawned_at_path = state.join("threatdb-spawned-at");
     if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
         if let Ok(spawned_ts) = content.trim().parse::<u64>() {
@@ -599,14 +594,13 @@ fn daemon_should_spawn_update() -> bool {
 
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    // kill(pid, 0) probes existence without actually sending a signal.
+    // kill(pid, 0) probes existence without sending a signal.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
-    // Conservatively assume alive if the PID file exists — a proper Windows
-    // implementation should use OpenProcess.
+    // Conservatively assume alive (Windows should use OpenProcess).
     true
 }
 
@@ -636,8 +630,7 @@ pub fn start() -> i32 {
 
     eprintln!("tirith: starting daemon on {}", sock.display());
 
-    // Runs in the foreground; production deployments rely on a process
-    // supervisor (systemd/launchd) for daemonisation.
+    // Foreground; production relies on a supervisor (systemd/launchd).
     run_server(&sock, &pid)
 }
 
@@ -810,9 +803,8 @@ mod tests {
         }
     }
 
-    /// CodeRabbit R3 #4: the daemon evaluates the full manifest, so the matched
-    /// `allowed[]` entry name must survive the daemon→client serde boundary
-    /// (previously `check.rs` hardcoded `None`, dropping the audit annotation).
+    /// CodeRabbit R3 #4: the matched `allowed[]` entry must survive the
+    /// daemon→client serde boundary (previously `check.rs` hardcoded `None`).
     #[test]
     fn daemon_response_round_trips_manifest_allowed_match() {
         let resp = DaemonResponse {
@@ -828,9 +820,8 @@ mod tests {
         assert_eq!(back.manifest_allowed_match.as_deref(), Some("deploy"));
     }
 
-    /// `None` is omitted from the wire (skip_serializing_if), and a payload from
-    /// a PRE-UPGRADE daemon that lacks the field deserializes cleanly to `None`
-    /// (serde `default`) — so the wiring is backward-compatible.
+    /// `None` is omitted on the wire and a pre-upgrade payload without the field
+    /// deserializes to `None` — backward-compatible.
     #[test]
     fn daemon_response_omits_and_defaults_manifest_allowed_match() {
         // None => omitted on the wire.

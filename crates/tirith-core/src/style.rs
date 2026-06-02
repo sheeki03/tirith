@@ -1,20 +1,16 @@
 use crate::verdict::Severity;
 use owo_colors::OwoColorize;
 
-/// Which output stream color decisions should be based on.
-/// Commands route human output to different streams (e.g., check uses stderr,
-/// warnings uses stdout), so color must be evaluated per-stream.
+/// The output stream color decisions are based on (commands route human output
+/// to stdout vs stderr, so color is evaluated per-stream).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stream {
     Stdout,
     Stderr,
 }
 
-/// Check if color should be used for a given output stream.
-/// Respects the `NO_COLOR` env var (https://no-color.org/) and TTY detection.
-///
-/// Per the NO_COLOR spec, the presence of the variable is sufficient to disable
-/// color, regardless of its value (including empty string).
+/// Whether color should be used for `stream`. Respects `NO_COLOR`
+/// (https://no-color.org/ — presence alone disables, even if empty) and TTY.
 pub fn use_color_for(stream: Stream) -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -25,9 +21,8 @@ pub fn use_color_for(stream: Stream) -> bool {
     }
 }
 
-/// Format a severity label with color appropriate for the given stream.
-/// Returns a bracketed severity label like `[CRITICAL]` with ANSI color when
-/// color is supported, or plain text otherwise.
+/// A bracketed severity label like `[CRITICAL]`, ANSI-colored when `stream`
+/// supports color, else plain.
 pub fn severity_label(severity: &Severity, stream: Stream) -> String {
     let label = format!("[{}]", severity);
     if !use_color_for(stream) {

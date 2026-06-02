@@ -1,78 +1,51 @@
 //! M11 ch5 — incident mode (L2 #21).
 //!
-//! An *incident* is a manually-declared "we may be under attack right now"
-//! posture. While an incident is active tirith stops being advisory and turns
-//! the screws via three levers: the runtime policy `fail_mode` is forced to
+//! An *incident* is a manually-declared "under attack" posture. While active,
+//! three levers turn the screws: `fail_mode` is forced to
 //! [`crate::policy::FailMode::Closed`], the `TIRITH=0` env bypass (interactive
-//! AND non-interactive) is disabled, and a curated set of already-shipping
-//! detection rules is elevated so the *next* suspicious thing the operator runs
-//! is far more likely to block.
-//!
-//! Scope note: on the primary `tirith check` exec path the operative levers are
-//! the bypass-disable and the rule-elevation. `fail_mode=Closed` governs the
-//! fail-OPEN/CLOSED decision at the points that consult it (the MCP output
-//! filter and the install transaction); the ordinary `check` verdict derives
-//! its action from finding severity, so the elevation — not `fail_mode` — is
-//! what makes more commands block during an incident.
+//! AND non-interactive) is disabled, and the rules in [`INCIDENT_ELEVATED_RULES`]
+//! are elevated. On the `tirith check` exec path the operative levers are the
+//! bypass-disable and the elevation (the verdict's action derives from severity,
+//! so elevation — not `fail_mode` — is what makes more commands block).
 //!
 //! # Corrupt flag → fail SAFE (NOT fail-open)
 //!
-//! The flag file's mere *existence* is the signal that an incident is active.
-//! If the file exists but is corrupt/truncated (a parse failure), tirith treats
-//! the incident as **active** — it applies the fail-closed overlay anyway and
-//! warns on stderr — rather than silently dropping the posture. Distinguishing
-//! "absent" (truly no incident) from "present-but-corrupt" (an incident WAS
-//! started; honor it) is what keeps the headline guarantee honest. See
-//! [`read_flag_at`] / [`active_cached`].
+//! The flag file's mere *existence* signals an active incident. A corrupt/
+//! truncated file is treated as **active** (overlay applied + stderr warning),
+//! never silently dropped — distinguishing "absent" from "present-but-corrupt"
+//! is what keeps the guarantee honest. See [`read_flag_at`] / [`active_cached`].
 //!
 //! # Zero new RuleIds
 //!
-//! Incident mode introduces **no** new [`crate::verdict::RuleId`]. It works
-//! entirely by layering runtime overrides on top of the loaded
-//! [`crate::policy::Policy`]:
-//!
-//! * `fail_mode` → [`crate::policy::FailMode::Closed`]
-//! * `allow_bypass_env` → `false`
-//! * `allow_bypass_env_noninteractive` → `false`
-//! * a severity-override for each [`RuleId`] in [`INCIDENT_ELEVATED_RULES`],
-//!   applied ONLY when the policy does not already pin that rule higher (we
-//!   never *downgrade* an operator's explicit override).
-//!
-//! The override merge lives in [`crate::policy::Policy::apply_runtime_overrides`]
-//! and runs on every analyze via the policy-discovery path, behind a 5-second
-//! per-process stat cache so the common no-incident path is a near-noop.
-//!
-//! # The mode flag
-//!
-//! Active state is a single JSON file at `state_dir()/incident_active.json`
-//! holding `{started_at, started_by, reason}`. Its mere existence means "an
-//! incident is active"; deleting it ends the incident. This is deliberately
-//! the simplest possible mechanism, for one load-bearing reason:
+//! Incident mode adds NO new [`crate::verdict::RuleId`]; it layers runtime
+//! overrides on the loaded [`crate::policy::Policy`] (`fail_mode` → Closed,
+//! both `allow_bypass_env*` → false, and a severity-override per
+//! [`INCIDENT_ELEVATED_RULES`] entry applied ONLY when the policy does not
+//! already pin it higher — we never downgrade an operator's override). The merge
+//! lives in [`crate::policy::Policy::apply_runtime_overrides`], behind a 5s stat
+//! cache so the no-incident path is a near-noop.
 //!
 //! # Lockout safety (CRITICAL)
 //!
-//! `tirith incident stop` is a **direct deletion of this state file** — it is
-//! NOT routed through `tirith check` and is therefore NOT subject to the
-//! incident's own fail-closed policy. If `stop` were gated by the policy it
-//! flips on, a stuck incident on a machine with `allow_bypass_env: false`
-//! would be unrecoverable. Stopping an incident must ALWAYS succeed regardless
-//! of policy, so it is modeled as plain filesystem state, not a gated command.
-//! The `tirith incident start --reason "…"` lockout test pins this.
+//! Active state is a single JSON file at `state_dir()/incident_active.json`;
+//! deleting it ends the incident. `tirith incident stop` is a DIRECT deletion of
+//! that file — NOT routed through `tirith check`, so it is not subject to the
+//! incident's own fail-closed policy. Were it gated, a stuck incident on a
+//! machine with `allow_bypass_env: false` would be unrecoverable. `stop` must
+//! ALWAYS succeed (pinned by the lockout test).
 //!
 //! # Concurrent starts
 //!
-//! [`start`] uses `create_new` (O_EXCL) so a second `start` while one is
-//! already active fails with [`StartError::AlreadyActive`] carrying the
-//! existing `started_at` — it never silently overwrites the original reason or
-//! timestamp.
+//! [`start`] uses `create_new` (O_EXCL) so a second `start` fails with
+//! [`StartError::AlreadyActive`] (carrying the existing `started_at`) rather than
+//! overwriting the original reason/timestamp.
 //!
 //! # Honest scope
 //!
-//! The flag file is user-writable. An attacker who already has the operator's
-//! shell can delete it (ending the incident) exactly as they could touch any
-//! other tirith state file. This is operator-trust — a footgun-and-response
-//! aid, not an adversary-resistant control. Same model as the M8 sudo-session
-//! and the M11 canary store.
+//! The flag file is user-writable: an attacker with the operator's shell can
+//! delete it like any other tirith state file. This is operator-trust — a
+//! footgun aid, not an adversary-resistant control (same model as the M8
+//! sudo-session and the M11 canary store).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -82,30 +55,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::{RuleId, Severity};
 
-/// The already-shipping rules incident mode elevates, with the severity each
-/// is forced to while an incident is active.
+/// Rules incident mode elevates, with the forced severity while active.
 ///
-/// **Grep-traceability invariant:** every entry here MUST be a real
-/// [`RuleId`] variant. A new detection wave that warrants incident elevation
-/// adds its rule to this list in the same chunk. The
-/// `incident_elevated_rules_exist` test round-trips every entry through serde
-/// so a renamed/removed variant is caught at test time, not in the field.
-///
-/// We only ever elevate (Medium → High, High → Critical, …). The merge in
-/// [`crate::policy::Policy::apply_runtime_overrides`] never lowers a severity
-/// the operator already pinned, and never lowers a rule's baseline.
+/// Grep-traceability invariant: every entry MUST be a real [`RuleId`] variant;
+/// `incident_elevated_rules_exist` round-trips each through serde to catch a
+/// renamed/removed variant at test time. The merge only ever ELEVATES — it never
+/// lowers an operator's pinned severity or a rule's baseline.
 pub const INCIDENT_ELEVATED_RULES: &[(RuleId, Severity)] = &[
-    // A command sweeping multiple credential files at once — during an
-    // incident this is "someone is collecting secrets to exfiltrate".
+    // Credential-file sweep — mid-incident, "collecting secrets to exfiltrate".
     (RuleId::CredentialFileSweep, Severity::Critical),
-    // base64-decode-then-execute — the textbook obfuscated-payload shape.
+    // base64-decode-then-execute — textbook obfuscated payload.
     (RuleId::Base64DecodeExecute, Severity::Critical),
-    // M9 ch5 — the leader binary was modified in the last few minutes. Benign
-    // noise normally; during an incident a freshly-written binary is a prime
-    // "the attacker just dropped this" signal.
+    // M9 ch5 — leader binary modified in the last few minutes (just-dropped signal).
     (RuleId::ExecRecentlyModified, Severity::High),
-    // M9 ch5 — the leader binary is world-writable. Same reasoning: a
-    // world-writable binary in the exec path is far more alarming mid-incident.
+    // M9 ch5 — leader binary world-writable (more alarming mid-incident).
     (RuleId::ExecWorldWritable, Severity::High),
 ];
 
@@ -119,39 +82,25 @@ pub fn flag_path() -> Option<PathBuf> {
 pub struct IncidentState {
     /// Unix epoch seconds when the incident was declared.
     pub started_at: u64,
-    /// Best-effort identity of who started it (`$USER` / `$LOGNAME`, else
-    /// `"unknown"`). Advisory only — never load-bearing.
+    /// Best-effort starter identity (`$USER`/`$LOGNAME`, else `"unknown"`). Advisory.
     #[serde(default)]
     pub started_by: String,
-    /// Operator-supplied reason string. Stored verbatim, no parsing.
+    /// Operator-supplied reason, stored verbatim.
     #[serde(default)]
     pub reason: String,
 }
 
-/// Upper bound on the stored `reason` length, in bytes. A reason longer than
-/// this is TRUNCATED (with an explicit marker) before the flag is written.
-///
-/// WHY (CodeRabbit R16 #1): the flag body is published to disk by [`start_at`]
-/// but read back through [`read_flag_at`], which rejects any body larger than
-/// [`FLAG_READ_CAP`] as `Corrupt`. An operator passing a very long `--reason`
-/// could otherwise persist a body the reader immediately rejects — `start`
-/// returns `Ok` yet the flag reads back self-corrupt. Capping the reason well
-/// below `FLAG_READ_CAP` (the rest of the body — `started_at`, `started_by`,
-/// JSON punctuation — is tiny) guarantees the written body is ALWAYS within the
-/// read cap, so a flag written by `start` always reads back `Valid`. 8 KiB is
-/// far more than any genuine human-written reason and leaves ~56 KiB of slack
-/// under the 64 KiB read cap for the rest of the (small) object.
+/// Upper bound on the stored `reason` (bytes); a longer reason is TRUNCATED with
+/// a marker before write. WHY (CodeRabbit R16 #1): capping well below
+/// [`FLAG_READ_CAP`] guarantees a flag written by [`start_at`] always reads back
+/// `Valid` rather than self-`Corrupt` (the reader rejects oversized bodies).
 pub const MAX_REASON_BYTES: usize = 8 * 1024;
 
-/// Marker appended to a `reason` that was truncated to fit [`MAX_REASON_BYTES`],
-/// so the recorded reason makes the truncation obvious rather than silently
-/// dropping the tail.
+/// Marker appended to a truncated `reason` so the drop is obvious.
 const REASON_TRUNCATED_MARKER: &str = "… [truncated]";
 
-/// Truncate `reason` to at most [`MAX_REASON_BYTES`] bytes (on a UTF-8 char
-/// boundary), appending [`REASON_TRUNCATED_MARKER`] when truncation occurred.
-/// The result is guaranteed `<= MAX_REASON_BYTES + REASON_TRUNCATED_MARKER.len()`,
-/// which is still vastly under [`FLAG_READ_CAP`].
+/// Truncate `reason` to [`MAX_REASON_BYTES`] (UTF-8 boundary), appending
+/// [`REASON_TRUNCATED_MARKER`] on truncation. Result stays vastly under [`FLAG_READ_CAP`].
 fn cap_reason(reason: String) -> String {
     if reason.len() <= MAX_REASON_BYTES {
         return reason;
@@ -162,13 +111,10 @@ fn cap_reason(reason: String) -> String {
 }
 
 impl IncidentState {
-    /// Construct fresh incident state anchored at `SystemTime::now()`. BOTH
-    /// env-influenced fields are bounded — `reason` to [`MAX_REASON_BYTES`]
-    /// (CodeRabbit R16 #1) and `started_by` to [`MAX_STARTED_BY_BYTES`] (R13 #D,
-    /// capped inside [`current_user`]) — so the serialized flag body can never
-    /// exceed [`FLAG_READ_CAP`]. A flag written by [`start_at`] therefore always
-    /// reads back as [`FlagRead::Valid`], never `Corrupt`, regardless of how large
-    /// `$USER`/`$LOGNAME` or the `--reason` argument were.
+    /// Fresh incident state at `now()`. Both env-influenced fields are bounded
+    /// (`reason` via [`MAX_REASON_BYTES`], `started_by` via [`current_user`]) so
+    /// the serialized body can never exceed [`FLAG_READ_CAP`] — a flag written by
+    /// [`start_at`] always reads back [`FlagRead::Valid`].
     pub fn now(reason: impl Into<String>) -> Self {
         Self {
             started_at: unix_now(),
@@ -177,8 +123,8 @@ impl IncidentState {
         }
     }
 
-    /// RFC-3339-ish display of `started_at` for human output. Falls back to the
-    /// raw epoch seconds when the timestamp is outside chrono's range.
+    /// RFC-3339 display of `started_at`, falling back to raw epoch seconds when
+    /// outside chrono's range.
     pub fn started_at_display(&self) -> String {
         chrono::DateTime::from_timestamp(self.started_at as i64, 0)
             .map(|dt| dt.to_rfc3339())
@@ -189,10 +135,9 @@ impl IncidentState {
 /// Why a [`start`] failed.
 #[derive(Debug)]
 pub enum StartError {
-    /// An incident is already active. Carries the existing state so the CLI can
-    /// print "already active since X" without re-reading the file.
+    /// An incident is already active; carries the existing state for the CLI.
     AlreadyActive(Box<IncidentState>),
-    /// `state_dir()` could not be resolved (no `$HOME`, no `$XDG_STATE_HOME`).
+    /// `state_dir()` could not be resolved.
     NoStateDir,
     /// A filesystem error while creating the flag file.
     Io(std::io::Error),
@@ -219,24 +164,21 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
-/// Tri-state result of reading the incident flag file. Distinguishing
-/// `Absent` from `Corrupt` is load-bearing for the fail-SAFE posture: a corrupt
-/// flag means an incident WAS started and the file later got mangled, so we
-/// must keep enforcing — never silently fall back to "no incident".
+/// Tri-state read of the incident flag. Distinguishing `Absent` from `Corrupt`
+/// is load-bearing for fail-SAFE: a corrupt flag means an incident WAS started
+/// and the file got mangled, so we keep enforcing — never fall back to "none".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlagRead {
-    /// No flag file on disk → no incident is active (the common path).
+    /// No flag file → no incident (common path).
     Absent,
-    /// Flag file present and parsed cleanly.
+    /// Present and parsed cleanly.
     Valid(IncidentState),
-    /// Flag file present but unreadable/unparseable. Treated as ACTIVE
-    /// (fail-safe): an incident was declared and the file is now corrupt.
+    /// Present but unreadable/unparseable → treated as ACTIVE (fail-safe).
     Corrupt,
 }
 
-/// A synthetic [`IncidentState`] used when the flag file exists but is corrupt.
-/// `started_at: 0` and the marker reason make the degraded state obvious in
-/// `status`/`report` output while still driving the fail-closed overlay.
+/// Synthetic [`IncidentState`] for a corrupt flag: `started_at: 0` + a marker
+/// reason make the degraded state obvious while still driving the overlay.
 pub fn corrupt_placeholder_state() -> IncidentState {
     IncidentState {
         started_at: 0,
@@ -249,8 +191,7 @@ pub fn corrupt_placeholder_state() -> IncidentState {
 pub const CORRUPT_FLAG_REASON: &str =
     "incident flag file is corrupt — fail-closed posture applied (run `tirith incident status`)";
 
-/// Read the current incident flag as a tri-state. This is the un-cached read;
-/// the hot path goes through [`active_cached`].
+/// Un-cached tri-state read of the incident flag (the hot path uses [`active_cached`]).
 pub fn read_flag() -> FlagRead {
     match flag_path() {
         Some(path) => read_flag_at(&path),
@@ -258,51 +199,35 @@ pub fn read_flag() -> FlagRead {
     }
 }
 
-/// The hot-path read cap for the incident flag. The flag is a tiny JSON object
-/// (`started_at` / `started_by` / `reason`); 64 KiB is far more than a genuine
-/// flag needs, so anything larger is treated as corrupt rather than buffered.
+/// Hot-path read cap for the flag (a tiny JSON object); anything larger is
+/// treated as corrupt rather than buffered.
 const FLAG_READ_CAP: u64 = 64 * 1024;
 
-/// [`read_flag`] against an explicit path (test seam). Distinguishes
-/// file-absent (→ [`FlagRead::Absent`]) from present-but-unparseable
-/// (→ [`FlagRead::Corrupt`]) — a corrupt flag must NOT downgrade to "no
-/// incident".
+/// [`read_flag`] against an explicit path (test seam). Distinguishes absent
+/// (→ [`FlagRead::Absent`]) from present-but-unparseable (→ [`FlagRead::Corrupt`]).
 ///
-/// HOT-PATH HARDENING (CodeRabbit R9 #C, hardened R11 #1): the flag path is read
-/// on every exec through [`active_cached`], and an attacker who can write the
-/// state dir could point it at a FIFO/device (a plain `std::fs::read` would BLOCK
-/// forever waiting for a writer) or a huge regular file (unbounded allocation).
-/// We go through the shared, race-free [`crate::util::read_regular_capped`]
-/// helper — it opens with `O_NONBLOCK` and `fstat`s the OPEN fd (closing the
-/// metadata→open TOCTOU a separate `stat`+`open` left), rejects any non-regular
-/// file without blocking, and caps the read at [`FLAG_READ_CAP`]. The mapping is
-/// fail-SAFE: an `ENOENT` is the only `Absent` case; EVERYTHING else (non-regular
-/// file, oversized, permission/I/O error) is `Corrupt` so an incident is still
-/// considered active and the posture is never silently dropped.
+/// HOT-PATH HARDENING (CodeRabbit R9 #C / R11 #1): the path is read on every exec,
+/// and an attacker who can write the state dir could plant a FIFO/device (a plain
+/// `read` blocks forever) or a huge file. [`crate::util::read_regular_capped`]
+/// opens `O_NONBLOCK`, `fstat`s the OPEN fd (closing the stat→open TOCTOU),
+/// rejects non-regular files, and caps at [`FLAG_READ_CAP`]. Mapping is fail-SAFE:
+/// `ENOENT` is the only `Absent`; everything else is `Corrupt`.
 pub fn read_flag_at(path: &Path) -> FlagRead {
     let bytes = match crate::util::read_regular_capped(path, FLAG_READ_CAP) {
         Ok(b) => b,
-        // ENOENT from the (symlink-FOLLOWING) open. This is ONLY truly-absent
-        // when no path ENTRY exists at all. A DANGLING SYMLINK at the flag path
-        // also opens ENOENT (the symlink resolves to a missing target), yet a
-        // sentinel WAS placed there — mapping it to `Absent` would silently turn
-        // incident mode OFF (fail-OPEN), the inverse of the lockout guarantee. So
-        // we distinguish via `symlink_metadata` (does NOT follow the link): if a
-        // path entry exists (a dangling symlink, or any other lstat-able entry),
-        // it is fail-safe ACTIVE → Corrupt; only a genuinely-missing entry
-        // (lstat also ENOENT) stays `Absent`. `stop_at` clears such a sentinel.
+        // ENOENT from the symlink-following open. A DANGLING SYMLINK also opens
+        // ENOENT yet a sentinel WAS placed — mapping it to `Absent` would turn
+        // incident mode OFF (fail-OPEN). Distinguish via `symlink_metadata` (no
+        // follow): only a genuinely-missing entry stays `Absent`; any present
+        // entry is fail-safe ACTIVE → Corrupt. `stop_at` clears such a sentinel.
         Err(crate::util::OpenRegularError::NotFound) => {
             return match std::fs::symlink_metadata(path) {
-                // No entry at all → truly absent → no incident.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => FlagRead::Absent,
-                // A path entry exists (dangling symlink, etc.) but the regular-file
-                // open failed → an incident WAS declared; fail-safe ACTIVE.
                 _ => FlagRead::Corrupt,
             };
         }
-        // A non-regular flag (FIFO/device/socket/dir), an oversized flag, or any
-        // open/read error on a present path is fail-safe ACTIVE → Corrupt.
-        // `stop_at` clears a directory sentinel separately.
+        // Non-regular / oversized / any open-read error on a present path is
+        // fail-safe ACTIVE → Corrupt.
         Err(_) => return FlagRead::Corrupt,
     };
     match serde_json::from_slice(&bytes) {
@@ -311,12 +236,9 @@ pub fn read_flag_at(path: &Path) -> FlagRead {
     }
 }
 
-/// Read the current incident state for the CLI (`status`, `stop`, `report`).
-/// `None` only when no flag file exists. A corrupt flag yields the synthetic
-/// [`corrupt_placeholder_state`] (fail-safe: an incident is still considered
-/// active).
-///
-/// The hot-path read used by the engine goes through [`active_cached`].
+/// Read incident state for the CLI. `None` only when no flag exists; a corrupt
+/// flag yields [`corrupt_placeholder_state`] (fail-safe). The engine hot path
+/// uses [`active_cached`].
 pub fn read_state() -> Option<IncidentState> {
     match read_flag() {
         FlagRead::Absent => None,
@@ -325,8 +247,7 @@ pub fn read_state() -> Option<IncidentState> {
     }
 }
 
-/// [`read_state`] against an explicit path (test seam). A corrupt flag yields
-/// the synthetic [`corrupt_placeholder_state`]; an absent flag yields `None`.
+/// [`read_state`] against an explicit path (test seam).
 pub fn read_state_at(path: &Path) -> Option<IncidentState> {
     match read_flag_at(path) {
         FlagRead::Absent => None,
@@ -335,9 +256,8 @@ pub fn read_state_at(path: &Path) -> Option<IncidentState> {
     }
 }
 
-/// Declare an incident: atomically create the flag file with `0o600`. Fails
-/// with [`StartError::AlreadyActive`] if one already exists (O_EXCL) — never
-/// overwrites an in-flight incident's `started_at`/`reason`.
+/// Declare an incident: atomically create the `0o600` flag file. Fails with
+/// [`StartError::AlreadyActive`] (O_EXCL) rather than overwriting an in-flight one.
 pub fn start(reason: impl Into<String>) -> Result<IncidentState, StartError> {
     let path = flag_path().ok_or(StartError::NoStateDir)?;
     start_at(&path, reason)
@@ -345,17 +265,11 @@ pub fn start(reason: impl Into<String>) -> Result<IncidentState, StartError> {
 
 /// [`start`] against an explicit path (test seam).
 ///
-/// The flag is published ATOMICALLY with its full JSON body already present:
-/// the body is written to a sibling temp file, then `hard_link(tmp, path)`
-/// claims the final path. `hard_link` errors with `AlreadyExists` when `path`
-/// already exists — the exact same "someone beat us to it" semantics as the
-/// O_EXCL open, but a concurrent [`active_cached`] now sees either no file or a
-/// COMPLETE file, never the empty window between O_EXCL-create and `write_all`.
-/// If `hard_link` is unsupported on the platform/filesystem we fall back to the
-/// original O_EXCL-then-write path (whose only downside — a momentary empty
-/// file — is already fail-SAFE: a partial read is treated as an active
-/// incident). The `AlreadyExists` → surface-existing-state path is preserved in
-/// both branches.
+/// Published ATOMICALLY: the full JSON body is written to a sibling temp file,
+/// then `hard_link` claims the final path — a concurrent [`active_cached`] sees
+/// no file or a COMPLETE one, never the empty O_EXCL-create→write window.
+/// `AlreadyExists` surfaces the existing state. If `hard_link` is unsupported we
+/// fall back to O_EXCL-then-write (a momentary empty file is itself fail-SAFE).
 pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState, StartError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(StartError::Io)?;
@@ -364,9 +278,8 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
     let body =
         serde_json::to_vec_pretty(&state).map_err(|e| StartError::Io(std::io::Error::other(e)))?;
 
-    // Write the FULL body to a sibling temp file first, then atomically claim
-    // the final path via hard_link. NamedTempFile cleans itself up on drop, so
-    // a failed/loser claim never leaves a stray temp file behind.
+    // Write the FULL body to a sibling temp file, then claim the final path via
+    // hard_link. NamedTempFile cleans up on drop, so a loser never strays.
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let tmp_result = match dir {
         Some(d) => tempfile::NamedTempFile::new_in(d),
@@ -377,25 +290,20 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Best-effort 0600 on the temp file before it becomes the flag.
+            // Best-effort 0600 before the temp file becomes the flag.
             let _ = tmp
                 .as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        // Durability: fsync the body to stable storage BEFORE `hard_link`
-        // publishes the inode at the final path. `flush()` only drains the
-        // userspace buffer; without the sync a crash after the link could leave a
-        // zero/partial flag. (A partial flag still reads as an active incident —
-        // fail-safe — but a durable full write keeps the recorded reason intact.)
+        // fsync the body BEFORE `hard_link` publishes the inode; `flush()` only
+        // drains the userspace buffer, so without this a crash could leave a
+        // partial flag (still fail-safe, but the reason would be lost).
         if tmp.write_all(&body).is_ok() && tmp.flush().is_ok() && tmp.as_file().sync_all().is_ok() {
             match std::fs::hard_link(tmp.path(), path) {
                 Ok(()) => {
-                    // We won the race; the final path now points at the fully
-                    // written content. Drop `tmp` to unlink the temp name (the
-                    // linked final path keeps the inode/content).
+                    // Won the race. Drop `tmp` to unlink the temp name (the linked
+                    // final path keeps the inode), then dir-fsync the new entry.
                     drop(tmp);
-                    // Make the new directory entry crash-durable (the body was
-                    // already fsync'd above; the LINK itself needs a dir fsync).
                     fsync_parent_dir(path);
                     invalidate_cache();
                     return Ok(state);
@@ -403,28 +311,16 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     return Err(already_active(path));
                 }
-                // hard_link unsupported (e.g. some filesystems) or another
-                // error: fall through to the O_EXCL path below. `tmp` is dropped
-                // here, removing the temp file.
+                // hard_link unsupported / other error → fall through to O_EXCL.
                 Err(_) => {}
             }
         }
     }
 
-    // Fallback (hard_link unsupported on this filesystem, or the temp file could
-    // not be created): O_EXCL create then write. We claim the final path first
-    // (O_EXCL fails rather than clobber a concurrent incident), then write +
-    // fsync the body.
-    //
-    // TRANSACTIONAL on the error path: if the write/flush/sync fails we must
-    // REMOVE the file we just created. `read_flag_at` treats ANY present
-    // non-empty-or-even-empty flag as fail-safe ACTIVE, so a partial flag left
-    // behind after a FAILED `start` would turn incident mode ON while `start`
-    // reports Err — exactly the inconsistency this fixes. After removal the read
-    // path sees no flag (inactive), matching the returned Err.
-    //
-    // DURABLE on the success path: fsync the body before returning Ok so a crash
-    // immediately after `start` keeps the recorded reason intact.
+    // Fallback: O_EXCL create then write. TRANSACTIONAL on error (REMOVE the
+    // just-created file, else a partial flag would turn incident mode ON while
+    // `start` reports Err); DURABLE on success (fsync before Ok). See
+    // `finish_excl_write`.
     let mut opts = std::fs::OpenOptions::new();
     // create_new => O_EXCL: fail rather than clobber a concurrent incident.
     opts.write(true).create_new(true);
@@ -436,9 +332,7 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
     match opts.open(path) {
         Ok(f) => {
             finish_excl_write(f, &body, path)?;
-            // The O_EXCL create added a new directory entry; fsync the parent so
-            // that entry survives a crash (the body was fsync'd in
-            // `finish_excl_write`).
+            // fsync the parent so the new directory entry survives a crash.
             fsync_parent_dir(path);
             invalidate_cache();
             Ok(state)
@@ -448,32 +342,18 @@ pub fn start_at(path: &Path, reason: impl Into<String>) -> Result<IncidentState,
     }
 }
 
-/// Write `body` to the just-O_EXCL-created flag `file`, flush, and fsync as one
-/// fallible unit. On ANY failure REMOVE `path` so no partial flag is left behind
-/// (`read_flag_at` treats any present flag as fail-safe ACTIVE, so a partial
-/// flag after a FAILED `start` would wrongly turn incident mode on), then
-/// surface the original write error. On success the body is durable on disk
-/// before returning.
-///
-/// Split out so the failure-path cleanup is unit-testable: a caller can pass a
-/// read-only-opened handle to force `write_all` to fail deterministically and
-/// assert the flag file is removed.
-///
-/// fsync the directory that CONTAINS the incident flag, so the new directory
-/// entry (created by `hard_link` or O_EXCL `create_new`) is itself crash-durable
-/// — not just the file body (CodeRabbit R7 #3). Without this, a crash right after
-/// the atomic claim could lose the directory entry even though the inode's data
-/// was synced, leaving incident mode silently un-armed after a power loss.
-///
-/// Routes through the shared [`crate::util::fsync_parent_dir_logged`]
-/// (CodeRabbit R13 #5, consolidating the former per-module copy): a failure of
-/// the trailing dir fsync must never make `start`/`stop` report an error after
-/// the flag is already published/removed — but it is now LOGGED rather than
-/// silently dropped. Best-effort + unix-only (the inner call no-ops on non-Unix).
+/// fsync the directory CONTAINING the flag so the new entry (from `hard_link` or
+/// O_EXCL) is crash-durable, not just the body (CodeRabbit R7 #3). Routes through
+/// [`crate::util::fsync_parent_dir_logged`] (R13 #5): best-effort, unix-only, and
+/// LOGGED — a dir-fsync failure must never make `start`/`stop` report an error.
 fn fsync_parent_dir(path: &Path) {
     crate::util::fsync_parent_dir_logged(path, "incident flag");
 }
 
+/// Write `body` to the just-O_EXCL-created `file`, flush, fsync as one fallible
+/// unit. On ANY failure REMOVE `path` (a partial flag would wrongly turn incident
+/// mode on) then surface the original error; on success the body is durable.
+/// Split out so the cleanup path is unit-testable via a read-only handle.
 fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Result<(), StartError> {
     use std::io::Write as _;
     let write_result = file
@@ -481,18 +361,12 @@ fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Resul
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all());
     if let Err(e) = write_result {
-        // Best-effort cleanup: drop the handle first, then unlink the partial
-        // flag. A failure to remove is swallowed — the original write error is
-        // the one worth surfacing.
+        // Best-effort cleanup: drop the handle, unlink the partial flag (a remove
+        // failure is swallowed — the write error is what matters).
         drop(file);
         let removed = std::fs::remove_file(path).is_ok();
-        // Durability of the ROLLBACK unlink (CodeRabbit R9 #B): the unlink mutates
-        // the parent directory's entries, and `read_flag_at` treats ANY present
-        // flag as fail-safe ACTIVE. If a crash/power-loss strikes after this unlink
-        // but before the directory entry is durable, the partial flag could be
-        // resurrected — turning incident mode wrongly ON after a FAILED `start`.
-        // fsync the parent so the removal is crash-durable too. Best-effort,
-        // unix-only, and only when something was actually removed.
+        // Make the rollback unlink crash-durable too (CodeRabbit R9 #B), else a
+        // crash could resurrect the partial flag → incident mode wrongly ON.
         if removed {
             fsync_parent_dir(path);
         }
@@ -501,12 +375,9 @@ fn finish_excl_write(mut file: std::fs::File, body: &[u8], path: &Path) -> Resul
     Ok(())
 }
 
-/// Build the [`StartError::AlreadyActive`] for a start that lost the race:
-/// surface the *existing* on-disk state, not ours. A corrupt existing flag
-/// reads back as the corrupt-marker state (CORRUPT_FLAG_REASON) rather than a
-/// blank "since 1970" — so the user is told the live flag is unreadable (F9).
-/// The empty fallback only fires in the narrow TOCTOU window where the file
-/// vanished between the failed claim and this read.
+/// Build [`StartError::AlreadyActive`] for a lost race, surfacing the EXISTING
+/// on-disk state (a corrupt flag reads back as CORRUPT_FLAG_REASON, F9). The
+/// empty fallback only fires in the TOCTOU window where the file just vanished.
 fn already_active(path: &Path) -> StartError {
     let existing = read_state_at(path).unwrap_or_else(|| IncidentState {
         started_at: 0,
@@ -516,12 +387,9 @@ fn already_active(path: &Path) -> StartError {
     StartError::AlreadyActive(Box::new(existing))
 }
 
-/// End an incident: delete the flag file. **Always** succeeds when the file is
-/// gone (idempotent — a missing flag is success). This is the lockout-safe
-/// recovery path: it is a plain unlink, never gated by the incident's own
-/// fail-closed policy.
-///
-/// Returns `Ok(true)` if a flag was removed, `Ok(false)` if none was present.
+/// End an incident: delete the flag file (idempotent — a missing flag is
+/// success). The lockout-safe recovery path: a plain unlink, never gated by the
+/// incident's own policy. `Ok(true)` if a flag was removed, else `Ok(false)`.
 pub fn stop() -> Result<bool, String> {
     let path = match flag_path() {
         Some(p) => p,
@@ -532,43 +400,30 @@ pub fn stop() -> Result<bool, String> {
 
 /// [`stop`] against an explicit path (test seam).
 ///
-/// LOCKOUT SAFETY: `read_flag_at` treats ANY non-`NotFound` read error on the
-/// flag path as a (fail-safe) active incident — including the case where the
-/// path is a DIRECTORY (a `read` of a dir is `EISDIR`, not `NotFound`). A plain
-/// `remove_file` would then error on that directory and leave the posture stuck
-/// fail-closed forever. So `stop` must clear a removable non-file sentinel too:
-/// if `remove_file` fails because the path is a directory, fall back to
-/// `remove_dir_all`. `stop` must ALWAYS be able to clear the active posture.
+/// LOCKOUT SAFETY: `read_flag_at` reads any non-`NotFound` error as active —
+/// including a DIRECTORY at the path (EISDIR). A plain `remove_file` would error
+/// on it and stick the posture fail-closed, so `stop` falls back to
+/// `remove_dir_all`. It must ALWAYS be able to clear the active posture.
 pub fn stop_at(path: &Path) -> Result<bool, String> {
     let removed = match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(file_err) => {
-            // Not a regular file we could unlink. If it is a directory (the
-            // EISDIR / Windows access-denied case that `read_flag_at` reports
-            // as an active incident), remove it recursively so the incident is
-            // genuinely cleared. Anything still unremovable is a real error.
+            // Not an unlinkable file. A directory (the EISDIR case `read_flag_at`
+            // reads as active) is removed recursively; a vanished path is
+            // idempotent success; anything else is a real error.
             match std::fs::metadata(path) {
                 Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path)
                     .map(|()| true)
                     .map_err(|e| format!("remove dir {}: {e}", path.display()))?,
-                // It vanished between the failed unlink and the stat → treat as
-                // already-gone (idempotent success, same as NotFound above).
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                // A real, non-directory removal failure (e.g. permissions on a
-                // regular file): surface the original error.
                 _ => return Err(format!("remove {}: {file_err}", path.display())),
             }
         }
     };
-    // DURABILITY (CodeRabbit R8 #2): a `remove_file`/`remove_dir_all` mutates the
-    // PARENT directory's entries, but that mutation is not crash-durable until the
-    // directory itself is fsync'd. Without this, a crash/power-loss right after
-    // `stop` could resurrect the (un-unlinked) flag, leaving incident mode wrongly
-    // ACTIVE — the inverse of the `start`-side parent fsync. Best-effort, unix-only
-    // (directory fsync is not portable), and only after an ACTUAL removal: if
-    // nothing was removed there is no entry change to make durable. A failure here
-    // must never make `stop` report an error after the flag is already gone.
+    // DURABILITY (CodeRabbit R8 #2): fsync the parent so the removal survives a
+    // crash, else the flag could resurrect → incident mode wrongly ACTIVE.
+    // Best-effort, unix-only, only after an actual removal.
     if removed {
         fsync_parent_dir(path);
     }
@@ -576,12 +431,9 @@ pub fn stop_at(path: &Path) -> Result<bool, String> {
     Ok(removed)
 }
 
-// ---- Hot-path cached active check -----------------------------------------
-
-/// Per-process cache of the "is an incident active?" answer, keyed on the
-/// resolved flag path. Mirrors [`crate::canary`]'s cache: load once, 5-second
-/// TTL, re-stat on the flag's mtime. The common no-incident path costs one
-/// `metadata()` stat (and not even that within the TTL window).
+/// Per-process cache of "is an incident active?", keyed on the flag path.
+/// Mirrors [`crate::canary`]'s cache: 5s TTL, re-stat on mtime. The no-incident
+/// path costs one `metadata()` stat (none within the TTL window).
 struct CacheState {
     path: PathBuf,
     state: Option<IncidentState>,
@@ -594,18 +446,12 @@ static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// Cache-invalidation stat for the flag path. Returns `(present, mtime_nanos)`.
+/// Cache-invalidation stat for the flag path → `(present, mtime_nanos)`.
 ///
-/// FAIL-SAFE + symlink-aware (CodeRabbit R13 #E). Two deliberate choices keep the
-/// 5s cache from masking the Corrupt→active path:
-///   * `symlink_metadata` (lstat) — does NOT follow symlinks, so a dangling
-///     symlink planted at the flag path lstat-succeeds as a present (link) entry
-///     rather than erroring like `metadata` would. read_flag_at then rejects the
-///     non-regular file as `Corrupt` → fail-safe active.
-///   * Only a genuine `NotFound` maps to "absent" `(false, 0)`. Every OTHER error
-///     (permission, ELOOP, I/O) maps to present `(true, 0)`, so it cannot be
-///     mistaken for the cached "absent" state and silently keep returning `None`;
-///     it forces a re-read, which surfaces the file as Corrupt → active.
+/// FAIL-SAFE + symlink-aware (CodeRabbit R13 #E): `symlink_metadata` (lstat) so a
+/// dangling symlink reads as present (→ Corrupt → active), and ONLY a genuine
+/// `NotFound` maps to absent `(false, 0)`; every other error maps to present
+/// `(true, 0)` so it forces a re-read instead of masking the Corrupt→active path.
 fn mtime_nanos(path: &Path) -> (bool, u128) {
     match std::fs::symlink_metadata(path) {
         Ok(m) => {
@@ -618,17 +464,14 @@ fn mtime_nanos(path: &Path) -> (bool, u128) {
             (true, nanos)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, 0),
-        // Present but unstattable (dangling symlink target, permission, I/O): treat
-        // as present-and-changed so the cache re-reads and fails safe.
+        // Present but unstattable → present-and-changed so the cache re-reads.
         Err(_) => (true, 0),
     }
 }
 
-/// The hot-path read: returns the active incident state through the 5s cache.
-/// `None` ONLY when the flag file is absent (no incident). A present-but-corrupt
-/// flag is FAIL-SAFE: it returns the synthetic [`corrupt_placeholder_state`] so
-/// [`crate::policy::Policy::apply_runtime_overrides`] still applies the
-/// fail-closed overlay, and a one-line warning is emitted to stderr.
+/// Hot-path read of the active incident state through the 5s cache. `None` ONLY
+/// when the flag is absent; a corrupt flag is FAIL-SAFE → [`corrupt_placeholder_state`]
+/// + a stderr warning so the overlay still applies.
 pub fn active_cached() -> Option<IncidentState> {
     let path = flag_path()?;
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -645,10 +488,8 @@ pub fn active_cached() -> Option<IncidentState> {
         }
     }
 
-    // Cache miss / stale: re-read via the tri-state. Absent → None (common
-    // path). Corrupt → fail-safe synthetic active state + a stderr warning
-    // (rate-limited to once per corrupt (path, mtime) so the hot path is not
-    // spammed). Valid → the parsed state.
+    // Cache miss / stale: re-read. Absent → None; Corrupt → fail-safe synthetic
+    // state + a rate-limited stderr warning; Valid → the parsed state.
     let parsed = match read_flag_at(&path) {
         FlagRead::Absent => None,
         FlagRead::Valid(state) => Some(state),
@@ -667,8 +508,7 @@ pub fn active_cached() -> Option<IncidentState> {
     parsed
 }
 
-/// Stderr warning for an honored corrupt flag, de-duplicated per
-/// `(path, mtime)` so a long-lived process re-reading every 5s does not spam.
+/// Stderr warning for an honored corrupt flag, de-duplicated per `(path, mtime)`.
 fn warn_corrupt_flag_once(path: &Path, mtime: u128) {
     use std::sync::Mutex as StdMutex;
     static LAST_WARNED: StdMutex<Option<(PathBuf, u128)>> = StdMutex::new(None);
@@ -678,8 +518,7 @@ fn warn_corrupt_flag_once(path: &Path, mtime: u128) {
         return;
     }
     *guard = Some(key);
-    // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
-    // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+    // Write fallibly so a closed stderr cannot panic this helper (CodeRabbit R22 #4).
     use std::io::Write as _;
     let _ = writeln!(
         std::io::stderr(),
@@ -688,14 +527,12 @@ fn warn_corrupt_flag_once(path: &Path, mtime: u128) {
     );
 }
 
-/// `true` when an incident is currently active (cached). Convenience over
-/// [`active_cached`] for call sites that only need the boolean.
+/// `true` when an incident is active (cached). Boolean convenience over [`active_cached`].
 pub fn is_active() -> bool {
     active_cached().is_some()
 }
 
-/// Drop the per-process cache. Tests that write/delete the flag directly then
-/// assert via the cached API call this so a stale earlier load is not reused.
+/// Drop the per-process cache. Tests that write/delete the flag directly call this.
 pub fn invalidate_cache() {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
@@ -708,19 +545,13 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Upper bound on the `started_by` label (CodeRabbit R13 #D). Real usernames are
-/// short; this is a generous cap that keeps the env-derived label from inflating
-/// the serialized flag body past [`FLAG_READ_CAP`] (which would make the flag read
-/// back as `Corrupt`). It is the `started_by` analogue of [`MAX_REASON_BYTES`], so
-/// the body-size invariant in [`IncidentState::now`] holds for EVERY field, not
-/// just `reason`.
+/// Upper bound on `started_by` (CodeRabbit R13 #D) — the env-derived analogue of
+/// [`MAX_REASON_BYTES`], so [`IncidentState::now`]'s body-size invariant holds for
+/// every field.
 const MAX_STARTED_BY_BYTES: usize = 256;
 
-/// Cap `label` to at most [`MAX_STARTED_BY_BYTES`] bytes on a UTF-8 char boundary
-/// — the `started_by` analogue of [`cap_reason`]. Unlike `reason` there is no
-/// truncation marker: `started_by` is advisory metadata, and a label this long is
-/// already pathological. Keeping it bounded is what lets [`IncidentState::now`]
-/// promise the serialized body never exceeds [`FLAG_READ_CAP`].
+/// Cap `label` to [`MAX_STARTED_BY_BYTES`] (UTF-8 boundary). No truncation marker
+/// — `started_by` is advisory and a label this long is already pathological.
 fn cap_started_by(label: String) -> String {
     if label.len() <= MAX_STARTED_BY_BYTES {
         label
@@ -729,10 +560,8 @@ fn cap_started_by(label: String) -> String {
     }
 }
 
-/// Best-effort current-user label for `started_by`. Never fails — falls back to
-/// `"unknown"`. Advisory metadata only. Capped via [`cap_started_by`]:
-/// `$USER`/`$LOGNAME`/`$USERNAME` come straight from the environment and an
-/// oversized one must not be able to push the flag body past [`FLAG_READ_CAP`].
+/// Best-effort `started_by` from `$USER`/`$LOGNAME`/`$USERNAME` (else `"unknown"`),
+/// capped via [`cap_started_by`] so an oversized env value can't bloat the flag body.
 fn current_user() -> String {
     let raw = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -754,10 +583,8 @@ mod tests {
 
     #[test]
     fn elevated_rules_are_real_ruleids() {
-        // Grep-traceability invariant: every INCIDENT_ELEVATED_RULES entry must
-        // round-trip through serde (i.e. be a live RuleId variant). A renamed
-        // or removed variant fails to compile the const, but this also pins the
-        // snake_case key the policy override map will use.
+        // Grep-traceability: every entry must round-trip through serde (a live
+        // RuleId variant), which also pins the snake_case override-map key.
         for (rule, sev) in INCIDENT_ELEVATED_RULES {
             let key = serde_json::to_value(rule)
                 .ok()
@@ -766,7 +593,6 @@ mod tests {
                 key.is_some(),
                 "RuleId {rule:?} does not serialize to a string"
             );
-            // Severity must also serialize (UPPERCASE).
             assert!(serde_json::to_value(sev).is_ok());
         }
         // The four spec-mandated rules must be present.
@@ -794,19 +620,14 @@ mod tests {
 
     #[test]
     fn start_publishes_full_state_atomically_never_empty() {
-        // F5 (Major): the flag is published with its full JSON body already
-        // present (hard_link of a fully-written temp file), so a reader
-        // immediately after start sees a COMPLETE, valid state — never an empty
-        // or partial file. We cannot easily race a real concurrent reader here,
-        // but we CAN prove the post-condition the atomic publish guarantees: the
-        // file exists, is non-empty, and parses to the started state.
+        // F5 (Major): the flag is published with its full body already present
+        // (hard_link of a written temp file), so it is never empty/partial. Proves
+        // the post-condition: file exists, non-empty, parses to the started state.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
 
         let state = start_at(&flag, "atomic publish").unwrap();
 
-        // Raw on-disk bytes are non-empty and valid JSON (no empty window left
-        // behind).
         let bytes = std::fs::read(&flag).expect("flag file present after start");
         assert!(!bytes.is_empty(), "published flag must never be empty");
         let parsed: IncidentState =
@@ -814,9 +635,8 @@ mod tests {
         assert_eq!(parsed.reason, "atomic publish");
         assert_eq!(parsed.started_at, state.started_at);
 
-        // And the tri-state read sees it as Valid (not Corrupt/partial).
         assert!(matches!(read_flag_at(&flag), FlagRead::Valid(_)));
-        // No stray temp file left in the directory besides the flag itself.
+        // No stray temp file left besides the flag itself.
         let stray: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -830,18 +650,13 @@ mod tests {
 
     #[test]
     fn excl_write_failure_leaves_no_flag_so_incident_reads_inactive() {
-        // CodeRabbit R6 #3: the O_EXCL fallback used to create the flag then
-        // write; a write failure returned Err but LEFT a zero/partial flag, and
-        // `read_flag_at` treats any present flag as fail-safe ACTIVE — so `start`
-        // failed yet incident mode turned ON. `finish_excl_write` now removes the
-        // partial file on any write failure. Force the failure deterministically
-        // by handing it a READ-ONLY handle (so `write_all` returns an error on
-        // every platform), and assert no flag remains → the read path is inactive.
+        // CodeRabbit R6 #3: a write failure must leave NO partial flag (else
+        // incident mode turns ON while `start` reports Err). Force the failure
+        // with a read-only handle and assert no flag remains.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
 
-        // Create the flag, then reopen it read-only to model the
-        // "O_EXCL-created, write fails" case.
+        // Create the flag, reopen read-only to model "O_EXCL-created, write fails".
         std::fs::File::create(&flag).unwrap();
         let ro = std::fs::OpenOptions::new().read(true).open(&flag).unwrap();
 
@@ -851,8 +666,7 @@ mod tests {
             "write to a RO fd must error"
         );
 
-        // The partial flag is gone, so the incident read path is INACTIVE
-        // (matching the returned Err) rather than stuck fail-closed.
+        // The partial flag is gone → the read path is inactive (matching the Err).
         assert!(
             !flag.exists(),
             "a failed excl write must leave no flag behind"
@@ -863,8 +677,7 @@ mod tests {
 
     #[test]
     fn excl_write_success_is_durable_and_complete() {
-        // The success path of the O_EXCL fallback fsyncs before returning, so the
-        // body is fully on disk and reads back as a Valid state.
+        // The O_EXCL success path fsyncs before returning → reads back Valid.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
 
@@ -933,15 +746,12 @@ mod tests {
 
     #[test]
     fn corrupt_flag_fails_safe_to_active() {
-        // F1 (Sev-7): a flag file that EXISTS but is corrupt means an incident
-        // WAS started and the file got mangled — it must fail SAFE (treated as
-        // active), NOT fall through to "no incident". The file's existence is
-        // the signal; a parse failure must never downgrade the posture.
+        // F1 (Sev-7): an EXISTING-but-corrupt flag must fail SAFE (active), not
+        // fall through to "no incident". The file's existence is the signal.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         std::fs::write(&flag, b"this is not json").unwrap();
 
-        // Tri-state read distinguishes corrupt from absent.
         assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
 
         // read_state_at yields the synthetic placeholder, NOT None.
@@ -952,12 +762,9 @@ mod tests {
 
     #[test]
     fn stop_clears_a_directory_sentinel_no_lockout() {
-        // LOCKOUT SAFETY (finding E): if the flag PATH is a directory (not a
-        // regular file), `read_flag_at` reads it as an active incident (a `read`
-        // of a dir is EISDIR → Corrupt → active). A plain `remove_file` would
-        // error on the directory and leave the posture stuck fail-closed. `stop`
-        // MUST still clear it. We create the flag path as a NON-EMPTY directory
-        // (so a naive `remove_dir` would also fail) and assert recovery.
+        // LOCKOUT SAFETY (finding E): a directory at the flag path reads as active
+        // (EISDIR → Corrupt), and a plain `remove_file` errors on it. `stop` must
+        // still clear it. Use a NON-EMPTY directory (so `remove_dir` would fail too).
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         std::fs::create_dir_all(&flag).unwrap();
@@ -976,19 +783,18 @@ mod tests {
             "stop must clear a directory sentinel, not error out"
         );
 
-        // And the incident is genuinely cleared afterwards — no lockout.
+        // Genuinely cleared afterwards — no lockout.
         assert_eq!(read_flag_at(&flag), FlagRead::Absent);
         assert!(
             read_state_at(&flag).is_none(),
             "after stop the directory sentinel is gone and the incident reads inactive"
         );
-        // Idempotent: a second stop finds nothing.
         assert!(!stop_at(&flag).unwrap());
     }
 
     #[test]
     fn absent_flag_reads_as_none() {
-        // The contrast case: a truly-absent flag is NOT an incident.
+        // Contrast: a truly-absent flag is NOT an incident.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         assert_eq!(read_flag_at(&flag), FlagRead::Absent);
@@ -1006,15 +812,10 @@ mod tests {
         }
     }
 
-    /// CodeRabbit R9 #C: the flag is `read` on every exec via `active_cached`. A
-    /// FIFO at the flag path would BLOCK a plain `std::fs::read` forever waiting
-    /// for a writer. `read_flag_at` routes through `util::read_regular_capped`,
-    /// which opens with `O_NONBLOCK` (so the open of a writer-less FIFO returns
-    /// immediately instead of blocking) and then `fstat`s the OPEN fd and refuses
-    /// any non-regular file — so the FIFO reads as `Corrupt` (fail-SAFE: incident
-    /// still considered active) and the call returns PROMPTLY. If that guard
-    /// regressed to a blocking read this test would HANG (caught by the suite
-    /// timeout). Unix-only (FIFO + `mkfifo`).
+    /// CodeRabbit R9 #C: a FIFO at the flag path would block a plain `read`
+    /// forever. `read_regular_capped` opens `O_NONBLOCK` and refuses non-regular
+    /// files, so the FIFO reads `Corrupt` (fail-safe) and returns promptly; a
+    /// regression to a blocking read would HANG this test. Unix-only.
     #[cfg(unix)]
     #[test]
     fn fifo_flag_is_corrupt_and_does_not_hang() {
@@ -1027,8 +828,7 @@ mod tests {
             eprintln!("skipping: mkfifo unsupported here");
             return;
         }
-        // The whole read must complete promptly; a blocking `read` on the FIFO
-        // would hang here. Fail-safe: a non-regular flag reads as active.
+        // Must complete promptly; a blocking read would hang. Non-regular → active.
         assert_eq!(read_flag_at(&flag), FlagRead::Corrupt);
         assert!(
             read_state_at(&flag).is_some(),
@@ -1036,11 +836,9 @@ mod tests {
         );
     }
 
-    /// CodeRabbit R9 #C (symlink to a non-regular file): a symlink pointing at a
-    /// FIFO must also be rejected. `read_regular_capped` opens the path with
-    /// `O_NONBLOCK` (following the symlink to the FIFO target without blocking),
-    /// then `fstat`s the open fd and refuses the non-regular target — Corrupt,
-    /// fail-safe, no hang. Unix-only.
+    /// CodeRabbit R9 #C: a symlink to a FIFO must also be rejected — the
+    /// `O_NONBLOCK` open follows the link, `fstat`s the target, and refuses it.
+    /// Unix-only.
     #[cfg(unix)]
     #[test]
     fn symlink_flag_to_fifo_is_corrupt_and_does_not_hang() {
@@ -1059,12 +857,10 @@ mod tests {
         assert!(read_state_at(&flag).is_some());
     }
 
-    /// CodeRabbit R16 #2: a DANGLING SYMLINK at the flag path opens ENOENT (the
-    /// target is missing), but a sentinel WAS placed — mapping it to `Absent`
-    /// would silently turn incident mode OFF (fail-OPEN). It must read as
-    /// `Corrupt` (fail-SAFE → active). A truly-absent path (no entry at all)
-    /// still reads `Absent`. And `stop` must still be able to clear the dangling
-    /// symlink (lockout safety). Unix-only (needs `symlink`).
+    /// CodeRabbit R16 #2: a DANGLING SYMLINK opens ENOENT yet a sentinel WAS
+    /// placed — it must read `Corrupt` (fail-safe), not `Absent` (fail-open). A
+    /// truly-absent path still reads `Absent`, and `stop` must clear the dangling
+    /// symlink (lockout). Unix-only.
     #[cfg(unix)]
     #[test]
     fn dangling_symlink_flag_is_corrupt_not_absent() {
@@ -1074,8 +870,7 @@ mod tests {
         // Contrast: a path with no entry at all is genuinely Absent.
         assert_eq!(read_flag_at(&flag), FlagRead::Absent);
 
-        // A symlink pointing at a non-existent target. `read_regular_capped`'s
-        // (symlink-following) open returns ENOENT, but the symlink ENTRY exists.
+        // Symlink to a non-existent target: the open returns ENOENT, but the entry exists.
         let missing_target = dir.path().join("does-not-exist.json");
         std::os::unix::fs::symlink(&missing_target, &flag).unwrap();
 
@@ -1100,9 +895,8 @@ mod tests {
 
     #[test]
     fn oversized_flag_is_corrupt() {
-        // CodeRabbit R9 #C: an oversized flag file must be treated as corrupt
-        // (fail-safe active) rather than buffered into memory unbounded. One byte
-        // over the cap is enough to trip the guard. Cross-platform (plain file).
+        // CodeRabbit R9 #C: an oversized flag is corrupt (fail-safe), not buffered.
+        // One byte over the cap trips the guard.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         let big = vec![b' '; (FLAG_READ_CAP as usize) + 1];
@@ -1116,12 +910,8 @@ mod tests {
 
     #[test]
     fn start_with_oversized_reason_reads_back_valid_not_corrupt() {
-        // CodeRabbit R16 #1: `read_flag_at` rejects any body > FLAG_READ_CAP as
-        // Corrupt, but `start_at` used to persist whatever `--reason` it was
-        // handed. A reason far larger than the read cap would write a flag that
-        // immediately reads back Corrupt → `start` returns Ok yet the flag is
-        // self-corrupt. `IncidentState::now` now caps the reason, so a flag
-        // written with a huge reason ALWAYS reads back Valid.
+        // CodeRabbit R16 #1: a `--reason` larger than the read cap used to write a
+        // self-corrupt flag. `IncidentState::now` now caps it, so it reads Valid.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
 
@@ -1129,8 +919,7 @@ mod tests {
         let huge = "A".repeat((FLAG_READ_CAP as usize) * 4);
         let state = start_at(&flag, huge).unwrap();
 
-        // The stored reason was capped well under the read cap and carries the
-        // truncation marker.
+        // Capped well under the read cap and carries the truncation marker.
         assert!(
             state.reason.len() <= MAX_REASON_BYTES + REASON_TRUNCATED_MARKER.len(),
             "reason must be capped, got {} bytes",
@@ -1138,7 +927,7 @@ mod tests {
         );
         assert!(state.reason.ends_with(REASON_TRUNCATED_MARKER));
 
-        // The written body is within the read cap → reads back Valid, NOT Corrupt.
+        // The written body is within the read cap → reads back Valid.
         let on_disk = std::fs::read(&flag).unwrap();
         assert!(
             (on_disk.len() as u64) <= FLAG_READ_CAP,
@@ -1155,10 +944,8 @@ mod tests {
 
     #[test]
     fn started_by_is_capped_so_body_stays_within_read_cap() {
-        // CodeRabbit R13 #D: `reason` was capped, but `started_by` came straight
-        // from `$USER`/`$LOGNAME` uncapped. A multi-KiB env value could push the
-        // serialized body past FLAG_READ_CAP, so `start_at` would return Ok yet the
-        // flag would immediately read back Corrupt. `cap_started_by` now bounds it.
+        // CodeRabbit R13 #D: a multi-KiB `$USER` could push the body past the read
+        // cap (self-corrupt flag). `cap_started_by` now bounds it.
         let huge = "U".repeat((FLAG_READ_CAP as usize) * 4);
         let capped = cap_started_by(huge);
         assert!(
@@ -1167,8 +954,7 @@ mod tests {
             capped.len()
         );
 
-        // Worst case: BOTH env-influenced fields at their caps. The serialized
-        // body must still fit under the read cap and round-trip as Valid.
+        // Worst case: both env-influenced fields at their caps must still fit.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         let state = IncidentState {
@@ -1191,15 +977,13 @@ mod tests {
 
     #[test]
     fn normal_started_by_is_not_truncated() {
-        // A genuine username is returned verbatim — the cap only bites pathological
-        // env values, never a real `$USER`.
+        // A genuine username is returned verbatim.
         assert_eq!(cap_started_by("alice".to_string()), "alice");
     }
 
     #[test]
     fn normal_reason_is_not_truncated() {
-        // A genuine human reason is stored verbatim — the cap only affects
-        // pathologically long inputs.
+        // A genuine reason is stored verbatim.
         let dir = tempdir().unwrap();
         let flag = flag_in(dir.path());
         let reason = "compromised CI token, rotating now";
@@ -1222,12 +1006,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mtime_nanos_treats_dangling_symlink_as_present_not_absent() {
-        // CodeRabbit R13 #E: the cache stat must distinguish "genuinely absent"
-        // from "present but unstattable". A dangling symlink planted at the flag
-        // path used to make `metadata()` (which follows the link) error → the old
-        // code returned (false, 0) = absent, identical to the cached no-incident
-        // state, so the 5s cache kept returning a stale `None` and masked the
-        // Corrupt→active fail-safe. `symlink_metadata` now lstat-sees the link.
+        // CodeRabbit R13 #E: a dangling symlink used to stat as absent (via
+        // `metadata`), so the 5s cache masked the Corrupt→active fail-safe.
+        // `symlink_metadata` now lstat-sees the link as present.
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");

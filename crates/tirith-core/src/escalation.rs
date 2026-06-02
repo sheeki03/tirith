@@ -1,11 +1,7 @@
-//! Escalation engine and post-processing verdict helper.
-//!
-//! Escalation rules upgrade the verdict action based on session warning history
-//! (repeat offenders) or current finding density (multi-medium).
-//!
-//! The `post_process_verdict` function is the shared helper that applies action
-//! overrides, approvals, paranoia filtering, escalation, and session recording
-//! in the correct order.
+//! Escalation engine + the `post_process_verdict` helper. Escalation rules
+//! upgrade the action based on session warning history (repeat offenders) or
+//! current finding density (multi-medium); `post_process_verdict` applies action
+//! overrides, approvals, paranoia, escalation, and session recording in order.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,13 +14,13 @@ fn default_window_60() -> u64 {
     60
 }
 
-/// An escalation rule: upgrade verdict action based on session history or
+/// An escalation rule: upgrade the verdict action based on session history or
 /// current finding count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "trigger", rename_all = "snake_case")]
 pub enum EscalationRule {
-    /// Upgrade to `action` when a matching rule has fired >= `threshold` times
-    /// within `window_minutes` (counting both session history AND current findings).
+    /// Upgrade when a matching rule fired >= `threshold` times within
+    /// `window_minutes` (session history + current findings).
     RepeatCount {
         rule_ids: Vec<String>,
         threshold: u32,
@@ -33,21 +29,19 @@ pub enum EscalationRule {
         action: EscalationAction,
         #[serde(default)]
         domain_scoped: bool,
-        /// Minutes after an escalation fires during which that (rule, domain) pair
-        /// will not re-escalate. 0 = no cooldown (default, preserves old behaviour).
+        /// Minutes after an escalation during which that (rule, domain) pair
+        /// won't re-escalate. 0 = no cooldown (default).
         #[serde(default)]
         cooldown_minutes: u64,
     },
-    /// Upgrade when the current verdict contains >= `min_findings` findings of
-    /// severity Medium or above.
+    /// Upgrade when the verdict has >= `min_findings` findings of severity Medium+.
     MultiMedium {
         min_findings: u32,
         action: EscalationAction,
     },
 }
 
-/// The action an escalation rule can upgrade to. Only Block is supported —
-/// escalation can never downgrade the action.
+/// The action an escalation can upgrade to. Only Block — never a downgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationAction {
@@ -62,28 +56,24 @@ impl EscalationAction {
     }
 }
 
-/// Captures exactly which rule/domain triggered an escalation, enabling
-/// correct per-key cooldown scoping.
+/// Which rule/domain triggered an escalation, for per-key cooldown scoping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EscalationHit {
-    /// The finding rule that crossed the threshold, or `"*"` for wildcard aggregate.
+    /// The rule that crossed the threshold, or `"*"` for the wildcard aggregate.
     pub rule_id: String,
-    /// For `domain_scoped` rules, the specific domain that crossed the threshold.
+    /// For `domain_scoped` rules, the domain that crossed the threshold.
     pub domain: Option<String>,
 }
 
 impl EscalationHit {
-    /// True if this hit came from a wildcard aggregate threshold (`rule_id == "*"`).
     pub fn is_wildcard(&self) -> bool {
         self.rule_id == "*"
     }
 }
 
-/// Apply escalation rules against session history + current findings.
-///
-/// Returns the (potentially upgraded) action, the set of causal rule_ids,
-/// structured escalation hits (for cooldown recording), and an optional
-/// human-readable reason string. Never downgrades the action.
+/// Apply escalation rules against session history + current findings. Returns
+/// the (possibly upgraded) action, causal rule_ids, escalation hits (for
+/// cooldown recording), and an optional reason. Never downgrades.
 pub fn apply_escalation(
     current_action: Action,
     findings: &[Finding],
@@ -112,8 +102,7 @@ pub fn apply_escalation(
 
                 let wildcard = rule_ids.iter().any(|id| id == "*");
 
-                // Count current findings once per (rule_id, Option<domain>) key
-                // so we don't evaluate the same pair twice in the loop below.
+                // Count current findings once per (rule_id, domain) key.
                 let current_counts: HashMap<(String, Option<String>), u32> = {
                     let mut map = HashMap::new();
                     for f in findings {
@@ -145,8 +134,7 @@ pub fn apply_escalation(
                     if *cooldown_minutes > 0 {
                         let cooldown_active = session.escalation_events.iter().any(|ev| {
                             let rule_matches = if ev.rule_id == "*" {
-                                // Wildcard events only cool down the wildcard aggregate path.
-                                false
+                                false // wildcard events cool down only the aggregate path
                             } else {
                                 ev.rule_id == *fid
                             };
@@ -181,8 +169,7 @@ pub fn apply_escalation(
                             rule_id: fid.clone(),
                             domain: domain.clone(),
                         });
-                        // Record a wildcard hit alongside so the aggregate
-                        // path cannot bypass per-rule cooldown.
+                        // Record a wildcard hit too so the aggregate path can't bypass cooldown.
                         if wildcard {
                             hits.push(EscalationHit {
                                 rule_id: "*".to_string(),
@@ -197,9 +184,8 @@ pub fn apply_escalation(
                     }
                 }
 
-                // Wildcard aggregate path: catches mixed-rule sessions where no
-                // single rule crosses the threshold but the combined count does.
-                // Only applies when NOT domain_scoped.
+                // Wildcard aggregate path (non-domain-scoped only): catches
+                // mixed-rule sessions where the combined count crosses the threshold.
                 if wildcard && !domain_scoped && !action_gte(action, target) {
                     if *cooldown_minutes > 0 {
                         let wildcard_cooled = session.escalation_events.iter().any(|ev| {
@@ -261,10 +247,8 @@ pub fn apply_escalation(
     (action, causal, hits, reason)
 }
 
-/// Check whether a timestamp string (RFC 3339) is within `minutes` of now.
-///
-/// Fail-safe: unparseable timestamps are treated as within-window so cooldown
-/// stays active rather than allowing premature re-escalation.
+/// Is an RFC 3339 timestamp within `minutes` of now? Fail-safe: an unparseable
+/// timestamp counts as within-window so cooldown stays active.
 fn is_within_minutes(timestamp: &str, minutes: u64) -> bool {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return true;
@@ -274,8 +258,8 @@ fn is_within_minutes(timestamp: &str, minutes: u64) -> bool {
     ts >= cutoff
 }
 
-/// Apply per-rule action overrides. Only "block" is a valid override value.
-/// Returns upgraded action and causal rule_ids.
+/// Apply per-rule action overrides (only "block" is valid). Returns the
+/// upgraded action and causal rule_ids.
 pub fn apply_action_overrides(
     current_action: Action,
     findings: &[Finding],
@@ -301,7 +285,6 @@ pub fn apply_action_overrides(
 fn action_gte(a: Action, b: Action) -> bool {
     action_rank(a) >= action_rank(b)
 }
-
 fn action_rank(a: Action) -> u8 {
     match a {
         Action::Allow => 0,
@@ -316,8 +299,8 @@ fn extract_finding_domains(finding: &Finding) -> Vec<String> {
     crate::session_warnings::extract_domains_from_evidence(&finding.evidence)
 }
 
-/// Where the verdict is being processed. Non-CLI callers cannot prompt
-/// interactively, so approval requirements become blocks.
+/// Where the verdict is processed. Non-CLI callers can't prompt, so an approval
+/// requirement becomes a Block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerContext {
     Cli,
@@ -326,36 +309,16 @@ pub enum CallerContext {
     Daemon,
 }
 
-/// Apply [`crate::policy::agent_rules`][crate::policy::AgentRules] against the
-/// verdict's `agent_origin`. M4 item 8 chunk 3 — turns the chunk-2
-/// observation-only `agent_decision` helper into enforcement.
+/// Enforce `agent_rules` against the verdict's `agent_origin`.
 ///
-/// Behavior (the minimal chunk-3 cut — richer payloads land in a future chunk):
+/// * `Denied` — force [`Action::Block`] and append an
+///   [`RuleId::AgentDeniedByPolicy`] (High) finding naming the matched origin +
+///   matcher + policy path, all debug-escaped so a hostile caller-claimed string
+///   can't smuggle control bytes into the audit log. Existing findings preserved.
+/// * `Allowed` / `Unspecified` / no origin — no change. `allow` is NOT a bypass:
+///   an already-blocked verdict stays blocked.
 ///
-/// * [`crate::policy::AgentDecision::Denied`] — the action is forced to
-///   [`Action::Block`] (no downgrade — Block is the strictest action so
-///   this is also a no-op when the verdict is already blocked). A fresh
-///   [`Finding`] with [`RuleId::AgentDeniedByPolicy`] (severity
-///   [`Severity::High`]) is appended naming the matched origin AND the
-///   matched matcher (kind + optional name payload, debug-escaped so a
-///   hostile caller-claimed string cannot smuggle control bytes into the
-///   operator's terminal when they `cat` the audit log) plus the policy
-///   file path. Existing detection findings are preserved — `agent_rules`
-///   is layered on top, not a replacement.
-/// * [`crate::policy::AgentDecision::Allowed`] — no behavior change.
-///   `allow` is not a bypass: a verdict the engine already blocked stays
-///   blocked even if the caller is on the allow-list. (Chunk 3+ may
-///   introduce richer allow semantics — severity overrides, fail-mode
-///   tuning — and the design doc records this is intentional minimal.)
-/// * [`crate::policy::AgentDecision::Unspecified`] — no behavior change.
-/// * `verdict.agent_origin == None` — no behavior change (treated as
-///   `Unspecified`; an engine path that never set an origin has nothing
-///   to match against).
-///
-/// Returns `true` iff the verdict was mutated (action forced to Block AND
-/// the new finding appended). Callers can use this for instrumentation;
-/// `post_process_verdict` ignores the return value because the mutation
-/// is already on the passed-in `verdict`.
+/// Returns `true` iff it mutated the verdict (Block + finding).
 pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) -> bool {
     let decision = verdict
         .agent_origin
@@ -365,12 +328,8 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
 
     match decision {
         crate::policy::AgentDecision::Denied { matcher } => {
-            // Debug-escape the origin and policy path so a hostile
-            // caller-claimed `TIRITH_INTEGRATION` value (or an MCP
-            // `clientInfo.name`) cannot smuggle control bytes through to
-            // the audit log line or the operator's terminal. Mirrors the
-            // sanitization discipline `agent_origin.rs` already applies
-            // at ingest — defense-in-depth.
+            // Debug-escape origin + policy path so a hostile caller-claimed
+            // value can't smuggle control bytes into the audit log (defense-in-depth).
             let origin_repr = verdict
                 .agent_origin
                 .as_ref()
@@ -381,12 +340,7 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
                 .as_deref()
                 .map(|p| format!("{p:?}"))
                 .unwrap_or_else(|| "<unloaded>".to_string());
-            // Render the matched matcher cleanly using its closed `kind`
-            // plus the optional `name` payload (debug-escaped — same
-            // control-byte hygiene as origin_repr). Chunk-3 Finding D
-            // restored this payload to `AgentDecision::Denied` so the
-            // description no longer has to fall back to the policy path
-            // alone to identify the rule.
+            // Render the matched matcher (kind + optional name, debug-escaped).
             let matcher_repr = match matcher.name.as_deref() {
                 Some(payload) => format!("kind: {} name: {:?}", matcher.kind.as_str(), payload),
                 None => format!("kind: {}", matcher.kind.as_str()),
@@ -417,11 +371,9 @@ pub fn apply_agent_rules(verdict: &mut Verdict, policy: &crate::policy::Policy) 
     }
 }
 
-/// Shared post-processing pipeline applied after the core engine produces a
-/// raw verdict. Applies action overrides, approvals, paranoia filtering,
-/// escalation, and session warning recording in that order.
-///
-/// Side effects: reads and writes session state files (best-effort, never panics).
+/// Post-processing pipeline applied after the engine produces a raw verdict:
+/// action overrides, approvals, paranoia filtering, escalation, and session
+/// recording, in that order. Reads/writes session state (best-effort, never panics).
 pub fn post_process_verdict(
     raw_verdict: &Verdict,
     policy: &crate::policy::Policy,
@@ -432,8 +384,7 @@ pub fn post_process_verdict(
     let mut effective = raw_verdict.clone();
     let mut causal_rule_ids: HashSet<String> = HashSet::new();
 
-    // Action overrides apply to the RAW findings — before paranoia or any
-    // other filter could remove them.
+    // Action overrides apply to the RAW findings, before any filter removes them.
     if !policy.action_overrides.is_empty() {
         let (new_action, caused_by) = apply_action_overrides(
             effective.action,
@@ -444,29 +395,14 @@ pub fn post_process_verdict(
         causal_rule_ids.extend(caused_by);
     }
 
-    // PR #121 fix-list item 9 (mirrors `mcp/tools.rs:335-348`):
-    // `apply_agent_rules` must run BEFORE approval, and `check_approval`
-    // must be gated on `verdict.action != Action::Block`. Pre-fix the
-    // order was reversed — `check_approval`/`apply_approval` stamped
-    // `requires_approval=Some(true)` and the rest of the approval
-    // metadata; then `apply_agent_rules` (at the end of post-processing)
-    // forced `Action::Block` without clearing those fields, producing a
-    // contradiction ("Block this" + "Approve to continue") for callers
-    // that honor both signals (gateway, daemon, integrations). The MCP
-    // diagnostic handlers already had the fix; this is the parallel
-    // change for the central post-processing pipeline.
-    //
-    // Running agent rules here (not at the end) is sound: `apply_agent_rules`
-    // only upgrades to Block (never downgrades), and an early Block
-    // suppresses approval just like an early escalation-driven Block
-    // would. Escalation later still has nothing to upgrade (it only fires
-    // on Warn/WarnAck per the `matches!` guard).
+    // PR #121 fix-list item 9: `apply_agent_rules` must run BEFORE approval, and
+    // approval is gated on `action != Block`, so a denied verdict never carries
+    // both `action: Block` and `requires_approval: true`. Sound because agent
+    // rules only upgrade to Block, so escalation later still has nothing to weaken.
     apply_agent_rules(&mut effective, policy);
 
-    // Approval detection must run before session warning recording so an
-    // approval-required verdict doesn't get booked as a vanilla warning.
-    // Gated on `action != Block`: a denied / hard-blocked verdict carries
-    // no approval contract (see item 9 above).
+    // Approval runs before warning recording (so it isn't booked as a vanilla
+    // warning) and only when not already Block (a denied verdict has no approval contract).
     if effective.action != Action::Block {
         if let Some(meta) = crate::approval::check_approval(&effective, policy) {
             crate::approval::apply_approval(&mut effective, &meta);
@@ -477,8 +413,8 @@ pub fn post_process_verdict(
         }
     }
 
-    // Save the pre-paranoia action so we can enforce "never downgrade" after
-    // filter_findings_by_paranoia recalculates the action from what's left.
+    // Save the pre-paranoia action to enforce "never downgrade" after paranoia
+    // recalculates the action from what's left.
     let pre_paranoia_action = effective.action;
 
     let causal_indices: Vec<usize> = raw_verdict
@@ -491,9 +427,8 @@ pub fn post_process_verdict(
 
     crate::engine::filter_findings_by_paranoia(&mut effective, policy.paranoia);
 
-    // Paranoia must never downgrade an action that was explicitly set by an
-    // override or approval. Engine-natural verdicts (no causal rules) ARE
-    // allowed to be downgraded — that's the point of paranoia.
+    // Paranoia must not downgrade an action set by an override/approval, but
+    // engine-natural verdicts (no causal rules) CAN be downgraded.
     if !causal_rule_ids.is_empty()
         && action_rank(pre_paranoia_action) > action_rank(effective.action)
     {
@@ -515,10 +450,8 @@ pub fn post_process_verdict(
         }
     }
 
-    // When paranoia filtered every finding out but an override/approval still
-    // forced a non-Allow action, surface some findings so the user can see WHY
-    // the action was set. Skip this when causal_rule_ids is empty — then the
-    // Allow-equivalent recompute is correct.
+    // If paranoia filtered everything out but an override/approval forced a
+    // non-Allow action, re-surface findings so the user can see WHY.
     if !causal_rule_ids.is_empty()
         && effective.action != Action::Allow
         && effective.findings.is_empty()
@@ -543,33 +476,20 @@ pub fn post_process_verdict(
         );
         if new_action != effective.action {
             effective.escalation_reason = reason;
-            // Escalations upgrade to Action::Block, which skips the Warn/WarnAck
-            // recording path below — so record the escalation events separately.
+            // Escalation upgrades to Block, which skips the Warn/WarnAck recording
+            // below — so record the escalation events separately.
             crate::session_warnings::record_escalation_event(session_id, &escalation_hits);
         }
         effective.action = new_action;
         causal_rule_ids.extend(caused_by);
     }
 
-    // M4 item 8 chunk 3 — `apply_agent_rules` was previously called HERE,
-    // after escalation and just before warning recording. PR #121 fix-list
-    // item 9 moved it ABOVE the approval block (see the top of this
-    // function): the approval contract must be derived from the
-    // post-deny verdict so a denied caller never sees both
-    // `action: Block` and `requires_approval: Some(true)`. The
-    // "AFTER escalation / BEFORE warning recording" invariant still holds
-    // for the late-arriving Block effect because:
-    //   * `apply_agent_rules` only upgrades the action (never downgrades),
-    //     so moving the call earlier cannot weaken any later state.
-    //   * Escalation runs only on `Warn` / `WarnAck` (see the `matches!`
-    //     guard above), so an early Block from `apply_agent_rules`
-    //     correctly short-circuits escalation without bookkeeping changes.
-    //   * Warning recording below already treats Block as a no-op via
-    //     the `matches!(effective.action, Warn | WarnAck)` guard.
+    // (`apply_agent_rules` used to be called HERE; PR #121 item 9 moved it above
+    // approval. The move is safe: it only upgrades to Block, escalation runs only
+    // on Warn/WarnAck, and warning recording treats Block as a no-op.)
 
-    // Hidden findings = multiset diff of raw minus effective. Keep the actual
-    // Finding references so record_outcome can store full HiddenEvent details
-    // (exposed via `tirith warnings --hidden`).
+    // Hidden findings = multiset diff of raw minus effective. Keep the Finding
+    // refs so record_outcome can store full HiddenEvent details.
     let hidden_findings_vec: Vec<&Finding> = {
         let mut effective_counts: HashMap<(String, String, String, String), u32> = HashMap::new();
         for f in &effective.findings {
@@ -1116,21 +1036,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // M4 item 8 chunk 3 — `agent_rules` enforcement. The chunk-2
-    // observation-only test `agent_rules_chunk2_loading_changes_no_verdict`
-    // was retired (a populated `agent_rules` block can now flip an Allow
-    // verdict to Block on a `deny` match). The four behavioral arms below
-    // pin the enforcement contract:
-    //
-    //  * deny on Allow verdict           → Block + AgentDeniedByPolicy finding
-    //  * deny on already-blocked verdict → still Block + finding (no double-block)
-    //  * allow on Block verdict          → still Block (allow is NOT a bypass)
-    //  * Unspecified                     → unchanged
-    //
-    // Plus a regression guard:
-    //  * empty `agent_rules` policy      → no finding injected, verdict byte-identical
-    // -----------------------------------------------------------------------
+    // `agent_rules` enforcement contract:
+    //  * deny on Allow            → Block + AgentDeniedByPolicy finding
+    //  * deny on already-blocked  → still Block + finding (no double-block)
+    //  * allow on Block           → still Block (allow is NOT a bypass)
+    //  * Unspecified / empty rules → unchanged, no finding injected
 
     fn raw_verdict_with(
         action: Action,
@@ -1189,10 +1099,7 @@ mod tests {
 
     #[test]
     fn agent_rules_deny_forces_block_on_allow_verdict() {
-        // An engine-Allow verdict from a Human caller against a policy that
-        // denies humans → forced to Block with a new AgentDeniedByPolicy
-        // finding. No detection findings exist on the raw verdict, so the
-        // ONLY finding on the effective verdict is the policy injection.
+        // Allow verdict + deny-humans policy → Block with the sole (injected) finding.
         let raw = raw_verdict_with(
             Action::Allow,
             vec![],
@@ -1216,12 +1123,7 @@ mod tests {
         );
         assert_eq!(result.findings[0].rule_id, RuleId::AgentDeniedByPolicy);
         assert_eq!(result.findings[0].severity, Severity::High);
-        // The description must name the matched origin (debug-escaped),
-        // the matched matcher (kind), and the policy file path so the
-        // operator can trace the decision. Chunk-3 Finding D restored
-        // the matcher payload to `AgentDecision::Denied`, so the kind
-        // string is now first-class in the description rather than
-        // recovered via `{:?}` on the policy path.
+        // Description must name origin + matcher kind + policy path for traceability.
         assert!(
             result.findings[0].description.contains("Human")
                 && result.findings[0].description.contains("policy.yaml")
@@ -1233,12 +1135,8 @@ mod tests {
 
     #[test]
     fn agent_rules_deny_keeps_block_on_already_blocked_verdict() {
-        // The engine already produced a Block (e.g. an http+shell pipe).
-        // A deny match must STILL inject the AgentDeniedByPolicy finding
-        // (so the audit log records why the caller is denied) but must
-        // NOT double-block — the action stays Block (which is the
-        // strictest action anyway). Existing detection findings must be
-        // preserved alongside the new policy finding.
+        // Deny on an already-Block verdict still injects the finding (for the
+        // audit log) without double-blocking; existing detection findings persist.
         let detection_finding = make_finding(RuleId::CurlPipeShell, Severity::High);
         let raw = raw_verdict_with(
             Action::Block,
@@ -1255,8 +1153,7 @@ mod tests {
         );
 
         assert_eq!(result.action, Action::Block, "must stay Block");
-        // Both findings must be present — the detection one + the policy
-        // one. Order doesn't matter for the contract; only that both exist.
+        // Both findings must be present (order-independent).
         let has_detection = result
             .findings
             .iter()
@@ -1279,11 +1176,7 @@ mod tests {
 
     #[test]
     fn agent_rules_allow_does_not_bypass_block() {
-        // An `allow` matcher is NOT a bypass: a verdict the engine already
-        // blocked stays blocked even if the caller is on the allow-list.
-        // The chunk-3 minimal cut explicitly does not introduce "trusted
-        // agent unconditionally allows" — that needs a richer matcher
-        // payload (severity overrides, etc.) which is deferred.
+        // `allow` is NOT a bypass: an already-blocked verdict stays blocked.
         let detection_finding = make_finding(RuleId::CurlPipeShell, Severity::High);
         let raw = raw_verdict_with(
             Action::Block,
@@ -1304,8 +1197,7 @@ mod tests {
             Action::Block,
             "allow must NOT downgrade an existing Block — chunk-3 minimal-cut semantics"
         );
-        // No AgentDeniedByPolicy finding should be injected — only the
-        // existing detection finding is present.
+        // No AgentDeniedByPolicy finding is injected; only the detection one remains.
         assert!(
             result
                 .findings
@@ -1326,9 +1218,7 @@ mod tests {
 
     #[test]
     fn agent_rules_unspecified_leaves_verdict_unchanged() {
-        // A Human caller against a policy that allows only Agent kinds —
-        // the helper returns Unspecified. Neither action nor findings
-        // change.
+        // Human caller vs an allow-only-Agents policy → Unspecified, no change.
         let raw = raw_verdict_with(
             Action::Allow,
             vec![],
@@ -1359,18 +1249,14 @@ mod tests {
 
     #[test]
     fn agent_rules_unset_does_not_introduce_finding() {
-        // Critical regression guard: a legacy policy (no `agent_rules`
-        // block at all) must produce a verdict byte-identical to one
-        // produced with the chunk-2 (or pre-chunk-1) engine. No
-        // AgentDeniedByPolicy finding can ever appear from the default
-        // empty `agent_rules`.
+        // Regression guard: a legacy (empty `agent_rules`) policy never injects
+        // AgentDeniedByPolicy and never flips the action.
         let detection_finding = make_finding(RuleId::ShortenedUrl, Severity::Medium);
         let raw = raw_verdict_with(
             Action::Warn,
             vec![detection_finding.clone()],
             Some(crate::agent_origin::AgentOrigin::human(true)),
         );
-        // Default policy has empty agent_rules.
         let policy = crate::policy::Policy::default();
         let result = post_process_verdict(
             &raw,
@@ -1380,10 +1266,6 @@ mod tests {
             CallerContext::Cli,
         );
 
-        // The verdict is whatever the rest of post_process did to it
-        // (action_overrides + paranoia + escalation). The new contract
-        // is just: no AgentDeniedByPolicy finding ever appears, and
-        // the action is not flipped to Block by the chunk-3 hook.
         assert!(
             result
                 .findings
@@ -1392,8 +1274,6 @@ mod tests {
             "empty agent_rules must not inject AgentDeniedByPolicy: {:?}",
             result.findings
         );
-        // The verdict is exactly what the pre-chunk-3 pipeline produced —
-        // we can also check the action wasn't flipped to Block by chunk-3.
         // Default paranoia (1) preserves Medium findings → action stays Warn.
         assert_eq!(
             result.action,
@@ -1406,9 +1286,7 @@ mod tests {
 
     #[test]
     fn apply_agent_rules_returns_true_only_on_denied() {
-        // The pure helper signature: `apply_agent_rules` returns `true`
-        // iff it mutated the verdict (flipped to Block + injected the
-        // finding). Allowed / Unspecified return `false`.
+        // `apply_agent_rules` returns true iff it mutated (Denied); Allowed/Unspecified → false.
         let mut v_allow = raw_verdict_with(
             Action::Allow,
             vec![],
@@ -1447,11 +1325,7 @@ mod tests {
 
     #[test]
     fn apply_agent_rules_no_origin_is_treated_as_unspecified() {
-        // A verdict that has not yet had its `agent_origin` stamped —
-        // e.g. an engine fast-exit path that never reached the CLI's
-        // origin resolver. The helper must treat this as Unspecified
-        // (no mutation) rather than panicking or matching nothing
-        // implicitly.
+        // A verdict with no `agent_origin` is Unspecified (no mutation), not a panic.
         let mut v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(!apply_agent_rules(&mut v, &deny_human_policy()));
         assert_eq!(v.action, Action::Allow);
@@ -1460,14 +1334,9 @@ mod tests {
 
     #[test]
     fn agent_rules_finding_description_escapes_hostile_origin_payload() {
-        // A hostile `TIRITH_INTEGRATION` value carrying an ANSI escape
-        // would, in a raw `format!("{}", origin)`, leak through to the
-        // operator's terminal when they `cat` the audit log line. The
-        // implementation uses `{:?}` (Debug-escaped) on the origin so
-        // a control byte is rendered as e.g. `\u{1b}` rather than the
-        // raw ESC. We can't easily inject a hostile origin (the
-        // sanitizer rejects control bytes at ingest), but we can pin
-        // the rendering shape by asserting the Debug form is used.
+        // The description renders the origin via `{:?}` (Debug-escaped) so a
+        // control byte would show as `\u{1b}` rather than leaking to the terminal.
+        // The sanitizer rejects control bytes at ingest, so we pin the Debug shape.
         let hostile_origin = crate::agent_origin::AgentOrigin::agent("claude-code", Some("1.2.3"))
             .expect("constructor accepts safe value");
         let mut v = raw_verdict_with(Action::Allow, vec![], Some(hostile_origin));
@@ -1488,10 +1357,8 @@ mod tests {
             .iter()
             .find(|f| f.rule_id == RuleId::AgentDeniedByPolicy)
             .expect("finding injected");
-        // The Debug-format renders enum variants by name + struct fields,
-        // so we should see `Agent { tool: ...` style. This is the contract
-        // we're pinning — control bytes (if they ever slipped through
-        // sanitization) would show as `\u{...}` escapes.
+        // Debug renders the variant by name + fields (`Agent { tool: ... }`),
+        // so control bytes would surface as `\u{...}` escapes.
         assert!(
             finding.description.contains("Agent"),
             "description should render the origin in Debug form: {}",
@@ -1506,17 +1373,9 @@ mod tests {
 
     #[test]
     fn post_process_deny_does_not_emit_approval_metadata() {
-        // PR #121 fix-list item 9 — pre-fix, `post_process_verdict`
-        // ran `check_approval`/`apply_approval` BEFORE `apply_agent_rules`.
-        // A denied caller whose raw verdict also triggered an approval
-        // rule then received BOTH `action: Block` AND
-        // `requires_approval: Some(true)` — conflicting client
-        // instructions. The fix reorders the pipeline so
-        // `apply_agent_rules` runs first; approval is only derived when
-        // the verdict isn't already Block.
-        //
-        // Mirrors the MCP-side pin in
-        // `mcp_check_url_deny_does_not_emit_approval_metadata`.
+        // PR #121 item 9: a denied caller whose raw verdict also matched an
+        // approval rule must NOT receive both `action: Block` and
+        // `requires_approval: true`. (Mirrors the MCP-side pin.)
         let finding = make_finding(RuleId::PlainHttpToSink, Severity::High);
         let raw = raw_verdict_with(
             Action::Warn,
@@ -1524,9 +1383,7 @@ mod tests {
             Some(crate::agent_origin::AgentOrigin::human(true)),
         );
         let mut policy = deny_human_policy();
-        // An approval rule that matches the raw finding. Pre-fix this
-        // would stamp approval metadata even though the deny matcher
-        // also forces Block.
+        // An approval rule matching the raw finding (deny also forces Block).
         policy.approval_rules.push(crate::policy::ApprovalRule {
             rule_ids: vec!["plain_http_to_sink".to_string()],
             timeout_secs: 60,

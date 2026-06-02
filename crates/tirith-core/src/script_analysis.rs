@@ -67,8 +67,7 @@ pub fn detect_interpreter(content: &str) -> &str {
             if let Some(prog) = parts.first() {
                 let base = prog.rsplit('/').next().unwrap_or(prog);
                 if base == "env" {
-                    // Walk past `env` flags (-S, -i, …) and `VAR=val`
-                    // assignments to reach the actual interpreter name.
+                    // Walk past env flags (-S, -i, …) and VAR=val assignments to the interpreter name.
                     for part in parts.iter().skip(1) {
                         if part.starts_with('-') || part.contains('=') {
                             continue;

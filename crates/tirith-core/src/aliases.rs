@@ -1,49 +1,31 @@
-//! Shell-alias / function risk detection (M9 ch3).
-//!
-//! This module enumerates the aliases and functions defined in a user's shell
-//! configuration and classifies each one against four risk rules: overriding a
-//! critical command, hiding a network call, reading a credential file, and
-//! having been added very recently. It powers `tirith aliases scan|explain`.
+//! Shell-alias / function risk detection (M9 ch3). Enumerates a user's shell
+//! aliases/functions and classifies each against four rules (overrides a
+//! critical command, hides a network call, reads a credential file, recently
+//! added). Powers `tirith aliases scan|explain`.
 //!
 //! ## Two-tier, static-first (safe by construction)
 //!
-//! **Tier 1 (DEFAULT — static parse, NO shell execution).** [`scan_with_root`]
-//! reads the well-known rc/profile files directly (`~/.bashrc`, `~/.zshrc`,
-//! `~/.config/fish/config.fish`, PowerShell `$PROFILE` paths) and runs
-//! lightweight tokenizers over them. It never evaluates the files, so a
-//! malicious rc cannot run code merely because tirith inspected it. This
-//! catches the common `alias foo='…'` / `alias foo="…"` / `alias foo=bar` and
-//! `function bar() { … }` / `bar() { … }` shapes.
+//! Tier 1 (DEFAULT): [`scan_with_root`] statically parses the well-known
+//! rc/profile files — it NEVER evaluates them, so a malicious rc can't run code.
 //!
-//! **Tier 2 (OPT-IN — `include_runtime`).** When the caller asks for it, the
-//! scanner *additionally* shells out to each available shell with explicit
-//! **no-rc flags** so the shell does NOT source the user's real rc files:
-//! `bash --norc --noprofile -c 'alias'`, `zsh -f -c 'alias'`,
-//! `fish --no-config -c 'functions'`. Shells without a reliable no-rc switch
-//! are marked unsupported and skipped. The runtime tier exists to surface
-//! aliases defined somewhere the static parser does not read (a sourced
-//! fragment, an interactive-only definition); it is never the default because
-//! it spawns processes. Tests always pass `include_runtime=false` to keep CI
-//! hermetic.
+//! Tier 2 (OPT-IN — `include_runtime`): additionally shells out with explicit
+//! no-rc flags (`bash --norc --noprofile -c 'alias'`, `zsh -f -c 'alias'`,
+//! `fish --no-config -c 'functions'`) so the real rc files are NOT sourced;
+//! shells without a reliable no-rc switch are skipped. It surfaces aliases the
+//! static parser can't see. Tests always pass `include_runtime=false` (hermetic).
 //!
 //! ## The 4 rules are externally triggered
 //!
-//! `scan` is the only producer of [`AliasFinding`]s. The four rules
-//! ([`crate::verdict::RuleId::AliasOverridesCriticalCommand`],
-//! [`AliasContainsNetworkCall`](crate::verdict::RuleId::AliasContainsNetworkCall),
-//! [`AliasContainsCredentialRead`](crate::verdict::RuleId::AliasContainsCredentialRead),
-//! [`AliasRecentlyAdded`](crate::verdict::RuleId::AliasRecentlyAdded)) fire from
+//! `scan` is the only producer of [`AliasFinding`]s; the four rules fire from
 //! the alias parser, never from `engine::analyze`, so they carry no
 //! PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
 //!
 //! ## Robustness
 //!
-//! Multi-line / brace-balanced function bodies are hard to parse perfectly. The
-//! parsers do a best-effort brace match; an unbalanced or unparseable body is
-//! still recorded as an [`AliasEntry`] with `body_parsed = false` so the CLI
-//! can surface a "review manually" note. Parsing never panics on odd input
-//! (a bare `alias` with no `=`, an unterminated quote, a non-ASCII keyword
-//! head).
+//! Brace-balanced function bodies are best-effort: an unbalanced body is still
+//! recorded with `body_parsed = false` so the CLI can print a "review manually"
+//! note. Parsing never panics on odd input (bare `alias`, unterminated quote,
+//! non-ASCII keyword head).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,22 +37,18 @@ use serde::{Deserialize, Serialize};
 use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
 use crate::verdict::{RuleId, Severity};
 
-/// Budget for each runtime shell-out (`bash --norc -c 'alias'`, …). Matches the
-/// M8 / M9-ch2 context-detector budget.
+/// Budget for each runtime shell-out (matches the M8/M9-ch2 context detector).
 const RUNTIME_SHELL_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// How long a runtime introspection result is cached, keyed by the current
-/// process PID. Re-running `tirith aliases scan --include-runtime` repeatedly
-/// within this window reuses the cached enumeration instead of re-spawning
-/// shells. Static-mode scans do not touch the cache.
+/// Runtime introspection cache TTL, keyed by process PID so repeated
+/// `--include-runtime` scans reuse the enumeration. Static scans don't touch it.
 const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// "Recently added" threshold: an alias whose defining rc file's mtime is
-/// within this window fires [`RuleId::AliasRecentlyAdded`].
+/// "Recently added" threshold: an rc file mtime within this window fires
+/// [`RuleId::AliasRecentlyAdded`].
 const RECENTLY_ADDED_WINDOW: Duration = Duration::from_secs(60 * 60);
 
-/// Critical commands an alias/function must not silently shadow. Mirrors the
-/// M9 ch3 spec list exactly.
+/// Critical commands an alias/function must not silently shadow (M9 ch3 spec).
 const CRITICAL_COMMANDS: &[&str] = &[
     "ls", "cd", "git", "ssh", "sudo", "npm", "pip", "docker", "kubectl", "aws",
 ];
@@ -137,47 +115,37 @@ impl AliasKind {
 /// One enumerated alias or function definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasEntry {
-    /// The alias / function name (the command you'd type).
     pub name: String,
-    /// The expansion / body. For an alias this is the RHS; for a function it is
-    /// the (best-effort) body between the braces. Empty when the body could not
-    /// be isolated.
+    /// Alias RHS, or a function's (best-effort) body between braces. Empty when
+    /// the body could not be isolated.
     pub body: String,
-    /// alias vs function.
     pub kind: AliasKind,
-    /// Which shell this definition is for.
     pub shell: AliasShell,
     /// How it was discovered (static file vs runtime shell-out).
     pub source: AliasSource,
-    /// The rc/profile file it was parsed from, when known (static tier only).
+    /// The rc/profile file it was parsed from (static tier only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
     /// 1-based line number within `source_path`, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
-    /// `true` when the body was isolated cleanly. `false` flags an
-    /// unbalanced / unparseable function body so the CLI can print a
-    /// "review manually" note instead of pretending to know the body.
+    /// `false` flags an unbalanced/unparseable body so the CLI prints a
+    /// "review manually" note instead of pretending to know it.
     pub body_parsed: bool,
 }
 
 /// A single risk finding emitted for an [`AliasEntry`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasFinding {
-    /// The rule that fired.
     pub rule_id: RuleId,
     /// Severity (drives the scan exit code).
     pub severity: Severity,
-    /// The alias/function name the finding is about.
     pub name: String,
-    /// alias vs function.
     pub kind: AliasKind,
-    /// Which shell.
     pub shell: AliasShell,
     /// Human-readable location (`~/.zshrc:42`, or `runtime:bash`).
     pub location: String,
-    /// Short description of *why* the rule fired (e.g. `"shadows `sudo`"`,
-    /// `"body calls curl"`). Credential-redacted where it echoes body content.
+    /// Why the rule fired; credential-redacted where it echoes body content.
     pub detail: String,
 }
 
@@ -193,20 +161,13 @@ impl AliasFinding {
 pub struct AliasScan {
     /// Every alias/function discovered (static, plus runtime when opted in).
     pub entries: Vec<AliasEntry>,
-    /// Findings across all entries.
     pub findings: Vec<AliasFinding>,
-    /// Shells that were requested for runtime introspection but skipped because
-    /// they are unsupported / not installed (only populated when
-    /// `include_runtime` was set).
+    /// Runtime shells requested but skipped (unsupported / not installed).
     pub runtime_skipped: Vec<String>,
 }
 
-// ─── public entry points ─────────────────────────────────────────────────────
-
-/// Scan the real home directory's shell configs for risky aliases / functions.
-///
-/// Resolves `HOME` via the `home` crate and delegates to [`scan_with_root`].
-/// Returns an empty scan if the home directory cannot be resolved.
+/// Scan the real home directory's shell configs (resolves `HOME` via the `home`
+/// crate; empty scan if it can't be resolved). Delegates to [`scan_with_root`].
 pub fn scan(include_runtime: bool) -> AliasScan {
     match home::home_dir() {
         Some(h) => scan_with_root(&h, include_runtime),
@@ -214,14 +175,10 @@ pub fn scan(include_runtime: bool) -> AliasScan {
     }
 }
 
-/// Testable entry point: enumerate + classify aliases under `home` (a stand-in
-/// for `~`).
-///
-/// The static tier reads the rc/profile files under `home`; the optional
-/// runtime tier shells out with no-rc flags (ignoring `home`, since a no-rc
-/// shell sources nothing). Tests pass a `tempfile::tempdir()` path here and
-/// **always** pass `include_runtime=false` — the runtime tier spawns real
-/// shells and is not hermetic. `home` / `std::env` are never mutated.
+/// Testable entry point: enumerate + classify aliases under `home` (stands in
+/// for `~`). The static tier reads rc/profile files under `home`; the optional
+/// runtime tier shells out with no-rc flags (ignoring `home`). Tests pass a
+/// tempdir and always `include_runtime=false`; `std::env` is never mutated.
 pub fn scan_with_root(home: &Path, include_runtime: bool) -> AliasScan {
     let mut entries = collect_static(home);
 
@@ -241,9 +198,8 @@ pub fn scan_with_root(home: &Path, include_runtime: bool) -> AliasScan {
     }
 }
 
-/// Resolve the real home dir and explain a single alias/function by name.
-/// Thin wrapper over [`explain_with_root`] used by the CLI. Returns an empty
-/// result if the home directory cannot be resolved.
+/// CLI wrapper over [`explain_with_root`] that resolves the real home dir
+/// (empty result if it can't be resolved).
 pub fn explain(name: &str, include_runtime: bool) -> AliasExplain {
     match home::home_dir() {
         Some(h) => explain_with_root(&h, name, include_runtime),
@@ -272,14 +228,12 @@ pub fn explain_with_root(home: &Path, name: &str, include_runtime: bool) -> Alia
 /// Result of [`explain_with_root`]: the matching definition(s) and any findings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AliasExplain {
-    /// Every definition that matched the requested name (a name can be defined
-    /// in more than one rc file / shell).
+    /// Every definition matching the name (a name may be defined in >1 file/shell).
     pub matches: Vec<AliasEntry>,
-    /// Findings against the requested name.
     pub findings: Vec<AliasFinding>,
 }
 
-// ─── static tier (default, no shell execution) ────────────────────────────────
+// Static tier (default, no shell execution).
 
 /// rc/profile files inspected statically, paired with the shell they belong to.
 const STATIC_RC_FILES: &[(&str, AliasShell)] = &[
@@ -337,12 +291,7 @@ fn parse_file(
     }
 }
 
-/// Parse bash/zsh `alias` and POSIX function definitions.
-///
-/// Handles, line by line:
-/// - `alias foo='bar baz'`, `alias foo="bar baz"`, `alias foo=bar`
-/// - `function foo() { … }`, `function foo { … }`, `foo() { … }`
-///
+/// Parse bash/zsh `alias` and POSIX function definitions, line by line.
 /// Multi-line function bodies are accumulated by brace balance; an unbalanced
 /// body is recorded with `body_parsed = false`.
 fn parse_posix(
@@ -405,10 +354,8 @@ fn parse_posix(
     let _ = file_recent; // recency is applied in classify via per-entry lookup
 }
 
-/// Parse a `alias name=value` RHS (everything after the `alias` keyword).
-/// Returns `(name, body)`. Handles single quotes, double quotes, and bare
-/// values. Returns `None` when there is no `=` (a bare `alias name` listing
-/// form) or the name is empty.
+/// Parse an `alias name=value` RHS into `(name, body)` (single/double/bare).
+/// `None` for a bare `alias name` listing form or an empty name.
 fn parse_alias_assignment(rest: &str) -> Option<(String, String)> {
     let rest = rest.trim_start();
     // Some shells accept `alias -g name=…`; skip leading short flags.
@@ -441,17 +388,13 @@ fn skip_alias_flags(rest: &str) -> &str {
     cur
 }
 
-/// Try to parse a POSIX function starting at `lines[start]`. Returns
-/// `(name, lines_consumed, body, body_parsed)` on a match.
-///
-/// Recognizes `function name() { … }`, `function name { … }`, and
-/// `name() { … }`. The body is accumulated across lines until braces balance.
-/// If the opening brace is found but never balanced (truncated rc), the body is
-/// returned with `body_parsed = false` and consumption stops at EOF.
+/// Try to parse a POSIX function (`function name() {…}`, `function name {…}`,
+/// `name() {…}`) starting at `lines[start]`, returning `(name, lines_consumed,
+/// body, body_parsed)`. The body accumulates until braces balance; a never-
+/// balanced (truncated) body returns `body_parsed = false`.
 fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usize, String, bool)> {
     let first = strip_leading(lines[start]);
 
-    // Determine the function name + the remainder after the header.
     let (name, after_header) = if let Some(rest) = strip_keyword(first, "function") {
         // `function name() …` or `function name …`
         let rest = rest.trim_start();
@@ -464,14 +407,13 @@ fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usi
         let tail = tail.strip_prefix("()").unwrap_or(tail);
         (clean_name(raw_name), tail.trim_start().to_string())
     } else {
-        // `name() …` form: require `(` then `)` directly (allowing spaces).
+        // `name() …` form: require `(` then `)` so we don't match a plain
+        // command invocation like `git status`.
         let (raw_name, tail) = split_name(first);
         if raw_name.is_empty() || !is_valid_name(&clean_name(raw_name)) {
             return None;
         }
         let tail = tail.trim_start();
-        // Must look like `()` (POSIX function definition) to avoid matching a
-        // plain command invocation like `git status`.
         let tail = tail.strip_prefix('(')?.trim_start();
         let tail = tail.strip_prefix(')')?;
         (clean_name(raw_name), tail.trim_start().to_string())
@@ -481,24 +423,21 @@ fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usi
         return None;
     }
 
-    // Find the opening brace, possibly on a later line.
-    // Accumulate from `after_header` onward.
+    // Pull lines until the opening brace appears.
     let mut buffer = String::new();
     buffer.push_str(&after_header);
     let mut idx = start;
-    // If the header line had no `{` yet, pull subsequent lines until we see one.
     while !buffer.contains('{') {
         idx += 1;
         if idx >= lines.len() {
-            // No body brace at all — treat as not-a-function (avoids eating the
-            // rest of the file on a false positive).
+            // No body brace — not a function (avoids eating the rest of the file).
             return None;
         }
         buffer.push('\n');
         buffer.push_str(lines[idx]);
     }
 
-    // Now balance braces from the first `{`.
+    // Balance braces from the first `{`.
     let open_pos = buffer.find('{').unwrap();
     let mut depth = 0i32;
     let mut body = String::new();
@@ -554,7 +493,7 @@ fn try_parse_posix_function(lines: &[&str], start: usize) -> Option<(String, usi
     Some((name, consumed, body, balanced))
 }
 
-// ─── fish tier ─────────────────────────────────────────────────────────────────
+// Fish tier.
 
 /// Parse fish `alias name 'value'`, `alias name=value`, and
 /// `function name; … ; end` definitions.
@@ -628,12 +567,11 @@ fn parse_fish(contents: &str, path: &Path, file_recent: bool, out: &mut Vec<Alia
     let _ = file_recent;
 }
 
-/// Parse a fish alias RHS: either `name=value` or `name value` (fish accepts
-/// both). Returns `(name, body)`.
+/// Parse a fish alias RHS (`name=value` or `name value`) into `(name, body)`.
 fn parse_fish_alias(rest: &str) -> Option<(String, String)> {
     let rest = rest.trim();
     if let Some(eq) = rest.find('=') {
-        // `alias name=value` — but only if the name (before `=`) has no space.
+        // `alias name=value` — only if the name (before `=`) has no space.
         let name = rest[..eq].trim();
         if is_valid_name(name) && !name.contains(char::is_whitespace) {
             let body = unquote(rest[eq + 1..].trim());
@@ -653,7 +591,7 @@ fn parse_fish_alias(rest: &str) -> Option<(String, String)> {
     Some((name, body))
 }
 
-// ─── PowerShell tier ─────────────────────────────────────────────────────────
+// PowerShell tier.
 
 /// Parse PowerShell `Set-Alias`/`New-Alias` and `function Name { … }`.
 fn parse_powershell(contents: &str, path: &Path, file_recent: bool, out: &mut Vec<AliasEntry>) {
@@ -691,8 +629,6 @@ fn parse_powershell(contents: &str, path: &Path, file_recent: bool, out: &mut Ve
             let (raw_name, tail) = split_name(after.trim_start());
             let name = clean_name(raw_name);
             if is_valid_name(&name) {
-                // Build a synthetic line vec starting with the tail so the POSIX
-                // brace balancer can run over it.
                 if let Some((body, consumed, parsed)) =
                     balance_ps_function(&lines, i, tail.trim_start())
                 {
@@ -717,15 +653,13 @@ fn parse_powershell(contents: &str, path: &Path, file_recent: bool, out: &mut Ve
     let _ = file_recent;
 }
 
-/// Parse a `Set-Alias`/`New-Alias` line. Supports both positional
-/// (`Set-Alias gco git-checkout`) and named (`Set-Alias -Name gco -Value …`)
-/// forms.
+/// Parse a `Set-Alias`/`New-Alias` line, positional (`Set-Alias gco
+/// git-checkout`) or named (`Set-Alias -Name gco -Value …`).
 fn parse_ps_alias(line: &str) -> Option<(String, String)> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.len() < 3 {
         return None;
     }
-    // Named form.
     let mut name: Option<String> = None;
     let mut value: Option<String> = None;
     let mut idx = 1;
@@ -823,7 +757,7 @@ fn balance_ps_function(lines: &[&str], start: usize, tail: &str) -> Option<(Stri
     Some((body.trim().to_string(), idx - start + 1, balanced))
 }
 
-// ─── runtime tier (opt-in, no-rc shell-out) ───────────────────────────────────
+// Runtime tier (opt-in, no-rc shell-out).
 
 /// One PID-keyed cached runtime result.
 struct RuntimeCacheEntry {
@@ -835,9 +769,8 @@ struct RuntimeCacheEntry {
 
 static RUNTIME_CACHE: Mutex<Option<RuntimeCacheEntry>> = Mutex::new(None);
 
-/// Enumerate aliases/functions via no-rc shell-outs. Returns
-/// `(entries, skipped_shells)`. Results are cached per process PID for
-/// [`RUNTIME_CACHE_TTL`] so repeated scans within the window don't re-spawn.
+/// Enumerate aliases/functions via no-rc shell-outs → `(entries, skipped)`,
+/// cached per PID for [`RUNTIME_CACHE_TTL`] so repeated scans don't re-spawn.
 fn collect_runtime() -> (Vec<AliasEntry>, Vec<String>) {
     let pid = std::process::id();
 
@@ -869,7 +802,6 @@ fn collect_runtime_uncached() -> (Vec<AliasEntry>, Vec<String>) {
     let mut entries = Vec::new();
     let mut skipped = Vec::new();
 
-    // bash: `bash --norc --noprofile -c 'alias'`
     match run_no_rc("bash", &["--norc", "--noprofile", "-c", "alias"]) {
         RuntimeOutcome::Output(out) => {
             for (name, body) in parse_runtime_alias_output(&out) {
@@ -879,7 +811,7 @@ fn collect_runtime_uncached() -> (Vec<AliasEntry>, Vec<String>) {
         RuntimeOutcome::Unsupported => skipped.push("bash".to_string()),
     }
 
-    // zsh: `zsh -f -c 'alias'` (`-f` == NO_RCS, sources nothing)
+    // `-f` == NO_RCS (sources nothing).
     match run_no_rc("zsh", &["-f", "-c", "alias"]) {
         RuntimeOutcome::Output(out) => {
             for (name, body) in parse_runtime_alias_output(&out) {
@@ -889,13 +821,11 @@ fn collect_runtime_uncached() -> (Vec<AliasEntry>, Vec<String>) {
         RuntimeOutcome::Unsupported => skipped.push("zsh".to_string()),
     }
 
-    // fish: `fish --no-config -c 'functions'` (fish aliases are functions)
+    // fish aliases are functions; `functions --names` lists names only (no body),
+    // so we record the name (override check still fires) with body_parsed=false.
     match run_no_rc("fish", &["--no-config", "-c", "functions --names"]) {
         RuntimeOutcome::Output(out) => {
             for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                // `functions --names` lists names; the body is not echoed here.
-                // We still record the name so an override/check can fire; body
-                // stays empty and body_parsed=false (review manually).
                 entries.push(AliasEntry {
                     name: name.to_string(),
                     body: String::new(),
@@ -911,9 +841,8 @@ fn collect_runtime_uncached() -> (Vec<AliasEntry>, Vec<String>) {
         RuntimeOutcome::Unsupported => skipped.push("fish".to_string()),
     }
 
-    // PowerShell has no reliable cross-platform no-profile one-liner that is
-    // safe-by-default here; mark unsupported in runtime mode (static tier still
-    // covers `$PROFILE`).
+    // No reliable cross-platform safe-by-default no-profile one-liner for
+    // PowerShell; unsupported in runtime mode (static tier still covers $PROFILE).
     skipped.push("powershell".to_string());
 
     (entries, skipped)
@@ -927,8 +856,8 @@ enum RuntimeOutcome {
     Unsupported,
 }
 
-/// Run a shell with no-rc flags through the shared timeout helper. A missing
-/// binary / non-zero exit / timeout maps to [`RuntimeOutcome::Unsupported`].
+/// Run a shell with no-rc flags via the shared timeout helper. Missing binary /
+/// non-zero exit / timeout → [`RuntimeOutcome::Unsupported`].
 fn run_no_rc(program: &str, args: &[&str]) -> RuntimeOutcome {
     match run_shell_with_timeout(
         program,
@@ -944,8 +873,8 @@ fn run_no_rc(program: &str, args: &[&str]) -> RuntimeOutcome {
     }
 }
 
-/// Build a runtime [`AliasEntry`] (no source path / line; body comes from the
-/// shell's own `alias` listing).
+/// Build a runtime [`AliasEntry`] (no source path/line; body from the shell's
+/// own `alias` listing).
 fn runtime_entry(name: String, body: String, shell: AliasShell) -> AliasEntry {
     AliasEntry {
         name,
@@ -959,8 +888,8 @@ fn runtime_entry(name: String, body: String, shell: AliasShell) -> AliasEntry {
     }
 }
 
-/// Parse the output of `alias` (bash/zsh form: `name='value'` or
-/// `alias name='value'`, one per line). Returns `(name, body)` pairs.
+/// Parse `alias` output (`name='value'` or `alias name='value'`, one per line)
+/// into `(name, body)` pairs.
 fn parse_runtime_alias_output(out: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for raw in out.lines() {
@@ -974,7 +903,7 @@ fn parse_runtime_alias_output(out: &str) -> Vec<(String, String)> {
     pairs
 }
 
-// ─── classification (the 4 rules) ──────────────────────────────────────────────
+// Classification (the 4 rules).
 
 /// Run the four risk rules over every entry, returning all findings.
 fn classify_all(entries: &[AliasEntry]) -> Vec<AliasFinding> {
@@ -1006,9 +935,8 @@ fn classify_entry(entry: &AliasEntry, out: &mut Vec<AliasFinding>) {
         });
     }
 
-    // Rules 2 & 3 inspect the BODY. A runtime fish entry with no body is
-    // skipped for body checks (body_parsed=false + empty), but still got the
-    // name-based override check above.
+    // Rules 2 & 3 inspect the BODY (a bodyless runtime fish entry is skipped
+    // here but still got the name-based override check above).
     if !entry.body.is_empty() {
         // Rule 2 — network call (High).
         if let Some(tool) = body_network_tool(&entry.body) {
@@ -1070,7 +998,7 @@ fn body_network_tool(body: &str) -> Option<&'static str> {
 /// Credential-path fragments an alias body must not read. Returns the first
 /// matching fragment found in the body.
 fn body_reads_credential(body: &str) -> Option<String> {
-    // Order matters only for which one we report first; all are High.
+    // Order only decides which we report first; all are High.
     const FRAGMENTS: &[&str] = &[
         ".aws/credentials",
         ".aws/config",
@@ -1114,10 +1042,8 @@ fn contains_command_word(body: &str, word: &str) -> bool {
                 bytes[after],
                 b' ' | b'\t' | b'|' | b';' | b'&' | b')' | b'`' | b'\n' | b'\r'
             );
-        // Reject when the preceding char is `/` AND there's a longer word
-        // (e.g. `/usr/bin/curl` is OK as `curl`, but `curling` is not — the
-        // after_ok check already rejects `curling`). A `/`-prefixed exact
-        // match (an absolute path to the tool) IS a network call.
+        // A `/`-prefixed exact match (`/usr/bin/curl`) IS a network call;
+        // `curling` is already rejected by after_ok.
         if before_ok && after_ok {
             return true;
         }
@@ -1129,16 +1055,15 @@ fn contains_command_word(body: &str, word: &str) -> bool {
     false
 }
 
-// ─── small parsing helpers ─────────────────────────────────────────────────────
+// Small parsing helpers.
 
 /// Strip leading whitespace (spaces + tabs) but keep the rest verbatim.
 fn strip_leading(s: &str) -> &str {
     s.trim_start_matches([' ', '\t'])
 }
 
-/// If `line` begins with `keyword` followed by whitespace, return the remainder
-/// after the keyword (trimmed of the leading whitespace). ASCII-only, so a
-/// non-ASCII head never panics or false-matches.
+/// If `line` begins with `keyword` followed by whitespace, return the trimmed
+/// remainder. ASCII-only, so a non-ASCII head never panics or false-matches.
 fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(keyword)?;
     // Require a whitespace boundary so `aliased` doesn't match `alias`.
@@ -1180,10 +1105,9 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
-/// `true` when `name` is a plausible alias/function identifier: non-empty, no
-/// whitespace, and composed of the characters shells actually allow in a
-/// command name (letters, digits, `_`, `-`, `.`, `:`, `+`). Rejects assignment
-/// fragments and obvious garbage so we don't record `if`-blocks as functions.
+/// `true` when `name` is a plausible alias/function identifier (non-empty, no
+/// whitespace, only letters/digits/`_`/`-`/`.`/`:`/`+`). Rejects assignment
+/// fragments and garbage so we don't record `if`-blocks as functions.
 fn is_valid_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -1192,9 +1116,8 @@ fn is_valid_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '+'))
 }
 
-/// Human-readable location for an entry: `path:line` for static, `runtime:shell`
-/// otherwise. Used in finding `location` fields (full path for unambiguous
-/// remediation).
+/// Full location for finding `location` fields: `path:line` (static) or
+/// `runtime:shell`.
 fn entry_location(entry: &AliasEntry) -> String {
     match (&entry.source_path, entry.line) {
         (Some(p), Some(l)) => format!("{}:{}", p.display(), l),
@@ -1203,8 +1126,7 @@ fn entry_location(entry: &AliasEntry) -> String {
     }
 }
 
-/// Compact location for inventory listings: the file's basename + line, or
-/// `runtime:shell`. Keeps the `scan` table readable without losing the line.
+/// Compact location for inventory listings: basename + line, or `runtime:shell`.
 pub fn short_location(entry: &AliasEntry) -> String {
     match (&entry.source_path, entry.line) {
         (Some(p), line) => {
@@ -1221,8 +1143,8 @@ pub fn short_location(entry: &AliasEntry) -> String {
     }
 }
 
-/// `true` when `path`'s mtime is within [`RECENTLY_ADDED_WINDOW`] of now. A
-/// missing mtime / clock skew (mtime in the future) is treated as "not recent".
+/// `true` when `path`'s mtime is within [`RECENTLY_ADDED_WINDOW`]. A missing
+/// mtime or future mtime (clock skew) counts as "not recent".
 fn file_recently_modified(path: &Path) -> bool {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -1239,8 +1161,8 @@ fn file_recently_modified(path: &Path) -> bool {
     }
 }
 
-/// Read a path as UTF-8 text only when it is a regular file. Returns `None` for
-/// directories, missing files, permission errors, or non-UTF-8 content.
+/// Read a regular file as UTF-8 text; `None` for dirs, missing files, perm
+/// errors, or non-UTF-8 content.
 fn read_text_if_file(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
@@ -1593,11 +1515,8 @@ mod tests {
         assert!(!is_valid_name("if true; then"));
     }
 
-    // Helper using the `filetime` crate if available; otherwise via a libc
-    // utimensat-free fallback that just returns Err so the test self-skips.
+    // Set mtime via File::set_times (stable since 1.75); Err lets the test self-skip.
     fn filetime_set(path: &Path, t: SystemTime) -> std::io::Result<()> {
-        // We don't depend on the `filetime` crate; emulate by reopening and
-        // using `set_times` (stable since 1.75 via File::set_times).
         use std::fs::OpenOptions;
         let f = OpenOptions::new().write(true).open(path)?;
         let times = std::fs::FileTimes::new().set_modified(t);

@@ -27,8 +27,8 @@ const ALLOWED_EXACT: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "deno", "bun", "nodejs",
 ];
 
-/// Interpreter families that may have version suffixes (python3, python3.11, ruby3.2, node18, perl5.38).
-/// Matches: exact name OR name + digits[.digits]* suffix.
+/// Interpreter families allowed with an optional `digits[.digits]*` version
+/// suffix (python3, python3.11, ruby3.2, node18, perl5.38).
 const ALLOWED_FAMILIES: &[&str] = &["python", "ruby", "perl", "node"];
 
 fn is_allowed_interpreter(interpreter: &str) -> bool {
@@ -52,9 +52,7 @@ fn is_allowed_interpreter(interpreter: &str) -> bool {
     false
 }
 
-/// Check if a suffix is a valid version string: digits (.digits)*
-/// Valid: "3", "3.11", "3.2.1"
-/// Invalid: "", ".3", "3.", "3..11", "evil"
+/// A valid version suffix is `digits (.digits)*` ("3", "3.11"); rejects "", ".3", "3.", "evil".
 fn is_valid_version_suffix(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -155,20 +153,15 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         }
         tmp.write_all(&content)
             .map_err(|e| format!("write cache: {e}"))?;
-        // Durability: fsync the cached bytes before the rename publishes them so
-        // a crash after the rename cannot leave a zero/partial cache entry that a
-        // later run treats as a complete download.
+        // fsync bytes before rename so a crash can't leave a partial cache entry.
         tmp.as_file()
             .sync_all()
             .map_err(|e| format!("sync cache: {e}"))?;
         tmp.persist(&cached_path)
             .map_err(|e| format!("persist cache: {e}"))?;
-        // Durability of the RENAME itself (CodeRabbit R9 #B): the body is fsync'd
-        // above, but the new directory entry is not crash-durable until the parent
-        // dir is fsync'd. A downloaded-and-cached script is execution-sensitive, so
-        // make the published entry durable too. The persist already succeeded, so
-        // a dir-fsync failure is LOGGED, not propagated (R13 #5). Best-effort,
-        // unix-only.
+        // Also fsync the parent dir so the rename itself is crash-durable
+        // (CodeRabbit R9 #B). Best-effort: persist already succeeded, so a
+        // dir-fsync failure is logged not propagated (R13 #5). Unix-only.
         crate::util::fsync_parent_dir_logged(&cached_path, "run cache");
     }
 
@@ -183,8 +176,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     let interpreter = script_analysis::detect_interpreter(&content_str);
     let analysis = script_analysis::analyze(&content_str, interpreter);
 
-    // Interpreter allowlist is only enforced when we might execute. With
-    // --no-exec the user has already committed to inspecting the script.
+    // Allowlist is only enforced when we might execute (--no-exec is inspect-only).
     if !opts.no_exec && !is_allowed_interpreter(interpreter) {
         return Err(format!(
             "interpreter '{interpreter}' is not in the allowed list",
@@ -224,7 +216,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         });
     }
 
-    // Show analysis summary
     eprintln!(
         "tirith: downloaded {} bytes (SHA256: {})",
         content.len(),
@@ -241,7 +232,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         eprintln!("tirith: WARNING: script uses base64");
     }
 
-    // Confirm from /dev/tty
     let tty = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -268,7 +258,6 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
         });
     }
 
-    // Execute
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
     let status = Command::new(interpreter)
@@ -297,12 +286,10 @@ pub struct DownloadResult {
     pub interpreter: String,
 }
 
-/// Download `url` to `dest` WITHOUT executing it. Shares the redirect / 30s
-/// timeout / 10 MiB-cap policy with [`run`]. Verifies `expected_sha256` when
-/// supplied. Writes atomically (sibling temp + rename, `0600`) so a partial
-/// download never leaves a truncated file at `dest`. This is the
-/// download-and-keep primitive behind `tirith fetch --save`; the caller marks
-/// `dest` tainted (see `crate::taint`).
+/// Download `url` to `dest` WITHOUT executing it (the primitive behind
+/// `tirith fetch --save`). Shares [`run`]'s redirect / 30s-timeout / 10 MiB-cap
+/// policy, verifies `expected_sha256`, and writes atomically (sibling temp +
+/// rename, `0600`). Caller marks `dest` tainted (see `crate::taint`).
 pub fn download_to_path(
     url: &str,
     dest: &std::path::Path,
@@ -389,19 +376,14 @@ pub fn download_to_path(
         }
         tmp.write_all(&content)
             .map_err(|e| format!("write download: {e}"))?;
-        // Durability: force the downloaded bytes to stable storage BEFORE the
-        // rename publishes them. `write_all` only buffers into the kernel; a
-        // crash after the rename could otherwise leave a zero/partial file at
-        // `dest` that a later read treats as a complete download.
+        // fsync bytes before rename so a crash can't leave a partial file at dest.
         tmp.as_file()
             .sync_all()
             .map_err(|e| format!("sync download: {e}"))?;
         tmp.persist(dest)
             .map_err(|e| format!("persist download: {e}"))?;
-        // Durability of the RENAME itself (CodeRabbit R9 #B): fsync the parent dir
-        // so the new name→inode entry survives a crash, not just the synced body.
-        // The persist already succeeded, so a dir-fsync failure is LOGGED, not
-        // propagated (R13 #5). Best-effort, unix-only.
+        // Also fsync the parent dir so the rename survives a crash (CodeRabbit
+        // R9 #B). Best-effort: a dir-fsync failure is logged not propagated (R13 #5).
         crate::util::fsync_parent_dir_logged(dest, "downloaded script");
     }
 
@@ -540,14 +522,12 @@ mod tests {
             tmp.persist(&cached_path).unwrap();
         }
 
-        // No predictable temp file should remain
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
 
-        // Should only contain the final cached file
         assert_eq!(
             entries.len(),
             1,

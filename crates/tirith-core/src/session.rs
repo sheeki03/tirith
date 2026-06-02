@@ -6,14 +6,9 @@ use std::time::Instant;
 /// Global session ID for the current tirith process lifetime.
 static SESSION_ID: OnceLock<String> = OnceLock::new();
 
-/// Get or generate the session ID.
-///
-/// Priority:
-/// 1. `TIRITH_SESSION_ID` env var (set by shell hooks for cross-command sessions)
-/// 2. Auto-generated UUID for this process
-///
-/// Existing callers should continue using this. New code that needs
-/// file-based fallback for agent hooks should prefer `resolve_session_id()`.
+/// Get or generate the session ID: `TIRITH_SESSION_ID` env var, else an
+/// auto-generated per-process UUID. New code that needs the file-based fallback
+/// for agent hooks should prefer [`resolve_session_id`].
 pub fn session_id() -> &'static str {
     SESSION_ID.get_or_init(|| {
         std::env::var("TIRITH_SESSION_ID").unwrap_or_else(|_| generate_session_id())
@@ -30,10 +25,8 @@ pub fn new_session_id() -> String {
     generate_session_id()
 }
 
-/// Immutable env-var session (returns `&'static str`, cached in `OnceLock`).
-///
-/// Returns `Some` if `TIRITH_SESSION_ID` is set and non-empty, `None` otherwise.
-/// The value is cached for the process lifetime.
+/// `TIRITH_SESSION_ID` if set and non-empty, else `None`. Cached for the process
+/// lifetime.
 pub fn env_session_id() -> Option<&'static str> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED
@@ -60,19 +53,14 @@ const FALLBACK_FILE_MAX_AGE_SECS: u64 = 4 * 3600;
 /// Per-entry in-process cache refresh interval (5 minutes).
 const FALLBACK_CACHE_REFRESH_SECS: u64 = 300;
 
-/// Refreshable file-based fallback session ID.
-///
-/// Cache is keyed by scope (`{integration}-{cwd_hash_8chars}`).
-/// File lives at `state_dir()/sessions/fallback-{scope}.id`.
-/// If the file exists and its mtime is less than 4 hours, its content is used.
-/// Otherwise a new ID is generated and written.
-///
-/// An in-process `Mutex<HashMap>` caches resolved IDs with a 5-minute refresh.
+/// Refreshable file-based fallback session ID. Keyed by scope
+/// (`{integration}-{cwd_hash_8chars}`); the file lives at
+/// `state_dir()/sessions/fallback-{scope}.id` and is reused while its mtime is
+/// under 4 hours. An in-process `Mutex<HashMap>` caches with a 5-minute refresh.
 pub fn fallback_session_id() -> String {
     let scope = compute_scope();
     let cache = FALLBACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    // Check in-process cache first
     if let Ok(map) = cache.lock() {
         if let Some(entry) = map.get(&scope) {
             if entry.cached_at.elapsed().as_secs() < FALLBACK_CACHE_REFRESH_SECS {
@@ -81,10 +69,8 @@ pub fn fallback_session_id() -> String {
         }
     }
 
-    // Try to load from file, or generate fresh
     let id = load_or_create_fallback_file(&scope);
 
-    // Update in-process cache
     if let Ok(mut map) = cache.lock() {
         map.insert(
             scope,
@@ -98,14 +84,9 @@ pub fn fallback_session_id() -> String {
     id
 }
 
-/// Unified session ID resolver.
-///
-/// Priority:
-/// 1. `TIRITH_SESSION_ID` env var (immutable, process-lifetime cache)
-/// 2. File-based fallback (refreshable, scoped by integration + cwd)
-///
-/// Returns an owned `String`. New code should prefer this over `session_id()`
-/// when the caller might run outside a shell hook (e.g. agent integrations).
+/// Unified session ID resolver: `TIRITH_SESSION_ID` env var, else the file-based
+/// fallback (scoped by integration + cwd). Prefer this over [`session_id`] when
+/// the caller might run outside a shell hook (e.g. agent integrations).
 pub fn resolve_session_id() -> String {
     if let Some(env_id) = env_session_id() {
         return env_id.to_string();
@@ -113,18 +94,16 @@ pub fn resolve_session_id() -> String {
     fallback_session_id()
 }
 
-/// Compute a scope key from the current integration name and working directory.
-///
-/// Format: `{integration}-{cwd_hash_8chars}` where integration comes from
-/// `TIRITH_INTEGRATION` env var (default "unknown") and cwd_hash is the
-/// first 8 hex chars of the SHA-256 of the current directory.
+/// Scope key `{integration}-{cwd_hash_8chars}`: integration from
+/// `TIRITH_INTEGRATION` (default "unknown"), cwd_hash the first 8 hex chars of
+/// SHA-256(cwd).
 fn compute_scope() -> String {
     let integration = std::env::var("TIRITH_INTEGRATION")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Sanitize integration name: only [a-zA-Z0-9_-]
+    // Sanitize: only [a-zA-Z0-9_-].
     let integration: String = integration
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -196,7 +175,7 @@ fn write_fallback_file(path: &PathBuf, session_id: &str) {
         }
     }
 
-    // Refuse to follow symlinks (matches audit.rs / session_warnings.rs pattern)
+    // Refuse to follow symlinks (matches audit.rs / session_warnings.rs).
     #[cfg(unix)]
     {
         match std::fs::symlink_metadata(path) {
@@ -246,7 +225,7 @@ fn write_fallback_file(path: &PathBuf, session_id: &str) {
         .is_ok();
     drop(writer);
     if !write_ok {
-        // Remove partial/corrupt file so next read regenerates instead of
+        // Remove the partial file so the next read regenerates rather than
         // reading a truncated session ID.
         let _ = std::fs::remove_file(path);
     }
@@ -266,7 +245,6 @@ mod tests {
     #[test]
     fn test_generate_session_id_unique() {
         let a = generate_session_id();
-        // Small sleep to ensure different timestamp
         std::thread::sleep(std::time::Duration::from_millis(1));
         let b = generate_session_id();
         assert_ne!(a, b);
@@ -275,7 +253,7 @@ mod tests {
     #[test]
     fn test_generate_session_id_format() {
         let id = generate_session_id();
-        // UUID v4 format: 8-4-4-4-12 hex chars = 36 chars
+        // UUID v4: 8-4-4-4-12 hex = 36 chars.
         assert_eq!(id.len(), 36);
         assert!(uuid::Uuid::parse_str(&id).is_ok());
     }

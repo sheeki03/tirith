@@ -1,63 +1,37 @@
 //! PowerShell-specific detection rules.
 //!
-//! Complements [`super::command`]'s shell-agnostic command rules with three
-//! Windows / PowerShell-only patterns that the existing rules do not cover:
+//! Three Windows/PowerShell-only patterns `command.rs` doesn't cover:
+//! 1. `Set-ExecutionPolicy Bypass` (cmdlet + `powershell -ExecutionPolicy Bypass`
+//!    flag forms) — [`RuleId::PsSetExecutionPolicyBypass`].
+//! 2. `Add-MpPreference -ExclusionPath|-ExclusionProcess` — [`RuleId::PsDefenderExclusion`].
+//! 3. Inline `iex (iwr https://...)` with `iex`/`invoke-expression` LEADING (not a
+//!    pipe RHS) — [`RuleId::PsInlineDownloadExecute`].
 //!
-//! 1. **`Set-ExecutionPolicy Bypass`** (cmdlet form *and* `powershell -ExecutionPolicy Bypass`
-//!    flag form) — [`RuleId::PsSetExecutionPolicyBypass`].
-//! 2. **`Add-MpPreference -ExclusionPath|-ExclusionProcess`** — [`RuleId::PsDefenderExclusion`].
-//! 3. **Inline `iex (iwr https://...)`** where `iex` / `invoke-expression`
-//!    is the *leading* command (not a pipe RHS) — [`RuleId::PsInlineDownloadExecute`].
+//! Scope boundary with `command.rs`: the pipe form `iwr url | iex` is NOT covered
+//! here — `command::check`'s `check_pipe_to_interpreter` already catches it (via
+//! the `pipe_to_interpreter` PATTERN_TABLE entry), and double-firing would noise
+//! the verdict. So `is_pipe_separator` skips only `|` / `|&`; other PS separators
+//! (`;`, `\n`, `-and`, `-or`, `&&`, `||`) start fresh commands that
+//! `pipe_to_interpreter` does NOT match, where `check_inline_download_execute`
+//! still fires (e.g. `true; iex (iwr url)`). PS 5.1 lacks `&&`/`||`, but tirith
+//! scans the input string before that parse, so chained `iex` is still flagged.
 //!
-//! ## Scope boundary with `command.rs`
+//! Fixtures: `ps_iex_pipe_already_covered_not_double` pins the pipe boundary;
+//! `ps_iex_inline_after_{semicolon,and,or}_chained` pin the chained cases.
 //!
-//! The pipe form `iwr url | iex` (and `irm url | iex`) is **intentionally not**
-//! covered here. It is already caught by [`crate::rules::command::check`]'s
-//! `check_pipe_to_interpreter` via the `pipe_to_interpreter` PATTERN_TABLE
-//! entry (which lists `iex` and `invoke-expression` as recognized pipe-RHS
-//! interpreters). Double-firing would noise up the verdict and confuse
-//! downstream policy.
-//!
-//! Only the *pipe* separators (`|`, `|&`) are skipped — non-pipe separators
-//! the PS tokenizer actually emits (`;`, `\n`, `-and`, `-or`) start fresh
-//! commands that `pipe_to_interpreter` does NOT match, so
-//! `check_inline_download_execute` still fires on them (e.g.
-//! `true; iex (iwr url)`).
-//!
-//! Note: the PS tokenizer in `tokenize.rs` splits on `|`, `||`, `&&`, `;`,
-//! `-and`, `-or`, and newline. The `is_pipe_separator` guard suppresses only
-//! `"|"` and `"|&"` — all other separators (`||`, `&&`, `;`, `\n`, `-and`,
-//! `-or`) start fresh commands where `check_inline_download_execute` fires.
-//! PowerShell 5.1 doesn't support `&&`/`||` natively (the shell would emit a
-//! parse error), but tirith's detection runs on the input string before
-//! that parse — so we still flag the suspicious chained `iex` content
-//! correctly.
-//!
-//! The negative fixture `ps_iex_pipe_already_covered_not_double` in
-//! `tests/fixtures/command.toml` pins the pipe boundary — its
-//! `preceding_separator` is `Some("|")`, so `check_inline_download_execute`
-//! correctly skips it. The fixtures `ps_iex_inline_after_semicolon_chained`,
-//! `ps_iex_inline_after_and_chained`, and `ps_iex_inline_after_or_chained`
-//! pin the chained-`;` / `&&` / `||` cases respectively.
-//!
-//! ## Engine wiring
-//!
-//! These rules only run when `ctx.shell == ShellType::PowerShell`. POSIX
-//! input never reaches this module — the gate lives in `engine.rs`.
+//! Engine wiring: these rules run only when `ctx.shell == ShellType::PowerShell`
+//! — the gate lives in `engine.rs`.
 
 use crate::redact;
 use crate::rules::command::{normalize_cmd_base, normalize_shell_token};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Run PowerShell-specific detection rules against `input`.
-///
-/// Callers must ensure `shell == ShellType::PowerShell` before invoking this —
-/// the gate lives at the call site in `engine.rs` (`if ctx.shell == ShellType::PowerShell`).
-/// Tier-1 patterns are still required so the fast gate doesn't filter the
-/// input out before reaching this function; the corresponding `PATTERN_TABLE`
-/// entries in `build.rs` are `ps_set_execution_policy`, `ps_defender_exclusion`,
-/// and `ps_iex_inline`.
+/// Run PowerShell-specific detection rules against `input`. Caller must ensure
+/// `shell == ShellType::PowerShell` (gated in `engine.rs`). Tier-1 patterns are
+/// still required so the fast gate doesn't filter the input out first — the
+/// `build.rs` PATTERN_TABLE entries are `ps_set_execution_policy`,
+/// `ps_defender_exclusion`, `ps_iex_inline`.
 pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
     let mut findings = Vec::new();
     let segments = tokenize::tokenize(input, shell);
@@ -70,16 +44,12 @@ pub fn check(input: &str, shell: ShellType) -> Vec<Finding> {
 }
 
 /// Detect both shapes of `Set-ExecutionPolicy Bypass`:
-///
-/// 1. Cmdlet form — leading command `set-executionpolicy` with `bypass`
-///    somewhere in the args (case-insensitive after normalize).
-///    Note: `sep` is *not* a default PowerShell alias for
-///    `Set-ExecutionPolicy` (`Get-Alias sep` returns nothing on a clean
-///    install). It is intentionally not matched here — including it
-///    triggered tier-1 false-positives for benign inputs that happen to
-///    contain the bare token `sep` (e.g. `$sep = ","`).
-/// 2. Flag form — leading command `powershell` (or `pwsh`) with both
-///    `-executionpolicy` and `bypass` in the args.
+/// 1. Cmdlet form — leader `set-executionpolicy` with `bypass` in the args.
+///    Note: `sep` is NOT matched — it is not a default alias (`Get-Alias sep`
+///    is empty), and including it caused tier-1 false-positives on benign
+///    `$sep = ","`.
+/// 2. Flag form — leader `powershell`/`pwsh` with both `-executionpolicy` and
+///    `bypass` in the args.
 fn check_set_execution_policy(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -95,19 +65,10 @@ fn check_set_execution_policy(
             continue;
         }
 
-        // Cmdlet form: the policy value may appear in any of the following
-        // shapes (all equivalent to PowerShell's parameter binder):
-        //   * `Set-ExecutionPolicy Bypass`                      (positional)
-        //   * `Set-ExecutionPolicy -ExecutionPolicy Bypass`     (named, separated)
-        //   * `Set-ExecutionPolicy -ExecutionPolicy=Bypass`     (named, joined `=`)
-        //   * `Set-ExecutionPolicy -ExecutionPolicy:Bypass`     (named, joined `:`)
-        //
-        // PR #121 fix-list item 12: the colon-joined cmdlet form was the
-        // gap pre-fix — `seg.args` contained the literal
-        // `-ExecutionPolicy:Bypass` token, which `eq_ignore_ascii_case`
-        // never matched against the bare value `bypass`. Reusing
-        // `has_execution_policy_bypass_flag` here covers all four named
-        // forms; the positional check below catches `Set-ExecutionPolicy Bypass`.
+        // Cmdlet form: the value may be positional (`Set-ExecutionPolicy Bypass`)
+        // or named, separated or joined with `=`/`:`. PR #121 item 12: the
+        // colon-joined form was the pre-fix gap. `has_execution_policy_bypass_flag`
+        // covers all named forms; the positional check below covers the rest.
         if cmdlet_path {
             let mentions_bypass = seg.args.iter().any(|a| {
                 let n = normalize_shell_token(a.trim(), shell);
@@ -160,33 +121,22 @@ fn check_set_execution_policy(
     }
 }
 
-/// Return true if `args` contains both a `-ExecutionPolicy`-style flag and a
-/// `Bypass` value, in any of the standard PowerShell parameter-binding forms:
-///
-/// * `-ExecutionPolicy Bypass`  (separate tokens)
-/// * `-ExecutionPolicy=Bypass`  (joined with `=`)
-/// * `-ExecutionPolicy:Bypass`  (joined with `:` — PS parameter-binding form,
-///   PR #121 fix-list item 12)
-/// * `-ep Bypass` / `-ep=Bypass` / `-ep:Bypass` (short alias)
-/// * `-ex Bypass` / `-ex=Bypass` / `-ex:Bypass` (unambiguous prefix alias,
-///   PR #121 fix-list item 12 — PS parameter binding accepts any unambiguous
-///   prefix; `-ex` is the shortest unambiguous form for `-ExecutionPolicy`
-///   that appears in published attacker payloads)
+/// True if `args` has both a `-ExecutionPolicy`-style flag and a `Bypass` value,
+/// in any binding form: separated (`-ExecutionPolicy Bypass`) or joined with
+/// `=`/`:` (PR #121 item 12), and the `-ep` / `-ex` aliases (PS accepts any
+/// unambiguous prefix; `-ex` appears in published payloads).
 fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
-    // The full set of recognized flag spellings. Keeping these as a constant
-    // array (rather than chained `strip_prefix` calls) keeps the joined-form
-    // and separated-form branches aligned: the same names cover both.
+    // Constant array (not chained `strip_prefix`) so the joined- and
+    // separated-form branches share the same names.
     const FLAG_NAMES: &[&str] = &["-executionpolicy", "-ep", "-ex"];
 
     for (i, arg) in args.iter().enumerate() {
         let n = normalize_shell_token(arg.trim(), shell);
         let lower = n.to_ascii_lowercase();
 
-        // Joined form: `-<flag>=Bypass` OR `-<flag>:Bypass`. PowerShell's
-        // parameter binder treats `:` and `=` as equivalent joined-form
-        // separators (the colon form is documented and commonly used in
-        // attacker payloads precisely because some detectors only check
-        // `=`). PR #121 fix-list item 12 mandates both.
+        // Joined form `-<flag>=Bypass` / `-<flag>:Bypass`: PS treats `:` and `=`
+        // as equivalent. The colon form is favored in payloads because some
+        // detectors only check `=` (PR #121 item 12 mandates both).
         for flag in FLAG_NAMES {
             for sep in ['=', ':'] {
                 let prefix = format!("{flag}{sep}");
@@ -198,7 +148,7 @@ fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
             }
         }
 
-        // Separated form: `-<flag> Bypass` (the value sits in args[i+1]).
+        // Separated form `-<flag> Bypass` (value in args[i+1]).
         if FLAG_NAMES.contains(&lower.as_str()) {
             if let Some(next) = args.get(i + 1) {
                 let next_n = normalize_shell_token(next.trim(), shell);
@@ -211,10 +161,8 @@ fn has_execution_policy_bypass_flag(args: &[String], shell: ShellType) -> bool {
     false
 }
 
-/// Detect `Add-MpPreference -ExclusionPath <path>`,
-/// `Add-MpPreference -ExclusionProcess <process>`, or
-/// `Add-MpPreference -ExclusionExtension <ext>`. All three whitelist the
-/// target from Defender real-time scanning, a documented evasion step.
+/// Detect `Add-MpPreference -ExclusionPath|-ExclusionProcess|-ExclusionExtension`
+/// — all whitelist the target from Defender scanning, a documented evasion step.
 fn check_defender_exclusion(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -229,11 +177,9 @@ fn check_defender_exclusion(
 
         let mentions_exclusion = seg.args.iter().any(|a| {
             let n = normalize_shell_token(a.trim(), shell).to_ascii_lowercase();
-            // Match the bare flag plus all joined-form separators PowerShell
-            // accepts: `=` and `:`. PR #121 fix-list item 12 adds the colon
-            // form — `Add-MpPreference -ExclusionPath:C:\...` is a documented
-            // attacker payload shape pre-fix this was a quiet detection
-            // failure (the colon form passed through tier-3 with no finding).
+            // Bare flag plus joined `=`/`:` forms. PR #121 item 12 adds the colon
+            // form (`-ExclusionPath:C:\...`), a payload shape that previously
+            // passed tier-3 with no finding.
             const FLAGS: &[&str] = &["-exclusionpath", "-exclusionprocess", "-exclusionextension"];
             FLAGS.iter().any(|f| {
                 n == *f || n.starts_with(&format!("{f}=")) || n.starts_with(&format!("{f}:"))
@@ -264,31 +210,21 @@ fn check_defender_exclusion(
     }
 }
 
-/// Detect the inline `iex (iwr https://...)` form, where `iex` /
-/// `invoke-expression` is the **leading** command for the segment and at
-/// least one arg contains `://`.
+/// Detect inline `iex (iwr https://...)` where `iex`/`invoke-expression` LEADS
+/// the segment and an arg contains `://`.
 ///
-/// **Boundary with `pipe_to_interpreter`:** the pipe form
-/// `iwr https://… | iex` already fires `pipe_to_interpreter`. To avoid
-/// double-firing we skip segments whose `preceding_separator` is a pipe
-/// (`|` or `|&`).
-///
-/// Non-pipe separators that the PS tokenizer emits (`;`, `\n`, `-and`,
-/// `-or`, and the PowerShell 7+ pipeline-chain operators `&&` / `||`) DO
-/// produce independent commands that are *not* covered by
-/// `pipe_to_interpreter`, so this rule must still fire for
-/// `true; iex (iwr url)`, `cmd1 -and iex (iwr url)`, and
-/// `cmd1 && iex (iwr url)` / `cmd1 || iex (iwr url)`.
+/// Boundary with `pipe_to_interpreter`: the pipe form `iwr url | iex` already
+/// fires it, so skip pipe-preceded segments (`|`/`|&`). Other separators (`;`,
+/// `\n`, `-and`, `-or`, `&&`, `||`) start independent commands it does NOT cover,
+/// so this rule still fires there (e.g. `true; iex (iwr url)`).
 fn check_inline_download_execute(
     segments: &[tokenize::Segment],
     shell: ShellType,
     findings: &mut Vec<Finding>,
 ) {
     for seg in segments {
-        // Pipe RHS is already covered by pipe_to_interpreter — skip it.
-        // Non-pipe separators the PS tokenizer emits (`;`, `\n`, `-and`,
-        // `-or`, `&&`, `||`) start fresh commands that pipe_to_interpreter
-        // does NOT match, so we must keep checking.
+        // Pipe RHS is already covered by pipe_to_interpreter — skip. Non-pipe
+        // separators start fresh commands it does NOT match, so keep checking.
         if let Some(sep) = seg.preceding_separator.as_deref() {
             if is_pipe_separator(sep) {
                 continue;
@@ -297,11 +233,9 @@ fn check_inline_download_execute(
 
         let Some(ref cmd) = seg.command else { continue };
         let cmd_base = normalize_cmd_base(cmd, shell);
-        // Match both `iex (iwr ...)` (whitespace before `(`) — where the
-        // tokenizer gives us a clean `iex` command + arg starting with `(` —
-        // and `iex(iwr ...)` (no space before `(`) — where the tokenizer
-        // pulls the open-paren into the command token itself, producing e.g.
-        // `iex(iwr`. Both forms are semantically identical to PowerShell.
+        // Match `iex (iwr ...)` (space before `(` → clean `iex` + arg) and
+        // `iex(iwr ...)` (no space → the tokenizer pulls `(` into the command
+        // token, e.g. `iex(iwr`). Both are identical to PowerShell.
         let is_iex_leading = cmd_base == "iex"
             || cmd_base == "invoke-expression"
             || cmd_base.starts_with("iex(")
@@ -310,11 +244,8 @@ fn check_inline_download_execute(
             continue;
         }
 
-        // The URL may be in the args (whitespace form), or in the command
-        // token itself when the no-space form has no whitespace before the
-        // URL (`iex(iwr` would have the URL split into the next token; but
-        // `iex(iwr,https://...)` or similar might pull `://` into the
-        // command token itself). Scan both surfaces.
+        // The URL may be in the args (whitespace form) or in the command token
+        // itself (e.g. `iex(iwr,https://...)` pulls `://` into it). Scan both.
         let has_url_arg = cmd_base.contains("://")
             || seg.args.iter().any(|a| {
                 let n = normalize_shell_token(a.trim(), shell);
@@ -345,15 +276,9 @@ fn check_inline_download_execute(
     }
 }
 
-/// True if `sep` (a value from `Segment::preceding_separator`) is one of
-/// the pipe separators that `pipe_to_interpreter` already handles.
-///
-/// `tokenize.rs` encodes pipe shapes as the literal strings `"|"` (single
-/// pipe) and `"|&"` (POSIX pipe-with-stderr). PowerShell's tokenizer only
-/// emits `"|"` for pipes. All other separators (`";"`, `"&&"`, `"||"`,
-/// `"&"`, `"\n"`, PowerShell's `"-and"`/`"-or"`) start fresh commands that
-/// are *not* covered by `pipe_to_interpreter`, so this rule must still run
-/// on them.
+/// True if `sep` is a pipe separator `pipe_to_interpreter` already handles.
+/// `tokenize.rs` encodes pipes as `"|"` and `"|&"`; all other separators start
+/// fresh commands that rule does NOT cover, so this one must still run on them.
 fn is_pipe_separator(sep: &str) -> bool {
     sep == "|" || sep == "|&"
 }

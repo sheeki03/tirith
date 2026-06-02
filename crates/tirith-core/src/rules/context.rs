@@ -1,38 +1,16 @@
 //! Operational-context rules (M8 ch1).
 //!
-//! These rules fire when the parsed command's leader is a cloud / k8s CLI
-//! (`kubectl`, `kustomize`, `helm`, `argocd`, `aws`, `aws-vault`, `gcloud`,
-//! `az`) AND the currently-active provider context is labeled
-//! `critical` / `production`. Three signals, three severities:
+//! Fire when the command's leader is a cloud/k8s CLI (`kubectl`, `helm`,
+//! `aws`, `gcloud`, `az`, …) AND the active provider context is labeled
+//! `critical`/`production`. Three signals: `ContextProdDestructiveCommand`
+//! (High, destructive verbs), `ContextProdWriteOperation` (Medium, state
+//! mutations), `ContextProdCredentialChange` (High, IAM/RBAC mutations).
 //!
-//! 1. **`ContextProdDestructiveCommand`** (High) — destructive verbs:
-//!    `kubectl delete`, `helm uninstall`, `aws s3 rm --recursive`,
-//!    `gcloud compute instances delete`, etc.
-//! 2. **`ContextProdWriteOperation`** (Medium) — state mutations that
-//!    aren't strictly destructive: `kubectl apply`, `helm upgrade`,
-//!    `aws s3 cp ... s3://...`, `kubectl patch`.
-//! 3. **`ContextProdCredentialChange`** (High) — IAM / RBAC mutations:
-//!    `aws iam create-access-key`, `gcloud iam service-accounts keys
-//!    create`, `kubectl create clusterrolebinding`.
-//!
-//! ## Detection guard
-//!
-//! Detection has TWO short-circuit gates:
-//!
-//! 1. **No labels configured.** The labels table is read from
-//!    [`crate::policy::Policy`]'s `context_labels` slot, loaded from
-//!    `~/.config/tirith/context-labels.yaml` (user) merged with
-//!    `<repo>/.tirith/context-labels.yaml` (repo). If the table is empty,
-//!    the rule cannot fire — return early without touching
-//!    [`crate::context_detect`].
-//! 2. **`context_guard_enabled: false`.** Operator opt-out. Default is
-//!    `true`; setting `false` in policy disables the rule for callers who
-//!    just want the labels file for reporting.
-//!
-//! After those gates we call [`crate::context_detect::detect_all`] (5s
-//! cached) and, for the parsed command's leader's provider, look up the
-//! label. Only when the label is `critical` / `production` do we emit a
-//! finding.
+//! Two short-circuit gates before consulting [`crate::context_detect`]:
+//! empty `context_labels` table → rule cannot fire; `context_guard_enabled:
+//! false` → operator opt-out. After the gates, [`crate::context_detect::detect_all`]
+//! (5s cached) supplies the active context; only a `critical`/`production`
+//! label emits a finding.
 
 use crate::context_detect::{self, Provider};
 use crate::policy::Policy;
@@ -70,11 +48,8 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 
     let detection = context_detect::detect_all();
 
-    // If the provider we'd have to consult had a detection failure
-    // (timeout, exec error, parse error), surface it on stderr so the
-    // operator knows the verdict can't safely fall back to "allow". Prior
-    // versions stored `detection.failures` but never surfaced it — see
-    // PR-127 review finding #5.
+    // Surface a provider detection failure (timeout/exec/parse) on stderr so the
+    // operator knows the verdict can't safely fall back to "allow" (PR-127 finding #5).
     if let Some(failure) = detection.failures.get(&provider) {
         eprintln!(
             "tirith: warning: {} context detection failed ({}); rule may not fire correctly for this command",
@@ -206,13 +181,10 @@ impl std::fmt::Display for VerbCategory {
 
 /// Classify an SSH inner-command string (the body of `ssh host '<body>'`).
 ///
-/// This is the classifier the `rules::ssh_context` module uses to decide
-/// whether a destructive verb is being run on a labeled-prod remote host.
-/// It tokenizes `inner` via the supplied shell (POSIX is the default for
-/// remote shells), steps past one level of `sudo` / `doas`, and then maps
-/// the leader to a [`VerbCategory`] using the same heuristics as the
-/// cloud-CLI path (with a small extra surface for general-purpose
-/// destructive shell verbs like `systemctl stop`, `rm -rf`, `dd`).
+/// Used by `rules::ssh_context` to decide whether a destructive verb runs on a
+/// labeled-prod remote host. Steps past one level of `sudo`/`doas`, then maps
+/// the leader to a [`VerbCategory`] via the cloud-CLI heuristics plus a small
+/// extra surface for general shell verbs (`systemctl stop`, `rm -rf`, `dd`).
 pub fn classify_inner_command_for_ssh(inner: &str, shell: ShellType) -> VerbCategory {
     let segments = tokenize::tokenize(inner, shell);
     let Some(seg) = segments.first() else {
@@ -230,27 +202,16 @@ pub fn classify_inner_command_for_ssh(inner: &str, shell: ShellType) -> VerbCate
         .collect();
     let first = positional.first().copied().unwrap_or("");
 
-    // Cloud-CLI path first (kubectl / aws / helm / etc.) — re-use the
-    // existing per-provider classifier so a remote `kubectl delete ns` is
-    // still recognized as Destructive.
+    // Cloud-CLI path first so a remote `kubectl delete ns` is still Destructive.
     if let Some(provider) = crate::context_detect::Provider::from_leader(&leader) {
         return classify(provider, &args, &[]);
     }
 
-    // General-purpose remote-shell verbs. SSH inner commands routinely
-    // wrap a `sudo systemctl …` or `rm -rf …`. We DON'T need a giant
-    // table — only the highest-signal verbs. Read-only commands explicitly
-    // map to ReadOnly so a `ssh prod-host 'ls'` does NOT fire.
+    // General-purpose remote-shell verbs — only the highest-signal ones. Read-only
+    // commands map to ReadOnly so `ssh prod-host 'ls'` does NOT fire.
     let leader_lc = leader.to_lowercase();
     match leader_lc.as_str() {
-        // Destructive — irreversible or service-level outage.
-        "rm" => {
-            // Bare `rm foo` is much lower-signal than `rm -rf`. We pick up
-            // BOTH (an `rm -rf` on prod is a paste-tear; `rm` alone is
-            // still "you didn't intend to do this on prod"), but flag
-            // `-rf` / `-fr` / `--recursive` / `--force` as Destructive.
-            VerbCategory::Destructive
-        }
+        "rm" => VerbCategory::Destructive,
         "dd" | "mkfs" | "shred" | "wipefs" | "fdisk" | "parted" | "blkdiscard" => {
             VerbCategory::Destructive
         }
@@ -272,10 +233,8 @@ pub fn classify_inner_command_for_ssh(inner: &str, shell: ShellType) -> VerbCate
         },
         "shutdown" | "poweroff" | "reboot" | "halt" | "init" => VerbCategory::Destructive,
         "iptables" | "nft" | "nftables" => VerbCategory::Write,
-        // Credential-change shell verbs.
         "passwd" | "chpasswd" | "useradd" | "userdel" | "usermod" | "groupadd" | "groupdel"
         | "groupmod" | "visudo" => VerbCategory::CredentialChange,
-        // Read-only shell verbs.
         "ls" | "cat" | "less" | "more" | "head" | "tail" | "stat" | "find" | "grep" | "ps"
         | "top" | "df" | "du" | "uname" | "hostname" | "whoami" | "id" | "uptime" => {
             VerbCategory::ReadOnly
@@ -285,8 +244,7 @@ pub fn classify_inner_command_for_ssh(inner: &str, shell: ShellType) -> VerbCate
 }
 
 fn classify(provider: Provider, args: &[String], custom_destructive: &[String]) -> VerbCategory {
-    // Strip quotes around each arg and skip flags / `KEY=VAL` shapes so
-    // `aws --profile foo s3 rm` still resolves to (`s3`, `rm`).
+    // Skip flags / `KEY=VAL` so `aws --profile foo s3 rm` resolves to (`s3`, `rm`).
     let positional: Vec<&str> = args
         .iter()
         .map(|a| a.trim_matches(|c: char| c == '"' || c == '\''))

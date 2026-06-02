@@ -21,7 +21,7 @@ pub fn is_code_file(path: Option<&str>, content: &str) -> bool {
             }
         }
     }
-    // Extensionless files only count as code if a shebang names a known interpreter.
+    // Extensionless files count as code only if a shebang names a known interpreter.
     if content.starts_with("#!") {
         let interp = detect_interpreter(content);
         if !interp.is_empty() {
@@ -90,9 +90,8 @@ const PROXIMITY_WINDOW: usize = 500;
 fn check_dynamic_code_execution(input: &str, findings: &mut Vec<Finding>) {
     for (pattern_a, pattern_b, description) in DYNAMIC_CODE_PAIRS.iter() {
         for mat_a in pattern_a.find_iter(input) {
-            // Clamp to UTF-8 char boundaries: ±PROXIMITY_WINDOW offsets can land
-            // inside a multi-byte char (e.g. '═' is 3 bytes). Unclamped byte slicing
-            // would panic at the boundary.
+            // Clamp to char boundaries: ±PROXIMITY_WINDOW can land inside a
+            // multi-byte char, and unclamped byte slicing would panic.
             let start = safe_start(input, mat_a.start().saturating_sub(PROXIMITY_WINDOW));
             let end = safe_end(input, mat_a.end() + PROXIMITY_WINDOW);
             let window = &input[start..end];
@@ -204,13 +203,10 @@ static SEND_PROPS: Lazy<Regex> =
 /// secret is inside an unknown property (like `meta:`) that is NOT a send context.
 static GENERIC_PROP: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w+\s*[:=]").unwrap());
 
-/// Find the end of a call's argument list by matching the closing delimiter.
-/// `open_pos` must point to the character AFTER the opening `(`.
-/// Returns the byte position after the matching `)`, or None if unbalanced.
-///
-/// Handles: nested brackets, string literals (`"`, `'`, `` ` ``),
-/// block comments (`/* ... */`), line comments (`//`, `#`), and
-/// JS regex literals (heuristic: `/` preceded by a non-value byte).
+/// Find the end of a call's argument list (`open_pos` points AFTER the opening
+/// `(`); returns the byte position after the matching `)`, or None if unbalanced.
+/// Handles nested brackets, string literals, block/line comments, and JS regex
+/// literals (`/` preceded by a non-value byte).
 fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
     let mut depth: u32 = 1;
     let mut i = open_pos;
@@ -248,8 +244,7 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
                     }
                     continue;
                 }
-                // JS regex literal `/.../` — heuristic: `/` preceded by something
-                // that is NOT a value/identifier token means it can't be division.
+                // JS regex literal `/.../`: `/` after a non-value token isn't division.
                 if b == b'/' {
                     let prev = {
                         let mut j = i;
@@ -320,7 +315,7 @@ fn check_suspicious_code_exfiltration(
         })
         .unwrap_or(false);
 
-    // Extensionless files: read the shebang to decide which exfil checker applies.
+    // Extensionless files: the shebang decides which exfil checker applies.
     let (is_js, is_py) = if !is_js && !is_py && file_path.is_some() {
         let interp = detect_interpreter(input);
         (
@@ -431,20 +426,15 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
     (depth, in_string.is_none())
 }
 
-/// Decide whether to suppress the exfil finding for a secret at `pos_in_span`
-/// within the HTTP call's argument span.
-///
-/// Logic: find the nearest shallow (depth ≤ 1), in-code property keyword
-/// (`word:` or `word=`) before the secret.
-/// - If it's a SEND keyword (body/data/json/params/payload) → fire (return false)
-/// - If it's anything else (headers, meta, unknown) → suppress (return true)
-/// - If NO property keyword at all → secret is in direct-argument / URL-concat
-///   context → fire (return false)
+/// Whether to suppress the exfil finding for a secret at `pos_in_span`. Finds
+/// the nearest shallow (depth ≤ 1) in-code property keyword before it: a SEND
+/// keyword (body/data/json/params/payload) fires (false), anything else
+/// suppresses (true), and no keyword (direct-arg / URL-concat) fires (false).
 fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
     let before = &arg_span[..pos_in_span];
     let bytes = before.as_bytes();
 
-    // Find the nearest property-like keyword at shallow depth in actual code.
+    // Nearest property-like keyword at shallow depth in actual code.
     let nearest_prop = GENERIC_PROP
         .find_iter(before)
         .filter(|m| {
@@ -458,10 +448,10 @@ fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
             if SEND_PROPS.is_match(m.as_str()) {
                 return false;
             }
-            // Anything else (headers, auth, meta, token, unknown) is too noisy to flag.
+            // headers/auth/meta/token/unknown — too noisy to flag.
             true
         }
-        // No surrounding property at all means the secret is a positional/URL arg.
+        // No surrounding property → positional/URL arg.
         None => false,
     }
 }
@@ -493,8 +483,7 @@ fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
             Some(end) => end,
             None => continue,
         };
-        // `call_end` walks raw bytes and can land inside a multi-byte char on
-        // non-ASCII input; clamp before slicing or we panic on the boundary.
+        // `call_end` walks raw bytes and can land mid-char; clamp before slicing.
         let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
         let arg_span = &input[http_match.end()..arg_end];
 
@@ -543,9 +532,8 @@ fn safe_end(s: &str, target: usize) -> usize {
     end
 }
 
-/// Find the smallest byte index ≥ `target` that falls on a UTF-8 char boundary.
-/// Mirrors `safe_end` for clamping the start of a window that was derived from
-/// an offset subtraction (e.g., `mat.start().saturating_sub(500)`).
+/// Smallest byte index ≥ `target` on a UTF-8 char boundary (start-side mirror
+/// of `safe_end`).
 fn safe_start(s: &str, target: usize) -> usize {
     let mut start = target.min(s.len());
     while start < s.len() && !s.is_char_boundary(start) {
@@ -1116,11 +1104,9 @@ mod tests {
         );
     }
 
-    // Regression: UTF-8 boundary clamp around the proximity window.
-    //
-    // Without `safe_start`/`safe_end`, slicing the ±500-byte window could land
-    // inside a multi-byte char (e.g. '═', 3 bytes) and panic with
-    // "byte index N is not a char boundary". The tests below pin that down.
+    // Regression: UTF-8 boundary clamp around the proximity window. Without
+    // safe_start/safe_end, slicing the ±500-byte window could land mid-char
+    // (e.g. '═', 3 bytes) and panic "not a char boundary".
     #[test]
     fn test_safe_start_clamps_into_multibyte() {
         // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk forward to 3.

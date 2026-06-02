@@ -1,8 +1,6 @@
-//! Help output and CLI regression tests.
-//!
-//! Verifies that all subcommands have examples in --help, that flag
-//! conflicts are enforced, JSON envelopes are stable, and error
-//! messages include corrective suggestions.
+//! Help output and CLI regression tests: every subcommand has --help examples,
+//! flag conflicts are enforced, JSON envelopes are stable, and error messages
+//! include corrective suggestions.
 
 use std::process::Command;
 
@@ -10,23 +8,13 @@ fn tirith() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tirith"))
 }
 
-/// Verify a subcommand's --help contains an "Examples:" section with expected content.
-///
-/// The expected-substring check is WHITESPACE-NORMALIZED on both sides: clap
-/// line-wraps long example strings at a terminal-width-dependent column, so a raw
-/// substring match on a long expected string (e.g. a full `tirith … | sh`
-/// example) can false-fail in CI when the wrap lands mid-phrase. Collapsing runs
-/// of whitespace to single spaces on both the captured stdout and the expected
-/// substring makes the match wrap-insensitive while still requiring every word in
-/// order. The structural "Examples:" header check stays a raw match (a single,
-/// unsplittable token).
+/// Verify a subcommand's --help contains an "Examples:" section with expected
+/// content. The expected substring is whitespace-normalized on both sides so a
+/// clap line-wrap mid-phrase can't false-fail in CI.
 fn assert_help_has_examples(args: &[&str], expected_substring: &str) {
     let out = tirith().args(args).output().expect("failed to run tirith");
-    // R19-N2: clap's `--help` is a successful invocation and exits 0. Assert the
-    // status FIRST — a `--help` that errored out (e.g. a malformed `after_help`
-    // template panicking, or the subcommand being dropped so the arg is rejected
-    // with exit 2) would otherwise pass the stdout content checks vacuously on an
-    // empty/partial body. Pinning success catches that regression class.
+    // R19-N2: assert success FIRST — a `--help` that errored (exit 2) would
+    // otherwise pass the content checks vacuously on an empty body.
     assert!(
         out.status.success(),
         "{args:?} --help should exit successfully (clap --help exits 0), got status {:?}\nstderr:\n{}",
@@ -79,21 +67,18 @@ help_example_tests! {
     help_fix        => (["fix", "--help"], "tirith fix --");
     help_setup      => (["setup", "--help"], "tirith setup claude-code");
     help_init       => (["init", "--help"], "tirith init --shell");
-    // M8 ch6 — `--prompt-status` flag and `tirith prompt-status` subcommand.
     help_init_prompt_status_flag => (["init", "--help"], "tirith init --shell zsh --prompt-status");
     help_prompt_status            => (["prompt-status", "--help"], "tirith prompt-status --short");
     help_prompt_status_json       => (["prompt-status", "--help"], "tirith prompt-status --json");
     help_doctor     => (["doctor", "--help"], "tirith doctor --fix");
     help_warnings   => (["warnings", "--help"], "tirith warnings");
     help_policy     => (["policy", "--help"], "tirith policy init");
-    // M13 ch5 — `tirith ai scan|diff|quarantine|explain-config|snapshot`.
     help_ai                => (["ai", "--help"], "tirith ai diff");
     help_ai_scan           => (["ai", "scan", "--help"], "tirith ai scan");
     help_ai_diff           => (["ai", "diff", "--help"], "tirith ai diff --json");
     help_ai_quarantine     => (["ai", "quarantine", "--help"], "tirith ai quarantine .cursorrules --move --yes");
     help_ai_explain_config => (["ai", "explain-config", "--help"], "tirith ai explain-config CLAUDE.md");
     help_ai_snapshot       => (["ai", "snapshot", "--help"], "tirith ai snapshot --update");
-    // M13 ch4 — custom-rule DSL CLI.
     help_rule          => (["rule", "--help"], "tirith rule validate");
     help_rule_test     => (["rule", "test", "--help"], "tirith rule test --rule block-unknown-curl-to-shell");
     help_rule_validate => (["rule", "validate", "--help"], "tirith rule validate --path .tirith/policy.yaml");
@@ -141,66 +126,52 @@ help_example_tests! {
     help_clipboard_copy  => (["clipboard", "copy", "--help"], "tirith clipboard copy ./snippet.sh");
     help_clipboard_scan  => (["clipboard", "scan", "--help"], "tirith clipboard scan");
     help_clipboard_guard => (["clipboard", "guard", "--help"], "tirith clipboard guard install-service");
-    // M12 ch1 — `clipboard watch` must be advertised in the PARENT clipboard help.
+    // `clipboard watch` must also be advertised in the PARENT clipboard help.
     help_clipboard_watch_in_parent => (["clipboard", "--help"], "tirith clipboard watch");
     help_clipboard_watch => (["clipboard", "watch", "--help"], "tirith clipboard watch --json");
-    // M7 ch5 — `tirith logs scan|summarize|redact`.
     help_logs            => (["logs", "--help"], "tirith logs scan ./error.log");
     help_logs_scan       => (["logs", "scan", "--help"], "tirith logs scan ./error.log");
     help_logs_summarize  => (["logs", "summarize", "--help"], "tirith logs summarize --safe-for-agent --max-lines 100 ./build.log");
     help_logs_redact     => (["logs", "redact", "--help"], "tirith logs redact --audience llm ./error.log");
-    // M7 ch4 — `gateway run --filter-output` and `mcp-server
-    // --sanitize-tool-output`. Pin both to the help output so a future
-    // re-organization that drops the flags is caught here.
     help_gateway_run_filter_output    => (["gateway", "run", "--help"], "--filter-output");
     help_gateway_run_filter_output_ex => (["gateway", "run", "--help"], "tirith gateway run --filter-output");
     help_mcp_server_sanitize          => (["mcp-server", "--help"], "--sanitize-tool-output");
     help_mcp_server_sanitize_ex       => (["mcp-server", "--help"], "tirith mcp-server --sanitize-tool-output");
-    // M8 ch1 — `tirith context status|guard|label`.
     help_context         => (["context", "--help"], "tirith context status");
     help_context_status  => (["context", "status", "--help"], "tirith context status");
     help_context_guard   => (["context", "guard", "--help"], "tirith context guard on");
     help_context_label   => (["context", "label", "--help"], "tirith context label kube:prod-us-east critical --scope user");
-    // M8 ch2 — `tirith ssh guard|label`.
     help_ssh             => (["ssh", "--help"], "tirith ssh guard on");
     help_ssh_guard       => (["ssh", "guard", "--help"], "tirith ssh guard on");
     help_ssh_label       => (["ssh", "label", "--help"], "tirith ssh label payments-prod-01 critical --scope user");
-    // M8 ch3 — `tirith iac guard|check-plan|require-plan-before-apply`.
     help_iac             => (["iac", "--help"], "tirith iac guard on");
     help_iac_guard       => (["iac", "guard", "--help"], "tirith iac guard on");
     help_iac_check_plan  => (["iac", "check-plan", "--help"], "tirith iac check-plan tfplan");
     help_iac_require_plan_before_apply => (["iac", "require-plan-before-apply", "--help"], "tirith iac require-plan-before-apply on");
-    // M8 ch4 — `tirith sudo guard|session|require-reason`.
     help_sudo                  => (["sudo", "--help"], "tirith sudo guard on");
     help_sudo_guard            => (["sudo", "guard", "--help"], "tirith sudo guard on");
     help_sudo_session          => (["sudo", "session", "--help"], "tirith sudo session start --ttl 30m --reason");
     help_sudo_require_reason   => (["sudo", "require-reason", "--help"], "tirith sudo require-reason on");
-    // M8 ch5 — `tirith devcontainer guard|inject` and `tirith codespaces setup|inject`.
     help_devcontainer          => (["devcontainer", "--help"], "tirith devcontainer guard on");
     help_devcontainer_guard    => (["devcontainer", "guard", "--help"], "tirith devcontainer guard on");
     help_devcontainer_inject   => (["devcontainer", "inject", "--help"], "tirith devcontainer inject");
     help_codespaces            => (["codespaces", "--help"], "tirith codespaces setup");
     help_codespaces_setup      => (["codespaces", "setup", "--help"], "tirith codespaces setup");
     help_codespaces_inject     => (["codespaces", "inject", "--help"], "tirith codespaces inject");
-    // M9 ch1 — `tirith hygiene scan|fix`.
     help_hygiene               => (["hygiene", "--help"], "tirith hygiene scan");
     help_hygiene_scan          => (["hygiene", "scan", "--help"], "tirith hygiene scan --json");
     help_hygiene_fix           => (["hygiene", "fix", "--help"], "tirith hygiene fix --dry-run");
-    // M9 ch2 — `tirith persistence scan|watch|diff`.
     help_persistence           => (["persistence", "--help"], "tirith persistence scan");
     help_persistence_scan      => (["persistence", "scan", "--help"], "tirith persistence scan --json");
     help_persistence_watch     => (["persistence", "watch", "--help"], "tirith persistence watch --interval 30");
     help_persistence_diff      => (["persistence", "diff", "--help"], "tirith persistence diff --json");
-    // M9 ch3 — `tirith aliases scan|explain`.
     help_aliases               => (["aliases", "--help"], "tirith aliases scan");
     help_aliases_scan          => (["aliases", "scan", "--help"], "tirith aliases scan --include-runtime");
     help_aliases_explain       => (["aliases", "explain", "--help"], "tirith aliases explain git");
-    // M9 ch4 — `tirith env guard|diff|explain`.
     help_env                   => (["env", "--help"], "tirith env guard on");
     help_env_guard             => (["env", "guard", "--help"], "tirith env guard status --json");
     help_env_diff              => (["env", "diff", "--help"], "tirith env diff --reset");
     help_env_explain           => (["env", "explain", "--help"], "tirith env explain AWS_SECRET_ACCESS_KEY");
-    // M9 ch5 — `tirith exec check|provenance` and `tirith path audit|watch|which`.
     help_exec                  => (["exec", "--help"], "tirith exec check kubectl");
     help_exec_check            => (["exec", "check", "--help"], "tirith exec check git --json");
     help_exec_provenance       => (["exec", "provenance", "--help"], "tirith exec provenance /tmp/installer");
@@ -208,83 +179,62 @@ help_example_tests! {
     help_path_audit            => (["path", "audit", "--help"], "tirith path audit --json");
     help_path_watch            => (["path", "watch", "--help"], "tirith path watch --interval 30");
     help_path_which            => (["path", "which", "--help"], "tirith path which git --secure");
-    // M9 ch6 — `tirith hooks scan|guard|explain`.
     help_hooks                 => (["hooks", "--help"], "tirith hooks scan");
     help_hooks_scan            => (["hooks", "scan", "--help"], "tirith hooks scan --json");
     help_hooks_guard           => (["hooks", "guard", "--help"], "tirith hooks guard on");
     help_hooks_explain         => (["hooks", "explain", "--help"], "tirith hooks explain pre-commit");
-    // M10 ch1 — `tirith preview` blast-radius simulator.
     help_preview               => (["preview", "--help"], "tirith preview -- \"rm -rf ./dist\"");
-    // M10 ch2 — `tirith watch` post-run diff. Two spellings, one impl: pin both
-    // the top-level shortcut and the namespaced `checkpoint watch` form.
+    // `watch` has two spellings, one impl: pin the shortcut and `checkpoint watch`.
     help_watch                 => (["watch", "--help"], "tirith watch -- npm install left-pad");
     help_checkpoint_watch      => (["checkpoint", "watch", "--help"], "tirith watch -- npm install left-pad");
-    // M10 ch3 — `tirith taint` tainted-content tracking.
     help_taint                 => (["taint", "--help"], "tirith taint list");
     help_taint_list            => (["taint", "list", "--help"], "tirith taint list --json");
     help_taint_explain         => (["taint", "explain", "--help"], "tirith taint explain ./install.sh");
     help_taint_clear           => (["taint", "clear", "--help"], "tirith taint clear ./install.sh --yes");
-    // M10 ch4 — `tirith intend` intent-vs-command heuristic.
     help_intend                => (["intend", "--help"], "tirith intend \"install a formatter\" -- \"curl https://x/install.sh | bash\"");
-    // M10 ch5 — `tirith baseline learn|status|reset` (opt-in anomaly baseline, D2).
     help_baseline              => (["baseline", "--help"], "tirith baseline learn");
     help_baseline_learn        => (["baseline", "learn", "--help"], "tirith baseline learn --json");
     help_baseline_status       => (["baseline", "status", "--help"], "tirith baseline status --json");
     help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
-    // M10 ch6 — `tirith temp-run` file-isolation workflow (D1, NOT a sandbox).
     help_temp_run              => (["temp-run", "--help"], "tirith temp-run -- ./script.sh");
-    // M11 ch1 — signed command cards.
     help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
     help_command_card_create   => (["command-card", "create", "--help"], "tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json");
     help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
     help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
-    // `command-card fetch` is #[cfg(unix)] (reuses the unix-only runner download
-    // path), so its --help only exists on Unix — gate the snapshot to match.
+    // `command-card fetch` is #[cfg(unix)] (unix-only runner path), so gate the
+    // snapshot to match.
     #[cfg(unix)]
     help_command_card_fetch    => (["command-card", "fetch", "--help"], "tirith command-card fetch https://example.com/install-card.json");
-    // M11 ch2 — repo command manifest (`tirith commands ...`).
     help_commands              => (["commands", "--help"], "tirith commands run test");
     help_commands_init         => (["commands", "init", "--help"], "tirith commands init");
     help_commands_list         => (["commands", "list", "--help"], "tirith commands list");
     help_commands_run          => (["commands", "run", "--help"], "tirith commands run test");
     help_commands_check        => (["commands", "check", "--help"], "tirith commands check -- \"npm run build\"");
-    // M11 ch3 — honeytoken / canary (`tirith canary ...`), design-decision D3.
     help_canary                => (["canary", "--help"], "tirith canary create aws-like");
     help_canary_create         => (["canary", "create", "--help"], "tirith canary create github-like --callback-url https://my-host.example/hit");
     help_canary_status         => (["canary", "status", "--help"], "tirith canary status");
     help_canary_list           => (["canary", "list", "--help"], "tirith canary list");
     help_canary_prune          => (["canary", "prune", "--help"], "tirith canary prune a1b2c3d4e5f6 --yes");
     help_canary_rotate         => (["canary", "rotate", "--help"], "tirith canary rotate a1b2c3d4e5f6");
-    // M11 ch4 — `tirith secret triage|rotate|revoke` (guidance-only assistant).
     help_secret                => (["secret", "--help"], "tirith secret rotate github");
     help_secret_triage         => (["secret", "triage", "--help"], "tirith secret triage --json");
     help_secret_rotate         => (["secret", "rotate", "--help"], "tirith secret rotate github");
     help_secret_revoke         => (["secret", "revoke", "--help"], "tirith secret revoke --provider aws");
 
-    // M11 ch5 — incident mode.
     help_incident              => (["incident", "--help"], "tirith incident start --reason");
     help_incident_start        => (["incident", "start", "--help"], "tirith incident start --reason");
     help_incident_stop         => (["incident", "stop", "--help"], "tirith incident stop --yes");
     help_incident_status       => (["incident", "status", "--help"], "tirith incident status");
     help_incident_report       => (["incident", "report", "--help"], "tirith incident report --out");
-    // M13 ch1 — onboarding wizard.
     help_onboard               => (["onboard", "--help"], "tirith onboard --json");
-    // M13 ch3 — local security dashboard.
     help_dashboard             => (["dashboard", "--help"], "tirith dashboard serve --port 8765");
     help_dashboard_export      => (["dashboard", "export", "--help"], "tirith dashboard export --out .");
     help_dashboard_serve       => (["dashboard", "serve", "--help"], "tirith dashboard serve --port 8765");
 }
 
-/// The dominant requirement for `tirith secret` is HONESTY: every surface must
-/// state plainly that tirith does NOT rotate/revoke (the user does) and that it
-/// makes zero network calls. Pin both so a future edit can't soften them.
-///
-/// Assertions match single, unsplittable tokens (`rotation`, `revocation`,
-/// `NOT`, `network`) rather than multi-word phrases: clap line-wraps
-/// `after_help` at a terminal-width-dependent column, so a phrase like "does
-/// NOT perform rotation" can land split across a line break in CI. Tokens
-/// can't be split mid-word, so the contract stays pinned without being
-/// brittle to wrap width.
+/// Pin the `tirith secret` honesty contract: every surface must state it does
+/// NOT rotate/revoke and makes zero network calls. Matches collapse whitespace
+/// first so a clap line-wrap can't split a phrase mid-break.
 #[test]
 fn help_secret_states_assistant_only_and_no_network() {
     for args in [
@@ -296,35 +246,18 @@ fn help_secret_states_assistant_only_and_no_network() {
         let out = tirith().args(args).output().expect("failed to run tirith");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let lower = stdout.to_ascii_lowercase();
-        // Collapse runs of whitespace/newlines to single spaces so a clap
-        // line-wrap between two words of a phrase doesn't break the match.
         let collapsed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-        // Honesty: tirith does NOT perform rotation / revocation. Require the
-        // negation ADJACENT to the rotate/revoke claim — the contiguous
-        // assistant-only banner phrase — on the whitespace-normalized LOWERCASE
-        // text (CodeRabbit R15 #7). The previous three independent substring
-        // checks (`does not` AND `rotation|rotate` AND `revocation|revoke`) could
-        // pass when "does not" came from the no-NETWORK sentence ("does not make
-        // network calls") while "rotate"/"revoke" came only from the Examples —
-        // so the honesty banner could be removed and the test still pass. Pinning
-        // the contiguous phrase ties the negation to the rotation/revocation claim
-        // itself. (Lowercase match keeps it robust to a future case change; the
-        // collapse already neutralizes clap's wrap width.)
+        // CodeRabbit R15 #7: require the negation ADJACENT to the rotate/revoke
+        // claim (the contiguous banner phrase), so three independent substring
+        // checks can't pass while the banner is removed.
         assert!(
             collapsed.contains("does not perform rotation or revocation"),
             "{args:?} --help must carry the contiguous 'tirith does NOT perform rotation or \
              revocation' honesty banner (negation adjacent to the rotate/revoke claim), got:\n{stdout}"
         );
-        // Zero network calls. Require a NEGATION adjacent to "network" (the
-        // current contract phrase is "ZERO network calls") — a bare
-        // `contains("network")` would also pass on a "may perform network calls"
-        // regression, so demand one of the explicit no-network phrasings.
-        //
-        // CodeRabbit R7 #10: every accepted phrasing must contain the literal
-        // token "network". The previous `"never fetched"` alternative did NOT,
-        // so the assertion could pass with no mention of "network" at all —
-        // directly contradicting the assert message. Dropped it; the remaining
-        // alternatives all carry "network".
+        // Require a negation adjacent to "network" (CodeRabbit R7 #10: every
+        // accepted phrasing must carry the literal token "network", else the
+        // assertion could pass with no mention of network at all).
         assert!(
             collapsed.contains("zero network")
                 || collapsed.contains("no network")
@@ -337,24 +270,18 @@ fn help_secret_states_assistant_only_and_no_network() {
     }
 }
 
-/// The two load-bearing guarantees of `tirith incident` must be stated plainly
-/// in help so a future edit can't quietly drop them: (1) it adds NO new rule
-/// IDs (it only re-weights existing detection), and (2) `stop` is ALWAYS
-/// recoverable (lockout safety). Match single unsplittable tokens so the
-/// assertion is robust to clap's line-wrapping.
+/// Pin the two `tirith incident` guarantees in help: (1) it adds NO new rule
+/// IDs, and (2) `stop` is always recoverable (lockout safety). Matches use
+/// single unsplittable tokens to survive clap's line-wrapping.
 #[test]
 fn help_incident_states_no_new_rules_and_lockout_safety() {
-    // The top-level help carries the "no new rule IDs" promise.
     let top = tirith()
         .args(["incident", "--help"])
         .output()
         .expect("failed to run tirith");
     let top_out = String::from_utf8_lossy(&top.stdout);
-    // CodeRabbit R7 #11: the contract is "NO new rule IDs" — a bare "no new
-    // rule" (without the "ID"/"IDs" qualifier) weakens it. Require the "id"
-    // qualifier too. Normalize whitespace first (lowercased) so a clap line-wrap
-    // between "rule" and "IDs" can't split the phrase and fail spuriously; the
-    // "no new rule id" prefix matches both "ID" and "IDs".
+    // CodeRabbit R7 #11: require the "id" qualifier ("no new rule id" matches
+    // both "ID" and "IDs"); normalize whitespace so a wrap can't split it.
     let top_collapsed: String = top_out
         .to_ascii_lowercase()
         .split_whitespace()
@@ -375,20 +302,13 @@ fn help_incident_states_no_new_rules_and_lockout_safety() {
     ] {
         let out = tirith().args(args).output().expect("failed to run tirith");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // Collapse runs of whitespace/newlines to single spaces BEFORE matching:
-        // a multi-word phrase like "lockout safety" can be clap line-wrapped
-        // (e.g. "LOCKOUT" at end of one line, "SAFETY" at the start of the next),
-        // which would break a raw substring match on the un-normalized text.
         let collapsed: String = stdout
             .to_ascii_lowercase()
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        // F13: require the SPECIFIC lockout/recoverability wording. The bare
-        // word "always" is too generic (it appears in unrelated help text like
-        // "always exits 0") and could let the real safety note go missing while
-        // the test still passed. Demand the "lockout" marker AND an explicit
-        // recoverability promise ("recoverable" or "always succeeds").
+        // F13: require the SPECIFIC lockout/recoverability wording — bare
+        // "always" is too generic and could let the safety note go missing.
         assert!(
             collapsed.contains("lockout safety")
                 && (collapsed.contains("recoverable") || collapsed.contains("always succeeds")),
@@ -398,8 +318,7 @@ fn help_incident_states_no_new_rules_and_lockout_safety() {
     }
 }
 
-/// The unknown-provider error must list all 11 valid providers so the user can
-/// self-correct without reading docs.
+/// The unknown-provider error must list all 11 valid providers.
 #[test]
 fn secret_rotate_unknown_provider_lists_all_eleven() {
     let out = tirith()
@@ -428,9 +347,8 @@ fn secret_rotate_unknown_provider_lists_all_eleven() {
     }
 }
 
-/// The dominant requirement for `temp-run` is honesty-of-claim: the help text
-/// must state plainly that it is NOT a sandbox and the command runs with full
-/// privileges. Pin the exact wording so a future edit can't soften it.
+/// Pin the `temp-run` honesty wording: it is NOT a sandbox and runs with full
+/// privileges.
 #[test]
 fn help_temp_run_states_not_a_sandbox() {
     let out = tirith()
@@ -454,9 +372,8 @@ fn help_temp_run_states_not_a_sandbox() {
 
 #[test]
 fn help_intend_documents_exit_codes() {
-    // `tirith intend` is Info-level and never blocks, but a non-zero exit on
-    // mismatch lets scripts detect one. The help must spell the codes out so
-    // the documented contract matches the integration tests.
+    // `intend` never blocks but exits non-zero on mismatch; the help must spell
+    // the codes out to match the integration tests.
     let out = tirith().args(["intend", "--help"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -475,12 +392,9 @@ fn help_intend_documents_exit_codes() {
     );
 }
 
-/// CodeRabbit M13 PR #132 R20 (F6): the AI-quarantine help must describe the
-/// quarantine store with a PLATFORM-NEUTRAL placeholder (`<cache-dir>/…`), not
-/// the Linux-only `~/.cache/…` literal (macOS uses ~/Library/Caches, Windows
-/// uses %LOCALAPPDATA%). Pin BOTH help surfaces that mention the path — the
-/// `ai` parent subcommand list and the `ai quarantine` detail — so a future
-/// edit can't silently reintroduce the OS-specific path.
+/// CodeRabbit PR #132 R20 (F6): the AI-quarantine help must use the
+/// platform-neutral `<cache-dir>/…` placeholder, not the Linux-only `~/.cache/…`
+/// literal. Pin both help surfaces that mention the path.
 #[test]
 fn help_ai_quarantine_path_is_platform_neutral() {
     for args in [&["ai", "--help"][..], &["ai", "quarantine", "--help"][..]] {
@@ -738,9 +652,6 @@ fn init_unsupported_shell_suggests() {
     );
 }
 
-// `tirith score` does purely local URL analysis with no network call, so
-// its JSON output is deterministic.
-
 #[test]
 fn json_envelope_check() {
     let out = tirith()
@@ -850,11 +761,8 @@ fn paste_conflict_json_and_format() {
 
 #[test]
 fn help_mcp_diff_documents_exit_codes() {
-    // `tirith mcp diff` exits 0 on a normal run (whether drift is present
-    // or not — `diff` is informational, not gating), but exits 2 on usage
-    // errors (no lockfile, malformed lockfile, unresolvable repo root).
-    // The help string must spell both out so the documented contract
-    // matches the integration tests in `cli_integration::mcp_diff_*`.
+    // `mcp diff` exits 0 on a normal run (drift or not) and 2 on usage errors;
+    // the help must spell both out to match cli_integration::mcp_diff_*.
     let out = tirith().args(["mcp", "diff", "--help"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -866,9 +774,7 @@ fn help_mcp_diff_documents_exit_codes() {
         stdout.contains("0  normal"),
         "mcp diff --help must document exit 0 as normal, got:\n{stdout}"
     );
-    // Normalize whitespace so the help-formatter's reflow does not break the
-    // substring assertion — the contract is "drift presence does not affect
-    // the exit code", not the exact phrasing.
+    // Normalize whitespace so the help-formatter's reflow can't break the match.
     let collapsed: String = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         collapsed.contains("whether drift is present or not"),

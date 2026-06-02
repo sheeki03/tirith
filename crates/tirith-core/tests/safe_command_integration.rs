@@ -1,14 +1,6 @@
-//! End-to-end coverage for the M6 ch5 safe-command transforms.
-//!
-//! Each transform ships one positive and one negative test. The
-//! `sudo-narrow` family now ships four: two negatives carried forward
-//! from M6 (`sudo rm -rf /` still flagging, `sudo sh` triggering the
-//! interactive-shell remediation) plus two M8 ch4 cases — the deferred
-//! positive (`sudo apt update`, where the stripped leader is benign)
-//! and a new negative that pins the M6 ch5 invariant that an
-//! interactive-shell leader NEVER yields a mechanical rewrite, even
-//! when the sudo-only rules added in M8 ch4 are what made the verdict
-//! fire.
+//! End-to-end coverage for the M6 ch5 safe-command transforms. Each transform
+//! ships a positive and a negative; `sudo-narrow` ships four (two M6 negatives
+//! plus the M8 ch4 deferred positive and an interactive-shell-invariant negative).
 
 use tirith_core::safe_command::{suggest, SafeSuggestion};
 use tirith_core::tokenize::ShellType;
@@ -92,9 +84,7 @@ fn typosquat_negative_ambiguous_target_no_rewrite() {
 
 #[test]
 fn sudo_narrow_negative_sudo_rm_rf_root_no_rewrite() {
-    // `sudo rm -rf /` — stripping sudo still gives `rm -rf /`, which the
-    // engine flags. sudo-narrow MUST return None in that case (per-finding
-    // suggestions already describe the underlying issue).
+    // Stripping sudo still leaves a flagged `rm -rf /`, so sudo-narrow returns None.
     let cmd = "sudo rm -rf /";
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
@@ -107,8 +97,7 @@ fn sudo_narrow_negative_sudo_rm_rf_root_no_rewrite() {
 
 #[test]
 fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
-    // `sudo sh` — stripped leader is `sh`, an interactive shell. sudo-narrow
-    // must emit a None-suggestion with the canonical remediation text.
+    // Stripped leader `sh` is an interactive shell → None-suggestion + remediation.
     let cmd = "sudo sh";
     let v = verdict_with(vec![finding(RuleId::PipeToInterpreter)]);
     let s = suggest(cmd, ShellType::Posix, &v);
@@ -134,29 +123,16 @@ fn sudo_narrow_negative_sudo_sh_returns_interactive_shell_remediation() {
 
 // ── 2a. sudo-narrow (M8 ch4 deferred POSITIVE) ───────────────────────────
 //
-// M6 ch5 had a sudo-narrow positive case marked DEFERRED to M8 ch4
-// because no stable benign-target fixture existed. M8 ch4 ships the
-// sudo rule family — including `SudoShellSpawn`, which finally gives
-// us a clean way to construct the positive: a sudo command that
-// fires a sudo-ONLY rule (no inner-command finding), so stripping
-// sudo leaves an Allow path.
-//
-// `sudo apt update` is the textbook positive — `apt update` alone
-// is Allow under the default engine. We DON'T drive this through
-// `tirith_core::engine::analyze` because the verdict-construction
-// in this test runs the suggester directly with a synthetic verdict;
-// the engine call inside `build_sudo_narrow_suggestion` re-analyzes
-// the stripped inner command and is what produces the rewrite.
+// The M6 ch5 positive was deferred for lack of a stable benign-target fixture.
+// `sudo apt update` is the textbook case: `apt update` alone is Allow, so
+// `build_sudo_narrow_suggestion`'s re-analysis of the stripped inner command
+// produces the rewrite.
 
 #[test]
 fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
-    // `sudo apt update` — the inner command `apt update` is Allow,
-    // and the leader (`apt`) is NOT an interactive shell. sudo-narrow
-    // must emit a rewrite to the bare inner command.
+    // Inner `apt update` is Allow and `apt` is not a shell → rewrite to bare command.
     let cmd = "sudo apt update";
-    // Synthetic finding to keep the call path uniform with the other
-    // sudo-narrow tests — any finding triggers the command-shape
-    // transforms.
+    // Any finding triggers the command-shape transforms.
     let v = verdict_with(vec![finding(RuleId::CommandNetworkDeny)]);
     let s = suggest(cmd, ShellType::Posix, &v);
     let entry = find_by_rule(&s, "sudo_narrow")
@@ -178,12 +154,9 @@ fn sudo_narrow_positive_sudo_apt_update_strips_sudo() {
 
 // ── 2b. sudo-narrow (M8 ch4 NEGATIVE — interactive shell invariant) ──────
 //
-// Pins the M6 ch5 invariant: an interactive-shell leader NEVER
-// yields a mechanical rewrite, even when the M8 ch4 sudo rules are
-// what made the verdict fire. The simpler `sudo sh` case above
-// drives this via a synthetic PipeToInterpreter; this version drives
-// it with the M8 ch4 `SudoShellSpawn` finding to confirm that
-// adding the sudo rules has NOT loosened the invariant.
+// Pins the M6 ch5 invariant — an interactive-shell leader NEVER yields a
+// mechanical rewrite — this time driven by the M8 ch4 `SudoShellSpawn` finding
+// to confirm the new sudo rules did not loosen it.
 
 #[test]
 fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
@@ -213,21 +186,11 @@ fn sudo_narrow_negative_sudo_shell_spawn_keeps_no_rewrite() {
 
 // ── 3. env-scrub ──────────────────────────────────────────────────────────
 
-// env_scrub end-to-end tests were intentionally dropped: they required
-// `std::env::set_var` / `remove_var` to set / clear sensitive variables, and
-// libc's environ mutation is not thread-safe on macOS / Windows even under
-// our internal `ENV_LOCK` (parallel readers in unrelated tests can observe a
-// torn write). The coverage they provided is preserved by:
-//   * `safe_command::tests::is_simple_command_for_env_scrub` direct-call
-//     unit tests (pipeline / redirection / && / ; / backtick / $() etc.) —
-//     these exercise the guard that controls env_scrub firing, without
-//     touching the real environment.
-//   * `safe_command::tests::build_env_scrub_suggestion_*` direct-call unit
-//     tests in the same module that drive the suggestion builder with a
-//     stub var list.
-// If a future change needs a real-env end-to-end test, gate the whole
-// integration target with `harness = false` and a custom `--test-threads=1`
-// runner, or inject env access via a parameter.
+// env_scrub end-to-end tests were dropped: they need `std::env::set_var`, whose
+// libc environ mutation is not thread-safe on macOS/Windows even under our
+// `ENV_LOCK`. Coverage is preserved by the `safe_command::tests`
+// `is_simple_command_for_env_scrub` and `build_env_scrub_suggestion_*`
+// direct-call unit tests, which avoid touching the real environment.
 
 // ── 4. archive-list-before-extract ────────────────────────────────────────
 
@@ -241,10 +204,8 @@ fn archive_list_first_positive_tar_xzf() {
         .safe_command
         .as_deref()
         .expect("archive-list-first should rewrite a known tar invocation");
-    // The preview uses `tar -tf` (no compression flag) so it works for
-    // .tar / .tar.gz / .tar.bz2 / .tar.xz / .tar.zst — modern GNU/BSD tar
-    // auto-detects compression from the archive's magic bytes. Hard-coding
-    // `-tzf` would have broken the preview step for every non-gzip variant.
+    // Preview uses universal `tar -tf` (magic-byte auto-detect), not `-tzf`,
+    // so it works for every .tar.* variant.
     assert!(
         sc.starts_with("tar -tf foo.tar.gz | head"),
         "expected preview-first sequence with `tar -tf`, got: {sc}"
@@ -272,9 +233,8 @@ fn archive_list_first_positive_tar_bz2_uses_universal_tf() {
 
 #[test]
 fn archive_list_first_negative_non_archive_leader_no_rewrite() {
-    // `ls foo.tar.gz` is not an archive command. Even with a synthetic
-    // ArchiveExtract finding (which would not fire in practice), the transform
-    // must refuse to invent a rewrite.
+    // `ls` is not an archive leader, so even a synthetic ArchiveExtract finding
+    // must not produce a rewrite.
     let cmd = "ls foo.tar.gz";
     let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
     let s = suggest(cmd, ShellType::Posix, &v);
@@ -287,15 +247,7 @@ fn archive_list_first_negative_non_archive_leader_no_rewrite() {
 
 // ── 5. dotfile-redirect ───────────────────────────────────────────────────
 
-// dotfile-redirect end-to-end tests were dropped for the same libc-environ
-// race reason described above for env_scrub: they had to set `HOME` so the
-// `expand_dotfile_to_fs_path` check resolved to a controlled directory, and
-// `std::env::set_var("HOME", ...)` is not thread-safe on macOS / Windows
-// even under our internal ENV_LOCK. The transform's structural correctness
-// (it only fires when the target exists, the rewrite is `cp X X.bak && ...`,
-// only single-segment commands, only `>` / `>>` to `~/.` or `$HOME/.`) is
-// pinned by unit tests on `dotfile_redirect_target` and
-// `rewrite_dotfile_backup_first` in `safe_command::tests`. The on-disk
-// existence check is the only branch we lose dedicated coverage on; if
-// regression risk grows there, gate the integration target with a custom
-// `--test-threads=1` harness or inject `home_dir()` for testability.
+// dotfile-redirect end-to-end tests were dropped for the same libc-environ race
+// as env_scrub (they had to set `HOME`). Structural correctness is pinned by the
+// `dotfile_redirect_target` and `rewrite_dotfile_backup_first` unit tests in
+// `safe_command::tests`; only the on-disk existence check loses dedicated coverage.

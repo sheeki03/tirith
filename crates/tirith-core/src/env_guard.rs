@@ -1,39 +1,21 @@
 //! Environment-variable lifecycle monitoring (M9 ch4).
 //!
 //! Backs `tirith env guard|diff|explain`. The sensitive-variable list is the
-//! SAME one [`crate::safe_command`]'s env-scrub transform uses — both read
-//! `assets/data/sensitive_env.toml` through [`sensitive_env_vars`], with an
-//! optional user extension merged in from
-//! [`crate::policy::Policy::env_guard_sensitive_vars`]. There is exactly one
-//! source of truth for "what counts as a secret env var".
+//! SAME one [`crate::safe_command`]'s env-scrub transform uses (via
+//! [`sensitive_env_vars`]), with an optional user extension from
+//! [`crate::policy::Policy::env_guard_sensitive_vars`] — one source of truth.
 //!
-//! ## What this module provides
+//! Provides: [`EnvSnapshot`] (name + 8-char value-hash record, **never a raw
+//! value**), [`diff_sensitive`] (newly-set/changed sensitive vars since shell
+//! start), [`explain_var`] (where a var is `export`ed — file+line, **value
+//! masked**), and rule helpers for the three M9 ch4 [`RuleId`]s. The rules take
+//! the set of set sensitive var names as a `&[String]` so they are unit-testable
+//! without mutating `std::env` (the libc `setenv` race, PR #125).
 //!
-//! 1. [`EnvSnapshot`] — a name + 8-char value-hash record of the environment,
-//!    persisted to `state_dir()/env_snapshot.json` by the shell hook at shell
-//!    start. **The snapshot NEVER stores a raw value.** It stores the variable
-//!    name plus the first 8 hex chars of `SHA-256(value)`. The 8-char prefix
-//!    is enough to notice a value *changed* but is useless for recovering the
-//!    value (and the full hash is never stored either).
-//! 2. [`diff_sensitive`] — given the shell-start snapshot and the *current*
-//!    process environment, report which sensitive vars are newly-set or
-//!    changed since shell start.
-//! 3. [`explain_var`] — locate where a variable is `export`ed across the
-//!    user's rc/profile files (file + line). **The value is never read or
-//!    printed** — only the source location and a masked `****` placeholder.
-//! 4. Rule helpers for the three M9 ch4 [`RuleId`]s, written so they can be
-//!    unit-tested without mutating `std::env` (the libc `setenv` race, PR
-//!    #125): the engine-path rules take the set of currently-set sensitive
-//!    var names as a `&[String]` argument, default-populated from `std::env`
-//!    in production via [`sensitive_env_set_in_process`].
-//!
-//! ## Why a child process writes the snapshot
-//!
-//! The shell hook does NOT pipe env values to tirith (that would put secrets
-//! on a pipe / in a tmpfile). Instead it execs `tirith env _snapshot`, and
-//! that child — which already inherited the parent shell's exported env — reads
-//! its OWN `std::env` and writes names + 8-char hashes. No value ever crosses
-//! an argv boundary or a temp file.
+//! Why a child process writes the snapshot: the shell hook execs
+//! `tirith env _snapshot` rather than piping env values (which would put secrets
+//! on a pipe/tmpfile). The child reads its OWN inherited `std::env` and writes
+//! names + 8-char hashes — no value crosses an argv boundary or temp file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,10 +36,9 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// Number of leading hex chars of `SHA-256(value)` stored per variable. Eight
-/// hex chars = 32 bits — enough to detect a value change with negligible
-/// collision risk for a handful of vars, but far too short to brute-force a
-/// secret back out. The full digest is never persisted.
+/// Leading hex chars of `SHA-256(value)` stored per variable. 8 chars = 32 bits:
+/// enough to detect a change, far too short to brute-force a secret back out.
+/// The full digest is never persisted.
 pub const VALUE_HASH_PREFIX_LEN: usize = 8;
 
 /// One recorded variable in the snapshot: its name and an 8-char value-hash
@@ -71,14 +52,12 @@ pub struct SnapshotVar {
     pub value_hash8: String,
 }
 
-/// A point-in-time snapshot of the environment's variable NAMES plus 8-char
-/// value-hash prefixes, taken by the shell hook at shell start and persisted
-/// to `state_dir()/env_snapshot.json`.
+/// A point-in-time snapshot of env variable NAMES plus 8-char value-hash
+/// prefixes, taken at shell start and persisted to `state_dir()/env_snapshot.json`.
 ///
-/// Security contract: this file contains NO raw values and NO full hashes —
-/// only names and 8-char prefixes. It is still written `0600` by
-/// [`save_snapshot`] because the *set of variable names* present in a shell can
-/// itself be mildly sensitive (it reveals which credentials you hold).
+/// Contains NO raw values and NO full hashes. Still written `0600` by
+/// [`save_snapshot`] because the *set of names* is itself mildly sensitive (it
+/// reveals which credentials you hold).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnvSnapshot {
     /// Snapshot schema version (forward-compat migrations).
@@ -178,16 +157,11 @@ pub struct EnvDiffEntry {
     pub delta: EnvDelta,
 }
 
-/// Compare the current sensitive-variable set against the shell-start
-/// snapshot. Reports sensitive vars that are NEWLY-SET or whose value CHANGED
-/// since the snapshot was taken.
-///
-/// `current` is `(name → 8-char value-hash)` for the sensitive vars currently
-/// set (production: derived from `std::env`; tests: synthetic). `sensitive`
-/// is the effective sensitive-name list (built-in ∪ policy extension). Vars
-/// that are unchanged, or that are sensitive-but-unset now, are not reported —
-/// the command surfaces what *appeared* since shell start, which is the risk
-/// window the guard cares about.
+/// Report sensitive vars NEWLY-SET or value-CHANGED since the shell-start
+/// snapshot. `current` is `(name → 8-char value-hash)` for the set sensitive
+/// vars; `sensitive` is the effective name list (built-in ∪ policy extension).
+/// Unchanged or now-unset vars are not reported — the guard surfaces what
+/// *appeared* since shell start.
 pub fn diff_sensitive(
     snapshot: &EnvSnapshot,
     current: &BTreeMap<String, String>,
@@ -215,10 +189,9 @@ pub fn diff_sensitive(
     out
 }
 
-/// The sensitive vars currently set in *this* process, as a
-/// `(name → 8-char value-hash)` map. Used to feed [`diff_sensitive`] on the
-/// production path. Empty-valued vars are treated as unset (they carry no
-/// secret), matching the env-scrub transform's `!v.is_empty()` check.
+/// The set sensitive vars in *this* process as a `(name → 8-char value-hash)`
+/// map, to feed [`diff_sensitive`]. Empty-valued vars are treated as unset
+/// (no secret), matching the env-scrub transform's `!v.is_empty()` check.
 pub fn current_sensitive_in_process(sensitive: &[String]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for name in sensitive {
@@ -287,13 +260,11 @@ pub struct EnvExplain {
 }
 
 /// Explain where `name` is set: scans the user's rc/profile files for an
-/// `export NAME=…` / `set -x NAME …` / `$env:NAME = …` directive and reports
-/// the file + line, with the value masked. Also reports whether the variable
-/// is currently set in this process.
+/// `export`/`set -x`/`$env:` directive and reports file + line (value masked),
+/// plus whether it is currently set in this process.
 ///
-/// **The value is never read or printed.** Even when the directive assigns a
-/// literal, [`mask_assignment`] replaces everything after the `=` (or the
-/// fish/PowerShell value position) with `****`.
+/// **The value is never read or printed** — [`mask_assignment`] replaces it
+/// with `****`.
 pub fn explain_var(name: &str) -> EnvExplain {
     let home = home::home_dir();
     explain_var_in(name, home.as_deref())
@@ -316,15 +287,11 @@ pub fn explain_var_in(name: &str, home: Option<&Path>) -> EnvExplain {
     }
 }
 
-/// Scan the user's rc/profile files for `export`s of any SENSITIVE variable,
-/// emitting a [`RuleId::EnvSensitivePersistedInShellRc`] (High) finding per
-/// (variable, source-location). This is the producer for that rule — surfaced
-/// by `tirith env guard status`. The value is NEVER read or printed; the
-/// finding's evidence carries the masked directive line (value → `****`).
-///
-/// `sensitive` is the effective sensitive-name list (built-in ∪ policy
-/// extension). Production passes `home = home::home_dir()`; tests pass a
-/// `tempfile::tempdir()` root.
+/// Scan rc/profile files for `export`s of any SENSITIVE var, emitting a
+/// [`RuleId::EnvSensitivePersistedInShellRc`] (High) finding per (var, location).
+/// The value is NEVER read or printed; evidence carries the masked directive
+/// line. `sensitive` is the effective name list; production passes
+/// `home::home_dir()`, tests a tempdir root.
 pub fn scan_rc_for_sensitive_exports(sensitive: &[String], home: Option<&Path>) -> Vec<Finding> {
     let mut findings = Vec::new();
     let Some(home) = home else {
@@ -520,11 +487,9 @@ pub fn load_snapshot(path: &Path) -> EnvSnapshot {
         .unwrap_or_default()
 }
 
-/// Persist `snapshot` to `path`, creating the parent directory. On Unix the
-/// file is created `0600` AT OPEN TIME (via `OpenOptions::mode`) so there is no
-/// umask-race window where the snapshot briefly exists world-readable — the
-/// variable-name set is mildly sensitive even without values. A chmod failure
-/// is propagated rather than swallowed.
+/// Persist `snapshot` to `path`. On Unix the file is created `0600` AT OPEN TIME
+/// (via `OpenOptions::mode`) so there is no umask-race window where the snapshot
+/// is briefly world-readable. A chmod failure is propagated.
 pub fn save_snapshot(path: &Path, snapshot: &EnvSnapshot) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -556,14 +521,10 @@ pub fn save_snapshot(path: &Path, snapshot: &EnvSnapshot) -> std::io::Result<()>
 // ─── engine-path rules ─────────────────────────────────────────────────────
 
 /// Build the `EnvSensitiveExposedToUnknownScript` finding (High) when a
-/// sensitive env var is set AND the command pipes to / executes an unknown
-/// downloaded script (`curl … | bash`, `wget … | sh`, generic
-/// pipe-to-interpreter).
-///
-/// `set_sensitive` is the list of sensitive var NAMES currently set — passed
-/// in by the caller (engine: from `std::env`; tests: synthetic) so the rule is
-/// unit-testable without an env mutation. Returns `None` when no sensitive var
-/// is set or the command is not a pipe-to-interpreter shape.
+/// sensitive env var is set AND the command pipes remote content to a shell
+/// (`curl … | bash`, etc.). `set_sensitive` (the set sensitive var NAMES) is
+/// passed in so the rule is unit-testable without an env mutation. `None` when
+/// no sensitive var is set or the command is not pipe-to-interpreter.
 pub fn check_sensitive_exposed_to_unknown_script(
     cmd: &str,
     shell: ShellType,
@@ -599,15 +560,9 @@ pub fn check_sensitive_exposed_to_unknown_script(
 
 /// Build the `EnvPrintenvToNetworkSink` finding (Medium) when an environment
 /// DUMP (`printenv` / bare `env`) is piped DIRECTLY into a network sink
-/// (`curl`, `wget`, `nc`/`ncat`/`netcat`).
-///
-/// The dump segment and the network-sink segment must be ADJACENT and joined
-/// by a pipe — we scan consecutive segment pairs rather than "any dump
-/// anywhere + any sink anywhere", so an unrelated `env` earlier in a chain
-/// does not falsely attribute a later sink to it. An environment dump is a
-/// bare `printenv` (no var-name argument — `printenv AWS_REGION` prints ONE
-/// variable, not the environment) or an `env` with no command word (`env
-/// FOO=1 cmd` RUNS `cmd`; bare `env` prints the environment).
+/// (`curl`/`wget`/`nc`). Dump and sink must be ADJACENT pipe segments, so an
+/// unrelated `env` earlier in a chain is not blamed for a later sink. A dump is
+/// a bare `printenv` (no var-name arg) or `env` with no command word.
 pub fn check_printenv_to_network_sink(cmd: &str, shell: ShellType) -> Option<Finding> {
     let segs = crate::tokenize::tokenize(cmd, shell);
     if segs.len() < 2 {
@@ -647,12 +602,9 @@ pub fn check_printenv_to_network_sink(cmd: &str, shell: ShellType) -> Option<Fin
     })
 }
 
-/// `true` when `cmd` is a `<fetch> URL | <shell>` shape: a URL-fetch command
-/// piped DIRECTLY into a shell interpreter. The fetch and the shell must be
-/// ADJACENT segments joined by a pipe — we scan consecutive segment pairs, so
-/// `curl https://ok >/tmp/x; echo hi | bash` (where the remote content is NOT
-/// piped to the shell) does NOT fire. Mirrors the recognition the
-/// `safe_command` pipe-to-shell rewrite uses, but only needs the boolean.
+/// `true` when `cmd` is a `<fetch> URL | <shell>` shape with the fetch and shell
+/// as ADJACENT pipe segments, so `curl … >/tmp/x; echo hi | bash` does NOT fire.
+/// Mirrors the `safe_command` pipe-to-shell recognition, boolean-only.
 fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
     let segs = crate::tokenize::tokenize(cmd, shell);
     if segs.len() < 2 {
@@ -670,14 +622,12 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
     })
 }
 
-/// `true` when `seg` is an environment DUMP: a bare `printenv` (no var-name
-/// argument) or an `env` with no command word. `printenv AWS_REGION` prints a
-/// single variable (not the environment); `env FOO=1 cmd` runs `cmd`. Only a
-/// dump leaks every variable.
+/// `true` when `seg` is an environment DUMP: a bare `printenv` (no var-name arg)
+/// or `env` with no command word. `printenv AWS_REGION` / `env FOO=1 cmd` are
+/// not dumps.
 fn segment_is_env_dump(seg: &crate::tokenize::Segment, shell: ShellType) -> bool {
     let leader = base_command(seg.command.as_deref().unwrap_or(""), shell);
     match leader.as_str() {
-        // `printenv` dumps the environment only with NO var-name argument.
         // Flags (`-0`) are fine; any non-flag arg names a specific variable.
         "printenv" => !seg.args.iter().any(|a| !a.starts_with('-')),
         // bare `env` (only flags / `VAR=val` assignments, no command word).

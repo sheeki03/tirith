@@ -7,51 +7,30 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Why [`open_regular_capped`] refused to hand back a usable reader. Each caller
-/// maps these onto its own surface (corrupt / unverified / silent-empty).
+/// Why [`open_regular_capped`] refused to hand back a usable reader.
 #[derive(Debug)]
 pub enum OpenRegularError {
-    /// The path does not exist (`ENOENT`). Callers that treat "absent" specially
-    /// (an empty store, no incident flag) branch on this.
+    /// The path does not exist (`ENOENT`); callers treat "absent" specially.
     NotFound,
-    /// The path was opened, but an `fstat` of the OPEN fd says it is not a
-    /// regular file (FIFO / device / socket / directory). Reading it could block
-    /// or stream forever, so it is refused.
+    /// An `fstat` of the OPEN fd says it is not a regular file (FIFO / device /
+    /// socket / directory) — refused since reading could block or stream forever.
     NotRegularFile,
-    /// A regular file whose `fstat` size exceeds the caller's cap. Refused before
-    /// any bytes are read so an oversized file cannot exhaust memory.
+    /// A regular file whose `fstat` size exceeds the cap; refused before any read.
     TooLarge,
-    /// Any other open / stat / read failure (permission denied, I/O error, a
-    /// post-open TOCTOU grow past the cap).
+    /// Any other open / stat / read failure (permission, I/O, post-open grow).
     Io(std::io::Error),
 }
 
 /// Open `path` and return its handle ONLY when it is a regular file no larger
-/// than `cap` bytes — closing the metadata→open TOCTOU that a plain
-/// `metadata(path)` + `open(path)` leaves open (CodeRabbit R11 #1/#2).
+/// than `cap` bytes — closing the metadata→open TOCTOU a plain `metadata` +
+/// `open` leaves (CodeRabbit R11 #1/#2).
 ///
-/// ## Why this is race-free
-///
-/// The naive guard stats the PATH, then opens the PATH. Between the two an
-/// attacker can swap the path to a FIFO/device, so the open/read still blocks on
-/// a special file. Here we open FIRST, then `fstat` the OPEN fd (`File::metadata`
-/// stats the inode behind the descriptor we hold, not the path) — the inode we
-/// check is exactly the inode we will read.
-///
-/// ## Why opening a FIFO does not block (unix)
-///
-/// We pass `O_NONBLOCK` via `custom_flags`. `open(2)` on a FIFO opened read-only
-/// with `O_NONBLOCK` returns IMMEDIATELY (success, no writer required) instead of
-/// blocking until a writer appears; we then `fstat` it, see it is not a regular
-/// file, and drop it without ever reading. On a regular file `O_NONBLOCK` is a
-/// no-op for reads (regular files are always "ready"), so the subsequent read is
-/// unaffected. Symlinks are FOLLOWED (a symlink to a regular file is fine; a
-/// symlink to a FIFO/device is rejected by the post-open `fstat`) — matching the
-/// pre-existing `metadata`-follows-symlinks behaviour of every read site.
-///
-/// On non-unix there is no FIFO open-blocking semantics to defend against, so we
-/// open plainly and `fstat` the open handle (still race-free: we check the inode
-/// we hold, not the path).
+/// Race-free because we open FIRST, then `fstat` the OPEN fd (the inode we check
+/// is exactly the one we will read) — a path swap after the open cannot
+/// substitute a special file. On unix we pass `O_NONBLOCK` so opening a FIFO
+/// returns immediately instead of blocking on a writer; the post-open `fstat`
+/// then rejects it. It is a no-op for reads of a regular file. Symlinks are
+/// followed; a symlink to a FIFO/device is rejected by the `fstat`.
 pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularError> {
     let open_result = {
         #[cfg(unix)]
@@ -59,9 +38,8 @@ pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularErr
             use std::os::unix::fs::OpenOptionsExt as _;
             std::fs::OpenOptions::new()
                 .read(true)
-                // O_NONBLOCK: a FIFO with no writer would otherwise block the
-                // open forever. With it, the open returns immediately and the
-                // fstat below rejects the FIFO before any read.
+                // O_NONBLOCK so a writer-less FIFO open returns immediately;
+                // the fstat below rejects it before any read.
                 .custom_flags(libc::O_NONBLOCK)
                 .open(path)
         }
@@ -77,8 +55,7 @@ pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularErr
         }
         Err(e) => return Err(OpenRegularError::Io(e)),
     };
-    // fstat the OPEN fd — NOT the path. This is the inode we will read, so a
-    // swap after our open cannot substitute a special file.
+    // fstat the OPEN fd, not the path — the inode we will read.
     let meta = file.metadata().map_err(OpenRegularError::Io)?;
     if !meta.is_file() {
         return Err(OpenRegularError::NotRegularFile);
@@ -89,14 +66,10 @@ pub fn open_regular_capped(path: &Path, cap: u64) -> Result<File, OpenRegularErr
     Ok(file)
 }
 
-/// Read at most `cap` bytes from a regular file at `path`, race-free.
-///
-/// Wraps [`open_regular_capped`] (so FIFOs/devices/oversized files are refused
-/// without blocking or unbounded allocation) and then reads through a
-/// `take(cap + 1)` so a TOCTOU grow BETWEEN the `fstat` and the read is caught:
-/// if the handle delivers more than `cap` bytes the read is rejected as
-/// [`OpenRegularError::TooLarge`] rather than buffered. Shared by the
-/// command-card read, the incident-flag read, and the baseline-salt read.
+/// Read at most `cap` bytes from a regular file at `path`, race-free. Wraps
+/// [`open_regular_capped`] and reads through `take(cap + 1)` so a TOCTOU grow
+/// between the `fstat` and the read is caught (rejected as
+/// [`OpenRegularError::TooLarge`] rather than buffered).
 pub fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, OpenRegularError> {
     use std::io::Read as _;
     let file = open_regular_capped(path, cap)?;
@@ -110,95 +83,52 @@ pub fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, OpenRegular
     Ok(buf)
 }
 
-/// Read a line-oriented store, returning the TRIMMED, non-empty lines.
+/// Read a line-oriented store (JSONL baseline / canary / taint), returning the
+/// TRIMMED, non-empty lines. Two failure behaviours are split so a corrupt file
+/// can never silently drop the rest, nor spin forever: a single
+/// [`std::io::ErrorKind::InvalidData`] (bad-UTF-8) line is SKIPPED, while any
+/// other error kind BREAKS the loop (a persistent fault would otherwise spin).
 ///
-/// Shared by the JSONL stores (baseline / canary / taint). Two failure
-/// behaviours are deliberately split so a corrupt file can never (a) silently
-/// drop the rest of the file, nor (b) spin forever:
+/// Absent vs unreadable (CodeRabbit R9 #G): an absent store yields an empty vec
+/// silently; a PRESENT-but-unreadable security store also returns empty but with
+/// a one-line stderr diagnostic, so a fail-open miss isn't silent.
 ///
-/// * A single [`std::io::ErrorKind::InvalidData`] line (the recoverable
-///   invalid-UTF-8 case — `BufRead::lines()` decodes each line as UTF-8 and
-///   yields `InvalidData` on a bad byte) is SKIPPED, so one corrupt byte does
-///   not hide every later entry. A previous `map_while(Result::ok)` stopped at
-///   the first such line, dropping the remainder of the store.
-/// * Any OTHER error kind BREAKS the loop. A persistent I/O fault keeps
-///   yielding the SAME `Err` from every `next()`, so an unconditional `continue`
-///   would be an unbounded spin — we stop reading instead and return what we
-///   have so far (fail-open, consistent with the corrupt-line-skip contract).
-///
-/// ## Absent vs unreadable (CodeRabbit R9 #G)
-///
-/// An ABSENT store (`ENOENT`) is legitimately empty and yields an empty vec
-/// SILENTLY — first use, before anything was ever written. A store that is
-/// PRESENT but cannot be opened/stat'd (permissions, I/O fault) is a different
-/// situation for a SECURITY store: returning empty silently is a fail-open miss
-/// (a canary/taint that should fire reads as "no entries"). We still return the
-/// lines we can (callers degrade gracefully), but emit a ONE-LINE stderr
-/// diagnostic so the operator is warned rather than the failure being silent.
-///
-/// ## Special files (CodeRabbit R9 #C, hardened R11 #1)
-///
-/// The canary/taint stores are read on the hot path; a store path an attacker
-/// could point at a FIFO/device would BLOCK `BufRead::lines()` forever. We go
-/// through the shared, race-free [`open_regular_capped`] helper — it opens with
-/// `O_NONBLOCK` and `fstat`s the OPEN fd, so a FIFO/device is refused (a
-/// diagnostic + empty) WITHOUT the metadata→open TOCTOU a separate `stat`+`open`
-/// leaves. `metadata`/`fstat` follow symlinks, so a symlink to a FIFO/device is
-/// correctly rejected too. No byte cap is applied (`u64::MAX`): the stores are
-/// legitimately multi-MiB (baseline holds up to `MAX_ENTRIES`) and are bounded by
-/// compaction, so capping would silently drop live entries.
+/// Special files (CodeRabbit R9 #C / R11 #1): goes through the race-free
+/// [`open_regular_capped`] so an attacker-planted FIFO/device (or symlink to one)
+/// is refused without blocking. No byte cap (`u64::MAX`): stores are legitimately
+/// multi-MiB and compaction-bounded, so capping would drop live entries.
 pub fn read_store_lines(path: &Path) -> Vec<String> {
-    // `open_regular_capped` opens-then-fstats (race-free) and distinguishes:
-    //   NotFound       → truly absent: empty, no diagnostic (common first use).
-    //   NotRegularFile → FIFO/device/socket/dir: warn + empty (never block).
-    //   Io             → present-but-unreadable (permissions, etc.): warn + empty.
-    // `cap == u64::MAX` so the size gate never trips for a legitimately large
-    // store; `TooLarge` is therefore unreachable here but handled for totality.
     read_store_lines_complete(path).0
 }
 
 /// Like [`read_store_lines`] but also reports whether the store was read to
-/// completion. Returns `(lines, complete)`.
-///
-/// `complete == false` means the lines are NOT a faithful image of the whole
-/// store and MUST NOT be used to rewrite it (CodeRabbit R13 #1). Two cases set
-/// it false:
-///
-/// * The line loop BROKE on a real mid-file I/O fault (the tail is unread) — see
-///   [`collect_store_lines_complete`].
-/// * The store is PRESENT but could not be opened/stat'd as a readable regular
-///   file (FIFO/device/oversized/permission/I/O). Those already yield an empty
-///   vec + a diagnostic for the fail-open reader; for a rewrite path, an empty
-///   "image" here is NOT proof the store is empty, so `complete` is false to
-///   forbid a truncating rewrite.
-///
-/// An ABSENT store (`NotFound`) is genuinely empty and returns `(vec![], true)`:
-/// a rewrite from "no lines" is correct (the store does not exist yet).
+/// completion. `complete == false` means the lines are NOT a faithful image and
+/// MUST NOT be used to rewrite the store (CodeRabbit R13 #1) — set when the loop
+/// broke on a mid-file I/O fault, or the store is present-but-unreadable (an
+/// empty image is not proof of emptiness). An ABSENT store returns
+/// `(vec![], true)`: rewriting from "no lines" is correct.
 pub fn read_store_lines_complete(path: &Path) -> (Vec<String>, bool) {
     read_store_lines_complete_inner(path, true)
 }
 
 /// Like [`read_store_lines_complete`] but yields each non-blank line RAW
-/// (UNTRIMMED) for the REWRITE/preserve path (CodeRabbit R15 #3). The
-/// open/stat/`complete` semantics are identical to [`read_store_lines_complete`];
-/// only the per-line trimming differs (see [`collect_store_lines_raw_complete`]).
-/// Rewrite callers (taint clear, canary prune/rotate, baseline compaction) use
-/// THIS so an unparseable line survives byte-for-byte through the rewrite.
+/// (untrimmed) for the rewrite/preserve path (CodeRabbit R15 #3), so an
+/// unparseable line survives byte-for-byte. Same open/stat/`complete` semantics;
+/// only the per-line trimming differs.
 pub fn read_store_lines_raw_complete(path: &Path) -> (Vec<String>, bool) {
     read_store_lines_complete_inner(path, false)
 }
 
 /// Shared open/stat core of the trimmed / raw store readers. `trim` selects the
-/// per-line policy ([`collect_store_lines_complete`] vs
-/// [`collect_store_lines_raw_complete`]); the unreadable/absent classification
-/// and `complete` flag are identical in both.
+/// per-line policy; the absent/unreadable classification and `complete` flag are
+/// identical in both.
 fn read_store_lines_complete_inner(path: &Path, trim: bool) -> (Vec<String>, bool) {
     let file = match open_regular_capped(path, u64::MAX) {
         Ok(f) => f,
         // Truly absent: an empty, COMPLETE image — rewriting from it is correct.
         Err(OpenRegularError::NotFound) => return (Vec::new(), true),
-        // Present-but-unreadable: empty image is NOT a proven-empty store, so
-        // mark it incomplete to forbid a truncating rewrite.
+        // Present-but-unreadable: empty image is NOT proven-empty, so mark
+        // incomplete to forbid a truncating rewrite.
         Err(OpenRegularError::NotRegularFile) => {
             warn_store_unreadable(path, "not a regular file");
             return (Vec::new(), false);
@@ -220,10 +150,8 @@ fn read_store_lines_complete_inner(path: &Path, trim: bool) -> (Vec<String>, boo
     }
 }
 
-/// One-line stderr diagnostic when a PRESENT security store cannot be read (vs a
-/// legitimately-absent one, which is silent). Kept deliberately simple per
-/// CodeRabbit R9 #G — a warning so the unreadable case is not silent; callers
-/// still degrade gracefully on the empty result.
+/// One-line stderr diagnostic when a PRESENT security store cannot be read, so
+/// the unreadable case is not silent (CodeRabbit R9 #G).
 fn warn_store_unreadable(path: &Path, reason: &str) {
     eprintln!(
         "tirith: warning: security store {} is present but unreadable ({reason}); \
@@ -233,66 +161,45 @@ fn warn_store_unreadable(path: &Path, reason: &str) {
 }
 
 /// Reader-generic core of [`read_store_lines`]. Split out so the
-/// skip-`InvalidData` / break-on-other-error termination contract is unit-
-/// testable against a custom `BufRead` (a real `File` cannot be made to yield a
-/// deterministic non-`InvalidData` error across platforms).
+/// skip-`InvalidData` / break-on-other-error contract is unit-testable against a
+/// custom `BufRead`.
 pub fn collect_store_lines<R: BufRead>(reader: R) -> Vec<String> {
     collect_store_lines_complete(reader).0
 }
 
 /// Like [`collect_store_lines`] but also reports whether the read reached EOF
-/// CLEANLY. Returns `(lines, complete)` where `complete == false` means the loop
-/// BROKE early on a non-`InvalidData` I/O fault — so `lines` is a PARTIAL prefix
-/// of the file, missing its unread tail.
+/// cleanly. `complete == false` means the loop broke on a non-`InvalidData` I/O
+/// fault, so `lines` is a partial prefix missing its unread tail.
 ///
-/// ## Why a REWRITE path must check this (CodeRabbit R13 #1 — data loss)
+/// A REWRITE path must check this (CodeRabbit R13 #1 — data loss): a skipped bad
+/// line is recoverable and keeps `complete == true`, but rewriting from a
+/// truncated prefix would permanently drop the unread tail. Such callers abort
+/// the rewrite when `complete == false`.
 ///
-/// A skipped [`std::io::ErrorKind::InvalidData`] line (one bad byte) is fully
-/// recoverable: the file is read to completion, just minus that one line, and
-/// `complete` stays `true`. But a REAL mid-file I/O fault (a `break`) leaves the
-/// tail UNREAD. The fail-open hot-path reader ([`read_store_lines`]) is fine with
-/// that — it returns what it has and the worst case is one missed lookup. A
-/// COMPACTION/CLEAR rewrite is NOT: rewriting the store from a truncated prefix
-/// would PERMANENTLY DROP every unread tail entry (data loss). Such callers use
-/// [`read_store_lines_complete`] and ABORT the rewrite when `complete == false`,
-/// leaving the store intact for a future attempt.
-///
-/// This is the TRIMMED variant: each retained line is whitespace-trimmed. Use it
-/// for the JSON-parse READ path (`serde_json` ignores surrounding whitespace, so
-/// trimming is harmless and the output is tidy). REWRITE paths that preserve an
-/// unparseable line verbatim must instead use [`collect_store_lines_raw_complete`]
-/// — trimming would corrupt a `  {unknown}  ` line's whitespace on write-back
+/// This is the TRIMMED variant (JSON-parse read path); rewrite paths that
+/// preserve an unparseable line verbatim use [`collect_store_lines_raw_complete`]
 /// (CodeRabbit R15 #3).
 pub fn collect_store_lines_complete<R: BufRead>(reader: R) -> (Vec<String>, bool) {
     collect_lines_inner(reader, true)
 }
 
 /// Like [`collect_store_lines_complete`] but yields each non-blank line RAW
-/// (UNTRIMMED). The REWRITE/preserve path (taint clear, canary prune/rotate,
-/// baseline compaction) keeps unparseable lines verbatim, so it must read them
-/// byte-for-byte: a leading/trailing-whitespace `  {"unknown":1}  ` line would
-/// otherwise be silently re-written without its surrounding whitespace
-/// (CodeRabbit R15 #3). Parseable lines are unaffected — `serde_json` tolerates
-/// the surrounding whitespace, so they still deserialize identically.
-///
-/// Genuinely blank (whitespace-only) lines are STILL dropped: they carry no
-/// data, are inert to every reader, and preserving them would let the store
-/// accumulate blank noise across rewrites. "Verbatim" therefore means
-/// "byte-for-byte for any line with content", not "re-emit empty lines".
-/// `complete` has the identical meaning as the trimmed variant.
+/// (untrimmed) for the rewrite/preserve path, so an unparseable line survives
+/// byte-for-byte (CodeRabbit R15 #3). Genuinely blank lines are STILL dropped, so
+/// "verbatim" means "byte-for-byte for any line with content". `complete` has the
+/// identical meaning as the trimmed variant.
 pub fn collect_store_lines_raw_complete<R: BufRead>(reader: R) -> (Vec<String>, bool) {
     collect_lines_inner(reader, false)
 }
 
 /// Shared core of the trimmed / raw line collectors. `trim == true` pushes the
-/// whitespace-trimmed line (read path); `trim == false` pushes the line verbatim
-/// (rewrite/preserve path). Either way a line that is blank AFTER trimming is
-/// skipped, and the `complete` flag follows the same skip-`InvalidData` /
-/// break-on-other-fault contract documented on [`collect_store_lines_complete`].
+/// trimmed line (read path); `trim == false` the verbatim line (rewrite path).
+/// Either way a blank-after-trimming line is skipped, and `complete` follows the
+/// skip-`InvalidData` / break-on-other-fault contract of
+/// [`collect_store_lines_complete`].
 fn collect_lines_inner<R: BufRead>(reader: R, trim: bool) -> (Vec<String>, bool) {
     let mut out = Vec::new();
-    // Optimistically complete; flipped to false only if we BREAK on a real fault.
-    // A clean EOF or a sequence of skipped InvalidData lines both leave this true.
+    // Optimistically complete; flipped only on a real-fault BREAK.
     let mut complete = true;
     for line in reader.lines() {
         let line = match line {
@@ -300,12 +207,12 @@ fn collect_lines_inner<R: BufRead>(reader: R, trim: bool) -> (Vec<String>, bool)
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(_) => {
                 // Real I/O fault: the tail is unread. Stop (a persistent fault
-                // would otherwise spin) and signal the partial read.
+                // would spin) and signal the partial read.
                 complete = false;
                 break;
             }
         };
-        // Skip blank/whitespace-only lines in BOTH modes — they hold no data.
+        // Skip blank lines in both modes — they hold no data.
         if line.trim().is_empty() {
             continue;
         }
@@ -318,39 +225,27 @@ fn collect_lines_inner<R: BufRead>(reader: R, trim: bool) -> (Vec<String>, bool)
     (out, complete)
 }
 
-/// Outcome of [`run_shell_with_timeout`]. Callers map this onto their own
-/// error type (e.g. `ContextDetectFailure`, plain `String`).
+/// Outcome of [`run_shell_with_timeout`]. Callers map this onto their own error
+/// type (e.g. `ContextDetectFailure`).
 #[derive(Debug)]
 pub enum ShellTimeoutOutcome {
-    /// Child ran to completion within the deadline. `stdout` is the
-    /// captured bytes; `status` is the exit status (callers decide how to
-    /// treat non-zero exits).
+    /// Child completed within the deadline. Callers decide how to treat non-zero.
     Completed { status: ExitStatus, stdout: Vec<u8> },
-    /// `spawn()` failed with `ErrorKind::NotFound` — the binary isn't on
-    /// PATH. Callers typically translate this to "not configured".
+    /// `spawn()` failed `NotFound` — binary not on PATH (often "not configured").
     NotFound,
-    /// `spawn()` failed for some other reason. The string carries a short
-    /// formatted reason for audit/log surfaces.
+    /// `spawn()` failed otherwise; the string is a short reason.
     SpawnError(String),
-    /// `try_wait()` returned an error after spawn succeeded.
+    /// `try_wait()` errored after spawn succeeded.
     WaitError(String),
-    /// Deadline elapsed; the child was sent `kill()` and reaped.
+    /// Deadline elapsed; the child was killed and reaped.
     Timeout,
 }
 
-/// Spawn a child process with stdout piped, drain stdout on a helper
-/// thread (so the pipe buffer never blocks the child), and poll
-/// `try_wait()` against a deadline. On timeout the child is killed and
-/// reaped before returning.
-///
-/// Stderr behaviour is delegated to the caller via `stderr_stdio` —
-/// passing `Stdio::null()` discards it cheaply, passing `Stdio::piped()`
-/// requires the caller to drain stderr themselves (or accept the
-/// pipe-fill deadlock risk). Most callers should pass `Stdio::null()`.
-///
-/// This consolidates two near-identical 70-line copies (PR-127 review #8)
-/// in `context_detect.rs::run_with_timeout` and
-/// `iac_plan.rs::run_terraform_show_json`.
+/// Spawn a child with stdout piped, drain stdout on a helper thread (so the pipe
+/// buffer never blocks the child), and poll `try_wait()` against a deadline,
+/// killing + reaping on timeout. Stderr is delegated via `stderr_stdio` — most
+/// callers pass `Stdio::null()`; `Stdio::piped()` requires the caller to drain it.
+/// Consolidates two near-identical copies (PR-127 review #8).
 pub fn run_shell_with_timeout(
     program: &str,
     args: &[&str],
@@ -374,8 +269,7 @@ pub fn run_shell_with_timeout(
         }
     };
 
-    // Stream stdout on a helper thread so the pipe buffer never blocks
-    // the child when output exceeds ~64KiB.
+    // Drain stdout on a helper thread so the pipe buffer never blocks the child.
     let stdout_handle: Option<JoinHandle<Vec<u8>>> = child.stdout.take().map(|mut s| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -417,44 +311,29 @@ pub fn run_shell_with_timeout(
     }
 }
 
-/// fsync the directory that CONTAINS `path`, so a freshly published or removed
-/// directory entry (a `rename`/`persist`/`hard_link` claim, or an unlink) is
-/// itself crash-durable — not just the file body.
+/// fsync the directory CONTAINING `path` so a freshly published/removed
+/// directory entry (rename / unlink) is itself crash-durable, not just the file
+/// body. On Unix the name→inode mutation isn't durable until the directory inode
+/// is fsync'd; without this a crash right after an atomic publish can lose a
+/// just-written entry (or resurrect a removed one). Callers fsync the body BEFORE
+/// the rename; this makes the directory entry durable after it.
 ///
-/// On Unix, `rename`/`unlink` mutate the parent directory's entries, and that
-/// mutation is not guaranteed durable until the directory inode is fsync'd.
-/// Without this, a crash/power-loss right after the atomic publish can lose the
-/// new name→inode mapping even though the file's DATA was synced — leaving a
-/// zero/absent entry where a complete file was just written (or resurrecting a
-/// just-removed one). Callers fsync the file body BEFORE the rename; this makes
-/// the directory entry durable AFTER it.
-///
-/// **Unix-only** real work; **no-op `Ok(())` on non-Unix** (directory fsync is
-/// not portable — Windows has no directory-fsync). Returns the fsync result
-/// (CodeRabbit R13 #5) so a durability-critical caller can LOG or propagate a
-/// dir-fsync failure instead of silently dropping it — see
-/// [`fsync_parent_dir_logged`] for the common "the body is already durable, so
-/// don't fail the publish but don't be silent" wrapper.
-///
-/// `#[must_use]`: the whole point of returning the error is that it not be
-/// dropped on the floor. A caller that genuinely wants best-effort with no log
-/// must say so explicitly (`let _ = …`).
-///
-/// (Consolidates the per-module copies in `incident.rs` / `selfupdate.rs` / the
-/// card-sign path; CodeRabbit R9 #B.)
+/// Unix-only real work; no-op `Ok(())` on non-Unix (no portable dir-fsync).
+/// Returns the result (CodeRabbit R13 #5) and is `#[must_use]` so a dir-fsync
+/// failure is logged or propagated, not silently dropped — see
+/// [`fsync_parent_dir_logged`]. Consolidates per-module copies (CodeRabbit R9 #B).
 #[cfg(unix)]
 #[must_use = "a dir-fsync failure should be logged or propagated, not silently dropped"]
 pub fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     match path.parent() {
-        // A single-component relative destination (e.g. `commands.yaml`) has
-        // `Path::parent() == Some("")`: its containing directory IS the current
-        // working directory, so fsync `.` rather than skipping — otherwise the
-        // required directory fsync is silently dropped (CodeRabbit R19 #2).
+        // A single-component relative dest (e.g. `commands.yaml`) has
+        // `parent() == Some("")`; fsync `.` rather than skipping it (CodeRabbit
+        // R19 #2).
         Some(parent) if parent.as_os_str().is_empty() => {
             std::fs::File::open(Path::new("."))?.sync_all()
         }
         Some(parent) => std::fs::File::open(parent)?.sync_all(),
-        // No parent (root, e.g. `/`): nothing to fsync — vacuously durable.
+        // No parent (root): nothing to fsync — vacuously durable.
         None => Ok(()),
     }
 }
@@ -467,12 +346,10 @@ pub fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// [`fsync_parent_dir`] for the common durability-path shape: the file BODY is
-/// already fsync'd and the atomic publish (rename/hard_link) has SUCCEEDED, so a
-/// failure of the trailing PARENT-DIR fsync must NOT turn the successful publish
-/// into an error — but it should also not be silent (CodeRabbit R13 #5). Logs a
-/// one-line stderr diagnostic on failure and returns nothing. No-op success path
-/// on non-Unix (the inner call returns `Ok`).
+/// [`fsync_parent_dir`] for the common shape where the body is already fsync'd
+/// and the publish succeeded: a trailing dir-fsync failure must not fail the
+/// publish, but isn't silent either (CodeRabbit R13 #5) — logs a one-line stderr
+/// diagnostic and returns nothing.
 pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
     if let Err(e) = fsync_parent_dir(path) {
         eprintln!(
@@ -483,27 +360,19 @@ pub fn fsync_parent_dir_logged(path: &Path, context: &str) {
     }
 }
 
-/// Resolve the EFFECTIVE atomic-rewrite target for `path` (CodeRabbit R13b).
-///
+/// Resolve the effective atomic-rewrite target for `path` (CodeRabbit R13b).
 /// When `path` is a symlink to an existing target, returns the canonicalized
-/// target so an atomic `temp → rename` writes THROUGH the link (preserving the
-/// symlink itself) instead of replacing it with a regular file. For a regular
-/// path, a missing path, or a dangling/unresolvable symlink, returns `path`
-/// unchanged so the caller renames onto it as before (a dangling link is replaced
-/// by a regular file — the pre-existing behaviour).
-///
-/// Callers must create their temp file in `dest.parent()` (so the rename stays on
-/// the same filesystem) and fsync `dest`'s parent. Shared by the state-store
-/// rewrites (`baseline`, `canary`, `taint`) and the CLI's `write_file_atomic`.
+/// target so a `temp → rename` writes THROUGH the link (preserving it) instead of
+/// replacing it. A regular/missing/dangling path returns `path` unchanged.
+/// Callers must put their temp file in `dest.parent()` and fsync that parent.
 pub fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
     match std::fs::symlink_metadata(path) {
-        // A symlink whose target resolves: write through to the real file.
-        // `canonicalize` follows the whole chain and requires the final target to
-        // exist — a dangling symlink errors and falls back to `path`.
+        // Symlink whose target resolves: write through to the real file
+        // (`canonicalize` errors on a dangling link, falling back to `path`).
         Ok(meta) if meta.file_type().is_symlink() => {
             std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
         }
-        // Not a symlink (regular file/dir/absent): rename onto `path` directly.
+        // Not a symlink: rename onto `path` directly.
         _ => path.to_path_buf(),
     }
 }
@@ -553,17 +422,11 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     dp[m][n]
 }
 
-/// Normalize a filesystem path's separators to forward slashes for the
-/// `file.path_matches` custom-rule DSL predicate.
-///
-/// DSL `file.path_matches` regexes are written with `/` separators (e.g.
-/// `(^|/)\.env(\.|$)`), so a Windows path like `C:\repo\.env` would never match
-/// without this normalization. Both the production FileScan path
-/// ([`crate::engine`]) and `tirith rule test` route their scanned path through
-/// here so the two use byte-identical normalization (CodeRabbit M13 PR #132).
-///
-/// Returns `Option<String>` to mirror the engine's `file_path_str` shape:
-/// `None` passes straight through (no path → no `file.path_matches` fact).
+/// Normalize a path's separators to forward slashes for the `file.path_matches`
+/// DSL predicate (its regexes are written with `/`, so a Windows `C:\repo\.env`
+/// would never match otherwise). Both the FileScan path and `tirith rule test`
+/// route through here for byte-identical normalization (CodeRabbit M13 PR #132).
+/// `None` passes through (no path → no `file.path_matches` fact).
 pub fn normalize_path_separators(path: Option<&Path>) -> Option<String> {
     path.map(|p| p.to_string_lossy().replace('\\', "/"))
 }
@@ -588,7 +451,7 @@ mod open_regular_tests {
     fn oversized_regular_file_is_rejected_before_read() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("big.bin");
-        // One byte over the cap. The fstat size gate must reject it.
+        // One byte over the cap — the fstat size gate must reject it.
         std::fs::write(&p, vec![b'x'; 1025]).unwrap();
         assert!(matches!(
             read_regular_capped(&p, 1024),
@@ -626,22 +489,19 @@ mod open_regular_tests {
     #[test]
     fn directory_is_not_regular_file() {
         let dir = tempdir().unwrap();
-        // The temp dir itself is a directory — opening it as a "regular file"
-        // must be rejected by the fstat (cross-platform: a dir is never a file).
+        // A directory must be rejected by the fstat (a dir is never a file).
         match open_regular_capped(dir.path(), 1024) {
             Err(OpenRegularError::NotRegularFile) => {}
-            // Some platforms refuse to `open` a directory for reading at all,
-            // surfacing an Io error instead — also acceptable (still not handed
-            // back as a readable regular file, still no block).
+            // Some platforms refuse to `open` a directory at all, surfacing an
+            // Io error instead — also acceptable.
             Err(OpenRegularError::Io(_)) => {}
             other => panic!("a directory must not open as a regular file, got {other:?}"),
         }
     }
 
-    /// R11 #1: a FIFO at a store path must NOT hang `read_store_lines`. The
-    /// shared helper opens with O_NONBLOCK and rejects the FIFO via the post-open
-    /// fstat, so the store reads as EMPTY and returns promptly. A regression to a
-    /// blocking read would HANG here (caught by the suite timeout). Unix-only.
+    /// R11 #1: a FIFO at a store path must NOT hang `read_store_lines` — the
+    /// helper opens O_NONBLOCK and rejects it via the post-open fstat, reading
+    /// empty. A regression to a blocking read would hang here. Unix-only.
     #[cfg(unix)]
     #[test]
     fn fifo_store_does_not_hang_and_reads_empty() {
@@ -665,9 +525,8 @@ mod open_regular_tests {
         ));
     }
 
-    /// R11 #1: a symlink pointing at a FIFO must also be rejected — `fstat` on the
-    /// open fd follows the symlink to the FIFO inode and refuses it — without
-    /// blocking. Unix-only.
+    /// R11 #1: a symlink to a FIFO must also be rejected — `fstat` on the open fd
+    /// follows it to the FIFO inode and refuses it without blocking. Unix-only.
     #[cfg(unix)]
     #[test]
     fn symlink_to_fifo_does_not_hang() {
@@ -697,11 +556,9 @@ mod store_line_tests {
     use super::{collect_store_lines, collect_store_lines_complete};
     use std::io::{self, BufRead, Read};
 
-    /// A `BufRead` whose `read_line` first yields some good lines, then returns
-    /// a PERSISTENT non-`InvalidData` error on every subsequent call — modelling
-    /// a hard I/O fault. If the loop `continue`d on this it would spin forever;
-    /// the contract is to BREAK, so the call must return promptly with only the
-    /// lines read before the fault.
+    /// A `BufRead` that yields good lines, then a PERSISTENT non-`InvalidData`
+    /// error on every subsequent call (a hard I/O fault). The contract is to
+    /// BREAK, not spin, so the call returns only the lines read before the fault.
     struct PersistentErrorReader {
         good: Vec<String>,
         idx: usize,
@@ -709,8 +566,8 @@ mod store_line_tests {
 
     impl Read for PersistentErrorReader {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            // `lines()` uses `read_line`, not `read`; this is only here to
-            // satisfy the `Read` supertrait bound on `BufRead`.
+            // Only here to satisfy the `Read` supertrait bound; `lines()` uses
+            // `read_line`.
             Err(io::Error::other("unused"))
         }
     }
@@ -720,8 +577,8 @@ mod store_line_tests {
             Ok(&[])
         }
         fn consume(&mut self, _amt: usize) {}
-        // `lines()` calls `read_line` under the hood; override it directly so we
-        // control exactly what each iteration yields.
+        // Override `read_line` directly (what `lines()` calls) to control each
+        // iteration.
         fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
             if self.idx < self.good.len() {
                 buf.push_str(&self.good[self.idx]);
@@ -729,8 +586,8 @@ mod store_line_tests {
                 self.idx += 1;
                 Ok(self.good[self.idx - 1].len() + 1)
             } else {
-                // Persistent fault: returns the SAME error every call. A
-                // `continue`-on-all-errors loop would never terminate.
+                // Persistent fault: the SAME error every call — a continue-on-all
+                // -errors loop would never terminate.
                 Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "persistent fault",
@@ -741,11 +598,8 @@ mod store_line_tests {
 
     #[test]
     fn persistent_non_invaliddata_error_breaks_does_not_spin() {
-        // CodeRabbit R6 #7: an unbounded `continue` on every read error spins
-        // forever on a persistent fault. `collect_store_lines` must BREAK on a
-        // non-`InvalidData` error and return the lines gathered so far. This
-        // test would hang (not fail) on a regression — it is deliberately
-        // cheap so the suite still time-boxes.
+        // CodeRabbit R6 #7: `collect_store_lines` must BREAK on a non-`InvalidData`
+        // error (an unbounded continue would spin). A regression hangs here.
         let reader = PersistentErrorReader {
             good: vec!["one".to_string(), "two".to_string()],
             idx: 0,
@@ -756,9 +610,8 @@ mod store_line_tests {
 
     #[test]
     fn invalid_utf8_line_is_skipped_not_fatal() {
-        // The recoverable case: a single invalid-UTF-8 line is skipped and the
-        // reader keeps going. A real `BufReader` over bytes yields `InvalidData`
-        // for the bad line, then continues.
+        // Recoverable case: a single invalid-UTF-8 line is skipped, the reader
+        // keeps going.
         let bytes: Vec<u8> = [b"good1\n".as_ref(), &[0xff, 0xfe, b'\n'], b"good2\n"].concat();
         let lines = collect_store_lines(std::io::BufReader::new(&bytes[..]));
         assert_eq!(lines, vec!["good1".to_string(), "good2".to_string()]);
@@ -766,11 +619,9 @@ mod store_line_tests {
 
     #[test]
     fn complete_flag_false_on_mid_file_io_fault() {
-        // CodeRabbit R13 #1: a REAL mid-file I/O fault leaves the tail unread, so
-        // the lines are a PARTIAL prefix. `collect_store_lines_complete` must
-        // report `complete == false` so a rewrite path knows NOT to truncate the
-        // store from this partial image. The lines read before the fault are still
-        // returned (for the fail-open reader), but the flag forbids a rewrite.
+        // CodeRabbit R13 #1: a mid-file I/O fault leaves the tail unread, so
+        // `complete == false` forbids a rewrite (the partial lines are still
+        // returned for the fail-open reader).
         let reader = PersistentErrorReader {
             good: vec!["one".to_string(), "two".to_string()],
             idx: 0,
@@ -782,9 +633,8 @@ mod store_line_tests {
 
     #[test]
     fn complete_flag_true_on_clean_eof_and_skipped_invalid_utf8() {
-        // A clean read — including one where a single invalid-UTF-8 line is
-        // skipped — reaches EOF, so the image is COMPLETE and a rewrite from it is
-        // safe (the skipped line is genuinely undecodable, not an unread tail).
+        // A clean read (even skipping a bad-UTF-8 line) reaches EOF, so the image
+        // is COMPLETE and safe to rewrite from.
         let bytes: Vec<u8> = [b"good1\n".as_ref(), &[0xff, 0xfe, b'\n'], b"good2\n"].concat();
         let (lines, complete) = collect_store_lines_complete(std::io::BufReader::new(&bytes[..]));
         assert_eq!(lines, vec!["good1".to_string(), "good2".to_string()]);
@@ -797,13 +647,8 @@ mod store_line_tests {
     #[test]
     fn raw_variant_preserves_surrounding_whitespace_but_drops_blank_lines() {
         use super::collect_store_lines_raw_complete;
-        // CodeRabbit R15 #3 — regression pinning BOTH properties of the raw
-        // collector used by the REWRITE/preserve path.
-        //
-        // A store with an unknown line that carries surrounding whitespace must
-        // come back EXACTLY (whitespace included) so a verbatim rewrite writes it
-        // byte-for-byte; a blank/whitespace-only line carries no data and is still
-        // dropped (so rewrites don't accumulate blank noise).
+        // CodeRabbit R15 #3 — the raw collector preserves surrounding whitespace
+        // on content lines (for a byte-for-byte rewrite) but still drops blank ones.
         let input = "  {\"unknown\":\"x\"}  \n\t{\"a\":1}\n   \n\n\tplain content\t\n";
         let (raw, complete) =
             collect_store_lines_raw_complete(std::io::BufReader::new(input.as_bytes()));
@@ -818,9 +663,8 @@ mod store_line_tests {
             "raw variant must keep each non-blank line byte-for-byte and drop blank lines"
         );
 
-        // CONTRAST: the TRIMMED variant (read path) strips that same whitespace.
-        // Proves the two variants differ exactly on the preserve property — and
-        // that the prior trimmed behavior the read path relies on is unchanged.
+        // CONTRAST: the TRIMMED variant (read path) strips that same whitespace,
+        // proving the two variants differ exactly on the preserve property.
         let (trimmed, _) = collect_store_lines_complete(std::io::BufReader::new(input.as_bytes()));
         assert_eq!(
             trimmed,
@@ -841,22 +685,16 @@ mod fsync_parent_dir_tests {
 
     #[test]
     fn single_component_relative_path_fsyncs_cwd() {
-        // CodeRabbit R19 #2: a single-component relative destination (e.g.
-        // `commands.yaml`) has `Path::parent() == Some("")`. The old
-        // `.filter(|p| !p.as_os_str().is_empty())` DROPPED that and returned
-        // `Ok(())`, SKIPPING the required directory fsync. The fix treats an
-        // empty parent as the current directory (`.`) and fsyncs it, so a
-        // relative single-component publish is still made durable. The test
-        // process always has an openable cwd, so this must SUCCEED (and never
-        // panic) — proving we now fsync `.` rather than skipping.
+        // CodeRabbit R19 #2: a single-component relative dest has `parent() ==
+        // Some("")`; the fix fsyncs `.` rather than skipping. The test process
+        // always has an openable cwd, so this must succeed.
         fsync_parent_dir(Path::new("commands.yaml"))
             .expect("single-component relative path must fsync the cwd, not skip");
     }
 
     #[test]
     fn root_path_with_no_parent_is_noop_ok() {
-        // The genuine no-parent case (`/` has `parent() == None`) stays a
-        // vacuous `Ok(())` no-op — there is no containing directory to fsync.
+        // The no-parent case (`/`) stays a vacuous `Ok(())` no-op.
         fsync_parent_dir(Path::new("/")).expect("a path with no parent is a vacuous Ok no-op");
     }
 }
@@ -896,8 +734,7 @@ mod normalize_path_separators_tests {
 
     #[test]
     fn plain_forward_slash_path_is_unchanged() {
-        // A POSIX path with no backslashes is returned byte-identical, so the
-        // common (non-Windows) FileScan path is behaviorally unchanged.
+        // A POSIX path with no backslashes is returned byte-identical.
         assert_eq!(
             normalize_path_separators(Some(Path::new("src/secrets/.env"))).as_deref(),
             Some("src/secrets/.env"),

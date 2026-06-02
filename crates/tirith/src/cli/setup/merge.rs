@@ -3,14 +3,8 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-/// Merge a server entry into an MCP JSON config file.
-///
-/// Creates the server object (under `server_key`) if missing. Drift detection:
-/// if the server exists with different config and `!force`, returns an error.
-/// Same config is silently skipped.
-///
-/// `server_key` is the top-level JSON key: `"mcpServers"` for Claude Code,
-/// Cursor, and Windsurf; `"servers"` for VS Code.
+/// Merge a server entry into an MCP JSON config file under `"mcpServers"`.
+/// Skips identical config; errors on drift unless `force`.
 pub fn merge_mcp_json(
     path: &Path,
     server_name: &str,
@@ -75,7 +69,7 @@ pub fn merge_mcp_json_with_key(
                 path.display()
             ));
         }
-        // force: create backup before overwriting user config (not in dry-run)
+        // force: back up before overwriting user config (not in dry-run).
         if !dry_run {
             super::fs_helpers::create_backup(path, true)?;
         }
@@ -100,10 +94,7 @@ pub fn merge_mcp_json_with_key(
 }
 
 /// Merge a hook entry into a hooks.json file (Cursor/Windsurf format).
-///
-/// Shared by Cursor (`beforeShellExecution`) and Windsurf (`pre_run_command`).
-/// Detects existing tirith hooks by scanning for `marker` substring in each
-/// entry's `command` field.
+/// Detects existing tirith hooks by the `marker` substring in each `command`.
 pub fn merge_hooks_json(
     path: &Path,
     event_name: &str,
@@ -138,7 +129,7 @@ pub fn merge_hooks_json(
         .as_array_mut()
         .ok_or_else(|| format!("hooks.{event_name} in {} is not an array", path.display()))?;
 
-    // Find all entries whose "command" field contains the marker
+    // All entries whose "command" field contains the marker.
     let matching_indices: Vec<usize> = event_arr
         .iter()
         .enumerate()
@@ -197,7 +188,7 @@ pub fn merge_hooks_json(
             if !dry_run {
                 super::fs_helpers::create_backup(path, true)?;
             }
-            // Remove in reverse order so earlier indices stay valid.
+            // Reverse order so earlier indices stay valid while removing.
             for &idx in matching_indices.iter().rev() {
                 event_arr.remove(idx);
             }
@@ -222,10 +213,8 @@ pub fn merge_hooks_json(
 }
 
 /// Merge a tirith MCP server into Claude Code's settings.json `mcpServers`.
-///
-/// This is used for user-scope `--with-mcp` instead of `claude mcp add`, which
-/// hangs when called from within an active Claude Code session (subprocess deadlock).
-/// Same drift-detection semantics as `merge_mcp_json`.
+/// Used for user-scope `--with-mcp` instead of `claude mcp add`, which deadlocks
+/// inside an active Claude Code session. Same drift semantics as `merge_mcp_json`.
 pub fn merge_claude_mcp_server(
     path: &Path,
     server_name: &str,
@@ -297,16 +286,12 @@ pub fn merge_claude_mcp_server(
     Ok(())
 }
 
-/// Merge a tirith hook into a settings.json with Claude Code / Gemini CLI
-/// hook structure: `hooks.{event_name}[]` array of matcher entries, each with
-/// an inner `hooks[]` array of command entries.
+/// Merge a tirith hook into a Claude Code / Gemini CLI settings.json
+/// (`hooks.{event_name}[]` matcher entries, each with an inner `hooks[]`).
 ///
-/// Operates at the **individual hook-command level** within a matcher's hooks
-/// array — preserves other hooks in the same matcher and other matcher entries.
-///
-/// `marker` is a tool-specific filename substring used to detect the existing
-/// tirith hook entry (e.g. `"tirith-check.py"` for Claude, `"tirith-security-guard-gemini.py"`
-/// for Gemini).
+/// Operates at the individual hook-command level, preserving other hooks and
+/// matchers. `marker` is a tool-specific filename substring used to detect the
+/// existing tirith hook entry.
 fn merge_hook_settings_inner(
     path: &Path,
     event_name: &str,
@@ -342,7 +327,6 @@ fn merge_hook_settings_inner(
         "command": hook_command
     });
 
-    // Helper: check if a hook entry's command contains the marker
     let has_marker = |h: &Value| -> bool {
         h.get("command")
             .and_then(|v| v.as_str())
@@ -350,7 +334,7 @@ fn merge_hook_settings_inner(
             .unwrap_or(false)
     };
 
-    // Find all matcher indices matching matcher_name
+    // All matcher indices matching matcher_name.
     let matcher_indices: Vec<usize> = arr
         .iter()
         .enumerate()
@@ -374,7 +358,7 @@ fn merge_hook_settings_inner(
         1 => {
             let idx = matcher_indices[0];
 
-            // Find marker-matching hook index within the matcher's inner hooks
+            // Marker-matching hook index within the matcher's inner hooks.
             let marker_hook_idx = arr[idx]
                 .get("hooks")
                 .and_then(|v| v.as_array())
@@ -410,8 +394,7 @@ fn merge_hook_settings_inner(
                 }
                 None => {
                     // Matcher exists but has no tirith hook: append to inner
-                    // hooks[], replacing it if it's missing or non-array
-                    // (e.g. null from a malformed config).
+                    // hooks[], replacing it if missing or non-array (e.g. null).
                     let obj = arr[idx]
                         .as_object_mut()
                         .ok_or_else(|| "matcher entry is not an object".to_string())?;
@@ -443,21 +426,20 @@ fn merge_hook_settings_inner(
                 super::fs_helpers::create_backup(path, true)?;
             }
 
-            // Remove marker-matching hooks from all matcher entries and
-            // collect non-marker hooks from duplicates so we can consolidate.
+            // Remove marker-matching hooks from all matchers; collect the
+            // non-marker hooks from duplicates into the first matcher rather
+            // than silently dropping them.
             let mut orphan_hooks: Vec<Value> = Vec::new();
             for (pos, &idx) in matcher_indices.iter().enumerate() {
                 if let Some(inner) = arr[idx]["hooks"].as_array_mut() {
                     inner.retain(|h| !has_marker(h));
-                    // Non-tirith hooks from duplicates get consolidated into
-                    // the first matcher so we don't silently drop them.
                     if pos > 0 {
                         orphan_hooks.append(inner);
                     }
                 }
             }
 
-            // Replace `hooks` if missing or non-array (e.g. null from malformed config).
+            // Replace `hooks` if missing or non-array (e.g. null).
             let first = arr[matcher_indices[0]]
                 .as_object_mut()
                 .ok_or_else(|| "matcher entry is not an object".to_string())?;
@@ -471,7 +453,6 @@ fn merge_hook_settings_inner(
             inner_arr.extend(orphan_hooks);
             inner_arr.push(new_hook_entry);
 
-            // Reverse order so earlier indices stay valid while removing.
             for &idx in matcher_indices[1..].iter().rev() {
                 arr.remove(idx);
             }
@@ -530,12 +511,9 @@ pub fn merge_gemini_settings(
     )
 }
 
-/// Merge a tirith hook into VS Code's settings.json using JSONC comment markers.
-///
-/// Uses `// BEGIN tirith-hooks` / `// END tirith-hooks` managed block markers.
-/// Preserves all content outside the managed block byte-for-byte. If an existing
-/// `"hooks"` key is found outside the managed block, returns a hard error with
-/// manual merge instructions.
+/// Merge a tirith hook into VS Code's settings.json using a JSONC managed block.
+/// Preserves all content outside the block byte-for-byte; errors (with manual
+/// instructions) if a `"hooks"` key already exists outside the block.
 pub fn merge_vscode_settings(
     path: &Path,
     hook_command: &str,
@@ -585,7 +563,7 @@ pub fn merge_vscode_settings(
          \x20\x20{end_marker}"
     );
 
-    // Line-by-line scan for an existing "hooks" key outside the managed block.
+    // Scan for an existing "hooks" key outside the managed block.
     let hooks_key_re =
         regex::Regex::new(r#"^\s*"hooks"\s*:"#).map_err(|e| format!("regex compile: {e}"))?;
 
@@ -616,7 +594,7 @@ pub fn merge_vscode_settings(
         }
     }
 
-    // Insert the managed block just before the file's closing brace.
+    // Insert the managed block before the file's closing brace.
     let insert_pos = working_text.rfind('}').ok_or_else(|| {
         println!(
             "Add the following to {}:\n{}",
@@ -632,8 +610,8 @@ pub fn merge_vscode_settings(
     let before_brace = &working_text[..insert_pos];
     let mut result = String::new();
 
-    // The last non-empty, non-comment line needs a trailing comma if the
-    // managed block is about to follow it in the same object.
+    // The last non-empty, non-comment line needs a trailing comma before the
+    // managed block follows it in the same object.
     let needs_comma = before_brace
         .lines()
         .rev()
@@ -693,9 +671,8 @@ pub fn merge_vscode_settings(
         return Ok(());
     }
 
-    // settings.json is high-value user content — always back up on first-time
-    // insertion, regardless of --force. Skip if the force+remove path above
-    // already took a backup this invocation.
+    // High-value user content: always back up on first-time insertion (skip if
+    // the force+remove path above already backed up this invocation).
     if path.exists() && !already_backed_up {
         super::fs_helpers::create_backup_always(path)?;
     }
@@ -705,7 +682,7 @@ pub fn merge_vscode_settings(
     Ok(())
 }
 
-/// Remove all lines between begin_marker and end_marker (inclusive).
+/// Remove all lines between `begin_marker` and `end_marker` (inclusive).
 fn remove_managed_block(
     text: &str,
     begin_marker: &str,
@@ -779,7 +756,6 @@ mod tests {
         let config = json!({"command": "tirith"});
         merge_mcp_json(&path, "tirith", config.clone(), false, false).unwrap();
 
-        // Second call should succeed (skip)
         merge_mcp_json(&path, "tirith", config, false, false).unwrap();
     }
 
@@ -800,7 +776,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
         merge_mcp_json(&path, "tirith", json!({"command": "old"}), false, false).unwrap();
 
-        // dry_run + drift should NOT error
+        // dry_run + drift must not error.
         let result = merge_mcp_json(&path, "tirith", json!({"command": "new"}), false, true);
         assert!(result.is_ok());
     }
@@ -823,7 +799,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
 
         merge_mcp_json(&path, "tirith", json!({"command": "tirith"}), false, true).unwrap();
-        assert!(!path.exists()); // dry-run should not create
+        assert!(!path.exists());
     }
 
     #[test]
@@ -832,7 +808,7 @@ mod tests {
         let path = dir.path().join("mcp.json");
         merge_mcp_json(&path, "tirith", json!({"command": "old"}), false, false).unwrap();
 
-        // dry-run + force should not create backup files
+        // dry-run + force must not create backup files.
         merge_mcp_json(&path, "tirith", json!({"command": "new"}), true, true).unwrap();
 
         let backup_count = fs::read_dir(dir.path())

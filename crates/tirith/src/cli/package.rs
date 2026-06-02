@@ -1,23 +1,16 @@
-//! `tirith package risk` and `tirith package explain` — provenance /
-//! maintainer-risk scoring for a package.
+//! `tirith package risk|explain|scan` — provenance / maintainer-risk scoring
+//! for a package, scored like `tirith score` scores a URL: a deterministic,
+//! fully explainable sum of named factors.
 //!
-//! `tirith package scan` is the spec-named CLI surface for the directory-level
-//! supply-chain scan. It is a thin wrapper over [`super::ecosystem::scan`] —
-//! the underlying engine is `tirith_core::ecosystem_scan::scan`. Both surfaces
-//! pass the same [`ScanMode`] and the byte-identical-JSON CLI test pins that
-//! one engine implementation serves both CLIs.
+//! `tirith package scan` is a thin wrapper over [`super::ecosystem::scan`] (the
+//! engine is `tirith_core::ecosystem_scan::scan`); a byte-identical-JSON test
+//! pins that one engine serves both CLIs.
 //!
-//! These commands score a package the way `tirith score` scores a URL: a
-//! deterministic, fully explainable sum of named factors.
-//!
-//! **Offline by default.** Name signals come from the local threat DB, and
-//! content signals only from a package directory the user already has on
-//! disk — no network. `--online` additionally consults the package's
-//! registry API (npm / PyPI / crates.io) for provenance signals; that is the
-//! ONLY path on which these commands reach the network — never the `check`
-//! hot path. `--offline` / `TIRITH_OFFLINE` forces offline even with
-//! `--online`, and a registry failure degrades gracefully to the offline
-//! score with an honest `api signals: unavailable (reason)`.
+//! Offline by default (threat-DB name signals + on-disk content only).
+//! `--online` additionally consults the registry API (npm/PyPI/crates.io) for
+//! provenance — the ONLY networked path, never the `check` hot path.
+//! `--offline` / `TIRITH_OFFLINE` forces offline; a registry failure degrades to
+//! the offline score with an honest `api signals: unavailable (reason)`.
 
 use std::path::{Path, PathBuf};
 
@@ -27,20 +20,13 @@ use tirith_core::package_risk::{
 use tirith_core::registry_api::{self, HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::{Ecosystem, ThreatDb};
 
-/// Run `tirith package scan` — the spec-named CLI surface for the
-/// directory-level supply-chain scan. A **thin wrapper** over
-/// [`super::ecosystem::scan`]; both CLIs route through the same engine
-/// (`tirith_core::ecosystem_scan::scan`). The byte-identical-JSON test in
-/// `crates/tirith/tests/cli_integration.rs` pins that invariant.
+/// Run `tirith package scan` — a thin wrapper over [`super::ecosystem::scan`]
+/// (same engine; a byte-identical-JSON test in `cli_integration.rs` pins it).
 ///
-/// `installed` and `lockfile` are mutually exclusive (clap enforces this).
-/// When neither is set and `path` is `None`, the wrapper defaults to
-/// `--installed` against cwd — the natural reading of the spec.
-///
-/// `max_installed_entries` caps the installed-tree walk (mirrors the same
-/// flag on `ecosystem scan`). `non_interactive` suppresses the network-call
-/// confirmation prompt that `--installed --online` raises against a large
-/// tree.
+/// `installed` and `lockfile` are mutually exclusive (clap-enforced); with
+/// neither set and no `path`, defaults to `--installed` against cwd.
+/// `max_installed_entries` caps the walk; `non_interactive` suppresses the
+/// `--installed --online` network-call prompt.
 #[allow(clippy::too_many_arguments)]
 pub fn scan(
     installed: bool,
@@ -52,14 +38,9 @@ pub fn scan(
     non_interactive: bool,
     json: bool,
 ) -> i32 {
-    // Resolve the scan target. Precedence:
-    //   1. --lockfile <path>       → SpecificLockfile (handled by the engine
-    //                                 once routed through `pick_mode`).
-    //   2. --installed             → installed-tree walk under cwd, unless
-    //                                 `path` overrides.
-    //   3. positional path          → manifests walk under that path.
-    //   4. nothing                  → default to --installed against cwd
-    //                                 (the spec's natural reading).
+    // Resolve the scan target. Precedence: --lockfile, then --installed (under
+    // cwd unless `path` overrides), then a positional path, else --installed
+    // against cwd.
     let (effective_path, effective_installed): (PathBuf, bool) = match (lockfile, installed, path) {
         (Some(lock), false, None) => (lock.to_path_buf(), false),
         (None, true, None) => (
@@ -73,26 +54,19 @@ pub fn scan(
             true,
         ),
         (Some(_), true, _) => {
-            // Defense in depth — clap's `conflicts_with` should already block
-            // this; if we somehow get here, fail with the same usage error
-            // clap would have produced.
+            // Defense in depth — clap's `conflicts_with` should block this.
             eprintln!("tirith package scan: --installed and --lockfile are mutually exclusive.");
             return 2;
         }
         (Some(_), false, Some(_)) => {
-            // --lockfile + --path is also a conflict the user could only
-            // construct programmatically; reject explicitly so the wrapper
-            // never silently drops one of the operator's inputs.
+            // --lockfile + --path: reject explicitly so no input is dropped.
             eprintln!("tirith package scan: --lockfile and --path are mutually exclusive.");
             return 2;
         }
     };
 
-    // Fail fast on non-UTF-8 paths rather than silently falling back to the
-    // cwd. `ecosystem::scan` takes `Option<&str>` (None = use cwd), so a
-    // `to_str()` that returns `None` would otherwise mean a non-UTF-8 path
-    // is dropped entirely and the scan target silently changes. Erroring
-    // explicitly preserves the operator's intent.
+    // Fail fast on a non-UTF-8 path rather than letting `ecosystem::scan`'s
+    // `Option<&str>` silently drop it and fall back to cwd.
     let effective_path_str = match effective_path.to_str() {
         Some(s) => s,
         None => {
@@ -116,15 +90,10 @@ pub fn scan(
     )
 }
 
-/// Run `tirith package risk <ecosystem> <name>`.
-///
-/// Prints the deterministic risk score (human or JSON). `path` optionally
-/// points at locally-available package content to inspect for install-script
-/// and binary-blob signals; when omitted, tirith tries to auto-discover the
-/// package under `node_modules` / `site-packages` relative to the cwd.
-///
-/// `online` opts into the registry-API provenance signals; `offline` (or the
-/// `TIRITH_OFFLINE` env var) forces offline scoring even when `online` is set.
+/// Run `tirith package risk <ecosystem> <name>`. Prints the deterministic risk
+/// score; `path` optionally points at local package content to inspect (else
+/// auto-discovered under `node_modules`/`site-packages`). `online` opts into
+/// registry provenance; `offline`/`TIRITH_OFFLINE` forces offline.
 pub fn risk(
     ecosystem: &str,
     name: &str,
@@ -177,9 +146,8 @@ fn run(
         return 2;
     }
 
-    // M6 ch6 — `<name>[@<version>]` parsing. Carries `version: Option<String>`
-    // into the signals so OSV correlation can match a version-pinned advisory.
-    // Bare `<name>` still works (the version is `None`).
+    // M6 ch6 — `<name>[@<version>]` parsing; version flows into the signals so
+    // OSV can match a version-pinned advisory (bare `<name>` → version `None`).
     let (parsed_name, parsed_version) = package_risk::parse_name_and_version(trimmed_name);
     if parsed_name.is_empty() {
         eprintln!("tirith package: package name must not be empty.");
@@ -196,15 +164,12 @@ fn run(
         .and_then(|db| db.check_typosquat(eco, &parsed_name))
         .map(|ts| ts.target_name);
 
-    // Content signals — only from locally-available package content. tirith
-    // never downloads the package to obtain these.
+    // Content signals — local content only; tirith never downloads to get these.
     let content_signals = gather_content_signals(eco, &parsed_name, path);
 
-    // Registry-API signals — ONLY when `--online` was passed and offline mode
-    // is not in force. The production client is the networked
-    // `HttpRegistryClient`; `gather_api` itself is offline-safe — it reports
-    // `NotComputed` for an intentional offline override and degrades a real
-    // registry failure to `Unavailable`.
+    // Registry-API signals — only with `--online` and offline not in force.
+    // `gather_api` is offline-safe (NotComputed for an intentional skip,
+    // Unavailable on a real failure).
     let api = if online {
         let client = HttpRegistryClient::new();
         gather_api(
@@ -215,7 +180,6 @@ fn run(
             offline,
         )
     } else {
-        // No `--online`: the default offline state.
         ApiSignals::offline()
     };
 
@@ -230,14 +194,12 @@ fn run(
         api,
     };
 
-    // `score_package` itself asserts the factor-sum invariant (the breakdown
-    // is reproducible by hand), so no extra guard is needed here.
+    // `score_package` asserts the factor-sum invariant itself.
     let breakdown = package_risk::score_package(&signals);
 
     if json {
-        // A JSON-write failure is the command's own I/O failure — exit
-        // non-zero so a piped consumer does not treat truncated JSON as
-        // success (consistent with `tirith version`).
+        // A JSON-write failure → exit non-zero so a piped consumer doesn't treat
+        // truncated JSON as success.
         if !print_json(&breakdown, explain) {
             return 1;
         }
@@ -247,24 +209,15 @@ fn run(
     0
 }
 
-// --- registry-API signals (opt-in, networked) ------------------------------
+// registry-API signals (opt-in, networked)
 
-/// Gather registry-API provenance signals using `client`.
-///
-/// `offline_flag` carries the `--offline` flag; when it — or the
-/// `TIRITH_OFFLINE` env var — is set, this is a guaranteed no-op that returns
-/// [`ApiSignals::NotComputed`] WITHOUT making any network call, so an
-/// `--online --offline` invocation (or `--online` under `TIRITH_OFFLINE=1`)
-/// stays purely local. `NotComputed` (not `Unavailable`) is correct here: the
-/// lookup was *intentionally not attempted*, not attempted-and-failed —
-/// `Unavailable` would misreport an explicit offline override as a degraded
-/// online run. Otherwise it delegates to [`registry_api::gather_api_signals`],
-/// which itself degrades any registry failure gracefully — this function
-/// never panics, never hangs beyond the client's timeout, and never blocks
-/// the caller.
-///
-/// `client` is a trait object so tests inject a fixture-fed fake and never
-/// touch the real registries.
+/// Gather registry-API provenance signals using `client`. With `offline_flag`
+/// (or `TIRITH_OFFLINE`) set this is a no-op returning [`ApiSignals::NotComputed`]
+/// WITHOUT any network call — `NotComputed` (not `Unavailable`) because the
+/// lookup was intentionally skipped, not attempted-and-failed. Otherwise
+/// delegates to [`registry_api::gather_api_signals`], which degrades failures
+/// gracefully; never panics, hangs, or blocks. `client` is a trait object so
+/// tests inject a fake.
 fn gather_api(
     client: &dyn RegistryClient,
     eco: Ecosystem,
@@ -280,12 +233,9 @@ fn gather_api(
                 .to_string(),
         };
     }
-    // M6 ch6 — `gather_api_signals` returns `(ApiSignals, PackageExistence)`.
-    // Fold the existence value into the provenance before returning so the
-    // public seam stays a single `ApiSignals`. When the call fails but
-    // existence is still positively `NotFound`, upgrade to an Available
-    // provenance carrying just the existence value so the policy gate
-    // (`PackageNotFoundInRegistry`) can read it.
+    // M6 ch6 — fold the `(ApiSignals, PackageExistence)` pair back into a single
+    // `ApiSignals`. On a failed call with a positive `NotFound`, upgrade to an
+    // Available provenance carrying the existence so the policy gate reads it.
     let (mut signals, existence) = registry_api::gather_api_signals(client, eco, name);
     use tirith_core::package_risk::{ApiProvenance, PackageExistence};
 
@@ -294,14 +244,9 @@ fn gather_api(
         provenance.package_existence = existence;
         // Snapshot-store write — reuses the fetched response, no extra call.
         let _ = tirith_core::registry_history::record_snapshot(eco, name, provenance);
-        // Diff against the previous snapshot, when one exists. We need BOTH
-        // the diff (for the `MaintainerChangeHistory`) and the full older /
-        // newer snapshot sets (for the `OwnershipTransfer`) — the diff-only
-        // view cannot distinguish "alice + bob + carol → alice + dave"
-        // (partial, alice stays) from "alice + bob + carol → dave + eve"
-        // (full takeover). `diff_and_transfer_recent` returns the transfer
-        // ONLY when no original maintainer survives, which is the honest
-        // signal `provenance.ownership_transfer` is documented to carry.
+        // Diff vs the previous snapshot. `diff_and_transfer_recent` returns the
+        // transfer ONLY when no original maintainer survives (a full takeover),
+        // which is the honest signal `ownership_transfer` carries.
         if let Some((history, transfer)) =
             tirith_core::registry_history::diff_and_transfer_recent(eco, name)
         {
@@ -310,11 +255,8 @@ fn gather_api(
                 provenance.ownership_transfer = Some(t);
             }
         }
-        // OSV correlation through the shipping `threatdb_api.rs` cache.
-        // Requires a version to do anything useful. We capture the
-        // `OsvLookupState` so the explainer can render "(no advisories
-        // verified)" vs "(OSV check unavailable: reason)" rather than have
-        // an empty `osv_advisories` ambiguously mean either.
+        // OSV correlation (needs a version). Capture `OsvLookupState` so the
+        // explainer distinguishes "no advisories" from "check unavailable".
         if let Some(v) = version {
             let result = tirith_core::osv_correlation::for_package_with_state(eco, name, v);
             provenance.osv_state = result.state;
@@ -328,7 +270,7 @@ fn gather_api(
         if dc.risk {
             provenance.dep_confusion = Some(dc);
         }
-        // Repo-mismatch is online-only and only attempted for known git hosts.
+        // Repo-mismatch — online-only, only for known git hosts.
         if let Some(repo_url) = provenance.repository_url_for_check() {
             let rm = tirith_core::repo_mismatch::verify(&repo_url, eco, name);
             provenance.repo_mismatch = Some(rm);
@@ -344,37 +286,30 @@ fn gather_api(
         if dc.risk {
             prov.dep_confusion = Some(dc);
         }
-        // We intentionally do NOT correlate OSV / write a snapshot for a
-        // package that does not exist; both would be incoherent.
+        // No OSV correlation / snapshot for a nonexistent package (incoherent).
         let _ = version;
         signals = ApiSignals::Available { provenance: prov };
     }
     signals
 }
 
-// --- content inspection (offline, filesystem-only) -------------------------
+// content inspection (offline, filesystem-only)
 
-/// The directory names a package's content lives under, per ecosystem, for
-/// auto-discovery relative to the cwd.
+/// The per-ecosystem directory a package's content lives under, for cwd-relative
+/// auto-discovery. `None` for ecosystems with no safe conventional layout
+/// (explicit `--path` still works).
 fn ecosystem_content_root(eco: Ecosystem) -> Option<&'static str> {
     match eco {
         Ecosystem::Npm => Some("node_modules"),
-        // pip installs unpack into a `site-packages` directory.
         Ecosystem::PyPI => Some("site-packages"),
-        // Other ecosystems have no single conventional local layout that is
-        // safe to auto-discover; an explicit --path still works for them.
         _ => None,
     }
 }
 
-/// Gather install-script / binary-blob signals from locally-available content.
-///
-/// Resolution order:
-///  1. an explicit `--path` (used as-is — error if it does not exist);
-///  2. otherwise, auto-discovery of `<content-root>/<name>` under the cwd;
-///  3. otherwise, [`ContentSignals::NotInspected`].
-///
-/// This only ever reads a directory the user already has — it never fetches.
+/// Gather install-script / binary-blob signals from local content: an explicit
+/// `--path` (error if missing), else auto-discovered `<content-root>/<name>`
+/// under cwd, else [`ContentSignals::NotInspected`]. Only ever reads a directory
+/// the user already has; never fetches.
 fn gather_content_signals(
     eco: Ecosystem,
     name: &str,
@@ -424,12 +359,9 @@ fn discover_local_package(eco: Ecosystem, name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Detect an install / lifecycle hook in a locally-available package directory.
-///
-/// - npm: a `package.json` with a non-empty `install`, `preinstall`, or
-///   `postinstall` script entry.
-/// - PyPI: a `setup.py` (executes arbitrary Python at install time).
-/// - Other ecosystems: not inspected for install scripts in this phase.
+/// Detect an install/lifecycle hook: npm `package.json` with a non-empty
+/// `(pre|post)install`/`install` script, or a PyPI `setup.py`. Other ecosystems
+/// are not inspected in this phase.
 fn detect_install_script(eco: Ecosystem, dir: &Path) -> (bool, Option<String>) {
     match eco {
         Ecosystem::Npm => detect_npm_install_script(dir),
@@ -483,19 +415,17 @@ fn detect_npm_install_script(dir: &Path) -> (bool, Option<String>) {
     }
 }
 
-/// Native / compiled artifact file extensions, lowercased, leading dot
-/// included. A file with one of these extensions inside the package directory
-/// is opaque compiled code that cannot be reviewed as source.
+/// Native/compiled artifact extensions (lowercased, leading dot) — opaque code
+/// that can't be reviewed as source.
 const BINARY_BLOB_EXTENSIONS: &[&str] = &[
     ".so", ".dll", ".dylib", ".node", ".wasm", ".a", ".lib", ".o", ".obj", ".exe", ".bin", ".dex",
     ".class", ".jar", ".pyd",
 ];
 
-/// Detect bundled binary blobs by walking the package directory and matching
-/// known native/compiled file extensions. Bounded: at most a few thousand
-/// entries are examined, and the walk reads only file names (no file content).
+/// Detect bundled binary blobs by walking the package directory for known
+/// native/compiled extensions. Bounded; reads file names only.
 fn detect_binary_blob(dir: &Path) -> (bool, Option<String>) {
-    // Cap the walk so a pathological tree cannot stall the command.
+    // Cap the walk so a pathological tree can't stall the command.
     const MAX_ENTRIES: usize = 20_000;
     let mut examined = 0usize;
     let mut found: Vec<String> = Vec::new();
@@ -537,11 +467,8 @@ fn detect_binary_blob(dir: &Path) -> (bool, Option<String>) {
     }
 }
 
-// --- output ----------------------------------------------------------------
-
-/// Emit the package-risk breakdown as JSON. Returns `false` on a JSON-write
-/// failure so the caller can exit non-zero — a piped consumer must not see
-/// truncated JSON paired with a success exit code.
+/// Emit the breakdown as JSON. `false` on a write failure so the caller exits
+/// non-zero (a piped consumer must not see truncated JSON with success).
 fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
     #[derive(serde::Serialize)]
     struct PackageRiskOutput<'a> {
@@ -585,7 +512,6 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
         breakdown.score, breakdown.risk_level
     );
 
-    // Name signal — always present.
     match &breakdown.name_vs_popular {
         NameVsPopular::KnownPopular => {
             println!("  name:        known-popular package (recognized)");
@@ -615,7 +541,6 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
         println!("  threat DB:   listed as a known malicious typosquat of '{target}'");
     }
 
-    // Content signal — what (if anything) was inspected.
     match &breakdown.content_signals {
         ContentSignals::NotInspected => {
             println!(
@@ -644,8 +569,7 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
         }
     }
 
-    // API-signal seam — always reported so the offline/online scope is
-    // explicit and a degraded online run is honest about why.
+    // API-signal seam — always reported so the offline/online scope is explicit.
     match &breakdown.api_signals {
         ApiSignals::NotComputed { reason } => {
             println!("  api signals: not computed — {reason}");
@@ -668,9 +592,8 @@ fn print_human(breakdown: &RiskBreakdown, explain: bool) {
     }
 }
 
-/// Render the gathered registry-API provenance for the human summary. Only the
-/// signals the registry actually reported are printed; an unknown datum is
-/// shown as `unknown` so the reader can see what the registry did not expose.
+/// Render the registry-API provenance for the human summary; an unknown datum
+/// shows as `unknown` so the reader sees what the registry didn't expose.
 fn print_api_provenance_human(p: &ApiProvenance) {
     println!("  api signals: from the {} registry API", p.source);
     match p.package_age_days {
@@ -713,16 +636,15 @@ fn print_api_provenance_human(p: &ApiProvenance) {
     }
 }
 
-/// Render the factor breakdown so the reader can reproduce the score by hand —
-/// identical in spirit to `tirith score --explain`. The actual formatting
-/// lives in [`write_breakdown_human`] so it can be unit-tested against a
-/// buffer.
+/// Render the factor breakdown so the reader can reproduce the score by hand
+/// (like `tirith score --explain`). Formatting lives in [`write_breakdown_human`]
+/// for buffer-based unit tests.
 fn print_breakdown_human(breakdown: &RiskBreakdown) {
     let _ = write_breakdown_human(breakdown, &mut std::io::stdout().lock());
 }
 
-/// Write the factor breakdown to `w`. Separated from [`print_breakdown_human`]
-/// purely so tests can capture the rendered text; the output is identical.
+/// Write the factor breakdown to `w` — split from [`print_breakdown_human`] only
+/// so tests can capture the (identical) text.
 fn write_breakdown_human(
     breakdown: &RiskBreakdown,
     w: &mut impl std::io::Write,
@@ -956,8 +878,7 @@ mod tests {
 
     use tirith_core::registry_api::{FetchError, RegistryMetadata};
 
-    /// A fixture-fed [`RegistryClient`]. The `panic!` on `fetch` for the
-    /// offline-short-circuit tests proves no network call was attempted.
+    /// A fixture-fed [`RegistryClient`].
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
     }
@@ -967,8 +888,8 @@ mod tests {
         }
     }
 
-    /// A client whose `fetch` panics — used to prove the offline switch
-    /// short-circuits *before* any registry call is made.
+    /// A client whose `fetch` panics — proves the offline switch short-circuits
+    /// before any registry call.
     struct ExplodingClient;
     impl RegistryClient for ExplodingClient {
         fn fetch(&self, _eco: Ecosystem, _name: &str) -> Result<RegistryMetadata, FetchError> {
@@ -978,10 +899,8 @@ mod tests {
 
     #[test]
     fn gather_api_offline_flag_skips_network() {
-        // CR12: the exploding client would panic if reached — the `--offline`
-        // flag must short-circuit *without* calling `fetch`, and report
-        // `NotComputed` (the lookup was intentionally not attempted), not
-        // `Unavailable` (which means an online lookup was attempted and failed).
+        // CR12: `--offline` must short-circuit without calling `fetch` (the
+        // exploding client would panic) and report NotComputed, not Unavailable.
         let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", None, true);
         match sig {
             ApiSignals::NotComputed { reason } => {
@@ -1014,10 +933,8 @@ mod tests {
 
     #[test]
     fn online_run_offline_flag_still_exits_zero_without_network() {
-        // `--online` together with `--offline` must score with offline
-        // signals and exit 0 — and make no network call (the offline flag
-        // short-circuits before any `HttpRegistryClient` request). This
-        // exercises the public `run` end-to-end with no real network.
+        // `--online --offline` scores offline and exits 0 with no network call,
+        // exercising the public `run` end-to-end.
         let code = run(
             "npm", "react", None, /* online = */ true, /* offline = */ true,
             /* json = */ true, /* explain = */ false,
@@ -1051,17 +968,15 @@ mod tests {
             api: ApiSignals::Available { provenance },
         };
         let breakdown = package_risk::score_package(&s);
-        // The breakdown carries the API factors; the score is non-zero.
+        // The breakdown carries the API factors; score is non-zero.
         assert!(breakdown.score > 0);
         assert!(breakdown.factors.iter().any(|f| f.id.starts_with("api_")));
         assert!(matches!(
             breakdown.api_signals,
             ApiSignals::Available { .. }
         ));
-        // The human renderer prints a line for every API signal.
+        // Confirm the human renderer doesn't panic on a full provenance.
         if let ApiSignals::Available { provenance } = &breakdown.api_signals {
-            // `print_api_provenance_human` writes to stdout; just confirm it
-            // does not panic on a fully-populated provenance.
             print_api_provenance_human(provenance);
         }
     }

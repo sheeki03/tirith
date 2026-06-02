@@ -8,54 +8,33 @@
 //!   [ 4-byte length prefix, NATIVE byte order ][ that many bytes of UTF-8 JSON ]
 //! ```
 //!
-//! On each valid frame we deserialize the JSON into a
-//! [`tirith_core::clipboard::ClipboardSourceRecord`] (the M12 ch1 on-disk
-//! contract) and write it ATOMICALLY to `state_dir()/clipboard_source.json` —
-//! the same file `tirith clipboard watch` and the `paste_source_mismatch` rule
-//! read. We then write a tiny `{"ok":true}` ack frame back (per the protocol)
-//! so the extension can confirm delivery.
+//! Each valid frame is deserialized into a
+//! [`tirith_core::clipboard::ClipboardSourceRecord`] and written ATOMICALLY to
+//! `state_dir()/clipboard_source.json` (the same file the engine's
+//! `paste_source_mismatch` rule reads), then a `{"ok":true}` ack frame is sent.
 //!
-//! ## Security model — input is UNTRUSTED
+//! Security model — the browser side is an UNTRUSTED input boundary into a file
+//! the engine later reads. Three defenses: (1) a hard [`MAX_FRAME_BYTES`] cap
+//! enforced BEFORE allocating, aborting the stream on an oversized prefix; (2)
+//! schema validation before write (a non-parsing frame is ack'd false and never
+//! touches disk); (3) atomic write via [`crate::cli::write_file_atomic`].
 //!
-//! This host writes a file the ENGINE later reads, so the browser side is an
-//! untrusted input boundary. Three defenses, all enforced here:
-//!
-//!   1. **Hard frame-length cap.** Chrome's documented limits are 1 MiB
-//!      host→browser and 4 GiB browser→host, but we must NEVER allocate an
-//!      attacker-controlled size. Incoming frames are capped at
-//!      [`MAX_FRAME_BYTES`] (256 KiB); a larger length prefix is rejected
-//!      WITHOUT allocating the buffer, and the host aborts the stream (a
-//!      malicious or desynced peer does not get to keep sending).
-//!   2. **Schema validation before write.** The bytes must deserialize into
-//!      `ClipboardSourceRecord`; a frame that does not parse is skipped (with an
-//!      ack `{"ok":false}`) and never touches disk. Garbage cannot land in the
-//!      file the engine trusts.
-//!   3. **Atomic write.** We use [`crate::cli::write_file_atomic`] so a reader
-//!      (the paste hot-path) never sees a torn / half-written record.
-//!
-//! Runs until stdin reaches EOF. Hidden from `--help` (it is invoked by Chrome,
-//! not a human), like `clipboard daemon --foreground`.
+//! Runs until stdin EOF. Hidden from `--help` (invoked by Chrome, not a human).
 
 use std::io::{Read, Write};
 
 use tirith_core::clipboard::SOURCE_READ_CAP;
 
-/// Hard cap on a single incoming frame: 256 KiB. The companion record is a tiny
-/// JSON object (timestamp, sha256 hex, URL, title, bool) — far under this. The
-/// cap exists so a hostile / desynced length prefix cannot make us allocate an
-/// arbitrary buffer. Mirrors the 64 KiB read cap on the file side
-/// ([`SOURCE_READ_CAP`]) with generous headroom for the wire form.
+/// Hard cap on a single incoming frame: 256 KiB. The companion record is tiny;
+/// the cap stops a hostile / desynced length prefix from forcing an arbitrary
+/// allocation. Larger than the 64 KiB file-side read cap ([`SOURCE_READ_CAP`]).
 pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
 
-/// `true` when a re-serialized record (`serde_json::to_vec_pretty`) is small
-/// enough that the FILE-side reader ([`tirith_core::clipboard::read_source_record`],
-/// capped at [`SOURCE_READ_CAP`]) will accept it. The wire-frame cap
-/// ([`MAX_FRAME_BYTES`], 256 KiB) is larger than the read cap (64 KiB), so a
-/// record in that 64–256 KiB band would pass the frame check, be written, then be
-/// silently UNREADABLE — we refuse to persist it. `read_regular_capped` rejects a
-/// file STRICTLY larger than the cap (it reads `cap + 1` and fails if it gets that
-/// many), so a serialized form of exactly `SOURCE_READ_CAP` bytes is still
-/// readable; the boundary here matches (`<=`).
+/// `true` when a re-serialized record fits the FILE-side read cap
+/// ([`SOURCE_READ_CAP`], 64 KiB). The wire cap ([`MAX_FRAME_BYTES`], 256 KiB) is
+/// larger, so a record in the 64–256 KiB band would frame fine, be written, then
+/// be silently UNREADABLE — refuse to persist it. The reader rejects strictly
+/// larger than the cap, so the boundary here is `<=`.
 fn serialized_fits_read_cap(bytes: &[u8]) -> bool {
     bytes.len() as u64 <= SOURCE_READ_CAP
 }
@@ -68,31 +47,21 @@ pub enum FrameRead {
     /// Clean end of stream (the 4-byte prefix could not be fully read because
     /// the peer closed). The host loop exits 0 on this.
     Eof,
-    /// The declared length exceeded [`MAX_FRAME_BYTES`]. Carries the rejected
-    /// length for diagnostics. The host treats this as fatal and stops — we do
-    /// NOT skip-and-resync, because a bogus length means the stream framing is
-    /// no longer trustworthy. NOTE: the oversized payload is never read or
-    /// allocated.
+    /// The declared length exceeded [`MAX_FRAME_BYTES`] (carried for
+    /// diagnostics). Fatal — a bogus length means framing is untrustworthy, so
+    /// the host stops rather than resync. The oversized payload is never read.
     TooLarge(u32),
-    /// A truncated frame: the prefix promised N body bytes but the stream ended
-    /// (or errored) before N arrived. Fatal — framing is broken.
+    /// The prefix promised N body bytes but the stream ended/errored first.
+    /// Fatal — framing is broken.
     Truncated,
 }
 
-/// Read exactly one native-messaging frame from `reader`.
-///
-/// Wire format: a 4-byte length prefix in NATIVE byte order (`u32::from_ne_bytes`,
-/// per Chrome's spec), then that many bytes of payload. Returns:
-///
-///   * [`FrameRead::Eof`] if the reader is at end-of-stream BEFORE any prefix
-///     byte (a clean close between frames).
-///   * [`FrameRead::TooLarge`] if the prefix exceeds [`MAX_FRAME_BYTES`] —
-///     WITHOUT reading the body (no attacker-controlled allocation).
-///   * [`FrameRead::Truncated`] if the prefix is partially read, or the body is
-///     short / errors.
-///   * [`FrameRead::Frame`] with the payload bytes otherwise.
+/// Read exactly one native-messaging frame from `reader`: a 4-byte native-order
+/// length prefix (`u32::from_ne_bytes`, per Chrome), then that many payload
+/// bytes. [`FrameRead::Eof`] for a clean inter-frame close; [`FrameRead::TooLarge`]
+/// when the prefix exceeds [`MAX_FRAME_BYTES`] (body never read);
+/// [`FrameRead::Truncated`] for a partial prefix or short body.
 pub fn read_frame<R: Read>(reader: &mut R) -> FrameRead {
-    // ---- length prefix (4 bytes, native order) ----------------------------
     let mut len_buf = [0u8; 4];
     match read_exact_or_eof(reader, &mut len_buf) {
         ReadExact::Ok => {}
@@ -103,18 +72,15 @@ pub fn read_frame<R: Read>(reader: &mut R) -> FrameRead {
     }
     let len = u32::from_ne_bytes(len_buf);
 
-    // ---- enforce the cap BEFORE allocating --------------------------------
+    // Enforce the cap BEFORE allocating.
     if len > MAX_FRAME_BYTES {
         return FrameRead::TooLarge(len);
     }
 
-    // A zero-length frame is well-formed (empty payload); it simply won't parse
-    // as a record and is acked false by the caller.
+    // A zero-length frame is well-formed but won't parse, so it's ack'd false.
     let mut payload = vec![0u8; len as usize];
     match read_exact_or_eof(reader, &mut payload) {
         ReadExact::Ok => FrameRead::Frame(payload),
-        // The prefix promised `len` bytes but the body was short / closed /
-        // errored — broken framing.
         ReadExact::Eof | ReadExact::Short | ReadExact::Err => FrameRead::Truncated,
     }
 }
@@ -161,34 +127,27 @@ pub fn parse_record(payload: &[u8]) -> Option<tirith_core::clipboard::ClipboardS
     serde_json::from_slice(payload).ok()
 }
 
-/// Write a single native-messaging ack frame (`{"ok":<ok>}`) back to `writer`:
-/// a 4-byte native-order length prefix followed by the JSON body. The returned
-/// `Result` IS observed by the caller ([`run`]): an `Err` means the peer closed
-/// the read end of our stdout, so the ack channel is one-way and `run` stops
-/// serving. (A failed PERSIST is the separate, non-fatal case — there the caller
-/// acks `{"ok":false}` and keeps serving.)
+/// Write a native-messaging ack frame (`{"ok":<ok>}`) — length prefix + JSON
+/// body. The `Result` is observed by [`run`]: an `Err` means the peer closed our
+/// stdout's read end, so the channel is one-way and `run` stops serving. (A
+/// failed PERSIST is separate and non-fatal — there the caller acks false.)
 fn write_ack<W: Write>(writer: &mut W, ok: bool) -> std::io::Result<()> {
     let body = if ok {
         b"{\"ok\":true}".to_vec()
     } else {
         b"{\"ok\":false}".to_vec()
     };
-    // The ack is tiny and fixed; the cast cannot overflow u32.
+    // Tiny fixed body; the cast cannot overflow u32.
     let len = body.len() as u32;
     writer.write_all(&len.to_ne_bytes())?;
     writer.write_all(&body)?;
     writer.flush()
 }
 
-/// `tirith browser host` entry point. Reads native-messaging frames from
-/// `stdin` until EOF; for each valid frame, persists the record and acks. A
-/// `--json` flag does NOT apply here (the wire protocol is the interface), so
-/// the signature takes none.
-///
-/// Returns the process exit code:
-///   * `0` — clean EOF (the normal way Chrome ends the host).
-///   * `1` — fatal framing error (oversized prefix, truncated frame) or the
-///     state directory could not be resolved.
+/// `tirith browser host` entry point. Reads native-messaging frames from stdin
+/// until EOF, persisting + acking each valid frame. Exit `0` on clean EOF (how
+/// Chrome ends the host); `1` on a fatal framing error or an unresolvable state
+/// directory.
 pub fn run() -> i32 {
     let Some(out_path) = tirith_core::clipboard::source_file_path() else {
         eprintln!("tirith browser host: cannot resolve the tirith state directory");
@@ -198,10 +157,9 @@ pub fn run() -> i32 {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
 
-    // Each iteration computes whether the frame should ack ok/false (or is fatal,
-    // handled inline with an early `return`), then writes the ack ONCE at the
-    // bottom. The ack result is OBSERVED: a write failure means Chrome's read end
-    // of our stdout is gone, so the channel is one-way and we stop serving.
+    // Each iteration computes the ack value (or returns early on a fatal frame),
+    // then writes the ack ONCE at the bottom; a failed ack-write means Chrome's
+    // stdout read end is gone, so the channel is one-way and we stop serving.
     loop {
         // `false` = ack {"ok":false} (record dropped, keep serving); `true` = ok.
         let ack_ok: bool = match read_frame(&mut stdin) {
@@ -222,19 +180,13 @@ pub fn run() -> i32 {
             FrameRead::Frame(payload) => {
                 match parse_record(&payload) {
                     Some(record) => {
-                        // Re-serialize the VALIDATED record (not the raw bytes)
-                        // so only schema-clean JSON is ever written to the file
-                        // the engine reads. Pretty-printed to match the M12 ch1
-                        // on-disk form.
+                        // Re-serialize the VALIDATED record (pretty, M12 ch1 form)
+                        // so only schema-clean JSON reaches the file.
                         match serde_json::to_vec_pretty(&record) {
                             Ok(bytes) if !serialized_fits_read_cap(&bytes) => {
-                                // The wire-frame cap (256 KiB) is the first-line
-                                // defense, but the FILE-side reader caps at
-                                // `SOURCE_READ_CAP` (64 KiB): a 64–256 KiB record
-                                // would be ack'd ok, written, then be UNREADABLE by
-                                // the paste-provenance path. Reject it here so we
-                                // never persist a record the consumer can't read
-                                // back. Ack false; nothing touches disk.
+                                // A 64–256 KiB record frames fine but would be
+                                // UNREADABLE by the paste-provenance path — reject
+                                // it here. Ack false; nothing touches disk.
                                 eprintln!(
                                     "tirith browser host: dropped a record whose serialized form ({} bytes) exceeds the {SOURCE_READ_CAP}-byte read cap",
                                     bytes.len()
@@ -248,9 +200,7 @@ pub fn run() -> i32 {
                                         out_path.display()
                                     );
                                     // Persist failure: ack false, keep serving —
-                                    // a transient disk error should not kill the
-                                    // host mid-session. (This is a failed PERSIST,
-                                    // NOT a failed ack-write; the loop continues.)
+                                    // a transient disk error shouldn't kill the host.
                                     false
                                 } else {
                                     true
@@ -271,11 +221,9 @@ pub fn run() -> i32 {
             }
         };
 
-        // Observe the ack-write result. Unlike a failed PERSIST (transient, keep
-        // serving), a failed ACK-WRITE means the peer closed the read end of our
-        // stdout: the channel is now one-way (it could still feed us stdin while
-        // never seeing a reply). Continuing would let us read + persist records
-        // the peer can never confirm, so we stop serving.
+        // A failed ack-write (unlike a transient persist failure) means the peer
+        // closed our stdout's read end — the channel is one-way, so stop serving
+        // rather than persist records the peer can never confirm.
         if let Err(e) = write_ack(&mut stdout, ack_ok) {
             eprintln!(
                 "tirith browser host: failed to write ack frame ({e}); the peer's read end is gone, stopping"
@@ -284,26 +232,18 @@ pub fn run() -> i32 {
         }
     }
 
-    // Reached only via `break` above (broken ack channel). A clean EOF returns 0
-    // inline; an oversized/truncated frame returns 1 inline. Treat a dead ack
-    // channel as a normal-ish shutdown (the peer initiated the close) → exit 0.
+    // Reached only via the `break` above (broken ack channel) — treat the
+    // peer-initiated close as a normal shutdown.
     0
 }
 
-/// Persist `bytes` to `path` atomically (overwrite). Creates the parent
-/// directory first — `write_file_atomic` places its temp file in the
-/// destination's parent and renames over it, but does NOT itself `mkdir -p`, so
-/// on a fresh machine where `state_dir()/` does not exist yet the write would
-/// otherwise fail with `NotFound`. Thin wrapper over the shared
-/// `write_file_atomic` so the host and the rest of the CLI share one durable
-/// write implementation.
+/// Persist `bytes` to `path` atomically (overwrite), creating the parent dir
+/// first (`write_file_atomic` does not `mkdir -p`). Thin wrapper over the shared
+/// `write_file_atomic`.
 fn persist(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        // `write_file_atomic` fsyncs the FILE relative to its parent, but if the
-        // parent directory was just created on a fresh machine, a crash after the
-        // `{"ok":true}` ack could still lose the directory entry. Mirror the
-        // `commands init` durability pattern: fsync the parent only when it was
-        // newly created here. CodeRabbit.
+        // fsync the parent only when newly created, so a crash after the ack
+        // can't lose the directory entry (CodeRabbit; `commands init` pattern).
         let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)?;
         if !parent_existed {
@@ -345,14 +285,10 @@ mod tests {
         assert!(matches!(read_frame(&mut cursor), FrameRead::Eof));
     }
 
-    /// An oversized length prefix is rejected as `TooLarge` WITHOUT allocating
-    /// or reading the body. We prove the body is never read by providing a
-    /// reader that yields ONLY the 4-byte prefix and then panics if read again.
+    /// An oversized length prefix is rejected as `TooLarge` without reading the
+    /// body — proven by a reader that yields only the prefix, then panics.
     #[test]
     fn oversized_prefix_rejected_without_allocating() {
-        // A reader that hands out the prefix bytes, then panics on any further
-        // read — so if `read_frame` tried to read the (huge) body, the test
-        // would panic instead of returning TooLarge.
         struct PrefixOnlyThenPanic {
             prefix: [u8; 4],
             pos: usize,
@@ -483,16 +419,12 @@ mod tests {
         assert_eq!(back, rec);
     }
 
-    /// A schema-VALID record whose re-serialized (pretty) form exceeds the file-
-    /// side read cap (`SOURCE_READ_CAP`, 64 KiB) is rejected by
-    /// `serialized_fits_read_cap`, so the host never persists a record the
-    /// paste-provenance reader can't read back. The oversized record is still a
-    /// genuine `ClipboardSourceRecord` (it parses), proving the rejection is about
-    /// SIZE, not schema. A normal record fits.
+    /// A schema-VALID record whose serialized form exceeds the file-side read
+    /// cap is rejected by `serialized_fits_read_cap` (rejection is about SIZE,
+    /// not schema — it still parses). A normal record fits.
     #[test]
     fn oversized_serialized_record_is_rejected_before_persist() {
-        // A valid record with a `source_title` large enough that the pretty-printed
-        // serialization clears the 64 KiB read cap.
+        // A `source_title` large enough that serialization clears the read cap.
         let big_title = "A".repeat(SOURCE_READ_CAP as usize + 1);
         let record = tirith_core::clipboard::ClipboardSourceRecord {
             updated_at: "2026-05-30T00:00:00Z".to_string(),
@@ -501,8 +433,6 @@ mod tests {
             source_title: big_title,
             hidden_text_detected: false,
         };
-        // It round-trips through the wire framing as a VALID record (schema-clean),
-        // so the only reason to drop it is the read-cap check.
         let wire = frame(serde_json::to_vec(&record).unwrap().as_slice());
         let mut cursor = std::io::Cursor::new(wire.clone());
         let FrameRead::Frame(payload) = read_frame(&mut cursor) else {
@@ -510,8 +440,7 @@ mod tests {
         };
         let parsed = parse_record(&payload).expect("the record is schema-valid");
 
-        // The re-serialized (pretty) form is what the host would write — it exceeds
-        // the read cap, so the host must NOT persist it.
+        // The pretty form the host would write exceeds the read cap.
         let serialized = serde_json::to_vec_pretty(&parsed).unwrap();
         assert!(
             serialized.len() as u64 > SOURCE_READ_CAP,

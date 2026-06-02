@@ -1,32 +1,15 @@
 //! `tirith ssh guard|label` (M8 ch2).
 //!
-//! Two actions:
+//! * **`guard on|off|status`** — flips `policy.context_guard_enabled` (the same
+//!   M8 ch1 switch, so there's no second policy field to discover; the off
+//!   state silences SSH host-label findings too).
+//! * **`label <host> <criticality> [--scope user|repo]`** — writes one entry to
+//!   the SSH host-labels file. `~/.ssh/config` aliases are resolved at label
+//!   time via `ssh -G <host>` so the file stores the FINAL host string (the
+//!   rule then matches `ssh shortname` without re-resolving; 5s TTL cache).
 //!
-//! 1. **`guard on|off|status`** — flip `policy.context_guard_enabled`. M8 ch2
-//!    re-uses the M8 ch1 operator switch so the operational-context guard
-//!    can be flipped uniformly: SSH host-label findings are silenced when
-//!    the same flag is off. This avoids adding a second policy.yaml field
-//!    that operators would need to discover.
-//!
-//! 2. **`label <host> <criticality> [--scope user|repo]`** — write a
-//!    single entry into the SSH host-labels file
-//!    (`~/.config/tirith/ssh-host-labels.yaml` or
-//!    `<repo>/.tirith/ssh-host-labels.yaml`).
-//!
-//!    `~/.ssh/config` aliases are resolved at label time by shelling out
-//!    to `ssh -G <host>` and reading the canonical `hostname` line. The
-//!    labels file always stores the FINAL host string — this way the rule
-//!    can match `ssh shortname` without re-resolving every check (5s TTL
-//!    cache, identical pattern to `context_detect`).
-//!
-//! ### `bootstrap` is DEFERRED to M8.1
-//!
-//! `tirith ssh bootstrap <user@host>` will auto-scp the binary across to a
-//! remote host and install the hook there. We landed inspection / labeling
-//! first so the field-validation cycle can ship without the
-//! cross-host-binary-deploy complexity. The bootstrap stub here exits 2
-//! with a clear pointer at M8.1 so users typing the documented command get
-//! a real error instead of a "command not found".
+//! `bootstrap` is DEFERRED to M8.1: the stub exits 2 with a pointer, so the
+//! documented command gives a real error rather than "command not found".
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -36,9 +19,7 @@ use std::time::{Duration, Instant};
 
 use tirith_core::policy::{self as policy_mod, Policy};
 
-/// Allowed criticality values. Mirrors `cli::context::ALLOWED_CRITICALITIES`
-/// — we share the vocabulary so an operator who labeled `kube:prod` as
-/// `critical` can use the same word when labeling a host.
+/// Allowed criticality values, shared with `cli::context::ALLOWED_CRITICALITIES`.
 const ALLOWED_CRITICALITIES: &[&str] = &[
     "critical",
     "production",
@@ -52,8 +33,7 @@ const ALLOWED_CRITICALITIES: &[&str] = &[
     "test",
 ];
 
-/// Scope for `tirith ssh label` writes. Identical surface to
-/// `cli::context::LabelScope`.
+/// Scope for `tirith ssh label` writes (mirrors `cli::context::LabelScope`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelScope {
     User,
@@ -79,12 +59,8 @@ impl LabelScope {
 
 // ─── guard ─────────────────────────────────────────────────────────────────
 
-/// `tirith ssh guard on|off|status` — flip the operational-context switch.
-///
-/// Re-uses the M8 ch1 `context_guard_enabled` field. The operator-facing
-/// distinction (`tirith ssh guard` vs `tirith context guard`) is cosmetic
-/// — there is one policy switch under the hood. Documented in the
-/// `after_help` of both subcommands.
+/// `tirith ssh guard on|off|status` — flip the M8 ch1 `context_guard_enabled`
+/// field (`ssh guard` vs `context guard` is one switch under the hood).
 pub fn guard(action: &str, json: bool) -> i32 {
     let enable = match action {
         "on" | "enable" | "true" => true,
@@ -165,8 +141,8 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set the `context_guard_enabled` line in a policy YAML
-/// file. Append-or-rewrite semantics — never touches other lines.
+/// Idempotently set the `context_guard_enabled` line (append-or-rewrite, never
+/// touching other lines).
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -209,14 +185,10 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
 
 // ─── label ─────────────────────────────────────────────────────────────────
 
-/// `tirith ssh label <host> <criticality> [--scope user|repo]`.
-///
-/// Resolves `~/.ssh/config` aliases via `ssh -G <host>` so an operator who
-/// labels `prod-host` (their local alias) and later runs
-/// `ssh prod-host.example.com` (the real DNS name) gets a match. The
-/// labels file stores BOTH the raw input AND the resolved hostname
-/// whenever they differ — the rule at runtime only sees what the user
-/// typed at the shell, so the raw key has to round-trip.
+/// `tirith ssh label <host> <criticality> [--scope user|repo]`. Resolves
+/// `~/.ssh/config` aliases via `ssh -G <host>` and stores BOTH the raw input
+/// AND the resolved hostname when they differ (the runtime rule sees only the
+/// literal the user typed, so the raw key must round-trip).
 pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i32 {
     if host.trim().is_empty() {
         eprintln!("tirith ssh label: host is empty");
@@ -233,10 +205,8 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
     }
 
     let resolved_host = resolve_ssh_alias(host).unwrap_or_else(|| {
-        // Surface that the alias resolution failed so the operator knows
-        // labels may not catch DNS-name occurrences if `~/.ssh/config` is
-        // in play. We still proceed — labelling by the raw string is
-        // strictly more conservative than nothing.
+        // Resolution failed: warn that an alias may not match its DNS name, but
+        // still proceed — labeling the raw string is more conservative than nothing.
         eprintln!(
             "tirith ssh label: warning: `ssh -G {host}` failed (binary missing, timeout, or no hostname line); labeling raw input only — if {host} is an alias, runs against the resolved name will not match"
         );
@@ -260,14 +230,9 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
         },
     };
 
-    // Re-use `write_context_label` for the actual file write — the format
-    // is identical (flat YAML map of `key: value`).
-    //
-    // We write the RAW host input as the key first because the runtime
-    // rule looks up by the literal string the user typed at the shell. If
-    // the resolved hostname differs (alias → DNS name) we additionally
-    // write the resolved form so an operator who labels `prod-host`
-    // (alias) is also matched when they type `prod.example.com` directly.
+    // Write the RAW host input first (the runtime rule looks up the literal
+    // typed string); add the resolved form below when it differs, so labeling an
+    // alias also matches the DNS name. Same flat-YAML format as context labels.
     if let Err(e) = policy_mod::write_context_label(&target_path, host, criticality) {
         eprintln!(
             "tirith ssh label: failed to write {}: {e}",
@@ -316,12 +281,8 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
 
 // ─── bootstrap (M8.1 stub) ─────────────────────────────────────────────────
 
-/// `tirith ssh bootstrap user@host` — DEFERRED to M8.1.
-///
-/// Auto-scping the binary across hosts has scope-creep failure modes
-/// (PATH differences, libc mismatches, sudoers footguns) that deserve a
-/// dedicated PR with real field validation. M8 ch2 ships inspection +
-/// labeling only; this stub exits 2 with a pointer at the follow-up.
+/// `tirith ssh bootstrap user@host` — DEFERRED to M8.1 (cross-host binary
+/// deploy has too many failure modes for this PR); exits 2 with a pointer.
 pub fn bootstrap_stub(_target: &str, json: bool) -> i32 {
     let msg = "tirith ssh bootstrap: DEFERRED to M8.1 follow-up PR. \
                Run `tirith ssh label <host> <criticality>` for now; \
@@ -346,9 +307,8 @@ pub fn bootstrap_stub(_target: &str, json: bool) -> i32 {
 
 // ─── ssh -G alias resolution (with 5s cache) ───────────────────────────────
 
-/// Cached `ssh -G` outputs to avoid re-shelling on every label write in a
-/// scripted run. Same 5s TTL as `context_detect::CACHE_TTL_SECS` so the
-/// operator-facing surface feels uniform.
+/// Cached `ssh -G` outputs (5s TTL, matching `context_detect::CACHE_TTL_SECS`)
+/// to avoid re-shelling on every label write in a scripted run.
 static SSH_G_CACHE: Mutex<Option<SshGCache>> = Mutex::new(None);
 
 struct SshGCache {
@@ -359,18 +319,11 @@ struct SshGCache {
 const SSH_G_TTL: Duration = Duration::from_secs(5);
 const SSH_G_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Resolve an `~/.ssh/config` alias by shelling out to `ssh -G <host>`
-/// and reading the `hostname` line.
-///
-/// Returns `None` when `ssh` isn't on PATH, the call exceeds
-/// [`SSH_G_TIMEOUT`], or the output doesn't include a `hostname` line.
-/// The caller falls back to the raw host string in those cases — better
-/// to store the user's literal input than to fail the label entirely.
+/// Resolve a `~/.ssh/config` alias via `ssh -G <host>`'s `hostname` line.
+/// `None` when `ssh` is missing, the call exceeds [`SSH_G_TIMEOUT`], or there's
+/// no `hostname` line (the caller then keeps the raw host string).
 fn resolve_ssh_alias(input: &str) -> Option<String> {
-    // Strip optional `user@` prefix before resolving — `ssh -G user@host`
-    // is valid but we want the bare host for the cache key. We re-attach
-    // the user@ at return time if the resolved host doesn't already
-    // carry one.
+    // Strip any `user@` prefix for the cache key, re-attaching at return time.
     let (user_prefix, host_only) = match input.split_once('@') {
         Some((u, h)) => (Some(u), h),
         None => (None, input),
@@ -386,8 +339,7 @@ fn resolve_ssh_alias(input: &str) -> Option<String> {
 }
 
 fn reattach_user(user_prefix: Option<&str>, host: &str) -> String {
-    // Avoid double-prefixing if `ssh -G` already returned a `user@host`
-    // form (it shouldn't, but defensive).
+    // Defensive: don't double-prefix if `host` already carries a `user@`.
     if host.contains('@') {
         return host.to_string();
     }
@@ -431,7 +383,7 @@ fn run_ssh_g(host: &str) -> Option<String> {
         .stdin(Stdio::null());
     let mut child = cmd.spawn().ok()?;
 
-    // Stream stdout on a helper thread so the pipe doesn't fill.
+    // Stream stdout on a helper thread so the pipe can't fill.
     let stdout_handle = child.stdout.take().map(|mut s| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();

@@ -3,10 +3,8 @@ use std::path::Path;
 use tirith_core::rules::cloaking;
 
 /// `tirith fetch --save <path> <url>` — download `url` to `path` (no execution)
-/// and mark `path` tainted in the local taint store. The downloaded file is
-/// kept at the known `path` YOU chose, so a later `bash <path>` / `source
-/// <path>` fires the engine's tainted-file rule. Unlike `tirith run`, nothing
-/// is executed and the file is not in a temp dir that gets cleaned up.
+/// and mark `path` tainted, so a later `bash <path>` / `source <path>` fires the
+/// engine's tainted-file rule. Unlike `tirith run`, nothing is executed.
 pub fn save(url: &str, save_path: &str, sha256: Option<String>, json: bool) -> i32 {
     let dest = Path::new(save_path);
 
@@ -15,13 +13,8 @@ pub fn save(url: &str, save_path: &str, sha256: Option<String>, json: bool) -> i
         Err(e) => {
             if json {
                 let err = serde_json::json!({ "error": e });
-                // Propagate a broken `--json` write (CodeRabbit R16 #4): a
-                // consumer that asked for `--json` must not receive the semantic
-                // download-failure code (1) while its JSON never arrived. Route
-                // through the write-STATUS-returning path and exit with the
-                // JSON-write-failure code (2) when the write fails — consistent
-                // with the success path below and the other CLI presenters
-                // (e.g. `secret rotate`). Exit 1 only when the JSON was delivered.
+                // CodeRabbit R16 #4: on a broken `--json` write, exit 2 (JSON-write
+                // failure), not 1 (download failure) — the JSON never arrived.
                 if !super::write_json_stdout(
                     &err,
                     "tirith fetch --save: failed to write JSON output",

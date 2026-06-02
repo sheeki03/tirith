@@ -1,42 +1,18 @@
 //! M13 ch3 — `tirith dashboard` snapshot model + self-contained HTML renderer.
 //!
-//! This module is the SECURITY-SENSITIVE half of the dashboard feature: it
-//! assembles a [`DashboardSnapshot`] (pure, serde-serializable data — no HTML)
-//! from existing read-only sources, then renders it into a STATIC,
-//! self-contained HTML report from an embedded template.
-//!
-//! # Data sources (all read-only; degrade to "unavailable")
-//!
-//! * **Audit summary** — a 7-day window over the JSONL audit log read by
-//!   [`crate::audit_aggregator::read_log`] + [`crate::audit_aggregator::compute_stats`].
-//!   Counts by action, top findings (rule IDs), and a best-effort top-hosts
-//!   tally extracted from the already-REDACTED command previews.
-//! * **Policy** — built by [`build_policy_summary`] from
-//!   [`crate::policy::Policy::discover_local_only`] (a STRICT LOCAL parse — it
-//!   walks up for a local `policy.yaml`/`.yml` plus local overlays and performs
-//!   NO network fetch) summarized (paranoia, fail mode, allowlist / blocklist /
-//!   custom-rule counts).
-//! * **Threat DB** — [`crate::threatdb::ThreatDb`] header/stats, mirroring
-//!   `tirith threat-db status`. Degrades to "not installed".
-//! * **Trust + canaries** — the user/repo `trust.json` stores (read directly,
-//!   the same format `tirith trust` writes) and [`crate::canary::list`].
-//! * **Shell hook** — supplied by the CLI caller (it owns the read-only profile
-//!   probe `tirith onboard` / `doctor` use); core never materializes hooks.
+//! Assembles a [`DashboardSnapshot`] (pure serde data, no HTML) from read-only
+//! sources (audit log, policy, threat DB, trust/canary stores, caller-supplied
+//! shell-hook state — each degrades to "unavailable"), then renders it into a
+//! static self-contained HTML report from an embedded template.
 //!
 //! # The escaping invariant (local-report XSS)
 //!
-//! Audit entries carry redacted command previews and file paths built from
-//! USER-CONTROLLED bytes. Interpolating them raw into HTML is a local-report
-//! XSS: a pasted `<script>…` would execute when the operator opens the file (or
-//! views it over the loopback `serve`). Therefore EVERY value substituted into
-//! the template passes through [`html_escape`] — [`render_html`] has no
-//! "raw/unescaped" interpolation path. See `escaping_neutralizes_script_tag`.
-//!
-//! The snapshot itself stores RAW (unescaped) strings — escaping happens only at
-//! the HTML boundary. The `--json` surface emits the raw snapshot (JSON is not an
-//! HTML execution context; a consumer that re-renders it into HTML is
-//! responsible for its own escaping, exactly as with every other tirith `--json`
-//! output).
+//! Audit previews/paths are USER-CONTROLLED bytes; interpolating them raw is a
+//! local-report XSS (a pasted `<script>…` would execute on open / loopback
+//! `serve`). EVERY value substituted into the template passes through
+//! [`html_escape`] — [`render_html`] has no raw-interpolation path. The snapshot
+//! stores RAW strings; escaping happens only at the HTML boundary. `--json`
+//! emits the raw snapshot (a re-rendering consumer owns its own escaping).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -51,18 +27,11 @@ pub const DEFAULT_WINDOW_DAYS: i64 = 7;
 /// How many top findings / hosts the snapshot surfaces.
 const TOP_N: usize = 10;
 
-/// The embedded HTML template. Compiled into the binary so the report is
-/// self-contained and the CLI never has to locate an on-disk asset.
+/// The embedded HTML template — compiled in so the report is self-contained.
 const TEMPLATE_HTML: &str = include_str!("../assets/dashboard/template.html");
 
-// ---------------------------------------------------------------------------
-// Snapshot model — PURE DATA. No HTML, no I/O. serde-serializable for `--json`.
-// ---------------------------------------------------------------------------
-
-/// A point-in-time, local-only security snapshot. Pure data: assembled by
-/// [`build_snapshot`], rendered by [`render_html`], or serialized as-is for
-/// `--json`. Strings are stored RAW (unescaped); escaping is applied only when
-/// rendering HTML.
+/// A point-in-time, local-only security snapshot. Strings are stored RAW;
+/// escaping is applied only when rendering HTML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     /// Stable schema version (bump on a breaking field change).
@@ -103,22 +72,17 @@ pub struct AuditSummary {
     pub actions: Vec<(String, usize)>,
     /// Top rule IDs by occurrence (descending), capped at [`TOP_N`].
     pub top_findings: Vec<(String, usize)>,
-    /// Top hosts by occurrence (descending), capped at [`TOP_N`]. Best-effort:
-    /// extracted from the REDACTED command previews, so it may be empty even
-    /// when commands were seen.
+    /// Top hosts by occurrence (descending), capped at [`TOP_N`]. Best-effort,
+    /// from the REDACTED previews — may be empty even when commands were seen.
     pub top_hosts: Vec<(String, usize)>,
     /// Audit lines that failed to parse (surfaced so a corrupt log is visible).
     pub skipped_lines: usize,
 }
 
-/// The effective policy values the dashboard surfaces when a policy
-/// successfully resolved (either the built-in defaults or a parsed file, in
-/// both cases with the user/org/trust overlays applied).
-///
-/// These fields are shared by [`PolicySummary::NoFile`] and
-/// [`PolicySummary::Valid`]; they are flattened into each of those variants so
-/// the `--json` shape carries them at the same level as before
-/// (`{"state":"no_file","paranoia":1,…}`), only now under a `state` tag.
+/// Effective policy values when a policy resolved (built-in defaults or a
+/// parsed file, both with user/org/trust overlays applied). `#[serde(flatten)]`
+/// into [`PolicySummary::NoFile`]/[`Valid`] so `--json` carries them at the same
+/// level as before, under a `state` tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyValues {
     /// Paranoia tier (1–4).
@@ -135,61 +99,34 @@ pub struct PolicyValues {
     pub custom_rules_count: usize,
 }
 
-/// A summary of the effective discovered policy.
+/// Summary of the effective discovered policy.
 ///
-/// Three states are distinguished so the dashboard never presents a BROKEN
-/// policy as benign built-in defaults (a misleading fail-open dashboard —
-/// CodeRabbit M13 PR #132 R5-1). Modeling them as an ENUM rather than a flat
-/// struct of `Option` fields makes the contradictory "fail-open lie" state
-/// (an `error` set ALONGSIDE populated paranoia / counts) UNREPRESENTABLE by
-/// construction — the renderer and every `--json` consumer can only observe
-/// one of the three real states:
+/// Three states so the dashboard never presents a BROKEN policy as benign
+/// defaults (the "fail-open lie" — CodeRabbit M13 PR #132 R5-1). An enum rather
+/// than a flat struct of `Option`s makes the contradictory state (an `error`
+/// ALONGSIDE populated counts) UNREPRESENTABLE: `ParseError` has no numeric
+/// fields, since a policy that did not load has no known paranoia/counts.
 ///
-/// * **`NoFile`** — no local policy file was discovered, so the genuine
-///   built-in defaults (plus the read-only user/org/trust overlays) apply.
-///   Carries the effective [`PolicyValues`]; there is no path and no error.
-/// * **`Valid`** — a local policy file parsed successfully. Carries its `path`
-///   and the effective [`PolicyValues`] (parsed values + overlays).
-/// * **`ParseError`** — a policy file is present but unparseable (or otherwise
-///   unreadable). Carries the `path` that failed and the `error`, and CANNOT
-///   carry any numeric values: a policy that did not load has NO known
-///   paranoia / fail mode / counts, so surfacing zeros/defaults here would be
-///   the exact fail-open lie this representation exists to prevent.
-///
-/// # serde representation
-///
-/// Internally tagged on a `state` discriminator, snake-cased, so JSON consumers
-/// see `{"state":"no_file",…}` / `{"state":"valid",…}` /
-/// `{"state":"parse_error",…}`. The `NoFile`/`Valid` variants `#[serde(flatten)]`
-/// their [`PolicyValues`], so the numeric fields sit at the top level of the
-/// `policy` object exactly as they did before this became an enum (only the
-/// `state` tag and, for `Valid`, the `path` are new there).
+/// serde: internally tagged on a snake_cased `state` discriminator; `NoFile`/
+/// `Valid` `#[serde(flatten)]` their [`PolicyValues`] so the numeric fields sit
+/// at the top level of the `policy` object as before the enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PolicySummary {
-    /// No local policy file was discovered — genuine built-in defaults (+ the
-    /// read-only overlays) apply.
+    /// No local policy file discovered — genuine built-in defaults + overlays.
     NoFile {
-        /// The effective values (built-in defaults + user/org/trust overlays).
         #[serde(flatten)]
         values: PolicyValues,
     },
     /// A local policy file parsed successfully.
     Valid {
-        /// The discovered policy file path.
         path: String,
-        /// The effective values (parsed policy + user/org/trust overlays).
         #[serde(flatten)]
         values: PolicyValues,
     },
-    /// A policy file is present but could not be loaded/parsed. Carries no
-    /// numeric values by construction — the fail-closed state.
-    ParseError {
-        /// The path of the file that failed to load.
-        path: String,
-        /// The load/parse failure reason.
-        error: String,
-    },
+    /// A policy file is present but unparseable — the fail-closed state, no
+    /// numeric values by construction.
+    ParseError { path: String, error: String },
 }
 
 /// Threat-DB status, mirroring `tirith threat-db status`.
@@ -224,8 +161,8 @@ pub struct TrustSummary {
     pub canary_with_callback: usize,
 }
 
-/// Shell-hook install state. Populated by the CLI caller (which owns the
-/// read-only profile probe); core does not detect or materialize hooks.
+/// Shell-hook install state. Populated by the CLI caller; core never detects
+/// or materializes hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookSummary {
     /// The detected interactive shell (e.g. `"zsh"`), or `"unknown"`.
@@ -234,22 +171,9 @@ pub struct HookSummary {
     pub installed: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot assembly
-// ---------------------------------------------------------------------------
-
-/// Assemble a [`DashboardSnapshot`].
-///
-/// * `audit_log` — path to the JSONL audit log, or `None` to use the default
-///   ([`crate::audit::audit_log_path`]). When the file is absent or unreadable
-///   the `audit` field degrades to `None` rather than failing.
-/// * `cwd` — directory used for policy / trust discovery (walks up to `.git`).
-///   `None` uses the process cwd.
-/// * `hook` — shell-hook state from the caller's read-only probe.
-///
-/// Pure with respect to the working tree: it only READS the audit log, policy,
-/// threat DB, trust stores, and canary store. It never writes or materializes
-/// anything.
+/// Assemble a [`DashboardSnapshot`]. `audit_log` `None` uses the default path;
+/// `cwd` `None` uses the process cwd for policy/trust discovery (walks to
+/// `.git`); `hook` is the caller's read-only probe. Read-only — never writes.
 pub fn build_snapshot(
     audit_log: Option<&Path>,
     cwd: Option<&str>,
@@ -284,22 +208,11 @@ fn build_audit_summary(audit_log: Option<&Path>, since: &str, until: &str) -> Op
         Some(p) => p.to_path_buf(),
         None => crate::audit::audit_log_path()?,
     };
-    // HARDENED READ (CodeRabbit M13 PR #132): the audit log path can be
-    // caller-supplied (`audit_log`) or the default state-dir path; either way a
-    // plain `std::fs::read_to_string` (what `audit_aggregator::read_log` uses)
-    // follows symlinks, applies no size cap, and would BLOCK on a FIFO/device —
-    // so a log symlinked at `/dev/zero` (or an unbounded file) could hang or OOM
-    // the render. This was the MISSED read path: the policy/trust reads were
-    // already hardened in earlier rounds. Route the read through the shared,
-    // race-free `read_regular_capped` (opens with `O_NONBLOCK`, `fstat`s the
-    // OPEN fd to reject non-regular files without blocking, and caps the body),
-    // then feed the bounded content to `audit_aggregator::parse_log` for the
-    // SAME parse + malformed-line accounting `read_log` performs. A read error
-    // (absent / non-regular / oversize / unreadable) degrades to `None`, exactly
-    // like the previous `.exists()` + `read_log(..).ok()?` — never a panic or
-    // hang. (The prior `path.exists()` precheck is dropped: it was a TOCTOU-prone
-    // duplicate of the open, and `read_regular_capped`'s `NotFound` already maps
-    // to the same `None` degrade.)
+    // HARDENED READ (CodeRabbit M13 PR #132): the (possibly caller-supplied)
+    // log path goes through race-free `read_regular_capped` (O_NONBLOCK +
+    // fstat-the-open-fd + size cap) so a symlink-to-/dev/zero or unbounded log
+    // can't hang/OOM the render, then `parse_log` for the same malformed-line
+    // accounting as `read_log`. Any read error degrades to `None`.
     let bytes = crate::util::read_regular_capped(&path, AUDIT_READ_CAP).ok()?;
     let content = String::from_utf8(bytes).ok()?;
     let read = audit_aggregator::parse_log(&content, Some(&path));
@@ -330,13 +243,9 @@ fn build_audit_summary(audit_log: Option<&Path>, since: &str, until: &str) -> Op
     })
 }
 
-/// Best-effort top-hosts tally from the REDACTED command previews.
-///
-/// The audit `command_redacted` field is DLP-redacted and truncated to 80
-/// bytes, so this is intentionally lossy — a host whose URL was truncated or
-/// redacted simply does not appear. We reuse the engine's own URL extractor
-/// (`extract::extract_urls`) + host parser (`parse::extract_raw_host`) so the
-/// notion of "a host" matches the rest of tirith rather than a bespoke regex.
+/// Best-effort top-hosts tally from the REDACTED previews. Intentionally lossy
+/// (the field is DLP-redacted + truncated to 80 bytes). Reuses the engine's own
+/// URL extractor + host parser so "a host" matches the rest of tirith.
 fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for r in records {
@@ -352,37 +261,26 @@ fn top_hosts(records: &[AuditRecord]) -> Vec<(String, usize)> {
         }
     }
     let mut hosts: Vec<(String, usize)> = counts.into_iter().collect();
-    // Sort by descending count, then host name for a stable, deterministic order.
+    // Descending count, then host name, for a deterministic order.
     hosts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     hosts.truncate(TOP_N);
     hosts
 }
 
-/// Read cap for the discovered local policy file. A `.tirith/policy.yaml` is a
-/// small hand-authored document; 1 MiB is far above any legitimate size and
-/// bounds the in-memory buffer when the path is attacker-influenced.
+/// Read cap for the discovered local policy file (a small hand-authored doc).
 const POLICY_READ_CAP: u64 = 1024 * 1024;
 
-/// Read cap for the JSONL audit log. Unlike the policy/trust files this is an
-/// append-only machine-written log that legitimately grows over time and has no
-/// in-tree rotation, so the cap is much larger — 64 MiB, mirroring the order of
-/// magnitude of the runner's 10 MiB download cap but with generous headroom for
-/// a long-lived log. The cap exists only to bound the in-memory buffer (and to
-/// not block on a FIFO / not follow a symlink to a device) when `audit_log` is
-/// attacker-influenced; on the (rare) over-cap log the dashboard degrades to an
-/// empty audit summary rather than buffering an unbounded file. The 7-day window
-/// filter runs over whatever fits, so a normally-sized log is always summarized
-/// in full.
+/// Read cap for the JSONL audit log. Larger (64 MiB) since the log is
+/// machine-written, append-only, and unrotated; bounds the in-memory buffer
+/// (and won't block on a FIFO / follow a symlink to a device). An over-cap log
+/// degrades to an empty audit summary.
 const AUDIT_READ_CAP: u64 = 64 * 1024 * 1024;
 
-/// Read cap for a `trust.json` store. The dashboard only counts entries, so even
-/// a large store is bounded well under this for the snapshot's purposes.
+/// Read cap for a `trust.json` store (the dashboard only counts entries).
 const TRUST_READ_CAP: u64 = 1024 * 1024;
 
-/// Render a [`crate::util::OpenRegularError`] as a short, human-readable reason
-/// for the dashboard's policy `error` state. `OpenRegularError` has no `Display`
-/// impl (callers elsewhere match its variants), so map each variant here, keeping
-/// the wording consistent with the FIFO/device/oversize hardening it reports.
+/// Render a [`crate::util::OpenRegularError`] as a short reason for the policy
+/// `error` state (the type has no `Display` impl).
 fn open_error_text(e: &crate::util::OpenRegularError) -> String {
     match e {
         crate::util::OpenRegularError::NotFound => "file not found".to_string(),
@@ -394,73 +292,36 @@ fn open_error_text(e: &crate::util::OpenRegularError) -> String {
     }
 }
 
-/// Summarize the EFFECTIVE policy the engine enforces, while still surfacing a
-/// broken LOCAL policy file rather than masking it as benign defaults.
+/// Summarize the EFFECTIVE policy the engine enforces, OFFLINE, while still
+/// surfacing a broken LOCAL file rather than masking it as benign defaults.
 ///
-/// # Two concerns, two mechanisms
+/// Two concerns:
 ///
-/// 1. **Counts must match what `analyze()` actually enforces — but OFFLINE.**
-///    The engine does NOT enforce the bare local `policy.yaml`: in
-///    `engine::analyze_inner` it builds the effective policy as
-///    `Policy::discover(cwd)` (local resolution + optional remote replacement +
-///    incident `apply_runtime_overrides`) followed by the read-only overlay
-///    helpers `load_user_lists()`, `load_org_lists(cwd)` and
-///    `load_trust_entries(cwd)`. Those overlays APPEND to `allowlist`,
-///    `allowlist_rules` and `blocklist` (user/org flat-file lists + non-expired
-///    `trust.json` entries). Summarizing only the strict local parse (round 5)
-///    UNDER-reports the active allow/block counts versus enforcement (CodeRabbit
-///    M13 PR #132 R6-1). So we reproduce that sequence here for the COUNTS — but
-///    via `Policy::discover_local_only(cwd)` rather than `Policy::discover`,
-///    because the dashboard is a local, offline reporting surface whose embedded
-///    report promises it "makes no network calls". `discover` would fetch the
-///    REMOTE policy whenever a policy server is configured (env or local file);
-///    `discover_local_only` mirrors `discover`'s LOCAL behavior (local file +
-///    incident overrides) while skipping every remote-fetch branch, so a render
-///    can never hit the network (CodeRabbit M13 PR #132 R9-2). The local file +
-///    user/org/trust overlays is the effective LOCAL policy, with zero I/O off
-///    the box.
+/// 1. Counts must match enforcement. `engine::analyze_inner` applies the local
+///    policy PLUS the read-only overlays (`load_user_lists` + `load_org_lists` +
+///    `load_trust_entries`, which APPEND to allow/block lists); summarizing only
+///    the strict local parse under-reports them (CodeRabbit R6-1). We reproduce
+///    that here via `discover_local_only` (NOT `discover`) so the render never
+///    fetches a remote policy — the report promises "no network calls"
+///    (CodeRabbit R9-2).
+/// 2. A broken local file must not read as safe defaults. `Policy::discover`
+///    fails closed SILENTLY, so a malformed file would render as a populated
+///    summary — the fail-open lie (CodeRabbit R5-1). So we additionally do a
+///    STRICT local parse to DETECT it and set the `error` state.
 ///
-/// 2. **A broken local file must NOT read as safe defaults.** `Policy::discover`
-///    fails CLOSED on an unparseable named file (it returns a block-everything
-///    policy, not the open default) — but it does so SILENTLY for the dashboard:
-///    a malformed `.tirith/policy.yaml` would render as a populated summary with
-///    no indication that the operator's real policy never loaded. On a security
-///    dashboard that is the fail-open lie this representation exists to prevent
-///    (CodeRabbit M13 PR #132 R5-1). So we ADDITIONALLY do a STRICT local parse
-///    (the same `discover_local_policy_path` + [`crate::policy::Policy::try_parse_yaml`]
-///    idiom `tirith policy validate` uses) purely to DETECT a broken local file
-///    and set the `error` state.
-///
-/// # Resulting states
-///
-/// * Broken LOCAL policy file → `error` populated, numeric fields `None`, `path`
-///   set (the hard-error state; takes precedence — counts are meaningless when
-///   the operator's file did not load).
-/// * No local policy file → the effective defaults + overlays (NOT an error;
-///   the common fresh-install case). `path` is `None` only when discovery found
-///   no file at all.
-/// * Valid local policy file → the EFFECTIVE summary (local parse + overlays),
-///   `error` `None`.
-///
-/// Overlay application is non-fatal: each `load_*` helper is itself read-only and
-/// degrades internally (a corrupt overlay source is skipped with a diagnostic,
-/// never a panic), so the strict local parse is the only hard-error state.
+/// States: broken file → `ParseError` (takes precedence); no file → defaults +
+/// overlays; valid file → effective summary. Overlays are non-fatal (each
+/// `load_*` is read-only and degrades internally).
 fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
-    // (1) Strict local parse FIRST — this is the ONLY hard-error state. A
-    // present-but-unparseable local file must surface as "unavailable" instead
-    // of any populated summary (which `Policy::discover`'s fail-closed default
-    // would otherwise silently present).
+    // (1) Strict local parse FIRST — the ONLY hard-error state. A
+    // present-but-unparseable file must surface as "unavailable", not the
+    // populated summary `Policy::discover`'s fail-closed default would present.
     if let Some(path) = crate::policy::discover_local_policy_path(cwd) {
         let path_str = path.display().to_string();
-        // HARDENED READ (CodeRabbit M13 PR #132 R23): `discover_local_policy_path`
-        // returns a repo-CONTROLLED path. A plain `std::fs::read_to_string` follows
-        // symlinks, applies no size cap, and would BLOCK on a FIFO/device — so a
-        // `.tirith/policy.yaml` symlinked at `/dev/zero` (or a multi-GiB file) could
-        // hang or OOM the render. Route through the shared, race-free
-        // `read_regular_capped`: it opens with `O_NONBLOCK`, `fstat`s the OPEN fd
-        // (rejecting non-regular files without blocking), and caps the body. Its
-        // error maps into the SAME `policy_summary_error` fail-closed state a read
-        // failure already produced, preserving the `path_str` context.
+        // HARDENED READ (CodeRabbit M13 PR #132 R23): the repo-controlled path
+        // goes through race-free `read_regular_capped` (O_NONBLOCK + fstat +
+        // cap) so a symlink-to-/dev/zero or multi-GiB file can't hang/OOM the
+        // render. Its error maps into the same `policy_summary_error` state.
         let content = match crate::util::read_regular_capped(&path, POLICY_READ_CAP) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => s,
@@ -483,18 +344,11 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
         }
     }
 
-    // (2) Local file parsed (or there is none): build the EFFECTIVE LOCAL
-    // policy the same way `engine::analyze_inner` does, so the surfaced counts
-    // match what is actually enforced (local discovery + the read-only overlay
-    // helpers). We use `discover_local_only` rather than `discover` so the
-    // dashboard NEVER makes a network call: `discover` would invoke
-    // `fetch_remote_policy` whenever `TIRITH_SERVER_URL`+`TIRITH_API_KEY` (or
-    // the local file's `policy_server_url`/`policy_server_api_key`) are set, but
-    // the embedded report promises it "makes no network calls" and is a local,
-    // offline reporting surface (CodeRabbit M13 PR #132 R9-2). The local-only
-    // path still applies the incident-mode runtime overrides (a local concern).
-    // Each overlay is internally non-fatal (read-only, degrades on a corrupt
-    // source).
+    // (2) File parsed (or absent): build the effective LOCAL policy as
+    // `analyze_inner` does (local discovery + read-only overlays) so counts
+    // match enforcement, but via `discover_local_only` so the dashboard never
+    // fetches a remote policy (CodeRabbit M13 PR #132 R9-2). Still applies
+    // incident-mode runtime overrides (a local concern).
     let mut policy = crate::policy::Policy::discover_local_only(cwd);
     policy.load_user_lists();
     policy.load_org_lists(cwd);
@@ -519,9 +373,8 @@ fn policy_values_from(policy: &crate::policy::Policy) -> PolicyValues {
     }
 }
 
-/// Build a populated [`PolicySummary`] from a successfully-loaded policy. The
-/// presence of a discovered `path` selects [`PolicySummary::Valid`] (a real
-/// file parsed) vs [`PolicySummary::NoFile`] (genuine built-in defaults).
+/// Build a populated [`PolicySummary`]; a discovered `path` selects `Valid`,
+/// its absence `NoFile` (built-in defaults).
 fn policy_summary_from(policy: &crate::policy::Policy, path: Option<String>) -> PolicySummary {
     let values = policy_values_from(policy);
     match path {
@@ -530,9 +383,7 @@ fn policy_summary_from(policy: &crate::policy::Policy, path: Option<String>) -> 
     }
 }
 
-/// Build the fail-closed [`PolicySummary::ParseError`] for a present-but-
-/// unparseable policy file. By construction it carries NO numeric values — a
-/// policy that did not load has no known paranoia / fail mode / counts.
+/// Build the fail-closed [`PolicySummary::ParseError`] (no numeric values).
 fn policy_summary_error(path: String, error: String) -> PolicySummary {
     PolicySummary::ParseError { path, error }
 }
@@ -592,10 +443,8 @@ fn build_threatdb_summary() -> ThreatDbSummary {
     }
 }
 
-/// The minimal `trust.json` shape needed to count non-expired entries. Mirrors
-/// the format `tirith trust` writes (`{version, entries:[{ttl_expires, …}]}`),
-/// but kept local + lenient (extra fields ignored) so core does not depend on
-/// the CLI crate's struct.
+/// Minimal lenient `trust.json` shape for counting non-expired entries (so core
+/// does not depend on the CLI crate's struct).
 #[derive(Debug, Deserialize)]
 struct TrustStoreFile {
     #[serde(default)]
@@ -615,16 +464,11 @@ fn count_trust_entries(path: &Path) -> usize {
 }
 
 /// Inner of [`count_trust_entries`] with the comparison instant injected, so the
-/// `>= now` boundary is deterministically testable (a literal `Utc::now()`
-/// entry advances past `now` before the check runs, hiding the `>` vs `>=`
-/// distinction).
+/// `>= now` boundary is deterministically testable.
 fn count_trust_entries_at(path: &Path, now: chrono::DateTime<chrono::Utc>) -> usize {
-    // HARDENED READ (CodeRabbit M13 PR #132 R23): `path` is a repo-CONTROLLED
-    // `.tirith/trust.json`. As with the policy read above, a plain
-    // `read_to_string` would follow a symlink to a FIFO/device (blocking the
-    // render) or apply no size cap. Route through the race-free
-    // `read_regular_capped`; a non-regular/oversize/unreadable file collapses to
-    // the SAME zero-count safe path a missing-or-unparseable file already takes.
+    // HARDENED READ (CodeRabbit M13 PR #132 R23): the repo-controlled path goes
+    // through race-free `read_regular_capped`; a non-regular/oversize/unreadable
+    // file collapses to the same zero-count path a missing file takes.
     let Ok(bytes) = crate::util::read_regular_capped(path, TRUST_READ_CAP) else {
         return 0;
     };
@@ -640,18 +484,12 @@ fn count_trust_entries_at(path: &Path, now: chrono::DateTime<chrono::Utc>) -> us
         .filter(|e| match &e.ttl_expires {
             None => true, // permanent
             Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
-                // `>= now`, not `> now`: `Policy::merge_trust_store` only expires
-                // an entry when `expiry < now`, so an entry whose `ttl_expires`
-                // is EXACTLY `now` is still ACTIVE at runtime. Match that boundary
-                // so the snapshot's live-trust count agrees with what the engine
-                // enforces (CodeRabbit M13 PR #132 R17-2).
+                // `>= now`, not `> now`: `merge_trust_store` only expires when
+                // `expiry < now`, so `ttl_expires == now` is still active
+                // (CodeRabbit M13 PR #132 R17-2).
                 Ok(expiry) => expiry >= now,
-                // An unparseable expiry is treated as EXPIRED (inactive), matching
-                // runtime trust enforcement, which skips entries whose `ttl_expires`
-                // cannot be parsed rather than honoring them. Counting a malformed
-                // TTL as active would overstate the live trust surface in the
-                // snapshot relative to what the engine actually applies
-                // (CodeRabbit M13 PR #132 R3-2).
+                // Unparseable TTL = expired, matching runtime enforcement which
+                // skips it; counting it active would overstate trust (R3-2).
                 Err(_) => false,
             },
         })
@@ -681,43 +519,29 @@ fn build_trust_summary(cwd: Option<&str>) -> TrustSummary {
     }
 }
 
-// ---------------------------------------------------------------------------
 // HTML rendering — the ONLY place snapshot strings cross into HTML.
-// ---------------------------------------------------------------------------
 
-/// Number of random bytes in a `serve` token before hex-encoding. 32 bytes =
-/// 256 bits of OS entropy → a 64-char hex token.
+/// Random bytes in a `serve` token before hex-encoding (32 bytes = 256 bits).
 const SERVE_TOKEN_BYTES: usize = 32;
 
-/// Generate a fresh ephemeral token for `tirith dashboard serve`:
-/// [`SERVE_TOKEN_BYTES`] of OS entropy, lower-hex encoded.
-///
-/// Uses `getrandom::fill` — the SAME OS CSPRNG the canary store and the
-/// per-install baseline salt draw from (no new crypto dependency). It lives in
-/// core so the CLI does not need its own RNG dep. On the (astronomically
-/// unlikely) event entropy is unavailable it returns `Err` rather than emitting
-/// a guessable token — a weak token would defeat the whole loopback guard.
+/// Generate a fresh ephemeral `tirith dashboard serve` token: [`SERVE_TOKEN_BYTES`]
+/// of OS entropy (via `getrandom::fill`), lower-hex encoded. Returns `Err` if
+/// entropy is unavailable rather than emit a guessable token (which would defeat
+/// the loopback guard).
 pub fn generate_serve_token() -> Result<String, String> {
     let mut buf = [0u8; SERVE_TOKEN_BYTES];
     getrandom::fill(&mut buf).map_err(|e| format!("OS RNG unavailable: {e}"))?;
     let mut hex = String::with_capacity(SERVE_TOKEN_BYTES * 2);
     for b in buf {
         use std::fmt::Write as _;
-        // Infallible write into a String.
         let _ = write!(hex, "{b:02x}");
     }
     Ok(hex)
 }
 
-/// Escape HTML special characters for safe interpolation into the report.
-///
-/// The order matters: `&` MUST be escaped FIRST, otherwise the `&` introduced
-/// by a later replacement (e.g. `<` → `&lt;`) would itself be re-escaped into
-/// `&amp;lt;`. After that the remaining characters are independent.
-///
-/// Covers the five characters that can break out of HTML text / attribute
-/// contexts: `&`, `<`, `>`, `"`, `'`. (`'` is escaped as the numeric
-/// `&#x27;` because the named `&apos;` is not defined in HTML4.)
+/// Escape the five HTML-breaking chars (`&`, `<`, `>`, `"`, `'`; `'` as the
+/// numeric `&#x27;`). `&` MUST be escaped FIRST so a `&` introduced by a later
+/// replacement isn't re-escaped into `&amp;lt;`.
 pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -726,14 +550,11 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Render a [`DashboardSnapshot`] into a self-contained HTML report.
-///
-/// EVERY interpolated value passes through [`html_escape`]; there is no
-/// raw-interpolation path. Numeric values are formatted via `format!` (no
-/// user-controlled bytes) but still composed only into escaped text nodes.
+/// Render a [`DashboardSnapshot`] into a self-contained HTML report. EVERY
+/// interpolated value passes through [`html_escape`]; no raw-interpolation path.
 pub fn render_html(snap: &DashboardSnapshot) -> String {
-    // The full substitution table. The values are pre-escaped here so the
-    // template fill is a single uniform pass — no caller can add a "raw" entry.
+    // Pre-escaped substitution table — the template fill is one uniform pass,
+    // so no caller can add a "raw" entry.
     let block_rate = snap
         .audit
         .as_ref()
@@ -789,16 +610,11 @@ pub fn render_html(snap: &DashboardSnapshot) -> String {
     expand_template(TEMPLATE_HTML, subs)
 }
 
-/// Expand `{{MARKER}}` placeholders in `template` in a SINGLE left-to-right
-/// pass, looking each marker up in `subs`. Because we scan the ORIGINAL
-/// template (never the growing output), a substituted value that happens to
-/// contain another marker — e.g. a user-controlled snapshot string holding the
-/// literal `{{HOOK_SECTION}}` — is emitted verbatim and is NEVER re-scanned or
-/// re-substituted (CodeRabbit M13 finding R2). All replacement values are
-/// already HTML-escaped by the caller, so this introduces no raw-interpolation
-/// path. Unknown markers are left intact (matched by the
-/// `render_html_has_no_unreplaced_placeholders` test, which asserts the
-/// template uses only known markers).
+/// Expand `{{MARKER}}` placeholders in a SINGLE left-to-right pass over the
+/// ORIGINAL template (never the growing output), so a substituted value that
+/// itself contains a marker is emitted verbatim, never re-substituted
+/// (CodeRabbit M13 R2). Values are pre-escaped by the caller. Unknown markers
+/// are left intact.
 fn expand_template(template: &str, subs: &[(&str, String)]) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -807,19 +623,17 @@ fn expand_template(template: &str, subs: &[(&str, String)]) -> String {
         let after_open = &rest[start..];
         match after_open.find("}}") {
             Some(end) => {
-                // `marker` spans the full `{{…}}` token, inclusive of braces,
-                // to match the keys in `subs`.
+                // Full `{{…}}` token (braces included) to match `subs` keys.
                 let marker = &after_open[..end + 2];
                 match subs.iter().find(|(m, _)| *m == marker) {
                     Some((_, value)) => out.push_str(value),
-                    // Unknown marker: emit it unchanged. Crucially we do NOT
-                    // rescan it, so it can never trigger nested expansion.
+                    // Unknown marker: emit unchanged, never rescanned.
                     None => out.push_str(marker),
                 }
                 rest = &after_open[end + 2..];
             }
             None => {
-                // No closing `}}` — the remainder is literal template text.
+                // No closing `}}` — remainder is literal template text.
                 out.push_str(after_open);
                 rest = "";
                 break;
@@ -897,16 +711,10 @@ fn render_activity(audit: &Option<AuditSummary>) -> String {
     s
 }
 
-/// The policy key/value block.
-///
-/// The renderer `match`es exhaustively on the [`PolicySummary`] enum: the
-/// `ParseError` arm CANNOT reach the numeric block (and vice versa), so the
-/// fail-open lie — rendering benign defaults for a policy that never loaded —
-/// is now impossible by construction rather than by a runtime `if` (CodeRabbit
-/// M13 PR #132 R5-1). A present-but-unparseable policy file renders an explicit
-/// "policy unavailable" notice with the parse error; `NoFile`/`Valid` render
-/// the numeric block (with the file path, or a built-in-defaults note). Like
-/// every other value, the path and error are HTML-escaped.
+/// The policy key/value block. The exhaustive `match` on [`PolicySummary`]
+/// makes the fail-open lie impossible by construction: `ParseError` renders an
+/// explicit "policy unavailable" notice and cannot reach the numeric block
+/// (CodeRabbit M13 PR #132 R5-1). Path and error are HTML-escaped.
 fn render_policy(p: &PolicySummary) -> String {
     let (values, path) = match p {
         PolicySummary::ParseError { path, error } => {
@@ -1026,13 +834,9 @@ fn render_hook(h: &HookSummary) -> String {
 mod tests {
     use super::*;
 
-    /// The full set of environment variables that influence where
-    /// `build_policy_summary` resolves config from. `config_dir()` (etcetera)
-    /// reads `XDG_CONFIG_HOME` on Linux/macOS but `%APPDATA%`/`%LOCALAPPDATA%`
-    /// on Windows; trust counts additionally resolve via `HOME`/`USERPROFILE`;
-    /// and policy discovery / remote-fetch read `TIRITH_*`. A hermetic test must
-    /// pin EVERY one of these (so it never reads the developer's real config on
-    /// any OS) and restore EVERY one (so it never leaks into a later test).
+    /// Every env var that influences where `build_policy_summary` resolves
+    /// config from (XDG / %APPDATA% / %LOCALAPPDATA% / HOME / USERPROFILE /
+    /// TIRITH_*). A hermetic test must pin and restore EVERY one across OSes.
     const ENV_KEYS: [&str; 8] = [
         "XDG_CONFIG_HOME",
         "APPDATA",
@@ -1044,26 +848,16 @@ mod tests {
         "TIRITH_API_KEY",
     ];
 
-    /// RAII guard that, on construction, SAVES the prior value of every key in
-    /// [`ENV_KEYS`] and applies the test's overrides, then on `Drop` RESTORES
-    /// every saved value (set-back or remove). Mirrors the `EnvVarGuard` shape
-    /// in `policy.rs`/`mcp/tools.rs`, but operates on the whole config-resolving
-    /// env set at once so a test cannot read real config or leak state.
-    ///
-    /// `TEST_ENV_LOCK` (held by the caller) serializes env-mutating tests; this
-    /// guard adds the restore half. Must be bound to a live local
-    /// (`let _env = …`) so it is dropped at the end of the test, not eagerly.
+    /// RAII guard: on construction saves + overrides every [`ENV_KEYS`] var, on
+    /// `Drop` restores them. Serialized by the caller's `TEST_ENV_LOCK`; bind to
+    /// `let _env = …` so it lives for the whole test.
     struct DashboardEnvGuard {
         prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl DashboardEnvGuard {
-        /// Snapshot all [`ENV_KEYS`], then apply `overrides`: `Some(v)` sets the
-        /// var, `None` removes it. Keys in [`ENV_KEYS`] not named in `overrides`
-        /// are removed, so the resolved environment is fully determined by the
-        /// caller regardless of what the host shell had set. Values are
-        /// `&OsStr`, so both `Path::as_os_str()` and string literals (e.g. a
-        /// `TIRITH_SERVER_URL`) pass through uniformly.
+        /// Snapshot all [`ENV_KEYS`], then apply `overrides` (`Some` sets,
+        /// `None`/unnamed removes) so the resolved env is fully caller-determined.
         fn apply(overrides: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
             let prev = ENV_KEYS.iter().map(|&k| (k, std::env::var_os(k))).collect();
             // SAFETY: env mutation is serialized by `TEST_ENV_LOCK`, which the
@@ -1073,8 +867,7 @@ mod tests {
                     let ovr = overrides.iter().find(|(k, _)| *k == key);
                     match ovr {
                         Some((_, Some(value))) => std::env::set_var(key, value),
-                        // Named with None, or not named at all → ensure unset so
-                        // the host environment cannot bleed in.
+                        // None or unnamed → unset, so the host env can't bleed in.
                         _ => std::env::remove_var(key),
                     }
                 }
@@ -1137,11 +930,8 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Invariant A — HTML escaping. EVERY interpolated value must pass through
-    // html_escape; a `<script>` in a redacted command preview must never
-    // appear literally in the rendered HTML.
-    // -----------------------------------------------------------------------
+    // Invariant A — HTML escaping: every interpolated value passes through
+    // html_escape; a `<script>` payload must never render as a live tag.
 
     #[test]
     fn html_escape_orders_ampersand_first() {
@@ -1159,8 +949,7 @@ mod tests {
 
     #[test]
     fn escaping_neutralizes_script_tag() {
-        // PINNED TEST (invariant A): a snapshot whose redacted preview carries a
-        // `<script>` payload must render escaped — never as a live tag.
+        // PINNED (invariant A): a `<script>` payload renders escaped, not live.
         let mut snap = empty_snapshot();
         snap.audit = Some(AuditSummary {
             total_commands: 1,
@@ -1168,8 +957,7 @@ mod tests {
             block_rate: 1.0,
             sessions_seen: 1,
             actions: vec![("Block".into(), 1)],
-            // The hostile payload lands in BOTH a findings row and a hosts row so
-            // we cover the count-table render path with attacker bytes.
+            // Hostile payload in both a findings and a hosts row.
             top_findings: vec![("<script>alert(1)</script>".into(), 1)],
             top_hosts: vec![("<script>alert('xss')</script>".into(), 1)],
             skipped_lines: 0,
@@ -1198,30 +986,24 @@ mod tests {
 
     #[test]
     fn snapshot_value_with_literal_marker_is_escaped_not_expanded() {
-        // PINNED TEST (CodeRabbit M13 finding R2): a user-controlled snapshot
-        // value that contains the literal text of a template marker (here
-        // `{{HOOK_SECTION}}`) must be emitted ESCAPED and must NOT be expanded
-        // into the hook section. The old recursive `.replace()` loop would
-        // re-substitute it; the single-pass expander never re-scans output.
+        // PINNED (CodeRabbit M13 R2): a snapshot value containing a literal
+        // marker must be emitted verbatim, not expanded into that section. The
+        // single-pass expander never re-scans output (the old loop did).
         let mut snap = empty_snapshot();
-        // generated_at maps to `{{GENERATED_AT}}`. Smuggle a marker plus a
-        // sentinel inside it.
+        // generated_at maps to `{{GENERATED_AT}}`; smuggle a marker + sentinel.
         snap.generated_at = "SENTINEL_PRE {{HOOK_SECTION}} SENTINEL_POST".into();
 
         let html = render_html(&snap);
 
-        // `html_escape` does not touch braces, so the marker text survives
-        // verbatim in the escaped value and must appear literally exactly once.
+        // Braces survive html_escape, so the marker text appears once verbatim.
         assert_eq!(
             html.matches("SENTINEL_PRE {{HOOK_SECTION}} SENTINEL_POST")
                 .count(),
             1,
             "the injected marker text must appear once, verbatim and un-expanded"
         );
-        // The real hook section (driven by the `{{HOOK_SECTION}}` placeholder in
-        // the template) is rendered exactly ONCE from the snapshot's own hook
-        // data — the injected copy did NOT spawn a second hook pill. The
-        // uninstalled hook pill is a unique, attacker-uncontrollable string.
+        // The real hook section renders exactly ONCE — the injected copy did
+        // not spawn a second hook pill.
         assert_eq!(
             html.matches(r#"<span class="pill pill-off">not installed</span>"#)
                 .count(),
@@ -1252,8 +1034,7 @@ mod tests {
 
     #[test]
     fn expand_template_edge_cases() {
-        // Adjacent markers `{{A}}{{B}}` are each substituted independently in one
-        // left-to-right pass.
+        // Adjacent markers each substitute independently in one pass.
         assert_eq!(
             expand_template(
                 "{{A}}{{B}}",
@@ -1263,8 +1044,7 @@ mod tests {
             "adjacent markers each expand once"
         );
 
-        // An unterminated `{{` (no closing `}}`) is emitted verbatim as literal
-        // template text — never treated as a marker.
+        // An unterminated `{{` is emitted verbatim, never treated as a marker.
         assert_eq!(
             expand_template("pre {{UNCLOSED", &[("{{UNCLOSED}}", "z".into())]),
             "pre {{UNCLOSED",
@@ -1278,11 +1058,8 @@ mod tests {
             "unknown marker is passed through verbatim"
         );
 
-        // Security property (single pass, no re-expansion): a substituted VALUE
-        // that itself contains a marker is emitted verbatim and is NEVER re-scanned
-        // — the boundary that stops template/XSS injection via snapshot content.
-        // `{{A}}`'s value contains `{{B}}`, which must NOT be expanded even though
-        // `{{B}}` is a known marker.
+        // Security property: a substituted value containing a marker is NOT
+        // re-expanded (the boundary that stops template/XSS injection).
         assert_eq!(
             expand_template(
                 "{{A}}",
@@ -1337,13 +1114,9 @@ mod tests {
 
     #[test]
     fn parse_error_variant_cannot_carry_numeric_values() {
-        // The whole point of the enum refactor: the contradictory "fail-open lie"
-        // state — an error ALONGSIDE populated paranoia / counts — is now
-        // UNREPRESENTABLE. `PolicySummary::ParseError` has only `{path, error}`
-        // fields (this would not compile if someone re-added a numeric field to
-        // it), and its serialized form carries NONE of the value keys. A consumer
-        // that sees `state == "parse_error"` therefore cannot also read a paranoia
-        // tier or any count. (CodeRabbit M13 PR #132 R5-1.)
+        // The enum refactor's point: the "fail-open lie" state (error + populated
+        // counts) is unrepresentable. `ParseError` has only `{path, error}` and
+        // serializes none of the value keys (CodeRabbit M13 PR #132 R5-1).
         let err = PolicySummary::ParseError {
             path: "/repo/.tirith/policy.yaml".into(),
             error: "boom".into(),
@@ -1375,8 +1148,7 @@ mod tests {
             "ParseError serializes to {{state, path, error}} only: {obj:?}"
         );
 
-        // The populated states DO carry the value keys (and round-trip back to the
-        // right variant), proving the flatten is wired correctly.
+        // The populated states DO carry the value keys and round-trip correctly.
         let valid = PolicySummary::Valid {
             path: "/repo/.tirith/policy.yaml".into(),
             values: PolicyValues {
@@ -1401,9 +1173,8 @@ mod tests {
 
     #[test]
     fn top_hosts_extracts_and_counts_from_redacted_previews() {
-        // Best-effort host extraction reuses the engine's URL extractor. A
-        // command preview carrying a URL yields its host; counts aggregate and
-        // sort descending.
+        // Host extraction reuses the engine's URL extractor; counts aggregate
+        // and sort descending.
         let rec = |cmd: &str| AuditRecord {
             timestamp: "2026-05-30T00:00:00Z".into(),
             session_id: "s".into(),
@@ -1448,17 +1219,10 @@ mod tests {
 
     #[test]
     fn build_snapshot_degrades_when_no_audit_log() {
-        // Pointing at a nonexistent log path must yield audit = None, not panic.
-        //
-        // CodeRabbit M13 PR #132 R17-3: isolate from the developer's real
-        // environment. Previously this passed `cwd = None`, so `build_snapshot`
-        // resolved policy/trust from the PROCESS cwd + user config — a broken
-        // `~/.config/tirith/policy.yaml` or a set `TIRITH_POLICY_ROOT` would flake
-        // the `policy.error.is_none()` assertion. Serialize env mutation via
-        // TEST_ENV_LOCK, pin the config-resolving env (XDG + %APPDATA%/
-        // %LOCALAPPDATA% + HOME/USERPROFILE) at an isolated temp dir, and pass a
-        // temp cwd containing a `.git` dir (so `find_repo_root` stops there) with
-        // NO `.tirith/policy.yaml` — i.e. genuine built-in defaults.
+        // A nonexistent log path yields audit = None, not a panic. Isolated from
+        // the developer's real config (CodeRabbit M13 PR #132 R17-3): pin the
+        // config-resolving env at a temp dir and use a temp cwd with a `.git`
+        // dir but no `.tirith/policy.yaml` (genuine built-in defaults).
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1510,20 +1274,10 @@ mod tests {
 
     #[test]
     fn build_policy_summary_surfaces_broken_policy_and_keeps_genuine_defaults() {
-        // CodeRabbit M13 PR #132 R5-1: a security dashboard must NOT present a
-        // malformed `.tirith/policy.yaml` as benign built-in defaults (a
-        // fail-open lie). `build_policy_summary` uses a STRICT load and returns the
-        // 3-variant `PolicySummary` enum, so the state is unambiguous:
-        //   * broken file   → ParseError { path, error }  (NO numeric values)
-        //   * NO policy file → NoFile { values }           (genuine defaults)
-        //   * valid file     → Valid { path, values }      (parsed values)
-        // Modeling these as an enum makes the contradictory "error + populated
-        // numbers" state UNREPRESENTABLE — `ParseError` has no value fields.
-        // Env mutation is serialized via the crate-wide TEST_ENV_LOCK and
-        // isolated so the developer's real user-config policy is never read on
-        // ANY OS. The guard pins the full config-resolving env set (XDG +
-        // %APPDATA%/%LOCALAPPDATA% + HOME/USERPROFILE) at the isolated dir and
-        // clears TIRITH_*, then restores every value on drop.
+        // CodeRabbit M13 PR #132 R5-1: a malformed file must NOT read as benign
+        // defaults. The 3-variant enum makes the state unambiguous (broken →
+        // ParseError, no file → NoFile, valid → Valid) and the "error + numbers"
+        // state unrepresentable. Env isolated + restored via TEST_ENV_LOCK.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1550,9 +1304,8 @@ mod tests {
         )
         .unwrap();
         let summary = build_policy_summary(Some(broken.path().to_str().unwrap()));
-        // A malformed file is the ParseError state — by construction it carries no
-        // numeric values (the contradictory fail-open state is unrepresentable),
-        // and it still reports WHICH file failed.
+        // Malformed file → ParseError (no numeric values), still reporting which
+        // file failed.
         match summary {
             PolicySummary::ParseError { path, error } => {
                 assert!(!error.is_empty(), "the parse error must be surfaced");
@@ -1609,14 +1362,10 @@ mod tests {
 
     #[test]
     fn build_policy_summary_non_regular_policy_yields_safe_error() {
-        // CodeRabbit M13 PR #132 R23: the discovered policy path is repo-CONTROLLED.
-        // A NON-REGULAR file at `.tirith/policy.yaml` (here a DIRECTORY; `mkdir
-        // policy.yaml` is the simplest cross-platform non-regular) must surface the
-        // fail-closed `error` state via `read_regular_capped`'s `NotRegularFile`
-        // rejection — NOT panic, and NOT read as benign defaults. (`find_policy_in_dir`
-        // discovers any path that `.exists()`, directory included, so this exercises
-        // the hardened read.) Env is isolated exactly as the sibling broken-policy
-        // test so the developer's real user-config policy is never consulted.
+        // CodeRabbit M13 PR #132 R23: a NON-REGULAR policy path (here a directory)
+        // must surface the fail-closed error state via `read_regular_capped`'s
+        // `NotRegularFile` rejection — not panic, not benign defaults. Env
+        // isolated as the sibling broken-policy test.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1637,21 +1386,16 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".tirith/policy.yaml")).unwrap();
 
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
-        // A non-regular policy path must surface the fail-closed ParseError state,
-        // not benign defaults. The enum makes the "no numeric values" guarantee
-        // structural — ParseError has no value fields to leak.
+        // Non-regular path → fail-closed ParseError (no value fields to leak).
         let (path, err) = match summary {
             PolicySummary::ParseError { path, error } => (path, error),
             other => panic!(
                 "a non-regular policy path must surface ParseError, not benign defaults: {other:?}"
             ),
         };
-        // On Unix, opening a directory succeeds and the fstat-based regular-file
-        // check produces the "not a regular file" message. On Windows, `File::open`
-        // on a directory fails at open time with an OS error — also fail-closed,
-        // just a different message. The cross-platform fail-closed contract (error
-        // state, no benign defaults, path reported) is asserted above; only the
-        // exact non-regular message is Unix-specific.
+        // Unix: the fstat check yields "not a regular file". Windows: open fails
+        // with a different OS error — also fail-closed. Only the exact message
+        // is Unix-specific; the fail-closed contract is asserted above.
         #[cfg(unix)]
         assert!(
             err.contains("not a regular file"),
@@ -1671,10 +1415,9 @@ mod tests {
 
     #[test]
     fn build_policy_summary_oversized_policy_yields_safe_error() {
-        // CodeRabbit M13 PR #132 R23: an OVERSIZED policy file (> POLICY_READ_CAP)
-        // must be refused by `read_regular_capped` BEFORE it is buffered, surfacing
-        // the fail-closed `error` state rather than reading the whole file into
-        // memory. We write one byte past the cap.
+        // CodeRabbit M13 PR #132 R23: an oversized policy file (> POLICY_READ_CAP)
+        // is refused before buffering, surfacing the fail-closed error state. One
+        // byte past the cap.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1691,8 +1434,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".git")).unwrap();
         std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
-        // One byte over the cap. The content is otherwise harmless YAML padding,
-        // proving rejection is on SIZE, not parse failure.
+        // One byte over the cap, otherwise valid padding (rejection is on SIZE).
         let oversized = vec![b' '; (POLICY_READ_CAP as usize) + 1];
         std::fs::write(repo.path().join(".tirith/policy.yaml"), &oversized).unwrap();
 
@@ -1712,12 +1454,10 @@ mod tests {
         // `_env` restores the full env set on drop.
     }
 
-    /// CodeRabbit M13 PR #132 R23: a FIFO at the discovered policy path would BLOCK
-    /// a plain `std::fs::read_to_string` forever waiting for a writer. The hardened
-    /// `read_regular_capped` opens with `O_NONBLOCK` and rejects the non-regular
-    /// target, so `build_policy_summary` returns PROMPTLY with the fail-closed error
-    /// state. If the guard regressed to a blocking read this test would HANG (caught
-    /// by the suite timeout). Unix-only (needs `mkfifo`).
+    /// CodeRabbit M13 PR #132 R23: a FIFO at the policy path would block a plain
+    /// read forever; `read_regular_capped` (O_NONBLOCK) rejects it so this
+    /// returns promptly with the fail-closed error state. A regression would HANG
+    /// (suite timeout). Unix-only (needs `mkfifo`).
     #[cfg(unix)]
     #[test]
     fn build_policy_summary_fifo_policy_does_not_hang() {
@@ -1746,11 +1486,9 @@ mod tests {
             return;
         }
 
-        // Must complete promptly; a blocking read on the writer-less FIFO would
-        // hang here. The non-regular FIFO surfaces the fail-closed error state.
+        // Must complete promptly (a blocking read would hang) and surface the
+        // fail-closed ParseError state.
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
-        // A FIFO at the policy path must surface the ParseError state (and not
-        // hang). ParseError carries no numeric values by construction.
         assert!(
             matches!(summary, PolicySummary::ParseError { .. }),
             "a FIFO at the policy path must surface ParseError (and not hang): {summary:?}"
@@ -1760,10 +1498,9 @@ mod tests {
 
     #[test]
     fn count_trust_entries_non_regular_path_counts_zero() {
-        // CodeRabbit M13 PR #132 R23: `trust.json` is a repo-controlled path read by
-        // the dashboard. A NON-REGULAR path (here a directory) must collapse to the
-        // SAME zero-count safe path a missing/unparseable file takes — via
-        // `read_regular_capped`'s `NotRegularFile` rejection, never a panic or hang.
+        // CodeRabbit M13 PR #132 R23: a non-regular trust.json (here a directory)
+        // collapses to the same zero-count path a missing file takes — never a
+        // panic or hang.
         let dir = tempfile::tempdir().unwrap();
         let trust = dir.path().join("trust.json");
         std::fs::create_dir_all(&trust).unwrap();
@@ -1776,9 +1513,8 @@ mod tests {
 
     #[test]
     fn count_trust_entries_oversized_path_counts_zero() {
-        // CodeRabbit M13 PR #132 R23: an OVERSIZED trust.json (> TRUST_READ_CAP) is
-        // refused before buffering and counts as zero — the dashboard never reads an
-        // unbounded file into memory just to count entries.
+        // CodeRabbit M13 PR #132 R23: an oversized trust.json (> TRUST_READ_CAP)
+        // is refused before buffering and counts as zero.
         let dir = tempfile::tempdir().unwrap();
         let trust = dir.path().join("trust.json");
         let oversized = vec![b' '; (TRUST_READ_CAP as usize) + 1];
@@ -1792,13 +1528,9 @@ mod tests {
 
     #[test]
     fn build_audit_summary_reads_valid_log_through_capped_reader() {
-        // Happy path: a real, in-window JSONL audit log must still produce a
-        // POPULATED summary after the hardened-read refactor (capped read +
-        // `parse_log`). Two verdict records inside the window → 2 commands; one
-        // blank line and one malformed line exercise `parse_log`'s skip +
-        // `skipped_lines` accounting (unchanged from `read_log`). We build each
-        // line by serializing a real `AuditRecord` so the JSON shape matches the
-        // parser exactly.
+        // Happy path: a real in-window log still produces a populated summary
+        // after the capped-read refactor. Two verdict records → 2 commands; a
+        // blank + a malformed line exercise `parse_log`'s skipped_lines counting.
         let mut rec = AuditRecord {
             timestamp: "2026-05-30T00:00:00Z".into(),
             session_id: "s1".into(),
@@ -1859,12 +1591,8 @@ mod tests {
 
     #[test]
     fn build_audit_summary_non_regular_path_degrades_to_none() {
-        // CodeRabbit M13 PR #132: the audit-log path can be caller-supplied. A
-        // NON-REGULAR path (here a directory) must collapse to the SAME safe
-        // degrade (`None`, no audit summary) a missing/unreadable log takes — via
-        // `read_regular_capped`'s `NotRegularFile` rejection — never a panic. We
-        // pass the path explicitly, so no env isolation is needed (only the audit
-        // read is exercised). `since`/`until` are arbitrary; the read fails first.
+        // CodeRabbit M13 PR #132: a non-regular audit-log path (here a directory)
+        // collapses to the same `None` degrade a missing log takes, never a panic.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log.jsonl");
         std::fs::create_dir_all(&log).unwrap();
@@ -1878,12 +1606,9 @@ mod tests {
 
     #[test]
     fn build_audit_summary_oversized_log_degrades_to_none() {
-        // CodeRabbit M13 PR #132: an OVERSIZED audit log (> AUDIT_READ_CAP) is
-        // refused by `read_regular_capped` BEFORE it is buffered, so
-        // `build_audit_summary` degrades to `None` rather than reading an
-        // unbounded file into memory. We write one byte past the cap; the content
-        // is otherwise-valid-ish bytes so rejection is proven to be on SIZE, not a
-        // parse failure (an oversized-but-parseable log would still be refused).
+        // CodeRabbit M13 PR #132: an oversized log (> AUDIT_READ_CAP) is refused
+        // before buffering, so the summary degrades to `None`. One byte over the
+        // cap, with valid-ish bytes (rejection is on SIZE, not parse failure).
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log.jsonl");
         let oversized = vec![b'\n'; (AUDIT_READ_CAP as usize) + 1];
@@ -1896,12 +1621,10 @@ mod tests {
         );
     }
 
-    /// CodeRabbit M13 PR #132: a FIFO at the audit-log path would BLOCK a plain
-    /// `std::fs::read_to_string` (what `read_log` uses) forever waiting for a
-    /// writer. The hardened `read_regular_capped` opens with `O_NONBLOCK` and
-    /// rejects the non-regular target, so `build_audit_summary` returns PROMPTLY
-    /// with the `None` degrade. If the read regressed to a blocking slurp this
-    /// test would HANG (caught by the suite timeout). Unix-only (needs `mkfifo`).
+    /// CodeRabbit M13 PR #132: a FIFO at the audit-log path would block a plain
+    /// read forever; `read_regular_capped` (O_NONBLOCK) rejects it so this
+    /// returns promptly with the `None` degrade. A regression would HANG.
+    /// Unix-only (needs `mkfifo`).
     #[cfg(unix)]
     #[test]
     fn build_audit_summary_fifo_log_does_not_hang() {
@@ -1914,8 +1637,7 @@ mod tests {
             eprintln!("skipping: mkfifo unsupported here");
             return;
         }
-        // Must complete promptly; a blocking read on the writer-less FIFO would
-        // hang here. The non-regular FIFO degrades to None.
+        // Must complete promptly (a blocking read would hang); degrades to None.
         let summary =
             build_audit_summary(Some(&fifo), "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
         assert!(
@@ -1927,26 +1649,19 @@ mod tests {
     #[test]
     fn build_policy_summary_counts_include_effective_overlays() {
         // CodeRabbit M13 PR #132 R6-1: the dashboard must summarize the EFFECTIVE
-        // policy `engine::analyze_inner` enforces — i.e. the local parse PLUS the
-        // read-only overlay helpers (`load_user_lists` + `load_org_lists` +
-        // `load_trust_entries`) that APPEND user/org flat-file lists and
-        // non-expired `trust.json` entries to the allow/block lists. Summarizing
-        // only the strict local parse (round 5) UNDER-reports those counts.
-        //
-        // Here a local policy declares ONE allowlist entry; overlays add a user
-        // allowlist line, an org blocklist line, and two trust entries (one
-        // flat → allowlist, one rule-scoped → allowlist_rules). The effective
-        // counts must reflect ALL of them, not just the single local entry. A
-        // broken LOCAL file is still the hard-error state (asserted at the end).
+        // policy (local parse PLUS the read-only overlays that append user/org
+        // lists + trust entries to allow/block); the strict-local-only parse
+        // under-reports. Here: 1 local allowlist entry + a user allowlist line,
+        // an org blocklist line, and two trust entries (flat → allowlist,
+        // rule-scoped → allowlist_rules). A broken local file is still the
+        // hard-error state (asserted at the end).
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
-        // `config_dir()` (etcetera) resolves to `<XDG_CONFIG_HOME>/tirith` on
-        // Linux/macOS but to `%APPDATA%\tirith` on Windows. The guard points
-        // ALL of them at the isolated dir so the developer's real user config is
-        // never read AND our user-overlay files are seen on every platform, and
-        // clears TIRITH_* — then restores every value on drop.
+        // Point every config-resolving var at the isolated dir (XDG on
+        // Linux/macOS, %APPDATA% on Windows) so the overlay files are seen on
+        // every platform and the real config is never read.
         let cfg = isolated_config.path().as_os_str();
         let _env = DashboardEnvGuard::apply(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
@@ -1966,10 +1681,8 @@ mod tests {
         )
         .unwrap();
 
-        // User-scope overlay: a flat allowlist line (`load_user_lists`). Plant
-        // it at the SAME path `config_dir()` resolves to under the isolated env
-        // (etcetera's base differs by OS — XDG dir vs %APPDATA%), so the file is
-        // exactly where `load_user_lists`/`load_trust_entries` will look.
+        // User-scope overlay: a flat allowlist line, planted where
+        // `config_dir()` resolves under the isolated env.
         let user_tirith =
             crate::policy::config_dir().expect("config_dir resolves under the isolated env");
         std::fs::create_dir_all(&user_tirith).unwrap();
@@ -1999,8 +1712,7 @@ mod tests {
 
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
 
-        // The local file parsed → Valid, carrying the effective values (which
-        // include the overlays). A ParseError here would be a regression.
+        // The local file parsed → Valid, carrying the effective (overlaid) values.
         let values = match summary {
             PolicySummary::Valid { values, .. } => values,
             other => panic!("a valid local policy + overlays must be Valid: {other:?}"),
@@ -2024,9 +1736,8 @@ mod tests {
             "blocklist must include the org flat-file overlay: {values:?}"
         );
 
-        // A BROKEN local file is still the hard-error (ParseError) state even
-        // though overlays exist — counts are meaningless when the operator's file
-        // did not load, and ParseError cannot carry them by construction.
+        // A broken local file is still the hard-error (ParseError) state even
+        // with overlays present.
         std::fs::write(
             repo.path().join(".tirith/policy.yaml"),
             "paranoia: [unterminated\n",
@@ -2043,31 +1754,20 @@ mod tests {
 
     #[test]
     fn build_policy_summary_never_fetches_remote_with_server_env_set() {
-        // CodeRabbit M13 PR #132 R9-2: the dashboard is a local, offline
-        // reporting surface (its embedded report states it "makes no network
-        // calls"). `build_policy_summary` must therefore reflect the LOCAL
-        // effective policy WITHOUT a remote fetch, even when a policy server is
-        // configured via `TIRITH_SERVER_URL` + `TIRITH_API_KEY` (or the local
-        // file). It must complete (no hang / network error) and surface local
-        // data — never a fetched / fail-closed remote result.
-        //
-        // The control: the local file sets `policy_fetch_fail_mode: closed` and
-        // the env names an UNREACHABLE server. `Policy::discover` would, with
-        // this exact setup, fail closed and yield `paranoia: None` (the error
-        // state). Observing the LOCAL `paranoia: 3` instead proves no fetch
-        // branch ran — `build_policy_summary` took the offline path.
+        // CodeRabbit M13 PR #132 R9-2: the dashboard must reflect the LOCAL
+        // effective policy without a remote fetch, even with a policy server
+        // configured. Control: the local file sets `policy_fetch_fail_mode:
+        // closed` and the env names an UNREACHABLE server, so `Policy::discover`
+        // would fail closed (paranoia None); observing local `paranoia: 3`
+        // instead proves the offline path ran.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let isolated_config = tempfile::tempdir().unwrap();
         let cfg = isolated_config.path().as_os_str();
-        // Pin config resolution at the isolated dir on every OS (XDG +
-        // %APPDATA%/%LOCALAPPDATA% + HOME/USERPROFILE) so the developer's real
-        // config is never read, clear TIRITH_POLICY_ROOT, and name a bogus,
-        // unreachable policy server. If the dashboard ever called
-        // `fetch_remote_policy`, this would (best case) flip the summary to the
-        // fail-closed/error state and (worst case) hang on a connect. The guard
-        // restores every value on drop.
+        // Pin config resolution at the isolated dir and name a bogus, unreachable
+        // policy server. A stray `fetch_remote_policy` would flip the summary to
+        // the error state or hang.
         let _env = DashboardEnvGuard::apply(&[
             ("XDG_CONFIG_HOME", Some(cfg)),
             ("APPDATA", Some(cfg)),
@@ -2093,9 +1793,8 @@ mod tests {
         // Must return promptly and reflect the LOCAL policy — no remote fetch.
         let summary = build_policy_summary(Some(repo.path().to_str().unwrap()));
 
-        // Offline discovery must NOT surface a network/fetch error: the local file
-        // parsed, so this is Valid (a remote fetch would have failed closed and
-        // yielded the ParseError state instead).
+        // The local file parsed → Valid (a remote fetch would have failed closed
+        // and yielded ParseError).
         let values = match summary {
             PolicySummary::Valid { values, .. } => values,
             other => panic!(
@@ -2118,9 +1817,8 @@ mod tests {
 
     #[test]
     fn render_policy_shows_unavailable_for_broken_policy_escaped() {
-        // The error state renders an explicit "unavailable" notice (not fake
-        // defaults), and both the path and the parse error are HTML-escaped so a
-        // hostile path / error string cannot break out of the report.
+        // The error state renders an "unavailable" notice (not fake defaults),
+        // with path and error HTML-escaped.
         let p = PolicySummary::ParseError {
             path: "/repo/.tirith/<script>.yaml".into(),
             error: "yaml parse error: did not find expected <node>".into(),
@@ -2193,11 +1891,8 @@ mod tests {
 
     #[test]
     fn count_trust_entries_treats_malformed_ttl_as_inactive() {
-        // CodeRabbit M13 PR #132 R3-2: an entry whose `ttl_expires` cannot be
-        // parsed must NOT be counted as active — that would overstate the live
-        // trust surface relative to runtime enforcement (which skips malformed
-        // timestamps). Here: one permanent (active) + one garbage-TTL (inactive)
-        // → exactly 1 counted.
+        // CodeRabbit M13 PR #132 R3-2: an unparseable `ttl_expires` is not active
+        // (runtime enforcement skips it). One permanent + one garbage-TTL → 1.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trust.json");
         let store = serde_json::json!({
@@ -2217,12 +1912,9 @@ mod tests {
 
     #[test]
     fn count_trust_entries_counts_ttl_equal_to_now_as_active() {
-        // CodeRabbit M13 PR #132 R17-2: the dashboard boundary must match runtime
-        // enforcement. `Policy::merge_trust_store` only expires an entry when
-        // `expiry < now`, so `ttl_expires == now` is still ACTIVE. Pin the
-        // comparison instant so the `>= now` (not `> now`) boundary is exercised
-        // deterministically: an entry timestamped EXACTLY at `now` must count, and
-        // one a microsecond earlier must NOT.
+        // CodeRabbit M13 PR #132 R17-2: `merge_trust_store` expires only when
+        // `expiry < now`, so `ttl_expires == now` is active. Pin the instant to
+        // exercise the `>= now` boundary: at-now counts, a µs earlier does not.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trust.json");
         let now = chrono::Utc::now();

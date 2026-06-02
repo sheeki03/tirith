@@ -1,21 +1,12 @@
-//! Per-MCP-session origin state.
+//! Per-MCP-session origin state (M4 item 8).
 //!
-//! M4 item 8. The MCP server (`tirith mcp-server`) is a stdio process:
-//! one client connects, runs through `initialize` once, then issues
-//! `tools/call` requests for the rest of the session. The
-//! [`AgentOrigin::Mcp`] payload — derived from `initialize.clientInfo`
-//! — is therefore process-scoped: stable for the lifetime of the MCP
-//! server process.
+//! The MCP server is a stdio process: one client `initialize`s once, then issues
+//! `tools/call` requests. The [`AgentOrigin::Mcp`] payload (from
+//! `initialize.clientInfo`) is process-scoped. The dispatcher writes it on
+//! `initialize`; the tools layer reads it per verdict and enforces
+//! `agent_rules.deny`.
 //!
 //! [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
-//!
-//! The dispatcher writes the origin once when it handles `initialize`;
-//! the tools layer reads it when constructing each verdict. The
-//! `tools/call_check_command` handler routes through
-//! [`crate::escalation::apply_agent_rules`] via `post_process_verdict`,
-//! and the `tools/call_check_url` / `tools/call_check_paste` handlers
-//! call [`crate::escalation::apply_agent_rules`] directly. All three
-//! enforce `agent_rules.deny`.
 
 use std::sync::RwLock;
 
@@ -24,18 +15,14 @@ use crate::mcp::types::ClientInfo;
 
 /// Process-scoped store of the current MCP session's origin.
 ///
-/// `RwLock<Option<...>>` rather than `OnceLock` because the dispatcher accepts
-/// a *new* `initialize` from the Initialized / Ready states (the MCP spec
-/// allows clients to renegotiate); the second initialize replaces the first.
+/// `RwLock<Option<...>>` not `OnceLock` because the MCP spec lets clients
+/// re-`initialize`; the second one replaces the first.
 static MCP_ORIGIN: RwLock<Option<AgentOrigin>> = RwLock::new(None);
 
-/// Record the MCP client identity from an `initialize` payload. Called by the
-/// dispatcher exactly when it handles the `initialize` request.
+/// Record the MCP client identity from an `initialize` payload.
 ///
-/// If `client_info` is `None` (some implementations omit it), records a
-/// default-shaped [`AgentOrigin::Mcp`] with `client_name = "unknown-mcp-client"`
-/// so the audit entry still says "this came from an MCP client" rather than
-/// silently falling back to the CLI default.
+/// `client_info: None` (some clients omit it) records an `unknown-mcp-client`
+/// origin so the audit entry still attributes it to MCP, not the CLI default.
 pub fn set_from_initialize(client_info: Option<&ClientInfo>) {
     let origin = match client_info {
         Some(ci) => {
@@ -50,25 +37,17 @@ pub fn set_from_initialize(client_info: Option<&ClientInfo>) {
         },
     };
 
-    // RwLock::write can only fail if the lock is poisoned (a thread holding
-    // it panicked). MCP dispatcher is single-threaded today but defend
-    // anyway — recovering the inner value lets us still update the origin.
+    // Recover from a poisoned lock so we can still update the origin.
     let mut guard = MCP_ORIGIN
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some(origin);
 }
 
-/// Return the current MCP session's origin, if `initialize` has been seen.
+/// Return the current MCP session's origin, or `None` before `initialize`.
 ///
-/// Returns `None` before `initialize` (no tool call should reach the tools
-/// layer in that state — the dispatcher refuses).
-///
-/// A poisoned `RwLock` (caused by a thread panicking inside a `write()`
-/// scope elsewhere) is still recoverable for reads: the inner `Option` is
-/// valid data and reading it cannot make poisoning worse. We explicitly
-/// recover so a panic in some unrelated codepath does not silently strip
-/// the MCP origin off every subsequent verdict.
+/// Recovers from a poisoned `RwLock` so an unrelated panic doesn't silently
+/// strip the MCP origin off every later verdict (the inner data is still valid).
 pub fn current() -> Option<AgentOrigin> {
     let guard = match MCP_ORIGIN.read() {
         Ok(g) => g,
@@ -77,21 +56,14 @@ pub fn current() -> Option<AgentOrigin> {
     guard.as_ref().cloned()
 }
 
-/// Test-only mutex that serializes access to [`MCP_ORIGIN`] across tests.
-/// Cargo runs lib-tests in parallel within a single binary, so without a
-/// guard test cases would race on the global and trip each other's
-/// `current()` assertions. Any test that mutates or reads `MCP_ORIGIN` must
-/// hold this lock for its duration via [`serial_lock`] or
-/// [`reset_for_test`]. `Mutex` rather than `RwLock` — even read-only tests
-/// must serialize, because a parallel writer would invalidate the reader's
-/// expected value.
+/// Test-only mutex serializing [`MCP_ORIGIN`] access across the parallel
+/// lib-tests. Even read-only tests must hold it, since a parallel writer would
+/// invalidate the reader's expected value.
 #[cfg(test)]
 static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Test-only: acquire [`TEST_SERIAL`] without touching [`MCP_ORIGIN`].
-/// Used by tests that drive the dispatcher (which writes `MCP_ORIGIN` via
-/// `set_from_initialize`) and want to observe their own write without
-/// another concurrent test clobbering it. Recovers from a poisoned mutex.
+/// Test-only: acquire [`TEST_SERIAL`] without touching [`MCP_ORIGIN`] (for tests
+/// that drive the dispatcher). Recovers from a poisoned mutex.
 #[cfg(test)]
 #[must_use = "bind to `let _guard = serial_lock();` to hold the test lock"]
 pub(crate) fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -100,13 +72,8 @@ pub(crate) fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Test-only reset hook. Acquires [`TEST_SERIAL`] (so the test runs without
-/// other origin-tests interleaving), clears [`MCP_ORIGIN`], and returns the
-/// guard so the caller can hold it for the rest of the test by binding to
-/// `let _guard = reset_for_test();`.
-///
-/// Recovers from a poisoned mutex / rwlock — a panicking earlier test would
-/// otherwise wedge every subsequent test against `unwrap()`.
+/// Test-only reset hook: acquire [`TEST_SERIAL`], clear [`MCP_ORIGIN`], and
+/// return the guard to hold for the rest of the test. Recovers from poisoning.
 #[cfg(test)]
 #[must_use = "bind to `let _guard = reset_for_test();` to hold the test lock"]
 pub(crate) fn reset_for_test() -> std::sync::MutexGuard<'static, ()> {
@@ -164,9 +131,8 @@ mod tests {
     #[test]
     fn hostile_client_info_is_sanitized() {
         let _guard = reset_for_test();
-        // A million-byte name with embedded ANSI / newline / NUL bytes must
-        // (a) not crash, (b) cap at MAX_LABEL_LEN, (c) leave no control
-        // bytes in the stored value.
+        // A huge name with ANSI/newline/NUL must not crash, must cap at
+        // MAX_LABEL_LEN, and must leave no control bytes.
         let hostile = format!("{}\n\x1b[31m\x00", "x".repeat(1_000_000));
         let ci = ClientInfo {
             name: hostile,
@@ -200,25 +166,16 @@ mod tests {
         }
     }
 
-    /// CodeRabbit Minor (cid 3292343382): a poisoned `RwLock` is recoverable
-    /// for reads — the inner data is still valid. Before the fix `current()`
-    /// returned `None` if any other thread had panicked while holding a
-    /// write lock, silently stripping `agent_origin` off every later
-    /// verdict. We test by deliberately poisoning the global through a
-    /// scoped panic inside a write guard, then asserting `current()` still
-    /// returns the stored value.
-    ///
-    /// This test is isolated to its own `RwLock` so it cannot leak a
-    /// poisoned state to the rest of the suite. It also exercises the
-    /// `Err(poisoned) => poisoned.into_inner()` arm directly, which is the
-    /// behavior `current()` must mirror against `MCP_ORIGIN`.
+    /// CodeRabbit Minor (cid 3292343382): a poisoned `RwLock` is recoverable for
+    /// reads. Before the fix `current()` returned `None` after any unrelated
+    /// write-lock panic, stripping `agent_origin` off every later verdict. Uses
+    /// a local `RwLock` (so poisoning can't leak) to exercise the recovery arm.
     #[test]
     fn poisoned_lock_still_returns_stored_origin() {
         use std::panic::{self, AssertUnwindSafe};
         use std::sync::RwLock;
 
-        // Local store mirroring MCP_ORIGIN's shape — keeps poisoning
-        // contained to this test.
+        // Local store mirroring MCP_ORIGIN; keeps poisoning contained.
         let store: RwLock<Option<AgentOrigin>> = RwLock::new(Some(AgentOrigin::Mcp {
             client_name: "poison-survivor".to_string(),
             client_version: Some("9.9.9".to_string()),

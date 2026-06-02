@@ -1,35 +1,19 @@
-//! Rust-native PTY conformance harness for tirith shell-hook tests.
+//! Rust-native PTY conformance harness: spawns a disposable interactive shell
+//! through a real pseudo-terminal (`portable-pty`), sources a tirith hook,
+//! sends commands + Enter, reads terminal output, and lets the caller assert
+//! invariants — no dependency on the flaky external `expect` tool. Substrate
+//! for the hook conformance contract (`docs/shell-hook-conformance.md`,
+//! `tests/shell_conformance.rs`).
 //!
-//! This module spawns a *disposable* interactive shell through a real
-//! pseudo-terminal (via `portable-pty`), sources a tirith shell hook inside
-//! it, sends bytes (commands + Enter), reads terminal output, and lets the
-//! caller assert invariants. The test *driver* is Rust — there is no
-//! dependency on the external `expect` Tcl tool, which is flaky on macOS and
-//! silently bash-version-sensitive.
-//!
-//! The harness is the substrate for the "hook conformance contract" — see
-//! `docs/shell-hook-conformance.md` and `tests/shell_conformance.rs`.
-//!
-//! ## Hermeticity
-//!
-//! Every session runs with `XDG_STATE_HOME` / `XDG_DATA_HOME` /
-//! `XDG_CONFIG_HOME` pointed at fresh temp dirs, so a test never reads or
-//! writes the developer's real tirith state. `HOME` is also redirected. The
-//! enter-mode bash hook shells out to `tirith check`, which *may* attempt a
-//! background threat-DB refresh; tests must therefore not assert on network
-//! behaviour. A future `--offline` switch (roadmap M0.3) will let the harness
-//! pin this deterministically.
-//!
-//! ## Test tiers / graceful skipping
-//!
-//! Helpers return `None` (or the test early-returns) when a required shell is
-//! not installed. `cargo test --workspace` must stay green on a machine with
-//! no modern bash, no fish, no tmux and no SSH — absence is a skip, never a
-//! failure.
+//! Hermetic: every session points `HOME`/`XDG_*` at fresh temp dirs, so a test
+//! never touches real tirith state. The hook shells out to `tirith check`,
+//! which may do a background threat-DB refresh, so tests must not assert on
+//! network behaviour. Helpers return `None` / early-return when a shell is
+//! missing — `cargo test` stays green on a machine without bash/fish/etc.
 
 #![cfg(unix)]
-// Each Rust integration test file is its own crate, so a shared support
-// module inevitably has items that a given test file does not touch.
+// Each integration test file is its own crate, so a shared support module
+// inevitably has items a given file does not touch.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -44,17 +28,13 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tempfile::TempDir;
 
-/// A writer shared between the reader thread (which answers terminal-capability
-/// queries) and the test driver (which sends commands). Each side writes a
-/// complete escape/byte sequence while holding the lock, so the two never
-/// interleave on the PTY master.
+/// A writer shared between the reader thread (terminal-query answers) and the
+/// test driver (commands); each side writes a complete sequence under the lock
+/// so the two never interleave on the PTY master.
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// Absolute path to an embedded shell hook.
-///
-/// Tests source the *embedded* copy under `assets/shell/lib/`, exactly as the
-/// existing `expect`-based tests do. `embedded_shell_hooks_match_repo_hooks`
-/// (in `cli_integration.rs`) guarantees it is byte-identical to `shell/lib/`.
+/// Absolute path to an embedded shell hook under `assets/shell/lib/`
+/// (`embedded_shell_hooks_match_repo_hooks` guarantees it matches `shell/lib/`).
 pub fn embedded_hook(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets/shell/lib")
@@ -66,17 +46,10 @@ pub fn tirith_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
 }
 
-/// Directory containing the freshly-built `tirith` binary.
-///
-/// The bash and fish hooks shell out to `tirith` by *name* (`command tirith
-/// check …`), so the spawned shell can only find it if its directory is on
-/// `PATH`. Cargo does not add `target/<profile>/` to `PATH` for integration
-/// tests — it only exposes `CARGO_BIN_EXE_tirith` — so the harness must put it
-/// there itself (see [`PtySession::spawn`]). Without this, the hook resolves
-/// whatever `tirith` happens to be on the developer's `PATH` (an arbitrary
-/// installed version) or, on a clean CI runner, nothing at all — and a missing
-/// `tirith` makes `command tirith check` exit 127, which the enforce path
-/// treats as an unexpected failure and *blocks the command*.
+/// Directory of the freshly-built `tirith` binary. The hooks resolve `tirith`
+/// by NAME, but cargo doesn't put `target/<profile>/` on `PATH` for integration
+/// tests (only `CARGO_BIN_EXE_tirith`), so the harness prepends this itself (see
+/// [`PtySession::spawn`]); otherwise `command tirith` exits 127 → false block.
 pub fn tirith_bin_dir() -> PathBuf {
     tirith_bin()
         .parent()
@@ -84,12 +57,8 @@ pub fn tirith_bin_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Locate a modern bash (>= 5).
-///
-/// macOS ships an ancient `/bin/bash` 3.2 that lacks features the hook's
-/// enter mode relies on; Homebrew installs a current bash at
-/// `/opt/homebrew/bin/bash` (Apple Silicon) or `/usr/local/bin/bash` (Intel).
-/// Returns `None` when no bash >= 5 can be found, so callers skip cleanly.
+/// Locate a modern bash (>= 5). macOS's `/bin/bash` is 3.2 (too old for enter
+/// mode); checks the Homebrew paths and whatever's on `PATH`. `None` ⇒ skip.
 pub fn modern_bash() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/opt/homebrew/bin/bash"),
@@ -126,12 +95,9 @@ pub fn bash_major_version(path: &Path) -> Option<u32> {
     rest.split('.').next()?.trim().parse::<u32>().ok()
 }
 
-/// Read the full `$BASH_VERSION` string of the bash binary at `path`.
-///
-/// The bash enter-mode capability cache is keyed on the exact `$BASH_VERSION`
-/// string, so a test that seeds a cache must use the same value the running
-/// shell reports — not the `bash --version` banner, which is formatted
-/// differently.
+/// Read the full `$BASH_VERSION` string at `path`. The capability cache is keyed
+/// on this exact string (not the differently-formatted `bash --version` banner),
+/// so a test seeding a cache must use this value.
 pub fn bash_version_string(path: &Path) -> Option<String> {
     let out = Command::new(path)
         .args(["-c", "printf '%s' \"$BASH_VERSION\""])
@@ -165,10 +131,8 @@ pub fn fish_bin() -> Option<PathBuf> {
     }
 }
 
-/// A fresh, fully-isolated environment for one PTY session.
-///
-/// Holds the temp dirs alive for the session's lifetime and exposes the env
-/// var map to apply to the spawned shell. Dropping it cleans everything up.
+/// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
+/// alive and exposes the env var map for the spawned shell. Drop cleans up.
 pub struct IsolatedEnv {
     _root: TempDir,
     pub home: PathBuf,
@@ -205,13 +169,10 @@ impl IsolatedEnv {
             "XDG_CONFIG_HOME".to_string(),
             config_home.display().to_string(),
         );
-        // Keep the spawned shell from inheriting a double-load guard or a
-        // stale bash mode from the developer's own shell.
         env.insert("TERM".to_string(), "xterm-256color".to_string());
-        // Unique session id per IsolatedEnv so tirith's per-session state never
-        // collides between concurrently-running tests. `process::id()` alone is
-        // identical for every test in one `cargo test` run (integration tests
-        // share a process); a per-call counter makes it genuinely unique.
+        // Unique session id per IsolatedEnv so per-session state never collides
+        // between concurrent tests (`process::id()` is shared across a run, so
+        // pair it with a per-call counter).
         use std::sync::atomic::{AtomicU64, Ordering};
         static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
         env.insert(
@@ -248,10 +209,8 @@ impl IsolatedEnv {
         self
     }
 
-    /// Path to the persisted bash safe-mode flag for this environment.
-    ///
-    /// The bash hook writes this file when enter mode degrades, so a test can
-    /// assert that a *visible* degrade also *persisted*.
+    /// Path to the persisted bash safe-mode flag (the hook writes it on enter-mode
+    /// degrade, so a test can assert a visible degrade also persisted).
     pub fn bash_safe_mode_flag(&self) -> PathBuf {
         self.state_home.join("tirith").join("bash-safe-mode")
     }
@@ -261,23 +220,18 @@ impl IsolatedEnv {
         self.state_home.join("tirith").join("bash-enter-capability")
     }
 
-    /// Seed the bash enter-mode capability cache (issue #111) with a verdict.
-    ///
-    /// `verdict` is `works` / `broken` / `inconclusive`. The hook reads this
-    /// file at startup to decide enter-vs-preexec; seeding it lets a test pin
-    /// the decision deterministically. `bash_version` must match the exact
-    /// `$BASH_VERSION`, and `bash_path` the exact `$BASH`, of the shell the test
-    /// will spawn — or the hook treats the cache as stale (itself a useful
-    /// thing to test). The harness spawns bash by absolute path, so `$BASH` is
-    /// that path; pass the same path used for [`PtySession::spawn`].
+    /// Seed the bash enter-mode capability cache (#111) with `verdict`
+    /// (`works`/`broken`/`inconclusive`) to pin the hook's enter-vs-preexec
+    /// decision. `bash_version`/`bash_path` must match the spawned shell's exact
+    /// `$BASH_VERSION`/`$BASH` or the hook treats the cache as stale (also useful
+    /// to test); pass the same path used for [`PtySession::spawn`].
     pub fn seed_bash_enter_capability(&self, verdict: &str, bash_version: &str, bash_path: &Path) {
         let path = self.bash_enter_capability_file();
         std::fs::create_dir_all(path.parent().expect("capability cache parent"))
             .expect("pty harness: create state dir");
-        // Schema 1 mirrors `cli::bash_capability::CACHE_SCHEMA`. tirith_version
-        // is left blank: the hook only enforces a tirith-version match when a
-        // sibling `.hooks-version` file exists, and the harness sources the
-        // hook directly (no `.hooks-version`), so the check is skipped.
+        // Schema 1 mirrors `CACHE_SCHEMA`. tirith_version is blank: the hook only
+        // enforces it when a sibling `.hooks-version` exists, which the harness
+        // (sourcing the hook directly) does not create.
         let body = format!(
             "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
              bash_path={}\nenter_capability={verdict}\n\
@@ -294,17 +248,10 @@ impl Default for IsolatedEnv {
     }
 }
 
-/// Answer the terminal-capability queries a shell emits at startup.
-///
-/// Fish 4.x in particular probes the terminal — DA1 (`ESC [ c`), cursor
-/// position (`ESC [ 6 n`), the OSC 11 background-colour query, the kitty
-/// keyboard-protocol query (`ESC [ ? u`) and XTGETTCAP (`ESC P + q`). With a
-/// real terminal those are answered by the emulator; inside a bare PTY they
-/// go unanswered and fish *blocks in startup forever*. This responder writes
-/// minimal, honest replies back through the master so the shell proceeds.
-///
-/// It is harmless for bash (bash does not issue these), so the harness always
-/// installs it.
+/// Answer the terminal-capability queries a shell emits at startup. Fish 4.x
+/// probes DA1, cursor position, OSC 11, kitty-keyboard and XTGETTCAP; unanswered
+/// in a bare PTY it blocks in startup forever, so this writes minimal honest
+/// replies. Harmless for bash (which doesn't issue these), so always installed.
 fn answer_terminal_queries(writer: &SharedWriter, data: &[u8]) {
     let contains = |needle: &[u8]| -> bool {
         !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle)
@@ -338,11 +285,9 @@ fn answer_terminal_queries(writer: &SharedWriter, data: &[u8]) {
     }
 }
 
-/// A live shell running inside a PTY.
-///
-/// `send`/`expect`/`drain` drive the conversation; `output()` returns
-/// everything read so far. The child is killed on `Drop` as a backstop, but
-/// callers should still call [`PtySession::close`] for a clean exit.
+/// A live shell running inside a PTY. `send`/`expect`/`drain` drive it;
+/// `output()` returns all read so far. Killed on `Drop` as a backstop, but
+/// callers should still [`PtySession::close`] for a clean exit.
 pub struct PtySession {
     writer: SharedWriter,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -355,9 +300,7 @@ pub struct PtySession {
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl PtySession {
-    /// Spawn `program` with `args` inside a fresh PTY under `env`.
-    ///
-    /// The shell starts with `cwd` set to the isolated `workdir`.
+    /// Spawn `program` with `args` in a fresh PTY under `env` (cwd = `workdir`).
     pub fn spawn(env: &IsolatedEnv, program: &Path, args: &[&str]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -372,20 +315,13 @@ impl PtySession {
         for a in args {
             cmd.arg(a);
         }
-        // Start from a clean slate, then apply only the isolated env. This
-        // prevents the developer's exported `_TIRITH_*` vars, bash mode,
-        // SSH_* markers, etc. from leaking into the disposable shell.
+        // Clean slate + only the isolated env, so the developer's `_TIRITH_*` /
+        // bash-mode / SSH_* vars don't leak in.
         cmd.env_clear();
-        // PATH must survive so the shell can find coreutils, the shells, etc.,
-        // and — critically — the freshly-built `tirith` under test. The hooks
-        // shell out via `command tirith check …`, resolving `tirith` by name;
-        // cargo does not put `target/<profile>/` on `PATH` for integration
-        // tests, so the harness prepends the binary's directory itself. Without
-        // it the hook would resolve an arbitrary installed `tirith` (or, on a
-        // clean CI runner, nothing — `command tirith` then exits 127, which the
-        // preexec-enforce path treats as a failure and blocks the command).
-        // Prepending — not appending — guarantees the binary under test wins
-        // over any stale globally-installed copy.
+        // PATH must survive (coreutils, shells) and PREPEND the tirith under
+        // test: the hooks resolve `tirith` by name, cargo doesn't put
+        // `target/<profile>/` on PATH, and a missing tirith → exit 127 → false
+        // block. Prepending wins over any stale installed copy.
         let parent_path = std::env::var("PATH").unwrap_or_default();
         let path = if parent_path.is_empty() {
             tirith_bin_dir().display().to_string()
@@ -402,15 +338,12 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .expect("pty harness: spawn shell");
-        // The slave handle must be dropped once the child holds it, or the
-        // master read loop never sees EOF when the child exits.
+        // Drop the slave once the child holds it, or the master never sees EOF.
         drop(pair.slave);
 
-        // `take_writer` is single-shot, so the one writer is shared behind a
-        // mutex between the reader thread (terminal-query answers) and the
-        // test driver (commands). The reader thread answers queries inline —
-        // promptly enough for fish's blocking startup probes — and forwards
-        // all output on `tx`.
+        // `take_writer` is single-shot, so the one writer is mutex-shared between
+        // the reader thread (answers terminal queries inline, promptly enough for
+        // fish's startup probes, and forwards output on `tx`) and the driver.
         let writer: SharedWriter = Arc::new(Mutex::new(
             pair.master.take_writer().expect("pty harness: take_writer"),
         ));
@@ -418,12 +351,11 @@ impl PtySession {
             .master
             .try_clone_reader()
             .expect("pty harness: clone_reader");
-        // The master is not needed past this point: the reader is cloned and
-        // the writer is taken. Dropping it keeps the PTY pair minimal.
+        // Master no longer needed (reader cloned, writer taken).
         drop(pair.master);
 
-        // Drain the PTY on a background thread so a chatty shell can never
-        // deadlock us by filling the kernel pipe buffer while we are writing.
+        // Drain on a background thread so a chatty shell can't deadlock us by
+        // filling the kernel pipe buffer while we write.
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let answer_writer = Arc::clone(&writer);
         thread::spawn(move || {
@@ -451,15 +383,15 @@ impl PtySession {
         }
     }
 
-    /// Pull whatever output is currently available into the buffer, blocking
-    /// at most `slice` for the first chunk.
+    /// Pull available output into the buffer, blocking at most `slice` for the
+    /// first chunk.
     fn pump(&mut self, slice: Duration) {
         match self.rx.recv_timeout(slice) {
             Ok(bytes) => self.buf.push_str(&String::from_utf8_lossy(&bytes)),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => self.closed = true,
         }
-        // Greedily absorb any further chunks already queued.
+        // Greedily absorb any further queued chunks.
         while let Ok(bytes) = self.rx.try_recv() {
             self.buf.push_str(&String::from_utf8_lossy(&bytes));
         }
@@ -472,19 +404,16 @@ impl PtySession {
         w.flush().expect("pty harness: flush pty");
     }
 
-    /// Type `line` followed by a carriage return (the Enter key).
-    ///
-    /// `\r` — not `\n` — is what a real terminal delivers when the user
-    /// presses Return, and it is the byte the shell hooks bind.
+    /// Type `line` + a carriage return (`\r`, not `\n`, is what Enter sends and
+    /// what the hooks bind).
     pub fn send_line(&mut self, line: &str) {
         let mut s = line.to_string();
         s.push('\r');
         self.send_raw(s.as_bytes());
     }
 
-    /// Block until `needle` appears in cumulative output, or panic on timeout.
-    ///
-    /// Returns the full output captured up to and including the match.
+    /// Block until `needle` appears in cumulative output (panic on timeout),
+    /// returning the full captured output.
     pub fn expect(&mut self, needle: &str) -> String {
         self.expect_within(needle, DEFAULT_TIMEOUT)
     }
@@ -517,19 +446,12 @@ impl PtySession {
         }
     }
 
-    /// Block until *any* of `needles` appears in cumulative output, then return
-    /// the full captured output. On timeout (or the shell exiting first) it
-    /// returns whatever was captured **without panicking** — so the caller can
-    /// assert with a domain-specific message.
-    ///
-    /// Use this — not [`PtySession::wait_idle`] — when the thing being waited
-    /// for is produced by a command whose hook shells out to `tirith`. The
-    /// `tirith` subprocess has variable latency and emits nothing until it
-    /// returns; `wait_idle` keys on terminal silence and would return *during*
-    /// that subprocess (the no-output race documented on [`wait_for_marker`]),
-    /// capturing only the keystroke echo. `expect_any` polls patiently and is
-    /// therefore robust regardless of how slow that subprocess is — including a
-    /// debug-build `tirith` on a loaded CI box.
+    /// Block until ANY of `needles` appears, returning the captured output; on
+    /// timeout (or the shell exiting) returns what was captured WITHOUT panicking
+    /// so the caller can assert with a domain message. Use this (not
+    /// [`PtySession::wait_idle`]) when waiting on output from a command whose hook
+    /// shells out to `tirith` — `wait_idle` would return mid-subprocess (the
+    /// no-output race on [`wait_for_marker`]); this polls patiently.
     pub fn expect_any(&mut self, needles: &[&str], timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
@@ -575,18 +497,14 @@ impl PtySession {
         &self.buf
     }
 
-    /// Discard captured output so far. Useful between phases of a test so a
-    /// later [`PtySession::expect`] cannot match an echo from an earlier
-    /// command.
+    /// Discard captured output so a later [`PtySession::expect`] can't match an
+    /// earlier command's echo.
     pub fn clear_buffer(&mut self) {
         self.buf.clear();
     }
 
-    /// Block until the shell produces no new output for `quiet` consecutively,
-    /// bounded by `max`. Returns the full captured output.
-    ///
-    /// This is the harness's "the shell has settled" signal — more robust than
-    /// a fixed sleep when a hook shells out to `tirith` (variable latency).
+    /// Block until no new output for `quiet` consecutively (bounded by `max`) —
+    /// the "shell settled" signal, more robust than a fixed sleep.
     pub fn wait_idle(&mut self, quiet: Duration, max: Duration) -> String {
         let hard_deadline = Instant::now() + max;
         loop {
@@ -630,10 +548,8 @@ impl Drop for PtySession {
     }
 }
 
-/// Count non-overlapping occurrences of `needle` in `haystack`.
-///
-/// The central tool for the "executes EXACTLY ONCE" invariant: a hook bug
-/// that swallows a command yields 0, one that double-delivers yields 2.
+/// Count non-overlapping occurrences of `needle` — the "executes EXACTLY ONCE"
+/// primitive (a swallowed command yields 0, a double-delivery yields 2).
 pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     if needle.is_empty() {
         return 0;
@@ -647,25 +563,14 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
-/// Poll `marker` until it contains `needle` at least once, or `timeout`
-/// elapses. Returns the file's final contents either way.
+/// Poll `marker` until it contains `needle` (or `timeout`), returning the
+/// file's final contents.
 ///
-/// ## Why this exists — the no-output race
-///
-/// [`PtySession::wait_idle`] keys on *terminal output* going quiet. That is the
-/// right "command finished" signal for a command that prints — but a
-/// side-effect-only command like `printf 'RAN\n' >> marker` writes nothing to
-/// the terminal. Worse, when tirith *allows* such a command it shells out to
-/// `tirith check`, which on an allow verdict also prints nothing. So the only
-/// terminal output is the keystroke echo: `wait_idle` sees "quiet" and returns
-/// *before* the hook has finished shelling out to `tirith` and delivered the
-/// command. The marker is then read while still empty. macOS happens to win
-/// that race; a slower Linux CI box does not (issue surfaced in #116 CI).
-///
-/// The fix is to stop inferring completion from terminal silence and instead
-/// poll the filesystem side effect directly — the marker file is the ground
-/// truth the conformance contract already relies on. This is correct by
-/// construction on any machine speed: a generous timeout, not a fixed sleep.
+/// The no-output race: [`PtySession::wait_idle`] keys on terminal quiet, but a
+/// side-effect-only command (and an allow-verdict `tirith check`) prints
+/// nothing, so `wait_idle` returns BEFORE the hook delivers the command and the
+/// marker is read while empty (macOS wins this race, slow CI doesn't — #116).
+/// Polling the filesystem side effect is correct at any machine speed.
 pub fn wait_for_marker(marker: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {

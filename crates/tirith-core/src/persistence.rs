@@ -1,57 +1,24 @@
 //! Persistence-mechanism inventory + state-change detection (M9 ch2).
 //!
-//! This module inventories a fixed set of well-known *persistence surfaces* —
-//! the files and registries an attacker mutates to survive a reboot or a new
-//! shell: shell rc/profile files, `~/.ssh/authorized_keys`, `~/.ssh/config`,
-//! `~/.gitconfig`, `~/.npmrc`, the user crontab, systemd-user units, macOS
-//! LaunchAgents, login items, `.envrc` in the cwd ancestry, and the git global
-//! hooks path. For each surface it records a sha256 + size, and on `diff` it
-//! compares the live state against a recorded snapshot to surface *changes*.
+//! Inventories well-known *persistence surfaces* (shell rc/profile files,
+//! `~/.ssh/{authorized_keys,config}`, `~/.gitconfig`, `~/.npmrc`, the crontab,
+//! systemd-user units, macOS LaunchAgents, login items, `.envrc` ancestry, the
+//! git global hooks path), recording a sha256 + size each. `diff` compares the
+//! live state against a recorded snapshot to surface *changes*.
 //!
-//! ## Design
-//!
-//! The single testable entry point is [`scan_with_root`], which takes the
-//! home-directory root and an optional cwd (for the `.envrc` ancestry walk) as
-//! parameters. [`scan`] is a thin wrapper that resolves the *real* home dir and
-//! cwd and calls it. Tests point [`scan_with_root`] at a `tempfile::tempdir()`
-//! and **never** mutate `HOME` / `std::env` — mutating process-global env in
-//! tests is a libc data race (see PR #125 history).
-//!
-//! ## The 6 rules fire on DIFF, not scan
-//!
-//! `scan` is pure inventory: it never emits a [`crate::verdict::RuleId`]. The
-//! six persistence rules are *state-change* rules — they fire from
-//! [`diff_against_snapshot`] when a watched surface changed relative to the
-//! recorded snapshot. They therefore carry no PATTERN_TABLE entry and live in
-//! the `EXTERNALLY_TRIGGERED_RULES` set, following the M8 / M9-ch1
-//! runtime-state pattern.
-//!
-//! ## Shell-outs are timeout-bounded and failure-tolerant
-//!
-//! `crontab -l` and the macOS login-items `osascript` query run through the
-//! shared [`crate::util::run_shell_with_timeout`] helper with a 1.5s budget.
-//! A non-zero exit (e.g. crontab's "no crontab for <user>") is treated as
-//! **empty**, never as an error — absence of a crontab is the common case.
-//!
-//! ## Diff shows ADDED LINES ONLY, redacted
-//!
-//! [`diff_against_snapshot`] reports only lines present in the new content but
-//! not the old (never removed lines, never full content), and runs each added
-//! line through the shipping credential redactor ([`crate::redact::redact`])
-//! before it is surfaced — a new `authorized_keys` entry or a sourced token
-//! must never leak verbatim into a finding.
-//!
-//! ## Snapshot stores NO cleartext at rest (only hashes)
-//!
-//! The on-disk snapshot ([`PersistenceSnapshot`] at
-//! `state_dir()/persistence_snapshot.json`) is written `0600` AND stores only a
-//! per-file `sha256` + `size` + a SET of per-line hashes ([`SnapshotEntry`]) —
-//! never the raw bytes of `.bashrc` / `.envrc` / `authorized_keys` / `crontab`.
-//! Added lines are recomputed at `diff` time by re-reading the CURRENT file
-//! (cleartext is legitimately available then), keeping any line whose hash is
-//! absent from the prior snapshot's line-hash set, and redacting it. So a
-//! secret exported in an rc file never lands unredacted in a sibling state file
-//! that another local account could read.
+//! Key invariants:
+//! * Testable entry point is [`scan_with_root`] (home + optional cwd); [`scan`]
+//!   resolves the real home/cwd. Tests use a `tempfile::tempdir()` and NEVER
+//!   mutate `HOME`/env (libc data race, PR #125).
+//! * The 6 rules fire on DIFF, not scan — `scan` emits no RuleId. They are
+//!   state-change rules (no PATTERN_TABLE entry; in `EXTERNALLY_TRIGGERED_RULES`).
+//! * `crontab -l` / login-items `osascript` run via [`crate::util::run_shell_with_timeout`]
+//!   with a 1.5s budget; a non-zero exit ("no crontab") counts as empty, not an error.
+//! * The diff reports ADDED LINES ONLY (never removed/full content), each run
+//!   through [`crate::redact::redact`] so a new key/token never leaks into a finding.
+//! * The on-disk snapshot ([`PersistenceSnapshot`]) is `0600` and stores NO
+//!   cleartext — only `sha256` + `size` + per-line hashes. Added lines are
+//!   recomputed at diff time from the CURRENT file (legitimately in hand then).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,41 +29,27 @@ use serde::{Deserialize, Serialize};
 use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
 use crate::verdict::{RuleId, Severity};
 
-/// Budget for each persistence shell-out (`crontab -l`, login-items
-/// `osascript`). Matches the M8 context-detector budget.
+/// Budget for each persistence shell-out (`crontab -l`, login-items `osascript`).
 const SHELL_OUT_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// The class of persistence surface a [`PersistenceEntry`] represents. The kind
-/// determines which [`RuleId`] a change fires in [`diff_against_snapshot`].
+/// The class of persistence surface; determines which [`RuleId`] a change fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistenceKind {
-    /// A shell rc / profile file (`~/.bashrc`, `~/.zshrc`, `~/.profile`, fish /
-    /// PowerShell profiles). A modification fires
-    /// [`RuleId::PersistenceShellRcModified`].
+    /// Shell rc / profile file → [`RuleId::PersistenceShellRcModified`].
     ShellRc,
-    /// `~/.ssh/authorized_keys`. An added line fires
-    /// [`RuleId::PersistenceAuthorizedKeysNewEntry`].
+    /// `~/.ssh/authorized_keys` → [`RuleId::PersistenceAuthorizedKeysNewEntry`].
     AuthorizedKeys,
-    /// `~/.ssh/config`. A newly-added `Include` directive fires
-    /// [`RuleId::PersistenceSshConfigInclude`].
+    /// `~/.ssh/config`; an added `Include` → [`RuleId::PersistenceSshConfigInclude`].
     SshConfig,
-    /// The user crontab (`crontab -l`). A change fires
-    /// [`RuleId::PersistenceCrontabModified`].
+    /// The user crontab → [`RuleId::PersistenceCrontabModified`].
     Crontab,
-    /// A `~/.config/systemd/user/*.service` unit or a
-    /// `~/Library/LaunchAgents/*.plist`. A newly-appeared unit fires
-    /// [`RuleId::PersistenceLaunchAgentAdded`].
+    /// systemd-user unit or LaunchAgent plist → [`RuleId::PersistenceLaunchAgentAdded`].
     LaunchAgent,
-    /// A `.envrc` in the cwd ancestry (direnv). A newly-appeared file fires
-    /// [`RuleId::PersistenceDirenvNewEnvrc`].
+    /// A `.envrc` in the cwd ancestry → [`RuleId::PersistenceDirenvNewEnvrc`].
     Direnv,
-    /// `~/.gitconfig`, `~/.npmrc`, the git global hooks path, login items, and
-    /// other surfaces inventoried for change-detection but without a dedicated
-    /// rule (a modification is reported generically as a shell-rc-class change
-    /// only when it is itself an rc file; these are surfaced in `scan` and
-    /// tracked in the snapshot but do NOT fire one of the six rules — they are
-    /// inventory-only context).
+    /// Inventory-only context (gitconfig, npmrc, git hooks path, login items):
+    /// tracked in the snapshot but fires none of the six rules.
     Other,
 }
 
@@ -114,24 +67,16 @@ impl PersistenceKind {
     }
 }
 
-/// One inventoried persistence surface: a stable key, its kind, a display
-/// location, and the current content fingerprint (`sha256` + `size`).
-///
-/// `content` carries the raw bytes-as-UTF-8 (lossy) for diffable surfaces so a
-/// later `diff` can compute *added lines*. For a surface that does not exist
-/// (no crontab, no authorized_keys), `present` is `false`, `sha256` is the hash
-/// of the empty string, and `content` is empty — this lets a later
-/// appearance/addition be detected as a change from "absent".
+/// One inventoried persistence surface: key, kind, location, and content
+/// fingerprint (`sha256` + `size`). A non-existent surface has `present = false`,
+/// the empty-string hash, and empty content, so a later appearance is detectable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceEntry {
-    /// Stable identifier used as the snapshot map key (e.g. `shell_rc:.zshrc`,
-    /// `crontab`, `launch_agent:com.foo.plist`). Stable across runs so the
-    /// snapshot diff lines up.
+    /// Stable snapshot map key (e.g. `shell_rc:.zshrc`, `launch_agent:com.foo.plist`).
     pub key: String,
     /// The class of surface (drives the rule a change fires).
     pub kind: PersistenceKind,
-    /// Human-readable location (a path, or a synthetic label like
-    /// `crontab -l` / `login items`).
+    /// Human-readable location (a path, or a label like `crontab -l`).
     pub location: String,
     /// `true` when the surface currently exists / produced output.
     pub present: bool,
@@ -139,25 +84,19 @@ pub struct PersistenceEntry {
     pub sha256: String,
     /// Byte length of `content`.
     pub size: usize,
-    /// Raw content (UTF-8 lossy), held IN MEMORY only for the current scan so
-    /// the diff can recompute added lines against the prior snapshot's line
-    /// hashes. NEVER serialized — neither into the `scan` JSON output nor into
-    /// the on-disk snapshot (which stores only `sha256` + `size` + per-line
-    /// hashes). Keeping cleartext out of the snapshot is the secret-at-rest
-    /// fix; see the module doc.
+    /// Raw content (UTF-8 lossy), IN MEMORY only for the current scan to recompute
+    /// added lines. NEVER serialized (the snapshot keeps cleartext out — see module doc).
     #[serde(skip)]
     pub content: String,
 }
 
-/// A point-in-time snapshot of every watched persistence surface, keyed by
-/// [`PersistenceEntry::key`]. Persisted as JSON at
-/// `state_dir()/persistence_snapshot.json`.
+/// A point-in-time snapshot of every watched surface, keyed by
+/// [`PersistenceEntry::key`]. Persisted at `state_dir()/persistence_snapshot.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistenceSnapshot {
-    /// Snapshot schema version (for forward-compatible migrations).
+    /// Schema version (for forward-compatible migrations).
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    /// Map of entry key → fingerprint + content.
     #[serde(default)]
     pub entries: BTreeMap<String, SnapshotEntry>,
 }
@@ -166,14 +105,9 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// The persisted per-surface record: fingerprint + per-line hashes.
-///
-/// **No cleartext is stored.** Beyond the whole-file `sha256` + `size` (which
-/// detect *that* a surface changed), `line_hashes` holds the 16-char SHA-256
-/// prefix of every non-empty line, so `diff` can compute *added lines* by
-/// re-reading the current file and keeping lines whose hash is absent here —
-/// without ever persisting the raw rc/`.envrc`/`authorized_keys`/crontab bytes
-/// (which can carry secrets) to a world-readable sibling state file.
+/// The persisted per-surface record: fingerprint + per-line hashes, NO cleartext.
+/// `line_hashes` (16-char SHA-256 prefix of each non-empty line) lets `diff` find
+/// *added* lines from the current file without ever persisting the raw bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub kind: PersistenceKind,
@@ -181,16 +115,14 @@ pub struct SnapshotEntry {
     pub present: bool,
     pub sha256: String,
     pub size: usize,
-    /// 16-char SHA-256 prefix of each non-empty content line (order-preserving,
-    /// as it appeared). Used by the diff to detect *added* lines without storing
-    /// cleartext. Empty for surfaces with no line content.
+    /// 16-char SHA-256 prefix of each non-empty line, order-preserving. Empty for
+    /// surfaces with no line content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub line_hashes: Vec<String>,
 }
 
 impl PersistenceSnapshot {
-    /// Build a snapshot from a freshly-collected inventory. Stores per-line
-    /// hashes (never cleartext) so a later diff can detect added lines.
+    /// Build a snapshot from an inventory (per-line hashes, never cleartext).
     pub fn from_entries(entries: &[PersistenceEntry]) -> Self {
         let mut map = BTreeMap::new();
         for e in entries {
@@ -216,37 +148,25 @@ impl PersistenceSnapshot {
 /// A single state-change finding emitted by [`diff_against_snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceFinding {
-    /// The rule that fired.
     pub rule_id: RuleId,
-    /// Severity (drives the diff/watch exit code).
     pub severity: Severity,
-    /// The class of surface that changed.
     pub kind: PersistenceKind,
-    /// Human-readable location of the changed surface.
     pub location: String,
-    /// Short description of *what* changed (`"added authorized key"`,
-    /// `"content modified"`, `"new unit appeared"`).
+    /// Short description of *what* changed (e.g. `"new unit appeared"`).
     pub change: String,
-    /// Lines present in the new content but not the snapshot, **already run
-    /// through the shipping credential redactor**. Empty for an appearance of a
-    /// surface that has no line content (e.g. a new plist tracked by hash).
+    /// Added lines (new content minus snapshot), ALREADY credential-redacted.
     pub added_lines: Vec<String>,
 }
 
 impl PersistenceFinding {
-    /// `true` when this finding is High or Critical (drives diff/watch exit 1).
+    /// `true` when High or Critical (drives diff/watch exit 1).
     pub fn is_high(&self) -> bool {
         matches!(self.severity, Severity::High | Severity::Critical)
     }
 }
 
-// ─── inventory (scan) ────────────────────────────────────────────────────────
-
-/// Inventory every watched persistence surface for the real home dir + cwd.
-///
-/// Resolves `HOME` via the `home` crate and the cwd via
-/// [`std::env::current_dir`]. Returns an empty inventory if the home directory
-/// cannot be resolved (the `.envrc` ancestry walk still runs against the cwd).
+/// Inventory every watched surface for the real home dir + cwd. Returns an empty
+/// inventory if home can't be resolved (the `.envrc` walk still runs against cwd).
 pub fn scan() -> Vec<PersistenceEntry> {
     let home = home::home_dir();
     let cwd = std::env::current_dir().ok();
@@ -259,14 +179,8 @@ pub fn scan() -> Vec<PersistenceEntry> {
     }
 }
 
-/// Testable entry point: inventory `home` (a stand-in for `~`) plus an optional
-/// `cwd` for the `.envrc` ancestry walk.
-///
-/// Every surface under `home` is inspected: shell rc/profile files,
-/// `~/.ssh/{authorized_keys,config}`, `~/.gitconfig`, `~/.npmrc`, the user
-/// crontab (via `crontab -l`), `~/.config/systemd/user/*.service`,
-/// `~/Library/LaunchAgents/*.plist`, login items (macOS `osascript`), and the
-/// git global hooks path. Tests pass a `tempfile::tempdir()` path here.
+/// Testable entry point: inventory every surface under `home` plus an optional
+/// `cwd` for the `.envrc` walk. Tests pass a `tempfile::tempdir()` here.
 pub fn scan_with_root(home: &Path, cwd: Option<&Path>) -> Vec<PersistenceEntry> {
     let mut entries = Vec::new();
 
@@ -279,7 +193,7 @@ pub fn scan_with_root(home: &Path, cwd: Option<&Path>) -> Vec<PersistenceEntry> 
             &path,
         ));
     }
-    // PowerShell profiles live under deeper paths; include the common ones.
+    // PowerShell profiles (only the common paths).
     for rel in POWERSHELL_PROFILES {
         let path = home.join(rel);
         if path.is_file() {
@@ -303,8 +217,7 @@ pub fn scan_with_root(home: &Path, cwd: Option<&Path>) -> Vec<PersistenceEntry> 
         &home.join(".ssh").join("config"),
     ));
 
-    // Inventory-only context surfaces (tracked for change-detection, no
-    // dedicated rule): gitconfig, npmrc.
+    // Inventory-only context surfaces (no dedicated rule): gitconfig, npmrc.
     entries.push(file_entry(
         "other:.gitconfig",
         PersistenceKind::Other,
@@ -330,8 +243,7 @@ pub fn scan_with_root(home: &Path, cwd: Option<&Path>) -> Vec<PersistenceEntry> 
         "plist",
     ));
 
-    // Login items (macOS osascript). On non-macOS this produces an absent
-    // entry (the binary is not found / produces no output).
+    // Login items (macOS osascript); absent entry on non-macOS.
     entries.push(login_items_entry());
 
     // git global hooks path (core.hooksPath), inventory-only.
@@ -364,9 +276,8 @@ const POWERSHELL_PROFILES: &[&str] = &[
     "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
 ];
 
-/// Build a [`PersistenceEntry`] for a single file path. A missing / unreadable
-/// file yields an `absent` entry (hash of the empty string) so a later
-/// appearance is a detectable change.
+/// Build a [`PersistenceEntry`] for a file path. A missing/unreadable file
+/// yields an absent entry (empty-string hash) so a later appearance is detectable.
 fn file_entry(key: &str, kind: PersistenceKind, path: &Path) -> PersistenceEntry {
     let (present, content) = match read_text_if_file(path) {
         Some(c) => (true, c),
@@ -383,8 +294,8 @@ fn file_entry(key: &str, kind: PersistenceKind, path: &Path) -> PersistenceEntry
     }
 }
 
-/// Inventory the user crontab via `crontab -l`. A non-zero exit (the common
-/// "no crontab for <user>" case) is treated as an EMPTY crontab, NOT an error.
+/// Inventory the user crontab via `crontab -l`; a non-zero exit ("no crontab")
+/// counts as an EMPTY crontab, not an error.
 fn crontab_entry() -> PersistenceEntry {
     let content = match run_shell_with_timeout(
         "crontab",
@@ -396,8 +307,7 @@ fn crontab_entry() -> PersistenceEntry {
         ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
             String::from_utf8_lossy(&stdout).into_owned()
         }
-        // Non-zero exit ("no crontab"), NotFound, timeout, or spawn error →
-        // treat as an empty crontab. Absence is the common case, never an error.
+        // Non-zero exit / NotFound / timeout / spawn error → empty crontab.
         _ => String::new(),
     };
     let present = !content.trim().is_empty();
@@ -412,11 +322,9 @@ fn crontab_entry() -> PersistenceEntry {
     }
 }
 
-/// Inventory each unit file in a launch-agent / systemd-user directory. Each
-/// matching file (by `ext`) becomes its own entry keyed by filename so an
-/// added unit is detected as a newly-appearing key. The raw file is HASHED for
-/// change-detection (we do not parse plists — a content hash is sufficient and
-/// avoids a `plutil` shell-out per file).
+/// Inventory each `.{ext}` file in a launch-agent / systemd-user dir as its own
+/// entry keyed by filename (so an added unit is a new key). Files are HASHED, not
+/// parsed — a content hash avoids a `plutil` shell-out per file.
 fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
     let mut entries = Vec::new();
     let read = match std::fs::read_dir(dir) {
@@ -437,8 +345,7 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
         }
         // Read raw bytes (plists may be binary); hash for change-detection.
         let bytes = std::fs::read(&path).unwrap_or_default();
-        // Keep a UTF-8-lossy copy for added-line diffing of XML plists /
-        // systemd units (binary plists simply won't yield meaningful lines).
+        // UTF-8-lossy copy for added-line diffing of XML plists / systemd units.
         let content = String::from_utf8_lossy(&bytes).into_owned();
         entries.push(PersistenceEntry {
             key: format!("launch_agent:{name}"),
@@ -453,9 +360,8 @@ fn launch_agent_dir(dir: &Path, ext: &str) -> Vec<PersistenceEntry> {
     entries
 }
 
-/// Inventory macOS login items via `osascript`. On non-macOS (or when
-/// `osascript` is absent / errors / times out) this yields an `absent`
-/// inventory-only entry.
+/// Inventory macOS login items via `osascript`; an absent entry on non-macOS
+/// (or when `osascript` is absent / errors / times out).
 fn login_items_entry() -> PersistenceEntry {
     let content = match run_shell_with_timeout(
         "osascript",
@@ -484,9 +390,8 @@ fn login_items_entry() -> PersistenceEntry {
     }
 }
 
-/// Inventory the git global hooks path (`core.hooksPath`) if `~/.gitconfig`
-/// sets one. Inventory-only (no dedicated rule); a change is surfaced in
-/// `scan`. Returns `None` when no hooks path is configured.
+/// Inventory the git global hooks path (`core.hooksPath`) from `~/.gitconfig`
+/// (inventory-only); `None` when unset.
 fn git_hooks_path_entry(home: &Path) -> Option<PersistenceEntry> {
     let gitconfig = read_text_if_file(&home.join(".gitconfig"))?;
     let hooks_path = parse_git_hooks_path(&gitconfig)?;
@@ -501,9 +406,8 @@ fn git_hooks_path_entry(home: &Path) -> Option<PersistenceEntry> {
     })
 }
 
-/// Extract `core.hooksPath` from a gitconfig body. Handles both the
-/// `[core]` section `hooksPath = …` form and the one-line dotted
-/// `core.hooksPath = …` form.
+/// Extract `core.hooksPath` from a gitconfig body (both the `[core]` section
+/// form and the dotted `core.hooksPath = …` form).
 fn parse_git_hooks_path(contents: &str) -> Option<String> {
     let mut in_core = false;
     for raw in contents.lines() {
@@ -535,9 +439,8 @@ fn parse_git_hooks_path(contents: &str) -> Option<String> {
     None
 }
 
-/// Walk from `cwd` up to the filesystem root collecting every `.envrc` found.
-/// Each `.envrc` is its own entry keyed by its absolute path so a newly-created
-/// one in the ancestry is a detectable appearance.
+/// Walk from `cwd` to the FS root collecting every `.envrc`, each keyed by its
+/// absolute path so a newly-created one in the ancestry is detectable.
 fn collect_envrc_ancestry(cwd: &Path) -> Vec<PersistenceEntry> {
     let mut entries = Vec::new();
     let mut cur = Some(cwd);
@@ -567,15 +470,8 @@ fn collect_envrc_ancestry(cwd: &Path) -> Vec<PersistenceEntry> {
     entries
 }
 
-// ─── diff (state-change detection) ─────────────────────────────────────────────
-
-/// Compare the live inventory under `home` / `cwd` against `snapshot` and emit
-/// a [`PersistenceFinding`] for every watched surface that changed.
-///
-/// Added lines are computed (new content minus snapshot content) and run
-/// through the shipping credential redactor before being attached to the
-/// finding. Only added lines are reported — never removed lines, never full
-/// content.
+/// Compare the live inventory under `home`/`cwd` against `snapshot`, emitting a
+/// [`PersistenceFinding`] per changed surface (added lines only, redacted).
 pub fn diff_against_snapshot(
     home: &Path,
     cwd: Option<&Path>,
@@ -585,8 +481,8 @@ pub fn diff_against_snapshot(
     diff_entries(&current, snapshot)
 }
 
-/// Core diff used by both [`diff_against_snapshot`] and the CLI: compare a
-/// freshly-collected `current` inventory against `snapshot`.
+/// Core diff (shared by [`diff_against_snapshot`] and the CLI): compare a
+/// `current` inventory against `snapshot`.
 pub fn diff_entries(
     current: &[PersistenceEntry],
     snapshot: &PersistenceSnapshot,
@@ -596,19 +492,16 @@ pub fn diff_entries(
     for entry in current {
         let prev = snapshot.entries.get(&entry.key);
 
-        // Determine whether this surface changed. The prior content is gone
-        // (the snapshot stores only hashes), so we diff against the prior set
-        // of per-line hashes rather than the prior text.
+        // The prior content is gone (snapshot stores only hashes), so diff
+        // against the prior per-line hash set.
         let (changed, prev_line_hashes, prev_present): (bool, &[String], bool) = match prev {
             Some(p) => (
                 p.sha256 != entry.sha256,
                 p.line_hashes.as_slice(),
                 p.present,
             ),
-            // No snapshot record for this key. A NEWLY-APPEARING surface that
-            // is present now is a change worth reporting (a brand-new
-            // LaunchAgent / .envrc). An absent surface with no prior record is
-            // not a change (first-ever scan of an empty surface).
+            // No prior record: a present surface is a new appearance; an absent
+            // one is not a change (first-ever scan of an empty surface).
             None => (entry.present, &[], false),
         };
 
@@ -616,8 +509,7 @@ pub fn diff_entries(
             continue;
         }
 
-        // Map the surface kind onto its rule + severity. Inventory-only
-        // surfaces (`Other`) never fire a rule.
+        // Map kind → rule + severity; `Other` never fires.
         let (rule_id, severity) = match entry.kind {
             PersistenceKind::ShellRc => (RuleId::PersistenceShellRcModified, Severity::Medium),
             PersistenceKind::AuthorizedKeys => {
@@ -626,8 +518,7 @@ pub fn diff_entries(
             PersistenceKind::Crontab => (RuleId::PersistenceCrontabModified, Severity::Medium),
             PersistenceKind::LaunchAgent => (RuleId::PersistenceLaunchAgentAdded, Severity::High),
             PersistenceKind::SshConfig => {
-                // Only fire when the change ADDS an `Include` directive — a
-                // benign `Host` edit should not trip the persistence rule.
+                // Fire only when the change ADDS an `Include` (a `Host` edit shouldn't).
                 if !added_includes(prev_line_hashes, &entry.content) {
                     continue;
                 }
@@ -669,12 +560,9 @@ fn describe_change(kind: PersistenceKind, prev_present: bool, now_present: bool)
     }
 }
 
-/// Lines present in `new_content` whose per-line hash is NOT in the prior
-/// snapshot's `prev_line_hashes` set, run through the shipping credential
-/// redactor. Order-preserving. The prior text is never available (the snapshot
-/// stores hashes only), so membership is decided by hash — which is exactly the
-/// secret-at-rest contract: we recompute added lines from the CURRENT cleartext
-/// (legitimately in hand at diff time) against the PRIOR hashes.
+/// Lines in `new_content` whose per-line hash is NOT in `prev_line_hashes`,
+/// credential-redacted, order-preserving. Membership is by hash (the snapshot
+/// stores no cleartext) — the secret-at-rest contract.
 fn added_lines_redacted(prev_line_hashes: &[String], new_content: &str) -> Vec<String> {
     use std::collections::HashSet;
     let prev: HashSet<&str> = prev_line_hashes.iter().map(String::as_str).collect();
@@ -691,13 +579,9 @@ fn added_lines_redacted(prev_line_hashes: &[String], new_content: &str) -> Vec<S
     out
 }
 
-/// `true` when `new_content` contains an `Include` directive RAW line whose
-/// hash is absent from the prior snapshot's `prev_line_hashes`. Used to gate the
-/// SSH-config rule on an *added* include specifically.
-///
-/// The hash MUST be computed over the same raw (untrimmed, non-empty) line that
-/// [`line_hashes`] persists, so an indented `  Include …` line that is unchanged
-/// still matches its prior hash and does not look "added".
+/// `true` when `new_content` has an `Include` RAW line whose hash is absent from
+/// `prev_line_hashes`. The hash MUST be over the same raw (untrimmed) line that
+/// [`line_hashes`] persists, so an unchanged indented `  Include …` doesn't look added.
 fn added_includes(prev_line_hashes: &[String], new_content: &str) -> bool {
     use std::collections::HashSet;
     let prev: HashSet<&str> = prev_line_hashes.iter().map(String::as_str).collect();
@@ -707,8 +591,7 @@ fn added_includes(prev_line_hashes: &[String], new_content: &str) -> bool {
         .any(|raw| !prev.contains(line_hash(raw).as_str()))
 }
 
-/// `true` when a RAW config line is an `Include`/`IncludeIf` directive
-/// (case-insensitive keyword on the trimmed line; comments / blanks excluded).
+/// `true` when a RAW config line is an `Include`/`IncludeIf` directive.
 fn line_is_include(raw: &str) -> bool {
     let line = raw.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -718,16 +601,14 @@ fn line_is_include(raw: &str) -> bool {
     keyword.eq_ignore_ascii_case("include")
 }
 
-/// 16-char SHA-256 prefix of one content line. 64 bits is ample to distinguish
-/// "line already present" from "line added" for the small line counts these
-/// surfaces carry, while storing nothing recoverable.
+/// 16-char SHA-256 prefix of one content line (64 bits is ample here, and stores
+/// nothing recoverable).
 fn line_hash(line: &str) -> String {
     sha256_hex(line.as_bytes()).chars().take(16).collect()
 }
 
-/// Per-line hashes for every NON-EMPTY line of `content`, order-preserving.
-/// These are what the snapshot persists in place of cleartext. Hashes the RAW
-/// (untrimmed) line so the diff's membership test is consistent.
+/// Per-line hashes of every NON-EMPTY line (RAW, untrimmed, order-preserving) —
+/// what the snapshot persists in place of cleartext.
 fn line_hashes(content: &str) -> Vec<String> {
     content
         .lines()
@@ -735,8 +616,6 @@ fn line_hashes(content: &str) -> Vec<String> {
         .map(line_hash)
         .collect()
 }
-
-// ─── shared helpers ────────────────────────────────────────────────────────────
 
 /// Hex sha256 of a byte slice.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -750,8 +629,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Read a path as UTF-8 text only when it is a regular file. Returns `None` for
-/// directories, missing files, permission errors, or non-UTF-8 content.
+/// Read a path as UTF-8 text only when it is a regular file; `None` otherwise.
 fn read_text_if_file(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
@@ -764,9 +642,8 @@ pub fn snapshot_path() -> Option<PathBuf> {
     crate::policy::state_dir().map(|d| d.join("persistence_snapshot.json"))
 }
 
-/// Load a snapshot from `path`. Returns an empty (default) snapshot when the
-/// file is absent or unparseable — a missing snapshot means "no baseline yet",
-/// not an error.
+/// Load a snapshot from `path`; an empty (default) snapshot when absent or
+/// unparseable (a missing snapshot means "no baseline yet", not an error).
 pub fn load_snapshot(path: &Path) -> PersistenceSnapshot {
     match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
@@ -774,14 +651,9 @@ pub fn load_snapshot(path: &Path) -> PersistenceSnapshot {
     }
 }
 
-/// Persist `snapshot` to `path`, creating the parent directory if needed.
-///
-/// Written `0600` AT OPEN TIME (no umask-race window where it is briefly
-/// world-readable) and ATOMICALLY (write to a sibling temp file, then rename),
-/// matching [`crate::env_guard::save_snapshot`]. Even though the snapshot now
-/// stores only hashes (no cleartext — see the module doc), the set of tracked
-/// surfaces is mildly sensitive, so the same 0600 discipline applies. A perms
-/// failure is propagated, never swallowed.
+/// Persist `snapshot` to `path` (creating the parent dir), `0600` AT OPEN TIME
+/// (no umask race) and ATOMICALLY (sibling temp + rename). The tracked-surface
+/// set is mildly sensitive, so the 0600 discipline applies; perms failures propagate.
 pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -789,8 +661,7 @@ pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Re
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Write to a sibling temp file first, then rename into place so a partial
-    // write can never leave a truncated/corrupt snapshot.
+    // Sibling temp + rename so a partial write can't leave a corrupt snapshot.
     let tmp = path.with_extension("json.tmp");
 
     let mut opts = std::fs::OpenOptions::new();
@@ -826,7 +697,6 @@ mod tests {
         findings.iter().map(|f| f.rule_id).collect()
     }
 
-    /// Snapshot the current inventory, mutate the tree, then diff.
     fn snapshot_then(home: &Path, cwd: Option<&Path>) -> PersistenceSnapshot {
         let entries = scan_with_root(home, cwd);
         PersistenceSnapshot::from_entries(&entries)
@@ -923,8 +793,7 @@ mod tests {
 
     #[test]
     fn crontab_modified_fires_medium_via_entries() {
-        // Crontab content comes from a shell-out we can't drive in a unit
-        // test; exercise the diff logic directly with synthesized entries.
+        // Crontab content comes from a shell-out; drive the diff with synthesized entries.
         let old = vec![PersistenceEntry {
             key: "crontab".to_string(),
             kind: PersistenceKind::Crontab,
@@ -1007,9 +876,8 @@ mod tests {
 
     #[test]
     fn ssh_config_indented_include_unchanged_does_not_fire() {
-        // An INDENTED `  Include …` that is unchanged must not look "added":
-        // the snapshot hashes the RAW line and `added_includes` must hash the
-        // same RAW line (the trimmed-vs-raw mismatch was a real bug).
+        // An unchanged indented `  Include …` must not look "added" — the
+        // trimmed-vs-raw hash mismatch was a real bug.
         let home = tempdir().unwrap();
         let ssh = home.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -1018,8 +886,7 @@ mod tests {
 
         let snap = snapshot_then(home.path(), None);
 
-        // Change an UNRELATED indented option — the indented Include is
-        // untouched, so the SSH-config rule must NOT fire.
+        // Change an unrelated option; the indented Include is untouched → no fire.
         std::fs::write(
             &cfg,
             b"Host *\n  Include ~/.ssh/config.d/work\n  ServerAliveInterval 60\n",
@@ -1078,9 +945,8 @@ mod tests {
 
     #[test]
     fn added_lines_are_credential_redacted() {
-        // A sourced AWS key in an rc diff must be redacted in added_lines. The
-        // prior content is represented ONLY by its per-line hashes (the
-        // secret-at-rest contract) — the diff still finds the new line.
+        // A sourced AWS key must be redacted in added_lines; the prior content
+        // is only its per-line hashes, yet the diff still finds the new line.
         let old = "export PATH=/usr/bin\n";
         let new = "export PATH=/usr/bin\nexport AWS_KEY=AKIAIOSFODNN7EXAMPLE\n";
         let added = added_lines_redacted(&line_hashes(old), new);
@@ -1095,8 +961,7 @@ mod tests {
 
     #[test]
     fn snapshot_persists_no_cleartext_only_hashes() {
-        // The serialized snapshot must NOT contain the raw rc-file bytes (a
-        // secret in an rc/.envrc would otherwise land world-readable at rest).
+        // The serialized snapshot must NOT contain raw rc-file bytes (secret-at-rest).
         let home = tempdir().unwrap();
         std::fs::write(
             home.path().join(".zshrc"),
@@ -1130,11 +995,8 @@ mod tests {
 
     #[test]
     fn crontab_absence_is_empty_not_present() {
-        // A crontab shell-out that fails ("no crontab") yields an absent,
-        // empty entry — and diffing two absent crontabs yields no finding.
+        // A failing crontab shell-out yields an absent, empty, well-formed entry.
         let entry = crontab_entry();
-        // On CI there is usually no crontab; either way the entry must be
-        // well-formed (64-char hash, content/size consistent).
         assert_eq!(entry.sha256.len(), 64);
         assert_eq!(entry.size, entry.content.len());
         assert_eq!(entry.kind, PersistenceKind::Crontab);
@@ -1173,15 +1035,12 @@ mod tests {
         let loaded = load_snapshot(&path);
         assert_eq!(loaded.schema_version, 1);
         assert!(loaded.entries.contains_key("shell_rc:.bashrc"));
-        // Per-line hashes survive the round-trip (NOT cleartext) so a later
-        // diff can still detect added lines. The original line's hash is
-        // present; an unrelated line's is not.
+        // Per-line hashes survive the round-trip (not cleartext) so a later diff still works.
         let lh = &loaded.entries["shell_rc:.bashrc"].line_hashes;
         assert!(lh.contains(&line_hash("alias l=ls")), "{lh:?}");
         assert!(!lh.contains(&line_hash("alias x=cat")), "{lh:?}");
 
-        // End-to-end: appending a new line to the rc file and diffing against
-        // the loaded (hash-only) snapshot still surfaces the added line.
+        // End-to-end: a later diff against the hash-only snapshot surfaces the added line.
         std::fs::write(
             home.path().join(".bashrc"),
             b"alias l=ls\nsource ~/evil.sh\n",

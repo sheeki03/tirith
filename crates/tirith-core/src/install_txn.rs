@@ -1,32 +1,17 @@
 //! Safe-install transaction analysis — the engine behind `tirith install`.
 //!
-//! `tirith install` is the *assembly* of existing tirith building blocks into
-//! one recorded install transaction. This module is its core: it composes a
-//! single explainable [`Verdict`] for a package-manager install (`npm` / `pip`
-//! / `cargo`) from two already-existing engines —
+//! Composes one explainable [`Verdict`] for a package-manager install from two
+//! existing engines: the command-shape analysis ([`crate::engine::analyze`])
+//! and the deterministic package-risk scorer ([`crate::package_risk`], with the
+//! opt-in registry-API provenance signals). It re-implements neither, and
+//! reuses [`crate::rules::threatintel::extract_packages`] for extraction.
 //!
-//!  1. the command-shape analysis ([`crate::engine::analyze`], which itself
-//!     runs the install-command rules from [`crate::rules::install`], the URL
-//!     rules, and the local-threat-DB package rules); and
-//!  2. the deterministic package-risk scorer ([`crate::package_risk`], chunks
-//!     2–3, plus the opt-in registry-API provenance signals of chunk 6).
+//! Honest framing: this is pre-execution analysis plus a recorded transaction —
+//! NOT a sandbox. Runtime sandboxing is an explicit tirith non-goal
+//! (`docs/threat-model.md`); the real install still runs with full privileges.
 //!
-//! It does **not** re-implement either engine, and it does **not** parse the
-//! command line itself — package extraction reuses
-//! [`crate::rules::threatintel::extract_packages`].
-//!
-//! ## Honest framing
-//!
-//! This is **pre-execution install-risk analysis plus a recorded transaction**.
-//! It is *not* a sandbox and it does not isolate or contain the install —
-//! runtime sandboxing is an explicit tirith non-goal (`docs/threat-model.md`).
-//! Nothing in this module — code, output, or docs — may imply otherwise. The
-//! real install still runs with the user's full privileges; tirith's value is
-//! that it is analyzed, surfaced, and recorded *first*.
-//!
-//! The URL form of `tirith install` is handled separately by the CLI: it
-//! delegates wholly to [`crate::runner`], the existing safe download-and-run
-//! machinery, rather than going through this module.
+//! The URL form of `tirith install` is handled separately by the CLI via
+//! [`crate::runner`], not this module.
 
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
@@ -40,20 +25,13 @@ use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 
-/// Which package manager an install transaction drives.
+/// Which package manager an install transaction drives. (The `url` form of
+/// `tirith install` is handled by the CLI via [`crate::runner`], not here.)
 ///
-/// The `url` form of `tirith install` is intentionally absent here: it is not
-/// a package-manager transaction and is handled by the CLI through
-/// [`crate::runner`] directly.
-///
-/// **M6 ch1** — extended with eight distro/docker/go backends. These ship
-/// command-complete (the right argv is built, the verdict carries the right
-/// `manager` label, threat-DB and command-shape rules run) but **signal-weak**:
-/// no registry adapter is wired for them, so `--online` provenance signals
-/// degrade to [`crate::package_risk::ApiSignals::Unavailable`] with the honest
-/// reason `"no registry adapter for <eco>"`. The CLI surfaces a banner saying
-/// so on every `tirith install <backend>` invocation, and threat-DB lookups
-/// for these ecosystems return empty until feed wiring extends.
+/// **M6 ch1** — the eight distro/docker/go backends are command-complete but
+/// signal-weak: no registry adapter is wired, so `--online` provenance degrades
+/// to [`crate::package_risk::ApiSignals::Unavailable`] (the CLI shows a banner),
+/// and threat-DB lookups for these ecosystems return empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
     /// `npm install <pkg...>`
@@ -62,10 +40,8 @@ pub enum PackageManager {
     Pip,
     /// `cargo install <pkg...>`
     Cargo,
-    /// `apt-get install <pkg...>` — Debian/Ubuntu. The scriptable interface is
-    /// `apt-get`, not `apt` (per Debian docs `apt` is meant for interactive
-    /// use). One variant ↔ one program: there is no `apt`-vs-`apt-get`
-    /// ambiguity at the dispatch level.
+    /// `apt-get install <pkg...>` — Debian/Ubuntu. Maps to `apt-get` (the
+    /// scriptable interface), not `apt`; one variant ↔ one program.
     Apt,
     /// `brew install <pkg...>` — Homebrew, macOS / Linuxbrew.
     Brew,
@@ -73,33 +49,23 @@ pub enum PackageManager {
     Dnf,
     /// `yum install <pkg...>` — RHEL 7 and earlier, still common in CI images.
     Yum,
-    /// `pacman -S <pkg...>` — Arch / Manjaro. argv[1] is `-S` (the Sync
-    /// op flag), not a positional subcommand; this is encoded through
-    /// [`Self::install_subcommand`] so the generic argv builder stays
-    /// untouched.
+    /// `pacman -S <pkg...>` — Arch / Manjaro. argv[1] is `-S` (Sync), encoded
+    /// via [`Self::install_subcommand`] so the generic argv builder is untouched.
     Pacman,
-    /// `scoop install <pkg...>` — Windows-only command-line installer. The
-    /// dry-run analysis path runs on every OS; the real-run path is gated
-    /// behind `cfg!(target_os = "windows")` by the CLI so a Linux/macOS
-    /// operator cannot accidentally trigger a half-broken install.
+    /// `scoop install <pkg...>` — Windows-only installer. The dry-run analysis
+    /// runs on every OS; the CLI gates the real run behind Windows.
     Scoop,
-    /// `docker pull <image>[:<tag>|@<digest>]` — pulls an image; the install
-    /// subcommand is `pull`, not `install`. Image refs are parsed by
-    /// [`crate::parse::parse_docker_ref`] (the existing engine code path).
+    /// `docker pull <image>[:<tag>|@<digest>]` — install subcommand is `pull`.
+    /// Image refs are parsed by [`crate::parse::parse_docker_ref`].
     Docker,
-    /// `go install <module>[@<version>]` — the version suffix defaults to
-    /// `@latest` if not supplied, mirroring `go install`'s own default. Module
-    /// path parsing is local (a small split on `@`).
+    /// `go install <module>[@<version>]` — version defaults to `@latest`,
+    /// mirroring `go install`. Module-path parsing is a local split on `@`.
     Go,
 }
 
 impl PackageManager {
-    /// The program name to invoke (argv[0] of the real install).
-    ///
-    /// **One variant ↔ exactly one program.** No `"apt"|"apt-get"`
-    /// ambiguity: `Apt` always maps to `apt-get` because that is the
-    /// scriptable interface; `apt` itself is documented as for interactive
-    /// use only.
+    /// The program name to invoke (argv[0]). One variant ↔ one program; `Apt`
+    /// maps to `apt-get` (the scriptable interface).
     pub fn program(self) -> &'static str {
         match self {
             PackageManager::Npm => "npm",
@@ -116,28 +82,18 @@ impl PackageManager {
         }
     }
 
-    /// The install subcommand for this manager.
-    ///
-    /// Most are `install`. Docker uses `pull`. Pacman uses `-S` (the Sync
-    /// op flag — `pacman` has no positional subcommand). Encoding pacman's
-    /// `-S` through this method means [`build_argv`] stays generic: it
-    /// inserts `argv[1] = install_subcommand`, and that just happens to be
-    /// a flag for pacman.
+    /// The install subcommand. Most are `install`; Docker uses `pull`; Pacman
+    /// uses `-S` (Sync) — encoding it here keeps [`build_argv`] generic.
     pub fn install_subcommand(self) -> &'static str {
         match self {
             PackageManager::Docker => "pull",
             PackageManager::Pacman => "-S",
-            // npm / pip / cargo / apt-get / brew / dnf / yum / scoop / go.
             _ => "install",
         }
     }
 
-    /// The registry [`Ecosystem`] this manager installs from — the ecosystem
-    /// the package-risk scorer is keyed on.
-    ///
-    /// The distro/docker/go ecosystems are present so the scorer's
-    /// per-package output can carry the right label; today no registry
-    /// adapter exists for them so `--online` signals degrade.
+    /// The registry [`Ecosystem`] this manager installs from (what the
+    /// package-risk scorer is keyed on).
     pub fn ecosystem(self) -> Ecosystem {
         match self {
             PackageManager::Npm => Ecosystem::Npm,
@@ -154,10 +110,8 @@ impl PackageManager {
         }
     }
 
-    /// Human label for output. By default the same as [`Self::program`] —
-    /// for `Apt` we return `"apt"` instead of `"apt-get"` because that is
-    /// the user-facing CLI name even though `apt-get` is the scriptable
-    /// program we invoke.
+    /// Human label for output — same as [`Self::program`] except `Apt` shows
+    /// `"apt"` (the user-facing name) even though we invoke `apt-get`.
     pub fn label(self) -> &'static str {
         match self {
             PackageManager::Apt => "apt",
@@ -165,16 +119,9 @@ impl PackageManager {
         }
     }
 
-    /// `true` when this manager has **no registry adapter** wired into
-    /// [`crate::registry_api`] today, so `--online` provenance signals
-    /// degrade to [`crate::package_risk::ApiSignals::Unavailable`] with the
-    /// reason `"no registry adapter for <eco>"`. The CLI uses this to
-    /// print a one-line "signals are weak" banner on every invocation.
-    ///
-    /// **Source of truth** lives in [`crate::registry_api`]'s `fetch`
-    /// dispatch; this method must agree with it. A future PR that wires an
-    /// adapter for one of these ecosystems flips this method's return value
-    /// to `false`, then the banner disappears.
+    /// `true` when this manager has no registry adapter in [`crate::registry_api`],
+    /// so `--online` provenance degrades to `Unavailable` and the CLI shows a
+    /// banner. Must agree with `registry_api`'s `fetch` dispatch (source of truth).
     pub fn lacks_registry_adapter(self) -> bool {
         // Today only npm / pypi / crates.io have adapters.
         !matches!(
@@ -183,8 +130,8 @@ impl PackageManager {
         )
     }
 
-    /// The one-line banner printed (and embedded in JSON) when this manager
-    /// has no registry adapter. The plan's verbatim text is reproduced here.
+    /// The one-line banner printed (and embedded in JSON) when this manager has
+    /// no registry adapter.
     pub fn no_registry_adapter_banner(self) -> String {
         format!(
             "note: registry-API provenance signals for {} are not available \
@@ -194,21 +141,17 @@ impl PackageManager {
         )
     }
 
-    /// `true` when this manager runs the real install only on Windows
-    /// (currently just Scoop). The dry-run / analysis path runs on every
-    /// OS; the real-run path is gated by the CLI.
+    /// `true` when the real install runs only on Windows (currently Scoop); the
+    /// dry-run/analysis path runs on every OS.
     pub fn is_windows_only_runtime(self) -> bool {
         matches!(self, PackageManager::Scoop)
     }
 }
 
 /// The argv of the real install command, e.g.
-/// `["npm", "install", "left-pad", "--save-dev"]`.
-///
-/// This is what the CLI actually executes — directly via
-/// `std::process::Command`, never through a shell. The same tokens, joined
-/// with spaces, form the [`InstallPlan::analysis_command`] string used purely
-/// for analysis and audit.
+/// `["npm", "install", "left-pad", "--save-dev"]`. Executed directly via
+/// `std::process::Command`, never through a shell; the same tokens joined with
+/// spaces form [`InstallPlan::analysis_command`] (analysis/audit only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallArgv {
     /// argv[0] — the package-manager program.
@@ -218,8 +161,8 @@ pub struct InstallArgv {
 }
 
 impl InstallArgv {
-    /// The command as a single human-readable string, for display and audit.
-    /// This string is **never** handed to a shell.
+    /// The command as a single human-readable string (display/audit); never
+    /// handed to a shell.
     pub fn display(&self) -> String {
         if self.args.is_empty() {
             self.program.clone()
@@ -229,39 +172,30 @@ impl InstallArgv {
     }
 }
 
-/// A fully-analyzed, ready-to-run install transaction.
-///
-/// Produced by [`plan_install`]. The CLI inspects [`InstallPlan::verdict`] to
-/// decide whether to proceed (and how), then runs [`InstallPlan::argv`].
+/// A fully-analyzed, ready-to-run install transaction, produced by
+/// [`plan_install`]. The CLI inspects [`InstallPlan::verdict`], then runs
+/// [`InstallPlan::argv`].
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
     /// The package manager being driven.
     pub manager: PackageManager,
     /// The exact argv of the real install command.
     pub argv: InstallArgv,
-    /// The argv joined into a string — used for analysis and the audit log
-    /// only, never executed through a shell.
+    /// The argv joined into a string — analysis/audit only, never shell-executed.
     pub analysis_command: String,
-    /// The packages the transaction will install, as extracted from the
-    /// arguments. Empty when the user passed only flags (e.g. a bare
-    /// `pip install -r requirements.txt`, where there is no package on the
-    /// command line to score). Each [`PlannedPackage`] carries its own
-    /// [`RiskBreakdown`] — see [`InstallPlan::risk_breakdowns`].
+    /// The packages the transaction will install (empty for a flags-only /
+    /// manifest install). Each carries its own [`RiskBreakdown`].
     pub packages: Vec<PlannedPackage>,
-    /// The composed verdict: command-shape findings merged with
-    /// package-risk findings, de-duplicated, action derived from the strongest.
+    /// The composed verdict: command-shape + package-risk findings, deduped,
+    /// action from the strongest.
     pub verdict: Verdict,
-    /// Notes about analysis coverage (a missing threat DB, an unrecognized
-    /// package spec). Surfaced so the transaction is honest about its limits.
+    /// Coverage notes (missing threat DB, unrecognized spec) — honest limits.
     pub notes: Vec<String>,
 }
 
 impl InstallPlan {
-    /// The per-package [`RiskBreakdown`]s, in [`InstallPlan::packages`] order.
-    ///
-    /// A derived view over `packages` — the breakdown is stored once, on each
-    /// [`PlannedPackage`], so there is no separate `risk_breakdowns` field that
-    /// could drift out of agreement with it.
+    /// The per-package [`RiskBreakdown`]s, in [`InstallPlan::packages`] order —
+    /// a derived view (stored once per [`PlannedPackage`], so no drift).
     pub fn risk_breakdowns(&self) -> impl Iterator<Item = &RiskBreakdown> {
         self.packages.iter().map(|p| &p.risk)
     }
@@ -276,57 +210,41 @@ pub struct PlannedPackage {
     pub risk: RiskBreakdown,
 }
 
-/// How the registry-API (`--online`) package signals are resolved.
-///
-/// Mirrors [`crate::ecosystem_scan::OnlineMode`]: the CLI supplies this so the
-/// core never reaches the network or reads an environment variable itself.
+/// How the registry-API (`--online`) package signals are resolved. The CLI
+/// supplies this so the core never reaches the network itself.
 pub enum OnlineMode<'a> {
-    /// Offline analysis — every package's API signals are
-    /// [`ApiSignals::NotComputed`].
+    /// Offline — every package's API signals are [`ApiSignals::NotComputed`].
     Off,
-    /// `--online` analysis — the closure resolves each `(ecosystem, name)` to
-    /// its [`ApiSignals`]. The closure must be offline-safe (degrading any
-    /// failure to [`ApiSignals::Unavailable`]); it is called at most once per
-    /// distinct package.
+    /// `--online` — an offline-safe closure resolving each `(ecosystem, name)`
+    /// to its [`ApiSignals`], called at most once per distinct package.
     Resolver(&'a dyn Fn(Ecosystem, &str) -> ApiSignals),
 }
 
-/// Inputs to [`plan_install`], kept in a struct so the signature stays stable.
+/// Inputs to [`plan_install`], in a struct so the signature stays stable.
 pub struct PlanRequest<'a> {
     /// Which package manager is being driven.
     pub manager: PackageManager,
-    /// The user's arguments *after* the `npm|pip|cargo` source — e.g.
-    /// `["left-pad", "--save-dev"]`. The install subcommand is prepended by
-    /// the planner, so a caller passes the package list and flags only.
+    /// The user's arguments after the source (the planner prepends the install
+    /// subcommand), e.g. `["left-pad", "--save-dev"]`.
     pub user_args: &'a [String],
-    /// The loaded threat DB, or `None` when one is not installed (analysis
-    /// still runs; name signals fall back to "unknown" and a note is added).
+    /// The loaded threat DB, or `None` (analysis still runs, weaker signals).
     pub db: Option<&'a ThreatDb>,
-    /// The active policy — drives severity overrides and the bypass decision.
+    /// The active policy — severity overrides and the bypass decision.
     pub policy: &'a Policy,
     /// The current working directory, for the engine's command analysis.
     pub cwd: Option<String>,
-    /// Whether the run is interactive (affects only the verdict's
-    /// `interactive_detected` flag — the gate is the CLI's job).
+    /// Whether the run is interactive (sets the verdict flag only; the gate is
+    /// the CLI's job).
     pub interactive: bool,
     /// Registry-API resolution mode.
     pub online: OnlineMode<'a>,
 }
 
 /// Analyze a package-manager install and produce a ready-to-run [`InstallPlan`].
-///
-/// This is the single entry point. It:
-///  1. builds the real install argv and the analysis command string;
-///  2. runs [`engine::analyze`] over that command string (command-shape,
-///     URL, and local-threat-DB package findings — for free);
-///  3. extracts the packages and scores each with [`package_risk`];
-///  4. merges the package-risk findings into the command findings,
-///     de-duplicating against the threat-DB findings the engine already
-///     produced; and
-///  5. derives the final [`Action`] from the strongest merged finding.
-///
-/// It performs **no** network I/O itself — the only networked path is the
-/// caller-supplied [`OnlineMode::Resolver`] closure. It never panics.
+/// The single entry point: builds the argv, runs [`engine::analyze`], extracts
+/// and scores packages with [`package_risk`], merges (de-duped) findings, and
+/// derives the final [`Action`]. No network I/O except the caller's
+/// [`OnlineMode::Resolver`]; never panics.
 pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     let manager = request.manager;
     let argv = build_argv(manager, request.user_args);
@@ -342,12 +260,9 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         );
     }
 
-    // --- (1) command-shape analysis -------------------------------------
-    // Analyze the synthesized real command exactly as `tirith check` would.
-    // This yields the install-command rules (unsigned repo, remote manifest,
-    // ...), URL rules, and local-threat-DB package rules in one pass — we do
-    // NOT call `rules::install::check` or `rules::threatintel::check`
-    // directly; the engine already wires them.
+    // (1) command-shape analysis — analyze the synthesized command as `tirith
+    // check` would (install-command + URL + threat-DB rules in one pass). We do
+    // NOT call the rule modules directly; the engine already wires them.
     let ctx = AnalysisContext {
         input: analysis_command.clone(),
         shell: ShellType::Posix,
@@ -365,19 +280,11 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;
 
-    // --- (2) + (3) package extraction and package-risk scoring ----------
-    // Reuse the existing extractor rather than re-parsing the command line.
-    // For Npm / Pip / Cargo this is sufficient — the generic extractor
-    // recognizes those commands. For Docker and Go the manager-specific
-    // parser is authoritative (it parses image refs / module paths with
-    // versions, including the implicit-`latest` default for both), so for
-    // those two managers we *replace* the generic extractor's output with
-    // the manager-specific output to avoid emitting two PlannedPackage
-    // entries for the same `(ecosystem, name)`. For Apt / Brew / Dnf / Yum
-    // / Pacman / Scoop there is no public per-package registry to score
-    // against in M6 ch1 and the manager-specific parser intentionally
-    // returns empty — the verdict for those backends is command-shape
-    // analysis + the no-registry-adapter banner.
+    // (2)+(3) package extraction and scoring. Reuse the existing extractor for
+    // npm/pip/cargo; for Docker/Go the manager-specific parser is authoritative
+    // (and replaces the generic output to avoid duplicate PlannedPackage
+    // entries). The distro backends have no registry to score against and
+    // return empty — their verdict is command-shape + the no-adapter banner.
     let segments = tokenize::tokenize(&analysis_command, ShellType::Posix);
     let extracted: Vec<PackageRef> = match manager {
         PackageManager::Docker | PackageManager::Go => {
@@ -386,30 +293,21 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         _ => threatintel::extract_packages(&segments),
     };
 
-    // M6 ch1 — the `schemeless_to_sink` false positive on `go install
-    // <module>` / `docker pull <image>` is suppressed at the engine layer
-    // in `extract.rs` (docker has a long-standing carve-out; go got one in
-    // M6 ch1 alongside this code). No additional install-side filtering
-    // needed here.
+    // M6 ch1 — the `schemeless_to_sink` FP on `go install` / `docker pull` is
+    // suppressed at the engine layer in `extract.rs`; nothing extra needed here.
 
-    // Keep only packages for this manager's ecosystem. `extract_packages`
-    // recognizes every install command it sees; the synthesized command only
-    // ever contains one, so this is belt-and-suspenders.
+    // Keep only packages for this manager's ecosystem (belt-and-suspenders).
     let eco = manager.ecosystem();
     let mut planned: Vec<PlannedPackage> = Vec::new();
 
     let online_in_use = matches!(request.online, OnlineMode::Resolver(_));
     for pkg in extracted.into_iter().filter(|p| p.ecosystem == eco) {
         let signals = gather_package_signals(request, eco, &pkg, &mut notes);
-        // `score_package` itself asserts the factor-sum invariant.
         let breakdown = package_risk::score_package(&signals);
 
-        // M6 ch7 — install-script signal is only present when (a) `--online`
-        // resolved the package and inline `scripts.*` arrived, OR (b) the
-        // path is `ecosystem scan --installed` / `package scan --lockfile
-        // --online` (where script text is on disk). A bare offline `tirith
-        // install` cannot evaluate the signal — surface that gap explicitly
-        // rather than silently allowing the policy rule to no-op.
+        // M6 ch7 — the install-script signal needs `--online` (or on-disk script
+        // text). A bare offline install can't evaluate it; surface the gap
+        // rather than silently no-op the policy rule.
         if request
             .policy
             .package_policy
@@ -424,8 +322,8 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
             ));
         }
 
-        // Honest framing for the M6 ch7 `block_not_found` rule too: offline
-        // runs cannot resolve `PackageExistence` and the policy never fires.
+        // Likewise: offline runs can't resolve `PackageExistence`, so
+        // `block_not_found` never fires — note the gap.
         if request.policy.package_policy.block_not_found
             && !online_in_use
             && package_existence(&signals.api).is_none()
@@ -437,8 +335,8 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
             ));
         }
 
-        // (4) Turn the breakdown into findings, de-duplicated against the
-        // threat-DB findings the engine already produced for this package.
+        // (4) breakdown → findings, de-duped against the engine's threat-DB
+        // findings for this package.
         for finding in risk_findings_for(&pkg, &breakdown, &findings, request.policy) {
             findings.push(finding);
         }
@@ -450,13 +348,10 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
     }
 
     if planned.is_empty() {
-        // M6 ch1 — when the manager has no registry adapter (apt / brew /
-        // dnf / yum / pacman / scoop), we DO NOT score per-package risk
-        // even though a package name was given. The "no installable package
-        // name" wording would be confusing for `apt-get install nginx`
-        // (`nginx` IS the name — we just have no adapter). Use a
-        // backend-honest note in that case; for npm/pip/cargo keep the
-        // existing manifest-form pointer.
+        // M6 ch1 — a no-adapter backend (apt/brew/dnf/yum/pacman/scoop) doesn't
+        // score per-package even with a name given; "no installable package
+        // name" would mislead for `apt-get install nginx`. Use a backend-honest
+        // note for those; keep the manifest-form pointer for npm/pip/cargo.
         let note = if manager.lacks_registry_adapter() && !request.user_args.is_empty() {
             format!(
                 "{} has no registry adapter wired into tirith yet, so per-package \
@@ -475,21 +370,12 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         };
         notes.push(note);
 
-        // PR #121 fix-list item 1 — close the manifest-form install bypass.
-        // Previously, when `planned.is_empty()` AND the user invoked a
-        // manifest-driven form (`pip install -r requirements.txt`,
-        // `npm install` with no args, `cargo install --path .`, ...), the
-        // analysis was complete with ZERO package-risk scoring contribution
-        // and frequently exited ALLOW. Operators saw "verdict: ALLOW — no
-        // supply-chain risks found" and believed tirith had analyzed their
-        // manifest. It had not — `extract_packages` cannot extract names from
-        // a manifest path; the manifest body would have to be parsed.
-        //
-        // The fix: when a manifest flag is present, emit a finding so the
-        // operator sees the unanalyzed surface as an explicit gap, with a
-        // pointer to `tirith ecosystem scan` (the path that DOES parse
-        // manifests). Severity escalates under `fail_mode: closed` so a
-        // strict-mode policy hard-blocks instead of just warning.
+        // PR #121 fix-list item 1 — close the manifest-form install bypass: a
+        // manifest-driven form (`pip install -r …`, bare `npm install`, …) used
+        // to exit ALLOW with zero package scoring (`extract_packages` can't read
+        // a manifest body). When a manifest flag is present, emit a finding
+        // pointing at `tirith ecosystem scan`; severity escalates under
+        // `fail_mode: closed` so strict mode hard-blocks.
         if let Some(manifest_arg) = detect_manifest_flag(request.user_args) {
             let strict = matches!(request.policy.fail_mode, FailMode::Closed);
             let severity = if strict {
@@ -557,10 +443,8 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
         }
     }
 
-    // --- (5) compose the verdict ----------------------------------------
-    // Apply policy severity overrides to the merged findings, then derive the
-    // action from the strongest. `from_findings` is the same max-severity →
-    // action mapping the rest of tirith uses.
+    // (5) compose the verdict — apply policy severity overrides, then derive
+    // the action from the strongest finding (the shared max-severity mapping).
     for finding in &mut findings {
         if let Some(sev) = request.policy.severity_override(&finding.rule_id) {
             finding.severity = sev;
@@ -585,28 +469,21 @@ pub fn plan_install(request: &PlanRequest) -> InstallPlan {
 }
 
 /// The kind of manifest-driven install flag detected on a `planned.is_empty()`
-/// install command. Surfaces enough structure that a finding can carry the
-/// exact manifest path / form back to the operator.
+/// command — enough structure for the finding to name the exact form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManifestFlag {
-    /// A flag that takes a separate-token path: `pip install -r requirements.txt`,
-    /// `pip install --requirement requirements.txt`, `pip install -e .`,
-    /// `cargo install --path .`, etc.
+    /// Flag with a separate-token path (`-r requirements.txt`, `--path .`, …).
     PathArg { flag: String, value: String },
-    /// A `flag=value` joined form: `pip install --requirement=requirements.txt`,
-    /// `cargo install --path=.`.
+    /// Joined `flag=value` form (`--requirement=requirements.txt`, `--path=.`).
     JoinedPath { token: String },
-    /// A bareword that is itself a manifest reference: `pip install .`,
-    /// `pip install ./subdir`, `pip install /abs/path` (pip uses a path
-    /// positional to install from `pyproject.toml`).
+    /// A bareword that is itself a manifest reference (`.`, `./subdir`, `/abs`).
     Bareword { token: String },
-    /// `npm install` with NO user arguments (npm uses the local
-    /// `package-lock.json` / `package.json` implicitly).
+    /// `npm install` with NO args (implicit local `package(-lock).json`).
     NoArgs,
 }
 
 impl ManifestFlag {
-    /// One-line description used in finding bodies.
+    /// One-line description for finding bodies.
     fn describe(&self) -> &'static str {
         match self {
             ManifestFlag::PathArg { .. } | ManifestFlag::JoinedPath { .. } => {
@@ -618,35 +495,14 @@ impl ManifestFlag {
     }
 }
 
-/// Detect whether `user_args` represents a manifest-driven install.
-///
-/// The detection is conservative: only the well-known manifest forms across
-/// pip / npm / cargo are recognized. A future package manager (or a flag this
-/// list does not cover) returns `None` and falls through to the existing
-/// "no package on the command line" note without escalating to a finding.
-///
-/// Forms recognized today:
-///
-/// * pip — `-r FILE`, `--requirement FILE`, `--requirements FILE`, `-c FILE`,
-///   `--constraint FILE`, `-e PATH` (editable), `--editable PATH`,
-///   `--requirement=FILE` / `--constraint=FILE` / `--editable=PATH` joined,
-///   and a bareword path (`.`, `./x`, `/abs/path`).
-/// * npm — install with NO user args (the default reads
-///   `package.json`/`package-lock.json`).
-/// * cargo — `--path PATH`, `--path=PATH`, `--git URL`, `--git=URL`.
-///
-/// The check runs *before* the verdict is composed — `user_args` here is the
-/// caller's arguments after the `<source>` positional, i.e. exactly what the
-/// install subcommand will see.
+/// Detect whether `user_args` is a manifest-driven install. Conservative: only
+/// the well-known pip/npm/cargo forms (`-r`/`--requirement`/`-c`/`--constraint`/
+/// `-e`/`--editable`, `--path`/`--git`, joined `flag=value`, bareword paths, and
+/// a bare `npm install`); anything else returns `None`. Runs before the verdict;
+/// `user_args` is what the install subcommand will see.
 fn detect_manifest_flag(user_args: &[String]) -> Option<ManifestFlag> {
-    // npm install with NO args — implicit local manifest. The same is *not*
-    // true for pip / cargo: a bare `pip install` or `cargo install` is a
-    // usage error (no target), so we only treat the empty-args form as
-    // manifest-driven when SOME flag-or-positional is present. Empty
-    // `user_args` therefore returns `NoArgs` only when the engine analyzed
-    // an actual `<manager> install` invocation with no further args; the
-    // CLI rejects empty args before `plan_install` is called for pip/cargo,
-    // so in practice NoArgs surfaces for npm.
+    // Empty args = npm's implicit local manifest. (The CLI rejects empty args
+    // for pip/cargo before this is called, so NoArgs surfaces for npm.)
     if user_args.is_empty() {
         return Some(ManifestFlag::NoArgs);
     }
@@ -669,9 +525,8 @@ fn detect_manifest_flag(user_args: &[String]) -> Option<ManifestFlag> {
     while i < user_args.len() {
         let arg = user_args[i].as_str();
         if SEPARATE_FLAGS.contains(&arg) {
-            // Need a following value token. If the user wrote `pip install -r`
-            // with nothing after it, that's a usage error pip itself catches;
-            // we still surface the manifest-form finding with an empty value.
+            // Surface the finding even if the value token is missing (a usage
+            // error pip itself catches).
             let value = user_args.get(i + 1).cloned().unwrap_or_default();
             return Some(ManifestFlag::PathArg {
                 flag: arg.to_string(),
@@ -696,17 +551,9 @@ fn detect_manifest_flag(user_args: &[String]) -> Option<ManifestFlag> {
                 });
             }
         }
-        // Bareword path positional (pip's `pip install .` form). We treat a
-        // bareword as a manifest reference when it *looks* like a path
-        // (starts with `.`, `/`, or `~`). A normal package name like
-        // `requests` is not a manifest reference — pip parses it as a name.
-        //
-        // We deliberately ignore arguments that start with `-` (they're
-        // flags), and we only consider a token a path-positional when it
-        // STARTS with one of those characters (a bare `.` is the canonical
-        // "install from this directory" pip form; `requirements.txt` alone
-        // without `-r` is NOT a manifest install per pip's CLI, so we do
-        // NOT treat a `.txt` suffix as a signal).
+        // Bareword path positional (pip's `pip install .`): a manifest ref only
+        // when it LOOKS like a path (starts with `.`, `/`, or `~`). A plain name
+        // like `requests` is not; a bare `.txt` suffix is not a signal either.
         if !arg.starts_with('-')
             && (arg == "."
                 || arg == ".."
@@ -724,11 +571,8 @@ fn detect_manifest_flag(user_args: &[String]) -> Option<ManifestFlag> {
     None
 }
 
-/// Build the real install argv for `manager` from the user's arguments.
-///
-/// The install subcommand is inserted right after argv[0]; the user's
-/// arguments follow verbatim. No argument is interpreted or rewritten — they
-/// are passed straight through to the package manager.
+/// Build the real install argv: install subcommand after argv[0], then the
+/// user's arguments verbatim (never interpreted or rewritten).
 pub fn build_argv(manager: PackageManager, user_args: &[String]) -> InstallArgv {
     let mut args = Vec::with_capacity(user_args.len() + 1);
     args.push(manager.install_subcommand().to_string());
@@ -739,29 +583,12 @@ pub fn build_argv(manager: PackageManager, user_args: &[String]) -> InstallArgv 
     }
 }
 
-/// M6 ch1 — manager-specific package extraction for the install backends
-/// the generic [`threatintel::extract_packages`] does not recognize.
-///
-/// Today this covers:
-///
-///  * `Docker` — parses `<image>[:<tag>|@<digest>]` arguments into
-///    [`PackageRef`]s keyed at `Ecosystem::Docker`. Uses
-///    [`crate::parse::parse_docker_ref`] (the existing engine code path) so
-///    a digest form, a registry prefix, and an implicit `library/` namespace
-///    all round-trip through one parser.
-///  * `Go` — parses `<module>[@<version>]` arguments into [`PackageRef`]s
-///    keyed at `Ecosystem::Go`, defaulting the version to `latest` when
-///    absent (mirroring `go install`'s own implicit default). Note the
-///    generic extractor *also* recognizes `go install pkg@v1`, so for
-///    explicit-version forms there is some overlap — the dedupe by
-///    `(ecosystem, name)` in the scoring loop tolerates duplicates.
-///
-/// For `Npm`, `Pip`, `Cargo`, `Apt`, `Brew`, `Dnf`, `Yum`, `Pacman`, `Scoop`
-/// this returns an empty vector: the first three are covered by the
-/// generic extractor; the last six have no public per-package registry to
-/// score against in M6 ch1 and intentionally produce no PackageRef. The
-/// verdict for those is command-shape analysis + the no-registry-adapter
-/// banner, not silent name-scoring.
+/// M6 ch1 — manager-specific package extraction for the backends the generic
+/// [`threatintel::extract_packages`] does not recognize: `Docker`
+/// (`<image>[:<tag>|@<digest>]` via [`crate::parse::parse_docker_ref`]) and `Go`
+/// (`<module>[@<version>]`, default `latest`). Returns empty for everything else
+/// (npm/pip/cargo use the generic extractor; the distro backends have no
+/// registry to score against).
 fn extract_packages_manager_specific(
     manager: PackageManager,
     user_args: &[String],
@@ -769,8 +596,7 @@ fn extract_packages_manager_specific(
     match manager {
         PackageManager::Docker => parse_docker_specs(user_args),
         PackageManager::Go => parse_go_specs(user_args),
-        // The covered-or-no-op managers — explicit so a future manager forces
-        // a decision here rather than silently inheriting "no extraction".
+        // Explicit (not `_`) so a future manager forces a decision here.
         PackageManager::Npm
         | PackageManager::Pip
         | PackageManager::Cargo
@@ -783,19 +609,10 @@ fn extract_packages_manager_specific(
     }
 }
 
-/// Parse Docker image-ref arguments into [`PackageRef`]s.
-///
-/// Accepts:
-///  * `<image>` (e.g. `alpine`) — implicit `library/` namespace, version
-///    `latest` (Docker's own default).
-///  * `<image>:<tag>` (e.g. `alpine:3.18`).
-///  * `<image>@<digest>` (e.g. `alpine@sha256:abcdef...`).
-///  * `<registry>/<image>[:tag|@digest]` (e.g. `ghcr.io/owner/img:v1`).
-///
-/// Tokens that start with `-` (flags) are skipped. The package `name` is the
-/// canonical `<registry-or-empty>/<image>` (with an implicit `library/`
-/// namespace expanded), and `version` carries the tag — or `sha256:...`
-/// when the spec used a digest form, prefixed so the audit line distinguishes.
+/// Parse Docker image-ref arguments into [`PackageRef`]s, accepting `<image>`
+/// (implicit `library/` namespace, version `latest`), `<image>:<tag>`,
+/// `<image>@<digest>`, and `<registry>/<image>[:tag|@digest]`. Flags are
+/// skipped; `version` carries the tag or `sha256:...` for a digest.
 fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
     use crate::parse::{parse_docker_ref, UrlLike};
     let mut out = Vec::new();
@@ -803,13 +620,9 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
     while i < user_args.len() {
         let arg = &user_args[i];
         if arg.starts_with('-') {
-            // Flags with separate value forms: skip BOTH the flag and its
-            // value so the value (e.g. `linux/amd64` after `--platform`)
-            // isn't misclassified as an image ref. Inline `--flag=value`
-            // doesn't consume the next token. The list below is the set of
-            // docker pull / run flags that take a separate value AND whose
-            // value can plausibly look like an image (contains `/`, `:`, or
-            // a digest-looking string). Boolean flags don't need to skip.
+            // For a value-bearing flag, skip BOTH flag and value so the value
+            // (e.g. `linux/amd64` after `--platform`) isn't read as an image
+            // ref. Inline `--flag=value` consumes only one token.
             if !arg.contains('=') && is_docker_value_bearing_flag(arg) && i + 1 < user_args.len() {
                 i += 2;
                 continue;
@@ -844,10 +657,8 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
     out
 }
 
-/// Docker CLI flags whose VALUE is a separate token (not inlined with `=`)
-/// AND whose value can plausibly match an image-ref shape (contains `/` or
-/// `:`) — so we must skip the value to avoid misclassifying it as a pull
-/// target. Conservative list: only the flags whose values look image-like.
+/// Docker flags whose separate-token value can look image-like (contains `/` or
+/// `:`), so the value must be skipped to avoid misclassifying it as a target.
 fn is_docker_value_bearing_flag(flag: &str) -> bool {
     matches!(
         flag,
@@ -884,18 +695,9 @@ fn is_docker_value_bearing_flag(flag: &str) -> bool {
     )
 }
 
-/// Parse Go module-spec arguments into [`PackageRef`]s.
-///
-/// Accepts:
-///  * `<module>` (e.g. `github.com/spf13/cobra`) — version defaults to
-///    `latest`, mirroring `go install`'s own implicit default.
-///  * `<module>@<version>` (e.g. `github.com/spf13/cobra@latest`,
-///    `github.com/spf13/cobra@v1.8.0`).
-///
-/// Tokens that start with `-` (flags) are skipped. A module path is
-/// minimally validated: it must contain at least one `.` or `/` to look
-/// like an import path. Otherwise the token is ignored (a plain word like
-/// `nginx` is not a Go module).
+/// Parse Go module-spec arguments into [`PackageRef`]s: `<module>` (version
+/// defaults to `latest`) or `<module>@<version>`. Flags are skipped; a module
+/// path must contain a `.` or `/` (a plain `nginx` is ignored).
 fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
     let mut out = Vec::new();
     for arg in user_args {
@@ -906,10 +708,8 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
             Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, Some(v.to_string())),
             _ => (arg.as_str(), Some("latest".to_string())),
         };
-        // Reject local-path install targets. `go install ./cmd/foo`,
-        // `go install /abs/path/...`, `go install ~/repo/...` operate on
-        // local filesystem paths, not remote registry modules — turning them
-        // into `PackageRef`s would emit bogus risk findings for paths.
+        // Reject local-path targets (`./cmd/foo`, `/abs/...`, `~/repo/...`):
+        // they're filesystem paths, not registry modules.
         if name == "."
             || name == ".."
             || name.starts_with("./")
@@ -919,8 +719,7 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
         {
             continue;
         }
-        // Conservative shape check — a Go module path is dotted or has a
-        // slash. `nginx` is rejected as a likely typo from a wrong source.
+        // A Go module path is dotted or slashed; `nginx` is rejected.
         if !name.contains('.') && !name.contains('/') {
             continue;
         }
@@ -933,10 +732,9 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
     out
 }
 
-/// Gather the [`PackageSignals`] for one package: name signals from the threat
-/// DB, content signals left un-inspected (a pre-install transaction has no
-/// local package directory — tirith never downloads the package to inspect
-/// it), and registry-API signals per the request's [`OnlineMode`].
+/// Gather the [`PackageSignals`] for one package: threat-DB name signals,
+/// uninspected content (a pre-install transaction has no local dir, and tirith
+/// never downloads to inspect), and registry-API signals per [`OnlineMode`].
 fn gather_package_signals(
     request: &PlanRequest,
     eco: Ecosystem,
@@ -966,38 +764,22 @@ fn gather_package_signals(
     PackageSignals {
         ecosystem: eco,
         name: pkg.name.clone(),
-        // M6 ch6 — carry version through from the install-extractor's parse
-        // so OSV correlation can pin to (eco, name, version) downstream.
+        // M6 ch6 — carry version through so OSV can pin to (eco, name, version).
         version: pkg.version.clone(),
         threat_db_missing: db.is_none(),
         name_vs_popular,
         malicious_typosquat_of,
-        // A pre-install transaction never has the package on disk yet, and
-        // tirith never downloads it to peek — content signals are simply not
-        // evaluated. This is not a failure and not a fetch.
+        // Pre-install: nothing on disk and we never fetch — content not evaluated.
         content_signals: ContentSignals::NotInspected,
         api,
     }
 }
 
-/// Turn a package's [`RiskBreakdown`] into the [`Finding`]s it warrants for the
-/// install verdict — de-duplicated against `existing` (the findings the engine
-/// already produced, which include the local-threat-DB package rules).
-///
-/// The engine's `threatintel` rules already emit
-/// [`RuleId::ThreatMaliciousPackage`] / [`RuleId::ThreatPackageTyposquat`] /
-/// [`RuleId::ThreatPackageSimilarName`] for a package the threat DB knows. To
-/// avoid a doubled finding for the same package + rule, this function skips
-/// any `(rule_id, package)` pair already present in `existing`. What it adds
-/// that the engine cannot:
-///
-///  * a *confirmed-typosquat* finding when the package-risk DB lookup found
-///    one but the engine's `threatintel` pass did not (different DB tables);
-///  * an **aggregate-score** finding — when a package's deterministic risk
-///    score is high/critical from *provenance* signals (package age,
-///    ownership, version spike, missing source repo, yanked status — the
-///    chunk-6 `--online` additions) rather than from a name match. The engine
-///    has no equivalent: it does not score provenance.
+/// Turn a package's [`RiskBreakdown`] into [`Finding`]s, de-duped against
+/// `existing` (the engine's threat-DB findings) by `(rule_id, package)`. Adds
+/// what the engine cannot: a confirmed-typosquat from the package-risk DB, and
+/// an aggregate-score finding driven by provenance signals (the chunk-6
+/// `--online` additions) rather than a name match.
 fn risk_findings_for(
     pkg: &PackageRef,
     breakdown: &RiskBreakdown,
@@ -1008,17 +790,15 @@ fn risk_findings_for(
     let eco = pkg.ecosystem;
     let pp = &policy.package_policy;
 
-    // Does `existing` already carry a finding of `rule` that names this
-    // package? The threatintel findings put the package name in the title and
-    // description; an exact word match on the name is a safe, conservative
-    // dedupe key.
+    // Does `existing` already carry `rule` naming this package? A whole-word
+    // match on the name is a safe, conservative dedupe key.
     let already_has = |rule: RuleId| -> bool {
         existing
             .iter()
             .any(|f| f.rule_id == rule && finding_mentions_package(f, &pkg.name))
     };
 
-    // --- confirmed typosquat from the package-risk DB lookup ------------
+    // Confirmed typosquat from the package-risk DB lookup.
     if let Some(target) = &breakdown.malicious_typosquat_of {
         if !already_has(RuleId::ThreatPackageTyposquat)
             && !already_has(RuleId::ThreatMaliciousPackage)
@@ -1046,15 +826,13 @@ fn risk_findings_for(
                 custom_rule_id: None,
             });
         }
-        // A confirmed typosquat is the dominant signal — do not also pile on
-        // an aggregate-score finding for the same package.
+        // A confirmed typosquat is the dominant signal — no aggregate finding too.
         return out;
     }
 
-    // --- aggregate provenance / maintainer risk -------------------------
-    // Only when the score is high/critical AND it is not already explained by
-    // a name-match finding the engine produced. This is the chunk-6 value:
-    // a package that is dangerous on provenance grounds, with no name tell.
+    // Aggregate provenance / maintainer risk — only when the score is
+    // high/critical AND no name-match finding already explains it (the chunk-6
+    // value: dangerous on provenance grounds, with no name tell).
     let name_match_present = already_has(RuleId::ThreatMaliciousPackage)
         || already_has(RuleId::ThreatPackageTyposquat)
         || already_has(RuleId::ThreatPackageSimilarName);
@@ -1095,18 +873,15 @@ fn risk_findings_for(
         });
     }
 
-    // --- M6 ch7 policy-driven rules ------------------------------------
+    // M6 ch7 policy-driven rules.
     out.extend(policy_findings_for(pkg, breakdown, policy));
 
     out
 }
 
-/// M6 ch7 — emit findings driven by `policy.package_policy` thresholds.
-///
-/// Each rule path here has a clean default (do not fire) and only emits
-/// when a policy threshold crosses a signal carried in `breakdown`. The
-/// caller hand-rolls "is this signal observable on the path's --online
-/// state" gating; this function trusts the inputs.
+/// M6 ch7 — emit findings driven by `policy.package_policy` thresholds. Each
+/// rule defaults to not firing and only emits when a threshold crosses a signal
+/// in `breakdown`; the caller handles --online-observability gating.
 fn policy_findings_for(
     pkg: &PackageRef,
     breakdown: &RiskBreakdown,
@@ -1299,7 +1074,7 @@ fn policy_findings_for(
     out
 }
 
-/// Helper: extract `package_existence` from `api_signals` when available.
+/// Extract `package_existence` from `api_signals` when available.
 fn package_existence(api: &ApiSignals) -> Option<PackageExistence> {
     match api {
         ApiSignals::Available { provenance } => Some(provenance.package_existence),
@@ -1307,32 +1082,20 @@ fn package_existence(api: &ApiSignals) -> Option<PackageExistence> {
     }
 }
 
-/// Whether `finding`'s title or description mentions `name` as a whole word.
-///
-/// Used as a conservative de-duplication key: the `threatintel` package
-/// findings always embed the package name in both fields, so a whole-word
-/// match reliably identifies "this finding is about this package" without the
-/// false positives a substring match would give (`react` inside `react-dom`).
+/// Whether `finding`'s title or description mentions `name` as a whole word —
+/// a conservative dedupe key avoiding substring false positives (`react` in
+/// `react-dom`).
 fn finding_mentions_package(finding: &Finding, name: &str) -> bool {
     mentions_word(&finding.title, name) || mentions_word(&finding.description, name)
 }
 
-/// Whole-package-name containment check: does `haystack` contain `word`
-/// bounded, on both sides, by a character that cannot be part of a package
-/// name (or by a string end)?
-///
-/// A package name can contain ASCII alphanumerics plus `-`, `.`, `/`, `_`,
-/// `@` (npm scopes, paths). Those characters are therefore treated as
-/// *name characters*: `react` must NOT match inside `react-dom` or
-/// `@scope/react`. The boundary characters are everything else — whitespace,
-/// quotes, parentheses, the `≈` in a similar-name title, etc.
+/// Whole-package-name containment: `word` in `haystack` bounded by a non-name
+/// char (or string end). Name chars are alphanumerics plus `-`, `.`, `/`, `_`,
+/// `@`, so `react` does not match inside `react-dom` or `@scope/react`.
 fn mentions_word(haystack: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
     }
-    // Characters that can legitimately be part of a package name. A match
-    // flanked by one of these is a substring of a *longer* name, not a
-    // reference to `word` itself.
     let is_name_char =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '/' | '_' | '@');
     let mut start = 0;
@@ -1357,8 +1120,8 @@ fn mentions_word(haystack: &str, word: &str) -> bool {
     false
 }
 
-/// Whether `verdict` permits the install to proceed without an interactive
-/// acknowledgement: only an [`Action::Allow`] does.
+/// Whether `verdict` permits the install without acknowledgement — only
+/// [`Action::Allow`] does.
 pub fn is_clear_to_proceed(verdict: &Verdict) -> bool {
     verdict.action == Action::Allow
 }
@@ -1372,7 +1135,7 @@ mod tests {
         Policy::default()
     }
 
-    /// A fixture-fed [`RegistryClient`] — tests never touch a real registry.
+    /// Fixture-fed [`RegistryClient`] — tests never touch a real registry.
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
     }
@@ -1423,7 +1186,7 @@ mod tests {
 
     #[test]
     fn plan_install_clean_package_allows() {
-        // A package with no name tell and no threat DB → score 0 → Allow.
+        // No name tell, no threat DB → score 0 → Allow.
         let req = PlanRequest {
             manager: PackageManager::Npm,
             user_args: &["my-unique-internal-pkg-xyzzy".to_string()],
@@ -1452,8 +1215,7 @@ mod tests {
 
     #[test]
     fn plan_install_no_package_argument_notes_command_only() {
-        // `pip install -r requirements.txt` has no package on the command
-        // line — the plan must note it scored the command shape only.
+        // `pip install -r requirements.txt` has no package on the command line.
         let req = PlanRequest {
             manager: PackageManager::Pip,
             user_args: &["-r".to_string(), "requirements.txt".to_string()],
@@ -1476,11 +1238,9 @@ mod tests {
 
     #[test]
     fn plan_install_pip_dash_r_manifest_bypass_emits_finding() {
-        // PR #121 fix-list item 1 regression pin — a `pip install -r
-        // requirements.txt` invocation used to fall through to a clean ALLOW
-        // because no package name could be extracted from the command line.
-        // Now the manifest-form path emits a Medium finding under the default
-        // `fail_mode: open` so the unanalyzed surface is visible.
+        // PR #121 fix-list item 1 regression pin — `pip install -r req.txt` used
+        // to fall through to ALLOW; now the manifest path emits a Medium finding
+        // under the default `fail_mode: open`.
         let req = PlanRequest {
             manager: PackageManager::Pip,
             user_args: &["-r".to_string(), "requirements.txt".to_string()],
@@ -1529,9 +1289,8 @@ mod tests {
 
     #[test]
     fn plan_install_pip_dash_r_under_fail_closed_escalates_to_high() {
-        // Same manifest-form bypass, but with `fail_mode: closed` — the
-        // severity escalates from Medium to High so a strict-mode policy
-        // hard-blocks. Action goes Warn → Block.
+        // Same bypass under `fail_mode: closed`: severity Medium → High, action
+        // Warn → Block.
         let policy = Policy {
             fail_mode: FailMode::Closed,
             ..Policy::default()
@@ -1560,8 +1319,7 @@ mod tests {
 
     #[test]
     fn plan_install_pip_editable_dot_emits_finding() {
-        // `pip install -e .` and `pip install .` are pip's "install from this
-        // directory's pyproject.toml" forms. Same manifest-bypass surface.
+        // `pip install -e .` / `pip install .` — same manifest-bypass surface.
         for args in [
             vec!["-e".to_string(), ".".to_string()],
             vec![".".to_string()],
@@ -1592,11 +1350,8 @@ mod tests {
 
     #[test]
     fn plan_install_npm_no_args_emits_manifest_finding() {
-        // `npm install` with no further args reads the local
-        // package-lock.json / package.json — a manifest-driven install with
-        // no package on the command line. (The tirith CLI rejects empty args
-        // for pip/cargo before this function is called, so this exercises the
-        // npm-specific path.)
+        // Bare `npm install` reads the local manifest — a no-package install.
+        // (The CLI rejects empty args for pip/cargo, so this is npm-specific.)
         let req = PlanRequest {
             manager: PackageManager::Npm,
             user_args: &[],
@@ -1619,8 +1374,7 @@ mod tests {
 
     #[test]
     fn plan_install_cargo_path_manifest_emits_finding() {
-        // `cargo install --path .` builds the crate at `.` rather than a
-        // published name — no name extractable from the command line.
+        // `cargo install --path .` builds a local crate — no extractable name.
         for args in [
             vec!["--path".to_string(), ".".to_string()],
             vec!["--path=.".to_string()],
@@ -1653,8 +1407,7 @@ mod tests {
 
     #[test]
     fn plan_install_detect_manifest_flag_recognizes_known_forms() {
-        // Direct unit test on the detector — narrow coverage so adding a new
-        // flag is a one-line diff with a clear pin.
+        // Direct unit test on the detector.
         assert!(detect_manifest_flag(&[]).is_some());
         assert!(detect_manifest_flag(&["-r".to_string(), "req.txt".to_string()]).is_some());
         assert!(detect_manifest_flag(&["--requirement=r.txt".to_string()]).is_some());
@@ -1672,10 +1425,8 @@ mod tests {
 
     #[test]
     fn plan_install_online_resolver_high_provenance_risk_warns() {
-        // A package the (absent) threat DB does not know, but whose registry
-        // provenance is alarming: brand-new, ownerless, version-spiked, no
-        // source repo, yanked. That stacks to a high aggregate score with no
-        // name tell — exactly the chunk-6 value the engine alone misses.
+        // Alarming provenance (brand-new, ownerless, version-spiked, no repo,
+        // yanked) stacks to a high score with no name tell — the chunk-6 value.
         use crate::package_risk::ApiProvenance;
         #[allow(deprecated)]
         let provenance = ApiProvenance {
@@ -1722,9 +1473,8 @@ mod tests {
 
     #[test]
     fn plan_install_online_resolver_unavailable_is_noted_and_degrades() {
-        // An `--online` run whose registry call fails must degrade to the
-        // offline score and add an honest note — never panic, never block on
-        // the failure alone.
+        // A failed `--online` call degrades to the offline score with a note —
+        // never panics or blocks on the failure alone.
         let resolver = |_eco: Ecosystem, _name: &str| ApiSignals::unavailable("connection refused");
         let req = PlanRequest {
             manager: PackageManager::Cargo,
@@ -1750,9 +1500,8 @@ mod tests {
 
     #[test]
     fn risk_findings_dedupe_against_existing_threatintel_finding() {
-        // If the engine already emitted a ThreatPackageSimilarName for a
-        // package, an aggregate-score finding for the SAME package must be
-        // suppressed — no doubled finding.
+        // An existing ThreatPackageSimilarName must suppress the aggregate
+        // finding for the same package.
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
@@ -1795,8 +1544,8 @@ mod tests {
 
     #[test]
     fn risk_findings_typosquat_emitted_when_engine_missed_it() {
-        // The package-risk DB lookup found a confirmed typosquat the engine's
-        // threatintel pass did not (different tables) → emit it once.
+        // The package-risk DB found a typosquat the engine's pass missed
+        // (different tables) → emit once.
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
@@ -1823,7 +1572,7 @@ mod tests {
 
     #[test]
     fn fake_registry_client_drives_resolver_without_network() {
-        // Proves the resolver seam works with a fixture client — no network.
+        // The resolver seam works with a fixture client — no network.
         let client = FakeClient {
             result: Ok(RegistryMetadata {
                 source: "npm".to_string(),
@@ -1836,13 +1585,11 @@ mod tests {
         assert!(matches!(signals, ApiSignals::Available { .. }));
     }
 
-    // ── M6 ch1 — distro / docker / go backends ─────────────────────────────
+    // M6 ch1 — distro / docker / go backends.
 
     #[test]
     fn package_manager_m6_ch1_program_label_and_ecosystem_mapping() {
-        // One variant ↔ one program. `Apt` maps to `apt-get` (the
-        // scriptable interface), not `apt`; its `label()` shows `apt` for
-        // the user-facing string.
+        // `Apt` maps to program `apt-get` but label `apt`.
         assert_eq!(PackageManager::Apt.program(), "apt-get");
         assert_eq!(PackageManager::Apt.label(), "apt");
         assert_eq!(PackageManager::Brew.program(), "brew");
@@ -1853,8 +1600,7 @@ mod tests {
         assert_eq!(PackageManager::Docker.program(), "docker");
         assert_eq!(PackageManager::Go.program(), "go");
 
-        // install_subcommand: most use `install`; pacman uses `-S`; docker
-        // uses `pull`. argv[1] = install_subcommand by build_argv contract.
+        // install_subcommand: most `install`; pacman `-S`; docker `pull`.
         assert_eq!(PackageManager::Apt.install_subcommand(), "install");
         assert_eq!(PackageManager::Brew.install_subcommand(), "install");
         assert_eq!(PackageManager::Dnf.install_subcommand(), "install");
@@ -1864,8 +1610,7 @@ mod tests {
         assert_eq!(PackageManager::Docker.install_subcommand(), "pull");
         assert_eq!(PackageManager::Go.install_subcommand(), "install");
 
-        // Ecosystem mapping — each variant maps to its dedicated Ecosystem
-        // (Apt..=Docker), Go maps to the existing Ecosystem::Go.
+        // Ecosystem mapping — each variant to its dedicated Ecosystem.
         assert_eq!(PackageManager::Apt.ecosystem(), Ecosystem::Apt);
         assert_eq!(PackageManager::Brew.ecosystem(), Ecosystem::Brew);
         assert_eq!(PackageManager::Dnf.ecosystem(), Ecosystem::Dnf);
@@ -1878,9 +1623,8 @@ mod tests {
 
     #[test]
     fn lacks_registry_adapter_matches_registry_api_dispatch() {
-        // Source of truth lives in `registry_api`'s `fetch` dispatch — these
-        // assertions pin the two in agreement. A future PR that wires an
-        // adapter must flip this method, or the banner becomes a lie.
+        // Pins this in agreement with `registry_api`'s `fetch` dispatch (the
+        // source of truth); wiring a new adapter must flip the method here.
         assert!(!PackageManager::Npm.lacks_registry_adapter());
         assert!(!PackageManager::Pip.lacks_registry_adapter());
         assert!(!PackageManager::Cargo.lacks_registry_adapter());
@@ -1896,8 +1640,8 @@ mod tests {
 
     #[test]
     fn no_registry_adapter_banner_uses_manager_label() {
-        // The banner text is fixed and machine-readable — downstream tests
-        // / docs consumers depend on the exact wording.
+        // Banner text is fixed/machine-readable; downstream consumers depend on
+        // the exact wording.
         let banner = PackageManager::Apt.no_registry_adapter_banner();
         assert!(
             banner.contains("apt"),
@@ -1926,8 +1670,7 @@ mod tests {
 
     #[test]
     fn build_argv_pacman_inserts_sync_flag_at_argv1() {
-        // pacman has no positional subcommand — argv[1] is `-S` (Sync).
-        // build_argv is generic: install_subcommand("-S") goes at argv[1].
+        // pacman's argv[1] is `-S` (Sync); build_argv stays generic.
         let argv = build_argv(PackageManager::Pacman, &["firefox".to_string()]);
         assert_eq!(argv.program, "pacman");
         assert_eq!(argv.args, vec!["-S", "firefox"]);
@@ -1954,8 +1697,7 @@ mod tests {
         let pkgs = parse_docker_specs(&["alpine:3.18".to_string()]);
         assert_eq!(pkgs[0].version.as_deref(), Some("3.18"));
 
-        // Digest form — version carries `sha256:...` so the audit row
-        // distinguishes immutable vs mutable refs.
+        // Digest form — version carries `sha256:...`.
         let pkgs = parse_docker_specs(&["alpine@sha256:abcdef0123456789".to_string()]);
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].version.as_deref(), Some("sha256:abcdef0123456789"));
@@ -1974,10 +1716,8 @@ mod tests {
 
     #[test]
     fn parse_docker_specs_skips_value_after_value_bearing_flag() {
-        // Regression: `--platform linux/amd64` is a flag with a separate
-        // value token. The flag is skipped; the value `linux/amd64` MUST
-        // also be skipped — otherwise it parses as a `linux/amd64:latest`
-        // bogus image ref.
+        // Regression: the value of `--platform linux/amd64` must be skipped too,
+        // or it parses as a bogus `linux/amd64:latest` image.
         let pkgs = parse_docker_specs(&[
             "--platform".to_string(),
             "linux/amd64".to_string(),
@@ -1986,9 +1726,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1, "only `alpine` should parse, not the value");
         assert_eq!(pkgs[0].name, "library/alpine");
 
-        // Same for `-v /host:/container alpine` — the `/host:/container`
-        // value contains `/` and `:`, both of which would otherwise make it
-        // parse as an image ref.
+        // Same for `-v /host:/container alpine` (the mount value looks ref-like).
         let pkgs = parse_docker_specs(&[
             "-v".to_string(),
             "/host:/container".to_string(),
@@ -1997,8 +1735,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1, "only `alpine` should parse, not the mount");
         assert_eq!(pkgs[0].name, "library/alpine");
 
-        // Inline `--flag=value` form: only the flag token is skipped, the
-        // next positional argument IS parsed.
+        // Inline `--flag=value` skips only the flag; the next positional parses.
         let pkgs = parse_docker_specs(&["-p=8080:80".to_string(), "alpine".to_string()]);
         assert_eq!(pkgs.len(), 1, "inline `-p=8080:80` skips one token only");
         assert_eq!(pkgs[0].name, "library/alpine");
@@ -2021,9 +1758,7 @@ mod tests {
         let pkgs = parse_go_specs(&["github.com/spf13/cobra@v1.8.0".to_string()]);
         assert_eq!(pkgs[0].version.as_deref(), Some("v1.8.0"));
 
-        // A bare word that does not look like a module path is skipped —
-        // `nginx` is not a Go module, even though it might be a Go binary
-        // someone confused.
+        // A non-module-shaped bareword (`nginx`) is skipped.
         let pkgs = parse_go_specs(&["nginx".to_string()]);
         assert!(
             pkgs.is_empty(),
@@ -2037,9 +1772,8 @@ mod tests {
 
     #[test]
     fn parse_go_specs_rejects_local_path_targets() {
-        // Regression: `go install ./cmd/foo` was being treated as a remote
-        // registry module because `./cmd/foo` contains `/`. Local paths are
-        // NOT modules — they must be skipped entirely.
+        // Regression: `go install ./cmd/foo` was treated as a module because it
+        // contains `/`. Local paths must be skipped entirely.
         let cases = vec![
             ".".to_string(),
             "..".to_string(),
@@ -2070,11 +1804,8 @@ mod tests {
 
     #[test]
     fn plan_install_apt_emits_banner_via_lacks_registry_adapter() {
-        // M6 ch1 acceptance — an apt install plan reaches ALLOW (the
-        // command-shape rules don't fire on `apt-get install nginx`), the
-        // packages list is empty (no registry adapter, no scoring), and the
-        // manager carries the lacks-registry-adapter flag so the CLI shows
-        // the banner.
+        // M6 ch1 acceptance — apt plan reaches ALLOW, packages empty (no
+        // adapter, no scoring), and the lacks-adapter flag drives the banner.
         let req = PlanRequest {
             manager: PackageManager::Apt,
             user_args: &["nginx".to_string()],
@@ -2128,8 +1859,7 @@ mod tests {
 
     #[test]
     fn plan_install_go_install_extracts_module_with_default_latest() {
-        // No `@version` — the manager-specific parser defaults to `latest`,
-        // mirroring `go install`'s own behavior.
+        // No `@version` — defaults to `latest`, mirroring `go install`.
         let req = PlanRequest {
             manager: PackageManager::Go,
             user_args: &["github.com/spf13/cobra".to_string()],
@@ -2156,9 +1886,8 @@ mod tests {
 
     #[test]
     fn plan_install_distro_no_registry_adapter_note_is_specific() {
-        // For distro backends the "no installable package name" note would be
-        // misleading (nginx IS the name — we just have no adapter). The note
-        // must instead say so explicitly so the operator isn't confused.
+        // For distro backends the "no installable package name" note would
+        // mislead (the name IS present); the note must name the missing adapter.
         let req = PlanRequest {
             manager: PackageManager::Brew,
             user_args: &["ripgrep".to_string()],
@@ -2174,8 +1903,7 @@ mod tests {
             "the note must point at the missing-adapter gap: {:?}",
             plan.notes,
         );
-        // The legacy "no installable package name" wording must NOT appear
-        // for a backend with a name on the command line.
+        // The legacy "no installable package name" wording must NOT appear here.
         assert!(
             !plan
                 .notes
@@ -2187,10 +1915,9 @@ mod tests {
         );
     }
 
-    // ── M6 ch7 — policy-driven rule emission tests ─────────────────────────
+    // M6 ch7 — policy-driven rule emission tests.
 
-    /// Build a minimal `RiskBreakdown` carrying the given provenance
-    /// (so the policy_findings_for helper has data to read).
+    /// Build a minimal `RiskBreakdown` carrying the given provenance.
     #[allow(deprecated)]
     fn breakdown_with_provenance(
         name: &str,
@@ -2243,8 +1970,8 @@ mod tests {
 
     #[test]
     fn package_policy_not_found_does_not_fire_when_existence_unknown() {
-        // Honest no-data: offline runs report Unknown, and even with
-        // `block_not_found: true` the rule must stay silent.
+        // Unknown existence (offline) must stay silent even with
+        // `block_not_found: true`.
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "some-pkg".to_string(),
@@ -2405,11 +2132,9 @@ mod tests {
 
     #[test]
     fn aggregate_threshold_reads_from_policy_not_constants() {
-        // Hand-curate a breakdown with score == 60 (provenance-only). With
-        // the default policy (warn=51, block=76) this should fire a
-        // Medium-severity ThreatSuspiciousPackage finding (Warn). With a
-        // custom policy lowering block to 60, it must escalate to High
-        // (Block) — proving thresholds are policy-driven.
+        // A provenance-only breakdown fires Medium under default thresholds and
+        // escalates to High under tighter ones — proving thresholds are
+        // policy-driven, not constants.
         #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "npm".to_string(),
@@ -2435,7 +2160,6 @@ mod tests {
             provenance,
         );
 
-        // With default policy and a critical score, the finding must be High.
         let policy = empty_policy();
         let findings = risk_findings_for(&pkg, &breakdown, &[], &policy);
         let sus = findings
@@ -2443,8 +2167,7 @@ mod tests {
             .find(|f| f.rule_id == RuleId::ThreatSuspiciousPackage)
             .expect("expected ThreatSuspiciousPackage on default thresholds");
 
-        // Lower both thresholds far below the score and re-evaluate. Result
-        // remains High (block_threshold crossed).
+        // Lower both thresholds far below the score → still High.
         let mut tight_policy = empty_policy();
         tight_policy.package_policy.warn_aggregate_score = Some(1);
         tight_policy.package_policy.block_aggregate_score = Some(1);
@@ -2453,9 +2176,7 @@ mod tests {
             .iter()
             .find(|f| f.rule_id == RuleId::ThreatSuspiciousPackage)
             .expect("tighter policy must still emit the finding");
-        // The default-policy finding's severity must follow the same map
-        // (we're not pinning the exact score here — just that the warn
-        // threshold drives Medium and block drives High):
+        // Default-policy finding must be Medium or High (warn vs block).
         assert!(
             matches!(sus.severity, Severity::Medium | Severity::High),
             "default-policy aggregate finding must be Medium or High"

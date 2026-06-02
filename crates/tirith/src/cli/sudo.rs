@@ -1,22 +1,8 @@
-//! `tirith sudo guard|session|require-reason` (M8 ch4).
-//!
-//! Three operator surfaces:
-//!
-//! 1. **`guard on|off|status`** — flips `policy.context_guard_enabled`
-//!    (the shared M8 operator switch). When OFF, the M8 ch4 sudo rules
-//!    silence uniformly with M8 ch1/ch2/ch3 — one knob disables every
-//!    operational-context gate.
-//!
-//! 2. **`session start [--ttl 30m] [--reason "…"] / end / status`** —
-//!    creates / removes / reports an active sudo-session anchor file
-//!    under `state_dir()/sudo-session.json`. When
-//!    `policy.sudo_require_reason` is ON, an active session downgrades
-//!    the five M8 ch4 sudo rules from High to Medium.
-//!
-//! 3. **`require-reason on|off|status`** — flips
-//!    `policy.sudo_require_reason`. When OFF (the default), the session
-//!    file is consulted purely for status reporting; every sudo rule
-//!    fires at its baseline High severity.
+//! `tirith sudo guard|session|require-reason` (M8 ch4). Three operator surfaces:
+//! `guard` flips the shared `policy.context_guard_enabled`; `session
+//! start|end|status` manages `state_dir()/sudo-session.json` (an active session
+//! downgrades the five sudo rules High→Medium when `sudo_require_reason` is on);
+//! `require-reason` flips `policy.sudo_require_reason` (off by default).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,10 +10,7 @@ use std::path::{Path, PathBuf};
 use tirith_core::policy::{self as policy_mod, Policy};
 use tirith_core::sudo_session::{self, SudoSession};
 
-// ─── guard ─────────────────────────────────────────────────────────────────
-
-/// `tirith sudo guard on|off|status` — flip the shared operational-context
-/// switch.
+/// `tirith sudo guard on|off|status` — flip the shared operational-context switch.
 pub fn guard(action: &str, json: bool) -> i32 {
     let enable = match action {
         "on" | "enable" | "true" => true,
@@ -96,8 +79,6 @@ fn guard_status(json: bool) -> i32 {
     }
     0
 }
-
-// ─── require-reason ────────────────────────────────────────────────────────
 
 /// `tirith sudo require-reason on|off|status`.
 pub fn require_reason(action: &str, json: bool) -> i32 {
@@ -170,8 +151,6 @@ fn require_reason_status(json: bool) -> i32 {
     }
     0
 }
-
-// ─── session start | end | status ──────────────────────────────────────────
 
 /// `tirith sudo session start [--ttl 30m] [--reason "…"]`.
 pub fn session_start(ttl_str: Option<&str>, reason: Option<&str>, json: bool) -> i32 {
@@ -288,8 +267,6 @@ pub fn session_status(json: bool) -> i32 {
     }
     0
 }
-
-// ─── shared helpers ────────────────────────────────────────────────────────
 
 fn resolve_policy_path() -> Result<PathBuf, i32> {
     if let Some(existing) = policy_mod::discover_local_policy_path(None) {

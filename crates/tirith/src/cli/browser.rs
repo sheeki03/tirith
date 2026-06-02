@@ -1,37 +1,21 @@
-//! M12 ch3 — `tirith browser install-extension`: write the Chrome **Native
-//! Messaging Host manifest** so the companion browser extension can launch
+//! M12 ch3 — `tirith browser install-extension`: write the Chrome Native
+//! Messaging Host manifest so the companion extension can launch
 //! `tirith browser host`.
 //!
-//! Chrome discovers a native messaging host by a JSON manifest named after the
-//! host (`sh.tirith.browser.json`) placed in a per-OS `NativeMessagingHosts`
-//! directory. The manifest names the host, the absolute path to the executable
-//! Chrome should spawn, the `stdio` transport, and the `allowed_origins` —
-//! exactly which extension IDs may connect.
+//! Chrome discovers the host via a JSON manifest (`sh.tirith.browser.json`) in a
+//! per-OS `NativeMessagingHosts` directory, naming the host, the absolute exe
+//! path, the `stdio` transport, and the `allowed_origins`. Mirrors
+//! `clipboard::install_service`: dry-run by default, `--apply` writes it
+//! (idempotent).
 //!
-//! This mirrors `clipboard::install_service`: a DRY-RUN by default (prints the
-//! manifest + target path), and `--apply` actually writes it (creating the
-//! directory). It is idempotent — re-applying identical content is a no-op.
+//! The extension ID is not known yet (separate, unpublished repo);
+//! `--extension-id <id>` supplies it, else a clearly-marked placeholder + note.
 //!
-//! ## The extension ID is not known yet
+//! On Windows the host is registered via a registry key, not a file drop — we
+//! print guidance rather than writing the registry.
 //!
-//! The TypeScript extension lives in a separate repo and is not yet published,
-//! so its Chrome extension ID is unknown. `--extension-id <id>` supplies it;
-//! without it we use a clearly-marked placeholder and print a note that the real
-//! ID is required before the host will actually accept a connection.
-//!
-//! ## Windows
-//!
-//! On Windows the manifest is registered via a REGISTRY key
-//! (`HKCU\Software\Google\Chrome\NativeMessagingHosts\sh.tirith.browser`)
-//! pointing at a manifest file, not by dropping a file in a well-known
-//! directory. We do NOT write the registry here — we print guidance.
-//!
-//! ## Browser selection
-//!
-//! Chromium-family browsers each keep their own `NativeMessagingHosts`
-//! directory. `--browser <chrome|chromium|brave|edge>` (default `chrome`)
-//! selects which one the manifest targets; the chosen path is always printed so
-//! the operator knows exactly where it went.
+//! `--browser <chrome|chromium|brave|edge>` (default `chrome`) selects which
+//! browser's `NativeMessagingHosts` directory the manifest targets.
 
 use std::path::PathBuf;
 
@@ -78,12 +62,9 @@ impl Browser {
         }
     }
 
-    /// The Windows registry root under which this browser looks for native-
-    /// messaging host keys (`HKCU\<root>\<HOST_NAME>`). Each Chromium-family
-    /// browser uses its own vendor sub-tree, mirroring the per-browser
-    /// `NativeMessagingHosts` directories [`manifest_path`] targets on
-    /// macOS/Linux — so `--browser edge` no longer points the operator at the
-    /// Chrome key.
+    /// The Windows registry root for this browser's native-messaging host keys
+    /// (`HKCU\<root>\<HOST_NAME>`). Per-browser vendor sub-tree, so `--browser
+    /// edge` doesn't point at the Chrome key.
     fn windows_registry_root(self) -> &'static str {
         match self {
             Browser::Chrome => "Software\\Google\\Chrome\\NativeMessagingHosts",
@@ -94,44 +75,30 @@ impl Browser {
     }
 }
 
-/// `true` when `id` is a well-formed Chrome extension ID: exactly 32 characters,
-/// each in the range `a`–`p` (Chrome encodes the 128-bit id with the first 16
-/// letters of the alphabet). A malformed id would render an `allowed_origins`
-/// entry Chrome can never match, so the manifest would look successful yet never
-/// authorize the extension — we reject it instead. The documented
-/// [`PLACEHOLDER_EXTENSION_ID`] deliberately does NOT satisfy this (it is handled
-/// separately, with a replace-me note).
+/// `true` when `id` is a well-formed Chrome extension ID: exactly 32 letters
+/// `a`–`p`. A malformed id would render an `allowed_origins` Chrome can never
+/// match, so we reject it. [`PLACEHOLDER_EXTENSION_ID`] deliberately fails this
+/// (handled separately with a replace-me note).
 pub fn is_valid_extension_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| (b'a'..=b'p').contains(&b))
 }
 
-/// The native messaging host name. Must match the value the companion extension
-/// passes to `chrome.runtime.connectNative(...)` and the `name` field in the
-/// manifest. Lives under the `sh.tirith` reverse-DNS prefix the rest of tirith
-/// uses (cf. `sh.tirith.clipboard` launchd label).
+/// The native messaging host name — must match the extension's
+/// `chrome.runtime.connectNative(...)` arg and the manifest `name`.
 pub const HOST_NAME: &str = "sh.tirith.browser";
 
-/// Documented placeholder extension ID, used when `--extension-id` is omitted.
-/// A real Chrome extension ID is 32 lowercase letters `a`–`p`; this placeholder
-/// is obviously NOT a real ID, so a manifest written with it cannot silently
-/// authorize a real extension. The accompanying note tells the operator to
-/// re-run with `--extension-id`.
+/// Placeholder extension ID used when `--extension-id` is omitted. Obviously not
+/// a real ID (32 letters a–p), so a manifest written with it cannot silently
+/// authorize a real extension.
 pub const PLACEHOLDER_EXTENSION_ID: &str = "EXTENSION_ID_PLACEHOLDER_REPLACE_ME";
 
 /// `tirith browser install-extension` entry point.
 ///
-/// * `extension_id` — the Chrome extension ID allowed to connect; defaults to
-///   [`PLACEHOLDER_EXTENSION_ID`] with a note when omitted. A non-placeholder id
-///   that is not 32 letters `a`–`p` is rejected (exit 1) rather than rendered
-///   into a manifest Chrome can never match.
-/// * `browser` — which Chromium-family browser's `NativeMessagingHosts`
-///   directory to target (default [`Browser::Chrome`]).
-/// * `apply` — write the manifest (creating the dir) instead of just printing.
-/// * `json` — emit a JSON envelope instead of the human text.
-///
-/// Returns the process exit code (0 on success / dry-run; 1 on a write failure,
-/// a malformed extension id, an executable path that cannot be resolved to an
-/// absolute path, or an unresolvable manifest path on non-Windows).
+/// `extension_id` defaults to [`PLACEHOLDER_EXTENSION_ID`] (with a note) when
+/// omitted; a non-placeholder id that isn't 32 letters `a`–`p` is rejected.
+/// `apply` writes the manifest (else dry-run); `json` emits an envelope.
+/// Returns 0 on success/dry-run; 1 on a write failure, malformed id,
+/// unresolvable exe path, or unresolvable manifest path on non-Windows.
 pub fn install_extension(
     extension_id: Option<String>,
     browser: Browser,
@@ -140,12 +107,9 @@ pub fn install_extension(
 ) -> i32 {
     let platform = manifest_platform();
 
-    // The manifest `path` MUST be an absolute path — Chrome/Chromium silently
-    // refuse to launch a native-messaging host pointed at a relative path. If we
-    // cannot determine the absolute path of our own executable, fail fast BEFORE
-    // rendering, printing, or writing anything (in BOTH dry-run and --apply
-    // modes: a dry-run that prints a manifest with a relative path is equally
-    // misleading). There is no PATH-relative fallback.
+    // The manifest `path` MUST be absolute — Chrome/Chromium silently refuse a
+    // relative one. Fail fast (in both dry-run and --apply) if our own exe path
+    // can't be resolved; there is no PATH-relative fallback.
     let Some(exe) = current_tirith_exe() else {
         let msg = "cannot determine the absolute path of the tirith executable; aborting so we \
                    never write a relative native-messaging manifest path";
@@ -167,9 +131,7 @@ pub fn install_extension(
         return 1;
     };
 
-    // Resolve and validate the extension ID. A blank/whitespace value is
-    // treated as "not provided" so `--extension-id ''` doesn't write an empty
-    // origin.
+    // A blank/whitespace `--extension-id` is treated as "not provided".
     let (extension_id, is_placeholder) = match extension_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -179,8 +141,7 @@ pub fn install_extension(
     };
 
     // N1+N2 — reject a malformed (non-placeholder) id before rendering a
-    // manifest that would look successful but can never authorize the extension.
-    // The placeholder is exempt (it is handled with a replace-me note below).
+    // manifest that could never authorize the extension. Placeholder is exempt.
     if !is_placeholder && !is_valid_extension_id(&extension_id) {
         let msg = format!(
             "invalid --extension-id '{extension_id}': a Chrome extension id is exactly 32 \
@@ -194,8 +155,8 @@ pub fn install_extension(
                 "written": false,
                 "error": msg,
             });
-            // Even on the error path we want a parseable envelope; the non-zero
-            // exit code is what signals failure.
+            // Parseable envelope even on the error path; the non-zero exit
+            // signals failure.
             let _ = write_json_stdout(
                 &env,
                 "tirith browser install-extension: failed to write JSON output",
@@ -209,12 +170,10 @@ pub fn install_extension(
     let manifest = render_manifest(&exe, &extension_id);
     let manifest_path = manifest_path(browser);
 
-    // ---- platforms without a file-drop install -----------------------------
     let Some(path) = manifest_path else {
-        // CR2 — distinguish Windows (registry-based, expected) from a genuine
-        // failure to resolve HOME on macOS/Linux. Only the former is a success.
+        // CR2 — Windows (registry-based) is an expected success; a None path on
+        // macOS/Linux is a genuine HOME-resolve failure.
         if cfg!(target_os = "windows") {
-            // Windows: registry-based registration, not a directory drop.
             if json {
                 let env = serde_json::json!({
                     "platform": platform,
@@ -241,16 +200,14 @@ pub fn install_extension(
                 eprintln!("tirith browser install-extension: manifest body to register:");
                 println!("{manifest}");
             }
-            // Not an error: we gave the operator everything they need to register
-            // it manually. Exit 0 in the dry-run sense.
+            // Not an error — the operator has what they need to register it
+            // manually. Exit 0 (dry-run sense).
             return 0;
         }
 
-        // Non-Windows: a `None` path is a real failure. Distinguish the two causes
-        // so the operator is pointed at the right problem — an unsupported target
-        // (no per-OS NMH dir for this build) vs. a resolvable platform whose HOME
-        // could not be found. Report it and exit non-zero rather than masquerading
-        // as the Windows success path.
+        // Non-Windows: a `None` path is a real failure. Distinguish an
+        // unsupported target from an unresolvable HOME so the operator is
+        // pointed at the right problem; exit non-zero either way.
         let msg = if platform == "unsupported" {
             "native messaging host installation is not supported on this platform"
         } else {
@@ -275,7 +232,7 @@ pub fn install_extension(
         return 1;
     };
 
-    // ---- dry-run (default): print the manifest + target path ---------------
+    // dry-run (default): print the manifest + target path.
     if !apply {
         if json {
             let env = serde_json::json!({
@@ -308,13 +265,13 @@ pub fn install_extension(
                      (32 letters a–p) or the host will refuse the connection."
                 );
             }
-            // The manifest itself goes to stdout so it can be redirected.
+            // The manifest goes to stdout so it can be redirected.
             println!("{manifest}");
         }
         return 0;
     }
 
-    // ---- --apply: write the manifest (idempotent) --------------------------
+    // --apply: write the manifest (idempotent).
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             let msg = format!("failed to create {}: {e}", parent.display());
@@ -322,7 +279,7 @@ pub fn install_extension(
         }
     }
 
-    // Idempotency: skip the write when the on-disk content already matches.
+    // Idempotent: skip the write when on-disk content already matches.
     let needs_write =
         !matches!(std::fs::read_to_string(&path), Ok(existing) if existing == manifest);
     if needs_write {
@@ -373,13 +330,9 @@ pub fn install_extension(
     0
 }
 
-/// Emit an apply-time (`--apply`) write failure and return the non-zero exit
-/// code. When `json` is set this writes the SAME parseable error envelope the
-/// early error paths use (`platform` / `browser` / `host_name` / `written:false`
-/// / `error`), additionally carrying the `manifest_path` we were writing to (the
-/// path is known here, unlike the HOME-unresolvable early path). Keeps
-/// `install-extension --json --apply` machine-readable on `create_dir_all` /
-/// `write_file_atomic` errors instead of printing plain text.
+/// Emit an `--apply` write failure (with the known `manifest_path`) and return
+/// the non-zero exit code, keeping `--json --apply` machine-readable on
+/// `create_dir_all` / `write_file_atomic` errors.
 fn apply_failure(
     json: bool,
     platform: &str,
@@ -406,9 +359,8 @@ fn apply_failure(
     1
 }
 
-/// Build the native messaging host manifest JSON for the given executable path
-/// and extension id. Pretty-printed and stable so the idempotency content
-/// comparison is reliable.
+/// Build the native messaging host manifest JSON. Pretty-printed and stable so
+/// the idempotency content comparison is reliable.
 pub fn render_manifest(exe: &str, extension_id: &str) -> String {
     let manifest = serde_json::json!({
         "name": HOST_NAME,
@@ -417,16 +369,11 @@ pub fn render_manifest(exe: &str, extension_id: &str) -> String {
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{extension_id}/")],
     });
-    // `to_string_pretty` cannot fail for a value we built; fall back defensively.
     serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Short OS-only platform tag for JSON envelopes / human messages. The selected
-/// browser is reported SEPARATELY in the `browser` envelope field, so this tag is
-/// the OS alone — it previously hardcoded `macos-chrome` / `linux-chrome` for ALL
-/// `--browser` values, which was misleading for a `--browser brave` / `edge` run.
-/// `windows-registry` keeps its registry-vs-file-drop distinction (it describes
-/// the install MECHANISM, not the browser).
+/// Short OS-only platform tag for JSON envelopes / human messages (the browser
+/// is reported separately). `windows-registry` describes the install mechanism.
 fn manifest_platform() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -446,13 +393,9 @@ fn manifest_platform() -> &'static str {
     }
 }
 
-/// The per-OS, per-browser path of the NativeMessagingHosts manifest. `None` on
-/// Windows (registry-based), unsupported platforms, or when `$HOME` cannot be
-/// resolved.
-///
-/// Each Chromium-family browser keeps its own `NativeMessagingHosts` directory
-/// (G2): a Chromium / Brave user who installed against `google-chrome/` would
-/// get a silently-unfound manifest. The per-browser sub-path is:
+/// The per-OS, per-browser NativeMessagingHosts manifest path. `None` on Windows
+/// (registry-based), unsupported platforms, or when `$HOME` cannot be resolved.
+/// Each Chromium-family browser keeps its own directory (G2):
 ///
 /// | Browser  | macOS (`~/Library/Application Support/...`)   | Linux (`~/.config/...`)                  |
 /// | -------- | --------------------------------------------- | ---------------------------------------- |
@@ -505,9 +448,8 @@ fn manifest_path(browser: Browser) -> Option<PathBuf> {
     }
 }
 
-/// Guidance text printed on Windows, where the host is registered via a registry
-/// key rather than a directory drop. The registry root is per-browser (G2/N4):
-/// `--browser edge` names the Edge sub-tree, not Chrome's.
+/// Windows guidance text — register the host via a per-browser registry key
+/// (G2/N4) rather than a directory drop.
 fn windows_guidance(exe: &str, browser: Browser) -> String {
     let root = browser.windows_registry_root();
     format!(
@@ -519,13 +461,10 @@ fn windows_guidance(exe: &str, browser: Browser) -> String {
     )
 }
 
-/// Resolve the ABSOLUTE path to the current `tirith` binary for the manifest's
-/// `path` field — the executable Chrome will spawn. Returns `None` when an
-/// absolute path cannot be determined (`current_exe()` / `canonicalize()`
-/// failed). Chrome/Chromium require the native-messaging manifest `path` to be
-/// absolute on Linux and macOS, so there is deliberately NO PATH-relative
-/// `"tirith"` fallback: a relative value would make the host silently fail to
-/// launch. The caller fails fast on `None` rather than writing a broken manifest.
+/// Resolve the ABSOLUTE path to the current `tirith` binary for the manifest
+/// `path` (the exe Chrome spawns). `None` when no absolute path is determinable.
+/// No PATH-relative fallback: Chrome/Chromium require an absolute `path`, so a
+/// relative one would silently fail to launch; the caller fails fast on `None`.
 fn current_tirith_exe() -> Option<String> {
     std::env::current_exe()
         .ok()
@@ -537,8 +476,8 @@ fn current_tirith_exe() -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The rendered manifest carries the host name, the exe path, the stdio
-    /// transport, and the extension id woven into a `chrome-extension://` origin.
+    /// The rendered manifest carries host name, exe path, stdio transport, and
+    /// the extension id as a `chrome-extension://` origin.
     #[test]
     fn manifest_contains_required_fields() {
         let m = render_manifest("/usr/local/bin/tirith", "abcdefghijklmnopabcdefghijklmnop");
@@ -558,11 +497,9 @@ mod tests {
         );
     }
 
-    /// `current_tirith_exe()` resolves to an ABSOLUTE path in a normal run — the
-    /// property the native-messaging manifest depends on (Chrome/Chromium refuse
-    /// a relative `path`). The `None` branch (exe path unresolvable) can't be
-    /// reliably forced in-process, so we assert the happy path: `Some(_)` AND the
-    /// returned path is absolute.
+    /// `current_tirith_exe()` resolves to an absolute path in a normal run (the
+    /// property the manifest depends on). The `None` branch can't be forced
+    /// in-process, so we assert the happy path.
     #[test]
     fn current_tirith_exe_is_some_and_absolute() {
         let s = current_tirith_exe()
@@ -573,8 +510,8 @@ mod tests {
         );
     }
 
-    /// The manifest embeds the exe path verbatim (the load-bearing `path` field
-    /// Chrome spawns), so a path with spaces survives the JSON round-trip.
+    /// The exe path is embedded verbatim, so one with spaces survives the JSON
+    /// round-trip.
     #[test]
     fn manifest_preserves_exe_path_with_spaces() {
         let m = render_manifest(
@@ -585,8 +522,8 @@ mod tests {
         assert_eq!(parsed["path"], "/Applications/My Tools/tirith");
     }
 
-    /// The placeholder extension id flows into the origin so a dry-run shows the
-    /// operator exactly the (obviously-fake) origin they need to replace.
+    /// The placeholder id flows into the origin so a dry-run shows the
+    /// (obviously-fake) origin to replace.
     #[test]
     fn placeholder_id_appears_in_origin() {
         let m = render_manifest("/bin/tirith", PLACEHOLDER_EXTENSION_ID);
@@ -596,8 +533,7 @@ mod tests {
         );
     }
 
-    /// Windows guidance names the (Chrome) registry key and the host executable
-    /// so a Windows operator can register it manually.
+    /// Windows guidance names the (Chrome) registry key and the host exe.
     #[test]
     fn windows_guidance_mentions_registry_and_exe() {
         let g = windows_guidance("C:\\tools\\tirith.exe", Browser::Chrome);
@@ -606,9 +542,8 @@ mod tests {
         assert!(g.contains("C:\\tools\\tirith.exe"));
     }
 
-    /// N4 — `--browser` is honored in the Windows guidance: Edge guidance names
-    /// the EDGE registry root (not Chrome's), so an Edge user is pointed at the
-    /// key Edge actually reads. Brave / Chromium likewise carry their own roots.
+    /// N4 — `--browser` is honored in the Windows guidance: each browser's
+    /// guidance names its own registry root, not Chrome's.
     #[test]
     fn windows_guidance_honors_browser_registry_root() {
         let edge = windows_guidance("C:\\tools\\tirith.exe", Browser::Edge);
@@ -634,13 +569,12 @@ mod tests {
         );
     }
 
-    /// On the file-drop platforms the manifest path ends in the host filename
-    /// inside a `NativeMessagingHosts` directory.
+    /// On file-drop platforms the manifest path ends in the host filename inside
+    /// a `NativeMessagingHosts` directory.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn manifest_path_targets_native_messaging_hosts_dir() {
-        // home::home_dir() is set in normal test environments; if it isn't,
-        // skip rather than fail (CI sandboxes occasionally unset HOME).
+        // Skip rather than fail if HOME is unset (CI sandboxes occasionally do).
         let Some(p) = manifest_path(Browser::Chrome) else {
             eprintln!("skipping: no home dir resolved in this environment");
             return;
@@ -652,10 +586,9 @@ mod tests {
         );
     }
 
-    /// G2 — each Chromium-family browser targets a DISTINCT, vendor-specific
-    /// `NativeMessagingHosts` directory, so a Chromium / Brave user no longer
-    /// gets the `google-chrome` path silently. All four still end in the host
-    /// filename and carry the expected vendor segment.
+    /// G2 — each Chromium-family browser targets a distinct, vendor-specific
+    /// directory (all ending in the host filename with the expected vendor
+    /// segment).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn manifest_path_is_per_browser() {
@@ -705,38 +638,32 @@ mod tests {
             );
             seen.push(s);
         }
-        // The four paths are mutually distinct (no two browsers collide).
+        // The four paths are mutually distinct.
         let before = seen.len();
         seen.sort();
         seen.dedup();
         assert_eq!(before, seen.len(), "per-browser paths must be distinct");
     }
 
-    /// N1+N2 — the extension-id validator accepts exactly 32 letters a–p and
-    /// rejects everything else (wrong length, out-of-range letters, the
-    /// placeholder, uppercase).
+    /// N1+N2 — the validator accepts exactly 32 letters a–p, rejects everything
+    /// else.
     #[test]
     fn extension_id_validator_accepts_only_32_letters_a_to_p() {
         assert!(is_valid_extension_id("abcdefghijklmnopabcdefghijklmnop"));
         assert!(is_valid_extension_id(&"a".repeat(32)));
         assert!(is_valid_extension_id(&"p".repeat(32)));
-        // Too short / too long.
+        // Wrong length, out-of-range letters, digits, uppercase, placeholder.
         assert!(!is_valid_extension_id("abcdefghijklmnop"));
         assert!(!is_valid_extension_id(&"a".repeat(33)));
-        // Out-of-range letters (q–z) and digits.
         assert!(!is_valid_extension_id(&"q".repeat(32)));
         assert!(!is_valid_extension_id(&"z".repeat(32)));
         assert!(!is_valid_extension_id("0123456789abcdef0123456789abcdef"));
-        // Uppercase is not in a–p.
         assert!(!is_valid_extension_id("ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"));
-        // The placeholder is deliberately NOT a valid id.
         assert!(!is_valid_extension_id(PLACEHOLDER_EXTENSION_ID));
     }
 
-    /// The platform tag is OS-only and carries NO browser suffix (the selected
-    /// browser is reported in the separate `browser` envelope field). Regression
-    /// for the round-3 finding: a `--browser brave` run no longer reports
-    /// `macos-chrome`. Windows keeps `windows-registry` (the install mechanism).
+    /// The platform tag is OS-only, no browser suffix (regression: a `--browser
+    /// brave` run no longer reports `macos-chrome`).
     #[test]
     fn manifest_platform_is_os_only_no_browser_suffix() {
         let p = manifest_platform();
@@ -752,8 +679,7 @@ mod tests {
         assert_eq!(p, "windows-registry");
     }
 
-    /// `--browser` parses the four documented values (case-insensitively) and
-    /// rejects an unknown one.
+    /// `--browser` parses the four values (case-insensitively), rejects unknown.
     #[test]
     fn browser_parses_known_values() {
         use std::str::FromStr;

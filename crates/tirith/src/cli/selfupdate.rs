@@ -1,14 +1,9 @@
 //! `tirith verify-self`, `tirith update`, and `tirith version --provenance`.
 //!
-//! These commands verify tirith's OWN integrity and update tirith itself. They
-//! reach the network ONLY when the user explicitly invokes them — there is no
-//! hot-path network here. Honesty is the load-bearing property: a `verify-self`
-//! that cannot fully verify says so plainly and never reports a falsely
-//! confident "verified", and `update` never self-modifies a package-manager-
-//! managed install.
-//!
-//! See `tirith_core::selfupdate` for the design notes on what the release
-//! pipeline actually produces and how verification maps onto it.
+//! Verify tirith's OWN integrity and update tirith itself. Network access only
+//! on explicit invocation. Honesty is load-bearing: a `verify-self` that cannot
+//! fully verify says so and never falsely reports "verified", and `update` never
+//! self-modifies a package-manager-managed install.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,25 +27,17 @@ const COSIGN_IDENTITY_REGEXP: &str = "github.com/sheeki03/tirith";
 /// cosign OIDC issuer — the GitHub Actions OIDC provider.
 const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-// ===========================================================================
-// version --provenance
-// ===========================================================================
-
 /// Gather the running binary's provenance without any network access.
 pub fn gather_provenance() -> Provenance {
     let raw_exe = std::env::current_exe().ok();
-    // Resolve through symlinks / npm wrapper / Scoop shim, the same way the
-    // shadow-binary detector does, so the install-method classifier sees the
-    // real on-disk binary.
+    // Resolve through symlinks / npm wrapper / Scoop shim so the install-method
+    // classifier sees the real on-disk binary.
     let resolved = raw_exe
         .as_deref()
         .and_then(crate::cli::resolve_effective_tirith_target);
-    // When resolution failed but we DO have a raw `current_exe()` path, we fall
-    // back to that unresolved path. The fallback keeps `version --provenance`
-    // useful, but the install-method classifier is then run on a path that may
-    // still be a symlink / wrapper — record that so consumers can lower their
-    // confidence (an unresolved path could otherwise misdetect the install
-    // method, including toward the self-replaceable `SelfManaged`).
+    // Fall back to the unresolved `current_exe()` path when resolution failed;
+    // record it so consumers lower confidence (an unresolved symlink/wrapper
+    // could misdetect the install method, including toward `SelfManaged`).
     let path_resolution_failed = resolved.is_none() && raw_exe.is_some();
     let binary_path = resolved.or(raw_exe);
 
@@ -59,7 +46,6 @@ pub fn gather_provenance() -> Provenance {
     let install_method = match &binary_path {
         Some(p) => {
             let m = selfupdate::detect_install_method(p);
-            // Refine a system-path Unknown into apt/dnf when on Linux.
             selfupdate::refine_system_pm(m, &read_os_release_ids())
         }
         None => InstallMethod::Unknown,
@@ -84,7 +70,6 @@ pub fn gather_provenance() -> Provenance {
 /// version line (the plain `tirith version` behavior).
 pub fn version(provenance: bool, json: bool) -> i32 {
     if !provenance {
-        // Plain `tirith version`: same string clap's `--version` produces.
         if json {
             let v = serde_json::json!({ "version": env!("CARGO_PKG_VERSION") });
             println!("{v}");
@@ -95,9 +80,8 @@ pub fn version(provenance: bool, json: bool) -> i32 {
     }
 
     let prov = gather_provenance();
-    // `version --provenance` is offline: it reports the *local* facts and a
-    // local-only verification verdict. Full networked verification is
-    // `verify-self`.
+    // Offline: reports local facts and a local-only verdict. Full networked
+    // verification is `verify-self`.
     let local_status = local_verification_status(&prov);
 
     if json {
@@ -164,10 +148,9 @@ pub fn version(provenance: bool, json: bool) -> i32 {
     0
 }
 
-/// Read the `ID` and `ID_LIKE` tokens from `/etc/os-release`, lowercased, for
-/// apt-vs-dnf disambiguation of a system-path install. Returns an empty vec on
-/// any non-Linux platform or when the file is absent/unreadable — the caller
-/// (`refine_system_pm`) then simply leaves the method as `Unknown`.
+/// Read lowercased `ID`/`ID_LIKE` tokens from `/etc/os-release` for apt-vs-dnf
+/// disambiguation. Empty vec on non-Linux or absent/unreadable file (caller then
+/// leaves the method `Unknown`).
 fn read_os_release_ids() -> Vec<String> {
     if !cfg!(target_os = "linux") {
         return Vec::new();
@@ -198,10 +181,8 @@ fn read_os_release_ids() -> Vec<String> {
     ids
 }
 
-/// The verification verdict obtainable WITHOUT network access. `version
-/// --provenance` is intentionally offline, so it can only state structural
-/// facts: a dev build cannot be a verified release; an installed release
-/// binary's full verification requires `verify-self`.
+/// The verification verdict obtainable WITHOUT network access: structural facts
+/// only. Full verification of an installed release requires `verify-self`.
 fn local_verification_status(prov: &Provenance) -> VerificationStatus {
     if prov.dev_build {
         return VerificationStatus::Unverified {
@@ -233,20 +214,18 @@ fn local_verification_status(prov: &Provenance) -> VerificationStatus {
 // verify-self
 // ===========================================================================
 
-/// Outcome of `run_verify_self`: the verification status plus whether the run
-/// hit an *operational* error (something went wrong locally that prevented
-/// verification — e.g. tirith could not read its own binary's bytes). An
-/// operational error is distinct from an honest [`VerificationStatus::Unverified`]
-/// (offline / dev build / unpublished platform): the latter is a benign
-/// "cannot verify", the former is a real failure that must exit non-zero so a
-/// scripted `verify-self && deploy` does not proceed.
+/// Outcome of `run_verify_self`: verification status plus whether the run hit an
+/// *operational* error (a local failure that prevented verification, e.g. tirith
+/// could not read its own bytes). An operational error is distinct from an honest
+/// [`VerificationStatus::Unverified`] (offline / dev build / unpublished
+/// platform): the latter is a benign "cannot verify"; the former must exit
+/// non-zero so a scripted `verify-self && deploy` does not proceed.
 struct VerifySelfOutcome {
     status: VerificationStatus,
     operational_error: bool,
-    /// When set, the precise `verification_detail` string to report instead of
-    /// the generic [`status_detail`] for this status. Used to surface *why*
-    /// the cosign signature was not checked (absent vs present-but-broken) on
-    /// an otherwise checksum-only verification.
+    /// Precise `verification_detail` to report instead of the generic
+    /// [`status_detail`] — surfaces *why* the cosign signature was not checked
+    /// (absent vs present-but-broken) on a checksum-only verification.
     detail_override: Option<String>,
 }
 
@@ -260,8 +239,8 @@ impl VerifySelfOutcome {
         }
     }
 
-    /// An operational error: surfaced as `Unverified` to the user (we genuinely
-    /// could not verify) but flagged so `verify-self` exits non-zero.
+    /// An operational error: surfaced as `Unverified` but flagged so
+    /// `verify-self` exits non-zero.
     fn operational(reason: String) -> Self {
         VerifySelfOutcome {
             status: VerificationStatus::Unverified { reason },
@@ -277,15 +256,10 @@ impl VerifySelfOutcome {
     }
 }
 
-/// `tirith verify-self`. Verify the running binary against its known-good
-/// release checksum and signature, where possible. Exit code:
-///   * `0` — verification succeeded (signed or checksum-only) OR could only be
-///     honestly reported as *unverified* for a benign reason (dev build,
-///     offline, unpublished platform). An honest "cannot verify" is not an
-///     error.
-///   * `1` — verification was attempted and FAILED (mismatch / bad signature),
-///     an operational error prevented verification (e.g. tirith could not read
-///     its own binary), or the JSON output could not be serialized.
+/// `tirith verify-self`. Verify the running binary against its release checksum
+/// and signature where possible. Exit `0` on success OR an honest "unverified"
+/// (dev build, offline, unpublished platform); `1` on a FAILED verification
+/// (mismatch / bad signature), an operational error, or a JSON serialize failure.
 pub fn verify_self(json: bool) -> i32 {
     let prov = gather_provenance();
     let outcome = run_verify_self(&prov);
@@ -297,17 +271,16 @@ pub fn verify_self(json: bool) -> i32 {
     );
     let verdict_rc = match outcome.status {
         VerificationStatus::Failed { .. } => 1,
-        // An operational error is surfaced as `Unverified` but is NOT a benign
-        // "cannot verify" — it must fail the command so a scripted
-        // `verify-self && deploy` does not silently proceed.
+        // An operational error must fail the command (it is not a benign
+        // "cannot verify") so `verify-self && deploy` does not proceed.
         _ if outcome.operational_error => 1,
         _ => 0,
     };
     verdict_rc.max(emit_rc)
 }
 
-/// Core of `verify-self`: do the networked verification of the running binary.
-/// Kept separate so the emit/exit logic is trivially correct.
+/// Core of `verify-self`: the networked verification, kept separate so the
+/// emit/exit logic is trivially correct.
 fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     // 1. A dev build can never be matched against a release.
     if prov.dev_build {
@@ -318,8 +291,8 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         });
     }
 
-    // 2. Need a published target and a parseable version. Both of these are
-    //    honest "cannot verify" conditions, not operational errors.
+    // 2. Need a published target and parseable version — both honest "cannot
+    //    verify" conditions, not operational errors.
     let target = match &prov.target {
         Some(t) => t.clone(),
         None => {
@@ -343,10 +316,8 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     };
 
     // 3. Need the running binary's own bytes. Failure here is an OPERATIONAL
-    //    error — tirith has a path but could not read/hash the file (I/O,
-    //    permissions, or the binary was replaced out from under us). That is
-    //    not a benign "cannot verify": `verify-self` must exit non-zero so a
-    //    scripted `verify-self && deploy` does not proceed.
+    //    error (path known but unreadable/replaced), not a benign "cannot
+    //    verify" — `verify-self` must exit non-zero.
     let (binary_path, binary_sha) = match (&prov.binary_path, &prov.binary_sha256) {
         (Some(p), Some(s)) => (p.clone(), s.clone()),
         (Some(p), None) => {
@@ -369,8 +340,8 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     let workdir = match tempfile::Builder::new().prefix("tirith-verify-").tempdir() {
         Ok(d) => d,
         Err(e) => {
-            // Could not create a temp working directory: an operational error
-            // — verification could not even be started.
+            // Could not create a temp dir: operational error — verification
+            // could not even start.
             return VerifySelfOutcome::operational(format!(
                 "could not create a working directory: {e}"
             ));
@@ -414,9 +385,9 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         }
     };
 
-    // 6. Extract the binary from the verified archive and compare it,
-    //    byte-for-byte, to the running binary. This is the step that ties the
-    //    archive-level checksum to the actual file on disk.
+    // 6. Extract the binary from the verified archive and compare it
+    //    byte-for-byte to the running binary — ties the archive checksum to the
+    //    actual file on disk.
     let extracted = match extract_tirith_binary(&release.archive_path, &target, workdir.path()) {
         Ok(p) => p,
         Err(e) => {
@@ -449,10 +420,9 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         });
     }
 
-    // Running binary == official release binary. The strength of the verdict
-    // is whatever the archive-vs-checksums step achieved. For a checksum-only
-    // result, carry the cosign note (absent vs broken) into the detail so a
-    // `--format json` consumer sees *why* the signature went unchecked.
+    // Running binary == official release binary. Verdict strength is whatever
+    // the archive-vs-checksums step achieved; for a checksum-only result, carry
+    // the cosign note (absent vs broken) into the detail.
     match checksum_status {
         ChecksumStrength::Signed => VerifySelfOutcome::verdict(VerificationStatus::VerifiedSigned),
         ChecksumStrength::ChecksumOnly => {
@@ -462,21 +432,16 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     }
 }
 
-/// Print the `verify-self` result. Returns `1` if (and only if) JSON output
-/// was requested but could not be serialized — the caller folds that into the
-/// exit code so a JSON consumer never receives nothing on stdout AND a `0`
-/// exit. Returns `0` otherwise (the verdict-based exit code is the caller's).
-///
-/// `detail_override`, when `Some`, is a more precise `verification_detail`
-/// string than the generic [`status_detail`] (e.g. the reason a cosign
-/// signature was not checked).
+/// Print the `verify-self` result. Returns `1` only when JSON was requested but
+/// could not be serialized (so a JSON consumer never gets empty stdout + exit 0);
+/// `0` otherwise (the verdict-based exit code is the caller's). `detail_override`,
+/// when `Some`, is a more precise `verification_detail` than [`status_detail`].
 fn emit_verify_self(
     prov: &Provenance,
     status: &VerificationStatus,
     detail_override: Option<&str>,
     json: bool,
 ) -> i32 {
-    // Prefer a precise per-outcome detail when one was supplied.
     let detail = detail_override.map_or_else(|| status_detail(status), |d| d.to_string());
     if json {
         let v = serde_json::json!({
@@ -534,9 +499,8 @@ fn emit_verify_self(
                 "  The running binary matches the SHA-256 published in the release \
                  checksums.txt."
             );
-            // Report *why* the signature went unchecked. With a precise
-            // `detail` (cosign absent vs cosign broken vs no signature
-            // published) print that; otherwise fall back to the common case.
+            // Report *why* the signature went unchecked, preferring the precise
+            // detail when present.
             if detail_override.is_some() {
                 println!("  The cosign signature was NOT checked: {detail}");
             } else {
@@ -560,14 +524,9 @@ fn emit_verify_self(
             );
         }
     }
-    // Human output never fails to "serialize"; the verdict-based exit code is
-    // the caller's responsibility.
+    // Human output never fails to "serialize".
     0
 }
-
-// ===========================================================================
-// update
-// ===========================================================================
 
 /// `tirith update`. Update tirith to the latest release, package-manager-aware.
 ///
@@ -709,12 +668,9 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
         }
     };
 
-    // 3. Verify the downloaded release.
-    //    `--verify` makes verification MANDATORY: anything short of a positive
-    //    integrity result aborts. Without `--verify` we still verify and
-    //    refuse on a hard FAILED (a checksum mismatch is never acceptable),
-    //    but tolerate an honest "unverified" (e.g. cosign missing → still
-    //    checksum-verified; that is `is_integrity_ok`).
+    // 3. Verify the downloaded release. `--verify` makes verification
+    //    MANDATORY; without it we still refuse on a hard FAILED (checksum
+    //    mismatch) but tolerate an honest "unverified" (e.g. cosign missing).
     let archive_verdict = verify_archive_against_checksums(&release, &archive_name);
     match &archive_verdict {
         ArchiveVerdict::Failed(reason) => {
@@ -725,9 +681,8 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
             return 1;
         }
         ArchiveVerdict::ChecksumMissing(reason) => {
-            // No checksum entry at all. With --verify this is fatal; without
-            // it, we still refuse — installing an unverifiable binary over a
-            // working one is not acceptable for a security tool.
+            // No checksum entry: refuse either way — installing an unverifiable
+            // binary over a working one is unacceptable for a security tool.
             emit_update_error(
                 json,
                 &format!(
@@ -814,9 +769,8 @@ fn run_update(prov: &Provenance, verify: bool, dry_run: bool, yes: bool, json: b
     0
 }
 
-/// Print the exact package-manager upgrade command for a PM-managed install,
-/// and explain that tirith will not self-modify it. Exit `0` — this is the
-/// correct, intended outcome for a package-managed install, not an error.
+/// Print the package-manager upgrade command for a PM-managed install and
+/// explain tirith will not self-modify it. Exit `0` — the intended outcome.
 fn advise_package_manager(prov: &Provenance, json: bool) -> i32 {
     let method = &prov.install_method;
     let cmd = method.upgrade_command();
@@ -946,20 +900,16 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         return 0;
     }
 
-    // Restore: atomically install the backup's bytes onto the live path.
-    //
-    // This deliberately does NOT route through `atomic_self_replace` —
-    // `atomic_self_replace` would first copy the live binary onto
-    // `previous_backup_path(dest)`, which is the *same path* as `backup`,
-    // overwriting the rollback source with the current bytes before the swap.
+    // Restore via `atomic_restore_from`, NOT `atomic_self_replace`: the latter
+    // would first copy the live binary onto `previous_backup_path(dest)` (the
+    // same path as `backup`), clobbering the rollback source before the swap.
     // `atomic_restore_from` reads the source up front and never writes to it.
     match atomic_restore_from(&binary_path, &backup) {
         Ok(()) => {
-            // The backup's bytes are now the live binary. Remove the now-stale
-            // backup file: it is no longer "the previous version". If the
-            // removal fails, warn — a leftover `.tirith-previous` whose bytes
-            // are now identical to the live binary means a *later* `--rollback`
-            // would "restore" the same version and look like a no-op.
+            // Remove the now-stale backup (no longer "the previous version").
+            // A leftover `.tirith-previous` identical to the live binary would
+            // make a later `--rollback` a confusing no-op — so warn if removal
+            // fails.
             if let Err(e) = std::fs::remove_file(&backup) {
                 eprintln!(
                     "tirith: warning: rolled back successfully but could not remove the now-stale \
@@ -997,10 +947,6 @@ fn emit_update_error(json: bool, msg: &str) {
     }
 }
 
-// ===========================================================================
-// networking — release download
-// ===========================================================================
-
 /// A downloaded release artifact set, all in a working directory.
 struct ReleaseSet {
     archive_path: PathBuf,
@@ -1014,9 +960,8 @@ struct ReleaseSet {
     checksums_path: PathBuf,
 }
 
-/// Why a download could not be completed. The distinction matters: `Offline`
-/// and `NotFound` are *honest* non-failures for `verify-self`, while `Other`
-/// is an operational error.
+/// Why a download could not be completed. `Offline`/`NotFound` are honest
+/// non-failures for `verify-self`; `Other` is an operational error.
 enum DownloadError {
     Offline(String),
     NotFound(String),
@@ -1051,14 +996,14 @@ fn download_release_set(
     let client = http_client(DOWNLOAD_TIMEOUT_SECS)
         .map_err(|e| DownloadError::Other(format!("HTTP client: {e}")))?;
 
-    // The archive is required.
+    // The archive and checksums.txt are required; the cosign sig/cert are
+    // optional (an older release may lack them — an honest "checksum-only").
     let archive_url = format!("{base}/{archive_name}");
     let archive_bytes = fetch_bytes(&client, &archive_url, MAX_ARCHIVE_SIZE)?;
     let archive_path = workdir.join(archive_name);
     write_file(&archive_path, &archive_bytes)
         .map_err(|e| DownloadError::Other(format!("write archive: {e}")))?;
 
-    // checksums.txt is required for any verification.
     let checksums_url = format!("{base}/checksums.txt");
     let checksums_bytes = fetch_bytes(&client, &checksums_url, MAX_METADATA_SIZE)?;
     let checksums_txt = String::from_utf8(checksums_bytes.clone())
@@ -1067,8 +1012,6 @@ fn download_release_set(
     write_file(&checksums_path, &checksums_bytes)
         .map_err(|e| DownloadError::Other(format!("write checksums.txt: {e}")))?;
 
-    // The cosign signature + certificate are optional: an older release may
-    // not have them, and that is an honest "checksum-only", not a failure.
     let sig_path = fetch_optional(
         &client,
         &format!("{base}/checksums.txt.sig"),
@@ -1133,7 +1076,7 @@ fn fetch_bytes(
         )
         .send()
         .map_err(|e| {
-            // A connect/timeout error is "offline"; anything else is operational.
+            // Connect/timeout → offline; anything else → operational.
             if e.is_connect() || e.is_timeout() {
                 DownloadError::Offline(e.to_string())
             } else {
@@ -1151,7 +1094,7 @@ fn fetch_bytes(
         )));
     }
 
-    // Fast-reject via Content-Length before reading the body.
+    // Fast-reject via Content-Length before reading.
     if let Some(len) = resp.content_length() {
         if len > max {
             return Err(DownloadError::Other(format!(
@@ -1187,10 +1130,6 @@ fn fetch_optional(
     Some(path)
 }
 
-// ===========================================================================
-// verification — archive vs checksums vs cosign
-// ===========================================================================
-
 /// Strength of a successful archive verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChecksumStrength {
@@ -1205,10 +1144,9 @@ enum ArchiveVerdict {
     /// The archive's SHA-256 matched the entry in `checksums.txt`.
     Ok {
         signed: ChecksumStrength,
-        /// When the signature was NOT checked, why. `None` for a fully signed
-        /// verification; for `ChecksumOnly` this distinguishes "cosign is not
-        /// installed" from "cosign IS installed but could not be executed" —
-        /// a distinction an `eprintln!` alone would lose under `--format json`.
+        /// Why the signature was NOT checked (`None` when fully signed). For
+        /// `ChecksumOnly` this distinguishes "cosign not installed" from
+        /// "cosign present but unrunnable" — lost by an `eprintln!` under JSON.
         cosign_note: Option<String>,
     },
     /// Verification was attempted and FAILED (mismatch / bad signature).
@@ -1221,7 +1159,7 @@ enum ArchiveVerdict {
 /// if `cosign` is available and the release shipped a signature — verify the
 /// cosign signature over `checksums.txt`.
 fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) -> ArchiveVerdict {
-    // 1. Archive bytes vs the digest recorded in checksums.txt.
+    // 1. Archive bytes vs the digest in checksums.txt.
     let archive_bytes = match std::fs::read(&release.archive_path) {
         Ok(b) => b,
         Err(e) => {
@@ -1264,18 +1202,16 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
     }
 }
 
-/// Why a cosign signature check could not be performed. This is NOT a
-/// verification failure — it is an honest "signature not checked" — but the
-/// two cases differ operationally and the distinction must reach JSON output.
+/// Why a cosign signature check could not be performed. NOT a verification
+/// failure (an honest "signature not checked"), but the cases differ
+/// operationally and the distinction must reach JSON output.
 enum CosignUnavailable {
     /// The release did not publish a `.sig`/`.pem` pair at all.
     NoSignaturePublished,
     /// No `cosign` binary is resolvable on `PATH`.
     NotInstalled,
-    /// A `cosign` binary IS on `PATH`, but it could not be executed (e.g. it
-    /// is not actually runnable, or spawning it failed). The string is the
-    /// spawn error. Distinct from `NotInstalled`: the user installed cosign,
-    /// so "install cosign" is the wrong advice — something is broken.
+    /// `cosign` is on `PATH` but could not be executed (string is the spawn
+    /// error). Distinct from `NotInstalled` so we don't misadvise "install it".
     ExecFailed(String),
 }
 
@@ -1305,8 +1241,8 @@ impl CosignUnavailable {
 enum CosignOutcomeInternal {
     /// The signature verified against the expected Sigstore identity.
     Verified,
-    /// Verification could not be attempted. NOT a failure — see
-    /// [`CosignUnavailable`] for which sub-case.
+    /// Verification could not be attempted (not a failure — see
+    /// [`CosignUnavailable`]).
     Unavailable(CosignUnavailable),
     /// `cosign` ran and the signature did NOT verify.
     Failed(String),
@@ -1314,17 +1250,14 @@ enum CosignOutcomeInternal {
 
 /// Verify the cosign keyless signature over `checksums.txt`.
 ///
-/// tirith has no in-process Sigstore implementation — keyless verification
-/// needs to talk to Rekor/Fulcio — so this shells out to the `cosign` binary,
-/// exactly as `scripts/install.sh` does, with the SAME pinned identity and
-/// OIDC issuer. If `cosign` is not on `PATH`, cannot be executed, or the
-/// release shipped no signature, verification is `Unavailable` (honest), never
-/// a false pass — but the three cases are reported distinctly so a
-/// `--format json` consumer can tell "cosign absent" from "cosign broken".
+/// No in-process Sigstore (keyless needs Rekor/Fulcio), so this shells out to
+/// `cosign` exactly as `scripts/install.sh` does, with the SAME pinned identity
+/// and OIDC issuer. Missing cosign / no signature → `Unavailable` (honest, never
+/// a false pass); the cases are reported distinctly so JSON consumers can tell
+/// "cosign absent" from "cosign broken".
 fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
     let (sig, cert) = match (&release.sig_path, &release.cert_path) {
         (Some(s), Some(c)) => (s, c),
-        // release shipped no signature
         _ => return CosignOutcomeInternal::Unavailable(CosignUnavailable::NoSignaturePublished),
     };
 
@@ -1358,12 +1291,9 @@ fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
             )
         }
         Err(e) => {
-            // `cosign_available()` saw a `cosign` on PATH a moment ago, but it
-            // could not actually be executed. Treat as unavailable rather than
-            // a verification failure — but distinctly from "not installed", so
-            // the JSON detail does not falsely advise "install cosign". The
-            // eprintln! is kept for the human path; JSON consumers get the
-            // distinction via `cosign_note` on the verdict.
+            // cosign was on PATH but could not be executed: unavailable, not a
+            // verification failure — and distinct from "not installed" so the
+            // JSON detail does not falsely advise "install cosign".
             eprintln!("tirith: warning: could not run cosign ({e}); skipping signature check");
             CosignOutcomeInternal::Unavailable(CosignUnavailable::ExecFailed(e.to_string()))
         }
@@ -1391,32 +1321,15 @@ fn cosign_available() -> bool {
     probe.map(|s| s.success()).unwrap_or(false)
 }
 
-// ===========================================================================
-// archive extraction
-// ===========================================================================
-
-/// Extract the `tirith` binary from a release archive into `workdir` and
-/// return its path. The archive is `.tar.gz` (Unix) or `.zip` (Windows); we
-/// shell out to `tar` / `unzip` (or PowerShell `Expand-Archive`) rather than
-/// pulling in an archive crate. The extracted binary file name is `tirith`
-/// (`tirith.exe` on Windows).
+/// Extract the `tirith` binary (`tirith.exe` on Windows) from a release archive
+/// into `workdir` and return its path. Shells out to `tar` / PowerShell
+/// `Expand-Archive` rather than pulling in an archive crate.
 ///
-/// ## Path-traversal containment (defense-in-depth)
-///
-/// The archive being extracted has ALREADY been checksum- (and where possible
-/// cosign-) verified against the signed release before this function runs, so
-/// a path-traversal payload would have to come from a release that itself
-/// verified — outside tirith's strict trust model. Even so, extraction is the
-/// single most security-critical step, and the containment check below is
-/// cheap, so it is done unconditionally:
-///
-///   * `tar` is run with `--no-same-owner` so an extracted file can never be
-///     chowned to an unexpected uid/gid.
-///   * After extraction the produced binary path is canonicalized and asserted
-///     to lie *inside* `extract_dir`. A malicious archive member that is a
-///     symlink escaping the extraction directory (e.g. a `tirith` symlink
-///     pointing at `/etc/...` or `../../../`) is therefore rejected here
-///     instead of being hashed / installed.
+/// Path-traversal containment (defense-in-depth, done unconditionally even
+/// though the archive is already checksum/cosign-verified): `tar` runs with
+/// `--no-same-owner`, and the produced path is canonicalized and asserted to lie
+/// INSIDE `extract_dir`, so an escaping symlink member is rejected here rather
+/// than hashed/installed.
 fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result<PathBuf, String> {
     let extract_dir = workdir.join("extracted");
     std::fs::create_dir_all(&extract_dir).map_err(|e| format!("create extract dir: {e}"))?;
@@ -1428,7 +1341,7 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     };
 
     if target.contains("windows") {
-        // `.zip` — use PowerShell's Expand-Archive (always present on Windows).
+        // `.zip` via PowerShell Expand-Archive.
         let status = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(format!(
@@ -1442,9 +1355,8 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
             return Err("Expand-Archive failed to extract the release zip".to_string());
         }
     } else {
-        // `.tar.gz` — use `tar`. `--no-same-owner` keeps an extracted file
-        // owned by the current user regardless of the uid/gid recorded in the
-        // archive (relevant when extraction runs as root).
+        // `.tar.gz` via `tar`. `--no-same-owner` keeps extracted files owned by
+        // the current user regardless of the archived uid/gid (matters as root).
         let status = std::process::Command::new("tar")
             .arg("--no-same-owner")
             .arg("-xzf")
@@ -1465,11 +1377,8 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
         ));
     }
 
-    // Containment check: the extracted binary must resolve to a real path
-    // INSIDE `extract_dir`. Canonicalize both sides so a symlink (or `..`
-    // component) that escapes the extraction directory is caught — the
-    // canonical form of an escaping symlink will not be prefixed by the
-    // canonical `extract_dir`.
+    // Containment check: the extracted binary must canonicalize to a path
+    // INSIDE `extract_dir`, catching a symlink or `..` member that escapes.
     let canonical_extract_dir = extract_dir
         .canonicalize()
         .map_err(|e| format!("could not canonicalize the extraction directory: {e}"))?;
@@ -1488,10 +1397,6 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
 
     Ok(canonical_binary)
 }
-
-// ===========================================================================
-// atomic self-replace + rollback
-// ===========================================================================
 
 /// Result of an atomic self-replace.
 struct SwapResult {
@@ -1513,24 +1418,17 @@ fn previous_backup_path(binary_path: &Path) -> PathBuf {
 /// Atomically replace the binary at `dest` with `new_binary`, keeping the
 /// current `dest` as a `.tirith-previous` backup for rollback.
 ///
-/// Safety properties:
-///   * The new binary is first copied into a temp file in `dest`'s OWN
-///     directory (so the final step is a same-filesystem rename, which is
-///     atomic), with executable permissions set BEFORE the rename.
-///   * The current `dest` is copied to the backup path before the swap, so a
-///     rollback point exists even though the swap itself never deletes the old
-///     bytes.
-///   * The swap is a single `rename(temp, dest)` — `dest` is never absent or
-///     half-written at any instant. A reader either sees the old binary or the
-///     new one.
+/// Safety: the new binary is staged in `dest`'s own directory (so the swap is a
+/// same-filesystem, atomic rename) with the exec bit set before the rename; the
+/// current `dest` is backed up first; the swap is a single `rename(temp, dest)`
+/// so a reader always sees either the old or the new binary, never a partial.
 fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, String> {
     let dir = dest
         .parent()
         .ok_or_else(|| "cannot determine the binary's directory".to_string())?;
 
-    // Refuse early if the directory is not writable: better a clean error than
-    // a partial install. (The rename below would fail anyway, but this gives a
-    // clearer message and never even creates a temp file.)
+    // Refuse early on a non-writable directory: a clean error beats a raw
+    // rename failure, and no temp file is created.
     if !dir_is_writable(dir) {
         return Err(format!(
             "the directory {} is not writable — tirith cannot replace its own binary there \
@@ -1547,19 +1445,12 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
             backup.display()
         )
     })?;
-    // Durability (CodeRabbit R13 #L): `std::fs::copy` leaves the backup's bytes in
-    // the page cache. The new binary and the rename below are made crash-durable
-    // (sync_all + parent fsync), so without syncing the backup too a crash right
-    // after a successful swap could leave the live binary replaced while the
-    // advertised `--rollback` target is missing or truncated. fsync the backup's
-    // CONTENTS here; its directory entry is covered by the parent fsync at step 4
-    // (same directory, after both the backup and the renamed binary exist).
-    //
-    // The handle MUST be opened for WRITE: on Windows `sync_all` calls
-    // `FlushFileBuffers`, which requires a writable handle (a read-only
-    // `File::open` fails there with access-denied, even though POSIX `fsync`
-    // accepts a read-only fd). `write(true)` opens the existing copy without
-    // truncating it.
+    // Durability: fsync the backup's CONTENTS so a crash after the swap can't
+    // leave the live binary replaced while the `--rollback` target is
+    // truncated. The handle MUST be opened for WRITE — Windows `sync_all` calls
+    // `FlushFileBuffers`, which rejects a read-only handle; `write(true)` opens
+    // the existing copy without truncating. Its dir entry is covered by the
+    // parent fsync at step 4.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&backup)
@@ -1583,8 +1474,7 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
     tmp.flush()
         .map_err(|e| format!("could not flush the new binary: {e}"))?;
 
-    // 3. Make the temp file executable BEFORE it becomes the live binary, so
-    //    there is never an instant where `tirith` exists but is not runnable.
+    // 3. Set the exec bit BEFORE the swap so `tirith` is never live-but-unrunnable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1593,29 +1483,25 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
             .map_err(|e| format!("could not set executable permissions: {e}"))?;
     }
 
-    // Durability: fsync the new binary's bytes AND its mode to stable storage
-    // BEFORE the rename makes it the live `tirith`. `flush()` only drains the
-    // userspace buffer; a crash after the rename could otherwise leave a
-    // zero/partial binary at `dest`. The sync MUST follow `set_permissions`:
-    // fsyncing before the chmod can leave the file durable WITHOUT the exec bit
-    // (a durable-but-un-runnable `tirith`).
+    // Durability: fsync the new binary's bytes AND mode before the rename. The
+    // sync MUST follow `set_permissions` — syncing first could leave the file
+    // durable without the exec bit (durable-but-unrunnable).
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("could not sync the new binary: {e}"))?;
 
     // 4. Atomic rename over the live binary.
     tmp.persist(dest).map_err(|e| {
-        // The rename failed. The old binary is still in place (rename does not
-        // touch dest until it succeeds) and the backup exists; report cleanly.
+        // Rename failed; the old binary is intact (rename doesn't touch dest
+        // until it succeeds) and the backup exists.
         format!(
             "could not atomically replace {}: {} (the old binary is intact)",
             dest.display(),
             e.error
         )
     })?;
-    // Durability of the rename itself: fsync the parent directory so the new
-    // name→inode entry survives a crash (the file data is synced above, the
-    // directory metadata is not). Best-effort; no-op on non-Unix.
+    // Rename durability: fsync the parent dir so the new name→inode entry
+    // survives a crash. Best-effort; no-op on non-Unix.
     fsync_parent_dir(dest);
 
     Ok(SwapResult {
@@ -1623,15 +1509,12 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
     })
 }
 
-/// Atomically install the bytes of `source` onto `dest`, used by `--rollback`.
+/// Atomically install `source`'s bytes onto `dest`, used by `--rollback`.
 ///
-/// Unlike [`atomic_self_replace`] this takes NO backup: rollback's `source` is
-/// the backup, and [`atomic_self_replace`] would clobber that very file as its
-/// first step (it backs `dest` up to `previous_backup_path(dest)`, which the
-/// rollback caller passes as `source`). `atomic_restore_from` reads `source`
-/// fully into memory up front, so even if `source` and `previous_backup_path`
-/// coincide the restored bytes are correct, and the atomic rename is the only
-/// thing that touches `dest`.
+/// Unlike [`atomic_self_replace`] this takes NO backup: rollback's `source` IS
+/// the backup, which `atomic_self_replace` would clobber as its first step. This
+/// reads `source` fully into memory up front, so the restored bytes are correct
+/// even when `source == previous_backup_path(dest)`.
 fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
     let dir = dest
         .parent()
@@ -1643,8 +1526,7 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
         ));
     }
 
-    // Read the source bytes up front: after this point `source` may be freely
-    // overwritten or deleted without affecting the restore.
+    // Read source bytes up front: `source` may then be freely overwritten.
     let bytes = std::fs::read(source).map_err(|e| {
         format!(
             "could not read the rollback binary {}: {e}",
@@ -1667,11 +1549,8 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("could not set executable permissions: {e}"))?;
     }
-    // Durability: fsync AFTER `set_permissions`, before the rename makes this the
-    // live binary. fsyncing before the chmod could leave the restored binary
-    // durable WITHOUT the exec bit (a durable-but-un-runnable `tirith`); a crash
-    // after the rename must never leave a zero/partial or non-executable binary
-    // at `dest`.
+    // Durability: fsync AFTER `set_permissions`, before the rename (syncing
+    // first could leave the restored binary durable without the exec bit).
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("could not sync the rollback binary: {e}"))?;
@@ -1682,38 +1561,25 @@ fn atomic_restore_from(dest: &Path, source: &Path) -> Result<(), String> {
             e.error
         )
     })?;
-    // Durability of the rename itself (see `atomic_self_replace`): fsync the
-    // parent directory so the new name→inode entry survives a crash.
+    // Rename durability (see `atomic_self_replace`): fsync the parent dir.
     fsync_parent_dir(dest);
     Ok(())
 }
 
-/// fsync of `path`'s parent directory after a rename, so the new directory entry
-/// (name→inode) is durable. A bare file fsync persists the file's data but NOT
-/// the directory metadata recording its name, so a crash right after a rename can
-/// lose the entry.
-///
-/// Routes through the shared [`tirith_core::util::fsync_parent_dir_logged`]
-/// (CodeRabbit R13 #5, consolidating the former local copy): the binary swap has
-/// already succeeded, so a dir-fsync failure must never fail it — but it is now
-/// LOGGED rather than silently ignored. No-op success path on non-Unix.
+/// fsync `path`'s parent directory after a rename so the new name→inode entry is
+/// durable. Routes through the shared `fsync_parent_dir_logged`: the swap already
+/// succeeded, so a dir-fsync failure is LOGGED, never fatal. No-op on non-Unix.
 fn fsync_parent_dir(path: &Path) {
     tirith_core::util::fsync_parent_dir_logged(path, "binary swap");
 }
 
-/// Best-effort writability probe for a directory: try to create and delete a
-/// temp file in it. A `false` here lets `atomic_self_replace` fail with a
-/// helpful message instead of a raw rename error.
+/// Best-effort writability probe: try to create a temp file in `dir`.
 fn dir_is_writable(dir: &Path) -> bool {
     tempfile::Builder::new()
         .prefix(".tirith-wtest-")
         .tempfile_in(dir)
         .is_ok()
 }
-
-// ===========================================================================
-// small shared helpers
-// ===========================================================================
 
 /// SHA-256 of a byte slice, lowercase hex.
 fn hex_sha256(data: &[u8]) -> String {
@@ -1728,8 +1594,7 @@ fn hash_file_opt(path: &Path) -> Option<String> {
     Some(hex_sha256(&bytes))
 }
 
-/// Write `bytes` to `path` (plain, non-atomic — used only for files inside a
-/// freshly-created private temp dir).
+/// Write `bytes` to `path` (plain, non-atomic — only for files in a private temp dir).
 fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
     f.write_all(bytes)?;
@@ -1770,7 +1635,6 @@ fn describe_status(status: &VerificationStatus) -> String {
 mod tests {
     use super::*;
 
-    /// `atomic_self_replace` swaps the binary AND keeps a recoverable backup.
     #[test]
     fn atomic_self_replace_swaps_and_keeps_backup() {
         let dir = tempfile::tempdir().unwrap();
@@ -1789,8 +1653,7 @@ mod tests {
         assert_eq!(swap.previous_backup, previous_backup_path(&live));
     }
 
-    /// After a swap, restoring from the backup via `atomic_restore_from`
-    /// recovers the original binary — the property `--rollback` depends on.
+    /// `--rollback` property: restoring from the backup recovers the original.
     #[test]
     fn rollback_from_backup_restores_original() {
         let dir = tempfile::tempdir().unwrap();
@@ -1807,22 +1670,18 @@ mod tests {
         assert_eq!(std::fs::read(&live).unwrap(), b"V1");
     }
 
-    /// REGRESSION: `atomic_restore_from` must restore the SOURCE bytes even
-    /// when `source` is exactly `previous_backup_path(dest)` — which is the
-    /// rollback case. Using `atomic_self_replace` here would clobber the
-    /// source with the live bytes first and "restore" the wrong thing.
+    /// REGRESSION: `atomic_restore_from` must restore the SOURCE bytes even when
+    /// `source == previous_backup_path(dest)` (the rollback case).
     #[test]
     fn atomic_restore_from_does_not_clobber_source_at_backup_path() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         std::fs::write(&live, b"CURRENT-BYTES").unwrap();
-        // The rollback source IS the conventional backup path next to `live`.
         let backup = previous_backup_path(&live);
         std::fs::write(&backup, b"PREVIOUS-BYTES").unwrap();
 
         atomic_restore_from(&live, &backup).unwrap();
 
-        // The live binary must hold the PREVIOUS bytes, not the current ones.
         assert_eq!(std::fs::read(&live).unwrap(), b"PREVIOUS-BYTES");
     }
 
@@ -1852,7 +1711,7 @@ mod tests {
         let new = dir.path().join("new-tirith");
         std::fs::write(&live, b"old").unwrap();
         std::fs::write(&new, b"new").unwrap();
-        // The new file is deliberately NOT executable before the swap.
+        // Deliberately NOT executable before the swap.
         std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         atomic_self_replace(&live, &new).unwrap();
@@ -1884,7 +1743,6 @@ mod tests {
 
     #[test]
     fn hex_sha256_known_value() {
-        // SHA-256 of the empty string.
         assert_eq!(
             hex_sha256(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -1909,8 +1767,7 @@ mod tests {
         assert_eq!(short("abc"), "abc");
     }
 
-    /// `verify_archive_against_checksums` returns `Failed` when the archive
-    /// bytes do not match the digest in checksums.txt — a tampered download.
+    /// `Failed` when the archive bytes don't match checksums.txt (tampered download).
     #[test]
     fn archive_verify_fails_on_checksum_mismatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -1936,9 +1793,7 @@ mod tests {
         assert!(matches!(verdict, ArchiveVerdict::Failed(_)));
     }
 
-    /// When the archive bytes DO match checksums.txt and no signature was
-    /// published, the verdict is `Ok` with `ChecksumOnly` strength — an honest
-    /// "checksum verified, signature not checked".
+    /// Archive matches checksums.txt with no signature → `Ok(ChecksumOnly)`.
     #[test]
     fn archive_verify_ok_checksum_only_without_signature() {
         let dir = tempfile::tempdir().unwrap();
@@ -1965,8 +1820,8 @@ mod tests {
                 cosign_note,
             } => {
                 assert_eq!(signed, ChecksumStrength::ChecksumOnly);
-                // No `.sig`/`.pem` was published — the note must say so, NOT
-                // (mis)advise the user to install cosign.
+                // No `.sig`/`.pem` published — the note must say so, not advise
+                // "install cosign".
                 let note = cosign_note.expect("checksum-only must carry a cosign note");
                 assert!(
                     note.contains("did not publish"),
@@ -1977,8 +1832,7 @@ mod tests {
         }
     }
 
-    /// A checksums.txt with no entry for the archive yields `ChecksumMissing`
-    /// (an honest "cannot verify"), never a false pass.
+    /// No entry for the archive → `ChecksumMissing`, never a false pass.
     #[test]
     fn archive_verify_checksum_missing_when_no_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -2000,8 +1854,7 @@ mod tests {
         assert!(matches!(verdict, ArchiveVerdict::ChecksumMissing(_)));
     }
 
-    /// `local_verification_status` for a dev build is always Unverified with a
-    /// dev-build reason — never a confident pass.
+    /// A dev build is always Unverified, never a confident pass.
     #[test]
     fn local_status_dev_build_is_unverified() {
         let prov = Provenance {
@@ -2018,9 +1871,8 @@ mod tests {
         assert!(matches!(status, VerificationStatus::Unverified { .. }));
     }
 
-    /// `run_verify_self` for a dev build short-circuits to Unverified WITHOUT
-    /// any network access — the honest-failure path the spec calls out. It is
-    /// an HONEST unverified, NOT an operational error: exit 0 must be kept.
+    /// A dev build short-circuits to Unverified WITHOUT network — an honest
+    /// unverified (not operational): exit 0 must be kept.
     #[test]
     fn verify_self_dev_build_short_circuits_offline() {
         let prov = Provenance {
@@ -2032,7 +1884,6 @@ mod tests {
             dev_build: true,
             path_resolution_failed: false,
         };
-        // No network is touched because dev_build is checked first.
         let outcome = run_verify_self(&prov);
         assert!(matches!(
             outcome.status,
@@ -2045,8 +1896,7 @@ mod tests {
         );
     }
 
-    /// `run_verify_self` for an unpublished platform short-circuits to
-    /// Unverified, again without network — and again NOT an operational error.
+    /// An unpublished platform short-circuits to Unverified, not operational.
     #[test]
     fn verify_self_unpublished_platform_short_circuits() {
         let prov = Provenance {
@@ -2069,11 +1919,8 @@ mod tests {
         );
     }
 
-    /// F2: when tirith has a binary PATH but could not read/hash its own bytes
-    /// (`binary_sha256 == None`), `run_verify_self` reports an OPERATIONAL
-    /// error. The status is surfaced as `Unverified` (we genuinely could not
-    /// verify) but `operational_error` is set so `verify-self` exits non-zero —
-    /// a scripted `verify-self && deploy` must not silently proceed.
+    /// F2: a known PATH but unreadable own bytes (`binary_sha256 == None`) is an
+    /// OPERATIONAL error — surfaced as `Unverified` but exits non-zero.
     #[test]
     fn verify_self_unreadable_own_binary_is_operational_error() {
         let prov = Provenance {
@@ -2090,15 +1937,14 @@ mod tests {
             outcome.operational_error,
             "an unreadable own-binary is an operational error, not a benign unverified"
         );
-        // Still surfaced honestly as `Unverified`, never a false `Failed`.
+        // Surfaced as `Unverified`, never a false `Failed`.
         assert!(matches!(
             outcome.status,
             VerificationStatus::Unverified { .. }
         ));
     }
 
-    /// F2: when tirith cannot even determine its own binary path
-    /// (`binary_path == None`) that, too, is an operational error.
+    /// F2: an unknown own-binary path (`binary_path == None`) is operational too.
     #[test]
     fn verify_self_unknown_own_path_is_operational_error() {
         let prov = Provenance {
@@ -2121,13 +1967,13 @@ mod tests {
         ));
     }
 
-    /// `extract_tirith_binary` round-trips a real tar.gz on Unix: it must find
-    /// the `tirith` member and return a path whose bytes match.
+    /// `extract_tirith_binary` round-trips a real tar.gz, finding the `tirith`
+    /// member and returning a path whose bytes match.
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_finds_member_in_targz() {
         let dir = tempfile::tempdir().unwrap();
-        // Build a tiny tar.gz containing a `tirith` file plus a decoy.
+        // tar.gz with a `tirith` file plus a decoy.
         let stage = dir.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("tirith"), b"BINARY-CONTENT").unwrap();
@@ -2150,7 +1996,7 @@ mod tests {
         assert_eq!(std::fs::read(&extracted).unwrap(), b"BINARY-CONTENT");
     }
 
-    /// `extract_tirith_binary` errors when the archive has no `tirith` member.
+    /// Errors when the archive has no `tirith` member.
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_errors_when_no_binary() {
@@ -2172,25 +2018,20 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// F21 / F1: extraction containment. A release archive whose `tirith`
-    /// member is a SYMLINK escaping the extraction directory must be REJECTED
-    /// — `extract_tirith_binary` canonicalizes the produced path and refuses
-    /// anything resolving outside `extract_dir`, so the escaping symlink is
+    /// F21 / F1: extraction containment. A `tirith` member that is a SYMLINK
+    /// escaping the extraction dir must be REJECTED (canonicalized path refused),
     /// never hashed or installed.
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_rejects_symlink_escaping_extract_dir() {
         let dir = tempfile::tempdir().unwrap();
 
-        // A sensitive file OUTSIDE the extraction dir that the payload tries
-        // to make `tirith` point at.
+        // A sensitive file OUTSIDE the extraction dir the payload targets.
         let outside_secret = dir.path().join("outside-secret");
         std::fs::write(&outside_secret, b"SENSITIVE-BYTES-OUTSIDE").unwrap();
 
-        // Stage an archive whose `tirith` member is a symlink to `../`-escape.
-        // `workdir` passed to extract_tirith_binary is `dir.path()/work`, so
-        // extraction lands in `dir.path()/work/extracted`; a `../../` symlink
-        // target from there reaches `dir.path()`.
+        // `tirith` member is a `../../`-escaping symlink. Extraction lands in
+        // `dir/work/extracted`, so `../../outside-secret` reaches `dir`.
         let stage = dir.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::os::unix::fs::symlink("../../outside-secret", stage.join("tirith")).unwrap();
@@ -2219,19 +2060,16 @@ mod tests {
             err.contains("OUTSIDE") || err.contains("path-traversal"),
             "rejection should name the containment violation, got: {err}"
         );
-        // The outside file is untouched — extraction never wrote through the
-        // escaping link.
+        // The outside file is untouched — never written through the link.
         assert_eq!(
             std::fs::read(&outside_secret).unwrap(),
             b"SENSITIVE-BYTES-OUTSIDE"
         );
     }
 
-    /// F21 / F1: a `../`-prefixed archive MEMBER must not cause a write outside
-    /// the extraction directory. `tar` strips a leading `../` itself (printing
-    /// a warning), so the escaping member never lands; the `tirith` binary is
-    /// then simply absent and extraction fails cleanly — nothing is written to
-    /// the parent directory.
+    /// F21 / F1: a `../`-prefixed archive MEMBER must not write outside the
+    /// extraction dir. `tar` strips the leading `../`, so the member never lands
+    /// and extraction fails cleanly with nothing written to the parent.
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_dotdot_member_writes_nothing_outside() {
@@ -2250,8 +2088,7 @@ mod tests {
             .arg("s,^tirith,../escaped-tirith,")
             .arg("tirith")
             .status();
-        // GNU tar supports --transform; if it is unavailable (bsdtar) skip the
-        // member-rename and just confirm a clean archive still does not leak.
+        // GNU tar has --transform; bsdtar may not, so tolerate failure.
         let renamed = ok.map(|s| s.success()).unwrap_or(false);
 
         let workdir = dir.path().join("work");
@@ -2260,8 +2097,7 @@ mod tests {
         let _ = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
 
         if renamed {
-            // The `../`-prefixed member must NOT have escaped `extracted/` into
-            // `work/`.
+            // The `../`-prefixed member must not have escaped into `work/`.
             assert!(
                 !leak.exists(),
                 "a `../`-prefixed archive member must not be written outside the extract dir"
@@ -2269,10 +2105,8 @@ mod tests {
         }
     }
 
-    /// F21 / F1: a PRE-EXISTING `extracted/tirith` regular file (not from the
-    /// archive) is inside `extract_dir`, so it passes containment — the
-    /// containment check rejects ESCAPES, not in-directory files. This pins
-    /// that the check does not over-reject a legitimate in-bounds path.
+    /// F21 / F1: the containment check rejects ESCAPES, not in-bounds files — a
+    /// pre-existing `extracted/tirith` inside `extract_dir` must be allowed.
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_preexisting_in_bounds_file_is_allowed() {
@@ -2291,27 +2125,20 @@ mod tests {
             .unwrap();
 
         let workdir = dir.path().join("work");
-        // Pre-create `work/extracted/tirith` before extraction runs.
+        // Pre-create `work/extracted/tirith` before extraction.
         let pre = workdir.join("extracted");
         std::fs::create_dir_all(&pre).unwrap();
         std::fs::write(pre.join("tirith"), b"PRE-EXISTING").unwrap();
 
         let extracted =
             extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir).unwrap();
-        // The returned path is canonical and inside the extraction directory.
         assert!(extracted.starts_with(pre.canonicalize().unwrap()));
     }
 
-    /// F19: when a `cosign` binary IS on `PATH` but EXITS NON-ZERO, the
-    /// signature does not verify and `verify_archive_against_checksums` must
-    /// return `ArchiveVerdict::Failed` — cosign saying "no" is a hard failure,
-    /// never folded into a checksum-only pass.
-    ///
-    /// `verify_cosign_signature` resolves `cosign` from the process `PATH`, so
-    /// this test mutates `PATH`. It therefore holds the crate-wide `ENV_LOCK`
-    /// (the same lock `cli::test_harness::with_fake_env` uses) for the whole
-    /// PATH mutation, so it cannot race any other env-mutating test, and
-    /// restores `PATH` via an `EnvGuard` (panic-safe).
+    /// F19: a `cosign` on `PATH` that EXITS NON-ZERO must yield
+    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass.
+    /// Mutates `PATH`, so it holds the crate-wide `ENV_LOCK` and restores via
+    /// `EnvGuard`.
     #[cfg(unix)]
     #[test]
     fn cosign_failure_makes_archive_verdict_failed() {
@@ -2320,8 +2147,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
 
-        // A fake `cosign` that always exits 1 (signature does not verify).
-        // It MUST be executable or PATH resolution would skip it.
+        // A fake `cosign` that always exits 1. MUST be executable or PATH
+        // resolution would skip it.
         let fake_bin_dir = dir.path().join("fakebin");
         std::fs::create_dir_all(&fake_bin_dir).unwrap();
         let fake_cosign = fake_bin_dir.join("cosign");
@@ -2332,8 +2159,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // A real archive whose bytes match checksums.txt, so verification
-        // reaches the cosign step. The release ships a (dummy) .sig and .pem.
+        // Archive bytes match checksums.txt so verification reaches the cosign
+        // step; the release ships a dummy .sig and .pem.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
         let body = b"REAL ARCHIVE BYTES FOR COSIGN TEST";
         std::fs::write(&archive, body).unwrap();
@@ -2357,9 +2184,8 @@ mod tests {
         let verdict = {
             // Serialize against every other env-mutating test in the crate.
             let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // Prepend the fake-cosign dir to PATH (prepending, not replacing,
-            // keeps `sh` and friends resolvable). `EnvGuard` restores PATH on
-            // Drop even if the call below panics.
+            // Prepend (not replace) the fake-cosign dir so `sh` stays
+            // resolvable; `EnvGuard` restores PATH on Drop.
             let mut entries = vec![fake_bin_dir.clone()];
             if let Some(p) = std::env::var_os("PATH") {
                 entries.extend(std::env::split_paths(&p));

@@ -1,105 +1,59 @@
-//! Shared YAML scalar / inline-comment helpers used by every `tirith`
-//! subcommand that writes YAML scaffolds (`mcp policy init`, `agent policy
-//! init`, `agent allow`, …).
+//! Shared YAML scalar / inline-comment helpers for every `tirith` subcommand
+//! that writes YAML scaffolds (`mcp policy init`, `agent policy init`, …).
+//! Centralized so the YAML safety rules (incl. the DEL-escape fix) live in one
+//! place rather than being copied in `cli/mcp.rs` and `cli/agent.rs`.
 //!
-//! Why shared (M4 item 8 chunk 3, consolidation): pre-chunk-3, `cli/mcp.rs`
-//! and `cli/agent.rs` each carried their own copy of these helpers. The
-//! definitions were byte-identical (verified by the existing round-trip
-//! tests in both modules) but the duplication meant a future change had to
-//! land twice — and the DEL-escape fix landed mid-batch in `cli/mcp.rs`
-//! only, with `cli/agent.rs` independently copying the same rules to stay
-//! self-contained. Centralizing here means there is one place to audit
-//! the YAML safety rules, one place for the DEL-escape fix to live, and
-//! one place to extend when a future scaffold needs a new escape form.
-//!
-//! ## Safety contract
-//!
+//! Safety contract:
 //! * [`safe_scalar`] returns YAML that round-trips byte-for-byte through
-//!   `serde_yaml`. Every YAML reserved indicator, every C0 control byte,
-//!   DEL, the empty string, and multi-byte UTF-8 are all quoted-and-escaped
-//!   correctly. The chunk-2 round-trip test (preserved in
-//!   `cli/mcp.rs::yaml_safe_scalar_round_trips_through_yaml_parser`)
-//!   pins the contract for every YAML special character; we re-run a
-//!   minimal smoke set here too so this module is self-checking.
+//!   `serde_yaml` (every reserved indicator, C0 control byte, DEL, empty string,
+//!   and multi-byte UTF-8 quoted/escaped). The full per-character contract is
+//!   pinned by `cli/mcp.rs::yaml_safe_scalar_round_trips_through_yaml_parser`; a
+//!   smoke set runs here too.
+//! * [`safe_inline_comment`] is for `#`-comment suffixes: any control byte
+//!   (line-breakers / ANSI escapes) renders the whole string in `Debug` form.
 //!
-//! * [`safe_inline_comment`] is for `#`-comment suffixes. The only
-//!   characters we worry about there are line-breakers (`\n`, `\r`) and
-//!   control bytes that could reach the operator's terminal as ANSI
-//!   escapes. When the input contains any control byte we render the
-//!   whole string in Rust's `Debug` form (`format!("{s:?}")`); otherwise
-//!   we pass it through unmodified.
-//!
-//! Both helpers are `pub(crate)` so they're reachable from every CLI
-//! subcommand without being part of the public `tirith` library surface.
+//! Both are `pub(crate)`, not part of the public library surface.
 
-/// Bytes that force a YAML scalar to be quoted rather than emitted as a
-/// bare plain scalar.
-///
-/// The list is the union of:
-/// * YAML's reserved indicator set (`:` would split a key, `#` would
-///   start a comment, `-` could start a sequence, `?`/`,`/`[`/`]`/`{`/`}`
-///   are flow-style structure, `&`/`*` are anchors/aliases, `!` is a
-///   tag, `|`/`>` are block-scalar indicators, `'`/`"` are quote
-///   markers, `%` is a directive, `@`/`` ` `` are reserved for future
-///   use);
-/// * whitespace (`space`, `\t`) — leading or embedded whitespace can
-///   confuse plain-scalar parsing rules.
-///
-/// **Control bytes** (`b < 0x20` and `0x7f` DEL) are checked separately
-/// in [`safe_scalar`] — they too force quoting, and at the same
-/// time prevent terminal-injection when the operator `cat`s the
-/// example file.
+/// Bytes that force a YAML scalar to be quoted: YAML's reserved indicator set
+/// (`:#-?,[]{}&*!|>'"%@` plus backtick) and whitespace (space, tab). Control
+/// bytes (`< 0x20`, `0x7f` DEL) are checked separately in [`safe_scalar`].
 pub(crate) const YAML_NEEDS_QUOTING_BYTES: &[u8] = b":#-?,[]{}&*!|>'\"%@` \t";
 
-/// Render a scalar (server name / tool name / matcher payload) for
-/// inclusion in a YAML document. Returns the input unmodified when it is
-/// safe as a bare scalar; quotes (`"..."`) and JSON-escapes when it
-/// contains a YAML special character, whitespace, or any non-printable
-/// byte (including DEL).
+/// Render a scalar (server / tool / matcher name) for a YAML document. Returns
+/// the input unmodified when safe as a bare scalar; otherwise quotes and
+/// JSON-escapes it.
 ///
-/// This is **load-bearing for safety**: scaffolds carry server / tool /
-/// matcher names from arbitrary config files, and an attacker (or a
-/// careless author) can declare a name containing `:` (would split the
-/// YAML key), `#` (would split off the value as a comment), a newline
-/// (would break the document structure), or an ANSI escape (would
-/// reach the operator's terminal when the example is `cat`-ed). The
-/// quoted/escaped form is unambiguous in every case.
+/// LOAD-BEARING for safety: scaffolds carry names from arbitrary config files,
+/// and a name with `:` / `#` / a newline / an ANSI escape would otherwise split
+/// the key, comment out the value, break the document, or reach the terminal on
+/// `cat`. The quoted/escaped form is unambiguous.
 pub(crate) fn safe_scalar(s: &str) -> String {
-    // Empty string must always be quoted — bare empty is invalid YAML.
+    // Empty must be quoted — bare empty is invalid YAML.
     if s.is_empty() {
         return "\"\"".to_string();
     }
-    // A string is safe as a bare scalar iff every byte is a printable
-    // ASCII non-special character. The set of "special" YAML indicators
-    // is centralized in `YAML_NEEDS_QUOTING_BYTES`; control bytes are
-    // checked separately so a future indicator change does not have to
-    // remember to keep the `< 0x20` / `== 0x7f` guards too.
+    // Bare-safe iff every byte is printable ASCII non-special. Control bytes are
+    // checked separately so a future indicator change can't drop the guards.
     let needs_quoting = s
         .bytes()
         .any(|b| YAML_NEEDS_QUOTING_BYTES.contains(&b) || b < 0x20 || b == 0x7f);
     if !needs_quoting {
         return s.to_string();
     }
-    // JSON-style escaping (a strict subset of YAML's double-quoted form
-    // — `serde_json::to_string` handles every C0 control byte safely).
-    // Post-process for DEL (`\u{7f}`): JSON treats DEL as printable, so it
-    // ends up as a literal byte in the output, but YAML 1.2 §5.7 rejects
-    // a literal DEL inside a double-quoted scalar. Replace with ``
-    // so the YAML round-trip is exact — pinned by
-    // `yaml_safe_scalar_round_trips_del` in `cli/mcp.rs`.
+    // JSON escaping (a subset of YAML's double-quoted form) handles every C0
+    // byte. Post-process DEL: JSON leaves it literal, but YAML 1.2 §5.7 rejects
+    // a literal DEL in a quoted scalar; replace with``
+    // (pinned by `yaml_safe_scalar_round_trips_del` in `cli/mcp.rs`).
     serde_json::to_string(s)
         .map(|json| json.replace('\u{7f}', "\\u007F"))
         .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()))
 }
 
-/// Render a string for use as an inline `#`-comment suffix. We don't
-/// embed source-config paths inside YAML keys (they are not keys), so
-/// the unsafe characters we worry about are the line-breakers
-/// (`\n`, `\r`) and ANSI escapes. The simplest correct rendering is
-/// Rust's `Debug` form, which always emits printable bytes only.
+/// Render a string for an inline `#`-comment suffix. The risks are line-breakers
+/// (`\n`, `\r`) and ANSI escapes, so any control byte triggers `Debug` rendering
+/// (printable bytes only).
 pub(crate) fn safe_inline_comment(s: &str) -> String {
-    // If the string contains no control bytes, return it as-is for
-    // readability. Otherwise debug-escape the whole thing.
+    // No control bytes → as-is; otherwise debug-escape.
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
         format!("{s:?}")
     } else {
@@ -111,13 +65,8 @@ pub(crate) fn safe_inline_comment(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // The full round-trip behavior is pinned by the existing tests in both
-    // call-site modules (`cli/mcp.rs` and `cli/agent.rs`), which now reach
-    // into this shared module. The smoke checks below stay here so this
-    // module compiles green on its own — they're a copy of the most
-    // load-bearing handful of cases, not the full table.
-    // -----------------------------------------------------------------------
+    // Full round-trip behavior is pinned by the call-site modules (`cli/mcp.rs`,
+    // `cli/agent.rs`); these are a load-bearing smoke subset.
 
     #[test]
     fn safe_scalar_empty_becomes_quoted() {
@@ -155,9 +104,8 @@ mod tests {
 
     #[test]
     fn safe_scalar_escapes_del_for_yaml_roundtrip() {
-        // DEL must not appear as a raw byte in the YAML output (YAML 1.2
-        // §5.7 disallows it inside a double-quoted scalar). It must be
-        // escaped to ``.
+        // DEL must be escaped, not a raw byte (YAML 1.2 §5.7 disallows a raw DEL
+        // in a quoted scalar). Escaped to``.
         let scalar = safe_scalar("\x7f");
         assert!(
             !scalar.contains('\u{7f}'),

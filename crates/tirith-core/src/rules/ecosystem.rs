@@ -176,8 +176,7 @@ fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
                 for &(pop_owner, pop_repo) in crate::data::POPULAR_REPOS {
                     let po = pop_owner.to_lowercase();
                     let pr = pop_repo.to_lowercase();
-                    // Flag when owner matches but repo is one edit off (or vice versa) —
-                    // single-edit typosquats where the other half is a verbatim match.
+                    // Single-edit typosquat: one half is one edit off, the other verbatim.
                     if (owner == po && levenshtein(&repo, &pr) == 1)
                         || (repo == pr && levenshtein(&owner, &po) == 1)
                     {

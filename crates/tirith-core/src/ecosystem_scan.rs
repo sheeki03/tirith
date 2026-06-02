@@ -1,50 +1,19 @@
 //! `tirith ecosystem scan` — supply-chain risk scan of a project's dependency
-//! manifests.
+//! manifests. The directory-level companion to [`crate::package_risk`]: it
+//! discovers every dependency a project *declares* and scores each with the
+//! same deterministic factor engine (no model, reproducible by hand).
 //!
-//! This is the directory-level companion to [`crate::package_risk`]: where
-//! `package risk` scores **one** package by name, `ecosystem scan` discovers
-//! every dependency a project *declares* (across npm / Python / Rust / and
-//! more) and scores each one with the **same deterministic factor engine**.
-//! There is no model and no learned weight here either — every score is the
-//! `package_risk` factor sum, reproducible by hand.
+//! It discovers manifests via a bounded walk, parses declared dependencies
+//! (parsers never execute the manifest or reach the network), scores each
+//! through [`package_risk::score_package`] (with an opt-in `--online`
+//! registry pass), and folds in slopsquat detection — see [`slopsquat`].
 //!
-//! ## What it does
+//! Output is a [`Verdict`] of [`Finding`]s like the detection engine
+//! (explainable, audit-loggable, policy-aware), reusing the existing
+//! package-supply-chain [`RuleId`]s rather than inventing new ones.
 //!
-//! 1. **Discovers manifests.** A bounded directory walk finds dependency
-//!    manifests by their well-known names — `package.json`,
-//!    `package-lock.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml`,
-//!    `go.mod`, `Gemfile`. See [`discover_manifests`].
-//! 2. **Parses declared dependencies.** Each manifest format has a small,
-//!    total parser that extracts `(ecosystem, name)` pairs. Parsers never
-//!    execute the manifest and never reach the network.
-//! 3. **Scores each dependency.** Every declared package is run through
-//!    [`package_risk::score_package`] with offline signals (the threat-DB
-//!    `popular` / `typosquat` data). An opt-in `--online` pass adds the
-//!    registry-API provenance signals — gated exactly as `package risk` is.
-//! 4. **Folds in slopsquat detection.** *Slopsquatting* is the registration of
-//!    a plausible-but-fake package name that LLMs tend to hallucinate. A
-//!    dependency is flagged slopsquat-suspicious when it is **not** a
-//!    known-real / known-popular package, its name is *shaped like* an
-//!    AI-hallucinated name, and it sits near a real popular name. The signal
-//!    is built entirely from local threat-DB data plus the `package_risk`
-//!    name signal — see [`slopsquat`].
-//!
-//! ## Output: the Verdict / Finding model
-//!
-//! `ecosystem scan` produces a [`Verdict`] of [`Finding`]s, exactly like the
-//! detection engine — so the result is explainable, audit-loggable, and
-//! policy-aware (an allowlisted package is suppressed). It reuses the existing
-//! package-supply-chain [`RuleId`]s ([`RuleId::ThreatPackageTyposquat`],
-//! [`RuleId::ThreatPackageSimilarName`], [`RuleId::ThreatSuspiciousPackage`])
-//! rather than inventing new ones: a manifest scan is not a new *kind* of
-//! supply-chain risk, it is the same risks found by walking a project instead
-//! of one `install` command.
-//!
-//! ## Determinism
-//!
-//! Every function here is a pure, total function of its inputs except the
-//! filesystem walk and the opt-in registry fetch. Given the same manifests
-//! and the same threat DB, the verdict is byte-for-byte reproducible.
+//! Every function is pure and total except the filesystem walk and the
+//! opt-in registry fetch; given the same inputs the verdict is reproducible.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -57,29 +26,22 @@ use crate::package_risk::{
 use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
-/// Maximum directory depth the manifest walk descends. Manifests live at a
-/// project root or shallowly nested (a workspace member, a sub-package); a
-/// deep walk would mostly traverse `node_modules` / `target` and is bounded
-/// out instead.
+/// Maximum directory depth the manifest walk descends.
 pub const MAX_WALK_DEPTH: usize = 6;
 
-/// Hard cap on directory entries examined during the walk, so a pathological
-/// tree can never stall the scan.
+/// Hard cap on directory entries examined during the walk.
 pub const MAX_WALK_ENTRIES: usize = 50_000;
 
-/// Hard cap on declared dependencies scored in a single run. A manifest with
-/// more entries than this is still parsed; scoring stops at the cap and the
-/// summary records the truncation.
+/// Hard cap on declared dependencies scored in a single run. Excess is still
+/// parsed; scoring stops at the cap and the summary records the truncation.
 pub const MAX_DEPENDENCIES: usize = 5_000;
 
 /// Default cap on installed-tree entries (one entry = one installed package
-/// directory). Configurable via `--max-installed-entries` on the CLI; the
-/// engine accepts `0` to mean "unbounded" (caller has acknowledged the cost).
+/// directory). Configurable via `--max-installed-entries`; `0` means unbounded.
 pub const DEFAULT_MAX_INSTALLED_ENTRIES: usize = 5_000;
 
-/// Directory names never descended into — build output and vendored trees
-/// hold installed *content*, not a project's declared manifests, and would
-/// otherwise dominate the walk.
+/// Directory names never descended into — build output and vendored trees hold
+/// installed content, not declared manifests, and would dominate the walk.
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -96,22 +58,16 @@ const SKIP_DIRS: &[&str] = &[
     ".cargo",
 ];
 
-// ===========================================================================
-// manifest discovery
-// ===========================================================================
-
 /// A dependency-manifest file format `ecosystem scan` understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestKind {
     /// npm `package.json` — `dependencies` + `devDependencies` maps.
     NpmPackageJson,
-    /// npm `package-lock.json` — the fully-resolved `packages` / `dependencies`
-    /// tree (covers transitive dependencies the manifest alone does not).
+    /// npm `package-lock.json` — the fully-resolved tree (covers transitives).
     NpmPackageLock,
     /// Python `requirements.txt` — one requirement specifier per line.
     PyRequirementsTxt,
-    /// Python `pyproject.toml` — PEP 621 `[project].dependencies` and the
-    /// Poetry `[tool.poetry.dependencies]` table.
+    /// Python `pyproject.toml` — PEP 621 + Poetry dependency tables.
     PyPyprojectToml,
     /// Rust `Cargo.toml` — `[dependencies]` and friends.
     CargoToml,
@@ -147,9 +103,7 @@ impl ManifestKind {
     }
 
     /// Classify a file name as a known manifest, if it is one.
-    ///
-    /// `requirements.txt` matching is loosened to any `requirements*.txt`
-    /// (e.g. `requirements-dev.txt`) since split requirement files are common.
+    /// `requirements.txt` matching is loosened to any `requirements*.txt`.
     pub fn from_file_name(name: &str) -> Option<ManifestKind> {
         match name {
             "package.json" => Some(ManifestKind::NpmPackageJson),
@@ -179,12 +133,9 @@ pub struct DiscoveredManifest {
 }
 
 /// Walk `root` and return every dependency manifest found, bounded by
-/// [`MAX_WALK_DEPTH`] and [`MAX_WALK_ENTRIES`].
-///
-/// Build-output and vendored directories ([`SKIP_DIRS`]) are not descended.
-/// The walk reads only directory entries — never file content. When `root` is
-/// itself a manifest file, that single manifest is returned. The result is
-/// sorted by path so a scan is deterministic regardless of `read_dir` order.
+/// [`MAX_WALK_DEPTH`] and [`MAX_WALK_ENTRIES`]. [`SKIP_DIRS`] are not
+/// descended; reads only directory entries, never file content. A file `root`
+/// returns that single manifest. Result is sorted by path for determinism.
 pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
     let mut found: Vec<DiscoveredManifest> = Vec::new();
 
@@ -204,9 +155,7 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
     }
 
     // Iterative walk with an explicit work stack (no recursion, so depth is a
-    // hard, observable bound and a deep tree cannot blow the stack). The walk
-    // order is unspecified — the result is sorted by path before returning, so
-    // a scan is deterministic regardless.
+    // hard bound and a deep tree cannot blow the stack). Sorted before return.
     let mut examined = 0usize;
     let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = queue.pop() {
@@ -227,8 +176,6 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
             if file_type.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                // Never descend a build-output / vendored tree, and never a
-                // hidden directory other than the ones explicitly handled.
                 if SKIP_DIRS.iter().any(|d| *d == name) {
                     continue;
                 }
@@ -251,10 +198,6 @@ pub fn discover_manifests(root: &Path) -> Vec<DiscoveredManifest> {
     found
 }
 
-// ===========================================================================
-// manifest parsing — declared dependencies
-// ===========================================================================
-
 /// One dependency a manifest declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeclaredDependency {
@@ -263,9 +206,7 @@ pub struct DeclaredDependency {
     /// The ecosystem the manifest is for.
     #[serde(serialize_with = "serialize_ecosystem")]
     pub ecosystem: Ecosystem,
-    /// The version / version-range string as written, when the manifest gives
-    /// one (a `package-lock.json` resolves to an exact version; a bare
-    /// `requirements.txt` line may give none).
+    /// The version / version-range string as written, when the manifest gives one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Whether the manifest declares this as a development-only dependency.
@@ -276,21 +217,10 @@ fn serialize_ecosystem<S: serde::Serializer>(eco: &Ecosystem, s: S) -> Result<S:
     s.serialize_str(&eco.to_string())
 }
 
-/// Parse a manifest's text into the dependencies it declares.
-///
-/// Total and side-effect-free; never panics. The return distinguishes the two
-/// failure-shaped cases a scan note must tell apart:
-///
-/// * `Some(deps)` — the manifest *parsed*. `deps` may still be empty, which
-///   honestly means "this manifest declares no dependencies".
-/// * `None` — the manifest is **malformed** (a structured `package.json` /
-///   `Cargo.toml` / `pyproject.toml` whose JSON / TOML could not be parsed).
-///   A scan over a partly-broken project still reports the manifests it could
-///   read, and notes this one as un-parseable.
-///
-/// The line-based formats (`requirements.txt`, `go.mod`, `Gemfile`) have no
-/// "malformed" state — any text is a valid, possibly-empty line set — so they
-/// always return `Some`.
+/// Parse a manifest's text into the dependencies it declares. Total, never
+/// panics. `Some(deps)` (possibly empty) means it parsed; `None` means the
+/// manifest is malformed (a structured JSON/TOML that could not be parsed).
+/// Line-based formats have no malformed state and always return `Some`.
 pub fn parse_manifest(kind: ManifestKind, text: &str) -> Option<Vec<DeclaredDependency>> {
     match kind {
         ManifestKind::NpmPackageJson => parse_package_json(text),
@@ -304,9 +234,8 @@ pub fn parse_manifest(kind: ManifestKind, text: &str) -> Option<Vec<DeclaredDepe
 }
 
 /// npm `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`,
-/// `peerDependencies`. `devDependencies` are tagged `dev = true`.
-///
-/// `None` when the text is not valid JSON (a malformed manifest).
+/// `peerDependencies`. `devDependencies` are tagged `dev = true`. `None` on
+/// invalid JSON.
 fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
     let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let mut out = Vec::new();
@@ -334,10 +263,9 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
     Some(out)
 }
 
-/// npm `package-lock.json`: the fully-resolved tree. lockfile v2/v3 keys the
-/// `packages` map by install path (`node_modules/<name>`); v1 keys the
-/// `dependencies` map directly by name. Both are read so the lock's
-/// *transitive* closure is covered.
+/// npm `package-lock.json`: the fully-resolved tree. v2/v3 keys `packages` by
+/// install path; v1 keys `dependencies` by name. Both are read to cover the
+/// transitive closure.
 fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let mut seen: BTreeSet<(String, Option<String>)> = BTreeSet::new();
@@ -374,15 +302,12 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     Some(out)
 }
 
-/// Extract the package name from a `package-lock.json` v2/v3 path key.
-/// `"node_modules/lodash"` → `"lodash"`,
-/// `"node_modules/foo/node_modules/@scope/bar"` → `"@scope/bar"`.
-/// The empty string (the lockfile's root entry) yields `None`.
+/// Extract the package name from a `package-lock.json` v2/v3 path key — the
+/// segment after the LAST `node_modules/`. The empty (root) key yields `None`.
 fn package_lock_name_from_path(path_key: &str) -> Option<String> {
     if path_key.is_empty() {
         return None;
     }
-    // The installed name is whatever follows the LAST `node_modules/`.
     let tail = match path_key.rsplit_once("node_modules/") {
         Some((_, tail)) => tail,
         None => path_key,
@@ -424,10 +349,9 @@ fn collect_lock_v1_deps(
     }
 }
 
-/// Python `requirements.txt`: one PEP 508 requirement specifier per line.
-/// Comments (`#`), blank lines, and pip option lines (`-r`, `--index-url`,
-/// `-e`, …) are skipped. A leading environment marker / extras / version
-/// specifier is trimmed to leave the bare distribution name.
+/// Python `requirements.txt`: one PEP 508 specifier per line. Comments, blank
+/// lines, and pip option lines (`-r`, `--index-url`, `-e`, …) are skipped; the
+/// bare distribution name is extracted.
 fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
     let mut out = Vec::new();
     for raw_line in text.lines() {
@@ -460,12 +384,9 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
     out
 }
 
-/// Extract the bare distribution name from a PEP 508 requirement line.
-/// `"requests>=2.0"` → `"requests"`, `"flask[async]==3.0"` → `"flask"`,
-/// `'django ; python_version < "3.9"'` → `"django"`.
+/// Extract the bare distribution name from a PEP 508 requirement line,
+/// cutting at the first version operator, extras bracket, env-marker, or space.
 fn python_requirement_name(line: &str) -> Option<String> {
-    // Cut at the first character that ends the name: a version operator, an
-    // extras bracket, an environment-marker semicolon, or whitespace.
     let name_end = line
         .find(|c: char| {
             matches!(
@@ -552,8 +473,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
             push(name, false, &mut out);
         }
     }
-    // Poetry dev groups: `[tool.poetry.group.<name>.dependencies]` and the
-    // legacy `[tool.poetry.dev-dependencies]`.
+    // Poetry dev groups + legacy `[tool.poetry.dev-dependencies]`.
     if let Some(groups) = poetry
         .and_then(|p| p.get("group"))
         .and_then(|g| g.as_table())
@@ -595,8 +515,7 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                 if name.is_empty() || !is_plausible_package_name(name) {
                     continue;
                 }
-                // A `package = "real-name"` rename keys the real crate under a
-                // different table key — score the real crate name.
+                // A `package = "real-name"` rename: score the real crate name.
                 let real_name = spec
                     .as_table()
                     .and_then(|t| t.get("package"))
@@ -638,9 +557,8 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
     Some(out)
 }
 
-/// Go `go.mod`: `require` directives, both the single-line form
-/// (`require example.com/mod v1.2.3`) and the block form. The module path
-/// is taken as the package name.
+/// Go `go.mod`: `require` directives, both single-line and block form. The
+/// module path is taken as the package name.
 fn parse_go_mod(text: &str) -> Vec<DeclaredDependency> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -683,8 +601,8 @@ fn parse_go_mod(text: &str) -> Vec<DeclaredDependency> {
     out
 }
 
-/// Parse one `go.mod` require entry: `"example.com/mod v1.2.3"` (an optional
-/// trailing `// indirect`-style comment is already stripped by the caller).
+/// Parse one `go.mod` require entry (`module version`); the caller already
+/// stripped any trailing `// indirect` comment.
 fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
     let mut parts = entry.split_whitespace();
     let module = parts.next()?;
@@ -700,19 +618,14 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
     })
 }
 
-/// Ruby `Gemfile`: `gem "name"` / `gem 'name', '~> 1.0'` directives. A `gem`
-/// line inside a `group :development` / `group :test` block is tagged
-/// `dev = true`.
+/// Ruby `Gemfile`: `gem "name"` directives. A gem inside a `group :development`
+/// / `:test` block is tagged `dev = true`.
 fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    // A stack of open `… do` blocks; the bool records whether the block is a
-    // `group :development` / `group :test` block. A gem is dev-tagged when any
-    // enclosing block is a dev group. Every `do`/`end` pair is tracked — not
-    // only `group` blocks — so the depth stays correct when a non-dev block (a
-    // nested `group`, `platforms`, `source`, …) opens and closes inside a dev
-    // group; decrementing a single dev counter on every `end` would wrongly
-    // drop the dev tag when such an inner block closes.
+    // Stack of open `… do` blocks; bool = is-dev-group. EVERY do/end is tracked
+    // (not only `group`) so a nested non-dev block closing inside a dev group
+    // does not wrongly clear the dev tag.
     let mut block_stack: Vec<bool> = Vec::new();
 
     for raw in text.lines() {
@@ -754,7 +667,6 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
 /// Extract the gem name from a `gem "name", ...` Gemfile line.
 fn gemfile_gem_name(line: &str) -> Option<String> {
     let rest = line.strip_prefix("gem ")?.trim_start();
-    // The name is the first single- or double-quoted string.
     let (quote, after) = match rest.chars().next()? {
         '"' => ('"', &rest[1..]),
         '\'' => ('\'', &rest[1..]),
@@ -768,51 +680,37 @@ fn gemfile_gem_name(line: &str) -> Option<String> {
     }
 }
 
-/// `true` when `name` is shaped like a real package name and not, e.g., a
-/// path fragment, a TOML inline-table fragment, or an empty token. Deliberately
+/// `true` when `name` is shaped like a real package name. Deliberately
 /// permissive — it rejects only clearly-not-a-name strings.
 fn is_plausible_package_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 214 {
         return false;
     }
-    // A name is made of name characters: ASCII alphanumerics plus the small
-    // set of separators package ecosystems allow. A scope (`@scope/pkg`) and a
-    // Go module path (`example.com/mod`) both legitimately contain `/`.
+    // ASCII alphanumerics plus the separators ecosystems allow (scopes and Go
+    // module paths legitimately contain `/`).
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '/' | '+'))
 }
 
-// ===========================================================================
-// slopsquat detection
-// ===========================================================================
-
-/// The deterministic verdict of the slopsquat heuristic for one dependency.
+/// The deterministic slopsquat verdict for one dependency.
 ///
-/// *Slopsquatting* is the registration of a plausible-but-fake package name
-/// that an LLM is likely to hallucinate when asked to "suggest a package".
-/// This is **not** a confirmed-malicious signal — it is an advisory shape
-/// match — so it is deliberately conservative: it fires only when a name is
-/// unknown to the threat DB **and** looks AI-hallucinated **and** sits near a
-/// real popular name.
+/// *Slopsquatting* is a plausible-but-fake package name an LLM is likely to
+/// hallucinate. This is advisory, not confirmed-malicious, so it is
+/// conservative: it fires only when a name is unknown to the threat DB AND
+/// looks AI-hallucinated AND sits near a real popular name.
 ///
-/// Modeled as an enum so the two valid states are the *only* representable
-/// states: a [`SlopsquatAssessment::Suspicious`] always carries both its
-/// reasons and the near-popular anchor it matched — there is no representable
-/// "suspicious but anchorless" state, which is why [`findings_for`] needs no
-/// fallback for a missing anchor.
+/// The enum makes the two valid states the only representable ones:
+/// `Suspicious` always carries its reasons and anchor, so [`findings_for`]
+/// needs no fallback for a missing anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlopsquatAssessment {
     /// The dependency is not slopsquat-suspicious.
     Clear,
     /// The dependency is slopsquat-suspicious.
     Suspicious {
-        /// The named, inspectable reasons the heuristic fired. Each is a
-        /// plain-language clause a reader can verify; always non-empty.
+        /// Inspectable, plain-language reasons the heuristic fired; non-empty.
         reasons: Vec<String>,
-        /// The real popular package the suspicious name sits near — an
-        /// edit-distance near-miss or an embedded shared token. The heuristic
-        /// only ever fires *with* an anchor, so this is unconditionally
-        /// present.
+        /// The real popular package the suspicious name sits near (always present).
         near_popular: String,
     },
 }
@@ -829,10 +727,9 @@ impl SlopsquatAssessment {
     }
 }
 
-// A hand-written `Serialize` that preserves the pre-enum `--format json`
-// shape exactly: `{"suspicious": bool, "reasons": [...], "near_popular": "…"}`,
-// with `near_popular` present only when suspicious. A consumer parsing the
-// `ecosystem scan --format json` report sees no change.
+// Hand-written `Serialize` preserves the pre-enum `--format json` shape:
+// `{"suspicious": bool, "reasons": [...], "near_popular": "…"}` (the last only
+// when suspicious), so a report consumer sees no change.
 impl Serialize for SlopsquatAssessment {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -925,36 +822,23 @@ const HALLUCINATION_LANG_PREFIXES: &[&str] = &[
     "python", "py", "node", "js", "nodejs", "go", "golang", "rust", "ruby", "rb", "java",
 ];
 
-/// Assess whether a declared dependency is slopsquat-suspicious.
+/// Assess whether a declared dependency is slopsquat-suspicious. Pure and
+/// total; the DB is consulted read-only (no network/filesystem).
 ///
-/// Pure and total — a function of the name, its [`NameVsPopular`]
-/// classification (already computed by [`package_risk::classify_name`]), and
-/// the threat DB. The DB is consulted read-only for popular-name token / known
-/// status; no network, no filesystem.
-///
-/// The heuristic, all three layers required:
-///
-/// 1. **Unknown to the threat DB.** A known-popular package, or a name the DB
-///    lists as a confirmed typosquat, is *not* a slopsquat candidate — those
-///    are handled by their own (stronger) findings. Slopsquatting is about
-///    names that are simply *not real*.
-/// 2. **AI-hallucinated name shape.** The name is composed in the way an LLM
-///    composes a plausible-but-fake suggestion: a language prefix plus a real
-///    package token, or a stack of generic filler words, or an unusually long
-///    multi-segment descriptive name.
-/// 3. **Near a real popular name.** The name is one edit from a popular
-///    package ([`NameVsPopular::NearPopular`]), or it *contains a popular
-///    package name as one of its `-`/`_`-delimited tokens* (the
-///    `<popular>-helper` shape — a hallucinated companion to a real library).
+/// All three layers required:
+/// 1. Unknown to the threat DB (known-popular / confirmed-typosquat names are
+///    handled by their own stronger findings).
+/// 2. AI-hallucinated name shape (see [`hallucinated_name_shape`]).
+/// 3. Near a real popular name — one edit away, or embedding a popular name as
+///    a `-`/`_` token (the `<popular>-helper` shape).
 pub fn slopsquat(
     name: &str,
     name_vs_popular: &NameVsPopular,
     db: Option<&ThreatDb>,
     ecosystem: Ecosystem,
 ) -> SlopsquatAssessment {
-    // Layer 1 — must be unknown. A known-popular name is real; a near-popular
-    // name that the DB *also* lists as a confirmed typosquat is covered by the
-    // typosquat finding. Slopsquatting only concerns names that are not real.
+    // Layer 1 — must be unknown (known-popular / confirmed-typosquat names are
+    // real or covered elsewhere).
     match name_vs_popular {
         NameVsPopular::KnownPopular => return SlopsquatAssessment::clear(),
         NameVsPopular::NearPopular { .. } | NameVsPopular::Unknown => {}
@@ -983,13 +867,9 @@ pub fn slopsquat(
         near_popular = Some(token_hit);
     }
 
-    // The heuristic fires only when BOTH a hallucinated shape AND a
-    // near-popular anchor are present. A name that merely looks generic, or
-    // merely resembles a popular name, is not enough on its own — that keeps
-    // the false-positive rate low (an honest `data-utils` with no popular
-    // anchor does not fire; a near-miss with a normal name does not fire).
-    // When both hold, `near_popular` is `Some` by construction, so the
-    // `Suspicious` variant can carry it unconditionally.
+    // Fire only when BOTH a hallucinated shape AND a near-popular anchor are
+    // present — either alone is too weak (keeps false positives low). When both
+    // hold, `near_popular` is `Some` by construction.
     match (shape.is_some(), near_popular) {
         (true, Some(near_popular)) => SlopsquatAssessment::Suspicious {
             reasons,
@@ -1000,25 +880,19 @@ pub fn slopsquat(
 }
 
 /// If `name` is shaped like an AI-hallucinated package name, return a
-/// plain-language reason; otherwise `None`.
-///
-/// Three recognised shapes:
-/// * a language prefix (`python-`, `node-`, `go-`) on a longer descriptive
-///   name;
-/// * a name whose `-`/`_` tokens are *mostly* generic filler words;
-/// * an unusually long multi-segment descriptive name (4+ tokens).
+/// plain-language reason; otherwise `None`. Three recognised shapes: a
+/// language prefix on a descriptive name, mostly-filler-word tokens, or an
+/// unusually long multi-segment name (4+ tokens).
 fn hallucinated_name_shape(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
-    // Tokenize on the separators package names use. A scope is dropped so
-    // `@acme/data-helper-utils` tokenizes as `data`, `helper`, `utils`.
+    // Tokenize on package-name separators, dropping any scope.
     let bare = lower.rsplit('/').next().unwrap_or(&lower);
     let tokens: Vec<&str> = bare
         .split(['-', '_', '.'])
         .filter(|t| !t.is_empty())
         .collect();
     if tokens.len() < 2 {
-        // A single-token name (`requests`, `lodash`) is not a composed,
-        // descriptive shape — slopsquatting hallucinates *descriptive* names.
+        // A single-token name is not a composed, descriptive shape.
         return None;
     }
 
@@ -1056,9 +930,8 @@ fn hallucinated_name_shape(name: &str) -> Option<String> {
         ));
     }
 
-    // Shape C — an unusually long multi-segment descriptive name with at
-    // least one filler word (4+ tokens). Real packages are occasionally long
-    // (`@babel/plugin-transform-runtime`) so a filler word is also required.
+    // Shape C — 4+ tokens with at least one filler word (a filler word is also
+    // required because real packages are occasionally long).
     if tokens.len() >= 4 && filler_count >= 1 {
         return Some(format!(
             "the name stacks {} '-'/'_'-separated tokens including filler words — \
@@ -1070,20 +943,15 @@ fn hallucinated_name_shape(name: &str) -> Option<String> {
     None
 }
 
-/// If one of `name`'s `-`/`_`-delimited tokens is *itself* a known-popular
-/// package (and the whole name is not that package), return the popular token.
-///
-/// This catches the `<popular>-helper` / `easy-<popular>` slopsquat shape: an
-/// LLM hallucinates a companion to a library the user actually wanted
-/// (`react-router-helper`, `easy-express`). The token must be reasonably long
-/// (>= 3 chars) so a coincidental short token (`go`, `js`) does not match.
+/// If one of `name`'s `-`/`_` tokens is itself a known-popular package (and the
+/// whole name is not that package), return it. Catches the `<popular>-helper`
+/// slopsquat shape; the token must be >= 3 chars so short tokens don't match.
 fn popular_token_in_name(name: &str, db: Option<&ThreatDb>, eco: Ecosystem) -> Option<String> {
     let db = db?;
     let lower = name.to_lowercase();
     let bare = lower.rsplit('/').next().unwrap_or(&lower);
     let tokens: Vec<&str> = bare.split(['-', '_']).filter(|t| t.len() >= 3).collect();
-    // A single-token name *is* its token — that is not "embedding" a popular
-    // name, it is just being (or not being) that package. Require composition.
+    // A single-token name *is* its token, not an embedding — require composition.
     if tokens.len() < 2 {
         return None;
     }
@@ -1097,10 +965,6 @@ fn popular_token_in_name(name: &str, db: Option<&ThreatDb>, eco: Ecosystem) -> O
     }
     None
 }
-
-// ===========================================================================
-// per-dependency assessment + finding construction
-// ===========================================================================
 
 /// A complete, explainable risk assessment of one declared dependency.
 #[derive(Debug, Clone, Serialize)]
@@ -1119,16 +983,10 @@ pub struct DependencyAssessment {
     pub allowlisted: bool,
 }
 
-/// Build the [`Finding`]s a single [`DependencyAssessment`] produces.
-///
-/// A dependency can yield more than one finding (a confirmed-malicious package
-/// that is *also* slopsquat-shaped), but in practice the strongest signal
-/// usually stands alone. Findings reuse the existing package-supply-chain
-/// [`RuleId`]s. An allowlisted dependency produces no findings.
-///
-/// M6 ch7 — `policy` carries the `package_policy` thresholds that drive the
-/// `PackagePolicy*` rule paths (newer-than-days, low downloads, etc.). Tests
-/// can pass `&Policy::default()` to keep the M6 ch6 baseline.
+/// Build the [`Finding`]s a single [`DependencyAssessment`] produces, reusing
+/// the existing package-supply-chain [`RuleId`]s. An allowlisted dependency
+/// produces no findings. `policy` carries the `package_policy` thresholds for
+/// the `PackagePolicy*` rule paths (`&Policy::default()` keeps the baseline).
 pub fn findings_for(
     assessment: &DependencyAssessment,
     policy: &crate::policy::Policy,
@@ -1141,8 +999,7 @@ pub fn findings_for(
     let dep = &assessment.dependency;
     let manifest = &assessment.manifest;
 
-    // 1 — confirmed malicious typosquat from the threat DB. The strongest
-    // offline signal; it stands alone.
+    // 1 — confirmed malicious typosquat from the threat DB; stands alone.
     if let Some(target) = &assessment.risk.malicious_typosquat_of {
         findings.push(Finding {
             rule_id: RuleId::ThreatPackageTyposquat,
@@ -1173,10 +1030,8 @@ pub fn findings_for(
         return findings;
     }
 
-    // 2 — slopsquat-suspicious (AI-hallucinated name). Advisory: a name shaped
-    // like an LLM hallucination, near a real popular package. The `Suspicious`
-    // variant carries the near-popular anchor and reasons directly — no
-    // fallback for a missing anchor, because the type cannot represent one.
+    // 2 — slopsquat-suspicious (AI-hallucinated name near a popular package).
+    // The `Suspicious` variant carries the anchor and reasons directly.
     if let SlopsquatAssessment::Suspicious {
         reasons,
         near_popular,
@@ -1219,8 +1074,8 @@ pub fn findings_for(
         return findings;
     }
 
-    // 3 — name resembles a popular package (one edit) without a slopsquat
-    // shape and without a DB typosquat record. The weakest signal.
+    // 3 — name resembles a popular package (one edit) with no slopsquat shape
+    // and no DB typosquat record. The weakest signal.
     if let NameVsPopular::NearPopular {
         popular_name,
         distance,
@@ -1260,21 +1115,12 @@ pub fn findings_for(
         return findings;
     }
 
-    // 4 — provenance-only risk. PR #121 fix-list item 2: when none of the
-    // name-shape signals above fire BUT the deterministic risk score reaches
-    // High or Critical purely from provenance signals (brand-new package,
-    // sole maintainer, no downloads, ownership transfer, no source repo,
-    // yanked / deprecated), the package is risky on registry data alone.
-    // Previously `findings_for` returned after the similar-name block and a
-    // package scoring 76+/100 from provenance alone produced ZERO findings —
-    // the whole point of `--online` registry signals went unreported. The
-    // factor breakdown is the explainable evidence; we name the contributing
-    // factors so the operator knows *why* the score is what it is.
-    //
-    // M6 ch7 — thresholds now read from `policy.package_policy.*_effective()`
-    // rather than hard-coded constants. Severity mapping: score >=
-    // block_score → High (the action mapping sends High to Block), warn
-    // ≤ score < block → Medium (Warn).
+    // 4 — provenance-only risk (PR #121 fix-list item 2): when no name-shape
+    // signal fires but the deterministic score reaches High/Critical purely
+    // from registry provenance, the package is risky on registry data alone
+    // and must still emit a finding. Thresholds read from
+    // `policy.package_policy.*_effective()`; score >= block → High, warn ≤
+    // score < block → Medium.
     let warn_score = policy.package_policy.warn_aggregate_score_effective();
     let block_score = policy.package_policy.block_aggregate_score_effective();
     let score = assessment.risk.score;
@@ -1285,10 +1131,8 @@ pub fn findings_for(
         } else {
             Severity::Medium
         };
-        // Name the *named* contributing factors, in display order, so the
-        // description points at evidence the reader can verify by hand —
-        // exactly the discipline `package_risk` is built on. The factors
-        // vector is the breakdown's `verify()`-checked invariant.
+        // Name the contributing factors, in display order, so the description
+        // points at hand-verifiable evidence.
         let factor_labels: Vec<&str> = assessment
             .risk
             .factors
@@ -1339,10 +1183,9 @@ pub fn findings_for(
     findings
 }
 
-/// M6 ch7 — emit `PackagePolicy*` findings for a single dependency
-/// assessment. The signals are read directly from the `ApiProvenance` on
-/// the breakdown so the scan path's evidence matches the `install_txn`
-/// path's evidence.
+/// Emit `PackagePolicy*` findings for one dependency assessment. Signals are
+/// read from the `ApiProvenance` on the breakdown so the scan path's evidence
+/// matches the `install_txn` path's.
 fn policy_findings_for_assessment(
     assessment: &DependencyAssessment,
     policy: &crate::policy::Policy,
@@ -1356,13 +1199,10 @@ fn policy_findings_for_assessment(
         _ => None,
     };
 
-    // `PackagePolicyTyposquatDistance` is an OFFLINE policy gate — it reads
-    // `assessment.risk.name_vs_popular`, which is computed from the local
-    // threat DB without any registry call. Emit it BEFORE the `Some(prov)`
-    // gate so an offline / degraded `--online` scan still surfaces typosquat
-    // findings. The API-backed gates below (NotFound / NewerThanDays /
-    // LowDownloads / UnknownPackageWithInstallScripts / OsvAdvisoryActive)
-    // each require provenance and are skipped without it.
+    // `PackagePolicyTyposquatDistance` is an OFFLINE gate (reads
+    // `name_vs_popular`, no registry call). Emit it BEFORE the `Some(prov)`
+    // gate so a degraded `--online` scan still surfaces typosquat findings; the
+    // API-backed gates below all require provenance.
     if let Some(max_dist) = pp.block_typosquat_distance {
         if let package_risk::NameVsPopular::NearPopular {
             popular_name,
@@ -1540,10 +1380,8 @@ fn policy_findings_for_assessment(
         }
     }
 
-    // M6 ch7 — emit a `PackageOsvAdvisoryActive` finding when the
-    // registry-API path surfaced OSV advisories. Severity is driven by
-    // `block_osv_min_cvss`: any advisory whose CVSS meets/exceeds the
-    // threshold elevates to High (Block); otherwise Medium (Warn).
+    // PackageOsvAdvisoryActive — severity driven by `block_osv_min_cvss`: a
+    // CVSS at/above the threshold elevates to High, else Medium.
     if let Some(advs) = prov.osv_advisories.as_ref() {
         if !advs.is_empty() {
             let min_block_cvss = pp.block_osv_min_cvss_effective();
@@ -1600,10 +1438,6 @@ fn policy_findings_for_assessment(
     out
 }
 
-// ===========================================================================
-// the scan itself
-// ===========================================================================
-
 /// Why `ecosystem scan` could not score a manifest, or a note about a partial
 /// result. Surfaced in the report so a scan is honest about its coverage.
 #[derive(Debug, Clone, Serialize)]
@@ -1621,10 +1455,7 @@ pub struct EcosystemScanReport {
     /// The scan root (directory or file) the scan was given.
     pub scan_root: String,
     /// Which mode the scan ran in — `"manifests"`, `"installed"`, or
-    /// `"specific_lockfile"`. Surfaced as a top-level JSON field so a piped
-    /// consumer can tell which surface produced the report; the two CLI
-    /// surfaces (`ecosystem scan --installed` and `package scan --installed`)
-    /// emit byte-identical output for the same cwd.
+    /// `"specific_lockfile"`. The two CLI surfaces emit byte-identical output.
     pub mode: &'static str,
     /// The manifest files discovered and parsed.
     pub manifests: Vec<String>,
@@ -1634,54 +1465,35 @@ pub struct EcosystemScanReport {
     pub assessments: Vec<DependencyAssessment>,
     /// Whether the registry-API (`--online`) signals were used.
     pub online: bool,
-    /// Notes about coverage — unreadable manifests, truncation, a missing
-    /// threat DB.
+    /// Notes about coverage — unreadable manifests, truncation, missing DB.
     pub notes: Vec<ScanNote>,
-    /// The verdict: every finding from every non-allowlisted dependency, with
-    /// an action derived from the strongest finding's severity.
+    /// The verdict: every finding from every non-allowlisted dependency.
     pub verdict: Verdict,
 }
 
-/// How a scan resolves the registry-API state per dependency. The CLI layer
-/// supplies this so the core stays free of any direct network or
-/// environment-variable knowledge: an offline scan passes [`OnlineMode::Off`];
-/// an `--online` scan passes [`OnlineMode::Resolver`] with a closure that does
-/// the (cached, gated) fetch.
+/// How a scan resolves the registry-API state per dependency. Supplied by the
+/// CLI layer so the core stays free of network / env knowledge.
 pub enum OnlineMode<'a> {
-    /// Offline scan — every dependency's API signals are
-    /// [`ApiSignals::NotComputed`].
+    /// Offline scan — API signals are [`ApiSignals::NotComputed`].
     Off,
-    /// `--online` scan — the closure resolves each `(ecosystem, name)` to its
-    /// [`ApiSignals`]. The closure is expected to be offline-safe (degrading
-    /// any failure to [`ApiSignals::Unavailable`]); it is called at most once
-    /// per distinct package.
+    /// `--online` scan — the (offline-safe) closure resolves each
+    /// `(ecosystem, name)` to its [`ApiSignals`], called at most once per package.
     Resolver(&'a dyn Fn(Ecosystem, &str) -> ApiSignals),
 }
 
-/// What an `ecosystem_scan` operates on.
-///
-/// The engine has one entry point ([`scan`]); the mode picks which set of
-/// inputs feeds the per-package scoring loop. Two CLI surfaces (`tirith
-/// ecosystem scan --installed` and `tirith package scan`) call into the same
-/// `scan` function and only differ in which mode they pass — that is why a
-/// future reimplementation of `package scan` would diverge from
-/// `ecosystem scan --installed` and the byte-identical-JSON test catches it.
+/// What an `ecosystem_scan` operates on. The engine has one entry point
+/// ([`scan`]); the mode picks which inputs feed the per-package scoring loop.
+/// Two CLI surfaces share `scan` and differ only in the mode they pass.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ScanMode {
-    /// Walk the project root and discover dependency *manifests*
-    /// (`package.json`, `Cargo.toml`, `requirements*.txt`, ...). This is the
-    /// shipping behavior — manifests declare what a project intends to install.
+    /// Walk the project root for dependency *manifests* (the shipping behavior).
     #[default]
     Manifests,
-    /// Walk *installed* trees instead — `node_modules/<pkg>/package.json`,
-    /// `site-packages/<dist-info>/METADATA`, `vendor/<pkg>/` for Go modules,
-    /// and the workspace `Cargo.lock` for Rust. This reports what is *actually*
-    /// on disk, which can drift from the manifest's intent.
+    /// Walk *installed* trees (`node_modules`, `site-packages`, `vendor`,
+    /// `Cargo.lock`) — what is actually on disk, which can drift from intent.
     Installed,
-    /// Use the given file as a lockfile and parse it directly with the
-    /// existing manifest parser. The path is the same value `ecosystem scan
-    /// <path>` already accepts; the variant exists so `tirith package scan
-    /// --lockfile <path>` matches the spec wording.
+    /// Parse the given file directly as a lockfile (the `package scan
+    /// --lockfile <path>` form).
     SpecificLockfile(PathBuf),
 }
 
@@ -1696,41 +1508,31 @@ impl ScanMode {
     }
 }
 
-/// Inputs to [`scan`] — kept in a struct so the signature stays stable as
-/// options are added.
+/// Inputs to [`scan`] — a struct so the signature stays stable.
 pub struct ScanRequest<'a> {
     /// The directory or single manifest file to scan.
     pub root: &'a Path,
-    /// The loaded threat DB, or `None` when one is not installed (the scan
-    /// still runs; name signals fall back to "unknown" and a note is added).
+    /// The loaded threat DB, or `None` (scan still runs; signals fall back to
+    /// "unknown" and a note is added).
     pub db: Option<&'a ThreatDb>,
     /// The registry-API resolution mode.
     pub online: OnlineMode<'a>,
-    /// A predicate that returns `true` when a `(ecosystem, name)` pair is
-    /// allowlisted by policy and its findings must be suppressed.
+    /// `true` when a `(ecosystem, name)` pair is allowlisted and suppressed.
     pub is_allowlisted: &'a dyn Fn(Ecosystem, &str) -> bool,
-    /// Which kind of input the scan operates on. Defaults to [`ScanMode::Manifests`]
-    /// for backward compatibility — every shipping `ecosystem scan` call site
-    /// can omit it via `..Default::default()`.
+    /// Which input the scan operates on. Defaults to [`ScanMode::Manifests`].
     pub mode: ScanMode,
-    /// Cap on the number of installed-package entries examined in
-    /// [`ScanMode::Installed`]. `0` means unbounded (the CLI surfaces this
-    /// behind a confirmation prompt). Ignored for the other modes.
+    /// Cap on installed entries in [`ScanMode::Installed`]; `0` = unbounded.
+    /// Ignored for the other modes.
     pub installed_max_entries: usize,
-    /// M6 ch7 — the active policy, plumbed through so the scan emits the
-    /// `PackagePolicy*` rule paths (newer-than-days, low downloads,
-    /// typosquat-distance, unknown-with-install-scripts, not-found) and
-    /// uses the configurable aggregate-score thresholds. `None` keeps the
-    /// shipping baseline (matches a `Policy::default()`).
+    /// The active policy for the `PackagePolicy*` rule paths and the
+    /// configurable thresholds. `None` keeps the `Policy::default()` baseline.
     pub policy: Option<&'a crate::policy::Policy>,
 }
 
 /// Run an `ecosystem scan` over `request.root` and return the full report.
-///
-/// This is the single entry point. It discovers manifests, parses every
-/// declared dependency, scores each through [`package_risk::score_package`],
-/// folds in the [`slopsquat`] heuristic, and assembles a [`Verdict`]. It never
-/// panics; a malformed manifest is skipped with a note, not an error.
+/// The single entry point: discovers manifests, parses and scores every
+/// dependency, folds in [`slopsquat`], and assembles a [`Verdict`]. Never
+/// panics; a malformed manifest is skipped with a note.
 pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     let mut notes: Vec<ScanNote> = Vec::new();
 
@@ -1746,19 +1548,16 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
 
     let root_display = request.root.display().to_string();
 
-    // Dispatch on mode. Each branch returns (manifest_labels, declared_deps).
-    // The downstream scoring + verdict assembly is mode-independent — that is
-    // the load-bearing invariant the byte-identical-JSON test pins.
+    // Dispatch on mode → (manifest_labels, declared_deps). Downstream scoring +
+    // verdict assembly is mode-independent (the byte-identical-JSON invariant).
     let (mut manifest_labels, mut declared) = match &request.mode {
         ScanMode::Manifests => collect_from_manifests(request, &mut notes),
         ScanMode::Installed => collect_from_installed_tree(request, &mut notes),
         ScanMode::SpecificLockfile(path) => collect_from_specific_lockfile(path, &mut notes),
     };
 
-    // Stable order: the assembled labels and declared list must match across
-    // runs and across CLI surfaces. The walkers already sort their inputs, but
-    // sorting again at the dispatch boundary is cheap and removes any reliance
-    // on per-walker ordering.
+    // Stable order across runs and CLI surfaces — sort again at the dispatch
+    // boundary so we don't rely on per-walker ordering.
     manifest_labels.sort();
     manifest_labels.dedup();
     declared.sort_by(|(a, am), (b, bm)| {
@@ -1780,8 +1579,7 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         declared.truncate(MAX_DEPENDENCIES);
     }
 
-    // Score each declared dependency. The registry-API resolver is memoized so
-    // a package declared in two manifests is fetched at most once.
+    // Score each dependency; the registry-API resolver is memoized per package.
     let online = matches!(request.online, OnlineMode::Resolver(_));
     let mut api_cache: std::collections::HashMap<(Ecosystem, String), ApiSignals> =
         std::collections::HashMap::new();
@@ -1792,11 +1590,9 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         assessments.push(assessment);
     }
 
-    // On an `--online` scan, surface how many dependencies could not get their
-    // registry-API provenance — a fully-degraded online scan would otherwise
-    // be indistinguishable from a clean one. The per-dependency reason varies
-    // (offline, timeout, 404, ...); a representative one is carried so the note
-    // is actionable without one line per dependency.
+    // On `--online`, surface how many deps could not get provenance — a
+    // fully-degraded online scan would otherwise look clean. A representative
+    // reason is carried so the note is actionable without one line per dep.
     if online {
         let unavailable: Vec<&DependencyAssessment> = assessments
             .iter()
@@ -1836,15 +1632,13 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     let mut findings: Vec<Finding> = Vec::new();
     for assessment in &assessments {
         findings.extend(findings_for(assessment, effective_policy));
-        // M6 ch7 — policy-driven per-dependency rules (newer-than-days,
-        // low downloads, not-found, etc.). Allowlisted assessments
-        // suppress these too, matching `findings_for`'s behavior.
+        // Policy-driven per-dependency rules; allowlisted assessments suppress
+        // these too, matching `findings_for`.
         if !assessment.allowlisted {
             findings.extend(policy_findings_for_assessment(assessment, effective_policy));
         }
     }
-    // tier_reached is 3 — `ecosystem scan` does the full analysis (it is not a
-    // tier-gated hot-path command).
+    // tier_reached is 3 — `ecosystem scan` does the full analysis.
     let verdict = Verdict::from_findings(findings, 3, Timings::default());
 
     EcosystemScanReport {
@@ -1859,14 +1653,11 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     }
 }
 
-// ===========================================================================
-// per-mode collectors — all three return (manifest_labels, declared_deps)
-// in the same shape so the downstream scoring loop is mode-independent.
-// ===========================================================================
+// Per-mode collectors all return (manifest_labels, declared_deps) in the same
+// shape so the downstream scoring loop is mode-independent.
 
-/// Walk `request.root` for dependency manifests and parse each one. This is
-/// the shipping `ecosystem scan` behavior, extracted unchanged so the
-/// mode-dispatch in [`scan`] stays mechanical.
+/// Walk `request.root` for dependency manifests and parse each one — the
+/// shipping `ecosystem scan` behavior.
 fn collect_from_manifests(
     request: &ScanRequest,
     notes: &mut Vec<ScanNote>,
@@ -1892,9 +1683,8 @@ fn collect_from_manifests(
     (manifest_labels, declared)
 }
 
-/// Read a single lockfile by path (the `--lockfile <path>` form of
-/// `package scan`). The path is parsed with the existing manifest parser; an
-/// unrecognized file produces a clear note rather than an empty scan.
+/// Read a single lockfile by path (the `--lockfile <path>` form). An
+/// unrecognized file produces a note rather than an empty scan.
 fn collect_from_specific_lockfile(
     path: &Path,
     notes: &mut Vec<ScanNote>,
@@ -1936,15 +1726,9 @@ fn collect_from_specific_lockfile(
 }
 
 /// Walk installed-tree directories under `request.root` and synthesize
-/// per-package declarations. Looks for:
-///
-///   * `node_modules/<scope?>/<pkg>/package.json` (npm)
-///   * `site-packages/<dist>-<ver>.dist-info/METADATA` (PyPI)
-///   * `vendor/<host>/<owner>/<mod>/` (Go modules)
-///   * the workspace `Cargo.lock` at the root (Rust)
-///
-/// The walk respects `request.installed_max_entries`. When the cap fires, a
-/// note records the truncation so the caller can re-run with a larger cap.
+/// per-package declarations. Looks for `node_modules/` (npm), `site-packages/`
+/// `.dist-info/METADATA` (PyPI), `vendor/` (Go), and the root `Cargo.lock`
+/// (Rust). Respects `request.installed_max_entries`, noting any truncation.
 fn collect_from_installed_tree(
     request: &ScanRequest,
     notes: &mut Vec<ScanNote>,
@@ -1958,11 +1742,9 @@ fn collect_from_installed_tree(
     };
     let mut truncated_at: Option<usize> = None;
 
-    // Helper for label-stable manifest path display (root-relative when under
-    // root, else absolute). Mirrors `relative_label`.
     let label_for = |p: &Path| -> String { relative_label(request.root, p) };
 
-    // --- npm: node_modules/<scope?>/<pkg>/package.json ---------------------
+    // npm: node_modules/<scope?>/<pkg>/package.json
     let node_modules = request.root.join("node_modules");
     if node_modules.is_dir() {
         walk_node_modules(
@@ -1975,9 +1757,8 @@ fn collect_from_installed_tree(
         );
     }
 
-    // --- PyPI: site-packages/<dist>-<ver>.dist-info/METADATA --------------
-    // Prefer an in-tree site-packages; the CLI honors `VIRTUAL_ENV` separately
-    // and passes that directory as the scan root when set.
+    // PyPI: site-packages/<dist>.dist-info/METADATA (the CLI passes
+    // `VIRTUAL_ENV` as the scan root separately).
     for sp in find_site_packages_dirs(request.root) {
         if truncated_at.is_some() {
             break;
@@ -1992,7 +1773,7 @@ fn collect_from_installed_tree(
         );
     }
 
-    // --- Go: vendor/<host>/<owner>/<mod>/ ----------------------------------
+    // Go: vendor/<host>/<owner>/<mod>/
     if truncated_at.is_none() {
         let vendor = request.root.join("vendor");
         if vendor.is_dir() {
@@ -2007,7 +1788,7 @@ fn collect_from_installed_tree(
         }
     }
 
-    // --- Rust: Cargo.lock at the workspace root ----------------------------
+    // Rust: Cargo.lock at the workspace root
     if truncated_at.is_none() {
         let lock = request.root.join("Cargo.lock");
         if lock.is_file() {
@@ -2047,9 +1828,8 @@ fn collect_from_installed_tree(
     (manifest_labels, declared)
 }
 
-/// Parse one [`DiscoveredManifest`] into declared dependencies and push them
-/// onto `out`. Records a note on any read or parse failure so a partly-broken
-/// project still reports the manifests it could read.
+/// Parse one [`DiscoveredManifest`] into `out`, recording a note on any read
+/// or parse failure so a partly-broken project still reports.
 fn parse_one_manifest(
     manifest: &DiscoveredManifest,
     rel: &str,
@@ -2091,8 +1871,8 @@ fn parse_one_manifest(
     }
 }
 
-/// Walk `node_modules/` for installed npm packages. Handles both bare
-/// `node_modules/<pkg>/package.json` and scoped `node_modules/@scope/<pkg>/package.json`.
+/// Walk `node_modules/` for installed npm packages, handling both bare and
+/// scoped (`@scope/<pkg>`) layouts.
 fn walk_node_modules(
     root: &Path,
     cap: usize,
@@ -2152,9 +1932,8 @@ fn walk_node_modules(
 }
 
 /// Read one installed npm package's `package.json` and emit a single
-/// [`DeclaredDependency`] for that package (NOT its sub-dependencies — the
-/// installed-tree mode is about what is on disk, and each installed package
-/// is itself one entry).
+/// [`DeclaredDependency`] for that package (NOT its sub-dependencies — each
+/// installed package is itself one entry).
 fn read_node_package(
     pkg_dir: &Path,
     cap: usize,
@@ -2201,13 +1980,11 @@ fn read_node_package(
     ));
 }
 
-/// Find `site-packages` directories under `root`. Returns at most a handful —
-/// venv layouts always have one or two — so we don't bound the walk further.
+/// Find `site-packages` directories under `root` (well-defined venv layouts,
+/// so the walk is not bounded further).
 fn find_site_packages_dirs(root: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
-    // Common layouts: <root>/lib/python*/site-packages, <root>/Lib/site-packages
-    // (Windows venv), and <root>/site-packages directly. We don't recurse into
-    // arbitrary subdirs — venv layouts are well-defined.
+    // <root>/site-packages and the Windows-venv <root>/Lib/site-packages.
     let candidates: Vec<PathBuf> = vec![
         root.join("site-packages"),
         root.join("Lib").join("site-packages"),
@@ -2295,14 +2072,12 @@ fn walk_site_packages(
     }
 }
 
-/// Parse a PEP 566 METADATA file enough to extract the `Name:` and `Version:`
-/// header values. Header order is undefined; both are independent.
+/// Parse a PEP 566 METADATA file's `Name:` and `Version:` headers.
 fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
-    // METADATA headers stop at the first blank line — body is the package
-    // description we don't need.
+    // Headers stop at the first blank line; the body is unneeded description.
     for line in text.lines() {
         if line.is_empty() {
             break;
@@ -2322,8 +2097,7 @@ fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
     name.map(|n| (n, version))
 }
 
-/// Walk `vendor/` for vendored Go modules — directories whose `.go` file count
-/// suggests an actual module, with names shaped like `host/owner/repo` paths.
+/// Walk `vendor/` for vendored Go modules (`host/owner/repo`-shaped names).
 fn walk_vendor_go(
     root: &Path,
     cap: usize,
@@ -2332,10 +2106,8 @@ fn walk_vendor_go(
     truncated_at: &mut Option<usize>,
     label_for: &dyn Fn(&Path) -> String,
 ) {
-    // Go vendoring: each leaf module directory is `vendor/<host>/<owner>/<mod>`
-    // (e.g. `vendor/github.com/spf13/cobra`). We treat any dir three deep from
-    // `vendor/` as a candidate module (the typical depth); the `modules.txt`
-    // sibling is the authoritative list when present, and we prefer it.
+    // Prefer the authoritative `modules.txt` when present; otherwise treat any
+    // dir three deep under `vendor/` as a candidate module.
     let modules_txt = root.join("modules.txt");
     if modules_txt.is_file() {
         let text = std::fs::read_to_string(&modules_txt).unwrap_or_default();
@@ -2343,8 +2115,7 @@ fn walk_vendor_go(
         manifest_labels.push(label.clone());
         for line in text.lines() {
             let trimmed = line.trim();
-            // `# host/owner/mod v1.2.3` is a module header line; skip comments
-            // and explicit lines without a `#` prefix.
+            // `# host/owner/mod v1.2.3` is a module header line.
             let Some(rest) = trimmed.strip_prefix("# ") else {
                 continue;
             };
@@ -2422,8 +2193,7 @@ fn read_sorted_dirs(p: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse a `Cargo.lock` file into one [`DeclaredDependency`] per
-/// resolved `[[package]]` entry. The lockfile format is stable TOML.
+/// Parse a `Cargo.lock` into one [`DeclaredDependency`] per `[[package]]`.
 fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
     let Ok(doc) = toml::from_str::<toml::Value>(text) else {
         return Vec::new();
@@ -2485,16 +2255,13 @@ fn assess_dependency(
     let signals = PackageSignals {
         ecosystem: dep.ecosystem,
         name: dep.name.clone(),
-        // M6 ch6 — manifest-declared version (when the manifest specifies one)
-        // is carried through to OSV correlation downstream.
+        // Manifest-declared version, carried through to OSV correlation.
         version: dep.version.clone(),
         threat_db_missing: request.db.is_none(),
         name_vs_popular: name_vs_popular.clone(),
         malicious_typosquat_of,
-        // A manifest scan never has the package *content* on disk (the
-        // manifest only *declares* the dependency), so content signals are
-        // always NotInspected. `tirith package risk --path` is the command
-        // for inspecting installed content.
+        // A manifest scan never has package content on disk, so content signals
+        // are always NotInspected (use `package risk --path` to inspect content).
         content_signals: ContentSignals::NotInspected,
         api,
     };
@@ -2514,7 +2281,7 @@ fn assess_dependency(
 }
 
 /// A scan-root-relative label for a manifest path, falling back to the full
-/// path when it is not under the root. Keeps report output stable and short.
+/// path when it is not under the root.
 fn relative_label(root: &Path, manifest: &Path) -> String {
     // When the root is a file, the manifest *is* the root.
     if root.is_file() {
@@ -2551,8 +2318,6 @@ impl EcosystemScanReport {
 mod tests {
     use super::*;
 
-    // --- manifest classification ------------------------------------------
-
     #[test]
     fn manifest_kind_classifies_known_filenames() {
         assert_eq!(
@@ -2577,8 +2342,6 @@ mod tests {
         assert_eq!(ManifestKind::GoMod.ecosystem(), Ecosystem::Go);
         assert_eq!(ManifestKind::PyPyprojectToml.ecosystem(), Ecosystem::PyPI);
     }
-
-    // --- package.json -----------------------------------------------------
 
     #[test]
     fn parse_package_json_extracts_deps_and_dev_deps() {
@@ -2605,8 +2368,6 @@ mod tests {
         // just declares nothing.
         assert_eq!(parse_package_json(r#"{"name":"x"}"#), Some(Vec::new()));
     }
-
-    // --- package-lock.json ------------------------------------------------
 
     #[test]
     fn parse_package_lock_v3_reads_packages_map() {
@@ -2664,8 +2425,6 @@ mod tests {
         assert_eq!(package_lock_name_from_path(""), None);
     }
 
-    // --- requirements.txt -------------------------------------------------
-
     #[test]
     fn parse_requirements_txt_extracts_bare_names() {
         let text = "\
@@ -2706,8 +2465,6 @@ git+https://github.com/x/y.git
         );
         assert_eq!(python_requirement_name(""), None);
     }
-
-    // --- pyproject.toml ---------------------------------------------------
 
     #[test]
     fn parse_pyproject_pep621_dependencies() {
@@ -2753,8 +2510,6 @@ pytest = "^7.0"
         // Malformed TOML → `None` (the manifest could not be parsed).
         assert!(parse_pyproject_toml("[[[not toml").is_none());
     }
-
-    // --- Cargo.toml -------------------------------------------------------
 
     #[test]
     fn parse_cargo_toml_extracts_all_dep_tables() {
@@ -2807,8 +2562,6 @@ libc = "0.2"
         assert!(deps.iter().any(|d| d.name == "libc"));
     }
 
-    // --- go.mod -----------------------------------------------------------
-
     #[test]
     fn parse_go_mod_reads_block_and_single_require() {
         let text = "\
@@ -2832,8 +2585,6 @@ require (
             "the // indirect comment must be stripped, name kept"
         );
     }
-
-    // --- Gemfile ----------------------------------------------------------
 
     #[test]
     fn parse_gemfile_reads_gem_directives_and_groups() {
@@ -2880,8 +2631,6 @@ gem 'toplevelgem'
         assert!(!dev("toplevelgem"), "a top-level gem is not dev");
     }
 
-    // --- is_plausible_package_name ----------------------------------------
-
     #[test]
     fn plausible_package_name_rejects_garbage() {
         assert!(is_plausible_package_name("react"));
@@ -2891,8 +2640,6 @@ gem 'toplevelgem'
         assert!(!is_plausible_package_name("has spaces"));
         assert!(!is_plausible_package_name("{table}"));
     }
-
-    // --- slopsquat: hallucinated name shape -------------------------------
 
     #[test]
     fn hallucinated_shape_flags_lang_prefix_descriptive_name() {
@@ -2925,8 +2672,6 @@ gem 'toplevelgem'
         let shape = hallucinated_name_shape("acme-data-sync-helper-module");
         assert!(shape.is_some());
     }
-
-    // --- slopsquat: full heuristic ----------------------------------------
 
     #[test]
     fn slopsquat_clear_for_known_popular() {
@@ -3006,8 +2751,6 @@ gem 'toplevelgem'
             "a near-miss with a normal name shape is similar_name, not slopsquat"
         );
     }
-
-    // --- findings ----------------------------------------------------------
 
     fn assessment_with(
         name: &str,
@@ -3133,15 +2876,9 @@ gem 'toplevelgem'
     #[test]
     fn findings_for_provenance_only_high_risk_emits_finding() {
         // PR #121 fix-list item 2 regression pin — a dependency with no
-        // name-shape risk (no typosquat / no slopsquat / no similar-name) but
-        // a HIGH-or-CRITICAL deterministic risk score from registry-API
-        // provenance signals MUST emit a finding. Previously `findings_for`
-        // returned after the similar-name block, so a provenance-only High
-        // produced zero findings — the registry path was decorative.
-        //
-        // We build a fully-loaded `ApiProvenance` so the api_factors stack
-        // enough points to cross the High threshold (>= 51). The package name
-        // is unknown to the (absent) threat DB, so name signals fire nothing.
+        // name-shape risk but a High/Critical provenance score MUST emit a
+        // finding (previously it produced none). The fully-loaded provenance
+        // stacks enough points to cross the High threshold.
         #[allow(deprecated)]
         let provenance = package_risk::ApiProvenance {
             source: "npm".to_string(),
@@ -3213,11 +2950,9 @@ gem 'toplevelgem'
 
     #[test]
     fn findings_for_low_or_medium_risk_with_no_name_shape_emits_nothing() {
-        // The provenance-only fall-through MUST only fire on High/Critical —
-        // a Low/Medium score with no name-shape signals stays clean (the
-        // current behavior for the clean dependency test). This pin keeps
-        // the threshold conservative; flipping it to Medium would flood the
-        // verdict with low-confidence provenance noise.
+        // The provenance-only fall-through fires ONLY on High/Critical; a
+        // Low/Medium score with no name-shape signal stays clean (keeps the
+        // threshold conservative).
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "ordinary-pkg".to_string(),
@@ -3257,13 +2992,9 @@ gem 'toplevelgem'
 
     #[test]
     fn typosquat_policy_fires_when_api_signals_unavailable() {
-        // Regression: `policy_findings_for_assessment` used to early-return
-        // when `assessment.risk.api_signals` was not `Available`, which
-        // silently gated `PackagePolicyTyposquatDistance` (a purely-offline
-        // signal — computed from `name_vs_popular`, which is local) on
-        // network availability. An `--online` scan against a degraded
-        // registry would lose its typosquat findings. Pin that the
-        // typosquat gate fires regardless of API state.
+        // Regression: the offline PackagePolicyTyposquatDistance gate used to be
+        // skipped when api_signals was not Available, losing typosquat findings
+        // on a degraded `--online` scan. Pin that it fires regardless of API state.
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "reaqt".to_string(),
@@ -3305,8 +3036,6 @@ gem 'toplevelgem'
             findings.iter().map(|f| f.rule_id).collect::<Vec<_>>(),
         );
     }
-
-    // --- end-to-end scan over a temp project ------------------------------
 
     #[test]
     fn scan_discovers_and_scores_a_temp_project() {
@@ -3464,19 +3193,9 @@ gem 'toplevelgem'
         );
     }
 
-    // -----------------------------------------------------------------------
-    // M6 ch2 — installed-tree mode fixtures
-    //
-    // Four fixtures requested by the chunk plan: positive node_modules with a
-    // slopsquat-shaped name (the strongest signal we can fire without an
-    // on-disk signed threat DB), allow-clean node_modules, positive lockfile,
-    // and allow-clean lockfile. They live here next to the engine they pin —
-    // `tests/fixtures/ecosystem.toml` is the *command-line* fixture format
-    // (`tirith check ...`) and would not match the file-tree shape these
-    // need. Installed-mode + signed-threat-DB block fixtures are exercised by
-    // the integration tests in `crates/tirith/tests/cli_integration.rs`,
-    // which load the test fixture DB via env var.
-    // -----------------------------------------------------------------------
+    // Installed-tree mode fixtures live here (not in tests/fixtures/, which is
+    // the command-line `tirith check` format). Signed-threat-DB block fixtures
+    // are exercised by the integration tests in cli_integration.rs.
 
     fn never_allow(_eco: Ecosystem, _name: &str) -> bool {
         false
@@ -3484,13 +3203,9 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_positive_node_modules_surfaces_assessment() {
-        // A node_modules/<pkg>/package.json — without a threat DB the
-        // assessment cannot fire a name-based finding, but the engine must
-        // surface the package as a `DeclaredDependency` with the right
-        // ecosystem and version, and the mode field must read `"installed"`.
-        // The matching "malicious-name BLOCK" assertion lives in the
-        // integration test that loads the signed threat-DB fixture (see
-        // `crates/tirith/tests/cli_integration.rs::ecosystem_scan_installed_*`).
+        // Without a threat DB no name-based finding fires, but the package must
+        // still surface as a DeclaredDependency with mode "installed". The
+        // BLOCK side is in cli_integration.rs (signed threat-DB fixture).
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("node_modules").join("evil-package");
         std::fs::create_dir_all(&pkg).unwrap();

@@ -7,13 +7,9 @@ const DNS_BLOCKLISTS: &[(&str, &str)] = &[
     ("dnsbl.sorbs.net", "SORBS"),
 ];
 
-/// Check if a domain appears in DNS-based blocklists (DNSBLs).
-///
-/// This works by resolving the domain to its IP address(es), then querying each
-/// DNSBL with the reversed-IP lookup format: `<d>.<c>.<b>.<a>.<blocklist-zone>`.
-///
-/// Returns a list of blocklist display names that returned a positive result.
-/// Returns an empty list if the domain cannot be resolved or no blocklists match.
+/// Check if a domain appears in DNS-based blocklists (DNSBLs): resolve the
+/// domain to IPs, then query each DNSBL with the reversed-IP lookup format.
+/// Returns the matching blocklist display names (empty on no resolution/match).
 pub fn check_dns_blocklist(domain: &str) -> Vec<String> {
     let ips = match resolve_domain_ips(domain) {
         Some(ips) => ips,
@@ -43,9 +39,9 @@ pub fn check_dns_blocklist(domain: &str) -> Vec<String> {
     matches
 }
 
-/// Resolve a domain to its IPv4 addresses using the system resolver.
+/// Resolve a domain to its IPv4 addresses via the system resolver.
 fn resolve_domain_ips(domain: &str) -> Option<Vec<String>> {
-    // ToSocketAddrs requires a port; port 0 is a harmless placeholder.
+    // ToSocketAddrs requires a port; 0 is a harmless placeholder.
     let lookup = format!("{domain}:0");
     let addrs: Vec<String> = lookup
         .to_socket_addrs()
@@ -84,10 +80,8 @@ fn reverse_ipv4(ip: &str) -> Option<String> {
     ))
 }
 
-/// Perform a DNSBL lookup by trying to resolve the query hostname.
-///
-/// A positive result is indicated by the DNS query resolving to any address
-/// (typically `127.0.0.x`). A negative result means NXDOMAIN (resolution fails).
+/// A DNSBL lookup: a positive result is the query resolving to any address; a
+/// negative result is NXDOMAIN (resolution fails).
 fn dnsbl_lookup(query: &str) -> bool {
     let lookup = format!("{query}:0");
     lookup.to_socket_addrs().is_ok()

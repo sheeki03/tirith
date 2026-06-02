@@ -1,41 +1,20 @@
-//! `tirith prompt-status` — M8 ch6.
+//! `tirith prompt-status` — M8 ch6. A fast one-line status emitter for shell
+//! prompts: protection posture plus cloud/k8s contexts and sudo/SSH state.
 //!
-//! A *fast* status emitter designed to be called from a shell prompt on every
-//! redraw. Outputs one line summarising the operator's current protection
-//! posture plus the cloud / k8s contexts and sudo / SSH state.
+//! Output shapes: short (`[tirith:guarded][aws:prod][kube:payments-prod]`),
+//! long (`tirith: guarded; aws: prod; …`), and a stable `--json` envelope.
 //!
-//! ## Output shapes
+//! Two caches keep it prompt-fast: the 5s process-global cache in
+//! [`tirith_core::context_detect`] and a 30s per-user on-disk cache at
+//! `$XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache`. On a cold cache we read
+//! kubeconfig + AWS env/files only and deliberately SKIP the gcloud/az
+//! shell-outs `detect_all()` does (100ms-1.5s each, over the latency budget);
+//! the richer set is available via `tirith context status`.
 //!
-//! - **Short** (`--short`, the default form used in PS1 hooks):
-//!   `[tirith:guarded][aws:prod][kube:payments-prod]`
-//! - **Long** (no `--short`, no `--json`):
-//!   `tirith: guarded; aws: prod; kube: payments-prod; sudo: session active`
-//! - **JSON** (`--json`): a stable envelope keyed on `protection_mode`,
-//!   `contexts`, `ssh_remote`, `sudo_active`.
+//! No colour codes by default, so command substitution into `$PS1` / `$PROMPT`
+//! never injects an unmatched ANSI escape that clobbers cursor accounting.
 //!
-//! ## Latency model
-//!
-//! Two layers of caching:
-//!
-//! 1. **Process-global cache** in [`tirith_core::context_detect`] (5s TTL —
-//!    a small file read + minimal YAML parse for kubeconfig).
-//! 2. **Per-user on-disk cache** in `$XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache`
-//!    (30s TTL — used by *this* command to avoid re-running detection on
-//!    every prompt redraw, even within a fresh process).
-//!
-//! On a cold-cache invocation we read kubeconfig + AWS env/files only. We
-//! deliberately **skip the gcloud / az shell-outs** that `detect_all()`
-//! does — those add 100ms-1.5s each in the worst case and would blow the
-//! prompt-status latency budget. The richer detection still runs from
-//! `tirith context status` and the engine hot path (which is gated on a
-//! cloud-CLI leader anyway).
-//!
-//! No colour codes are emitted by default. A future `--color` opt-in could
-//! lift them in; for now we keep the output prompt-safe so command
-//! substitution into `$PS1` / `$PROMPT` never injects an unmatched ANSI
-//! escape that would clobber line-editor cursor accounting.
-//!
-//! ## Cache file format
+//! Cache file format:
 //!
 //! ```json
 //! {
@@ -47,11 +26,8 @@
 //! }
 //! ```
 //!
-//! 30-second TTL is the staleness tradeoff: if the operator runs `kubectx`
-//! the prompt may lag for up to 30s before re-detecting. We accept that
-//! over re-reading kubeconfig on every prompt redraw. Operators can force
-//! a refresh by invoking `tirith context status` or by waiting 30s. The
-//! tradeoff is documented in `docs/prompt-integration.md`.
+//! The 30s TTL is a staleness tradeoff (a `kubectx` may lag up to 30s);
+//! documented in `docs/prompt-integration.md`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -62,15 +38,11 @@ use serde::{Deserialize, Serialize};
 use tirith_core::context_detect::{self, Provider};
 use tirith_core::sudo_session;
 
-/// Per-user prompt-status cache TTL. Longer than the in-process detection
-/// cache (5s) because prompt-status is invoked on EVERY prompt redraw —
-/// the file cache is the difference between a single kubeconfig read per
-/// prompt and one read per 30s.
+/// Per-user prompt-status cache TTL — longer than the 5s in-process cache
+/// because prompt-status runs on every prompt redraw.
 const CACHE_TTL_SECS: u64 = 30;
 
-/// On-disk cache shape. Versioned (`schema_version`) so a future field
-/// addition can be done as an additive change without breaking
-/// already-cached files.
+/// On-disk cache shape. Versioned for additive field changes.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope {
     #[serde(default = "default_schema_version")]
@@ -86,9 +58,8 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// Public JSON envelope written to stdout. Distinct from
-/// [`CacheEnvelope`] only because the public envelope omits the cache
-/// timestamp (callers shouldn't have to care about caching).
+/// Public JSON envelope written to stdout — like [`CacheEnvelope`] but without
+/// the cache timestamp.
 #[derive(Debug, Serialize)]
 struct PublicEnvelope<'a> {
     schema_version: u32,
@@ -106,17 +77,13 @@ struct Status {
     sudo_active: bool,
 }
 
-/// Entry point. Precedence when multiple format flags are passed:
-/// `--json` always wins (JSON envelope), then `--short` (bracketed PS1
-/// line), and the long human form is the default. `--short` and `--json`
-/// are NOT enforced as mutually exclusive in clap — passing both is
-/// legal and produces JSON (PR-127 review #23, comment-analyzer #4).
+/// Entry point. Flag precedence: `--json` wins, then `--short`, else long form.
+/// `--short` and `--json` are not mutually exclusive in clap; both → JSON.
 pub fn run(short: bool, json: bool) -> i32 {
     let status = match load_or_refresh() {
         Ok(s) => s,
         Err(_) => {
-            // Never fail the prompt. On any error, emit a minimal off line
-            // so the shell prompt still draws cleanly.
+            // Never fail the prompt — emit a minimal off line on any error.
             Status {
                 protection_mode: "off".into(),
                 contexts: BTreeMap::new(),
@@ -139,9 +106,8 @@ pub fn run(short: bool, json: bool) -> i32 {
                 println!("{s}");
                 0
             }
-            // Even the JSON path must not abort the prompt — return 0 with
-            // an empty envelope rather than letting the shell display a
-            // raw error.
+            // The JSON path must not abort the prompt either — return 0 with an
+            // empty envelope rather than a raw error.
             Err(_) => {
                 println!(
                     "{{\"schema_version\":1,\"protection_mode\":\"off\",\"contexts\":{{}},\"ssh_remote\":false,\"sudo_active\":false}}"
@@ -160,17 +126,12 @@ pub fn run(short: bool, json: bool) -> i32 {
 
 /// Render the bracketed short form: `[tirith:guarded][aws:prod][kube:…]`.
 ///
-/// Always starts with the `[tirith:<mode>]` segment so a downstream parser
-/// can quickly recognise the line. Provider segments are sorted by
-/// provider name (BTreeMap iteration order) for deterministic output.
-///
-/// SSH-remote and sudo-active state are appended as their own segments
-/// only when active — keeps the bare-prompt case ([tirith:guarded]) tight.
+/// Starts with `[tirith:<mode>]` for downstream parsers; provider segments are
+/// BTreeMap-sorted; ssh/sudo segments appended only when active.
 fn format_short(s: &Status) -> String {
     let mut out = format!("[tirith:{}]", s.protection_mode);
     for (k, v) in &s.contexts {
-        // Skip silently if a value is empty — shouldn't happen, but a
-        // malformed cache entry shouldn't produce `[kube:]`.
+        // A malformed cache entry shouldn't render `[kube:]`.
         if v.is_empty() {
             continue;
         }
@@ -203,13 +164,12 @@ fn format_long(s: &Status) -> String {
     parts.join("; ")
 }
 
-/// Resolve a fresh [`Status`], using the on-disk cache when it's <30s
-/// old and refreshing otherwise. Cache failures are non-fatal — we
-/// silently fall through to a refresh.
+/// Resolve a fresh [`Status`], using the on-disk cache when <30s old and
+/// refreshing otherwise. Cache failures fall through to a refresh.
 fn load_or_refresh() -> Result<Status, String> {
     let cache_path = resolve_cache_path();
 
-    // Cache hit path. Read, parse, check TTL. Any error → refresh.
+    // Cache hit path: read, parse, check TTL. Any error → refresh.
     if let Some(path) = &cache_path {
         if let Ok(bytes) = fs::read(path) {
             if let Ok(env) = serde_json::from_slice::<CacheEnvelope>(&bytes) {
@@ -230,25 +190,17 @@ fn load_or_refresh() -> Result<Status, String> {
     }
 
     let status = refresh_status();
-    // Best-effort cache write. A write failure is silent — the next call
-    // will refresh again, which is correct behavior.
+    // Best-effort cache write; a failure just means the next call refreshes again.
     if let Some(path) = &cache_path {
         let _ = write_cache(path, &status);
     }
     Ok(status)
 }
 
-/// Refresh from authoritative sources. Reads only fast inputs:
-/// - `TIRITH_STATUS` env var (shell-hook-exported protection level).
-/// - `TIRITH_SSH_REMOTE` env var.
-/// - Sudo-session file via [`tirith_core::sudo_session`].
-/// - kubeconfig (file read + small YAML parse).
-/// - AWS env / config file (file existence check, no parsing).
-///
-/// Crucially this does **NOT** call `context_detect::detect_all()` because
-/// that shell-outs to `gcloud` / `az` — the per-prompt latency budget
-/// can't afford it. The user's full provider set is available via
-/// `tirith context status`.
+/// Refresh from fast inputs only (`TIRITH_STATUS`, `TIRITH_SSH_REMOTE`, the
+/// sudo-session file, kubeconfig, AWS env/config). Deliberately does NOT call
+/// `context_detect::detect_all()` — its `gcloud`/`az` shell-outs blow the
+/// per-prompt latency budget; the full set is at `tirith context status`.
 fn refresh_status() -> Status {
     let protection_mode = detect_protection_mode();
     let ssh_remote = std::env::var("TIRITH_SSH_REMOTE")
@@ -260,17 +212,13 @@ fn refresh_status() -> Status {
     let sudo_active = sudo_session::read_active_session().is_some();
 
     let mut contexts = BTreeMap::new();
-    // Kube: fast — reads `~/.kube/config` and parses YAML. The 5s
-    // process-local cache in `context_detect` coalesces repeat reads.
     if let Ok(ctx) = context_detect::detect_single(Provider::Kube) {
         contexts.insert(Provider::Kube.as_str().to_string(), ctx.context);
     }
-    // AWS: fast — env precedence, then a stat() on `~/.aws/config`.
     if let Ok(ctx) = context_detect::detect_single(Provider::Aws) {
         contexts.insert(Provider::Aws.as_str().to_string(), ctx.context);
     }
-    // Skip gcp/az for latency budget. They're available from
-    // `tirith context status` when the operator wants them.
+    // gcp/az skipped for the latency budget (see doc comment).
 
     Status {
         protection_mode,
@@ -280,20 +228,15 @@ fn refresh_status() -> Status {
     }
 }
 
-/// Read `TIRITH_STATUS` and map shell-hook values to prompt-status terms.
-///
-/// Thin env-reading wrapper over [`protection_mode_from_status`] — the pure
-/// mapping lives there so `tirith doctor --quick` can share it (see
-/// `cli::doctor::gather_quick_info`) and the two surfaces can never drift.
+/// Read `TIRITH_STATUS` and map it via [`protection_mode_from_status`] (env
+/// wrapper; the pure mapping is shared with `tirith doctor --quick`).
 fn detect_protection_mode() -> String {
     protection_mode_from_status(std::env::var("TIRITH_STATUS").ok().as_deref())
 }
 
-/// Map a hook-exported `TIRITH_STATUS` value to the cross-codebase
-/// `protection_mode` vocabulary. The single source of truth for this mapping,
-/// shared by `tirith prompt-status` (via [`detect_protection_mode`]) and
-/// `tirith doctor --quick` (via `cli::doctor`) so both report the same mode
-/// for the same status. Documented in `docs/prompt-integration.md`.
+/// Single source of truth mapping a hook-exported `TIRITH_STATUS` value to the
+/// cross-codebase `protection_mode` vocabulary, shared by `prompt-status` and
+/// `doctor --quick` so they can't drift. Documented in `docs/prompt-integration.md`.
 ///
 /// | shell hook value | prompt label  |
 /// |------------------|---------------|
@@ -312,28 +255,18 @@ pub(crate) fn protection_mode_from_status(status: Option<&str>) -> String {
     }
 }
 
-/// Test-only: exercise the real env-reading `detect_protection_mode` so the
-/// cross-module agreement test in `cli::doctor` compares the genuine
-/// `prompt-status` entry point (not just the shared pure mapping) against
-/// `doctor --quick`. Reachable across the `cli` module because it is
-/// `pub(crate)`. The caller is responsible for setting `TIRITH_STATUS` under
-/// the shared env lock.
+/// Test-only `pub(crate)` shim exposing the real env-reading
+/// `detect_protection_mode` to `cli::doctor`'s cross-module agreement test.
+/// Caller sets `TIRITH_STATUS` under the shared env lock.
 #[cfg(test)]
 pub(crate) fn protection_mode_for_test() -> String {
     detect_protection_mode()
 }
 
-/// Resolve the cache file path. Preference order:
-/// 1. `$XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache` (Linux runtime dir —
-///    tmpfs, per-user, cleared on logout).
-/// 2. `state_dir()/prompt-<uid>.cache` (macOS / no-XDG fallback).
-///
-/// Both branches set restrictive perms (`0700` on the parent, `0600` on
-/// the file itself) so a multi-user box can't read another user's
-/// cached protection state.
-///
-/// Returns `None` only when neither dir is resolvable — degenerate (no
-/// HOME, no XDG_RUNTIME_DIR). In that case we just skip caching.
+/// Resolve the cache file path: `$XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache`
+/// first, else `state_dir()/prompt-<uid>.cache`. Both use restrictive perms
+/// (0700 parent, 0600 file) so a multi-user box can't read another user's
+/// protection state. `None` (→ skip caching) only when neither dir resolves.
 fn resolve_cache_path() -> Option<PathBuf> {
     let uid = current_uid();
     let file_name = format!("prompt-{uid}.cache");
@@ -356,11 +289,8 @@ fn resolve_cache_path() -> Option<PathBuf> {
     None
 }
 
-/// Best-effort uid lookup. Used only to namespace the cache file path so
-/// a multi-user system doesn't collide. Returns `0` as a sentinel on
-/// non-Unix or lookup failure (the file name still ends up unique
-/// per-OS-user because either the `state_dir()` or `XDG_RUNTIME_DIR`
-/// path is already user-scoped).
+/// Best-effort uid, only to namespace the cache file. `0` on non-Unix (the
+/// path is already user-scoped, so no collision).
 fn current_uid() -> u32 {
     #[cfg(unix)]
     {
@@ -374,31 +304,24 @@ fn current_uid() -> u32 {
     }
 }
 
-/// Ensure `dir` exists with `0700` perms on Unix. No-op on other OSes
-/// beyond create_dir_all. Errors propagate so the caller can skip
-/// caching gracefully.
+/// Ensure `dir` exists with `0700` perms on Unix. Errors propagate so the
+/// caller can skip caching gracefully.
 fn ensure_dir_0700(dir: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o700);
-        // Ignore failures here — the dir may already be 0700 from a
-        // previous run, and a perms-set on an existing dir we don't own
-        // would surface as PermissionDenied. We never want to abort the
-        // prompt on a perms issue.
+        // Ignore failures — the dir may already be 0700, or be one we don't own;
+        // never abort the prompt on a perms issue.
         let _ = fs::set_permissions(dir, perms);
     }
     Ok(())
 }
 
-/// Write the cache file with `0600` perms on Unix. Atomic via
-/// write-tempfile-then-rename, so a concurrent reader (split-pane terminal,
-/// another shell instance) never observes a half-written envelope.
-///
-/// If the tempfile path can't be created (e.g. read-only directory) we
-/// fall back to a direct write — the worst case there is the documented
-/// "parse failure → refresh" path, which is operationally fine.
+/// Write the cache file with `0600` perms on Unix, atomically (tempfile +
+/// rename) so a concurrent reader never sees a half-written envelope. Falls
+/// back to a direct write if the tempfile can't be created.
 fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
     let envelope = CacheEnvelope {
         schema_version: 1,
@@ -431,7 +354,6 @@ fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
     let mut f = match opts.open(&tmp_path) {
         Ok(f) => f,
         Err(_) => {
-            // Tempfile creation failed — fall back to the direct write.
             return write_direct(path, &body);
         }
     };
@@ -470,8 +392,8 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Test-only helper — render `format_short` from a synthesized status so
-/// the shape doesn't depend on the host's real kubeconfig / AWS state.
+/// Test-only: render `format_short` from a synthesized status, independent of
+/// the host's real kubeconfig / AWS state.
 #[cfg(test)]
 fn render_short_for_test(
     protection_mode: &str,
@@ -515,10 +437,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Local serialization lock for env-var-mutating tests in this
-    /// module. `tirith_core::TEST_ENV_LOCK` is `pub(crate)` to its own
-    /// crate and isn't reachable from here; tests in this module touch
-    /// `TIRITH_STATUS` only, so a per-module lock is sufficient.
+    /// Local serialization lock for env-var-mutating tests here (touch only
+    /// `TIRITH_STATUS`; `tirith_core::TEST_ENV_LOCK` isn't reachable).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -546,8 +466,7 @@ mod tests {
 
     #[test]
     fn short_form_skips_empty_context_values() {
-        // Empty value should never appear, even if a corrupt cache slips
-        // one in — guard against `[kube:]` rendering.
+        // A corrupt cache must not render `[kube:]`.
         let line = render_short_for_test("guarded", &[("kube", "")], false, false);
         assert_eq!(line, "[tirith:guarded]");
     }

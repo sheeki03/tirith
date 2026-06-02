@@ -1,11 +1,9 @@
 //! M11 ch1 — `tirith command-card create|sign|verify|fetch`.
 //!
-//! Maintainer side: `create` builds an unsigned card from flags (or stdin
-//! prompts), `sign --key <ed25519-priv.bin> <card.json>` stamps an ed25519
-//! signature. User side: `verify <card.json>` checks a card against the
-//! trusted-keys directory, `fetch <url>` downloads a maintainer's card and
-//! caches it under `~/.cache/tirith/cards/<sha256>.json` (the ONLY remote-I/O
-//! path — `tirith check` never fetches).
+//! Maintainer: `create` builds an unsigned card; `sign --key <priv> <card.json>`
+//! stamps an ed25519 signature. User: `verify <card.json>` checks against the
+//! trusted-keys dir; `fetch <url>` downloads + caches under
+//! `~/.cache/tirith/cards/<sha256>.json` (the ONLY remote-I/O path).
 
 use std::io::Write;
 use std::path::Path;
@@ -15,25 +13,18 @@ use tirith_core::command_card::{
 };
 use tirith_core::util::{read_regular_capped, OpenRegularError};
 
-/// Read cap for a card JSON file in `sign`/`verify`. A command card is small
-/// (a command string, a few domains, a signature); 64 KiB is far more than a
-/// genuine card needs. Matches the engine hot-path `CARD_READ_CAP` so the CLI
-/// and the analysis path refuse the same oversized files. Routing through
-/// [`read_regular_capped`] also closes the read-guard class: a FIFO/device at
-/// `card_path` cannot block the open (it is opened `O_NONBLOCK` and rejected by
-/// an `fstat` of the open fd) and an oversized file cannot allocate unbounded.
+/// Read cap for a card JSON file in `sign`/`verify`. Matches the engine
+/// hot-path `CARD_READ_CAP` so the CLI and analysis refuse the same files;
+/// routing through [`read_regular_capped`] also blocks FIFO/device opens.
 const CARD_READ_CAP: u64 = 64 * 1024;
 
-/// Read cap for the ed25519 secret-key file in `sign`. A 32-byte key, even
-/// hex- or base64-encoded with trailing whitespace, is well under 4 KiB; a
-/// larger file is rejected as malformed. Reading through [`read_regular_capped`]
-/// keeps a FIFO/device `--key` path from blocking the open and bounds the read.
+/// Read cap for the ed25519 secret-key file in `sign`. A 32-byte key (raw/hex/
+/// base64) is well under 4 KiB; larger is malformed. Read via
+/// [`read_regular_capped`] to bound the read and refuse FIFO/device paths.
 const SECRET_KEY_READ_CAP: u64 = 4096;
 
-/// Render an [`OpenRegularError`] from the hardened reader as a human message,
-/// prefixed with `what` (e.g. `"read card.json"`). Keeps the FIFO/device and
-/// oversized cases legible instead of a bare `io::Error`. `cap` is the byte cap
-/// the read used, so the oversized message reports the limit that tripped.
+/// Render an [`OpenRegularError`] as a human message prefixed with `what` (e.g.
+/// `"read card.json"`), keeping the FIFO/device and oversized cases legible.
 fn describe_open_error(what: &str, path: &str, cap: u64, e: &OpenRegularError) -> String {
     match e {
         OpenRegularError::NotFound => format!("{what} {path}: no such file"),
@@ -60,21 +51,11 @@ pub fn create(
     expires: Option<String>,
     json: bool,
 ) -> i32 {
-    // Resolve the command from `--command` or the TTY prompt, then require it to
-    // be non-empty AFTER trimming. CodeRabbit R8 #4: the `Some(c)` branch
-    // previously skipped the non-empty check, so `create --command "   "` built a
-    // card whose `command` is unusable (and would never match a real command).
-    // Both the explicit-flag and prompt paths now reject a blank/whitespace-only
-    // value with the same validation error (JSON-aware under `--json`).
-    //
-    // CodeRabbit R19 #3: only fall back to the interactive prompt when stdin IS a
-    // terminal. `prompt` reads a line from stdin, so in a NON-interactive run
-    // (piped / no TTY) the old unconditional `prompt(...)` either blocked or
-    // silently CONSUMED piped data and attested the WRONG command. With no
-    // `--command` and a non-tty stdin we instead emit the same required-`--command`
-    // error below (exit 2, JSON-aware) without touching stdin. (This presenter's
-    // prompt path predates the `TIRITH_INTERACTIVE` override, so the gate is on
-    // `is_terminal(stdin)` — the actual stream `prompt` reads.)
+    // Resolve the command from `--command` or the TTY prompt, requiring it to be
+    // non-empty AFTER trimming (a whitespace-only value would never match a real
+    // command). Only prompt when stdin IS a terminal — a non-interactive run with
+    // no `--command` emits the required-`--command` error below WITHOUT touching
+    // stdin, so piped data is never consumed and attested as the wrong command.
     let command = match command {
         Some(c) => c,
         None if is_terminal::is_terminal(std::io::stdin()) => {
@@ -83,9 +64,7 @@ pub fn create(
         None => String::new(),
     };
     if command.trim().is_empty() {
-        // A broken-pipe JSON write returns 2 anyway (the error never reached the
-        // consumer); the validation failure is also exit 2 here, so the code is
-        // unchanged either way.
+        // Validation failure is exit 2; a broken-pipe JSON write is also 2.
         let _ = emit_error(
             json,
             "tirith command-card create",
@@ -94,24 +73,19 @@ pub fn create(
         return 2;
     }
 
-    // Default expiry: 90 days out, so a card created with no --expires is still
-    // usable but does not last forever.
+    // Default expiry: 90 days out (usable but not forever).
     let expires = expires.unwrap_or_else(|| {
         let in_90 = chrono::Utc::now().date_naive() + chrono::Duration::days(90);
         in_90.format("%Y-%m-%d").to_string()
     });
 
-    // Validate the expiry parses now so `create` fails fast rather than
-    // producing a card that never verifies. Store the TRIMMED value: a padded
-    // `--expires "2026-12-01 "` passes this `.trim()` check but, if stored raw,
-    // would later fail the STRICT `NaiveDate::parse_from_str` at verify/parse
-    // time (which does not trim) — a card that creates but never verifies.
+    // Validate the expiry now (fail fast). Store the TRIMMED value: a padded
+    // `--expires "2026-12-01 "` passes this `.trim()` check but the STRICT
+    // verify-time parse (which does not trim) would reject it — a card that
+    // creates but never verifies.
     let expires = expires.trim().to_string();
     if chrono::NaiveDate::parse_from_str(&expires, "%Y-%m-%d").is_err() {
-        // CodeRabbit R9 #J: route through the JSON-aware error emitter so a
-        // `--json` caller gets a parseable `{"error": …}` object, not a bare
-        // stderr line. The validation failure is exit 2; a broken-pipe JSON
-        // write is also 2, so the code is non-zero either way.
+        // JSON-aware error (exit 2; broken-pipe write is also 2).
         let _ = emit_error(
             json,
             "tirith command-card create",
@@ -131,11 +105,9 @@ pub fn create(
 
     match card.to_json_pretty() {
         Ok(s) => {
-            // Pretty JSON to stdout so `tirith command-card create > card.json`
-            // works directly. `json` is accepted for parity (the card is already
-            // JSON). Use a FALLIBLE write — not `println!`, which panics/aborts on
-            // a stdout write error — so a write failure returns the
-            // JSON-write-failure exit code 2, matching this presenter's contract.
+            // Pretty JSON to stdout so `create > card.json` works directly
+            // (`json` accepted for parity — the card is already JSON). Fallible
+            // write, not `println!`, so a stdout write error returns exit 2.
             let _ = json;
             let mut out = std::io::stdout();
             if writeln!(out, "{s}").and_then(|()| out.flush()).is_err() {
@@ -144,10 +116,7 @@ pub fn create(
             0
         }
         Err(e) => {
-            // Same JSON-aware path as the --expires error (CodeRabbit R9 #J):
-            // a serialization failure under --json must be a parseable object.
-            // A broken-pipe JSON write returns 2 (the error never reached the
-            // consumer); otherwise the semantic 1.
+            // JSON-aware: a broken-pipe write returns 2, otherwise the semantic 1.
             if !emit_error(json, "tirith command-card create", &e.to_string()) {
                 return 2;
             }
@@ -159,8 +128,7 @@ pub fn create(
 /// `tirith command-card sign --key <ed25519-priv.bin> <card.json>` — sign a
 /// card in place (rewrites the file with the `signature` block populated).
 pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
-    // For every fatal-error branch below: a broken-pipe JSON write returns 2
-    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
+    // Every fatal branch below: a broken-pipe JSON write → 2, otherwise 1.
     let secret = match read_secret_key(Path::new(key_path)) {
         Ok(k) => k,
         Err(e) => {
@@ -171,10 +139,7 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
         }
     };
 
-    // Hardened, capped read of the card path (CodeRabbit R17 #1): route through
-    // `read_regular_capped` so a FIFO/device cannot block the open and an
-    // oversized file cannot allocate unbounded — same guard the engine hot path
-    // (`read_card_bytes_guarded`) already applies to a `--card` reference.
+    // Hardened, capped read (same guard as the engine hot path's `--card`).
     let bytes = match read_regular_capped(Path::new(card_path), CARD_READ_CAP) {
         Ok(b) => b,
         Err(e) => {
@@ -218,11 +183,8 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             return 1;
         }
     };
-    // Write atomically: a temp file in the SAME directory then rename over the
-    // target. A plain `std::fs::write` truncates in place, so a crash mid-write
-    // would lose the original (unsigned) card and leave a truncated file. The
-    // rename is atomic on the same filesystem, so a reader sees either the old
-    // card or the fully-signed one, never a partial.
+    // Write atomically (temp-in-same-dir then rename) so a crash mid-write can't
+    // truncate the card; a reader sees either the old or the fully-signed one.
     if let Err(e) = write_card_atomic(Path::new(card_path), &format!("{out}\n")) {
         if !emit_error(
             json,
@@ -242,9 +204,8 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             "key_id": sig.key_id,
             "algo": sig.algo,
         });
-        // A failed JSON write (e.g. broken pipe / truncated output) must exit
-        // non-zero: the card WAS signed on disk, but a piped consumer that saw
-        // truncated JSON must not also see a success code.
+        // A failed JSON write must exit non-zero: the card WAS signed, but a
+        // consumer that saw truncated JSON must not also see success.
         if !super::write_json_stdout(&v, "tirith command-card sign: failed to write JSON output") {
             return 2;
         }
@@ -264,11 +225,8 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
 ///   0  verified (trusted key, good signature, not expired)
 ///   1  NOT verified (untrusted key / bad signature / expired / unsigned)
 pub fn verify(card_path: &str, json: bool) -> i32 {
-    // For every fatal-error branch below: a broken-pipe JSON write returns 2
-    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
-    // Hardened, capped read of the card path (CodeRabbit R17 #1): a FIFO/device
-    // at `card_path` cannot block and an oversized file cannot allocate
-    // unbounded — mirrors `sign` above and the engine hot-path guard.
+    // Every fatal branch below: a broken-pipe JSON write → 2, otherwise 1.
+    // Hardened, capped read (mirrors `sign` and the engine hot-path guard).
     let bytes = match read_regular_capped(Path::new(card_path), CARD_READ_CAP) {
         Ok(b) => b,
         Err(e) => {
@@ -323,8 +281,7 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
             "key_id": card.signature.as_ref().map(|s: &CardSignature| s.key_id.clone()),
             "reason": reason,
         });
-        // A failed JSON write must exit non-zero, even for a verified card: a
-        // consumer that saw truncated JSON must not read a success code. Exit 2
+        // A failed JSON write must exit non-zero even for a verified card; exit 2
         // is distinct from the "not verified" exit 1.
         if !super::write_json_stdout(
             &v,
@@ -355,25 +312,17 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
     }
 }
 
-/// `tirith command-card fetch <url>` — download a maintainer's card and cache
-/// it under `~/.cache/tirith/cards/<sha256>.json`. THIS IS THE ONLY remote-I/O
-/// path for cards; `tirith check` never fetches.
+/// `tirith command-card fetch <url>` — download a card and cache it under
+/// `~/.cache/tirith/cards/<sha256>.json`. THE ONLY remote-I/O path; `check`
+/// never fetches.
 ///
-/// PRIVACY: fetching a card tells the maintainer's domain that a tirith user is
-/// pulling their card (an IP + timestamp + the request). This is unavoidable
-/// for an explicit fetch — documented in `--help`.
-///
-/// UNIX-ONLY (v1): this reuses `tirith_core::runner::download_to_path`, the
-/// hardened (30s-timeout / 10 MiB-cap) download path, which is `#[cfg(unix)]`
-/// today — exactly like `tirith run` / `tirith fetch`. The `Fetch` CLI variant
-/// is therefore compiled in only on Unix; on Windows `create`/`sign`/`verify`
-/// (no network) remain available and a user copies the card to
-/// `~/.cache/tirith/cards/` manually. Removing this cfg gate requires a
-/// cross-platform `download_to_path`.
+/// PRIVACY: an explicit fetch reveals the user's IP + timestamp to the
+/// maintainer's domain (documented in `--help`). UNIX-ONLY (v1): reuses the
+/// hardened `#[cfg(unix)]` `runner::download_to_path`; on Windows the no-network
+/// subcommands remain and the user copies the card in manually.
 #[cfg(unix)]
 pub fn fetch(url: &str, json: bool) -> i32 {
-    // For every fatal-error branch below: a broken-pipe JSON write returns 2
-    // (the `{"error": …}` never reached the consumer); otherwise the semantic 1.
+    // Every fatal branch below: a broken-pipe JSON write → 2, otherwise 1.
     let cache_dir = match command_card::cards_cache_dir() {
         Some(d) => d,
         None => {
@@ -398,10 +347,8 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         return 1;
     }
 
-    // Download to a temp file (reusing the hardened 30s-timeout / 10 MiB-cap
-    // download path), validate it parses as a card, then move it to
-    // <sha256>.json. The content hash names the file, so we cannot know the
-    // destination until after the download.
+    // Download to a temp file, validate it parses, then move to <sha256>.json.
+    // The content hash names the file, so the dest is unknown until downloaded.
     let tmp = match tempfile::NamedTempFile::new_in(&cache_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -425,12 +372,9 @@ pub fn fetch(url: &str, json: bool) -> i32 {
         }
     };
 
-    // Reject an oversized download BEFORE reading/parsing it (CodeRabbit R13f).
-    // Every card READ (engine hot path, sign, verify) refuses bodies above
-    // `CARD_READ_CAP` (64 KiB), so a 64 KiB–10 MiB card would cache "successfully"
-    // yet never be readable back — a confusing dead cache entry. Gating on the
-    // downloader's reported size here drops the temp (no cache file written) and
-    // skips the wasted full read + JSON parse for content we would only reject.
+    // Reject an oversized download before reading it: every card READ refuses
+    // bodies above `CARD_READ_CAP`, so a larger card would cache but never read
+    // back (a dead cache entry). Gating here drops the temp, never writing it.
     if dl.size > CARD_READ_CAP {
         if !emit_error(
             json,
@@ -459,9 +403,7 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             return 1;
         }
     };
-    // Validate it is a card before caching — refuse to cache arbitrary content.
-    // (Size was already gated against `CARD_READ_CAP` above, off the downloader's
-    // reported size, so `bytes` here is always within the cap.)
+    // Validate it is a card before caching — refuse arbitrary content.
     if Card::from_json(&bytes).is_err() {
         if !emit_error(
             json,
@@ -475,14 +417,9 @@ pub fn fetch(url: &str, json: bool) -> i32 {
 
     let sha = command_card::sha256_hex(&bytes);
     let dest = cache_dir.join(format!("{sha}.json"));
-    // Persist atomically: NamedTempFile::persist renames within the same dir.
-    // The cache is content-addressed (`<sha256>.json`), so refetching the same
-    // card is IDEMPOTENT. `persist` (overwrite=true) already replaces an
-    // existing same-named file on the common platforms, so a refetch normally
-    // just succeeds. As belt-and-suspenders for any backend that surfaces an
-    // `AlreadyExists` on the rename (or a future switch to a no-clobber
-    // persist), explicitly treat "destination already holds these exact bytes"
-    // as a cache hit rather than an error.
+    // Persist atomically. The cache is content-addressed, so a refetch is
+    // idempotent; as belt-and-suspenders, treat "dest already holds these exact
+    // bytes" as a cache hit rather than an error.
     if let Err(e) = tmp.persist(&dest) {
         let already_cached = e.error.kind() == std::io::ErrorKind::AlreadyExists
             && std::fs::read(&dest)
@@ -498,14 +435,10 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             }
             return 1;
         }
-        // Cache hit: identical bytes already at `dest`. Fall through to report
-        // the cached path as success.
+        // Cache hit: identical bytes already at `dest`. Report it as success.
     }
-    // Durability of the RENAME (CodeRabbit R9 #B): fsync the parent dir so the
-    // newly cached card's directory entry survives a crash — the verify hot path
-    // reads this file back. The persist already succeeded, so a dir-fsync failure
-    // is LOGGED, not propagated (R13 #5). Best-effort, unix-only (matches the
-    // card-SIGN path's parent fsync in `write_card_atomic`).
+    // Rename durability: fsync the parent dir so the cached card's entry survives
+    // a crash (the verify hot path reads it back). LOGGED, not propagated.
     tirith_core::util::fsync_parent_dir_logged(&dest, "cached card");
 
     if json {
@@ -514,8 +447,7 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             "sha256": sha,
             "final_url": dl.final_url,
         });
-        // The card was cached on disk, but a failed JSON write must still exit
-        // non-zero so a piped consumer never pairs truncated JSON with success.
+        // The card was cached, but a failed JSON write must still exit non-zero.
         if !super::write_json_stdout(&v, "tirith command-card fetch: failed to write JSON output") {
             return 2;
         }
@@ -534,16 +466,11 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     0
 }
 
-/// Read a 32-byte ed25519 secret key from a file (raw 32 bytes, hex, or
-/// base64).
+/// Read a 32-byte ed25519 secret key (raw 32 bytes, hex, or base64).
 fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
-    // Hardened, capped read (CodeRabbit R17 #1): the `--key` path is
-    // operator-supplied, so a FIFO/device there would otherwise block the open
-    // and a huge file would allocate unbounded. `read_regular_capped` opens
-    // `O_NONBLOCK`, fstats the open fd, and caps at `SECRET_KEY_READ_CAP`. Map
-    // the open errors onto the existing `CardError` surface: a missing/I/O case
-    // is `Io`; a non-regular/oversized file is a `BadKey` (it is not a usable
-    // key file regardless of why the read refused it).
+    // Hardened, capped read of the operator-supplied `--key` path. Map open
+    // errors onto `CardError`: missing/I/O → `Io`; non-regular/oversized →
+    // `BadKey` (not a usable key file regardless of why the read refused).
     let raw = match read_regular_capped(path, SECRET_KEY_READ_CAP) {
         Ok(b) => b,
         Err(OpenRegularError::Io(e)) => return Err(CardError::Io(e)),
@@ -572,7 +499,7 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
         k.copy_from_slice(&raw);
         return Ok(k);
     }
-    // Try text encodings (hex / base64), trimming whitespace.
+    // Try hex / base64, trimming whitespace.
     if let Ok(text) = std::str::from_utf8(&raw) {
         let text = text.trim();
         if let Some(decoded) = command_card::hex_decode(text) {
@@ -597,48 +524,31 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
     )))
 }
 
-/// Write `contents` to `path` atomically: a temp file in the same directory is
-/// written, flushed, then renamed over `path`. The rename is atomic on the same
-/// filesystem, so a concurrent reader (or a crash) never observes a truncated
-/// or half-written card — it sees either the previous file or the new one.
+/// Write `contents` to `path` atomically (temp-in-same-dir, flushed, renamed)
+/// so a reader/crash never sees a truncated card.
 fn write_card_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    // Resolve a symlinked destination to its real target so signing a symlinked
-    // card updates the link's TARGET rather than clobbering the symlink with a
-    // regular file (CodeRabbit R22 #3). Non-symlinks (and dangling/unresolvable
-    // links) resolve to `path` unchanged — the prior behavior. Reuses the
-    // round-17 `cli::mod::resolve_atomic_dest` so both atomic writers canonicalize
-    // identically.
+    // Resolve a symlinked destination so signing updates the link's TARGET, not
+    // clobbering the link with a regular file. Reuses `resolve_atomic_dest` so
+    // both atomic writers canonicalize identically.
     let dest = super::resolve_atomic_dest(path);
     let dir = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match dir {
         Some(d) => tempfile::NamedTempFile::new_in(d)?,
-        // No parent component (e.g. a bare filename): place the temp file in the
-        // current directory so the rename stays on the same filesystem.
+        // Bare filename: temp in cwd so the rename stays on one filesystem.
         None => tempfile::NamedTempFile::new_in(".")?,
     };
     tmp.write_all(contents.as_bytes())?;
     tmp.flush()?;
-    // Durability: `flush()` only drains the userspace buffer into the kernel; a
-    // crash/power-loss after the rename could otherwise leave a zero-length or
-    // partially-written card at `path`. `sync_all()` forces the file's data (and
-    // metadata) to stable storage BEFORE the rename publishes it, so a reader
-    // after a crash sees either the old card or the complete new one — never a
-    // truncated one.
+    // `sync_all()` before the rename so a crash can't leave a partial card.
     tmp.as_file().sync_all()?;
     tmp.persist(&dest).map_err(|e| e.error)?;
-    // Durability of the RENAME itself: `persist()` renames the temp file over
-    // `dest` but does NOT fsync the containing directory. On Unix a crash right
-    // after the rename can lose the new name→inode directory entry (the file's
-    // data is synced above, but the directory metadata recording the new name is
-    // not). fsync the parent so the rename is durable too. The persist already
-    // succeeded, so a dir-fsync failure must not fail the sign — but it is LOGGED,
-    // not silently dropped (CodeRabbit R13 #5). No-op on non-Unix.
+    // Rename durability: fsync the parent dir (data is synced above, the dir
+    // entry is not). LOGGED, not fatal — the persist already succeeded.
     tirith_core::util::fsync_parent_dir_logged(&dest, "signed card");
     Ok(())
 }
 
-/// Prompt on stderr and read one line from stdin. Returns `None` if stdin is
-/// not readable.
+/// Prompt on stderr and read one line from stdin. `None` if stdin is unreadable.
 fn prompt(label: &str) -> Option<String> {
     eprint!("{label}: ");
     let _ = std::io::stderr().flush();
@@ -649,13 +559,9 @@ fn prompt(label: &str) -> Option<String> {
     }
 }
 
-/// Emit an error to stderr (human) or as a JSON `{"error": ...}` object.
-///
-/// Returns `false` when the JSON write itself failed (broken pipe / truncated
-/// output) so a `--json` caller can surface that as a distinct write-failure
-/// exit (2) instead of pairing a semantic exit code with no JSON delivered
-/// (CodeRabbit R12 #A). Human mode always returns `true` — the stderr line is
-/// best-effort. Mirrors `cli::canary::emit_error` / `cli::incident::emit_error`.
+/// Emit an error to stderr (human) or as a JSON `{"error": ...}` object. Returns
+/// `false` when the JSON write itself failed, so a `--json` caller surfaces a
+/// distinct write-failure exit (2). Human mode always returns `true`.
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
@@ -670,14 +576,10 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
 mod tests {
     use super::{emit_error, write_card_atomic};
 
-    /// CodeRabbit R12 #A: `emit_error` must PROPAGATE the JSON-write status so a
-    /// `--json` caller can return a distinct write-failure exit (2) instead of
-    /// pairing a semantic code with no JSON delivered. Human mode is best-effort
-    /// (stderr) and always reports success. The JSON-mode write-FAILURE → `false`
-    /// path is the `cli::write_json_to` seam, unit-tested there with a
-    /// deliberately-failing writer (real stdout cannot be made to fail
-    /// deterministically across platforms — and on Unix a real broken pipe is
-    /// SIGPIPE-killed before the write returns, per `main::run`'s SIG_DFL reset).
+    /// `emit_error` must propagate the JSON-write status so a `--json` caller can
+    /// return a distinct write-failure exit (2). Human mode is best-effort and
+    /// always reports success. (The JSON write-FAILURE path is tested at the
+    /// `cli::write_json_to` seam, since real stdout can't be made to fail here.)
     #[test]
     fn emit_error_human_mode_reports_success() {
         assert!(
@@ -686,11 +588,8 @@ mod tests {
         );
     }
 
-    /// JSON mode with a working stdout writes a parseable object and reports
-    /// success. (The buffer is the process stdout here; we only assert the
-    /// return contract — the parseable-shape + non-zero-exit end-to-end is
-    /// covered by `command_card_sign_json_fatal_error_is_parseable_nonzero` in
-    /// the CLI integration suite.)
+    /// JSON mode with a working stdout reports success (end-to-end shape is
+    /// covered by `command_card_sign_json_fatal_error_is_parseable_nonzero`).
     #[test]
     fn emit_error_json_mode_reports_success_when_stdout_ok() {
         assert!(
@@ -701,19 +600,10 @@ mod tests {
 
     #[test]
     fn write_card_atomic_writes_and_replaces_without_leaving_temp() {
-        // F3 (Major): signing writes the card atomically (temp-in-same-dir then
-        // rename) so a crash mid-write cannot lose the original. Prove the write
-        // lands exactly, an overwrite fully replaces the prior content, and no
-        // temp file is left behind in the directory.
-        //
-        // DURABILITY (CodeRabbit R3 #2): `write_card_atomic` now calls
-        // `sync_all()` on the temp file BEFORE the rename, so a crash/power-loss
-        // after the rename cannot leave a zero/partial card at `path`. fsync is
-        // not directly observable in a unit test (it forces kernel buffers to
-        // stable storage); the content-integrity assertions below cover the
-        // userspace-visible post-condition, and the sync is exercised on every
-        // call here (a sync error would surface as an `Err` from
-        // `write_card_atomic` and fail the `.unwrap()`).
+        // F3: the write lands exactly, an overwrite fully replaces, and no temp
+        // file is left behind. (The pre-rename `sync_all()` is exercised here —
+        // a sync error would fail the `.unwrap()` — but is not directly
+        // observable in a unit test.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.json");
 
@@ -741,19 +631,16 @@ mod tests {
         assert_eq!(entries[0], path);
     }
 
-    /// CodeRabbit R22 #3: signing a SYMLINKED card must update the link's TARGET,
-    /// not clobber the symlink with a regular file. `write_card_atomic` resolves a
-    /// symlink destination (via `cli::mod::resolve_atomic_dest`) and writes through
-    /// to the target. Unix-only (`std::os::unix::fs::symlink`).
+    /// Signing a SYMLINKED card must update the link's TARGET, not clobber the
+    /// link with a regular file. Unix-only.
     #[cfg(unix)]
     #[test]
     fn write_card_atomic_through_symlink_updates_target_not_link() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        // The real card lives in a SEPARATE subdir to prove the temp file is
-        // placed next to the RESOLVED target (same filesystem), not next to the
-        // link — a cross-directory symlink would otherwise break atomicity.
+        // Real card in a SEPARATE subdir to prove the temp lands next to the
+        // RESOLVED target (same filesystem), not next to the link.
         let target_dir = dir.path().join("real");
         std::fs::create_dir_all(&target_dir).unwrap();
         let target = target_dir.join("card.json");

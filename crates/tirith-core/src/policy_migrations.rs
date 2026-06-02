@@ -1,38 +1,23 @@
-//! Policy schema migration registry (M5.5 chunk F3).
+//! Policy schema migration registry (M5.5 F3).
 //!
-//! Tirith policies carry a `schema_version: u32` field. When the field is
-//! absent (shipping `policy.yaml` files written before M5.5), the loader
-//! treats the policy as `v1` for backward compatibility.
+//! Policies carry a `schema_version: u32`; absent = `v1` (pre-M5.5 files).
+//! Migrations operate on the raw `serde_yaml::Value` BEFORE typed
+//! deserialization — typed deser discards unknown fields, so a post-deser
+//! migration couldn't see (let alone rename) them.
 //!
-//! Migrations operate on the **raw `serde_yaml::Value` BEFORE deserializing
-//! into the typed `Policy` struct**. This matters: typed deserialization
-//! discards fields the struct does not know about, so a migration that runs
-//! after deserialization cannot see (let alone rename) those fields.
-//!
-//! As of M6 ch7 the registry has one entry: `v1 → v2` moves the legacy
-//! top-level `internal_package_names: [String]` list under
-//! `package_policy.internal_package_names: [{name}]`.
-//! [`CURRENT_SCHEMA_VERSION`] is now `2`. Each later wave that changes the
-//! policy shape bumps the version and registers a forward migration here.
-//!
-//! Loaders accept any version ≤ `CURRENT_SCHEMA_VERSION`; a policy file
-//! whose `schema_version` exceeds the registered maximum fails with a
-//! clear message asking the user to upgrade the tirith binary, rather
-//! than silently dropping unknown fields.
+//! One entry today: `v1 → v2` moves top-level `internal_package_names: [String]`
+//! under `package_policy.internal_package_names: [{name}]`. Loaders accept any
+//! version ≤ [`CURRENT_SCHEMA_VERSION`]; a higher version fails with an
+//! upgrade-tirith message rather than silently dropping unknown fields.
 
 use serde_yaml::Value;
 
-/// The schema version this tirith build understands.
-///
-/// Bump this every time a later wave changes the policy shape AND
-/// registers a migration in [`MIGRATIONS`].
+/// The schema version this tirith build understands. Bump when a wave changes
+/// the policy shape AND registers a migration in [`MIGRATIONS`].
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
-/// A single forward migration `from → to`.
-///
-/// The migration function mutates the raw `serde_yaml::Value` in place so
-/// later, typed deserialization sees the new shape. It MUST be idempotent
-/// (re-running on an already-migrated value is a no-op).
+/// A single forward migration `from → to`. Mutates the raw `Value` in place so
+/// typed deser sees the new shape; MUST be idempotent.
 #[derive(Clone, Copy)]
 pub struct Migration {
     pub from: u32,
@@ -40,44 +25,35 @@ pub struct Migration {
     pub run: fn(&mut Value),
 }
 
-/// Registered forward migrations.
-///
-/// Order: each entry's `to` MUST equal the next entry's `from`, walking
-/// from 1 up to [`CURRENT_SCHEMA_VERSION`]. The validator
-/// [`validate_migration_chain`] is called from a unit test.
+/// Registered forward migrations. Each entry's `to` MUST equal the next's
+/// `from`, walking from 1 to [`CURRENT_SCHEMA_VERSION`] (checked by a unit test).
 pub const MIGRATIONS: &[Migration] = &[Migration {
     from: 1,
     to: 2,
     run: migrate_v1_to_v2,
 }];
 
-/// M6 ch7 — move the M6 ch6 top-level `internal_package_names: [String]`
-/// list under `package_policy.internal_package_names: [{name}]`. Idempotent.
+/// M6 ch7 — move top-level `internal_package_names: [String]` under
+/// `package_policy.internal_package_names: [{name}]`. Idempotent.
 fn migrate_v1_to_v2(value: &mut Value) {
     let Some(map) = value.as_mapping_mut() else {
         return;
     };
     let key = Value::String("internal_package_names".to_string());
-    // Take the legacy list if present.
     let legacy = map.remove(&key);
     let Some(legacy) = legacy else {
         return;
     };
-    // The legacy shape is a sequence of strings. Anything else (a v2
-    // shape someone copy-pasted, etc.) is silently dropped to avoid
-    // shadowing whatever already lives under `package_policy`.
+    // Legacy shape is a sequence of strings; anything else is dropped to avoid
+    // shadowing whatever lives under `package_policy`.
     let Some(seq) = legacy.as_sequence() else {
         return;
     };
     let mut new_entries: Vec<Value> = Vec::new();
     for (idx, entry) in seq.iter().enumerate() {
         let Some(s) = entry.as_str() else {
-            // The v1 shape is `internal_package_names: [String]`. Anything
-            // else here (a v2-shape map someone hand-pasted, a number, null)
-            // is a forward-migration error the operator should know about —
-            // their intent is unrecoverable here, but silent drop hides
-            // configuration drift. Print one stderr line per malformed
-            // entry, then continue so the rest of the list migrates.
+            // A non-string entry is a migration error the operator should see —
+            // warn per entry (silent drop would hide config drift) and continue.
             eprintln!(
                 "tirith: migration warning: v1→v2 internal_package_names[{idx}] is not a \
                  string ({entry:?}); dropped — the v1 shape is `[\"name1\", \"name2\", ...]`",
@@ -103,8 +79,7 @@ fn migrate_v1_to_v2(value: &mut Value) {
     };
 
     let ipn_key = Value::String("internal_package_names".to_string());
-    // If `package_policy.internal_package_names` already exists, append
-    // (idempotency is the contract — we de-dupe by `name`).
+    // Append to any existing list, de-duping by `name` (idempotency contract).
     let mut combined: Vec<Value> = match pp_map.get(&ipn_key).cloned() {
         Some(Value::Sequence(s)) => s,
         _ => Vec::new(),
@@ -130,13 +105,9 @@ fn migrate_v1_to_v2(value: &mut Value) {
     map.insert(pp_key, Value::Mapping(pp_map));
 }
 
-/// Migrate a raw policy `Value` forward to the version this binary
-/// understands.
-///
-/// Returns `Ok(())` after a no-op when the policy is already at
-/// [`CURRENT_SCHEMA_VERSION`]. Returns `Err(MigrationError::FutureVersion)`
-/// when the policy declares a `schema_version` greater than this binary
-/// supports — so we never quietly drop fields a newer tirith added.
+/// Migrate a raw policy `Value` forward to [`CURRENT_SCHEMA_VERSION`]. No-op
+/// when already current; `Err(FutureVersion)` when the policy declares a higher
+/// version (so we never quietly drop fields a newer tirith added).
 pub fn migrate_forward(value: &mut Value) -> Result<(), MigrationError> {
     let mut current = detect_schema_version(value);
 
@@ -159,8 +130,8 @@ pub fn migrate_forward(value: &mut Value) -> Result<(), MigrationError> {
     Ok(())
 }
 
-/// Read the policy's declared `schema_version`, defaulting to `1` when the
-/// field is absent (the shipping convention for pre-M5.5 policies).
+/// Read the policy's declared `schema_version`, defaulting to `1` when absent
+/// (the pre-M5.5 convention).
 pub fn detect_schema_version(value: &Value) -> u32 {
     value
         .as_mapping()
@@ -182,16 +153,14 @@ fn set_schema_version(value: &mut Value, version: u32) {
 /// Errors returned by [`migrate_forward`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationError {
-    /// The policy declares a schema version newer than this tirith binary.
-    /// The user should upgrade tirith rather than have us silently drop
-    /// fields we don't recognise.
+    /// The policy declares a version newer than this binary — upgrade tirith
+    /// rather than silently drop unrecognised fields.
     FutureVersion {
         policy_version: u32,
         supported_version: u32,
     },
-    /// The migration chain is incomplete — no registered migration
-    /// advances `from` to any later version. This is a build-time bug if it
-    /// fires, because the chain is enforced by a unit test.
+    /// No registered migration advances `from` — a build-time bug (the chain is
+    /// enforced by a unit test).
     MissingMigration { from: u32 },
 }
 
@@ -239,8 +208,7 @@ mod tests {
 
     #[test]
     fn migration_chain_is_continuous() {
-        // The `to` of entry N MUST equal the `from` of entry N+1, walking
-        // from 1 to CURRENT_SCHEMA_VERSION.
+        // Entry N's `to` must equal entry N+1's `from`, 1 → CURRENT_SCHEMA_VERSION.
         let mut expected = 1u32;
         for m in MIGRATIONS {
             assert_eq!(
@@ -290,15 +258,13 @@ mod tests {
             }
             other => panic!("expected FutureVersion, got {other:?}"),
         }
-        // Display should mention upgrade
         let msg = format!("{err}");
         assert!(msg.contains("Upgrade tirith") || msg.contains("upgrade tirith"));
     }
 
     #[test]
     fn v1_policy_migrates_to_current() {
-        // After M6 ch7, CURRENT_SCHEMA_VERSION >= 2; v1 must reach the new
-        // version cleanly even without any ch6 internal_package_names field.
+        // v1 must reach the current version cleanly even with no legacy field.
         let mut v = make_value(None);
         migrate_forward(&mut v).expect("v1 should migrate cleanly");
         if CURRENT_SCHEMA_VERSION > 1 {
@@ -308,9 +274,8 @@ mod tests {
 
     #[test]
     fn v1_to_v2_moves_top_level_internal_package_names() {
-        // M6 ch7 — top-level `internal_package_names: ["@org/*"]` must be
-        // lifted under `package_policy.internal_package_names` as
-        // structured entries.
+        // Top-level `internal_package_names` lifted under `package_policy` as
+        // structured `{name}` entries.
         let mut map = serde_yaml::Mapping::new();
         map.insert(
             Value::String("paranoia".to_string()),
@@ -326,11 +291,11 @@ mod tests {
         let mut v = Value::Mapping(map);
         migrate_forward(&mut v).expect("migration must succeed");
 
-        // Top-level field must be gone.
+        // Top-level field gone.
         let top = v.as_mapping().unwrap();
         assert!(!top.contains_key(Value::String("internal_package_names".to_string())));
 
-        // Lifted under package_policy.internal_package_names with `name` key.
+        // Lifted under package_policy.internal_package_names with `name` keys.
         let pp = top
             .get(Value::String("package_policy".to_string()))
             .and_then(|v| v.as_mapping())
@@ -355,16 +320,15 @@ mod tests {
     fn v1_to_v2_with_no_legacy_field_is_clean() {
         let mut v = make_value(None);
         migrate_forward(&mut v).expect("migration must succeed");
-        // package_policy is not created when nothing to move.
+        // package_policy is not created when there's nothing to move.
         let top = v.as_mapping().unwrap();
         assert!(!top.contains_key(Value::String("internal_package_names".to_string())));
     }
 
     #[test]
     fn v1_to_v2_idempotent_merge_preserves_existing() {
-        // If a policy carries both the legacy top-level list AND a v2-shape
-        // entry under package_policy.internal_package_names, the migration
-        // must merge them without duplicating by name.
+        // Legacy top-level list AND a v2-shape entry must merge without
+        // duplicating by name.
         let mut existing_ipn = serde_yaml::Mapping::new();
         existing_ipn.insert(
             Value::String("name".to_string()),
@@ -409,7 +373,7 @@ mod tests {
                     .and_then(|v| v.as_str())
             })
             .collect();
-        // Both names present; "@my-co/*" appears only once.
+        // Both present; "@my-co/*" appears once.
         assert_eq!(names.iter().filter(|n| **n == "@my-co/*").count(), 1);
         assert!(names.contains(&"other"));
     }

@@ -1,8 +1,7 @@
 //! Shared constants and helpers used by multiple rule modules.
 
-/// Environment variable names that carry sensitive credentials.
-/// Used by both `command.rs` (SensitiveEnvExport detection) and
-/// `credential.rs` (dedup suppression).
+/// Sensitive-credential env var names. Used by `command.rs` (SensitiveEnvExport)
+/// and `credential.rs` (dedup suppression).
 pub const SENSITIVE_KEY_VARS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -12,13 +11,9 @@ pub const SENSITIVE_KEY_VARS: &[&str] = &[
     "GITHUB_TOKEN",
 ];
 
-/// Known URL-shortener hosts whose target is hidden behind a redirect. Used by
-/// `transport.rs` (the `ShortenedUrl` rule) and `paste_provenance.rs` (a
-/// shortened destination host is a risk signal that escalates a host mismatch).
-/// Centralised here so the two consumers cannot drift (M12 ch1).
-///
-/// Matching is exact (case-insensitive at the call site): a host equals one of
-/// these entries.
+/// Known URL-shortener hosts. Centralised so `transport.rs` (`ShortenedUrl`) and
+/// `paste_provenance.rs` (host-mismatch escalation) can't drift (M12 ch1).
+/// Matching is exact, case-insensitive at the call site.
 pub const URL_SHORTENER_HOSTS: &[&str] = &[
     "bit.ly",
     "t.co",
@@ -36,15 +31,9 @@ pub fn is_url_shortener(host: &str) -> bool {
     URL_SHORTENER_HOSTS.iter().any(|s| lower == *s)
 }
 
-/// The canonical set of "critical" criticality labels recognised by the
-/// M8 context / SSH / IaC / container rules. A label outside this set is
-/// recorded for operator inventory but never causes the rule to fire.
-///
-/// Centralising this list avoids the drift hazard from having four
-/// independent copies (PR-127 review #7) — adding `p1-staging` here
-/// covers every consumer in one edit.
-///
-/// Matching is case-insensitive and ignores surrounding whitespace.
+/// Canonical "critical" criticality labels for the M8 context/SSH/IaC/container
+/// rules; a label outside this set never fires. Centralised to avoid the
+/// four-copy drift hazard (PR-127 review #7). Case-insensitive, whitespace-trimmed.
 pub fn is_critical_label(label: &str) -> bool {
     let lower = label.trim().to_lowercase();
     matches!(

@@ -1,25 +1,10 @@
-//! Container-runtime rules (M8 ch5).
+//! Container-runtime rules (M8 ch5). Fire when the leader is `docker`/`podman`
+//! and: `run --privileged` (drops kernel-security boundaries), `run -v` mounting
+//! a sensitive host path, or `exec` against a container labeled prod/critical via
+//! `policy.context_labels` keyed by `container:<name>`.
 //!
-//! These rules fire when the parsed command's leader is `docker` /
-//! `podman` and either:
-//!
-//!   * `docker run --privileged …` — drops kernel-security boundaries.
-//!   * `docker run -v <host>:<container> …` where `<host>` is one of
-//!     the documented sensitive paths (`/var/run/docker.sock`, `~/.ssh`,
-//!     `~/.aws`, `/etc`).
-//!   * `docker exec <container> …` against a container labeled
-//!     `prod` / `production` / `critical` via `policy.context_labels`
-//!     keyed by `container:<name>`.
-//!
-//! The PATTERN_TABLE adds `docker_run` and `docker_exec` so these rules
-//! can reach the tier-3 path from the exec context.
-//!
-//! ## Detection guard
-//!
-//! Detection short-circuits when the parsed leader is not a container
-//! runtime. The pattern walks each segment to handle `… | docker run …`
-//! pipes, but the flag parsing is shape-specific to `run` vs `exec`
-//! subcommands.
+//! PATTERN_TABLE adds `docker_run`/`docker_exec` so these reach tier-3 from the
+//! exec context. Detection short-circuits on a non-container leader.
 
 use std::collections::HashSet;
 
@@ -30,9 +15,8 @@ use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Sensitive bind-mount source paths. Each entry is matched against
-/// the **source side** of a `-v src:dst[:opts]` / `--volume src:dst`
-/// pair. Container-side paths are NOT checked.
+/// Sensitive bind-mount source paths, matched against the SOURCE side of a
+/// `-v src:dst[:opts]` / `--volume src:dst` pair (container side not checked).
 static SENSITIVE_BIND_SOURCES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
         "/var/run/docker.sock",
@@ -156,9 +140,8 @@ fn check_exec(
     ));
 }
 
-/// Walk `args` and find the first non-flag positional — that's the
-/// docker subcommand. Returns the subcommand string and the slice of
-/// args AFTER it.
+/// First non-flag positional — the docker subcommand. Returns it plus the args
+/// AFTER it.
 fn locate_subcommand(args: &[String]) -> Option<(String, &[String])> {
     for (i, raw) in args.iter().enumerate() {
         let a = strip_outer_quotes(raw);
@@ -183,9 +166,8 @@ fn has_privileged_flag(args: &[String]) -> bool {
     false
 }
 
-/// Find the first `-v src:dst[:opts]` / `--volume src:dst[:opts]` /
-/// `--mount type=bind,source=…` argument that names a sensitive
-/// source path. Returns the matched source.
+/// First `-v` / `--volume` / `--mount source=…` argument naming a sensitive
+/// source path; returns the matched source.
 fn sensitive_bind_mount(args: &[String]) -> Option<String> {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {

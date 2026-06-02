@@ -1,42 +1,16 @@
-//! AI-relevant file hidden-content scan rules — file-content detection for
-//! file types an AI coding agent or a renderer reads and acts on, where an
-//! attacker can smuggle content past a human reviewer.
+//! AI-relevant file hidden-content scan rules — detect content a human
+//! reviewer would not see but an AI agent (or renderer) still processes.
 //!
-//! Where `cifile.rs` inspects a repository's *build/deploy* files and
-//! `configfile.rs` inspects AI *config* files for visible prompt-injection
-//! patterns, this module looks for **hidden / smuggled** content — content a
-//! human reviewing the file would not see, but an AI agent (or a renderer)
-//! would still process. It runs only on the `tirith scan` FileScan path (never
-//! the exec hot path), so a tier-1 PATTERN_TABLE entry is not required for
-//! reachability — `tier1_scan` always returns `true` for FileScan.
+//! Runs only on the `tirith scan` FileScan path (never the exec hot path), so
+//! no tier-1 PATTERN_TABLE entry is required — `tier1_scan` always returns
+//! `true` for FileScan.
 //!
-//! Three file kinds are covered:
+//! Three file kinds: Jupyter notebooks (`.ipynb`), AI agent-instruction files
+//! (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, … — only *hidden* directives
+//! fire, visible instructions are legitimate), and SVG images (`.svg`).
 //!
-//!  - **Jupyter notebooks (`.ipynb`)** — `notebook_hidden_content` and
-//!    `notebook_suspicious_output`. A notebook is JSON; a human reads the
-//!    rendered cells, not the raw structure. Detections: invisible / bidi /
-//!    zero-width characters inside cell source or markdown, base64-encoded
-//!    blobs embedded in source, a cell hidden from the rendered view via
-//!    `metadata.jupyter.source_hidden` / a `hide_input` tag, and cell
-//!    *outputs* that carry executable or hidden content.
-//!  - **AI agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`,
-//!    and similar)** — `agent_instruction_hidden`. These files *legitimately*
-//!    contain instructions for a coding agent, so an ordinary visible
-//!    instruction must NOT fire. Only *hidden* directives fire: an HTML
-//!    comment (`<!-- … -->`) carrying an instruction/imperative, or a
-//!    visually-hidden HTML element. (Invisible / zero-width / bidi characters
-//!    in these files are already covered by `configfile.rs` and the FileScan
-//!    byte-scan — not re-checked here.)
-//!  - **SVG images (`.svg`)** — `svg_script_embedded` and
-//!    `svg_external_reference`. An SVG is XML and can carry an active payload:
-//!    an embedded `<script>`, a `javascript:` URI, an inline `on*` event
-//!    handler, or an external reference (a remote `xlink:href` / `href`, or an
-//!    XXE external-entity declaration) that a viewer would fetch.
-//!
-//! Detection is pure parsing / pattern matching — no network. Every function
-//! here is total: a malformed file yields no findings, never a panic. DOCX /
-//! PPTX / ODT are deliberately out of scope (their ZIP/XML parser complexity
-//! is deferred).
+//! Detection is pure parsing — no network. Every function is total (malformed
+//! file → no findings, never a panic). DOCX/PPTX/ODT are out of scope.
 
 use std::path::Path;
 
@@ -56,11 +30,7 @@ pub enum AiFileKind {
 }
 
 /// AI agent-instruction basenames whose *hidden* content this module scans.
-///
-/// These files legitimately contain visible instructions for a coding agent,
-/// so the agent-instruction checks here only ever flag *hidden* content
-/// (HTML comments, visually-hidden elements). Visible prompt-injection text in
-/// these same files is the concern of `configfile.rs`.
+/// Visible prompt-injection text in these files is `configfile.rs`'s concern.
 const AGENT_INSTRUCTION_BASENAMES: &[&str] = &[
     "claude.md",
     "agents.md",
@@ -77,27 +47,22 @@ const AGENT_INSTRUCTION_BASENAMES: &[&str] = &[
     "llms-full.txt",
 ];
 
-/// Classify a file path as an AI-relevant file `aifile` rules should scan, if
-/// it is one. Returns `None` for any other file so the scan stays narrowly
-/// scoped. Matching is by basename / extension only — content is never read
-/// here.
+/// Classify a file path as an AI-relevant file, or `None`. Basename/extension
+/// only — content is never read here.
 pub fn classify(path: Option<&Path>) -> Option<AiFileKind> {
     let path = path?;
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower = basename.to_ascii_lowercase();
 
-    // `*.ipynb` — a Jupyter notebook.
     if lower.ends_with(".ipynb") {
         return Some(AiFileKind::Notebook);
     }
 
-    // `*.svg` — an SVG image. (`*.svgz` is gzip-compressed; not scanned —
-    // decompression is deferred, same rationale as DOCX/PPTX.)
+    // `*.svgz` (gzip-compressed) is not scanned — decompression deferred.
     if lower.ends_with(".svg") {
         return Some(AiFileKind::Svg);
     }
 
-    // An AI agent-instruction file — exact basename match.
     if AGENT_INSTRUCTION_BASENAMES.contains(&lower.as_str()) {
         return Some(AiFileKind::AgentInstructions);
     }
@@ -115,32 +80,22 @@ pub fn classify(path: Option<&Path>) -> Option<AiFileKind> {
     None
 }
 
-/// `true` when `path` is an AI-relevant file `aifile` rules scan. A thin
-/// wrapper over [`classify`] for the engine's dispatch check.
+/// `true` when `path` is an AI-relevant file `aifile` rules scan.
 pub fn is_ai_file(path: Option<&Path>) -> bool {
     classify(path).is_some()
 }
 
-/// `true` when `path` is an AI **config** file — the instruction / config
-/// surface a coding agent reads and acts on, which `tirith ai snapshot|diff`
-/// tracks. This is NARROWER than [`is_ai_file`]: it is the agent-instruction set
-/// (CLAUDE.md, AGENTS.md, .cursorrules, .clinerules, .claude/*, .cursor/rules/*,
-/// …) PLUS MCP server configs (`.mcp.json` / `mcp.json` / `mcp_settings.json`),
-/// and it deliberately EXCLUDES Jupyter notebooks and SVGs (which are content
-/// files an agent reads, not config that instructs it).
+/// `true` when `path` is an AI **config** file (the instruction/config surface
+/// `tirith ai snapshot|diff` tracks). NARROWER than [`is_ai_file`]: the
+/// agent-instruction set plus MCP server configs, EXCLUDING notebooks and SVGs
+/// (content files, not config). Delegates to [`classify_tool`], which covers
+/// exactly that surface.
 pub fn is_ai_config_file(path: &Path) -> bool {
-    // `classify_tool` already covers the whole AI-config surface: the
-    // agent-instruction set (→ `Generic`), the `.claude/*` / `.cursor/*`
-    // directory-aware membership, and MCP server configs (→ `Mcp`). Notebooks
-    // and SVGs are NOT recognised by `classify_tool`, so they are excluded — the
-    // intended narrowing relative to `is_ai_file`.
     classify_tool(path).is_some()
 }
 
-/// Run the AI-relevant-file hidden-content rules over a file's content.
-///
-/// `file_path` selects which checks apply (see [`classify`]); a file that is
-/// not a recognised AI-relevant file produces no findings.
+/// Run the AI-relevant-file hidden-content rules over a file's content. A file
+/// that is not a recognised AI-relevant file produces no findings.
 pub fn check(input: &str, file_path: Option<&Path>) -> Vec<Finding> {
     let mut findings = Vec::new();
     let Some(kind) = classify(file_path) else {
@@ -156,12 +111,10 @@ pub fn check(input: &str, file_path: Option<&Path>) -> Vec<Finding> {
     findings
 }
 
-// ===========================================================================
 // shared helpers
-// ===========================================================================
 
 /// Truncate `s` to at most `max` chars (char-boundary safe), appending `…`
-/// when truncation happened. Keeps evidence lines short.
+/// when truncation happened.
 fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
@@ -171,15 +124,10 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// Codepoints that are invisible-but-acted-on: bidi controls, zero-width
-/// characters, the Unicode Tags block, invisible math operators, word/zero-width
-/// joiners and the like. A human does not see these; an agent reading the raw
-/// text still consumes them.
-///
-/// This intentionally mirrors the set `configfile::is_invisible_control` flags,
-/// kept local so the notebook scan does not depend on a sibling module's
-/// private helper. The ordinary newline / tab / space are NOT invisible —
-/// they are normal whitespace and excluded.
+/// Codepoints that are invisible-but-acted-on: bidi controls, zero-width chars,
+/// the Unicode Tags block, invisible math operators, joiners, etc. Mirrors
+/// `configfile::is_invisible_control` (kept local to avoid a cross-module dep).
+/// Ordinary newline/tab/space are NOT invisible and are excluded.
 fn is_smuggled_invisible(ch: char) -> bool {
     matches!(ch,
         // Bidirectional formatting controls.
@@ -227,9 +175,8 @@ fn scan_invisible(s: &str) -> (usize, Vec<String>) {
     (count, codepoints)
 }
 
-/// A run of base64-looking characters long enough to carry a payload. A short
-/// run (a hash, an id) is not interesting; this looks for a long contiguous
-/// run that actually decodes to bytes — the shape of an embedded blob.
+/// Minimum length of a base64 run worth treating as an embedded payload (a
+/// short run — a hash, an id — is not interesting).
 const MIN_BASE64_BLOB_LEN: usize = 96;
 
 /// Whether `s` contains a long base64 run that decodes successfully — the
@@ -256,8 +203,7 @@ fn find_base64_blob(s: &str) -> Option<String> {
         }
         let run = &s[start..end];
         if run.len() >= MIN_BASE64_BLOB_LEN {
-            // Require it to actually decode (standard or URL-safe) — a long
-            // hex string or a long identifier will not.
+            // Require it to actually decode (standard or URL-safe).
             let decodes = base64::engine::general_purpose::STANDARD
                 .decode(run)
                 .is_ok()
@@ -279,15 +225,12 @@ fn find_base64_blob(s: &str) -> Option<String> {
     None
 }
 
-// ===========================================================================
 // Jupyter notebook checks
-// ===========================================================================
 
 /// Scan a Jupyter notebook's JSON for hidden content in cell source/markdown
 /// and for suspicious cell outputs.
 fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
-    // A notebook is a JSON document. A non-JSON file with a `.ipynb`
-    // extension is not a notebook — produce nothing rather than guess.
+    // A non-JSON `.ipynb` is not a notebook — produce nothing rather than guess.
     let Ok(json) = serde_json::from_str::<serde_json::Value>(input) else {
         return;
     };
@@ -295,9 +238,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
         return;
     };
 
-    // Accumulate one finding per detection class across all cells, so a
-    // notebook with 30 poisoned cells yields a small set of clear findings,
-    // not 30 noisy ones.
+    // One finding per detection class across all cells (not one per cell).
     let mut invisible_hit: Option<(usize, usize, Vec<String>)> = None; // (cell_idx, count, codepoints)
     let mut invisible_cells = 0usize;
     let mut base64_hit: Option<(usize, String)> = None;
@@ -313,7 +254,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
             None => continue,
         };
 
-        // --- cell source: invisible characters + base64 blob -------------
+        // cell source: invisible characters + base64 blob
         let source = join_source(cell_obj.get("source"));
 
         if !source.is_empty() {
@@ -331,7 +272,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
             }
         }
 
-        // --- hidden cell: collapsed/hidden from the rendered view --------
+        // hidden cell: collapsed/hidden from the rendered view
         if let Some(reason) = cell_is_hidden(cell_obj) {
             hidden_cell_count += 1;
             if hidden_cell_hit.is_none() {
@@ -339,7 +280,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
             }
         }
 
-        // --- cell outputs: invisible chars + embedded HTML --------------
+        // cell outputs: invisible chars + embedded HTML
         if let Some(outputs) = cell_obj.get("outputs").and_then(|o| o.as_array()) {
             for output in outputs {
                 let (out_inv, out_html) = scan_output(output);
@@ -357,7 +298,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
         }
     }
 
-    // --- emit notebook_hidden_content findings ---------------------------
+    // emit notebook_hidden_content findings
     if let Some((cell_idx, count, codepoints)) = invisible_hit {
         let cp = if codepoints.is_empty() {
             String::new()
@@ -439,7 +380,7 @@ fn check_notebook(input: &str, findings: &mut Vec<Finding>) {
         });
     }
 
-    // --- emit notebook_suspicious_output findings ------------------------
+    // emit notebook_suspicious_output findings
     if let Some((cell_idx, count, codepoints)) = output_invisible_hit {
         let cp = if codepoints.is_empty() {
             String::new()
@@ -506,18 +447,12 @@ fn join_source(source: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Whether a notebook cell is marked hidden from the rendered view. Returns a
-/// short reason when it is.
-///
-/// Two standard mechanisms: a `metadata.jupyter.source_hidden` (or
-/// `outputs_hidden`) boolean set by JupyterLab's cell-collapse UI, and a
-/// `metadata.tags` entry of `hide_input` / `hide_cell` (the nbconvert /
-/// jupyterbook convention). A *code* cell hidden this way is the concern —
-/// the reviewer does not see it but it still executes.
+/// Whether a notebook cell is marked hidden from the rendered view (a short
+/// reason when it is). Two mechanisms: `metadata.jupyter.source_hidden`
+/// (JupyterLab cell-collapse) and a `hide_input`/`hide_cell` tag (nbconvert).
 fn cell_is_hidden(cell: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
     let metadata = cell.get("metadata")?.as_object()?;
 
-    // `metadata.jupyter.source_hidden: true`.
     if let Some(jupyter) = metadata.get("jupyter").and_then(|j| j.as_object()) {
         if jupyter
             .get("source_hidden")
@@ -528,7 +463,6 @@ fn cell_is_hidden(cell: &serde_json::Map<String, serde_json::Value>) -> Option<&
         }
     }
 
-    // `metadata.tags: ["hide_input", …]`.
     if let Some(tags) = metadata.get("tags").and_then(|t| t.as_array()) {
         for tag in tags {
             if let Some(t) = tag.as_str() {
@@ -552,16 +486,13 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
         None => return (None, None),
     };
 
-    // The output text can live under `text` (stream output) or
-    // `data["text/plain"]` / `data["text/html"]` (rich output). Each is a
-    // string or an array of strings.
+    // Output text lives under `text` (stream) or `data["text/plain"]` /
+    // `data["text/html"]` (rich); each is a string or array of strings.
     let mut plain = String::new();
     let mut html = String::new();
-    // A JavaScript MIME bundle on the output. `application/javascript` is the
-    // standard Jupyter MIME for a script the notebook renderer *executes* on
-    // open; `text/javascript` is the older spelling some kernels still emit.
-    // Either is active content in a saved output — there is no benign reason a
-    // committed cell output carries executable JavaScript.
+    // A JS MIME bundle (`application/javascript` / older `text/javascript`) is
+    // active content the renderer executes on open — no benign committed output
+    // carries it.
     let mut has_js_mime = false;
 
     if let Some(t) = obj.get("text") {
@@ -593,11 +524,8 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
         }
     };
 
-    // Active / hidden content in a saved output. A JavaScript MIME bundle is
-    // executable content on its own — it is reported first. Otherwise the
-    // `text/html` output is classified for active content (`<script>` / event
-    // handler / `javascript:`, via the shared `active_html_reasons` helper) or
-    // for CSS-hiding (a notebook-output-only fallback).
+    // A JS MIME bundle is reported first; otherwise classify the `text/html`
+    // output for active content or CSS-hiding (notebook-output-only fallback).
     let html_hit = if has_js_mime {
         Some("an application/javascript output MIME bundle (executable content)")
     } else if !html.is_empty() {
@@ -613,31 +541,24 @@ fn scan_output(output: &serde_json::Value) -> (Option<(usize, Vec<String>)>, Opt
     (invisible_hit, html_hit)
 }
 
-// ===========================================================================
 // AI agent-instruction file checks
-// ===========================================================================
 
-/// Scan an AI agent-instruction file for *hidden* directives.
-///
-/// These files legitimately contain visible instructions, so visible text is
-/// never flagged here. Only hidden channels fire: an HTML comment carrying an
-/// instruction-shaped directive, or a visually-hidden HTML element.
+/// Scan an AI agent-instruction file for *hidden* directives. Visible text is
+/// never flagged (these files legitimately contain instructions); only an HTML
+/// comment carrying a directive or a visually-hidden HTML element fires.
 fn check_agent_instructions(input: &str, findings: &mut Vec<Finding>) {
     let mut hidden_hits: Vec<(usize, String)> = Vec::new();
 
-    // --- HTML comments carrying a directive ------------------------------
-    // `<!-- … -->`. Markdown renders an HTML comment to nothing, so a
-    // directive inside one is invisible to a human reading the rendered file
-    // but is still plain text an agent reading the raw file consumes.
+    // HTML comments carrying a directive: Markdown renders `<!-- … -->` to
+    // nothing, but it is plain text an agent reading the raw file consumes.
     for (line, body) in html_comments(input) {
         if comment_body_is_directive(&body) {
             hidden_hits.push((line, format!("HTML comment: \"{}\"", truncate(&body, 100))));
         }
     }
 
-    // --- visually-hidden HTML elements -----------------------------------
-    // A `<div hidden>`, `aria-hidden`, or a `style="display:none"` element
-    // embedded in the markdown carries text that is not rendered.
+    // Visually-hidden HTML elements (`<div hidden>`, `aria-hidden`,
+    // `style="display:none"`) carry text that is not rendered.
     for (line, snippet, _inner) in hidden_html_elements(input) {
         hidden_hits.push((
             line,
@@ -682,13 +603,9 @@ fn check_agent_instructions(input: &str, findings: &mut Vec<Finding>) {
 }
 
 /// Extract every `<!-- … -->` HTML comment from `input`, with the 1-based line
-/// number of the comment's start.
-///
-/// An unterminated `<!--` (no closing `-->`) is not skipped: the rest of the
-/// file is the comment body — it renders to nothing yet is plain text a coding
-/// agent still reads — so the tail is returned as a single hidden-content
-/// region. Aborting on the unterminated comment would let an attacker hide the
-/// file tail with no finding.
+/// number of the comment's start. An unterminated `<!--` is NOT skipped — the
+/// file tail is returned as one hidden region, else an attacker could hide it
+/// with no finding.
 fn html_comments(input: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let bytes = input.as_bytes();
@@ -712,11 +629,7 @@ fn html_comments(input: &str) -> Vec<(usize, String)> {
                     out.push((line, input[start..e].trim().to_string()));
                     i = e + 3;
                 }
-                // Unterminated comment — `<!--` with no closing `-->`. The
-                // whole tail of the file is inside the comment, so it renders
-                // to nothing while still being plain text an agent consumes.
-                // Treat EOF as the end of the hidden region: scan the rest of
-                // the file as the comment body, then stop.
+                // Unterminated `<!--`: EOF is the end of the hidden region.
                 None => {
                     let line = line_of(input, i);
                     out.push((line, input[start..].trim().to_string()));
@@ -730,13 +643,10 @@ fn html_comments(input: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// Whether an HTML-comment body looks like a *directive* aimed at an agent —
-/// an instruction / imperative / injection pattern — rather than an ordinary
-/// developer note (`<!-- TODO -->`, `<!-- prettier-ignore -->`).
-///
-/// Conservative on purpose: a short comment, or one without an
-/// instruction-shaped phrase, does not fire — the false-positive risk is a
-/// benign comment in a CLAUDE.md.
+/// Whether an HTML-comment body looks like a *directive* aimed at an agent
+/// (instruction / imperative / injection) rather than a developer note
+/// (`<!-- TODO -->`). Conservative: short or non-instruction-shaped bodies do
+/// not fire, to avoid flagging benign CLAUDE.md comments.
 fn comment_body_is_directive(body: &str) -> bool {
     let trimmed = body.trim();
     // Very short comments are notes, not smuggled instructions.
@@ -759,8 +669,7 @@ fn comment_body_is_directive(body: &str) -> bool {
         return false;
     }
 
-    // Instruction / injection-shaped phrases. A hidden comment containing one
-    // of these in an agent-instruction file is the attack shape.
+    // Instruction / injection-shaped phrases — the attack shape.
     const DIRECTIVE_MARKERS: &[&str] = &[
         "ignore previous",
         "ignore all previous",
@@ -796,33 +705,22 @@ fn comment_body_is_directive(body: &str) -> bool {
     DIRECTIVE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Whether an opening-tag `snippet` carries a `class` attribute whose
-/// whitespace-split TOKEN LIST contains an a11y-benign whole token (`icon` or
-/// `sr-only`, case-insensitive). Used by [`hidden_html_elements`]'s carve-out
-/// (CodeRabbit M13 round-23): the exception fires on a WHOLE class TOKEN, never a
-/// substring, so `class="iconography"` (substring) and `data-x="svg"` (wrong
-/// attribute) are NOT exempted, while `class="sr-only"` / `class="icon"` are.
-///
-/// The `class` value is extracted with a small focused parse: find `class`,
-/// require an `=` (allowing whitespace), then read the value as a double- or
-/// single-quoted run, or — for an unquoted attribute — a single whitespace-free,
-/// non-`>` token. Only `class` is inspected; any other attribute (`data-x`,
-/// `title`, …) is ignored, so it cannot smuggle the exempting token.
+/// Whether an opening-tag `snippet` has a `class` attribute whose
+/// whitespace-split token list contains an a11y-benign WHOLE token (`icon` /
+/// `sr-only`). [`hidden_html_elements`]'s carve-out (CodeRabbit M13 round-23):
+/// matching a whole class token (not a substring, not another attribute) keeps
+/// `class="iconography"` / `data-x="svg"` SCANNED while exempting `class="icon"`.
 fn class_has_a11y_token(snippet: &str) -> bool {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
-    // `class = "…"` / `class='…'` / `class=token`. Group 1/2/3 = the value for the
-    // double-quoted / single-quoted / unquoted form respectively. `(?i)` so a
-    // `CLASS=` spelling is still parsed; the value tokens are compared lower-cased.
+    // Group 1/2/3 = double-quoted / single-quoted / unquoted `class` value.
     static CLASS_ATTR: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r#"(?i)\bclass\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s">]+))"#).unwrap()
     });
 
     const A11Y_TOKENS: &[&str] = &["icon", "sr-only"];
 
-    // A tag can carry only one `class`, but iterate defensively and accept a match
-    // from any `class=` occurrence.
     for caps in CLASS_ATTR.captures_iter(snippet) {
         let value = caps
             .get(1)
@@ -840,40 +738,24 @@ fn class_has_a11y_token(snippet: &str) -> bool {
     false
 }
 
-/// Extract HTML elements that are visually hidden — `hidden` attribute,
-/// `aria-hidden="true"`, or a `style="…display:none…"` (or `visibility:hidden`
-/// / `opacity:0`).
+/// Extract visually-hidden HTML elements — `hidden`, `aria-hidden="true"`, or a
+/// `style` with `display:none` / `visibility:hidden` / `opacity:0`. `<svg
+/// aria-hidden>` and screen-reader-only / icon elements are excluded (matching
+/// `rendered.rs`).
 ///
-/// `<svg aria-hidden>` and screen-reader-only / icon elements are common,
-/// benign a11y patterns and are excluded — matching `rendered.rs`'s carve-out.
-///
-/// Each hit is `(line, opening_tag, inner_text)`: the 1-based line of the opening
-/// tag, the opening tag itself (e.g. `<div hidden>`), and the element's INNER TEXT
-/// — the raw bytes between the opening tag and its matching `</tag>` close (or, if
-/// the element is never closed, the rest of the document). The inner text lets the
-/// diff path key an element on its CONTENT, not just its opening tag, so an
-/// attacker who keeps the same hidden `<div …>` wrapper but rewrites the inner text
-/// into a directive (`<div hidden>note</div>` → `<div hidden>RUN: …</div>`) is
-/// still seen as drift (CodeRabbit M13 round-22 aifile.rs:1062-1066).
+/// Each hit is `(line, opening_tag, inner_text)`. The inner text (bytes up to
+/// the matching `</tag>`, or EOF if unclosed) lets the diff path key on element
+/// CONTENT so rewriting `<div hidden>note</div>` → `<div hidden>RUN: …</div>` is
+/// still drift (CodeRabbit M13 round-22).
 fn hidden_html_elements(input: &str) -> Vec<(usize, String, String)> {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
     static HIDDEN_TAG: Lazy<Regex> = Lazy::new(|| {
-        // The hidden-marker alternatives accept BOTH quoted and unquoted attribute
-        // values (CodeRabbit M13 round-23 aifile.rs:818-823): `aria-hidden=true`
-        // and `style=display:none` (no quotes) are valid HTML and were previously
-        // un-matched, letting an attacker dodge the scan by simply omitting quotes.
-        //   - `aria-hidden` accepts `"true"`, `'true'`, or a bare `true` token.
-        //   - `style` has two arms, both still gated to a HIDING declaration
-        //     (`display:none` / `visibility:hidden` / `opacity:0`):
-        //       * QUOTED (unchanged): `style="…display:none…"` — an opening quote,
-        //         any non-quote chars, then the hiding declaration.
-        //       * UNQUOTED: `style=display:none` — an unquoted HTML attribute value
-        //         is a single whitespace-free token, so any leading run is matched
-        //         with `[^\s">]*` (no quote, no space, not the closing `>`) up to the
-        //         hiding declaration. A `style=color:red` value has no hiding
-        //         declaration and so still does NOT match.
+        // Accept both quoted and unquoted attribute values (CodeRabbit M13
+        // round-23): `aria-hidden=true` / `style=display:none` (no quotes) are
+        // valid HTML and were previously un-matched. `style` is always gated to a
+        // hiding declaration, so `style=color:red` still does NOT match.
         Regex::new(
             r#"(?is)<([a-z][a-z0-9]*)\b[^>]*?(?:\bhidden\b|aria-hidden\s*=\s*(?:"true"|'true'|true)\b|style\s*=\s*(?:["'][^"']*|[^\s">]*)(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0))[^>]*>"#,
         )
@@ -881,30 +763,19 @@ fn hidden_html_elements(input: &str) -> Vec<(usize, String, String)> {
     });
 
     let mut out = Vec::new();
-    // `captures_iter` (not `find_iter`) so capture group 1 — the element name —
-    // is available to locate the matching `</tag>` that bounds the inner text.
+    // `captures_iter` so group 1 (element name) locates the matching `</tag>`.
     for caps in HIDDEN_TAG.captures_iter(input) {
         let m = caps.get(0).unwrap();
         let snippet = m.as_str();
         let tag = caps.get(1).map(|c| c.as_str()).unwrap_or("");
-        // a11y-benign carve-out (CodeRabbit M13 round-23 aifile.rs:831-834): the
-        // earlier version inspected the WHOLE lowercased opening tag for the
-        // SUBSTRINGS "svg" / "icon" / "sr-only" anywhere — attacker-controllable, so
-        // `<div hidden data-x="svg">` or any tag merely CONTAINING "icon" dodged the
-        // scan. Parse the opening tag structurally instead and exempt ONLY:
-        //   - the tag NAME is exactly `svg` (a decorative inline SVG), OR
-        //   - the `class` attribute's whitespace-split TOKEN LIST contains `icon` or
-        //     `sr-only` as a WHOLE token (the real a11y class names),
-        // never a substring and never inner text. So `<div hidden class="iconography">`
-        // (substring), `<div hidden data-x="svg">` (not the tag name / not a class
-        // token), and `<div hidden class="x" title="icon">` (wrong attribute) all
-        // stay SCANNED.
+        // a11y-benign carve-out (CodeRabbit M13 round-23): exempt ONLY a tag NAME
+        // of exactly `svg` or a WHOLE `class` token of `icon`/`sr-only` — never a
+        // substring or another attribute, so `class="iconography"` and
+        // `data-x="svg"` stay SCANNED.
         if tag.eq_ignore_ascii_case("svg") || class_has_a11y_token(snippet) {
             continue;
         }
-        // Inner text = bytes from the end of the opening tag to the matching
-        // `</tag>` (case-insensitive). If the element is never closed, the rest of
-        // the document is its inner text — text a coding agent still reads.
+        // Inner text up to the matching `</tag>` (or EOF if never closed).
         let after = &input[m.end()..];
         let close = format!("</{}", tag.to_ascii_lowercase());
         let inner = match after.to_ascii_lowercase().find(&close) {
@@ -920,29 +791,19 @@ fn hidden_html_elements(input: &str) -> Vec<(usize, String, String)> {
     out
 }
 
-// ===========================================================================
 // AI-config DRIFT diff (M13 ch5) — `tirith ai diff`
-// ===========================================================================
 
-/// Normalize an AI-config file's text before diffing so a pure Markdown reformat
-/// (re-wrapping, trailing-whitespace churn, blank-line runs) is NOT reported as
-/// drift (the plan's false-positive guard). The transform is deliberately
-/// minimal and content-preserving: it never reorders or drops a non-blank line,
-/// so a genuinely-added instruction always survives into the diff.
-///
-///  - each line's TRAILING whitespace is trimmed (editors / formatters churn it);
-///  - runs of blank lines collapse to a single blank line;
-///  - leading/trailing blank lines are dropped.
-///
-/// Leading indentation is preserved (it can be semantically meaningful in a
-/// nested directive), and inner non-blank lines keep their order and content.
+/// Normalize an AI-config file before diffing so a pure Markdown reformat is
+/// NOT reported as drift (false-positive guard). Trailing whitespace trimmed,
+/// blank-line runs collapsed, leading/trailing blanks dropped; leading
+/// indentation and the order/content of non-blank lines are preserved.
 fn normalize_for_diff(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut pending_blank = false;
     for raw in input.lines() {
         let trimmed_end = raw.trim_end();
         if trimmed_end.is_empty() {
-            // Defer blank lines: only emit a single separator when a non-blank
+            // Defer blank lines: emit a single separator only when a non-blank
             // line follows, so runs collapse and trailing blanks vanish.
             if !out.is_empty() {
                 pending_blank = true;
@@ -958,11 +819,9 @@ fn normalize_for_diff(input: &str) -> Vec<String> {
     out
 }
 
-/// The set of normalized lines ADDED in `new` relative to `old` — lines present
-/// in the new file but not in the snapshot. Whitespace-only lines never count as
-/// added (they are normalized away). Multiset-aware: a line that appears more
-/// times in `new` than in `old` is counted as added for each extra occurrence,
-/// so duplicating an existing directive still surfaces.
+/// The normalized lines ADDED in `new` relative to `old`. Whitespace-only lines
+/// never count. Multiset-aware: a line appearing more times in `new` than `old`
+/// is added for each extra occurrence, so a duplicated directive surfaces.
 fn added_lines(old: &str, new: &str) -> Vec<String> {
     use std::collections::HashMap;
     let old_norm = normalize_for_diff(old);
@@ -984,22 +843,14 @@ fn added_lines(old: &str, new: &str) -> Vec<String> {
     added
 }
 
-/// Normalize an AI-config document into PARAGRAPH-level units for the
-/// visible-directive-added diff. A paragraph is a run of consecutive non-blank
-/// lines (blank lines, after trailing-whitespace trimming, are separators); each
-/// paragraph collapses into a single normalized string — its lines joined with a
-/// single space, then every internal ASCII-whitespace run collapsed to one space.
+/// Normalize an AI-config document into PARAGRAPH-level units (a paragraph is a
+/// run of non-blank lines, joined and whitespace-collapsed to one string).
 ///
-/// Why this exists (R4): [`normalize_for_diff`] is LINE-based, so reflowing an
-/// existing directive paragraph from one Markdown line into two (or vice-versa)
-/// makes [`added_lines`] see the new line fragments as additions — and the first
-/// fragment can satisfy [`line_is_directive`], firing on a formatting-only edit.
-/// Collapsing a paragraph to one whitespace-normalized string means the SAME words
-/// across a DIFFERENT number of lines produce the SAME string.
-///
-/// Blank entries are never emitted, so the result is exactly the document's
-/// paragraphs in order. The transform is content-preserving within a paragraph
-/// (no word is reordered or dropped).
+/// R4: [`normalize_for_diff`] is line-based, so reflowing a directive paragraph
+/// across a different number of lines makes [`added_lines`] see fragments as
+/// additions and can fire [`line_is_directive`] on a formatting-only edit.
+/// Collapsing to one string means the SAME words → the SAME string regardless of
+/// line count. Content-preserving; no blank entries emitted.
 fn normalize_paragraphs(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current: Vec<&str> = Vec::new();
@@ -1028,75 +879,48 @@ fn normalize_paragraphs(input: &str) -> Vec<String> {
     out
 }
 
-/// Collapse a WHOLE document into one whitespace-normalized word stream: every
-/// non-blank line's content joined with a single space, then every ASCII-whitespace
-/// run collapsed to one space. Blank-line grouping is erased entirely, so a
-/// directive that was split across lines / paragraphs in `old` still appears as a
-/// contiguous word run here.
+/// Collapse a WHOLE document into one whitespace-normalized word stream (blank-
+/// line grouping erased), so a directive split across lines in `old` still
+/// appears as a contiguous word run.
 fn normalize_doc_words(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The normalized NEW paragraphs that are genuinely ADDED relative to `old`, used
-/// ONLY for the visible-directive-added branch of [`diff_findings`] (R4).
+/// The normalized NEW paragraphs genuinely ADDED relative to `old`, for the
+/// visible-directive-added branch of [`diff_findings`] (R4). Two-stage per NEW
+/// paragraph:
+///  1. EXACT-DUPLICATE (multiset of `normalize_paragraphs(old)`) — an unspent old
+///     copy accounts for it; once exhausted, further exact copies ARE drift, so
+///     adding a SECOND copy of a once-present directive surfaces (R12-1).
+///  2. REFLOW fallback (substring) — a paragraph with NO multiset entry is
+///     suppressed only if its words form a contiguous whole-token run of `old`'s
+///     word stream ([`normalize_doc_words`]).
 ///
-/// Two-stage test, applied per NEW paragraph in order:
-///  1. EXACT-DUPLICATE (multiset) — like [`added_lines`], a multiset of
-///     `normalize_paragraphs(old)` counts is consumed one-for-one. A NEW paragraph
-///     that is byte-for-byte (post-normalization) equal to an OLD paragraph is
-///     governed ONLY by this multiset: if the old multiset still has an unspent
-///     copy, decrement and skip (accounted for by the snapshot); once the old
-///     copies are exhausted, every FURTHER exact copy IS added drift. This is what
-///     makes ADDING A SECOND copy of a directive that existed ONCE in `old` surface
-///     (R12-1) — the single old count is spent on the first copy, and the duplicate
-///     falls through to `added`.
-///  2. REFLOW fallback (substring) — a NEW paragraph that is NOT an exact match of
-///     any old paragraph (i.e. it never appears verbatim in `old`'s paragraph set,
-///     so the multiset has no entry for it) is a candidate REFLOW: the same words
-///     re-wrapped across a different number of lines, or paragraphs regrouped by
-///     inserted/removed blank lines, both yield a paragraph string that differs
-///     from any old paragraph yet whose words still exist contiguously in `old`. It
-///     is checked against `old`'s whole-document word stream
-///     ([`normalize_doc_words`]); a contiguous-substring match means formatting-only
-///     and is suppressed. Only a paragraph that is neither an unspent exact copy nor
-///     a contiguous word-run of `old` is genuinely-new drift and surfaces.
-///
-/// The substring fallback is deliberately gated to paragraphs WITHOUT a multiset
-/// entry. If it were consulted for an exact-match paragraph after its old count was
-/// spent, a duplicated directive would be wrongly re-suppressed (its words are still
-/// a substring of `old`) — reintroducing the R12-1 bug.
+/// The substring fallback is gated to paragraphs WITHOUT a multiset entry; using
+/// it for a spent exact-match would re-suppress a duplicate (reintroducing R12-1).
 fn added_directive_paragraphs(old: &str, new: &str) -> Vec<String> {
     use std::collections::HashMap;
     let mut old_counts: HashMap<String, usize> = HashMap::new();
     for para in normalize_paragraphs(old) {
         *old_counts.entry(para).or_insert(0) += 1;
     }
-    // Space-padded word stream so the reflow-substring check below matches only
-    // WHOLE-TOKEN runs. Without the padding, `old_words.contains(para)` succeeds
-    // when `para` falls inside a LARGER token boundary — e.g. an old paragraph
-    // `Always rerun cargo test` would suppress a newly-added `run cargo test`,
-    // because the bytes `run cargo test` are a raw substring of `rerun cargo
-    // test`. Padding both haystack and needle with leading/trailing spaces means
-    // a needle only matches when its first and last tokens are themselves whole
-    // tokens in `old`, so `rerun` no longer satisfies a search for `run`
-    // (CodeRabbit M13 round-15 R15-1).
+    // Space-padded so the substring check matches WHOLE-TOKEN runs only: without
+    // padding `run cargo test` would match inside `rerun cargo test` (CodeRabbit
+    // M13 round-15 R15-1).
     let old_words = format!(" {} ", normalize_doc_words(old));
     let mut added = Vec::new();
     for para in normalize_paragraphs(new) {
         match old_counts.get_mut(&para) {
-            // Exact match of an old paragraph: governed solely by the multiset.
-            // An unspent old copy accounts for it; spend the copy and skip.
+            // Exact match, unspent old copy: spend it and skip.
             Some(n) if *n > 0 => {
                 *n -= 1;
                 continue;
             }
-            // Exact match but old copies are exhausted — a duplicate. It is NOT
-            // routed through the substring fallback (which would re-suppress it);
-            // it falls through to `added` below as genuine drift.
+            // Exact match but exhausted — a duplicate; falls through as drift
+            // (NOT routed through the substring fallback, which would re-suppress).
             Some(_) => {}
-            // Not an exact match of any old paragraph: a candidate reflow. Suppress
-            // only if its words already exist as a contiguous WHOLE-TOKEN run in
-            // `old` (space-padded both sides — see `old_words` above).
+            // No multiset entry — candidate reflow: suppress only if a contiguous
+            // whole-token run of `old`.
             None => {
                 if old_words.contains(&format!(" {para} ")) {
                     continue;
@@ -1108,33 +932,22 @@ fn added_directive_paragraphs(old: &str, new: &str) -> Vec<String> {
     added
 }
 
-/// A hidden construct found in an AI-config document: a directive-bearing HTML
-/// comment or a visually-hidden HTML element. `key` is a normalized identity used
-/// to compare the OLD and NEW documents (so a pure reformat is not "new");
-/// `evidence` is the human-facing detail line.
+/// A hidden construct in an AI-config document: a directive-bearing HTML comment
+/// or a visually-hidden HTML element. `key` is a normalized identity for
+/// comparing OLD vs NEW; `evidence` is the human-facing detail line.
 struct HiddenConstruct {
     key: String,
     evidence: String,
 }
 
-/// Detect every hidden construct in `input` (a whole AI-config document), scanned
-/// COMPLETE — `html_comments` / `hidden_html_elements` see multi-line constructs
-/// in full because they run over the whole document, not a sliced added-only
-/// block. The diff path uses this on BOTH the old and new versions and fires only
-/// for constructs present in NEW but not OLD (see [`diff_findings`]).
-///
-/// The `key` is whitespace-normalized (runs of ASCII whitespace collapse to a
-/// single space, lower-cased, trimmed) so a benign reformat of content that was
-/// already hidden produces the SAME key in both versions and is therefore not
-/// reported as new.
+/// Detect every hidden construct in a whole AI-config document. Scanned complete
+/// (so multi-line constructs are seen in full); the diff path runs this on both
+/// versions and fires only for constructs in NEW but not OLD. Keys are normalized
+/// so a benign reformat of already-hidden content is not reported as new.
 fn hidden_constructs(input: &str) -> Vec<HiddenConstruct> {
-    // Identity key for comparing OLD vs NEW: strip ALL ASCII whitespace and
-    // lower-case. Whitespace inside an HTML tag (or churned around a directive by
-    // a reformatter) is not semantically meaningful, and removing it entirely —
-    // rather than collapsing runs to a single space — makes a tag re-wrapped
-    // across lines (`<div\n  style=…\n>`) key-identical to its single-line form
-    // (`<div style=…>`). Two genuinely-distinct constructs colliding is negligible
-    // and would at worst suppress one finding for near-identical hidden content.
+    // OLD-vs-NEW key: strip ALL whitespace + lower-case, so a tag re-wrapped
+    // across lines (`<div\n  style=…\n>`) keys identically to its single-line
+    // form. Rare collisions at worst suppress one near-identical finding.
     fn normalize_key(s: &str) -> String {
         s.chars()
             .filter(|c| !c.is_ascii_whitespace())
@@ -1142,13 +955,9 @@ fn hidden_constructs(input: &str) -> Vec<HiddenConstruct> {
             .collect()
     }
 
-    // Whitespace-NORMALIZED (not stripped) inner-text fingerprint for an element
-    // key. Unlike `normalize_key`, which removes whitespace entirely, this collapses
-    // each ASCII-whitespace run to a single space and trims — so re-wrapping or
-    // re-indenting benign inner text keys identically (no false-positive drift),
-    // while CHANGING the words (`note` → `RUN: exfiltrate keys`) produces a new
-    // key and surfaces as drift (CodeRabbit M13 round-22 aifile.rs:1062-1066). The
-    // value is also lower-cased, mirroring `normalize_key`'s case-insensitivity.
+    // Inner-text fingerprint: collapse whitespace runs (not strip) + lower-case,
+    // so re-wrapping benign inner text keys identically while changing the words
+    // (`note` → `RUN: …`) surfaces as drift (CodeRabbit M13 round-22).
     fn normalize_inner(s: &str) -> String {
         s.split_whitespace()
             .collect::<Vec<_>>()
@@ -1166,12 +975,9 @@ fn hidden_constructs(input: &str) -> Vec<HiddenConstruct> {
             });
         }
     }
-    // Visually-hidden HTML elements. The key folds in a fingerprint of the
-    // element's INNER TEXT, not just its opening tag: keying on the opening tag
-    // alone (`element:<div hidden>`) let an attacker keep the wrapper and rewrite
-    // the inner text into a directive without changing the key, so the drift was
-    // missed and `AiConfigHiddenInstructionAdded` never fired. `truncate` bounds
-    // the fingerprint length (matching how evidence is bounded).
+    // Visually-hidden HTML elements. The key folds in the INNER-TEXT fingerprint
+    // (not just the opening tag), else an attacker could keep the wrapper, rewrite
+    // the inner text into a directive, and dodge `AiConfigHiddenInstructionAdded`.
     for (_line, snippet, inner) in hidden_html_elements(input) {
         out.push(HiddenConstruct {
             key: format!(
@@ -1185,16 +991,12 @@ fn hidden_constructs(input: &str) -> Vec<HiddenConstruct> {
     out
 }
 
-/// Whether a single (already-trimmed) line reads as an IMPERATIVE directive
-/// aimed at the agent — an instruction it is told to follow — rather than prose
-/// or documentation. Used for the "new instruction line added" half of
-/// [`RuleId::AiConfigHiddenInstructionAdded`].
-///
-/// Reuses the same instruction/injection vocabulary as
-/// [`comment_body_is_directive`] (so the hidden-comment and added-line paths
-/// agree on what "a directive" is), and additionally treats a leading
-/// imperative verb (`run`, `execute`, `always …`, `you must …`) as a directive.
-/// Conservative: a short line, or one without an imperative shape, does not fire.
+/// Whether an (already-trimmed) line reads as an IMPERATIVE directive aimed at
+/// the agent, for the "new instruction line added" half of
+/// [`RuleId::AiConfigHiddenInstructionAdded`]. Reuses
+/// [`comment_body_is_directive`]'s vocabulary plus a leading imperative verb
+/// (`run`, `always …`, `you must …`). Conservative: short / non-imperative does
+/// not fire.
 fn line_is_directive(line: &str) -> bool {
     let trimmed = line
         .trim_start_matches(['-', '*', '#', '>', ' ', '\t'])
@@ -1203,12 +1005,10 @@ fn line_is_directive(line: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    // Shared instruction / injection markers (same set the hidden-comment check
-    // uses). A line carrying one of these is a directive.
     if comment_body_is_directive(trimmed) {
         return true;
     }
-    // Leading imperative verbs that begin an instruction the agent is told to do.
+    // Leading imperative verbs.
     const IMPERATIVE_PREFIXES: &[&str] = &[
         "always ",
         "never ",
@@ -1228,82 +1028,48 @@ fn line_is_directive(line: &str) -> bool {
     IMPERATIVE_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
-/// Whether an added PARAGRAPH is itself a hidden construct *that the
-/// hidden-construct diff pass in [`diff_findings`] already accounted for* — a
-/// DIRECTIVE-bearing HTML comment, or a visually-hidden HTML element. The
-/// visible-directive arm SKIPs such a paragraph so a single hidden directive is
-/// not double-counted (CodeRabbit M13 round-19 aifile.rs:1300-1311).
+/// Whether an added PARAGRAPH is itself a hidden construct already accounted for
+/// by [`diff_findings`]'s construct pass — a directive-bearing HTML comment or a
+/// visually-hidden element. The visible-directive arm skips these to avoid
+/// double-counting (CodeRabbit M13 round-19).
 ///
-/// The comment test must use the SAME detection [`hidden_constructs`] uses — a
-/// directive-bearing HTML comment, via [`html_comments`] + [`comment_body_is_directive`]
-/// — NOT a bare `<!--` prefix check (CodeRabbit M13 round-23 aifile.rs:1172-1175).
-/// The earlier prefix check skipped ANY paragraph beginning with `<!--`, but
-/// `hidden_constructs` records ONLY directive-bearing comments. A paragraph that
-/// LEADS with a BENIGN comment yet carries a real directive after it
-/// (`<!-- TODO -->\nYou must run curl … | sh`) was therefore skipped here while
-/// never being recorded by the construct pass — the directive escaped entirely.
-/// Gating on `comment_body_is_directive` means a benign leading comment no longer
-/// suppresses the whole paragraph: the paragraph falls through to the
-/// `line_is_directive` arm and its real directive surfaces. A GENUINE
-/// directive-bearing hidden comment is still recorded by the construct pass AND
-/// returns `true` here, so it is still skipped once (the round-19 dedup intent holds).
+/// The comment test mirrors [`hidden_constructs`] (directive-bearing only), NOT a
+/// bare `<!--` prefix (CodeRabbit M13 round-23): a paragraph leading with a benign
+/// comment but carrying a real directive must fall through to `line_is_directive`
+/// rather than be wholly suppressed.
 fn paragraph_is_hidden_construct(para: &str) -> bool {
-    // A visually-hidden HTML element anywhere in the paragraph — recorded by the
-    // construct pass unconditionally — always counts.
+    // A visually-hidden element anywhere — always recorded by the construct pass.
     if !hidden_html_elements(para).is_empty() {
         return true;
     }
-    // A directive-bearing HTML comment — the ONLY comments the construct pass
-    // records. Mirror it exactly; a benign comment (`<!-- TODO -->`) does NOT make
-    // the paragraph a hidden construct, so a directive elsewhere in the paragraph
-    // is not suppressed.
+    // Mirror the construct pass exactly: only a directive-bearing comment counts,
+    // so a benign `<!-- TODO -->` does not suppress a directive elsewhere.
     html_comments(para)
         .iter()
         .any(|(_line, body)| comment_body_is_directive(body))
 }
 
-/// Whether a single (already-trimmed) line is a TOOL-USE / capability directive —
-/// it tells the agent to run / exec / spawn a shell, make a network call, or
-/// write files. Drives [`RuleId::AiConfigToolUseEscalation`]. Line-shape based,
-/// conservative, and case-insensitive.
+/// Whether an (already-trimmed) line is a TOOL-USE / capability directive (run /
+/// exec / spawn a shell, network call, or file write). Drives
+/// [`RuleId::AiConfigToolUseEscalation`]. Line-shape based, conservative,
+/// case-insensitive.
 fn line_is_tool_use(line: &str) -> bool {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
     let lower = line.to_ascii_lowercase();
 
-    // Run / exec / shell-spawn directives: a `run:` / `exec:` / `shell:` config
-    // key, or an imperative `run`/`exec`/`execute`/`spawn`/`invoke` verb followed
-    // by a COMMAND-SHAPED token. "Command-shaped" is one of four precise signals,
-    // chosen to fire on real command-execution directives WITHOUT firing on the
-    // English prose these verbs also begin (CodeRabbit M13 round-10 R10-2):
-    //   (1) a quote / path-char / known shell / script file (`run "..."`,
-    //       `run ./build.sh`, `exec bash`) — the round-1/2 set, unchanged;
-    //   (2) a CURATED known CLI tool name (`run cargo test`, `execute git diff`,
-    //       `invoke npm ci`) — a small closed list of real binaries, so a generic
-    //       English noun (`the tests`, `the plan`, `it again`) is NOT mistaken for
-    //       a command. Tokens that double as common English words (`go`, `make`,
-    //       `node`) are deliberately EXCLUDED from this arm so `go to the store` /
-    //       `make sure to …` stay benign; they still fire via arm (3) when they
-    //       carry a real flag (`make -j`);
-    //   (3) ANY token IMMEDIATELY followed by a `-flag` / `--flag` (`exec make
-    //       -j`, `run foo --bar`) — a flag glued to the next token (no space after
-    //       the dash) is a strong command signal that prose lacks.
-    // `regex` has no lookahead, so the exclusion of common filler (the / a / this /
-    // it / them / your / again / …) is encoded POSITIVELY: a token only matches
-    // when it is quoted/path-shaped, a curated tool, or carries a real flag. A
-    // bare `run the tests` matches none of these and is left as generic directive
-    // drift (the safe under-match for a High-severity rule — over-broadening it
-    // causes alert fatigue).
+    // Run/exec directives: a `run:`/`exec:`/`shell:` key, or an imperative verb
+    // followed by a COMMAND-SHAPED token (CodeRabbit M13 round-10 R10-2). `regex`
+    // has no lookahead, so command-shape is encoded POSITIVELY as: (1) a
+    // quote/path/shell/script token, (2) a curated real CLI tool, or (3) a token
+    // with a glued `-flag`. English-ambiguous words (`go`, `make`) are excluded
+    // from arm (2) — they still fire via (3). A bare `run the tests` matches none,
+    // the safe under-match for a High-severity rule (alert fatigue).
     static RUN_EXEC: Lazy<Regex> = Lazy::new(|| {
-        // Curated closed list of real CLI tool / interpreter names. Every entry is
-        // an actual binary, NOT an English-ambiguous word, so a bare `run <tool>`
-        // is a strong command signal. English-ambiguous tokens (`go`, `make`) are
-        // deliberately kept OUT of this arm (they still fire via the glued-flag
-        // arm). The interpreter names (`node`/`ruby`/`perl`/`php`/`lua`) were added
-        // in CodeRabbit M13 round-11 R11-1 — `run node build.js` /
-        // `execute ruby setup.rb` were previously unmatched; they are interpreter
-        // binaries, not filler, so false-positive risk is low.
+        // Curated closed list of real CLI / interpreter binaries (not English
+        // filler). Interpreters (`node`/`ruby`/`perl`/`php`/`lua`) added in
+        // CodeRabbit M13 round-11 R11-1.
         const CURATED_CLI_TOOLS: &str = concat!(
             "cargo|git|npm|npx|pnpm|yarn|pip|pip3|uv|deno|bun",
             "|node|ruby|perl|php|lua",
@@ -1327,55 +1093,25 @@ fn line_is_tool_use(line: &str) -> bool {
         return true;
     }
 
-    // File-write directives: an instruction to write / append / overwrite a file,
-    // or a shell redirection into a file destination.
-    //
-    // Two branches, each requiring a FILE-LIKE destination so benign prose
-    // ("save notes to memory", "write results to stdout") never matches:
-    //  - a write verb (`write`/`append`/`overwrite`/`save`/`echo`) followed by a
-    //    `to`/`into`/`onto` preposition AND a destination that is either a
-    //    PATH-LIKE token — an absolute `/path`, a `~/` home path, a `./` or `../`
-    //    relative path, a `$VAR/` expansion, or a Windows drive (`C:\…` / `C:/…`)
-    //    — OR a BARE repo-local FILENAME that is either a single leading-dot
-    //    dotfile (`.env`, `.gitignore`, `.npmrc`) OR an extension-bearing name
-    //    (`Cargo.toml`, `package.json`, `.env.local`). A leading dot OR an
-    //    extension is what distinguishes a file destination from a non-file noun:
-    //    `memory` / `stdout` carry neither and so still do not match (R5 +
-    //    CodeRabbit M13 round-10 R10-3) — OR a CURATED well-known EXTENSIONLESS
-    //    repo file (`Dockerfile`, `Makefile`, `Gemfile`, `LICENSE`, …), a closed
-    //    allowlist that lets these dot-less names match WITHOUT re-admitting an
-    //    unbounded bare word (CodeRabbit M13 round-11 R11-2);
-    //  - a shell redirection (`>`/`>>`) into the SAME destination set — a path-ish
-    //    token, a leading-dot dotfile, a bare extension-bearing filename, or a
-    //    curated extensionless repo file (`echo x > out.txt`,
-    //    `echo x > .gitignore`, `echo x > Gemfile`).
+    // File-write directives: a write verb + `to`/`into`/`onto` + a FILE-LIKE
+    // destination, or a `>`/`>>` redirection into one. Both branches require a
+    // file-like destination (path token, leading-dot dotfile, extension-bearing
+    // filename, or a curated extensionless repo file), so benign prose ("save
+    // notes to memory", "write results to stdout") never matches (R5 / R10-3 /
+    // R11-2).
     static FILE_WRITE: Lazy<Regex> = Lazy::new(|| {
-        // CURATED case-insensitive list of well-known EXTENSIONLESS repo files
-        // (no dot, no extension). These are real write destinations that the
-        // path/dotfile/extension alternation below cannot reach (CodeRabbit M13
-        // round-11 R11-2: `write to Dockerfile`, `append to Makefile`,
-        // `echo x > Gemfile` were unmatched). A closed allowlist — NOT an
-        // unbounded bare-word match — so `write to memory` / `write to stdout`
-        // still do NOT fire. Anchored with a trailing `\b` so a prefix
-        // (`license` in `licensee`) does not match.
+        // Curated extensionless repo files the path/dotfile/extension alternation
+        // cannot reach (CodeRabbit M13 round-11 R11-2). Closed allowlist, not a
+        // bare-word match, so `write to memory` still does NOT fire.
         const EXTENSIONLESS_REPO_FILES: &str = concat!(
             "dockerfile|makefile|gemfile|procfile|vagrantfile|jenkinsfile",
             "|rakefile|brewfile|license|readme|changelog|codeowners|authors|notice"
         );
-        // Shared destination set, used identically by BOTH the `to|into|onto`
-        // branch and the `>`/`>>` redirection branch: a PATH-like token (absolute
-        // `/`, `~/` or `~\`, `./` or `.\`, `../` or `..\`, `$VAR/`, Windows
-        // drive), an UNPREFIXED RELATIVE SUBPATH (`src/main.rs`, `docs\notes.txt`
-        // — at least one separator, so a bare prose word like `docs` does NOT
-        // over-match), a single leading-dot dotfile (`.env`), an extension-bearing
-        // filename (`Cargo.toml`), or a curated extensionless repo file
-        // (`Dockerfile`). The tilde/dot-relative anchors accept BOTH separators so
-        // Windows relative prefixes (`~\config`, `.\settings.json`, `..\notes.txt`)
-        // fire too, not just their forward-slash forms (CodeRabbit M13 round-15
-        // R15-2). The relative-subpath alternate closes the gap where an
-        // unprefixed `src/main.rs` destination was missed (CodeRabbit M13
-        // round-20 aifile.rs:1237-1242); requiring ≥1 separator keeps bare words
-        // (`write to docs`) benign.
+        // Shared destination set for both branches: a path-like token (incl.
+        // Windows separators — CodeRabbit M13 round-15 R15-2), an unprefixed
+        // relative subpath with ≥1 separator (so `docs` stays benign — round-20),
+        // a leading-dot dotfile, an extension-bearing filename, or a curated
+        // extensionless repo file.
         let dest = format!(
             r#"(?:~[/\\]|\.[/\\]|\.\.[/\\]|/|\$\w+[/\\]|[a-z]:[\\/]|[\w.-]+(?:[/\\][\w.-]+)+|(?:\.[\w-]+|[\w-]+(?:\.[\w.-]+)+)|(?:{EXTENSIONLESS_REPO_FILES})\b)"#,
         );
@@ -1385,38 +1121,23 @@ fn line_is_tool_use(line: &str) -> bool {
         .unwrap()
     });
     if FILE_WRITE.is_match(&lower) {
-        // The regex already requires a file-like destination — a path-like token
-        // or an extension-bearing filename (or a redirection into one) — so a
-        // match is a genuine file-write directive. Prose that merely mentions
-        // "write to disk" / "save to memory" / "write results to stdout" has no
-        // path and no extension-bearing filename, so it does not match.
+        // The regex already requires a file-like destination, so a match is a
+        // genuine file-write directive.
         return true;
     }
 
     false
 }
 
-/// Compare a current AI-config file's content to its last-known-safe snapshot
-/// and return the M13 ch5 drift findings. The PUBLIC entry point `tirith ai diff`
-/// calls.
+/// Compare an AI-config file's content to its last-known-safe snapshot and
+/// return the M13 ch5 drift findings (the `tirith ai diff` entry point).
 ///
-/// `old` is the snapshot's recorded content for this file (empty string when the
-/// file is newly-tracked / absent from the snapshot); `new` is the current
-/// on-disk content; `path` is the file's display path (used only in evidence /
-/// the title). Both sides are normalized ([`normalize_for_diff`]) so a reformat
-/// alone yields nothing. Only ADDED lines are examined — a removal never fires.
-///
-/// Two finding classes, each emitted at most once (one finding per class,
-/// citing the first few added lines that matched):
-///  - [`RuleId::AiConfigHiddenInstructionAdded`] — an added line carrying HIDDEN
-///    content (the [`check_agent_instructions`] shape: an HTML comment / hidden
-///    element with a directive) OR an added imperative directive line.
-///  - [`RuleId::AiConfigToolUseEscalation`] — an added line carrying a tool-use /
-///    network / file-write directive.
-///
-/// A line can match BOTH classes (a hidden `<!-- run curl … -->`); it then
-/// contributes evidence to both findings, which is correct — it is two distinct
-/// risk facts about the same addition.
+/// `old` is the snapshot content (empty when newly-tracked); `new` is current;
+/// `path` is for evidence only. Both sides are normalized so a reformat yields
+/// nothing, and only ADDED lines are examined. Two finding classes, each emitted
+/// at most once: [`RuleId::AiConfigHiddenInstructionAdded`] (hidden or imperative
+/// directive added) and [`RuleId::AiConfigToolUseEscalation`] (tool-use / network
+/// / file-write directive added). A line may match both.
 pub fn diff_findings(old: &str, new: &str, path: &str) -> Vec<Finding> {
     let added = added_lines(old, new);
     if added.is_empty() {
@@ -1424,36 +1145,20 @@ pub fn diff_findings(old: &str, new: &str, path: &str) -> Vec<Finding> {
     }
     let mut findings = Vec::new();
 
-    // R20 (quick win): `added_directive_paragraphs(old, new)` was computed TWICE —
-    // once for the visible-directive arm (c) of the hidden pass and once for the
-    // tool-use pass. It is a pure function of `(old, new)`, so compute it once and
-    // iterate it by reference in both passes (behavior is identical).
+    // R20: pure function of `(old, new)`, computed once and shared by both passes.
     let added_paragraphs = added_directive_paragraphs(old, new);
 
     // --- AiConfigHiddenInstructionAdded ----------------------------------
     let mut hidden_hits: Vec<String> = Vec::new();
 
-    // (a)+(b) Hidden constructs (directive-bearing HTML comments + visually-hidden
-    // HTML elements) that are NEW in this revision. A hidden construct frequently
-    // SPANS unchanged context lines — e.g. an attacker adds `style="display:none"`
-    // onto an existing multi-line `<div>`, or adds the closing half of a hidden
-    // wrapper around an existing directive — so it never forms a complete element
-    // / comment inside the added-ONLY text. Scanning only the joined added lines
-    // therefore misses real config-poisoning changes.
-    //
-    // Instead, detect hidden constructs over the WHOLE document on BOTH sides
-    // (normalized) and surface the constructs present in NEW but not in OLD. The
-    // set difference is the false-positive guard: a pure reformat of content that
-    // was ALREADY hidden yields the same normalized construct key in both sets, so
-    // it is not "new" and does not fire. Only a construct that did not exist as
-    // hidden in the snapshot surfaces.
-    // R19-2: a FREQUENCY map, not a set. If the snapshot has one hidden construct
-    // and the new revision adds a SECOND identical copy, the second copy is drift
-    // and must fire — a set merely tests existence and would skip BOTH copies,
-    // under-reporting duplicated hidden elements/comments. Mirrors the round-12
-    // multiset fix applied to the VISIBLE-directive path (`added_directive_paragraphs`).
-    // Each new construct consumes one old occurrence (decrement); once the old
-    // count is exhausted, further identical copies surface as added.
+    // (a)+(b) Hidden constructs NEW in this revision. Detect over the WHOLE
+    // document on both sides (not the added-only slice — a construct often spans
+    // unchanged context, e.g. adding `style="display:none"` onto an existing
+    // `<div>`) and surface those in NEW but not OLD; an already-hidden reformat
+    // keys identically and does not fire.
+    // R19-2: a FREQUENCY map, not a set, so adding a SECOND identical copy of an
+    // existing construct surfaces (mirrors the round-12 multiset fix on the
+    // visible-directive path). Each new construct consumes one old occurrence.
     let mut old_key_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for c in hidden_constructs(old) {
@@ -1467,25 +1172,14 @@ pub fn diff_findings(old: &str, new: &str, path: &str) -> Vec<Finding> {
             _ => hidden_hits.push(c.evidence),
         }
     }
-    // (c) Plainly-visible imperative directive lines newly added. (Visible
-    // directives are NOT flagged by the static `agent_instruction_hidden` scan —
-    // an instruction file legitimately contains them — but in a DIFF a NEWLY
-    // ADDED directive is drift worth surfacing.)
-    //
-    // R4: scan PARAGRAPH-level added units, not line-level. `normalize_for_diff`
-    // is line-based, so reflowing an existing directive paragraph across a
-    // different number of lines makes its fragments look "added" and the first can
-    // satisfy `line_is_directive`, firing on a formatting-only edit. A new paragraph
-    // is "added" only if its words are not already present contiguously in the old
-    // document, so a reflowed (or blank-line-regrouped) directive is not added,
-    // while a genuinely-new directive sentence still fires.
+    // (c) Plainly-visible imperative directive lines newly added. (The static
+    // scan never flags visible directives, but a NEWLY ADDED one is drift.)
+    // R4: scan PARAGRAPH-level units (a paragraph is "added" only if its words are
+    // not already contiguous in `old`), so a reflowed directive is not a false hit.
     for para in &added_paragraphs {
-        // R19-3: a paragraph that is ITSELF a hidden construct (an HTML comment or
-        // a visually-hidden HTML element) was already added to `hidden_hits` by the
-        // construct-diff pass (a)+(b) above. Recording it here AGAIN as a "new
-        // directive" double-counts one construct — two evidence rows and an inflated
-        // count for a single addition. Skip hidden-construct paragraphs; only
-        // PLAINLY-VISIBLE directive paragraphs belong to arm (c).
+        // R19-3: skip paragraphs already recorded by the construct pass (a)+(b),
+        // else a hidden directive double-counts. Only plainly-visible directives
+        // belong to arm (c).
         if paragraph_is_hidden_construct(para) {
             continue;
         }
@@ -1527,15 +1221,9 @@ pub fn diff_findings(old: &str, new: &str, path: &str) -> Vec<Finding> {
     }
 
     // --- AiConfigToolUseEscalation ---------------------------------------
-    // R3-4: scan PARAGRAPH-level added units, not the line-level `added` set.
-    // `added_lines` is line-based, so reflowing an EXISTING tool-use instruction
-    // (`Always run "curl … | sh"`) across a different number of lines produces
-    // fresh fragment lines that `line_is_tool_use` matches — firing on a
-    // formatting-only edit. Reuse the same whole-document word-stream containment
-    // the visible-directive branch uses: a paragraph counts as a NEW tool-use
-    // directive only when its words are not already present contiguously in the
-    // old document, so a reflowed (or blank-line-regrouped) directive is not
-    // "added" while a genuinely-new tool-use instruction still fires.
+    // R3-4: scan PARAGRAPH-level units (same word-stream containment as arm (c)),
+    // so reflowing an existing tool-use instruction does not fire while a
+    // genuinely-new one still does.
     let tool_hits: Vec<String> = added_paragraphs
         .iter()
         .filter(|para| line_is_tool_use(para))
@@ -1576,9 +1264,7 @@ pub fn diff_findings(old: &str, new: &str, path: &str) -> Vec<Finding> {
     findings
 }
 
-// ===========================================================================
 // Per-AI-tool risk derivation (M13 ch5) — `tirith ai explain-config`
-// ===========================================================================
 
 /// Which AI tool an AI-config file configures, for `tirith ai explain-config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1605,16 +1291,13 @@ impl AiTool {
     }
 }
 
-/// Identify which AI tool a config file at `path` configures. Returns `None`
-/// when the path is not a recognised AI-config file.
+/// Identify which AI tool a config file at `path` configures, or `None`.
 pub fn classify_tool(path: &Path) -> Option<AiTool> {
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower = basename.to_ascii_lowercase();
 
-    // A notebook or SVG is a CONTENT file an agent reads, never an AI-config file
-    // — even when it lives under `.claude/` or `.cursor/`. Reject these up front so
-    // the directory shortcut below does not misclassify `.cursor/logo.svg` or
-    // `.claude/notes.ipynb` as AI config (which would snapshot/diff them).
+    // A notebook or SVG is a CONTENT file, never AI config — reject up front so the
+    // directory shortcut below does not misclassify `.cursor/logo.svg`.
     if matches!(
         classify(Some(path)),
         Some(AiFileKind::Notebook) | Some(AiFileKind::Svg)
@@ -1632,8 +1315,7 @@ pub fn classify_tool(path: &Path) -> Option<AiTool> {
         return Some(AiTool::Cursor);
     }
 
-    // Directory-aware: `.claude/*` → Claude, `.cursor/rules/*` (or any
-    // `.cursor/…`) → Cursor. Walk the parent components.
+    // Directory-aware: `.claude/*` → Claude, `.cursor/…` → Cursor.
     for comp in path.components() {
         if let std::path::Component::Normal(os) = comp {
             let c = os.to_string_lossy().to_ascii_lowercase();
@@ -1646,8 +1328,7 @@ pub fn classify_tool(path: &Path) -> Option<AiTool> {
         }
     }
 
-    // Any other recognised agent-instruction file (AGENTS.md, .clinerules, …)
-    // is generic.
+    // Any other recognised agent-instruction file is generic.
     if classify(Some(path)) == Some(AiFileKind::AgentInstructions) {
         return Some(AiTool::Generic);
     }
@@ -1655,26 +1336,23 @@ pub fn classify_tool(path: &Path) -> Option<AiTool> {
     None
 }
 
-/// A capability / risk an AI-config file's CONTENT grants or signals, for
-/// `tirith ai explain-config`. Reuses the same hidden-content + tool-use
-/// detection the diff path uses, so the risk read is consistent.
+/// A capability / risk an AI-config file's CONTENT grants, for `tirith ai
+/// explain-config`.
 #[derive(Debug, Clone)]
 pub struct ConfigRisk {
     /// Short machine-ish id (e.g. `"hidden_instruction"`).
     pub id: &'static str,
-    /// One-line human description of what the config grants / the risk.
+    /// One-line human description of the risk.
     pub detail: String,
 }
 
 /// Derive the capability / risk signals an AI-config file's CONTENT carries.
-/// Pure parsing, no network. Reuses [`check_agent_instructions`] (hidden
-/// content) and the tool-use line classifier so the risk read matches the diff
-/// path. The whole file is treated as "added" for the tool-use scan — this is a
-/// static "what does this config grant" read, not a diff.
+/// Pure parsing; reuses [`check_agent_instructions`] + the tool-use classifier
+/// so the risk read matches the diff path (whole file treated as "added").
 pub fn explain_config_risks(content: &str, path: &Path) -> Vec<ConfigRisk> {
     let mut risks = Vec::new();
 
-    // Hidden directives anywhere in the file (the agent_instruction_hidden shape).
+    // Hidden directives anywhere in the file.
     let mut hidden = Vec::new();
     check_agent_instructions(content, &mut hidden);
     if !hidden.is_empty() {
@@ -1687,13 +1365,9 @@ pub fn explain_config_risks(content: &str, path: &Path) -> Vec<ConfigRisk> {
         });
     }
 
-    // Tool-use / capability directives present in the file. Scan PARAGRAPH-level
-    // units (the same `normalize_paragraphs` helper `diff_findings` uses), not raw
-    // `content.lines()`: a capability directive wrapped across two source lines
-    // (`append the changelog entry\nto ~/.config/app/notes.txt`) is not a single
-    // line, so a line-level filter misses it — while the diff path's
-    // paragraph-level scan catches it. Matching `diff_findings` here keeps the
-    // static "what does this config grant" read consistent with the drift read.
+    // Tool-use / capability directives. Scan PARAGRAPH-level units (matching
+    // `diff_findings`), not raw lines, so a directive wrapped across two lines is
+    // still caught.
     let tool_lines: Vec<String> = normalize_paragraphs(content)
         .into_iter()
         .filter(|para| line_is_tool_use(para))
@@ -1709,7 +1383,7 @@ pub fn explain_config_risks(content: &str, path: &Path) -> Vec<ConfigRisk> {
         });
     }
 
-    // MCP config: the file IS a server config, so note the server-launch surface.
+    // MCP config: note the server-launch surface.
     if classify_tool(path) == Some(AiTool::Mcp) {
         risks.push(ConfigRisk {
             id: "mcp_server_config",
@@ -1723,16 +1397,12 @@ pub fn explain_config_risks(content: &str, path: &Path) -> Vec<ConfigRisk> {
     risks
 }
 
-// ===========================================================================
 // SVG checks
-// ===========================================================================
 
 /// Scan an SVG image for an active payload and for an external reference.
 fn check_svg(input: &str, findings: &mut Vec<Finding>) {
-    // An SVG is XML. A `.svg` file that is not XML-shaped (no `<svg` or
-    // `<?xml`) is not really an SVG — but the active-content checks below are
-    // text-pattern based and stay correct either way, so no early return is
-    // needed. The checks are deliberately conservative.
+    // The text-pattern checks below stay correct on a non-XML `.svg` too, so no
+    // early return is needed.
     let lower = input.to_ascii_lowercase();
 
     check_svg_active_content(input, &lower, findings);
@@ -1740,17 +1410,11 @@ fn check_svg(input: &str, findings: &mut Vec<Finding>) {
 }
 
 /// `svg_script_embedded` — an SVG carrying executable content: a `<script>`
-/// element, an inline `on*` event handler, or a `javascript:` URI.
-///
-/// A static SVG image — paths, shapes, gradients, text — has none of these.
-/// Active content in an SVG runs when the SVG is opened inline in a browser /
-/// renderer; it is the SVG-as-attack-vector shape (stored XSS via an uploaded
-/// "image").
+/// element, an inline `on*` event handler, or a `javascript:` URI. The SVG-as-
+/// attack-vector shape (stored XSS via an uploaded "image").
 fn check_svg_active_content(input: &str, lower: &str, findings: &mut Vec<Finding>) {
-    // The active-content reasons are classified by the shared
-    // `active_html_reasons` helper (also used by the notebook-output path);
-    // this path reports the whole list and attaches a per-reason evidence
-    // snippet, so the snippet extraction stays here.
+    // Reasons classified by the shared `active_html_reasons` helper; per-reason
+    // evidence-snippet extraction stays here.
     let reasons = active_html_reasons(lower);
     if reasons.is_empty() {
         return;
@@ -1810,13 +1474,9 @@ fn check_svg_active_content(input: &str, lower: &str, findings: &mut Vec<Finding
     });
 }
 
-/// `svg_external_reference` — an SVG that pulls in remote / external content:
-/// a remote `xlink:href` / `href` (a remote image, stylesheet or use-element),
-/// or an XXE external-entity declaration (`<!ENTITY … SYSTEM "…">`).
-///
-/// A self-contained SVG references nothing outside itself. An external
-/// reference makes the SVG fetch content when opened — a tracking / cloaking
-/// channel, and (for an external entity) a local-file-disclosure (XXE) vector.
+/// `svg_external_reference` — an SVG that pulls in remote content (a remote
+/// `xlink:href`/`href`) or declares an XXE external entity (`<!ENTITY … SYSTEM
+/// "…">`). A tracking/cloaking channel, or a local-file-disclosure (XXE) vector.
 fn check_svg_external_reference(input: &str, lower: &str, findings: &mut Vec<Finding>) {
     use once_cell::sync::Lazy;
     use regex::Regex;
@@ -1835,7 +1495,7 @@ fn check_svg_external_reference(input: &str, lower: &str, findings: &mut Vec<Fin
     if EXTERNAL_ENTITY.is_match(input) {
         reason = Some("an external-entity declaration (XXE)");
         if let Some(m) = EXTERNAL_ENTITY.find(input) {
-            // Capture the whole entity declaration up to the closing `>`.
+            // The whole entity declaration up to the closing `>`.
             let from = m.start();
             let rest = &input[from..];
             let end = rest.find('>').map(|e| from + e + 1).unwrap_or(input.len());
@@ -1845,8 +1505,7 @@ fn check_svg_external_reference(input: &str, lower: &str, findings: &mut Vec<Fin
             ));
         }
     } else if let Some(cap) = REMOTE_HREF.captures(input) {
-        // A `use` / `image` referencing a remote document is the concern; a
-        // fragment-only `href="#id"` (internal) never matches the regex.
+        // A fragment-only `href="#id"` never matches the regex.
         reason = Some("a remote href / xlink:href");
         detail = Some(format!(
             "remote reference: {}",
@@ -1883,24 +1542,12 @@ fn check_svg_external_reference(input: &str, lower: &str, findings: &mut Vec<Fin
     });
 }
 
-// ===========================================================================
 // small text helpers shared by the notebook / agent / SVG checks
-// ===========================================================================
 
-/// The reasons an HTML string carries *active* content — a `<script>` element,
-/// an inline `on*` event handler, or a `javascript:` URI. Shared by the
-/// notebook-output check and the SVG check (the two callers that look for
-/// active HTML); each had its own copy of these three tests before.
-///
-/// `lower` must already be lowercased. The returned reasons are ordered
-/// `<script>` → event handler → `javascript:`. A caller that wants a single
-/// reason (the notebook path) takes the first; a caller that reports them all
-/// (the SVG path) uses the whole list. Per-caller evidence-snippet extraction
-/// stays with each caller — only the reason classification is shared.
-///
-/// CSS-hiding (`display:none` / …) is deliberately *not* folded in here: it is
-/// a notebook-output-only check ([`html_has_css_hiding`]); the SVG active-
-/// content rule does not look for it, and this helper must not silently add it.
+/// The reasons an HTML string carries *active* content — `<script>`, an inline
+/// `on*` event handler, or a `javascript:` URI — ordered `<script>` → handler →
+/// `javascript:`. `lower` must already be lowercased. CSS-hiding is deliberately
+/// NOT folded in (it is a notebook-output-only check, [`html_has_css_hiding`]).
 fn active_html_reasons(lower: &str) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if lower.contains("<script") {
@@ -1915,12 +1562,9 @@ fn active_html_reasons(lower: &str) -> Vec<&'static str> {
     reasons
 }
 
-/// Whether `lower` (an already-lowercased string) contains an inline HTML
-/// event-handler attribute — `onload=`, `onclick=`, `onerror=`, etc.
-///
-/// Matches a `on<word>` token immediately followed by `=` (optionally with
-/// whitespace), preceded by whitespace so a substring like `button onclick`
-/// matches but `python` does not.
+/// Whether `lower` (already-lowercased) has an inline HTML event-handler
+/// attribute (`onload=`, `onclick=`, …). Requires leading whitespace so
+/// `python` does not match.
 fn has_inline_event_handler(lower: &str) -> bool {
     use once_cell::sync::Lazy;
     use regex::Regex;
@@ -1950,11 +1594,11 @@ fn html_has_css_hiding(lower: &str) -> bool {
     CSS_HIDE.is_match(lower)
 }
 
-/// Return a short snippet of `input` around the first occurrence of `needle`
-/// in `lower` (the lowercased copy of `input`). Used for evidence.
+/// A short snippet of `input` around the first occurrence of `needle` (in the
+/// lowercased copy `lower`), for evidence.
 fn first_match_snippet(input: &str, lower: &str, needle: &str) -> Option<String> {
     let pos = lower.find(needle)?;
-    // Snap the start back to a char boundary, then take a window forward.
+    // Snap start back to a char boundary, then take a window forward.
     let mut start = pos;
     while start > 0 && !input.is_char_boundary(start) {
         start -= 1;

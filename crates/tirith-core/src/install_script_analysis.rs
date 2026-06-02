@@ -1,49 +1,30 @@
 //! M6 ch6 — install-script analysis (read-only, never executes).
 //!
 //! Token-level scan for network-call and shell-spawn patterns inside install
-//! lifecycle scripts:
+//! lifecycle scripts: npm `package.json` lifecycle hooks (preinstall / install /
+//! postinstall / prepare), PyPI `setup.py` + `pyproject.toml [project.scripts]`,
+//! and Cargo `build.rs`.
 //!
-//!  * **npm**: `package.json:scripts.{preinstall, install, postinstall,
-//!    prepare}` — the four lifecycle hooks that run unconditionally on
-//!    `npm install`.
-//!  * **PyPI**: `setup.py` body (executes arbitrary Python at install time)
-//!    and the script entries in `pyproject.toml [project.scripts]`.
-//!  * **Cargo**: `build.rs` body (a build script that runs at compile time).
+//! Contract: (1) read-only — never executes; (2) no fetch — operates only on
+//! text already on disk or inline in a registry-API response (tirith never
+//! downloads a package to inspect it); (3) per-ecosystem scope — npm responses
+//! carry `scripts.{...}` inline (lockfile + installed), PyPI/crates.io do not, so
+//! installed-tree mode only.
 //!
-//! ## Module contract (enforced by doc-comment + acceptance test)
-//!
-//!  1. **Read-only.** Never executes the script being analyzed.
-//!  2. **No fetch.** Operates on script text already on disk OR text carried
-//!     inline in a registry-API response. tirith does NOT download a package
-//!     to inspect it (matches the [`crate::install_txn`] shipping non-goal at
-//!     `install.rs:42`).
-//!  3. **Per-ecosystem scope.** npm registry responses carry `scripts.{...}`
-//!     inline — both lockfile and installed paths can evaluate; PyPI METADATA
-//!     does NOT carry setup.py content — installed-tree mode only;
-//!     crates.io does NOT carry build.rs — installed-tree mode only.
-//!
-//! The scan is a heuristic. Token-level matching with string-literal
-//! awareness reduces false positives but cannot eliminate them — a `curl`
-//! mention inside a comment can still match. This is documented in the
-//! rule's `false_positive_guidance`.
+//! Heuristic: token-level matching with string-literal awareness reduces but
+//! does not eliminate false positives (a `curl` in a comment can match).
 
 use crate::package_risk::InstallScriptSignals;
 
-/// Token-level scan for network calls and shell spawns.
-///
-/// Combines all four npm script hooks (`preinstall`, `install`, `postinstall`,
-/// `prepare`) into one analysis when present.
-///
-/// `script_text` is the raw text of the script (or the concatenation of all
-/// applicable npm script entries). Pure: no I/O.
+/// Token-level scan of `script_text` (one script, or all applicable npm hooks
+/// concatenated) for network calls and shell spawns. Pure: no I/O.
 pub fn analyze_script_text(script_text: &str) -> InstallScriptSignals {
     let mut signals = InstallScriptSignals::default();
     if script_text.is_empty() {
         return signals;
     }
 
-    // Walk lines and skip obvious comments. This is a heuristic — `curl` in a
-    // mid-line trailing comment will still match; document and accept that.
+    // Skip obvious comment lines (a `curl` in a trailing comment still matches).
     for line in script_text.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') || trimmed.starts_with("//") {
@@ -67,7 +48,7 @@ pub fn analyze_script_text(script_text: &str) -> InstallScriptSignals {
         }
     }
 
-    // Cap the descriptions to keep the JSON shape bounded.
+    // Cap descriptions to keep the JSON shape bounded.
     const MAX_DESC: usize = 5;
     if signals.suspicious_patterns.len() > MAX_DESC {
         signals.suspicious_patterns.truncate(MAX_DESC);
@@ -75,8 +56,8 @@ pub fn analyze_script_text(script_text: &str) -> InstallScriptSignals {
     signals
 }
 
-/// Network-call token patterns. Token boundary match — checked with
-/// `token_match` so a substring like "curlydocs" does not match "curl".
+/// Network-call token patterns (boundary-matched via `token_match`, so
+/// "curlydocs" does not match "curl").
 const NETWORK_CALL_PATTERNS: &[&str] = &[
     "curl",
     "wget",
@@ -110,15 +91,13 @@ const SHELL_SPAWN_PATTERNS: &[&str] = &[
     "process.spawn",
 ];
 
-/// `true` when `haystack` contains `needle` at a word/token boundary, treating
-/// `.`, `:`, `_`, `-`, `(`, ` ` as boundaries. Conservative — keeps "curl"
-/// from matching "curly".
+/// `true` when `haystack` contains `needle` at a token boundary, so "curl" does
+/// not match "curly".
 fn token_match(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    // For multi-char patterns that include spaces / parens / pipes already, a
-    // plain substring check is fine — the pattern itself is the boundary.
+    // Patterns already containing a space/paren/pipe are their own boundary.
     if needle.contains(' ')
         || needle.contains('(')
         || needle.contains('|')
@@ -127,7 +106,7 @@ fn token_match(haystack: &str, needle: &str) -> bool {
     {
         return haystack.contains(needle);
     }
-    // Otherwise, require a boundary on each side of the substring match.
+    // Otherwise require a boundary on each side of the match.
     for (idx, _) in haystack.match_indices(needle) {
         let before_ok = if idx == 0 {
             true
@@ -149,9 +128,8 @@ fn token_match(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Read npm install scripts from a `package.json` JSON value and concatenate
-/// their bodies into one string ready for [`analyze_script_text`].
-/// Returns `None` when no install lifecycle hooks are defined.
+/// Concatenate the npm install-lifecycle script bodies from a `package.json`
+/// value for [`analyze_script_text`], or `None` if none are defined.
 pub fn npm_script_text(package_json: &serde_json::Value) -> Option<String> {
     let scripts = package_json.get("scripts")?.as_object()?;
     let mut out = String::new();
@@ -170,8 +148,8 @@ pub fn npm_script_text(package_json: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Read a `package.json` from disk and run [`npm_script_text`] on it.
-/// Returns `None` on any I/O / parse failure.
+/// Read a `package.json` from disk and run [`npm_script_text`] on it; `None` on
+/// any I/O / parse failure.
 pub fn npm_script_text_from_disk(package_json_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(package_json_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;

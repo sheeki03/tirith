@@ -15,9 +15,8 @@ use tirith_core::threatdb_feeds::{
     parse_urlhaus_csv,
 };
 
-/// Pinned Ed25519 public key for manifest signature verification.
-/// MUST be identical to the key in tirith-core/assets/keys/threatdb-verify.pub.
-/// Both files must be kept in sync — they are the same key used for DB and manifest signing.
+/// Pinned Ed25519 manifest-verify key. MUST stay in sync with
+/// tirith-core/assets/keys/threatdb-verify.pub (same key for DB + manifest).
 static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
     include_bytes!("../../assets/keys/threatdb-verify.pub");
 
@@ -26,15 +25,10 @@ const MANIFEST_URL_PRIMARY: &str =
 const MANIFEST_URL_FALLBACK: &str =
     "https://github.com/sheeki03/tirith/releases/latest/download/threatdb-manifest.json";
 
-/// Max manifest size (64 KiB) to prevent abuse.
 const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
-/// Max DB file size (256 MiB) to prevent disk exhaustion.
 const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
-/// HTTP timeout for manifest fetch.
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
-/// HTTP timeout for DB download.
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
-/// HTTP timeout for Phase B supplemental feed downloads.
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// Max bytes read from any single supplemental feed response.
 const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = 256 * 1024 * 1024;
@@ -44,7 +38,6 @@ const NEXT_CHECK_FILE: &str = "threatdb-next-check-at";
 const SPAWNED_AT_FILE: &str = "threatdb-spawned-at";
 /// Soft dedup window: skip spawn if another was spawned within this many seconds.
 const SPAWNED_AT_DEDUP_SECS: u64 = 30;
-/// Backoff interval on failure (1 hour).
 const BACKOFF_SECS: u64 = 3600;
 const URLHAUS_EXPORT_TEMPLATE: &str =
     "https://urlhaus-api.abuse.ch/files/exports/full.csv?auth-key={auth_key}";
@@ -65,8 +58,8 @@ struct Manifest {
 }
 
 impl Manifest {
-    /// Reconstruct the canonical payload for signature verification.
-    /// Keys alphabetically sorted, no whitespace, no trailing newline.
+    /// Canonical payload for signature verification: keys sorted, no whitespace,
+    /// no trailing newline.
     fn canonical_payload(&self) -> String {
         let mut map = std::collections::BTreeMap::new();
         map.insert("sha256", serde_json::Value::String(self.sha256.clone()));
@@ -124,8 +117,7 @@ fn do_update(force: bool) -> Result<(), String> {
 
     manifest.verify_signature()?;
 
-    // Rollback protection: reject manifests with a lower version than what
-    // we already have installed, unless --force overrides.
+    // Rollback protection: reject a manifest older than the installed DB unless --force.
     if !force {
         if let Some(db) = ThreatDb::cached() {
             let current_seq = db.build_sequence();
@@ -160,7 +152,6 @@ fn do_update(force: bool) -> Result<(), String> {
         ));
     }
 
-    // ThreatDb::from_bytes parses + verifies the .dat internal signature.
     let min_seq = if force { 0 } else { current_sequence() };
     let db =
         ThreatDb::from_bytes(data.clone(), min_seq).map_err(|e| format!("invalid DB file: {e}"))?;
@@ -202,8 +193,7 @@ impl SupplementalEntries {
         self.hostnames.is_empty() && self.ips.is_empty()
     }
 
-    /// Merge parsed feed entries, tagging each with the given source.
-    /// Returns the total number of entries ingested.
+    /// Merge parsed feed entries tagged with `source`; returns the count ingested.
     fn ingest(
         &mut self,
         entries: tirith_core::threatdb_feeds::FeedEntries,
@@ -275,8 +265,8 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
         );
     }
 
-    // At least one group must be enabled to reach here (fully-disabled case
-    // returned early), so Tor exit is always included as a supplemental IP signal.
+    // At least one group is enabled here (fully-disabled returned early), so Tor
+    // exit is always included as a supplemental IP signal.
     attempted_feeds += 1;
     log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental));
 
@@ -371,8 +361,7 @@ fn fetch_tor_exit_feed(
     Ok(supplemental.ingest(entries, ThreatSource::TorExit))
 }
 
-/// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for safe
-/// use in log/error messages.
+/// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for log/error use.
 fn redact_url(url: &str) -> String {
     if let Some(q) = url.find('?') {
         format!("{}?<redacted>", &url[..q])
@@ -432,17 +421,16 @@ fn read_bounded_bytes<R: std::io::Read>(
 }
 
 fn local_overlay_signing_key() -> SigningKey {
-    // This key is not an authenticity root. It only satisfies the on-disk
-    // ThreatDb format for a mutable, user-local supplemental overlay that is
-    // intentionally loaded without pinned-key signature verification.
+    // Not an authenticity root: only satisfies the on-disk ThreatDb format for the
+    // mutable user-local overlay, which is loaded without pinned-key verification.
     let digest = Sha256::digest(b"tirith-local-supplemental-threatdb-v1");
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&digest[..32]);
     SigningKey::from_bytes(&key_bytes)
 }
 
-/// Run the background update (called with --background flag).
-/// Acquires exclusive lock, downloads, verifies, installs, writes next-check-at.
+/// Background update (`--background`): acquire exclusive lock, download, verify,
+/// install, write next-check-at.
 fn run_background_update() -> i32 {
     let state = match policy::state_dir() {
         Some(d) => d,
@@ -458,7 +446,7 @@ fn run_background_update() -> i32 {
 
     let lock_path = state.join(LOCKFILE_NAME);
 
-    // Exclusive lock: if already held, another child is updating — exit silently.
+    // Exclusive lock: if held, another child is updating — exit silently.
     let lock_file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -501,7 +489,7 @@ fn run_background_update() -> i32 {
         if let Err(ref e) = result {
             eprintln!("tirith: background update failed: {e}");
         }
-        // Backoff on failure to avoid hammering the upstream on repeated errors.
+        // Backoff on failure to avoid hammering upstream on repeated errors.
         let next = now + BACKOFF_SECS;
         if let Err(e) = std::fs::write(&next_check_path, next.to_string()) {
             eprintln!("tirith: warning: failed to write next-check-at: {e}");
@@ -594,8 +582,7 @@ fn gather_status() -> ThreatDbStatus {
 
             let policy = policy::Policy::discover(None);
             let stale_hours = policy.threat_intel.auto_update_hours;
-            // Stale threshold = 2x the configured update interval; disabled
-            // auto-update (= 0) means never stale.
+            // Stale = older than 2x the update interval; 0 (disabled) means never stale.
             let is_stale = if stale_hours == 0 {
                 false
             } else {
@@ -714,21 +701,17 @@ fn print_status_human(info: &ThreatDbStatus) {
 /// Guard: only try once per process lifetime.
 static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-/// Spawn a detached child process to update the threat DB if due.
+/// Spawn a detached child to update the threat DB if due (called from `check.rs`
+/// after the verdict). Cheap: reads a timestamp file and optionally spawns; the
+/// download happens in the child.
 ///
-/// Called from `check.rs` after the verdict is computed.
-/// This is intentionally cheap: reads a timestamp file and optionally spawns
-/// a detached child. The actual download happens in the child process.
-///
-/// `offline_flag` carries the `tirith check --offline` flag; when it (or the
-/// `TIRITH_OFFLINE` env var) is set, this is a guaranteed no-op — no
-/// timestamp files are written and no child process is spawned, so analysis
-/// stays purely local. This is a mechanism only: the default (online) is
-/// unchanged.
+/// `offline_flag` (`tirith check --offline`) or `TIRITH_OFFLINE` makes this a
+/// guaranteed no-op — no timestamp files written, no child spawned, analysis
+/// stays purely local.
 pub fn maybe_background_update(offline_flag: bool) {
-    // Offline short-circuit comes BEFORE the once-per-process guard so a
-    // later online call in the same process is not silently disabled by an
-    // earlier offline one (the guard is a dedup, not a latch on intent).
+    // Offline short-circuit comes BEFORE the once-per-process guard so a later
+    // online call in the same process is not disabled by an earlier offline one
+    // (the guard is a dedup, not a latch on intent).
     if offline_flag || super::offline_env_active() {
         return;
     }
@@ -747,8 +730,7 @@ pub fn maybe_background_update(offline_flag: bool) {
         None => return,
     };
 
-    // A missing or unparseable next-check-at file is fine — treat it as "due"
-    // for first run or corrupt state recovery.
+    // A missing or unparseable next-check-at file is treated as "due".
     let next_check_path = state.join(NEXT_CHECK_FILE);
     let now = unix_now();
     if let Ok(content) = std::fs::read_to_string(&next_check_path) {
@@ -759,9 +741,8 @@ pub fn maybe_background_update(offline_flag: bool) {
         }
     }
 
-    // Parent-side soft dedup so multiple `tirith check` processes launched in
-    // the same second don't all spawn an update child. The real lock lives
-    // inside the background child.
+    // Parent-side soft dedup so multiple `tirith check` processes in the same
+    // second don't all spawn a child. The real lock lives in the child.
     let spawned_at_path = state.join(SPAWNED_AT_FILE);
     if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
         if let Ok(spawned_ts) = content.trim().parse::<u64>() {
@@ -797,15 +778,14 @@ pub fn maybe_background_update(offline_flag: bool) {
     }
 }
 
-/// Fetch the manifest from primary URL, falling back to the release asset URL.
-/// Falls back when: primary fetch fails OR primary manifest is older than current DB
-/// (stale primary, e.g., manifest PR not yet merged).
+/// Fetch the manifest from the primary URL, falling back to the release asset URL
+/// when the primary fetch fails OR the primary manifest is older than the current
+/// DB (e.g. manifest PR not yet merged).
 fn fetch_manifest() -> Result<Manifest, String> {
     match fetch_manifest_from(MANIFEST_URL_PRIMARY) {
         Ok(m) => {
-            // If the primary manifest's version is at or below the currently-
-            // installed DB, try the fallback in case it's ahead (releases can
-            // lag the raw.githubusercontent.com path during deploys).
+            // If the primary version is at or below the installed DB, try the
+            // fallback in case it's ahead (releases can lag the raw path).
             if let Some(db) = ThreatDb::cached() {
                 if m.version <= db.build_sequence() {
                     eprintln!("tirith: primary manifest is stale (v{} <= current v{}), trying fallback...",
@@ -832,24 +812,23 @@ fn fetch_manifest() -> Result<Manifest, String> {
 /// Result of resolving a manifest from cache state + HTTP response.
 #[derive(Debug, PartialEq)]
 enum CacheResolution {
-    /// Use the fresh body from HTTP 200.
+    /// Fresh body from HTTP 200.
     Fresh(String),
-    /// Use cached body from disk (HTTP 304).
+    /// Cached body from disk (HTTP 304).
     Cached(String),
     /// Cache miss on 304 — need unconditional retry.
     RetryNeeded,
 }
 
-/// Resolve manifest from HTTP status and cache state.
-/// Extracted for testability — no I/O, pure logic.
+/// Resolve manifest from HTTP status and cache state. Pure logic, no I/O.
 fn resolve_cache(
     http_status: u16,
     response_body: Option<&str>,
     cached_body: Option<&str>,
 ) -> Result<CacheResolution, String> {
     if http_status == 304 {
-        // Corrupt or missing cached body falls through to RetryNeeded rather
-        // than erroring — caller will clean up stale ETag and retry.
+        // Corrupt/missing cached body falls through to RetryNeeded; caller cleans
+        // up the stale ETag and retries.
         if let Some(body) = cached_body {
             if serde_json::from_str::<Manifest>(body).is_ok() {
                 return Ok(CacheResolution::Cached(body.to_string()));
@@ -890,7 +869,7 @@ fn fetch_manifest_from_with_state(
     let etag_path = state.as_ref().map(|d| d.join(format!("{cache_key}-etag")));
     let body_path = state.as_ref().map(|d| d.join(format!("{cache_key}-body")));
 
-    // Conditional GET: attach a per-URL ETag from prior successful fetch.
+    // Conditional GET: attach a per-URL ETag from a prior fetch.
     let mut req = client.get(url).header(
         "User-Agent",
         format!("tirith/{}", env!("CARGO_PKG_VERSION")),
@@ -939,8 +918,8 @@ fn fetch_manifest_from_with_state(
     // Only load cached body for 304 — avoids unnecessary I/O on 200.
     let cached_body = if status == 304 {
         body_path.as_ref().and_then(|bp| {
-            // Size-check BEFORE reading so an attacker-planted huge file
-            // cannot force unbounded memory allocation.
+            // Size-check BEFORE reading: an attacker-planted huge file must not
+            // force unbounded allocation.
             if let Ok(meta) = std::fs::metadata(bp) {
                 if meta.len() > MAX_MANIFEST_SIZE {
                     eprintln!(
@@ -968,8 +947,7 @@ fn fetch_manifest_from_with_state(
         Ok(CacheResolution::Cached(body)) => serde_json::from_str::<Manifest>(&body)
             .map_err(|e| format!("cached manifest parse error: {e}")),
         Ok(CacheResolution::RetryNeeded) => {
-            // Delete stale ETag + body so the retry is unconditional —
-            // otherwise we'd loop on 304 forever.
+            // Delete stale ETag + body so the retry is unconditional (else loop on 304).
             if let Some(ref ep) = etag_path {
                 let _ = std::fs::remove_file(ep);
             }
@@ -1076,7 +1054,7 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-/// Atomic write: write to a temp file in the same directory, then rename.
+/// Atomic write: write to a temp file in the same dir, then rename.
 fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -1109,20 +1087,16 @@ fn current_sequence() -> u64 {
         .unwrap_or(0)
 }
 
-/// Hex encoding helper (avoid adding hex crate dependency).
+/// Hex encoding helper (avoids a hex crate dependency).
 mod hex {
     pub fn encode(data: impl AsRef<[u8]>) -> String {
         data.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
-// ===========================================================================
-// Threat-DB transparency subcommands (roadmap M2 item 11)
-//
-// `explain`, `sources`, `health`, and `diff` are read-only inspection
-// commands. They never download, never write the DB, and never change
-// existing `update`/`status` behavior. All support `--format json`.
-// ===========================================================================
+// Threat-DB transparency subcommands (M2 item 11): `explain`, `sources`,
+// `health`, `diff` — read-only inspection, no download/write, all support
+// `--format json`.
 
 use std::net::Ipv4Addr;
 
@@ -1130,10 +1104,8 @@ use tirith_core::threatdb::{Confidence, Ecosystem, SourceTier};
 
 /// File name for the append-only snapshot history used by `threat-db diff`.
 const HISTORY_FILE: &str = "threatdb-history.jsonl";
-/// Hard cap on retained snapshot lines — keeps the file tiny and bounded.
+/// Hard cap on retained snapshot lines — keeps the file bounded.
 const HISTORY_MAX_LINES: usize = 64;
-
-// --- shared serializable shapes --------------------------------------------
 
 /// Per-category entry counts for a loaded DB. Mirrors the DB's five sections.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1151,16 +1123,13 @@ impl CategoryCounts {
     }
 }
 
-/// One DB observation, appended to the history file. The history file is the
-/// only thing `diff` can compare against — the DB format itself retains no
-/// per-entry history.
+/// One DB observation appended to the history file — the only thing `diff` can
+/// compare against, since the DB format retains no per-entry history.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DbSnapshot {
-    /// Unix epoch seconds when this snapshot was recorded.
     recorded_at: u64,
     /// DB build sequence (the monotonic "version").
     build_sequence: u64,
-    /// DB build timestamp (Unix epoch seconds).
     build_timestamp: u64,
     /// Whether the DB's Ed25519 signature verified at observation time.
     signature_valid: bool,
@@ -1200,13 +1169,12 @@ fn current_snapshot() -> Option<DbSnapshot> {
     })
 }
 
-/// Load all retained snapshots, oldest first. Unparseable lines are skipped.
+/// Load all retained snapshots, oldest first (unparseable lines skipped).
 ///
-/// Returns `(snapshots, read_error)`. A missing history file is legitimate
-/// (no snapshots yet) and yields an empty list with no error. A history file
-/// that *exists* but cannot be read (permissions, I/O fault) yields an empty
-/// list **and** a `Some(message)` so callers can say "could not read history"
-/// rather than falsely reporting "first observation".
+/// Returns `(snapshots, read_error)`. A missing history file yields an empty
+/// list with no error; a file that exists but cannot be read yields an empty
+/// list AND `Some(message)`, so callers distinguish "could not read" from
+/// "first observation".
 fn load_history() -> (Vec<DbSnapshot>, Option<String>) {
     let Some(path) = history_path() else {
         return (Vec::new(), None);
@@ -1233,23 +1201,17 @@ fn load_history() -> (Vec<DbSnapshot>, Option<String>) {
     (snapshots, None)
 }
 
-/// Append `snapshot` to the history file if it records a build sequence not
-/// already present. Best-effort: any I/O error is silently ignored — the
-/// history is a convenience for `diff`, never load-bearing for analysis.
-///
-/// The file is truncated to the most recent [`HISTORY_MAX_LINES`] entries so
-/// it can never grow without bound.
+/// Append `snapshot` to the history file unless its content is already present.
+/// Best-effort: I/O errors are ignored (history is a `diff` convenience, never
+/// load-bearing). Truncated to the most recent [`HISTORY_MAX_LINES`] entries.
 fn record_snapshot(snapshot: &DbSnapshot) {
     let Some(path) = history_path() else {
         return;
     };
-    // The read-error note is irrelevant here: recording is best-effort and
-    // rewrites the whole file regardless.
     let (mut history, _) = load_history();
-    // Dedup on the snapshot's content (everything but `recorded_at`):
-    // re-running a transparency command against an unchanged DB must not append
-    // a near-identical line, but a changed supplemental overlay — same primary
-    // build_sequence, different counts/sources — must still record a snapshot.
+    // Dedup on content (everything but `recorded_at`): an unchanged DB must not
+    // append a near-identical line, but a changed overlay (same build_sequence,
+    // different counts/sources) must still record.
     if history.iter().any(|s| {
         s.build_sequence == snapshot.build_sequence
             && s.build_timestamp == snapshot.build_timestamp
@@ -1279,16 +1241,13 @@ fn record_snapshot(snapshot: &DbSnapshot) {
     let _ = atomic_write(&path, body.as_bytes());
 }
 
-/// Take a snapshot of the current DB and fold it into the history file.
-/// Called by the read-only transparency commands so `diff` accumulates a
-/// usable trail over time without any extra user action.
+/// Snapshot the current DB and fold it into the history file, so `diff`
+/// accumulates a trail as the read-only transparency commands run.
 fn snapshot_current_db() {
     if let Some(snapshot) = current_snapshot() {
         record_snapshot(&snapshot);
     }
 }
-
-// --- threat-db explain -----------------------------------------------------
 
 /// What kind of indicator the user passed to `explain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1310,13 +1269,9 @@ struct ParsedIndicator {
     value: String,
 }
 
-/// Classify the indicator string.
-///
-/// - A bare IPv4 literal → IP.
-/// - `eco:name` where `eco` is a known ecosystem (npm, pypi, …) → package.
-/// - `name@version` → package.
-/// - Anything containing a `.` and no `/` or space, not an IP → domain.
-/// - Otherwise → package (a bare name with no dots, e.g. `react`).
+/// Classify the indicator string: bare IPv4 → IP; `eco:name` (known ecosystem)
+/// or `name@version` or bare name → package; dotted slash/space-free non-IP →
+/// domain.
 fn parse_indicator(raw: &str) -> ParsedIndicator {
     let trimmed = raw.trim();
 
@@ -1329,8 +1284,7 @@ fn parse_indicator(raw: &str) -> ParsedIndicator {
         };
     }
 
-    // `eco:name` — only when the prefix is a recognized ecosystem, so a
-    // `host:port` style string is not misread as a package.
+    // `eco:name` — only for a recognized ecosystem, so `host:port` is not a package.
     if let Some((prefix, rest)) = trimmed.split_once(':') {
         if let Some(eco) = Ecosystem::from_name(prefix) {
             let (name, version) = split_name_version(rest);
@@ -1343,7 +1297,7 @@ fn parse_indicator(raw: &str) -> ParsedIndicator {
         }
     }
 
-    // `name@version` (npm-style) — treat as a package.
+    // `name@version` (npm-style) → package.
     if let Some((name, version)) = split_at_version(trimmed) {
         return ParsedIndicator {
             kind: IndicatorKind::Package,
@@ -1353,7 +1307,7 @@ fn parse_indicator(raw: &str) -> ParsedIndicator {
         };
     }
 
-    // A dotted, slash-free, space-free token that is not an IP → domain.
+    // Dotted, slash-free, space-free, non-IP → domain.
     if trimmed.contains('.') && !trimmed.contains('/') && !trimmed.contains(char::is_whitespace) {
         return ParsedIndicator {
             kind: IndicatorKind::Domain,
@@ -1372,8 +1326,8 @@ fn parse_indicator(raw: &str) -> ParsedIndicator {
     }
 }
 
-/// Split `name@version`, returning `None` when there is no `@` or it is a
-/// scoped npm package leading `@` (e.g. `@scope/pkg`).
+/// Split `name@version`; `None` when there is no `@` or `@` is a leading npm
+/// scope (e.g. `@scope/pkg`).
 fn split_at_version(s: &str) -> Option<(String, String)> {
     // A leading `@` is an npm scope, not a version separator.
     let search_from = if s.starts_with('@') { 1 } else { 0 };
@@ -1413,19 +1367,15 @@ struct ExplainResult {
 
 #[derive(Debug, serde::Serialize)]
 struct ExplainFinding {
-    /// Which lookup matched: `malicious_package`, `typosquat`,
-    /// `popular_lookalike`, `malicious_hostname`, or `malicious_ip`.
+    /// `malicious_package`, `typosquat`, `popular_lookalike`,
+    /// `malicious_hostname`, or `malicious_ip`.
     classification: String,
-    /// Stable source identifier, when the matched record carries a source.
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
-    /// Human-readable source label.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_label: Option<String>,
-    /// Match confidence, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<Confidence>,
-    /// Free-text explanation of what the DB knows.
     detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reference_url: Option<String>,
@@ -1474,8 +1424,7 @@ pub fn explain(indicator: &str, json: bool) -> i32 {
                 }
             }
             IndicatorKind::Package => {
-                // Ecosystems to probe: the caller's explicit one, or all of
-                // them when none was given.
+                // Probe the caller's ecosystem, or all of them when none given.
                 let ecosystems: Vec<Ecosystem> = match parsed.ecosystem {
                     Some(e) => vec![e],
                     None => ALL_ECOSYSTEMS.to_vec(),
@@ -1513,8 +1462,7 @@ pub fn explain(indicator: &str, json: bool) -> i32 {
     0
 }
 
-/// All package ecosystems, probed when `explain` gets a package name with no
-/// explicit ecosystem prefix.
+/// All ecosystems, probed when `explain` gets a package name with no prefix.
 const ALL_ECOSYSTEMS: [Ecosystem; 8] = [
     Ecosystem::Npm,
     Ecosystem::PyPI,
@@ -1526,8 +1474,8 @@ const ALL_ECOSYSTEMS: [Ecosystem; 8] = [
     Ecosystem::Packagist,
 ];
 
-/// Probe one ecosystem for a package name: malicious-package, typosquat, and
-/// popular-lookalike checks. Appends any matches to `findings`.
+/// Probe one ecosystem (malicious-package, typosquat, popular-lookalike),
+/// appending matches to `findings`.
 fn explain_package(
     db: &ThreatDb,
     eco: Ecosystem,
@@ -1644,16 +1592,12 @@ fn print_explain_human(r: &ExplainResult) {
     }
 }
 
-// --- threat-db sources -----------------------------------------------------
-
 #[derive(Debug, serde::Serialize)]
 struct SourcesReport {
     /// True when a DB is installed and the per-source counts are real.
     db_installed: bool,
-    /// DB build sequence, when installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     build_sequence: Option<u64>,
-    /// DB build timestamp (Unix epoch seconds), when installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     build_timestamp: Option<u64>,
     sources: Vec<SourceInfo>,
@@ -1661,16 +1605,13 @@ struct SourcesReport {
 
 #[derive(Debug, serde::Serialize)]
 struct SourceInfo {
-    /// Stable machine identifier.
     id: String,
-    /// Human-readable name.
     name: String,
     /// `primary` (signed CI DB) or `supplemental` (user-local overlay).
     tier: SourceTier,
     upstream_url: String,
-    /// Live record count for this source, or `null` when no DB is installed.
-    /// Typosquat and popular-package records carry no source byte on disk, so
-    /// the typosquat feed's count is reported under `typosquats` instead.
+    /// Live record count, or `null` when no DB is installed. Typosquat/popular
+    /// records carry no source byte, so the typosquat count lands under `typosquats`.
     record_count: Option<u64>,
 }
 
@@ -1682,8 +1623,8 @@ pub fn sources(json: bool) -> i32 {
 
     let mut source_infos = Vec::new();
     for src in ThreatSource::ALL {
-        // `count_for` now attributes the typosquat index count to
-        // `EcosystemsTyposquat`, so no per-source special-case is needed.
+        // `count_for` attributes the typosquat index to `EcosystemsTyposquat`,
+        // so no per-source special-case is needed.
         let record_count = breakdown.as_ref().map(|b| b.count_for(src));
         source_infos.push(SourceInfo {
             id: src.as_str().to_string(),
@@ -1748,38 +1689,29 @@ fn print_sources_human(r: &SourcesReport, popular_count: Option<u64>) {
     }
 }
 
-// --- threat-db health ------------------------------------------------------
-
 #[derive(Debug, serde::Serialize)]
 struct HealthReport {
-    /// DB file is present on disk.
     installed: bool,
-    /// Filesystem path the DB is expected at.
     path: Option<String>,
     /// Ed25519 signature verified (`None` when not installed or load failed).
     signature_valid: Option<bool>,
-    /// DB age in hours since its build timestamp.
     age_hours: Option<f64>,
     /// Configured refresh interval in hours (`auto_update_hours`, 0 = disabled).
     refresh_interval_hours: u64,
-    /// DB is older than 2x the refresh interval (never true when refresh is disabled).
+    /// Older than 2x the refresh interval (never true when refresh is disabled).
     stale: bool,
-    /// DB build sequence (the version).
     build_sequence: Option<u64>,
-    /// DB build timestamp (Unix epoch seconds).
     build_timestamp: Option<u64>,
     counts: Option<CategoryCounts>,
-    /// Status of the optional user-local supplemental overlay.
     supplemental: SupplementalHealth,
-    /// Load/parse error, when the DB file exists but could not be read.
+    /// Load/parse error when the DB file exists but could not be read.
     error: Option<String>,
-    /// Overall one-word health: `ok`, `stale`, `not_installed`, or `error`.
+    /// `ok`, `stale`, `not_installed`, or `error`.
     status: String,
 }
 
 #[derive(Debug, serde::Serialize)]
 struct SupplementalHealth {
-    /// A supplemental overlay file exists on disk.
     present: bool,
     path: Option<String>,
 }
@@ -1839,8 +1771,7 @@ fn gather_health() -> HealthReport {
             let stats = db.stats();
             let age_secs = unix_now().saturating_sub(stats.build_timestamp);
             let age_hours = age_secs as f64 / 3600.0;
-            // Stale = older than 2x the refresh interval; a disabled refresh
-            // (interval 0) means the DB is never considered stale.
+            // Stale = older than 2x the refresh interval; interval 0 = never stale.
             let stale =
                 refresh_interval_hours != 0 && age_hours > (refresh_interval_hours as f64 * 2.0);
             let counts = CategoryCounts {
@@ -1973,24 +1904,18 @@ fn print_supplemental_health(s: &SupplementalHealth) {
     }
 }
 
-// --- threat-db diff --------------------------------------------------------
-
 #[derive(Debug, serde::Serialize)]
 struct DiffReport {
-    /// The `--since` argument as the user supplied it.
+    /// The `--since` argument as supplied.
     since: String,
     /// How `--since` was interpreted: `version` or `date`.
     since_kind: String,
-    /// The baseline snapshot `diff` compared against, if one was found.
     baseline: Option<SnapshotSummary>,
-    /// The current DB observation.
     current: Option<SnapshotSummary>,
     /// Per-category count deltas (current - baseline). Positive = added.
     delta: Option<CountDelta>,
-    /// Per-source count deltas, keyed by stable source id.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     source_delta: std::collections::BTreeMap<String, i64>,
-    /// Honest statement of what this diff can and cannot show.
     limitation: String,
     /// Set when the diff could not be produced (no DB, no baseline, …).
     note: Option<String>,
@@ -2026,15 +1951,15 @@ fn delta_of(current: &CategoryCounts, baseline: &CategoryCounts) -> CountDelta {
     }
 }
 
-/// Parse `--since` as either a build-sequence number or an ISO date.
-/// Returns `(kind, version, epoch)` where exactly one of version/epoch is set.
+/// Parse `--since` as a build-sequence number or ISO date. Returns
+/// `(kind, version, epoch)` with exactly one of version/epoch set.
 fn parse_since(since: &str) -> Result<(String, Option<u64>, Option<u64>), String> {
     let s = since.trim();
     // A bare integer is a build sequence ("version").
     if let Ok(version) = s.parse::<u64>() {
         return Ok(("version".to_string(), Some(version), None));
     }
-    // Otherwise interpret as a date (YYYY-MM-DD, optionally with time).
+    // Otherwise a date (YYYY-MM-DD, optionally with time).
     if let Some(epoch) = parse_iso_date(s) {
         return Ok(("date".to_string(), None, Some(epoch)));
     }
@@ -2053,8 +1978,8 @@ fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Parse a `YYYY-MM-DD` (or `YYYY-MM-DDTHH:MM:SS`) date to a Unix epoch.
-/// Deliberately small and dependency-free; only the date part is used.
+/// Parse `YYYY-MM-DD` (or `...THH:MM:SS`) to a Unix epoch. Dependency-free;
+/// only the date part is used.
 fn parse_iso_date(s: &str) -> Option<u64> {
     let date_part = s.split(['T', ' ']).next().unwrap_or(s);
     let mut it = date_part.split('-');
@@ -2067,10 +1992,9 @@ fn parse_iso_date(s: &str) -> Option<u64> {
     if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
         return None;
     }
-    // Reject a day out of range for the actual month — e.g. 2026-02-30 or
-    // 2026-04-31. Without this the arithmetic below would silently roll the
-    // date into the next month, and `diff --since` would select the wrong
-    // baseline instead of erroring on the malformed input.
+    // Reject a day past the month length (e.g. 2026-02-30): otherwise the
+    // arithmetic rolls into the next month and `diff --since` picks the wrong
+    // baseline instead of erroring.
     let max_day = if month == 2 && is_leap_year(year) {
         29
     } else {
@@ -2099,8 +2023,8 @@ fn parse_iso_date(s: &str) -> Option<u64> {
 
 /// `tirith threat-db diff --since <version-or-date>`.
 pub fn diff(since: &str, json: bool) -> i32 {
-    // Fold the current DB into the history first, so a brand-new install can
-    // still be a baseline for a later diff.
+    // Fold the current DB into history first so a fresh install can be a
+    // baseline for a later diff.
     snapshot_current_db();
 
     let limitation = "The threat DB format retains no per-entry history, so this diff reports \
@@ -2113,9 +2037,8 @@ pub fn diff(since: &str, json: bool) -> i32 {
         Ok(v) => v,
         Err(e) => {
             if json {
-                // The exit code is already 1 (invalid --since); a JSON-write
-                // failure here cannot make it any worse, so the result is
-                // intentionally discarded.
+                // Exit code is already 1 (invalid --since); a JSON-write failure
+                // can't make it worse, so the result is discarded.
                 let _ = print_json_value(&DiffReport {
                     since: since.to_string(),
                     since_kind: "invalid".to_string(),
@@ -2136,12 +2059,9 @@ pub fn diff(since: &str, json: bool) -> i32 {
     let (history, history_read_error) = load_history();
     let current = current_snapshot();
 
-    // Pick the baseline: the newest snapshot at or before the requested point.
-    //
-    // For a version, compare against the DB build sequence. For a date,
-    // compare against `recorded_at` (when tirith observed that DB) — the user
-    // asking "diff since <date>" wants the DB tirith held on that date, not a
-    // DB whose CI build timestamp happens to predate it.
+    // Baseline: newest snapshot at or before the requested point. For a version,
+    // compare build_sequence; for a date, compare `recorded_at` (when tirith
+    // observed the DB), not the CI build timestamp.
     let baseline = history
         .iter()
         .filter(|s| match (want_version, want_epoch) {
@@ -2184,8 +2104,8 @@ pub fn diff(since: &str, json: bool) -> i32 {
         (None, Some(_)) => (
             None,
             Default::default(),
-            // A history file that exists but could not be read must not be
-            // reported as "no snapshot recorded" — surface the read failure.
+            // An existing-but-unreadable history file must surface the read
+            // failure, not "no snapshot recorded".
             Some(history_read_error.clone().unwrap_or_else(|| {
                 format!(
                     "No snapshot was recorded at or before '{since}'. tirith only began \
@@ -2275,12 +2195,8 @@ fn print_delta_line(label: &str, delta: i64) {
     println!("    {label:<14} {sign}");
 }
 
-// --- shared output helpers -------------------------------------------------
-
-/// Serialize `value` as pretty JSON to stdout. Returns `0` on success and `1`
-/// on a serialization failure — a JSON consumer must be able to tell that the
-/// output it received is incomplete, so the caller propagates the non-zero
-/// code rather than exiting `0` with nothing (or partial output) printed.
+/// Serialize `value` as pretty JSON to stdout. `0` on success, `1` on a
+/// serialization failure (so a JSON consumer can tell the output is incomplete).
 #[must_use]
 fn print_json_value(value: &impl serde::Serialize) -> i32 {
     match serde_json::to_string_pretty(value) {
@@ -2513,8 +2429,7 @@ mod tests {
 
     #[test]
     fn update_attempted_guard_fires_once() {
-        // Standalone AtomicBool because the real global UPDATE_ATTEMPTED
-        // cannot be reset without affecting other tests.
+        // Standalone AtomicBool: the real global UPDATE_ATTEMPTED can't be reset.
         let guard = AtomicBool::new(false);
 
         let first = guard.swap(true, Ordering::Relaxed);
@@ -2544,9 +2459,8 @@ mod tests {
             "second lock acquisition should fail while first is held"
         );
 
-        // Explicit unlock then drop: relying on Drop alone races on macOS BSD
-        // `flock` semantics where release-on-close isn't always observable to
-        // an immediate re-acquire. `unlock()` is deterministic.
+        // Explicit unlock then drop: Drop alone races on macOS BSD `flock`
+        // (release-on-close not always observable to an immediate re-acquire).
         let l1 = lock1.unwrap();
         fs2::FileExt::unlock(&l1).expect("unlock lock1");
         drop(l1);
@@ -2621,8 +2535,7 @@ mod tests {
 
     #[test]
     fn backoff_differs_from_normal_interval() {
-        // Failure backoff must be shorter than the normal interval so users
-        // retry sooner after a transient failure.
+        // Failure backoff must be shorter than the normal interval for faster retry.
         let default_config = policy::ThreatIntelConfig::default();
         let normal_interval_secs = default_config.auto_update_hours * 3600;
         assert_ne!(
@@ -3063,9 +2976,7 @@ mod tests {
         assert_eq!(r, super::CacheResolution::Fresh(VALID_MANIFEST.to_string()));
     }
 
-    // Transport-level tests use fetch_manifest_from_with_state with an
-    // injectable state dir so parallel tests don't race on env vars.
-    /// Helper: call fetch with isolated state dir (no env var races).
+    /// Fetch with an isolated state dir so parallel tests don't race on env vars.
     fn fetch_with_state(url: &str, state: &std::path::Path) -> Result<Manifest, String> {
         super::fetch_manifest_from_with_state(url, Some(state.to_path_buf()))
     }
@@ -3259,12 +3170,9 @@ mod tests {
         assert!(err.contains("exceeded max size"));
     }
 
-    // --- `--offline` / `TIRITH_OFFLINE` (roadmap M0.3) ---------------------
-    //
-    // The offline switch must make `maybe_background_update` a guaranteed
-    // no-op: zero network and — observably — no `spawned-at` state file
-    // written, since that file is the parent-side breadcrumb left right
-    // before a background update child is spawned.
+    // `--offline` / `TIRITH_OFFLINE` (M0.3): the switch must make
+    // `maybe_background_update` a guaranteed no-op — zero network and no
+    // `spawned-at` state file (the breadcrumb written right before a spawn).
 
     /// RAII guard that sets/removes `TIRITH_OFFLINE` and restores it on Drop.
     struct OfflineEnvGuard {
@@ -3293,8 +3201,7 @@ mod tests {
 
     #[test]
     fn offline_env_active_recognizes_truthy_values() {
-        // `offline_env_active` now lives in `cli/mod.rs` (one shared helper);
-        // this still exercises it through the local env-guard infra.
+        // `offline_env_active` lives in `cli/mod.rs`; exercised here via the env guard.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["1", "true", "TRUE", "yes", "On", " on "] {
             let _e = OfflineEnvGuard::set(v);
@@ -3324,9 +3231,8 @@ mod tests {
 
     #[test]
     fn offline_flag_skips_background_update_no_network_attempt() {
-        // With the explicit `--offline` flag, `maybe_background_update` must
-        // not even reach the state dir: no `spawned-at` file is written, so
-        // no background update child can be launched (= zero network).
+        // With `--offline`, `maybe_background_update` must not reach the state
+        // dir: no `spawned-at` file, so no child spawned (= zero network).
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _e = OfflineEnvGuard::unset();
         let tmp = tempfile::tempdir().unwrap();
@@ -3344,9 +3250,8 @@ mod tests {
 
     #[test]
     fn offline_env_skips_background_update_no_network_attempt() {
-        // Same guarantee via the `TIRITH_OFFLINE` env var (the path the shell
-        // hooks and the conformance harness use, since they cannot pass CLI
-        // flags through every `tirith check` invocation).
+        // Same guarantee via `TIRITH_OFFLINE` (the path shell hooks and the
+        // conformance harness use, lacking CLI flags per `tirith check`).
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _e = OfflineEnvGuard::set("1");
         let tmp = tempfile::tempdir().unwrap();
@@ -3365,11 +3270,9 @@ mod tests {
 
     #[test]
     fn offline_short_circuits_before_update_attempted_latch() {
-        // The offline check is intentionally ahead of the once-per-process
-        // `UPDATE_ATTEMPTED` latch: an offline call must not consume the
-        // latch, so a later online call in the same process is still free to
-        // proceed. Verified on a standalone AtomicBool that mirrors the
-        // global's swap semantics.
+        // The offline check is ahead of the once-per-process `UPDATE_ATTEMPTED`
+        // latch: an offline call must not consume it, so a later online call can
+        // still proceed. Verified on a standalone AtomicBool.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let latch = AtomicBool::new(false);
         // Simulate the offline early-return: the latch is never swapped.
@@ -3382,8 +3285,6 @@ mod tests {
             "an offline call must not consume the once-per-process latch"
         );
     }
-
-    // --- threat-db transparency: indicator parsing -------------------------
 
     #[test]
     fn parse_indicator_recognizes_ipv4() {
@@ -3479,8 +3380,6 @@ mod tests {
         );
     }
 
-    // --- threat-db transparency: --since parsing ---------------------------
-
     #[test]
     fn parse_since_accepts_version_number() {
         let (kind, version, epoch) = parse_since("42").unwrap();
@@ -3520,10 +3419,8 @@ mod tests {
 
     #[test]
     fn parse_iso_date_rejects_day_past_month_length() {
-        // A day in 1..=31 but past the actual month length (2026-02-30,
-        // 2026-04-31) was previously accepted and silently rolled into the next
-        // month — `diff --since` then picked the wrong baseline. It must now be
-        // rejected outright.
+        // A day past the month length (2026-02-30) was previously rolled into the
+        // next month, mis-selecting the `diff --since` baseline. Must reject now.
         assert_eq!(parse_iso_date("2026-02-30"), None);
         assert_eq!(parse_iso_date("2026-04-31"), None);
         assert_eq!(parse_iso_date("2026-06-31"), None);
@@ -3558,8 +3455,6 @@ mod tests {
         // 1700000000 = 2023-11-14 22:13:20 UTC (the fixture DB build time).
         assert_eq!(format_epoch(1700000000), "2023-11-14 22:13:20 UTC");
     }
-
-    // --- threat-db transparency: count delta -------------------------------
 
     #[test]
     fn delta_of_computes_signed_category_changes() {
@@ -3597,8 +3492,6 @@ mod tests {
         };
         assert_eq!(c.total(), 31);
     }
-
-    // --- threat-db transparency: snapshot history --------------------------
 
     #[test]
     fn record_snapshot_dedups_on_build_sequence() {

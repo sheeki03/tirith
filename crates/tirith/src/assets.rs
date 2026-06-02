@@ -1,8 +1,6 @@
-/// Shell hook assets embedded at compile time.
-/// These are written to the user data dir on first `tirith init`.
-///
-/// Assets live under `crates/tirith/assets/` so they are included in the
-/// crate tarball and `cargo install` / `cargo publish` work correctly.
+/// Shell hook assets embedded at compile time, written to the user data dir on
+/// first `tirith init`. Live under `crates/tirith/assets/` so they ship in the
+/// crate tarball (`cargo install` / `cargo publish`).
 pub const TIRITH_SH: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/shell/tirith.sh"

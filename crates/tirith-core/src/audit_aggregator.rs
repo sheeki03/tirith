@@ -1,9 +1,5 @@
-/// Audit log aggregation, analytics, and compliance reporting.
-///
-/// Reads JSONL audit log files and provides:
-/// - Export: filter + format as JSON/CSV
-/// - Stats: summary analytics per session or overall
-/// - Report: structured compliance report
+//! Audit log aggregation, analytics, and compliance reporting over JSONL logs:
+//! export (JSON/CSV), stats, and a structured compliance report.
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
@@ -69,8 +65,7 @@ pub struct AuditRecord {
     #[serde(default)]
     pub trust_scope: Option<String>,
 
-    /// M4 item 8 chunk 1: caller origin. Old log files without this field
-    /// parse cleanly (serde `default`).
+    /// M4 item 8 chunk 1: caller origin. Old logs parse cleanly (serde `default`).
     #[serde(default)]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }
@@ -123,22 +118,11 @@ pub struct ReadLogResult {
     pub skipped_lines: usize,
 }
 
-/// Read and parse all records from a JSONL audit log.
-///
-/// This is the file-reading entry. It STREAMS the file line-by-line through a
-/// [`std::io::BufReader`] (following symlinks, no size cap on the file as a
-/// whole, but never buffering the entire file in memory at once) and feeds each
-/// line to the shared per-line parser via [`parse_log_from_reader`]. For a large
-/// append-only audit log this keeps the working-set memory bounded by the
-/// longest line rather than the whole file. The parse result, malformed-line
-/// skipping, and [`ReadLogResult::skipped_lines`] accounting are byte-identical
-/// to the historical whole-file (`read_to_string` + [`parse_log`]) path — only
-/// the memory profile differs.
-///
-/// Callers that have already read the log through a hardened/size-capped reader
-/// (e.g. the offline dashboard, which must not block on a FIFO or OOM on an
-/// attacker-influenced path) should call [`parse_log`] directly with the bounded
-/// content instead of `read_log`.
+/// Read and parse all records from a JSONL audit log, STREAMING line-by-line via
+/// [`BufReader`] so a large append-only log is never fully buffered. Result and
+/// `skipped_lines` accounting are byte-identical to the whole-file [`parse_log`]
+/// path. Callers that already have bounded content (e.g. the hardened dashboard
+/// reader) should call [`parse_log`] directly.
 pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
@@ -146,24 +130,14 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     parse_log_from_reader(reader, Some(path))
 }
 
-/// Parse JSONL audit-log lines streamed from `reader` into records.
+/// Streaming counterpart of [`parse_log`]: pulls one line at a time from
+/// `reader`, identical malformed-line skipping / `skipped_lines` accounting.
 ///
-/// The streaming counterpart of [`parse_log`]: instead of taking the whole log
-/// as one `&str` it pulls one line at a time from a [`BufRead`], so a caller
-/// (e.g. [`read_log`]) can avoid buffering an unbounded append-only log in
-/// memory. Behavior — malformed-line skipping, the one-line stderr warning, and
-/// [`ReadLogResult::skipped_lines`] accounting — is identical to [`parse_log`].
-/// `source` is only used to label the warning; pass `None` when there is no
-/// meaningful path to name.
-///
-/// A read I/O error mid-stream is TERMINAL — the loop stops and returns `Err`,
-/// matching the former whole-file contract (`read_to_string` rejected such a
-/// file with an I/O error). This is NOT a skippable line: a non-advancing error
-/// (e.g. `EISDIR` when `path` is a directory — `File::open` succeeds on a
-/// directory on Unix, then every read returns the same error WITHOUT advancing
-/// the position) would otherwise spin forever. (A successfully-read line that is
-/// merely malformed JSON is still skipped + counted by `parse_log_line`; only an
-/// unreadable byte stream is fatal.)
+/// A read I/O error mid-stream is TERMINAL (returns `Err`, matching the former
+/// `read_to_string` contract) — NOT a skippable line: a non-advancing error
+/// (e.g. `EISDIR` on a directory, where `File::open` succeeds but every read
+/// fails without advancing) would otherwise spin forever. Malformed JSON on a
+/// successfully-read line is still skipped + counted.
 pub fn parse_log_from_reader(
     reader: impl BufRead,
     source: Option<&Path>,
@@ -188,15 +162,9 @@ pub fn parse_log_from_reader(
     })
 }
 
-/// Parse JSONL audit-log `content` (already read into memory) into records.
-///
-/// Split out of [`read_log`] so a caller that reads the log through a hardened,
-/// size-capped reader can reuse the EXACT same parse + malformed-line accounting
-/// without `read_log`'s streaming file read. Malformed lines are skipped (with a
-/// one-line stderr warning) and counted in [`ReadLogResult::skipped_lines`],
-/// identical to the streaming [`read_log`] / [`parse_log_from_reader`] behavior.
-/// `source` is only used to label the warning; pass `None` when there is no
-/// meaningful path to name.
+/// Parse already-in-memory JSONL `content` into records, so a caller with a
+/// hardened/size-capped reader reuses the same parse + malformed-line accounting
+/// as the streaming path. `source` only labels the warning (`None` if no path).
 pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     let mut records = Vec::new();
     let mut skipped_lines = 0usize;
@@ -209,12 +177,8 @@ pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     }
 }
 
-/// Parse one already-decoded log `line` (1-based `line_num`), pushing a parsed
-/// [`AuditRecord`] onto `records` or counting a skip in `skipped_lines`.
-///
-/// Shared by [`parse_log`] (whole-file `&str`) and [`parse_log_from_reader`]
-/// (streamed) so both paths apply the SAME trim / empty-skip / malformed-line
-/// rules and produce byte-identical results.
+/// Parse one decoded log `line`, pushing an [`AuditRecord`] or counting a skip.
+/// Shared by [`parse_log`] and [`parse_log_from_reader`] for identical results.
 fn parse_log_line(
     line: &str,
     line_num: usize,
@@ -235,10 +199,8 @@ fn parse_log_line(
     }
 }
 
-/// Emit the one-line stderr warning for a skipped audit line. Shared so the
-/// whole-file and streaming paths produce the IDENTICAL warning text (the
-/// file-path `Display` in the malformed-line warning must not drift between
-/// the two entries).
+/// One-line stderr warning for a skipped audit line, shared so both paths emit
+/// identical text.
 fn warn_malformed_line(line_num: usize, source: Option<&Path>, e: &dyn std::fmt::Display) {
     match source {
         Some(path) => eprintln!(
@@ -255,8 +217,8 @@ fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(ts).ok()
 }
 
-/// Returns true if a record's entry_type matches the requested filter value.
-/// Empty string and "verdict" are treated equivalently (backward compat for old log entries).
+/// Whether a record's entry_type matches the filter. Empty string and "verdict"
+/// are equivalent (backward compat for old log entries).
 fn entry_type_matches(record_type: &str, filter_type: &str) -> bool {
     if filter_type == "all" {
         return true;
@@ -271,7 +233,6 @@ fn entry_type_matches(record_type: &str, filter_type: &str) -> bool {
 
 /// Filter records by the given criteria.
 pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord> {
-    // Default entry_type filter to "verdict" when not set
     let entry_type_filter = filter.entry_type.as_deref().unwrap_or("verdict");
 
     records
@@ -280,8 +241,8 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
             if !entry_type_matches(&r.entry_type, entry_type_filter) {
                 return false;
             }
-            // Parse timestamps so --since/--until compare with timezone awareness;
-            // fall back to lexicographic compare when either side fails to parse.
+            // Parse timestamps for timezone-aware --since/--until; fall back to
+            // lexicographic compare when either side fails to parse.
             if let Some(ref since) = filter.since {
                 match (parse_ts(&r.timestamp), parse_ts(since)) {
                     (Some(rt), Some(st)) => {
@@ -331,8 +292,7 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
         .collect()
 }
 
-/// Compute summary statistics from a set of audit records.
-/// Only considers records with entry_type "verdict" (or empty, for old records).
+/// Summary statistics over the "verdict" records (empty entry_type counts too).
 pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut actions: HashMap<String, usize> = HashMap::new();
     let mut rule_counts: HashMap<String, usize> = HashMap::new();
@@ -342,7 +302,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut raw_total_findings = 0usize;
     let mut total_commands = 0usize;
 
-    // Empty entry_type indicates a pre-tagged-union log entry; treat it as "verdict".
+    // Empty entry_type = pre-tagged-union entry; treat it as "verdict".
     let is_verdict = |r: &&AuditRecord| r.entry_type.is_empty() || r.entry_type == "verdict";
 
     for record in records.iter().filter(is_verdict) {
@@ -353,8 +313,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
         for rid in &record.rule_ids {
             *rule_counts.entry(rid.clone()).or_insert(0) += 1;
         }
-        // Raw (pre-paranoia) stats. Older records without raw_rule_ids fall back
-        // to their effective rule_ids.
+        // Raw (pre-paranoia) stats; older records fall back to effective rule_ids.
         if let Some(ref raw_ids) = record.raw_rule_ids {
             raw_total_findings += raw_ids.len();
             for rid in raw_ids {
@@ -383,7 +342,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let time_range = if total_commands == 0 {
         None
     } else {
-        // Parsed-timestamp min/max — can't assume records are in arrival order.
+        // Parsed-timestamp min/max — records aren't guaranteed in arrival order.
         let min_ts = records
             .iter()
             .filter(is_verdict)
@@ -468,28 +427,14 @@ pub fn export_json(records: &[AuditRecord]) -> String {
     })
 }
 
-/// Export records as CSV (RFC 4180 compliant). Only supports verdict entries.
+/// Export records as RFC 4180 CSV (verdict entries only). `agent_origin` is the
+/// last column (no position shift for existing consumers), stringified per
+/// variant.
 ///
-/// `agent_origin` is appended as the last column so existing CSV consumers
-/// see no column-position shift. The JSON export already carries the field;
-/// CSV now exposes a compact stringification per variant
-/// (`human(interactive)` / `agent:<tool>` / `mcp:<client_name>` / `gateway` /
-/// `ci:<provider>` / `ide:<name>` / empty for `None`). Compliance dashboards
-/// consuming CSV no longer lose agent attribution.
-///
-/// **CSV-injection neutralization.** The `agent_origin` value embeds a
-/// caller-supplied `tool` name (`AgentOrigin::Agent { tool, .. }`), client
-/// name (`AgentOrigin::Mcp { client_name, .. }`), and similar payload
-/// fields. A hostile caller can declare a `tool` like `=cmd|'/bin/sh'!A1`,
-/// and Excel / Google Sheets / LibreOffice will *evaluate* a cell that
-/// starts with `=`, `+`, `-`, or `@` as a formula. The standard OWASP
-/// mitigation — prefix the cell with a tab — neutralizes the formula
-/// without altering the displayed value. Applied via
-/// [`csv_neutralize_formula`] before [`csv_escape`] on every cell whose
-/// content can carry caller-supplied bytes. (`timestamp` is engine-
-/// generated; `bypass_requested` / `tier_reached` are typed bool/u8 and
-/// non-string. The other text columns go through neutralization for
-/// belt-and-braces — see the field-level rationale on the helper.)
+/// CSV-injection neutralization: caller-supplied cells (the `agent_origin` tool/
+/// client name, etc.) can start with `=`/`+`/`-`/`@`, which Excel/Sheets/
+/// LibreOffice evaluate as a formula. [`csv_neutralize_formula`] tab-prefixes
+/// such cells (the OWASP mitigation) before [`csv_escape`].
 pub fn export_csv(records: &[AuditRecord]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -513,11 +458,8 @@ pub fn export_csv(records: &[AuditRecord]) -> String {
     out
 }
 
-/// Render an [`AgentOrigin`] for the CSV `agent_origin` cell.
-///
-/// Variants collapse to a `kind:payload` shape so dashboards can split on `:`
-/// without parsing JSON. `None` (old log rows that predate the field) yields
-/// an empty cell.
+/// Render an [`AgentOrigin`] for the CSV cell as `kind:payload` (so dashboards
+/// can split on `:`); `None` yields an empty cell.
 fn agent_origin_csv_render(origin: &Option<crate::agent_origin::AgentOrigin>) -> String {
     use crate::agent_origin::AgentOrigin;
     match origin {
@@ -544,8 +486,8 @@ fn agent_origin_csv_render(origin: &Option<crate::agent_origin::AgentOrigin>) ->
     }
 }
 
-/// Escape a field for RFC 4180 CSV: if it contains commas, double quotes,
-/// or newlines, wrap in double quotes and double any internal quotes.
+/// Escape a field for RFC 4180 CSV: wrap in double quotes (doubling internal
+/// quotes) when it contains a comma, quote, or newline.
 fn csv_escape(field: &str) -> String {
     if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
         let escaped = field.replace('"', "\"\"");
@@ -555,28 +497,10 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
-/// Neutralize CSV-injection formulas by prefixing a tab to any cell that
-/// would otherwise be evaluated as a formula by Excel / Google Sheets /
-/// LibreOffice / Numbers.
-///
-/// **Threat.** Spreadsheet applications evaluate a cell whose first
-/// character is `=`, `+`, `-`, or `@` as a formula. A caller-supplied
-/// `agent_origin.tool` like `=cmd|'/bin/sh'!A1` (or similar in other
-/// dialects) becomes RCE-adjacent when the audit CSV is opened in a
-/// spreadsheet. The CSV column is appended to compliance dashboards that
-/// auto-open in Excel — exactly the worst-case audience.
-///
-/// **Mitigation.** OWASP's recommended fix is to prefix a tab (`\t`).
-/// Excel renders the tab as a literal character (so the cell still
-/// reads as the intended value, just shifted) and refuses to interpret
-/// the leading `=` / `+` / `-` / `@`. The single-quote (`'`) alternative
-/// is consumed by Excel during display (cell shows the same value, no
-/// shift) but is preserved verbatim by Google Sheets and LibreOffice,
-/// producing an inconsistent rendering across tools. The tab approach
-/// is consistent across every major spreadsheet.
-///
-/// **No-op on safe cells.** A cell that does not start with a formula
-/// trigger is returned unchanged, so the common case adds zero bytes.
+/// Neutralize CSV-injection by tab-prefixing any cell starting with a spreadsheet
+/// formula trigger (`=`, `+`, `-`, `@`) — which Excel/Sheets/LibreOffice would
+/// otherwise evaluate (RCE-adjacent). The tab is OWASP's fix and is consistent
+/// across tools (unlike the `'` alternative). No-op on safe cells.
 fn csv_neutralize_formula(s: &str) -> String {
     match s.as_bytes().first() {
         Some(b'=' | b'+' | b'-' | b'@') => format!("\t{s}"),
@@ -767,7 +691,7 @@ tr:nth-child(even) { background: #e9ecef; }
     html
 }
 
-/// Escape a markdown table cell: pipe characters and newlines break table formatting.
+/// Escape a markdown table cell (pipes and newlines break table formatting).
 fn escape_md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
 }
@@ -933,7 +857,7 @@ mod tests {
         let records = sample_records();
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines.len(), 4); // header + 3 records
+        assert_eq!(lines.len(), 4); // header + 3
         assert!(lines[0].starts_with("timestamp,"));
         assert!(lines[1].contains("Block"));
     }
@@ -1006,7 +930,6 @@ mod tests {
     fn test_export_csv_includes_agent_origin_column() {
         use crate::agent_origin::AgentOrigin;
 
-        // A record with an MCP agent_origin, and one without (None).
         let mut records = vec![
             AuditRecord {
                 timestamp: "2026-01-15T10:00:00Z".into(),
@@ -1066,7 +989,7 @@ mod tests {
                 agent_origin: None,
             },
         ];
-        // Append rows for the remaining variants so we exercise each branch.
+        // Exercise each remaining variant.
         let base = records[1].clone();
         let mut push_variant = |origin: AgentOrigin| {
             let mut r = base.clone();
@@ -1099,19 +1022,17 @@ mod tests {
             "header should end with agent_origin column: {}",
             lines[0]
         );
-        // MCP row: last column is "mcp:Cursor@0.42".
         assert!(
             lines[1].ends_with(",mcp:Cursor@0.42"),
             "MCP row last column should be mcp:Cursor@0.42, got: {}",
             lines[1]
         );
-        // None row: empty cell (the line ends with a bare comma).
+        // None row: empty cell (bare trailing comma).
         assert!(
             lines[2].ends_with(','),
             "None row should leave the agent_origin cell empty, got: {}",
             lines[2]
         );
-        // Remaining variants.
         assert!(
             lines[3].ends_with(",human(interactive)"),
             "row 3: {}",
@@ -1147,22 +1068,16 @@ mod tests {
         assert!(stats.time_range.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // CodeRabbit M13 PR #132 F1 — `read_log` now STREAMS the file line-by-line
-    // (BufReader) instead of slurping the whole file via `read_to_string`. The
-    // memory profile changes; the parse RESULT must not. Pin that the streaming
-    // `read_log` produces a byte-identical `ReadLogResult` (record count, the
-    // records themselves, and `skipped_lines`) to the old whole-file
-    // `parse_log(&content, ..)` path for a multi-line log that INCLUDES a blank
-    // line and a malformed line.
-    // -----------------------------------------------------------------------
+    // CodeRabbit M13 PR #132 F1 — `read_log` now STREAMS (BufReader); the memory
+    // profile changes but the parse RESULT must not. Pin that streaming `read_log`
+    // is byte-identical to the old whole-file `parse_log` for a log with a blank
+    // and a malformed line.
     #[test]
     fn test_read_log_streaming_matches_whole_file_parse() {
         use std::io::Write as _;
 
-        // A representative multi-line JSONL log: two good verdict records, a
-        // blank line (skipped, not counted), and a malformed line (counted in
-        // `skipped_lines`).
+        // Two good records, a blank line (skipped, not counted), and a malformed
+        // line (counted).
         let good_a = serde_json::to_string(&AuditRecord {
             timestamp: "2026-01-15T10:00:00Z".into(),
             session_id: "sess-001".into(),
@@ -1219,15 +1134,13 @@ mod tests {
             agent_origin: None,
         })
         .unwrap();
-        // Blank line in the middle (must be skipped silently) and a malformed
-        // JSON line (must be counted in `skipped_lines`).
+        // Blank line (skipped silently) + malformed JSON line (counted).
         let content = format!("{good_a}\n\n{{not valid json}}\n{good_b}\n");
 
-        // Old whole-file path (the reference behavior).
+        // Reference whole-file path.
         let whole = parse_log(&content, None);
 
-        // New streaming path via the real `read_log` file entry, over a temp
-        // file with the SAME bytes.
+        // Streaming path via the real `read_log` over a temp file with the SAME bytes.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         std::fs::File::create(&path)
@@ -1252,8 +1165,7 @@ mod tests {
         );
         assert_eq!(whole.records.len(), 2, "the two good records both parse");
 
-        // Identical records (serialize both sides and compare — `AuditRecord`
-        // has no `PartialEq`, but its JSON round-trip is canonical here).
+        // Identical records (compared via JSON — `AuditRecord` has no `PartialEq`).
         let streamed_json = export_json(&streamed.records);
         let whole_json = export_json(&whole.records);
         assert_eq!(
@@ -1264,16 +1176,10 @@ mod tests {
 
     #[test]
     fn read_log_on_a_directory_errs_without_hanging() {
-        // Regression (M13 PR #132): `File::open` SUCCEEDS on a directory on Unix,
-        // then every read returns `EISDIR` WITHOUT advancing the position — so a
-        // streaming loop that treats a read I/O error as a skippable line spins
-        // forever (it hung `secret_triage_json_fatal_error_is_parseable_json` for
-        // ~20 min on the Linux/macOS CI runners; Windows passed because opening a
-        // directory as a file fails outright). The fix makes a read I/O error
-        // TERMINAL. The test COMPLETING is the proof it no longer hangs; we also
-        // assert `Err` so the former `read_to_string` "read failure → Err"
-        // contract is preserved on every platform (callers like `secret triage`
-        // rely on that fatal-error path).
+        // Regression (M13 PR #132): `File::open` succeeds on a directory on Unix,
+        // then every read returns `EISDIR` without advancing — a streaming loop
+        // treating that as skippable spins forever (it hung CI ~20 min). The fix
+        // makes the read error TERMINAL; completing + `Err` is the proof.
         let dir = tempfile::tempdir().expect("temp dir");
         assert!(
             read_log(dir.path()).is_err(),
@@ -1281,22 +1187,13 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 CR follow-up — `agent_origin` (and other caller-influenced
-    // CSV columns) must be neutralized against spreadsheet formula
-    // injection. A caller-supplied `AgentOrigin::Agent { tool: "=cmd...", ..}`
-    // would otherwise be evaluated as a formula by Excel / Sheets /
-    // LibreOffice when the audit CSV is opened in a spreadsheet — exactly
-    // the worst-case audience for compliance exports.
-    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — caller-influenced CSV columns must be neutralized
+    // against spreadsheet formula injection (`=cmd...` evaluated by Excel/Sheets/
+    // LibreOffice on opening the audit CSV).
 
     #[test]
     fn test_csv_neutralize_formula_prefixes_tab_for_dangerous_leaders() {
-        // Each of the four spreadsheet-formula leaders is neutralized by a
-        // single tab prefix. A leading tab keeps the rest of the value
-        // intact, so the displayed cell content is unchanged save for the
-        // shift — Excel / Sheets / LibreOffice all refuse to interpret a
-        // tab-prefixed cell as a formula.
+        // Each of the four formula leaders is neutralized by a tab prefix.
         assert_eq!(csv_neutralize_formula("=SUM(A1:A10)"), "\t=SUM(A1:A10)");
         assert_eq!(csv_neutralize_formula("+cmd"), "\t+cmd");
         assert_eq!(csv_neutralize_formula("-1+1"), "\t-1+1");
@@ -1305,8 +1202,7 @@ mod tests {
         assert_eq!(csv_neutralize_formula("normal"), "normal");
         assert_eq!(csv_neutralize_formula(""), "");
         assert_eq!(csv_neutralize_formula("ide:vscode"), "ide:vscode");
-        // Unicode leaders are NOT formula triggers, only the four ASCII
-        // leaders are — keep the cell shape minimal for the common case.
+        // Only the four ASCII leaders trigger; Unicode does not.
         assert_eq!(csv_neutralize_formula("é=value"), "é=value");
     }
 
@@ -1314,24 +1210,10 @@ mod tests {
     fn test_export_csv_neutralizes_formula_in_caller_supplied_columns() {
         use crate::agent_origin::AgentOrigin;
 
-        // The CR follow-up: every caller-supplied CSV cell that could
-        // start with a formula leader (`=`, `+`, `-`, `@`) must be
-        // tab-prefixed so Excel / Sheets / LibreOffice render it as a
-        // literal value instead of evaluating it as a formula.
-        //
-        // Today's `agent_origin` renderer fixes-prefix the value (e.g.
-        // `agent:<tool>`), so the rendered string itself never starts
-        // with a formula character for current variants. The defensive
-        // wrap is still applied so a future variant whose prefix is
-        // empty (or another caller-controllable column) does not need
-        // a separate fix. This test exercises both:
-        //   1. `rule_ids` — joined verbatim with no prefix, so a hostile
-        //      rule_id like `=SUM(...)` lands as the first byte and
-        //      MUST be neutralized.
-        //   2. `agent_origin` for the current `Agent`/`Mcp` shapes —
-        //      neutralization is a no-op because the renderer prefix
-        //      keeps the leader safe; the cell value is the raw
-        //      `agent:<tool>` form.
+        // Every caller-supplied CSV cell that could start with a formula leader
+        // must be tab-prefixed. Exercises (1) `rule_ids` — joined verbatim, so a
+        // hostile `=SUM(...)` lands first and MUST be neutralized; (2)
+        // `agent_origin`, a no-op today since the renderer prefix keeps it safe.
         let mut hostile_rules = AuditRecord {
             timestamp: "2026-01-15T10:00:00Z".into(),
             session_id: "sess-001".into(),
@@ -1368,21 +1250,19 @@ mod tests {
         let csv = export_csv(&[hostile_rules.clone()]);
         let line = csv.lines().nth(1).expect("must have a data row");
         let cols: Vec<&str> = line.split(',').collect();
-        // The rule_ids cell is the 4th column. After neutralization
-        // it must begin with a tab.
+        // The rule_ids cell (4th column) must begin with a tab after neutralization.
         assert!(
             cols[3].starts_with('\t'),
             "rule_ids cell beginning with a formula leader must be tab-prefixed \
              to neutralize the spreadsheet evaluation, got: {line}",
         );
-        // And the original value is preserved verbatim after the tab.
+        // The original value is preserved after the tab.
         assert!(
             cols[3].contains("=SUM(A1:A100)"),
             "rule_ids cell must still carry the original payload after the tab: {line}",
         );
 
-        // Also exercise the `command_redacted` column with each of the
-        // four formula leaders.
+        // Exercise `command_redacted` with each formula leader.
         for leader in ['=', '+', '-', '@'] {
             hostile_rules.command_redacted = format!("{leader}cmd");
             hostile_rules.rule_ids = vec!["safe_rule".into()];
@@ -1395,11 +1275,8 @@ mod tests {
             );
         }
 
-        // Belt-and-braces: a hostile `AgentOrigin` whose renderer prefix
-        // is empty would land directly in the agent_origin cell. The
-        // current variants all have a non-empty prefix, but pin the
-        // contract via the helper directly so a future variant that
-        // forgets the prefix still gets neutralized at the export site.
+        // Belt-and-braces: pin the helper contract directly so a future
+        // empty-prefix `AgentOrigin` variant is still neutralized at the export site.
         assert_eq!(
             csv_neutralize_formula("=cmd|'/bin/sh'!A1"),
             "\t=cmd|'/bin/sh'!A1",

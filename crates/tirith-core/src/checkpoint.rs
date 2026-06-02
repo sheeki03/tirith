@@ -1,12 +1,9 @@
-//! Checkpoint/rollback system for protecting against destructive operations.
+//! Checkpoint/rollback: file-level snapshots taken before destructive commands
+//! (`rm -rf`, `git reset --hard`, …) so users can recover destroyed work.
 //!
-//! Creates file-level snapshots before destructive commands (`rm -rf`, `git reset --hard`, etc.)
-//! so users can recover accidentally destroyed work.
-//!
-//! Storage: `$XDG_STATE_HOME/tirith/checkpoints/<uuid>/`
-//!   - `meta.json`: checkpoint metadata (timestamp, paths, trigger command)
-//!   - `files/`: preserved file contents (original directory structure flattened to SHA-256 names)
-//!   - `manifest.json`: path → SHA-256 mapping for restore
+//! Storage: `$XDG_STATE_HOME/tirith/checkpoints/<uuid>/` — `meta.json`
+//! (metadata), `files/` (contents, named by SHA-256), `manifest.json`
+//! (path → SHA-256 for restore).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,10 +32,8 @@ pub fn should_auto_checkpoint(command: &str) -> bool {
     AUTO_TRIGGER_PATTERNS
         .iter()
         .any(|p| lower.contains(p))
-        // Also catch `mv` — intentionally triggers on ALL mv commands, not just
-        // overwrites, because statically determining whether the destination exists
-        // is not possible. False positives are acceptable here: checkpoints are cheap
-        // and it's better to have an unnecessary snapshot than to miss a destructive move.
+        // `mv` fires on ALL moves (we can't statically tell if the destination
+        // exists); a spurious cheap snapshot beats missing a destructive move.
         || (lower.starts_with("mv ") || lower.contains(" mv "))
 }
 
@@ -159,7 +154,6 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
     }
 
     if manifest.is_empty() {
-        // Clean up empty checkpoint dir
         let _ = fs::remove_dir_all(&cp_dir);
         return Err("no files to checkpoint".to_string());
     }
@@ -174,11 +168,9 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
         file_count: manifest.len(),
     };
 
-    // Write metadata
     let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
     fs::write(cp_dir.join("meta.json"), meta_json).map_err(|e| format!("write meta: {e}"))?;
 
-    // Write manifest
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize: {e}"))?;
     fs::write(cp_dir.join("manifest.json"), manifest_json)
@@ -237,7 +229,6 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
         });
     }
 
-    // Sort newest first
     entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(entries)
 }
@@ -336,8 +327,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
-    // Track paths already classified so integrity/deleted/modified branches
-    // don't each emit a DiffEntry for the same file.
+    // Track classified paths so the branches don't double-emit for one file.
     let mut classified_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in &manifest {
@@ -513,60 +503,47 @@ pub struct PurgeResult {
     pub freed_bytes: u64,
 }
 
-/// Runtime-state observation captured by `tirith watch` (M10 ch2).
-///
-/// This is a BEST-EFFORT, after-the-fact observation of side effects a watched
-/// command had on the *environment* and *shell startup files* — distinct from
-/// the file-content checkpoint, which tracks the working tree. It is NOT a
-/// network monitor and NOT a security boundary; see the field docs.
-///
-/// `domains_contacted` is populated only when the caller opts into the
-/// experimental `--with-net-hints` heuristic. The empty default means "not
-/// observed", never "no network activity occurred".
+/// Runtime-state observation captured by `tirith watch` (M10 ch2): a
+/// BEST-EFFORT, after-the-fact view of a watched command's effect on the
+/// *environment* and *shell startup files*. NOT a network monitor and NOT a
+/// security boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostRunState {
-    /// Best-effort, heuristic DNS-resolver-side domain hints (experimental,
-    /// opt-in via `--with-net-hints`). May miss QUIC/UDP/direct-IP traffic
-    /// entirely. NOT authoritative and NOT a network monitor.
+    /// Heuristic DNS-resolver-side domain hints (experimental, opt-in via
+    /// `--with-net-hints`). Empty means "not observed", NOT "no traffic"; may
+    /// miss QUIC/UDP/direct-IP entirely. NOT authoritative.
     #[serde(default)]
     pub domains_contacted: Vec<String>,
-    /// Names of environment variables present AFTER the run that were absent
-    /// before. Observed by diffing a snapshot of the current process env, so it
-    /// reflects only variables the watched command exported back into tirith's
-    /// own environment (rarely the case for child processes) — primarily useful
-    /// when `tirith watch` is itself invoked from a wrapper that re-exports.
+    /// Env var names present after the run but absent before — only those the
+    /// command exported back into tirith's own env (so mainly useful when
+    /// `tirith watch` is invoked from a re-exporting wrapper).
     #[serde(default)]
     pub env_vars_added: Vec<String>,
-    /// Directories newly present on `$PATH` after the run (set-difference of the
-    /// colon-split `PATH` before vs after).
+    /// Directories newly on `$PATH` after the run (before-vs-after set diff).
     #[serde(default)]
     pub path_dirs_added: Vec<String>,
 }
 
-/// A before/after snapshot pair for the `tirith watch` runtime-state diff.
-///
-/// Captured by [`capture_runtime_state`] immediately before and after the
-/// watched command, then compared by [`diff_runtime_state`]. Kept separate from
-/// the file-content [`CheckpointMeta`] so the two concerns (working-tree files
-/// vs environment/PATH/shell-rc) stay independently testable.
+/// A before/after snapshot pair for the `tirith watch` runtime-state diff,
+/// captured by [`capture_runtime_state`] and compared by [`diff_runtime_state`].
+/// Separate from [`CheckpointMeta`] so working-tree vs env/PATH/shell-rc stay
+/// independently testable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
     /// Names of every environment variable visible at capture time.
     pub env_vars: Vec<String>,
     /// Colon-split `$PATH` entries at capture time (order preserved).
     pub path_dirs: Vec<String>,
-    /// Per shell-rc/profile file: relative-name → sha256 of its bytes. A file
-    /// that does not exist is recorded with the sha256 of the empty string so a
-    /// later *appearance* is detected as a change from "absent".
+    /// Per shell-rc/profile file: relative-name → sha256. An absent file gets
+    /// the empty-string sha so a later *appearance* reads as a change.
     pub shell_rc_hashes: std::collections::BTreeMap<String, String>,
-    /// Absolute home directory used to resolve the shell-rc paths (recorded so
-    /// the after-snapshot resolves the identical set).
+    /// Home dir used to resolve the shell-rc paths (so the after-snapshot
+    /// resolves the identical set).
     pub home: String,
 }
 
-/// Shell rc / profile files watched for modification during a `tirith watch`
-/// run. Mirrors the canonical list in `persistence.rs::SHELL_RC_FILES` plus the
-/// common PowerShell profile locations (only hashed when present).
+/// Shell rc / profile files watched during a `tirith watch` run. Mirrors
+/// `persistence.rs::SHELL_RC_FILES` plus the common PowerShell profile paths.
 const WATCH_SHELL_RC_FILES: &[&str] = &[
     ".bashrc",
     ".bash_profile",
@@ -582,9 +559,8 @@ const WATCH_SHELL_RC_FILES: &[&str] = &[
 /// Capture the current runtime state (env var names, `$PATH` entries, shell-rc
 /// hashes) for a `tirith watch` before/after comparison.
 ///
-/// `home` is taken as a parameter (not read from `std::env` here) so the unit
-/// tests can point it at a `tempfile::tempdir()` without mutating process-global
-/// `HOME` — mutating env in tests is a libc data race (see PR #125 history).
+/// `home` is a parameter (not read from `std::env`) so tests can point it at a
+/// tempdir without mutating process-global `HOME` (a libc data race — PR #125).
 pub fn capture_runtime_state(home: &Path) -> RuntimeStateSnapshot {
     let mut env_vars: Vec<String> = std::env::vars_os()
         .map(|(k, _)| k.to_string_lossy().into_owned())
@@ -602,8 +578,8 @@ pub fn capture_runtime_state(home: &Path) -> RuntimeStateSnapshot {
     let mut shell_rc_hashes = std::collections::BTreeMap::new();
     for rel in WATCH_SHELL_RC_FILES {
         let path = home.join(rel);
-        // Hash present files; record the empty-string hash for absent ones so a
-        // later appearance reads as a modification, not a no-op.
+        // Absent files get the empty-string hash so a later appearance reads as
+        // a modification.
         let sha = if path.is_file() {
             match sha256_file(&path) {
                 Ok(s) => s,
@@ -624,11 +600,8 @@ pub fn capture_runtime_state(home: &Path) -> RuntimeStateSnapshot {
 }
 
 /// Diff two runtime-state snapshots into the additive [`PostRunState`] plus the
-/// list of shell-rc files whose contents changed.
-///
-/// Returns `(state, modified_rc_files)` where `modified_rc_files` is the set of
-/// relative rc-file names whose sha256 differed between `before` and `after`
-/// (drives the [`crate::verdict::RuleId::PostRunShellRcModified`] finding).
+/// rc-file names whose sha256 changed between `before` and `after` (driving the
+/// [`crate::verdict::RuleId::PostRunShellRcModified`] finding).
 pub fn diff_runtime_state(
     before: &RuntimeStateSnapshot,
     after: &RuntimeStateSnapshot,
@@ -653,8 +626,7 @@ pub fn diff_runtime_state(
     for (rel, after_sha) in &after.shell_rc_hashes {
         match before.shell_rc_hashes.get(rel) {
             Some(before_sha) if before_sha == after_sha => {}
-            // Changed hash, or a file that appeared (no prior entry) — both are
-            // modifications-during-run.
+            // Changed hash or a newly-appeared file — both count as modified.
             _ => modified_rc_files.push(rel.clone()),
         }
     }
@@ -662,31 +634,25 @@ pub fn diff_runtime_state(
 
     (
         PostRunState {
+            // domains_contacted is filled by the CLI layer only under
+            // --with-net-hints; the pure diff never invents network claims.
             domains_contacted: Vec::new(),
             env_vars_added,
             path_dirs_added,
-            // domains_contacted is filled in by the CLI layer only under the
-            // experimental --with-net-hints opt-in; the pure diff never invents
-            // network claims.
         },
         modified_rc_files,
     )
 }
 
-/// SHA-256 of the empty byte string. Used as the sentinel hash for an absent
-/// shell-rc file so a later appearance diffs as a change.
+/// SHA-256 of the empty byte string — sentinel hash for an absent shell-rc file.
 fn empty_sha256() -> String {
     format!("{:x}", Sha256::new().finalize())
 }
 
-/// Build the [`crate::verdict::Finding`] list for a `tirith watch` post-run
-/// diff. Currently emits one High [`crate::verdict::RuleId::PostRunShellRcModified`]
-/// finding listing every shell-rc file modified during the run, or no findings
-/// when none changed.
-///
-/// Kept in core (not the CLI) so the rule-firing behavior is unit-testable
-/// without spawning a process — it lives in `EXTERNALLY_TRIGGERED_RULES` and is
-/// covered by `watch_flags_shell_rc_modification` below.
+/// Findings for a `tirith watch` post-run diff: one High
+/// [`crate::verdict::RuleId::PostRunShellRcModified`] listing every modified
+/// shell-rc file, or none when nothing changed. In core (not the CLI) so it is
+/// unit-testable without spawning a process.
 pub fn findings_for_modified_rc(modified_rc_files: &[String]) -> Vec<crate::verdict::Finding> {
     use crate::verdict::{Finding, RuleId, Severity};
     if modified_rc_files.is_empty() {
@@ -710,9 +676,8 @@ pub fn findings_for_modified_rc(modified_rc_files: &[String]) -> Vec<crate::verd
     }]
 }
 
-/// Create a checkpoint and then purge old ones with default limits.
-/// Convenience wrapper used in tests; CLI calls `create()` then `purge()` directly
-/// for distinct error messages.
+/// Create a checkpoint then purge old ones with default limits. Test convenience
+/// wrapper; the CLI calls `create()` then `purge()` for distinct error messages.
 pub fn create_and_purge(paths: &[&str], trigger_command: Option<&str>) -> Result<(), String> {
     create(paths, trigger_command)?;
     let config = CheckpointConfig::default();
@@ -752,10 +717,9 @@ fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
 
 /// Backup a directory recursively.
 ///
-/// NOTE: Empty directories are not recorded in the manifest. Only files are backed up.
-/// This means `restore()` will not recreate empty directories that existed at checkpoint
-/// time. Parent directories of restored files are created implicitly. Tracking empty
-/// directories would require manifest format changes and corresponding restore logic.
+/// NOTE: only files are recorded, so `restore()` does not recreate empty
+/// directories that existed at checkpoint time (parents of restored files are
+/// created implicitly).
 fn backup_dir(dir: &Path, files_dir: &Path) -> Result<Vec<ManifestEntry>, String> {
     let mut entries = Vec::new();
     const MAX_FILES: usize = 10_000;
@@ -794,7 +758,7 @@ fn backup_dir_recursive(
         };
         let path = entry.path();
 
-        // symlink_metadata avoids a TOCTOU race between is_symlink() and later reads.
+        // symlink_metadata avoids a TOCTOU race vs is_symlink() + later reads.
         let meta = match path.symlink_metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -804,8 +768,7 @@ fn backup_dir_recursive(
         };
 
         if meta.file_type().is_symlink() {
-            // Following symlinks could back up files outside the intended tree.
-            continue;
+            continue; // following symlinks could back up files outside the tree
         }
 
         if meta.file_type().is_file() {
@@ -825,8 +788,7 @@ fn backup_dir_recursive(
                 }
             }
         } else if path.is_dir() {
-            // Skip dotfiles/dotdirs (e.g. .git) — they're rarely worth snapshotting
-            // and can dominate the size budget.
+            // Skip dot-dirs (e.g. .git) — rarely worth it and can dominate the budget.
             if path
                 .file_name()
                 .and_then(|n| n.to_str())

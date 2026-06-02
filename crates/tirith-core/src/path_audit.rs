@@ -1,42 +1,22 @@
-//! `$PATH` shadowing + leader-path provenance (M9 ch5).
+//! `$PATH` shadowing + leader-path provenance (M9 ch5). Two surfaces:
 //!
-//! Two surfaces live here:
+//! 1. Hot-path leader checks ([`classify_leader_path`]) — three cheap,
+//!    stat-free compares (Exec, behind `policy.exec_guard_enabled`): is the
+//!    resolved leader in `/tmp`, in the repo, or in a user-writable repo-local/
+//!    `/tmp` `$PATH` dir preceding a system dir? Only syscall is one
+//!    `libc::access(W_OK)`. No codesign/file/mtime.
+//! 2. `tirith path audit` ([`audit_path_str`]) — cold full-PATH enumeration
+//!    (duplicate names, repo-local/`/tmp` dirs, writable-before-system). Takes
+//!    `$PATH` as a STRING so tests never mutate process `PATH` (PR #125).
 //!
-//! 1. **Hot-path leader checks** ([`classify_leader_path`]) — the THREE cheap,
-//!    stat-free string compares the engine runs (Exec context, behind
-//!    `policy.exec_guard_enabled`). Given the resolved leader's path, the
-//!    current repo root, and the `$PATH` string, decide whether the leader is
-//!    in `/tmp`, in the repo, or in a user-writable repo-local/`/tmp` `$PATH`
-//!    dir that precedes a system dir. The only syscall is a `libc::access`
-//!    `W_OK` probe (cheaper than a `stat`, and only on the dir that resolved
-//!    the leader). No `codesign`, no `file`, no mtime read.
+//! `PathWritableDirBeforeSystem` is scoped to repo-local/`/tmp` dirs because
+//! "any writable dir before a system dir" fires on nearly every shell (Intel
+//! macOS's world-writable `/usr/local/bin`, `~/.local/bin`, Homebrew, …). The
+//! broader inventory is informational in `tirith path audit`, not a hot block.
 //!
-//! 2. **`tirith path audit`** ([`audit_path_str`]) — the cold, full-PATH
-//!    enumeration: duplicate command names across dirs, repo-local `$PATH`
-//!    dirs, `/tmp` `$PATH` dirs, and writable-before-system dirs. Takes the
-//!    `$PATH` value as a STRING parameter so tests never mutate the process
-//!    `PATH` (the libc `setenv` race, PR #125).
-//!
-//! ## Why `PathWritableDirBeforeSystem` is repo-local / `/tmp` focused
-//!
-//! On Intel macOS, `/usr/local/bin` is world-writable by default, and almost
-//! every developer has `~/.local/bin`, `~/.cargo/bin`, Homebrew dirs, etc.
-//! ahead of `/usr/bin`. Flagging "any writable dir before a system dir" would
-//! fire on essentially every shell. The HOT-path rule therefore fires only
-//! when the writable, precedes-system dir is *also* repo-local or under
-//! `/tmp` — the genuinely suspicious shapes an attacker controls via a PR or a
-//! scratch drop. The broader "any writable dir before system" inventory is
-//! surfaced by `tirith path audit` (cold) as informational context, not as a
-//! blocking hot-path finding.
-//!
-//! ## Known limitation — resolution-vs-execution race (TOCTOU)
-//!
-//! Everything here resolves the leader / enumerates `$PATH` at ANALYSIS time.
-//! The shell may resolve a *different* binary at EXECUTION time (PATH hash
-//! cache, a file written between the two, a symlink swap). tirith reports what
-//! it observed at analysis time; it cannot guarantee the byte-identical file
-//! runs. This is inherent to a pre-exec advisory and is documented rather than
-//! papered over.
+//! Known TOCTOU: everything resolves at ANALYSIS time; the shell may run a
+//! different binary at EXEC time (PATH hash cache, a swapped symlink). Inherent
+//! to a pre-exec advisory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,20 +25,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// System directories whose precedence the writable-before-system rule cares
-/// about. A user-writable, repo-local/`/tmp` dir that appears BEFORE any of
-/// these in `$PATH` can shadow the system command of the same name.
-///
-/// Unix uses the FHS bin dirs; Windows uses the well-known `System32` /
-/// `Windows` roots so a writable dir ahead of them on `%PATH%` is still flagged
-/// rather than the audit silently treating every Windows PATH as clean (the
-/// writability probe is still Unix-only, so on Windows this only powers
-/// `is_system_path` / `--secure`, not the writable-before-system rule).
+/// System dirs the writable-before-system rule cares about: a user-writable,
+/// repo-local/`/tmp` dir BEFORE one of these in `$PATH` can shadow a system
+/// command. Windows variant powers only `is_system_path`/`--secure` (the
+/// writability probe is Unix-only).
 #[cfg(not(windows))]
 pub const SYSTEM_PATH_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
-/// Windows system directories (see [`SYSTEM_PATH_DIRS`] doc). Backslash form
-/// matches how `%PATH%` entries are written; `split_path` keeps them verbatim.
+/// Windows system dirs (see [`SYSTEM_PATH_DIRS`]). Backslash form matches `%PATH%`.
 #[cfg(windows)]
 pub const SYSTEM_PATH_DIRS: &[&str] = &[
     r"C:\Windows\System32",
@@ -67,66 +41,59 @@ pub const SYSTEM_PATH_DIRS: &[&str] = &[
     r"C:\Windows\System32\WindowsPowerShell\v1.0",
 ];
 
-/// One cheap classification of the resolved leader's path (hot path). A leader
-/// can match more than one (e.g. a repo dir that is also on `$PATH` ahead of a
-/// system dir), so [`classify_leader_path`] returns a set.
+/// One cheap classification of the resolved leader's path. A leader can match
+/// more than one, so [`classify_leader_path`] returns a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaderLocation {
-    /// Leader path is under `/tmp` (or `$TMPDIR`). → [`RuleId::ExecInTmp`].
+    /// Under `/tmp` (or `$TMPDIR`). → [`RuleId::ExecInTmp`].
     InTmp,
-    /// Leader path is inside the current repo working tree.
-    /// → [`RuleId::ExecInRepoBin`].
+    /// Inside the current repo working tree. → [`RuleId::ExecInRepoBin`].
     InRepo,
-    /// Leader resolved from a user-writable, repo-local/`/tmp` `$PATH` dir that
-    /// precedes a system dir. → [`RuleId::PathWritableDirBeforeSystem`].
+    /// User-writable repo-local/`/tmp` `$PATH` dir preceding a system dir.
+    /// → [`RuleId::PathWritableDirBeforeSystem`].
     WritableDirBeforeSystem,
 }
 
-/// Inputs to the hot-path leader classification. Kept as borrowed strings so
-/// the engine can pass slices it already holds.
+/// Inputs to the hot-path leader classification (borrowed slices the engine holds).
 pub struct LeaderContext<'a> {
-    /// The resolved leader path. Either an explicit path the user typed
-    /// (`./x`, `/tmp/x`, `~/x` already expanded) or the dir+name the `$PATH`
-    /// search resolved to. `None` short-circuits to no findings.
+    /// Resolved leader path (an explicit typed path or the `$PATH` hit). `None`
+    /// short-circuits to no findings.
     pub resolved_path: Option<PathBuf>,
-    /// The current repo root (`policy::find_repo_root(cwd)`), if any.
+    /// Current repo root (`policy::find_repo_root(cwd)`), if any.
     pub repo_root: Option<&'a Path>,
-    /// The directory the leader resolved FROM (the `$PATH` entry, or the
-    /// parent of an explicit path). Used for the writable-before-system check.
+    /// Directory the leader resolved FROM, for the writable-before-system check.
     pub resolved_dir: Option<&'a Path>,
-    /// The ordered `$PATH` dirs (already split), used to decide whether
-    /// `resolved_dir` precedes a system dir.
+    /// Ordered (already-split) `$PATH` dirs, to test whether `resolved_dir`
+    /// precedes a system dir.
     pub path_dirs: &'a [PathBuf],
     /// Temp-dir roots to treat as `/tmp` (production: `["/tmp", $TMPDIR]`).
     pub tmp_roots: &'a [PathBuf],
 }
 
-/// Classify the resolved leader path against the three cheap hot-path signals.
-/// Pure except for one `libc::access(W_OK)` probe on `resolved_dir` (only when
-/// the precedence check already matched). Returns the set of matched locations
-/// in a stable order.
+/// Classify the resolved leader path against the three cheap signals. Pure
+/// except for one `libc::access(W_OK)` probe on `resolved_dir` (only after the
+/// precedence check matches). Returns matched locations in a stable order.
 pub fn classify_leader_path(ctx: &LeaderContext<'_>) -> Vec<LeaderLocation> {
     let mut out = Vec::new();
     let Some(resolved) = ctx.resolved_path.as_deref() else {
         return out;
     };
 
-    // (i) /tmp — string prefix against each tmp root.
+    // (i) /tmp
     if path_under_any(resolved, ctx.tmp_roots) {
         out.push(LeaderLocation::InTmp);
     }
 
-    // (ii) repo — string prefix against the repo root.
+    // (ii) repo
     if let Some(repo) = ctx.repo_root {
         if path_under(resolved, repo) {
             out.push(LeaderLocation::InRepo);
         }
     }
 
-    // (iii) writable dir before system: the dir the leader resolved from must
-    // (a) appear in $PATH before a system dir, (b) be repo-local or under /tmp,
-    // and (c) be writable by the current user. (b) keeps ~/.local/bin and the
-    // world-writable Intel-macOS /usr/local/bin out of the HOT finding.
+    // (iii) writable dir before system: dir must (a) precede a system dir in
+    // $PATH, (b) be repo-local or /tmp (keeps ~/.local/bin and world-writable
+    // /usr/local/bin out of the HOT finding), and (c) be user-writable.
     if let Some(dir) = ctx.resolved_dir {
         let repo_local = ctx.repo_root.map(|r| path_under(dir, r)).unwrap_or(false);
         let tmp_local = path_under_any(dir, ctx.tmp_roots);
@@ -141,8 +108,8 @@ pub fn classify_leader_path(ctx: &LeaderContext<'_>) -> Vec<LeaderLocation> {
     out
 }
 
-/// Build the hot-path [`Finding`]s for the matched leader locations. The
-/// resolved leader path is included as evidence (it is not a secret).
+/// Build the hot-path [`Finding`]s for the matched leader locations (the resolved
+/// path is non-secret, so it's included as evidence).
 pub fn leader_findings(locations: &[LeaderLocation], resolved_display: &str) -> Vec<Finding> {
     locations
         .iter()
@@ -215,8 +182,7 @@ pub enum PathDirRisk {
     InRepo,
     /// Under `/tmp` (or `$TMPDIR`).
     InTmp,
-    /// User-writable AND precedes a system dir (informational in the audit;
-    /// the HOT rule is narrower).
+    /// User-writable AND precedes a system dir (informational; the HOT rule is narrower).
     WritableBeforeSystem,
     /// Resolves a command name that also resolves in another dir (duplicate).
     DuplicateCommand,
@@ -244,8 +210,7 @@ pub struct PathAuditReport {
 }
 
 impl PathAuditReport {
-    /// `true` when at least one High-severity-class finding is present
-    /// (`InTmp` or `WritableBeforeSystem`). Used by the CLI for exit code.
+    /// `true` when a High-class finding (`InTmp`/`WritableBeforeSystem`) is present.
     pub fn has_high(&self) -> bool {
         self.findings.iter().any(|e| {
             matches!(
@@ -256,11 +221,9 @@ impl PathAuditReport {
     }
 }
 
-/// Audit a `$PATH` string. `path_value` is the raw `$PATH` (colon-separated on
-/// Unix; the caller passes `std::env::var("PATH")` in production, a synthetic
-/// string in tests). `repo_root` and `tmp_roots` are injected so the function
-/// is hermetic. Directory existence + writability are probed on the real FS,
-/// so tests that want those signals create real temp dirs.
+/// Audit a `$PATH` string. `repo_root` and `tmp_roots` are injected for
+/// hermeticity; directory existence + writability are probed on the real FS, so
+/// tests that want those signals create real temp dirs.
 pub fn audit_path_str(
     path_value: &str,
     repo_root: Option<&Path>,
@@ -290,11 +253,8 @@ pub fn audit_path_str(
                 command: String::new(),
             });
         }
-        // Writable-before-system is SCOPED to repo-local / /tmp dirs (risk #2):
-        // flagging every writable dir ahead of the system path would fire on
-        // ~/.local/bin, Homebrew, and the world-writable Intel-macOS
-        // /usr/local/bin on essentially every dev machine. The narrow scope
-        // matches the hot-path `PathWritableDirBeforeSystem` rule.
+        // Writable-before-system is SCOPED to repo-local / /tmp dirs, matching
+        // the hot-path rule (flagging every writable dir would fire everywhere).
         if (repo_local || tmp_local) && dir_precedes_system(dir, &dirs) && dir_is_user_writable(dir)
         {
             report.findings.push(PathAuditEntry {
@@ -305,16 +265,10 @@ pub fn audit_path_str(
         }
     }
 
-    // Duplicate command names: enumerate executables per dir and report names
-    // that resolve in more than one dir. We report the SHADOWED dir (the later
-    // one) so the entry points at the copy the shell would NOT run.
-    //
-    // SCOPED to security-relevant duplicates: a duplicate is reported only when
-    // one of the two colliding directories is repo-local or under /tmp. On a
-    // normal dev machine hundreds of commands legitimately appear in both
-    // Homebrew and a system dir (`node`, `git`, …); flagging all of them would
-    // bury the genuine "a repo/ /tmp copy shadows (or is shadowed by) the real
-    // tool" signal. The narrow scope keeps the audit actionable.
+    // Duplicate command names across dirs: report the SHADOWED (later) dir so the
+    // entry points at the copy the shell would NOT run. SCOPED to duplicates where
+    // one colliding dir is repo-local/`/tmp` — flagging every Homebrew-vs-system
+    // dup (`node`, `git`, …) would bury the real signal.
     let suspicious_dir = |dir: &Path| -> bool {
         repo_root.map(|r| path_under(dir, r)).unwrap_or(false) || path_under_any(dir, tmp_roots)
     };
@@ -326,8 +280,7 @@ pub fn audit_path_str(
                     first_seen.insert(name, idx);
                 }
                 Some(first_idx) => {
-                    // Report only when the first OR the shadowed dir is
-                    // repo-local / /tmp.
+                    // Report only when the first or shadowed dir is repo-local/`/tmp`.
                     if suspicious_dir(dir) || suspicious_dir(&dirs[first_idx]) {
                         report.findings.push(PathAuditEntry {
                             dir: dir.display().to_string(),
@@ -343,9 +296,8 @@ pub fn audit_path_str(
     report
 }
 
-/// Resolve a bare command NAME against the `$PATH` string, returning every dir
-/// (in order) whose entry is an executable file of that name. Used by
-/// `tirith path which`. Does NOT mutate the process environment.
+/// Resolve a bare command NAME against `$PATH`, returning every dir (in order)
+/// holding an executable of that name. Does NOT mutate the process environment.
 pub fn which_all(command: &str, path_value: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in split_path(path_value) {
@@ -357,9 +309,8 @@ pub fn which_all(command: &str, path_value: &str) -> Vec<PathBuf> {
     out
 }
 
-/// `true` when `path` resolves to a SYSTEM location (under one of
-/// [`SYSTEM_PATH_DIRS`]). Used by `tirith path which --secure` to decide
-/// whether the first-resolved binary is the trusted system copy.
+/// `true` when `path` is under one of [`SYSTEM_PATH_DIRS`]. Used by
+/// `tirith path which --secure`.
 pub fn is_system_path(path: &Path) -> bool {
     SYSTEM_PATH_DIRS
         .iter()
@@ -368,7 +319,7 @@ pub fn is_system_path(path: &Path) -> bool {
 
 // ─── hot-path leader resolution ──────────────────────────────────────────────
 
-/// The resolved leader of a command, ready for [`classify_leader_path`].
+/// A resolved command leader, ready for [`classify_leader_path`].
 pub struct ResolvedLeader {
     /// Absolute (best-effort) path to the leader binary.
     pub path: PathBuf,
@@ -376,19 +327,13 @@ pub struct ResolvedLeader {
     pub dir: PathBuf,
 }
 
-/// Resolve a command leader token to a path for the hot-path provenance check.
+/// Resolve a command leader token to a path for the provenance check.
 ///
-/// If `leader` has a path component (`/`, or `\` on Windows): `~/...` expands
-/// against `home`, a relative path resolves against `cwd`, and an absolute path
-/// is used as-is. The path is NOT required to exist (a typed `./build/x` is
-/// still classifiable as repo-local).
-///
-/// Otherwise `leader` is a bare command name, resolved against `path_value` via
-/// [`which_all`], taking the FIRST executable hit (what the shell runs). A bare
-/// name with no PATH hit yields `None` (nothing to classify).
-///
-/// Pure w.r.t. the process environment: `cwd`, `home`, and `path_value` are all
-/// passed in, so the engine controls them and tests stay hermetic.
+/// With a path component: `~/…` expands against `home`, a relative path against
+/// `cwd`, an absolute path as-is — the path need not exist (a typed `./build/x`
+/// is still classifiable). Otherwise it's a bare name resolved via [`which_all`]
+/// (first hit; `None` if no PATH hit). Pure w.r.t. process env — `cwd`/`home`/
+/// `path_value` are passed in for hermeticity.
 pub fn resolve_leader(
     leader: &str,
     cwd: Option<&Path>,
@@ -426,9 +371,9 @@ pub fn resolve_leader(
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
 
-/// Split a `$PATH` value into directories. Empty entries (a literal `::` or a
-/// leading/trailing `:`) mean "current directory" in POSIX, which is itself a
-/// shadowing risk — we map them to `.` so they're audited rather than dropped.
+/// Split a `$PATH` value into dirs. Empty entries (`::` or leading/trailing `:`)
+/// mean "current directory" in POSIX (itself a shadowing risk), so map to `.`
+/// rather than drop them.
 pub fn split_path(path_value: &str) -> Vec<PathBuf> {
     #[cfg(windows)]
     let sep = ';';
@@ -446,22 +391,18 @@ pub fn split_path(path_value: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `true` when `child` is `ancestor` or lives beneath it. Both sides are
-/// canonicalized so a symlinked ancestor (macOS `/tmp` -> `/private/tmp`,
-/// `$TMPDIR` under `/var/folders`) still matches a child resolved through it.
-/// A non-existent child cannot be canonicalized directly, so we canonicalize
-/// its nearest EXISTING ancestor and re-append the trailing components — this
-/// keeps a typed `./build/x` (which may not exist yet) classifiable while
-/// still resolving the symlinked dir prefix.
+/// `true` when `child` is `ancestor` or lives beneath it. Both are canonicalized
+/// so a symlinked ancestor (macOS `/tmp` -> `/private/tmp`) still matches; a
+/// non-existent child resolves its nearest existing ancestor (keeps a typed
+/// `./build/x` classifiable). See [`canonicalize_lenient`].
 fn path_under(child: &Path, ancestor: &Path) -> bool {
     let c = canonicalize_lenient(child);
     let a = canonicalize_lenient(ancestor);
     c == a || c.starts_with(&a)
 }
 
-/// Canonicalize `path` if it exists; otherwise canonicalize the longest
-/// existing ancestor and re-append the remaining (non-existent) components.
-/// Falls back to the literal path if even the root cannot be canonicalized.
+/// Canonicalize `path`, or its longest existing ancestor with the remaining
+/// components re-appended; falls back to the literal path.
 fn canonicalize_lenient(path: &Path) -> PathBuf {
     if let Ok(c) = path.canonicalize() {
         return c;
@@ -488,8 +429,8 @@ fn path_under_any(child: &Path, ancestors: &[PathBuf]) -> bool {
     ancestors.iter().any(|a| path_under(child, a))
 }
 
-/// `true` when `dir` appears in `path_dirs` strictly before the first system
-/// dir. If no system dir is present, there is nothing to "precede" → false.
+/// `true` when `dir` appears in `path_dirs` strictly before the first system dir
+/// (false if no system dir is present).
 fn dir_precedes_system(dir: &Path, path_dirs: &[PathBuf]) -> bool {
     let dir_idx = path_dirs.iter().position(|d| d == dir);
     let Some(dir_idx) = dir_idx else {
@@ -504,10 +445,8 @@ fn dir_precedes_system(dir: &Path, path_dirs: &[PathBuf]) -> bool {
     }
 }
 
-/// `true` when the current user can write to `dir`. Uses `access(2)` `W_OK`
-/// (cheaper than a metadata stat, and matches the kernel's own check). On
-/// non-Unix this conservatively returns `false` (the writable-before-system
-/// rule is a Unix-PATH concern).
+/// `true` when the current user can write to `dir` (via `access(2)` `W_OK`).
+/// Non-Unix returns `false` (the rule is a Unix-PATH concern).
 #[cfg(unix)]
 fn dir_is_user_writable(dir: &Path) -> bool {
     use std::ffi::CString;
@@ -515,8 +454,7 @@ fn dir_is_user_writable(dir: &Path) -> bool {
     let Ok(cpath) = CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
-    // SAFETY: cpath is a valid NUL-terminated C string for the duration of the
-    // call; access() only reads it and returns an int.
+    // SAFETY: cpath is a valid NUL-terminated C string; access() only reads it.
     unsafe { libc::access(cpath.as_ptr(), libc::W_OK) == 0 }
 }
 
@@ -525,9 +463,8 @@ fn dir_is_user_writable(_dir: &Path) -> bool {
     false
 }
 
-/// `true` when `path` is a regular file with an execute bit set (Unix) / a
-/// likely-executable extension (non-Unix). Symlinks are followed (metadata,
-/// not symlink_metadata).
+/// `true` when `path` is a regular file with an execute bit (Unix) or a
+/// likely-executable extension (non-Unix). Symlinks are followed.
 pub fn is_executable_file(path: &Path) -> bool {
     let Ok(md) = std::fs::metadata(path) else {
         return false;
@@ -550,8 +487,8 @@ pub fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Enumerate the executable file names directly inside `dir` (non-recursive).
-/// Unreadable / missing dirs yield an empty list. Names only (no path).
+/// Executable file names directly inside `dir` (non-recursive, names only).
+/// Unreadable/missing dirs yield an empty list.
 fn executables_in_dir(dir: &Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -689,8 +626,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_repo_writable_dir_before_system_does_not_fire_on_hot_path() {
-        // A writable dir before /usr/bin that is NOT repo-local and NOT /tmp
-        // (the ~/.local/bin shape) must NOT fire the HOT rule.
+        // The ~/.local/bin shape (writable, before /usr/bin, but not repo/tmp)
+        // must NOT fire the HOT rule.
         let home_local = tempfile::tempdir().unwrap();
         let leader = home_local.path().join("ls");
         mkexec(&leader);
@@ -879,9 +816,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_leader_relative_no_cwd_is_none_not_panic() {
-        // A relative leader with no cwd must return None gracefully, never
-        // panic (the bug the Windows CI surfaced: a non-drive path is relative
-        // on Windows, so `cwd?` short-circuits to None instead of unwrapping).
+        // A relative leader with no cwd returns None, never panics (Windows CI bug:
+        // a non-drive path is relative, so `cwd?` short-circuits to None).
         assert!(resolve_leader(r"build\tool", None, None, "").is_none());
         assert!(resolve_leader("/usr/local/bin/foo", None, None, "").is_none());
     }

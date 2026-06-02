@@ -45,19 +45,16 @@ pub struct InitializeParams {
     pub protocol_version: String,
     #[allow(dead_code)]
     pub capabilities: Value,
-    /// MCP `initialize.clientInfo`. Read by the dispatcher to populate
-    /// [`AgentOrigin::Mcp`] (M4 item 8 chunk 1).
-    ///
-    /// [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
+    /// MCP `initialize.clientInfo`, read by the dispatcher to populate
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub client_info: Option<ClientInfo>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientInfo {
     /// Caller-claimed client name (`"Claude Code"`, `"cursor"`, …). Not
-    /// verified; sanitized before it lands in [`AgentOrigin::Mcp`].
-    ///
-    /// [`AgentOrigin::Mcp`]: crate::agent_origin::AgentOrigin::Mcp
+    /// verified; sanitized before it lands in
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub name: String,
     /// Caller-claimed client version. Optional and sanitized.
     pub version: Option<String>,
@@ -108,8 +105,8 @@ pub struct ToolCallParams {
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ContentItem>,
-    // M7 ch4: also deserialized for the output-filter wire path. Default
-    // false so an upstream that omits `isError` is treated as "no error".
+    // M7 ch4: deserialized for the output-filter path; default false so an
+    // upstream that omits `isError` reads as "no error".
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub is_error: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -157,8 +154,7 @@ pub fn negotiate_version(requested: &str) -> String {
     if SUPPORTED_VERSIONS.contains(&requested) {
         requested.to_string()
     } else {
-        // Unknown version from client — respond with our preferred version and
-        // let the client decide whether to continue.
+        // Unknown version — respond with our preferred and let the client decide.
         SUPPORTED_VERSIONS[0].to_string()
     }
 }

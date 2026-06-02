@@ -1,42 +1,20 @@
 //! SSH operational-context rules (M8 ch2).
 //!
-//! These rules fire when the parsed command's leader is `ssh` and either:
+//! Fire when the parsed command leader is `ssh` and either:
 //!
-//! 1. **`SshRemoteDestructiveOnLabeledHost`** (High) — the user is running
-//!    a destructive inner command (e.g. `sudo systemctl restart payments`)
-//!    on a remote host whose label is `critical` / `production`. We re-use
-//!    the destructive-verb classifier from `rules::context` for the inner
-//!    command portion. Detection requires:
-//!    a. an `ssh` invocation with an inner-command form
-//!    (`ssh host '<cmd>'` or `ssh -t host '<cmd>'`),
-//!    b. a host label entry in `policy.ssh_host_labels` for the resolved
-//!    host (`~/.ssh/config` aliases are resolved via `ssh -G` at
-//!    CLI-config time; the labels file stores final hostnames), and
-//!    c. the inner command's verb falls in the Destructive / Write /
-//!    CredentialChange category for shell-leader heuristics.
+//! 1. `SshRemoteDestructiveOnLabeledHost` (High) — a destructive inner command
+//!    on a remote host labeled critical/production. The inner command runs
+//!    through the same verb classifier as `rules::context`.
+//! 2. `SshRemoteShellOnLabeledHost` (Info) — a bare interactive shell on a
+//!    labeled host; a reminder that tirith's interception is local to the SSH
+//!    client (remote commands aren't protected without `ssh bootstrap`).
 //!
-//! 2. **`SshRemoteShellOnLabeledHost`** (Info) — the user is opening a
-//!    bare interactive remote shell (`ssh prod-host`) on a labeled host.
-//!    Info severity: not a block, just a visible reminder that tirith's
-//!    paste / enter interception is local to the SSH client. Remote
-//!    commands typed after the SSH handshake are NOT protected unless
-//!    the operator runs `tirith ssh bootstrap user@host` (M8.1 follow-up).
+//! Detection short-circuits when `policy.ssh_host_labels` is empty (opt-in).
+//! Tier-1 gate: PATTERN_TABLE entry `ssh_cmd`.
 //!
-//! ## Detection guard
-//!
-//! Detection short-circuits if `policy.ssh_host_labels` is empty
-//! (operator opt-in surface). The PATTERN_TABLE entry `ssh_cmd`
-//! (`\bssh\b`) is the tier-1 gate for the exec context.
-//!
-//! ## Inner-command parsing
-//!
-//! `ssh user@host 'sudo systemctl restart payments'` arrives at this rule
-//! as a single segment. We pop the host (skipping `-t`, `-tt`, `-i path`,
-//! `-p port`, `-o KEY=VAL`, etc.) then re-tokenize the remaining string
-//! and run the inner command through the same verb classifier as
-//! `rules::context`. Multi-shell carve-out: PowerShell tokenizer is
-//! handled identically — `ssh` on Windows takes the same POSIX-shaped
-//! argument list (the inner string is passed to the remote shell).
+//! Inner-command parsing: pop the host (skipping `-t`, `-i path`, `-o KEY=VAL`,
+//! …) then classify the remaining string. PowerShell is handled identically —
+//! `ssh` on Windows takes the same POSIX-shaped inner string.
 
 use crate::policy::Policy;
 use crate::rules::context::classify_inner_command_for_ssh;
@@ -44,26 +22,18 @@ use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// SSH flags that take a single argument value (consume the next arg).
-/// Single-letter flags `-i`, `-p`, `-l`, `-L`, `-R`, `-D`, `-F`, `-S`, `-c`,
-/// `-e`, `-o`, `-J`, `-Q`, `-b`, `-B`, `-E`, `-I`, `-O`, `-w`, `-m` per
-/// `ssh(1)`. We skip the value so the host detector doesn't accidentally
-/// pick up the value as the hostname.
+/// SSH flags that consume the next arg (per `ssh(1)`), so the host detector
+/// doesn't mistake a flag value for the hostname.
 const SSH_FLAGS_WITH_ARG: &[&str] = &[
     "-i", "-p", "-l", "-L", "-R", "-D", "-F", "-S", "-c", "-e", "-o", "-J", "-Q", "-b", "-B", "-E",
     "-I", "-O", "-w", "-m",
 ];
 
-/// Run SSH-context rules. Returns at most one finding.
-///
-/// Two distinct paths:
-///   1. `ssh host '<cmd>'` (or `ssh -t host '<cmd>'`) with a labeled host
-///      and a destructive / write / credential inner command →
-///      `SshRemoteDestructiveOnLabeledHost` (High).
-///   2. bare `ssh host` (no inner command) with a labeled host →
-///      `SshRemoteShellOnLabeledHost` (Info).
+/// Run SSH-context rules; returns at most one finding. A destructive inner
+/// command on a labeled host → `SshRemoteDestructiveOnLabeledHost` (High); a
+/// bare `ssh host` on a labeled host → `SshRemoteShellOnLabeledHost` (Info).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    // Empty labels file → no enforcement. M8 ch2 ships opt-in.
+    // Empty labels file → no enforcement (opt-in).
     if policy.ssh_host_labels.is_empty() {
         return Vec::new();
     }
@@ -85,8 +55,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         None => return Vec::new(),
     };
 
-    // Look up the host's label. Try the user@host form first (operators may
-    // label per-user); fall back to the bare host.
+    // Try the user@host label first, then the bare host.
     let label = match policy
         .ssh_host_labels
         .get(&parsed.user_at_host)
@@ -96,17 +65,13 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         None => return Vec::new(),
     };
     if !is_critical_label(label) {
-        // The host has a label but it's not in the critical/production
-        // class. We still don't fire — staging / dev / test are recorded
-        // for inventory only.
+        // A non-critical label (staging/dev/test) is inventory-only; don't fire.
         return Vec::new();
     }
 
     if let Some(inner) = parsed.inner_command {
-        // Re-classify the inner command via the same verb classifier
-        // `rules::context` uses for cloud / k8s CLIs. SSH inner commands
-        // use the POSIX shell convention even from a PowerShell launcher
-        // (the inner string is sent verbatim to the remote shell).
+        // Classify the inner command with the same verb classifier as
+        // `rules::context`, using POSIX even from a PowerShell launcher.
         let category = classify_inner_command_for_ssh(&inner, ShellType::Posix);
         if !category.is_actionable() {
             return Vec::new();
@@ -134,8 +99,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
                         parsed.host,
                         parsed.user_at_host,
                         label,
-                        // Truncate the inner-command preview so a giant
-                        // remote-script paste does not blow up evidence size.
+                        // Cap the inner-command preview so a giant paste doesn't bloat evidence.
                         inner.chars().take(200).collect::<String>(),
                     ),
                 },
@@ -157,7 +121,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         }];
     }
 
-    // Bare `ssh host` with a labeled host → Info reminder.
+    // Bare `ssh host` → Info reminder.
     vec![Finding {
         rule_id: RuleId::SshRemoteShellOnLabeledHost,
         severity: Severity::Info,
@@ -189,12 +153,8 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     }]
 }
 
-/// Decode the SSH command line into its host and optional inner command.
-///
-/// Returns `None` when no positional argument that looks like a host is
-/// present (e.g. `ssh --help`). The host is the FIRST positional that
-/// doesn't begin with `-`; the inner command is every positional after
-/// that, joined by spaces.
+/// The SSH command line decoded into host and optional inner command. The host
+/// is the first non-`-` positional; the inner command is everything after it.
 #[derive(Debug)]
 struct ParsedSsh {
     /// Bare host, with any leading `user@` stripped.
@@ -211,25 +171,21 @@ fn parse_ssh_invocation(args: &[String]) -> Option<ParsedSsh> {
         let raw = strip_outer_quotes(&args[idx]);
 
         if raw.starts_with('-') {
-            // `-tt` / `-t` etc. — single-letter combined flags. None take
-            // an arg unless they appear in SSH_FLAGS_WITH_ARG above.
-            // Match the FULL flag string (e.g. `-tt`) — SSH allows this.
             if SSH_FLAGS_WITH_ARG.contains(&raw) {
-                // Consume the value too.
+                // Flag takes a separate value — consume both.
                 idx += 2;
             } else if SSH_FLAGS_WITH_ARG
                 .iter()
                 .any(|f| raw.starts_with(f) && raw.len() > f.len())
             {
-                // `-iidentity` form (value glued onto the flag). Single
-                // token, no value to consume.
+                // `-iidentity` form — value glued on, single token.
                 idx += 1;
             } else {
                 idx += 1;
             }
             continue;
         }
-        // First positional — this is the host (possibly `user@host`).
+        // First positional — the host (possibly `user@host`).
         let user_at_host = raw.to_string();
         let host = match user_at_host.rsplit_once('@') {
             Some((_, h)) => h.to_string(),
@@ -266,8 +222,8 @@ fn strip_outer_quotes(s: &str) -> &str {
         && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
             || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
     {
-        // SAFETY: outer quotes are single-byte ASCII; the byte boundary
-        // matches a char boundary in any valid UTF-8 string.
+        // SAFETY: outer quotes are single-byte ASCII, so the byte boundary is a
+        // char boundary in any valid UTF-8 string.
         &s[1..s.len() - 1]
     } else {
         s
@@ -352,7 +308,6 @@ mod tests {
 
     #[test]
     fn ls_inner_command_does_not_fire() {
-        // Read-only `ls` against a labeled host is harmless.
         let policy = policy_with_label("prod-host", "critical");
         let findings = check("ssh prod-host 'ls'", ShellType::Posix, &policy);
         assert!(
@@ -422,8 +377,7 @@ mod tests {
 
     #[test]
     fn user_at_host_prefers_user_at_host_label() {
-        // Operator labeled `root@prod-host` but not the bare host. The
-        // exact key should win.
+        // The exact user@host key should win over the bare host.
         let mut policy = Policy::default();
         let mut labels = BTreeMap::new();
         labels.insert("root@prod-host".to_string(), "critical".to_string());
@@ -436,8 +390,7 @@ mod tests {
             &policy,
         );
         assert_eq!(findings.len(), 1);
-        // user@host took precedence (the bare host's `staging` label
-        // would NOT fire because non-critical labels are skipped).
+        // user@host took precedence (the bare host's `staging` would not fire).
         assert!(matches!(
             findings[0].rule_id,
             RuleId::SshRemoteDestructiveOnLabeledHost

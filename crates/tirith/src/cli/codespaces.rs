@@ -1,19 +1,11 @@
 //! `tirith codespaces setup|inject` (M8 ch5).
 //!
-//! Codespaces-specific wrappers around the shared `devcontainer_writer`
-//! helper. Separate namespace from `tirith devcontainer` so the
-//! advertised CLI (`tirith codespaces setup`) matches the
-//! implementation — the underlying file (`.devcontainer/devcontainer
-//! .json`) is the same, but the operator command surface is distinct.
+//! Codespaces-specific wrappers around `devcontainer_writer`; a distinct command
+//! surface from `tirith devcontainer` over the same file.
 //!
-//! 1. **`setup`** — writes `.devcontainer/devcontainer.json` if absent
-//!    (with the tirith hook + `TIRITH_DEVCONTAINER=1` env), and
-//!    appends a `.tirith/` entry to `.gitignore` so per-codespace state
-//!    never leaks into the operator's repo.
-//!
-//! 2. **`inject`** — alias of `tirith devcontainer inject`. Lives in
-//!    the codespaces namespace too so operators who think in
-//!    Codespaces terms find it where they expect.
+//! - `setup` — write `.devcontainer/devcontainer.json` if absent (tirith hook +
+//!   `TIRITH_DEVCONTAINER=1`) and add a `.tirith/` entry to `.gitignore`.
+//! - `inject` — alias of `tirith devcontainer inject`.
 
 use std::io::Write;
 use std::path::Path;
@@ -24,8 +16,8 @@ use tirith_core::devcontainer_writer::{
 
 use super::devcontainer::report_outcome;
 
-/// `tirith codespaces setup [--path <dir>]` — bootstrap a codespace-ready
-/// devcontainer.json with the tirith hook + `.tirith/` ignore entry.
+/// `tirith codespaces setup [--path <dir>]` — bootstrap a devcontainer.json with
+/// the tirith hook + `.tirith/` ignore entry.
 pub fn setup(path: Option<&Path>, json: bool) -> i32 {
     let cwd = match path {
         Some(p) => p.to_path_buf(),
@@ -79,9 +71,7 @@ pub fn setup(path: Option<&Path>, json: bool) -> i32 {
     0
 }
 
-/// `tirith codespaces inject [--path <dir>]` — alias of
-/// `tirith devcontainer inject` for operators who think in Codespaces
-/// terms.
+/// `tirith codespaces inject [--path <dir>]` — alias of `tirith devcontainer inject`.
 pub fn inject(path: Option<&Path>, create: bool, json: bool) -> i32 {
     super::devcontainer::inject(path, create, json)
 }

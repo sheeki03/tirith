@@ -1,28 +1,15 @@
-//! `tirith intend "<intent>" -- "<command>"` — intent-vs-command heuristic
-//! (M10 ch4).
+//! `tirith intend "<intent>" -- "<command>"` — intent-vs-command heuristic.
 //!
-//! Thin presenter over [`tirith_core::intent::analyze_intent`]. The heuristic is
-//! pure-Rust, no-LLM, and ADVISORY ONLY: it never blocks. It answers "does the
-//! thing you said you wanted match the thing this command actually does?" and
-//! flags Info-level mismatches (a high-impact command behavior the stated intent
-//! doesn't justify, e.g. piping a remote script to a shell when you only said
-//! you wanted to install a formatter).
+//! Thin presenter over [`tirith_core::intent::analyze_intent`]. Pure-Rust,
+//! no-LLM, ADVISORY ONLY: it never blocks. Flags Info-level mismatches where a
+//! high-impact command behavior is not justified by the stated intent.
 //!
-//! ## Exit codes (deliberately distinct from `tirith check`)
-//!
-//! `intend` is Info-level and NEVER blocks — but a non-zero exit on mismatch
-//! lets a script detect one without parsing output:
-//!
-//! - `0` — no mismatch (behavior justified by the intent, or no high-impact
-//!   behavior at all).
-//! - `1` — at least one mismatch was flagged. NOT a security block; the
-//!   command's real verdict comes from `tirith check`. Read: "the stated intent
-//!   did not justify what the command does; review it."
+//! Exit codes are deliberately distinct from `tirith check` (which ties 0/1/2/3
+//! to verdict severity); here they track mismatch, not security verdict:
+//! - `0` — no mismatch.
+//! - `1` — at least one mismatch flagged. NOT a security block; the real
+//!   verdict comes from `tirith check`.
 //! - `2` — usage error (empty intent or empty command).
-//!
-//! `tirith check` uses 0/1/2/3 tied to verdict severity; `intend`'s codes are
-//! tied to whether a mismatch was found. The two surfaces are intentionally
-//! different.
 
 use std::io::Write;
 
@@ -75,7 +62,6 @@ fn print_human(intent: &str, command: &str, report: &IntentBehaviorReport, expla
     println!("  command: {command}");
     println!();
 
-    // Intent classification.
     if report.intent_signals.is_empty() {
         println!("  intent signals: none recognized");
         println!(
@@ -93,7 +79,6 @@ fn print_human(intent: &str, command: &str, report: &IntentBehaviorReport, expla
         println!("  intent signals: {}", classes.join(", "));
     }
 
-    // Command behaviors.
     if report.command_signals.is_empty() {
         println!("  command signals: none (no high-impact behavior detected)");
     } else {
@@ -103,7 +88,6 @@ fn print_human(intent: &str, command: &str, report: &IntentBehaviorReport, expla
         }
     }
 
-    // Mismatches.
     if !report.mismatches.is_empty() {
         println!();
         println!("  mismatches:");
@@ -112,7 +96,6 @@ fn print_human(intent: &str, command: &str, report: &IntentBehaviorReport, expla
         }
     }
 
-    // Per-signal derivation (only with --explain).
     if explain && !report.derivation.is_empty() {
         println!();
         println!("  derivation (--explain):");

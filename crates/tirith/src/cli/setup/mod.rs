@@ -4,8 +4,7 @@
 //! Cursor, VS Code, Windsurf) by writing hook scripts, merging JSON configs,
 //! and registering MCP servers.
 
-// Conditional fs_helpers: Unix version uses PermissionsExt for chmod,
-// Windows version uses no-op permission shims (NTFS ACLs are default-secure).
+// Unix fs_helpers uses PermissionsExt for chmod; Windows uses no-op shims.
 #[cfg_attr(unix, path = "fs_helpers.rs")]
 #[cfg_attr(not(unix), path = "fs_helpers_windows.rs")]
 mod fs_helpers;
@@ -14,7 +13,6 @@ mod merge;
 mod shell_profile;
 mod tools;
 
-// zshenv is inherently Unix-specific (zsh configuration)
 #[cfg(unix)]
 mod zshenv;
 
@@ -119,8 +117,7 @@ mod run_impl {
         force: bool,
         update_configs: bool,
     ) -> Result<(), String> {
-        // --with-mcp only supported for claude-code and gemini-cli;
-        // other tools include MCP configuration automatically or don't support it.
+        // --with-mcp only applies to claude-code and gemini-cli.
         if with_mcp && tool != "claude-code" && tool != "gemini-cli" {
             return Err(
                 "--with-mcp is only supported for claude-code and gemini-cli (other tools register MCP automatically or don't support it)"
@@ -132,8 +129,7 @@ mod run_impl {
 
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Most hook scripts are Python; codex/pi-cli/openclaw use TypeScript or
-        // the codex CLI instead.
+        // Most hook scripts are Python; codex/pi-cli/openclaw are not.
         if tool != "codex" && tool != "pi-cli" && tool != "openclaw" {
             check_binary_on_path("python3", dry_run)?;
         }
@@ -146,7 +142,7 @@ mod run_impl {
             check_binary_on_path("zsh", dry_run)?;
         }
 
-        // --update-configs implies --force: refreshing implies overwriting stale files.
+        // --update-configs implies --force (refreshing overwrites stale files).
         let effective_force = force || update_configs;
 
         let opts = SetupOpts {
@@ -222,17 +218,13 @@ mod run_impl {
         }
     }
 
-    /// Resolve the tirith binary path for use in generated configs and hooks.
-    ///
-    /// 1. If `command -v tirith` succeeds, use the portable name `"tirith"`.
-    /// 2. If not on PATH, check `current_exe()` — use absolute path + warning.
-    /// 3. If neither: hard error (or placeholder in dry-run).
+    /// Resolve the tirith binary path for generated configs/hooks: portable `"tirith"` if
+    /// on PATH, else absolute `current_exe()` + warning, else hard error (placeholder in dry-run).
     fn resolve_tirith_bin(dry_run: bool) -> Result<String, String> {
         if is_on_path("tirith") {
             return Ok("tirith".into());
         }
 
-        // Fallback: use current_exe() as an absolute path.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(name) = exe.file_name() {
                 if name == "tirith" {
@@ -256,12 +248,9 @@ mod run_impl {
         }
     }
 
-    /// Resolve a tirith path suitable for ~/.zshenv.
-    ///
-    /// Unlike interactive shell profiles and MCP configs, `.zshenv` runs before
-    /// normal PATH setup (`.zprofile`/`.zshrc` haven't run yet in a non-
-    /// interactive `zsh -lc ...`). Resolve a stable executable path so the
-    /// guard's `command -v` succeeds regardless of PATH state.
+    /// Resolve a tirith path suitable for `~/.zshenv`. `.zshenv` runs before PATH setup
+    /// (`.zprofile`/`.zshrc` haven't run in a non-interactive `zsh -lc`), so resolve a
+    /// stable executable path rather than relying on PATH state.
     #[cfg(unix)]
     pub(super) fn resolve_tirith_bin_for_zshenv(
         tirith_bin: &str,
@@ -275,9 +264,8 @@ mod run_impl {
         )
     }
 
-    /// Pure-function core of [`resolve_tirith_bin_for_zshenv`]. Takes the two
-    /// candidate sources as inputs so it can be unit-tested without touching
-    /// process-global state.
+    /// Pure-function core of [`resolve_tirith_bin_for_zshenv`], taking the candidate
+    /// sources as inputs so it is unit-testable without process-global state.
     #[cfg(unix)]
     fn choose_zshenv_tirith_bin(
         path_candidate: Option<PathBuf>,
@@ -286,10 +274,8 @@ mod run_impl {
         dry_run: bool,
     ) -> Result<String, String> {
         if let Some(path) = path_candidate {
-            // If the PATH entry is a `#!` wrapper (e.g. the npm JS launcher),
-            // prefer the running native binary, which is what the wrapper
-            // exec'd into. Same root-cause class as the npm shadow-detection
-            // bug that needed canonicalize-through-wrapper handling.
+            // If the PATH entry is a `#!` wrapper (e.g. the npm JS launcher), prefer the
+            // running native binary the wrapper exec'd into (npm shadow-detection bug class).
             if is_script_wrapper(&path) {
                 if let Some(exe) = current_exe {
                     return Ok(exe.display().to_string());
@@ -331,10 +317,8 @@ mod run_impl {
             if !is_executable_file(&candidate) {
                 continue;
             }
-            // Always canonicalize when found, so a symlink on PATH (e.g.
-            // /usr/local/bin/tirith → /usr/bin/tirith) resolves to its real
-            // path. Caller compares this against `current_exe()`; a symlink
-            // mismatch reproduces the npm-shadow class of equality bug.
+            // Canonicalize so a symlink on PATH resolves to its real path before the
+            // caller compares against `current_exe()` (npm-shadow equality-bug class).
             return candidate.canonicalize().ok().or(Some(candidate));
         }
         None
@@ -351,9 +335,7 @@ mod run_impl {
 
     #[cfg(unix)]
     fn is_script_wrapper(path: &Path) -> bool {
-        // `read` not `read_exact`: a 1-byte file is not a wrapper but
-        // read_exact errors on it. Same end behavior here since we check
-        // n == 2, but `read` is the precise primitive for "up to N bytes."
+        // `read` not `read_exact`: a 1-byte file is not a wrapper but read_exact errors on it.
         use std::io::Read;
         let Ok(mut file) = std::fs::File::open(path) else {
             return false;

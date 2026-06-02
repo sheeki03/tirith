@@ -1,49 +1,25 @@
-//! Rust-native PTY shell-hook **conformance** tests.
+//! Rust-native PTY shell-hook CONFORMANCE tests.
 //!
-//! Tirith installs shell hooks (bash / zsh / fish / PowerShell / nushell) that
-//! intercept commands before execution. A hook that delivers commands wrong is
-//! a correctness *and* a safety bug: a swallowed command silently disappears
-//! (#111), a duplicated one runs twice, and a botched degrade leaves the user
-//! unprotected without telling them.
+//! Tirith's shell hooks (bash/zsh/fish/PowerShell/nushell) intercept commands
+//! before execution; delivering wrong is a safety bug (a swallow silently
+//! disappears — #111, a duplicate runs twice, a botched degrade leaves the user
+//! unprotected). This file asserts the hook conformance contract by driving a
+//! disposable shell through a real PTY (full contract:
+//! `docs/shell-hook-conformance.md`).
 //!
-//! This file asserts the **hook conformance contract** — the invariants every
-//! tirith shell hook must satisfy — by driving a *disposable* shell through a
-//! real pseudo-terminal. The full contract is documented in
-//! `docs/shell-hook-conformance.md`.
+//! A PTY is required because hooks bind keyboard events (Enter, paste) that only
+//! run under a real terminal; the harness ([`pty_support`]) is a deterministic
+//! Rust driver over `portable-pty` (no flaky external `expect`). Every test
+//! SKIPS cleanly when its shell is missing or too old, so `cargo test` stays
+//! green (put a modern bash first on `PATH` to exercise the bash tests).
 //!
-//! ## Why a PTY, and why Rust-native
-//!
-//! Shell hooks bind keyboard events (Enter, bracketed paste); those code paths
-//! only run under a real terminal, so a plain `Command` cannot exercise them.
-//! The previous PTY tests shelled out to the `expect` Tcl tool, which is flaky
-//! on macOS and silently sensitive to the bash version on `PATH`. The harness
-//! here ([`pty_support`]) is a Rust driver over `portable-pty`: deterministic,
-//! no external dependency, and explicit about which shell it runs.
-//!
-//! ## Test tiers
-//!
-//! Every test **skips cleanly** (early `return` with an `eprintln!`) when its
-//! shell is not installed or is too old. `cargo test --workspace` stays green
-//! on a machine with no modern bash, no fish, no tmux and no SSH. To exercise
-//! the bash tests, put a modern bash first on `PATH`
-//! (`PATH=/opt/homebrew/bin:$PATH cargo test`).
-//!
-//! ## Issue #111 — capability-gated enter mode
-//!
-//! Bash *enter* mode cannot deliver commands in a standard PTY (issue #111:
-//! `bind -x` on Enter runs the bound function but never accepts the line, so
-//! `PROMPT_COMMAND` — and therefore the pending-command delivery — never
-//! fires). Whether `bind -x` accepts the line is a capability of the running
-//! bash/readline build, so tirith does not guess: a disposable-PTY self-test
-//! (`cli::bash_capability`, run by `tirith setup` / `tirith doctor`) proves the
-//! capability and caches the verdict; the hook reads the cache at startup and
-//! uses enter mode only where proven, else falls back to preexec.
-//!
-//! The harness's bare PTY is an environment where enter delivery is broken, so
-//! the capability-correct behaviour is the preexec fallback. The regression
-//! tests below assert the capability-gated *system contract* — an allowed
-//! command runs exactly once, a blocked command does not run — through whatever
-//! mode the gate selected, with an anti-vacuous guard on the blocking test.
+//! Issue #111: bash ENTER mode can't deliver in a standard PTY (`bind -x` runs
+//! the function without accepting the line, so `PROMPT_COMMAND` never fires).
+//! A self-test (`cli::bash_capability`) proves the capability and the hook uses
+//! enter only where proven, else falls back to preexec. This bare PTY is a
+//! broken-delivery environment, so preexec is the capability-correct behaviour;
+//! the tests assert the gated SYSTEM contract (allowed runs once, blocked does
+//! not) through whichever mode the gate selected, with an anti-vacuous guard.
 
 #![cfg(unix)]
 
@@ -58,57 +34,42 @@ use pty_support::{
     IsolatedEnv, PtySession,
 };
 
-// ---------------------------------------------------------------------------
-// Shared timings. PTY tests are inherently timing-sensitive; these are
-// generous so the suite is reliable on a loaded CI box, yet bounded so a hung
-// shell fails fast rather than wedging the run.
-// ---------------------------------------------------------------------------
+// Shared timings: generous for a loaded CI box yet bounded so a hung shell
+// fails fast.
 
-/// "Output has settled" gap — no new bytes for this long means the shell
-/// finished the current command (it shelled out to `tirith` and came back).
+/// "Output has settled" gap — no new bytes for this long ⇒ the command finished.
 const QUIET: Duration = Duration::from_millis(700);
 /// Hard cap on waiting for one command to settle.
 const SETTLE_MAX: Duration = Duration::from_secs(12);
-/// Hard cap on waiting for a *side-effect-only* command's marker file to
-/// appear. A command like `printf >> marker` produces no terminal output, so
-/// [`PtySession::wait_idle`] cannot tell when it finished — the test must poll
-/// the marker file instead (see [`wait_for_marker`]). This bound is generous
-/// for a loaded CI box yet still fails fast on a genuinely swallowed command.
+/// Hard cap on a side-effect-only command's marker file (no terminal output, so
+/// [`PtySession::wait_idle`] can't time it — poll via [`wait_for_marker`]).
 const MARKER_MAX: Duration = Duration::from_secs(15);
 
-// ===========================================================================
-// bash — PREEXEC mode (DEBUG-trap, warn-only by default)
-//
-// Preexec mode observes commands via a DEBUG trap; the command executes
-// normally regardless of verdict (it is warn-only unless
-// TIRITH_BASH_PREEXEC_ENFORCE is set). Delivery therefore goes through bash's
-// own command loop and is reliable in a PTY.
-// ===========================================================================
+// === bash — PREEXEC mode (DEBUG-trap, warn-only unless
+// TIRITH_BASH_PREEXEC_ENFORCE) ===
+// Delivery goes through bash's own command loop, so it's reliable in a PTY.
 
-/// Spawn a modern bash in preexec mode with a deterministic prompt and the
-/// tirith hook sourced. Returns `None` when no modern bash is available.
+/// Spawn a modern bash in preexec mode with a deterministic prompt and the hook
+/// sourced; `None` when no modern bash is available.
 fn bash_preexec_session(env: &mut IsolatedEnv) -> Option<PtySession> {
     let bash = modern_bash()?;
     env.set("TIRITH_BASH_MODE", "preexec");
-    // A fixed, unmistakable prompt string the harness can synchronise on.
+    // A fixed prompt the harness can synchronise on.
     let mut sess = PtySession::spawn(env, &bash, &["--norc", "--noprofile", "-i"]);
     sess.send_line("export PS1='TIRITH_PTY> '");
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
     let hook = embedded_hook("bash-hook.bash");
     sess.send_line(&format!("source '{}'", hook.display()));
-    // The preexec banner or the next prompt — either way the hook is live.
+    // Either the preexec banner or the next prompt — the hook is live.
     sess.expect("TIRITH_PTY> ");
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
     Some(sess)
 }
 
-/// Contract (a) + (b): an allowed command in preexec mode executes EXACTLY
-/// ONCE and is not swallowed.
-///
-/// The command appends one line to a marker file; the file is the
-/// ground truth — terminal echo is noisy, a filesystem side-effect is not.
+/// Contract (a)+(b): an allowed command in preexec mode executes EXACTLY ONCE.
+/// The marker file is the ground truth (terminal echo is noisy).
 #[test]
 fn bash_preexec_allowed_command_executes_exactly_once() {
     let mut env = IsolatedEnv::new();
@@ -121,8 +82,7 @@ fn bash_preexec_allowed_command_executes_exactly_once() {
         }
     };
 
-    // `printf >> marker` produces no terminal output, so `wait_idle` cannot
-    // tell when it finished — poll the marker file directly.
+    // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
@@ -134,8 +94,8 @@ fn bash_preexec_allowed_command_executes_exactly_once() {
     );
 }
 
-/// Contract (b): an allowed command's own output reaches the terminal — the
-/// hook must not eat the command.
+/// Contract (b): an allowed command's output reaches the terminal (the hook
+/// must not eat it).
 #[test]
 fn bash_preexec_allowed_command_output_visible() {
     let mut env = IsolatedEnv::new();
@@ -147,13 +107,12 @@ fn bash_preexec_allowed_command_output_visible() {
         }
     };
 
-    // A nonce no shell banner or hook message would ever print.
+    // A nonce no banner or hook message would print.
     sess.send_line("echo conformance_nonce_8821");
     let out = sess.expect("conformance_nonce_8821");
     sess.close();
 
-    // Twice in the buffer at most — the keystroke echo plus the command
-    // output. Never zero (swallowed).
+    // At most twice (keystroke echo + output), never zero (swallowed).
     let n = count_occurrences(&out, "conformance_nonce_8821");
     assert!(
         (1..=2).contains(&n),
@@ -161,8 +120,8 @@ fn bash_preexec_allowed_command_output_visible() {
     );
 }
 
-/// Contract (c): an executed command is recorded in shell history exactly
-/// once — not zero (lost) and not twice (double-entered).
+/// Contract (c): an executed command is recorded in history exactly once —
+/// not zero (lost), not twice (double-entered).
 #[test]
 fn bash_preexec_no_history_duplication() {
     let mut env = IsolatedEnv::new();
@@ -177,32 +136,22 @@ fn bash_preexec_no_history_duplication() {
 
     // The probe command whose history recording is under test.
     sess.send_line("echo history_probe_5566");
-    // A *side-effect-only* completion barrier. In preexec mode every command
-    // fires the DEBUG trap, which shells out to `tirith check` — a real
-    // subprocess with variable latency. `wait_idle` keys on terminal silence
-    // and can therefore return *during* that subprocess (the no-output race
-    // documented on `wait_for_marker`), leaving the next command racing the
-    // shell. Polling a filesystem marker is race-free: bash runs one line at a
-    // time, so once `marker` exists the probe `echo` above — and its DEBUG-trap
-    // `tirith` call — have both fully completed.
+    // A side-effect-only completion barrier: bash runs one line at a time, so
+    // once the marker exists the probe echo and its DEBUG-trap `tirith` call have
+    // both completed (race-free, unlike `wait_idle` mid-subprocess).
     sess.send_line(&format!("printf 'DONE\\n' >> '{}'", marker.display()));
     wait_for_marker(&marker, "DONE", MARKER_MAX);
     sess.clear_buffer();
 
-    // Now ask bash to list history. `expect` polls until the needle appears or
-    // the (generous) timeout elapses — unlike `wait_idle` it does not give up
-    // on a quiet gap, so a slow `tirith` invocation on the `history` line
-    // cannot make it return before the listing is printed.
+    // `expect` polls patiently (unlike `wait_idle`) so a slow `tirith` on the
+    // history line can't make it return before the listing prints.
     sess.send_line("history");
     let out = sess.expect("echo history_probe_5566");
     sess.close();
 
-    // `clear_buffer()` was called before `send_line("history")`, so `out` only
-    // holds output from the `history` command onward — the probe string's
-    // "typed" occurrence is no longer in it. The probe appears in `out` at most
-    // once, in the history listing itself. `expect` above already proved it was
-    // recorded (>= 1); `<= 2` leaves headroom for a stray terminal-echo
-    // artefact and catches a double-entry.
+    // `out` starts after the buffer clear, so the probe appears at most once (in
+    // the listing). `expect` proved >= 1; `<= 2` allows an echo artefact and
+    // catches a double-entry.
     let n = count_occurrences(&out, "echo history_probe_5566");
     assert!(
         n <= 2,
@@ -224,10 +173,9 @@ fn bash_preexec_warned_command_executes_once() {
         }
     };
 
-    // `echo`-ing a shortened URL trips the `shortened_url` warn rule
-    // (tirith exit 2) while staying a benign, side-effect-only command. The
-    // `>> marker` redirect means there is no terminal output to settle on, so
-    // poll the marker file.
+    // Echoing a shortened URL trips the `shortened_url` warn rule (exit 2) yet
+    // stays benign + side-effect-only; the `>> marker` redirect → no terminal
+    // output, so poll the marker.
     sess.send_line(&format!(
         "echo https://bit.ly/warnprobe >> '{}'",
         marker.display()
@@ -242,11 +190,9 @@ fn bash_preexec_warned_command_executes_once() {
     );
 }
 
-/// Contract (d): with `TIRITH_BASH_PREEXEC_ENFORCE=1`, a *blocked* command
-/// does NOT execute.
-///
-/// Enforcement requires a trustworthy whole-line history view; a clean PTY
-/// shell with default `HISTCONTROL` provides exactly that.
+/// Contract (d): with `TIRITH_BASH_PREEXEC_ENFORCE=1` a blocked command does
+/// NOT execute (enforcement needs the trustworthy whole-line history a clean
+/// PTY provides).
 #[test]
 fn bash_preexec_enforce_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
@@ -271,9 +217,7 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
-    // A blocked pipe-to-shell whose payload, IF it ran, would create the
-    // marker. `curl ... | bash` is blocked; the `&&`-guarded marker write
-    // must never happen.
+    // A blocked pipe-to-shell whose `&&`-guarded marker write must never happen.
     sess.send_line(&format!(
         "curl https://example.com/install.sh | bash && touch '{}'",
         marker.display()
@@ -287,11 +231,9 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
     );
 }
 
-/// Contract (g): sourcing the bash hook in a NON-interactive shell is a
-/// complete no-op — no DEBUG trap installed, nothing that could leak into
-/// scripts. (`cli_integration.rs` covers the enter-mode no-op facets; this is
-/// the preexec-trap facet, kept here so the conformance file is self-contained
-/// on invariant (g).)
+/// Contract (g): sourcing the bash hook NON-interactively is a complete no-op
+/// (no DEBUG trap, nothing leaking into scripts) — the preexec-trap facet
+/// (`cli_integration.rs` covers the enter-mode facets).
 #[test]
 fn bash_noninteractive_source_installs_no_debug_trap() {
     let bash = match modern_bash() {
@@ -327,41 +269,20 @@ fn bash_noninteractive_source_installs_no_debug_trap() {
     );
 }
 
-// ===========================================================================
-// bash — ENTER mode and the #111 capability gate
-//
-// Enter mode rebinds Enter to `_tirith_enter` via `bind -x`. ISSUE #111:
-// `bind -x` on `\C-m` runs the bound function but does not then accept the
-// line, so `PROMPT_COMMAND` never fires and the pending command is never
-// delivered — the command is silently eaten.
-//
-// THE FIX is capability-based. `tirith setup` / `tirith doctor` run a
-// disposable-PTY self-test that *proves* whether enter-mode delivery works for
-// the running bash, and cache the verdict. The hook reads that cache at startup
-// (`_tirith_enter_capability_proven`):
-//
-//   * Verdict `works`  ⇒ default mode is enter (blocking).
-//   * Anything else (cache absent / stale / `broken`) ⇒ the hook falls back to
-//     the safe default, preexec.
-//
-// In this conformance PTY, `bind -x` delivery is genuinely broken (#111
-// reproduces). The *capability-correct* behaviour here is therefore the
-// fallback to preexec. The tests below assert the capability-gated **system
-// contract** — an allowed command runs exactly once, a blocked command does
-// not run — through whichever mode the gate selected. A test that forced enter
-// mode here could only "pass" vacuously: a swallowed allowed command and a
-// swallowed blocked command are indistinguishable, so a blocked-command
-// assertion under broken enter delivery would prove nothing.
-// ===========================================================================
+// === bash — ENTER mode and the #111 capability gate ===
+// Enter mode rebinds Enter via `bind -x`; #111: it runs the function without
+// accepting the line, so `PROMPT_COMMAND` never fires and the command is eaten.
+// The fix is capability-based: a self-test (`tirith setup`/`doctor`) proves
+// delivery and caches it, and the hook uses enter only on a `works` verdict,
+// else preexec. This PTY reproduces #111, so preexec is capability-correct; the
+// tests assert the gated SYSTEM contract through whichever mode the gate chose
+// (forcing enter here would pass vacuously — a swallowed allowed and a swallowed
+// blocked command are indistinguishable).
 
-/// Contract (f): a hook that cannot deliver in enter mode must degrade
-/// **visibly** — never silently. This is the safety floor.
-///
-/// `TIRITH_BASH_MODE=enter` is an explicit user override: it forces enter mode
-/// even though the capability gate would pick preexec here. The override is
-/// honoured (a deliberate user choice), and the runtime safety net — the
-/// pending-not-consumed detection — must then fire loudly and persist the
-/// safe-mode flag. This proves the override path still fails safe.
+/// Contract (f): a hook that can't deliver in enter mode must degrade VISIBLY,
+/// never silently — the safety floor. `TIRITH_BASH_MODE=enter` forces enter
+/// (overriding the gate's preexec pick here); the pending-not-consumed safety
+/// net must then fire loudly and persist the safe-mode flag.
 #[test]
 fn bash_enter_degradation_is_visible_not_silent() {
     let mut env = IsolatedEnv::new();
@@ -384,23 +305,15 @@ fn bash_enter_degradation_is_visible_not_silent() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
-    // First Enter on a real command: the `bind -x` function (`_tirith_enter`)
-    // captures it as a pending command but the line is never accepted in this
-    // PTY (#111). The command is a *warned* one (`echo`-ing a shortened URL
-    // trips the `shortened_url` warn rule) so that `tirith check` prints a
-    // visible warning — `expect`ing that warning is a race-free proof that the
-    // first `_tirith_enter` (and its `tirith check` subprocess) fully ran and
-    // set `_TIRITH_PENDING_EVAL`. `wait_idle` could not give that guarantee: it
-    // keys on terminal silence and can return *during* the `tirith` subprocess
-    // (the no-output race documented on `wait_for_marker`), making the second
-    // Enter race the hook.
+    // First Enter: `_tirith_enter` captures a pending command but the line is
+    // never accepted in this PTY (#111). It's a WARNED command (shortened URL)
+    // so `tirith check` prints a visible warning — `expect`ing it is race-free
+    // proof the first `_tirith_enter` ran and set `_TIRITH_PENDING_EVAL`.
     sess.send_line("echo https://bit.ly/enterprobe");
     sess.expect("bit.ly/enterprobe");
     sess.clear_buffer();
     // Second Enter: the hook sees the un-consumed pending command and must
-    // announce a degrade to preexec. `expect` polls patiently for the degrade
-    // banner rather than guessing completion from a quiet gap. The banner is
-    // the consolidated one-shot "protection downgraded to warn-only" headline.
+    // announce a degrade to preexec; `expect` polls patiently for the banner.
     sess.send_line("echo trigger_degrade");
     let out = sess.expect_within("protection downgraded", Duration::from_secs(15));
     sess.close();
@@ -418,19 +331,12 @@ fn bash_enter_degradation_is_visible_not_silent() {
     );
 }
 
-/// Contract (a)+(b) for the #111 fix: when the hook is sourced and enter-mode
-/// delivery is not proven (the capability-correct state in this PTY), an
-/// allowed command **executes exactly once** and is not swallowed.
-///
-/// This is the direct regression test for #111. Before the fix, the bash hook
-/// defaulted into enter mode, `bind -x` failed to deliver, and the command was
-/// eaten — the marker file stayed empty. After the fix, the capability gate
-/// sees no `works` verdict and falls back to preexec, which delivers the
-/// command through bash's own command loop. The marker must hold exactly one
-/// line: never zero (the #111 swallow), never two (a double-delivery).
-///
-/// No `TIRITH_BASH_MODE` is set, so the hook runs its real default-mode
-/// decision — exactly the path a normal user hits.
+/// Contract (a)+(b) for the #111 fix: with no proven enter delivery (the
+/// capability-correct state here), an allowed command executes EXACTLY ONCE.
+/// The direct #111 regression: pre-fix the hook defaulted to enter, `bind -x`
+/// failed, and the marker stayed empty; post-fix the gate falls back to preexec
+/// and delivers exactly one line (never 0 = swallow, never 2 = double). No
+/// `TIRITH_BASH_MODE` set — the real default-mode path a user hits.
 #[test]
 fn bash_enter_allowed_command_executes_exactly_once() {
     let env = IsolatedEnv::new();
@@ -442,8 +348,7 @@ fn bash_enter_allowed_command_executes_exactly_once() {
             return;
         }
     };
-    // Deliberately do NOT set TIRITH_BASH_MODE: let the hook's default-mode
-    // decision run. With no capability cache, the gate falls back to preexec.
+    // Do NOT set TIRITH_BASH_MODE: with no capability cache the gate → preexec.
 
     let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
     sess.send_line("export PS1='TIRITH_PTY> '");
@@ -455,9 +360,7 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
-    // No terminal output from `printf >> marker`; poll the marker file rather
-    // than rely on terminal-quiet (`wait_idle` would return before the hook
-    // finished shelling out to `tirith` and delivering the command).
+    // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
@@ -470,19 +373,11 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     );
 }
 
-/// Contract (d) for the #111 fix: a command tirith blocks **does not execute**,
-/// and — critically — this is proven *non-vacuously*.
-///
-/// A swallowed command trivially "does not execute", so an absent marker alone
-/// proves nothing. This test first runs an allowed command and asserts it *did*
-/// execute (the anti-vacuous guard: commands are being delivered, not eaten),
-/// and only then asserts the blocked `curl … | bash` left no marker.
-///
-/// `TIRITH_BASH_PREEXEC_ENFORCE=1` makes the capability-gated preexec fallback
-/// *enforce* (block via `extdebug` + `return 1`) rather than warn-only. So this
-/// is the end-to-end blocking guarantee through the #111 fallback path: enter
-/// delivery is unavailable here, the hook drops to enforced preexec, and a
-/// blocked command is genuinely stopped.
+/// Contract (d) for the #111 fix: a blocked command does NOT execute, proven
+/// NON-vacuously — an allowed command is first shown to run (commands aren't
+/// eaten) before asserting the blocked one left no marker.
+/// `TIRITH_BASH_PREEXEC_ENFORCE=1` makes the preexec fallback enforce, so this
+/// is the end-to-end block guarantee through the #111 fallback path.
 #[test]
 fn bash_enter_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
@@ -495,9 +390,8 @@ fn bash_enter_blocked_command_does_not_execute() {
             return;
         }
     };
-    // No TIRITH_BASH_MODE override: the capability gate runs and (no `works`
-    // cache) falls back to preexec. Enforcement turns that fallback into a real
-    // blocker.
+    // No TIRITH_BASH_MODE: the gate falls back to preexec, and enforcement turns
+    // that into a real blocker.
     env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
 
     let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
@@ -510,12 +404,9 @@ fn bash_enter_blocked_command_does_not_execute() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
-    // Anti-vacuous guard: an allowed command must actually run. If this marker
-    // is empty the session is swallowing commands and the blocked-command
-    // assertion below would be meaningless. The allowed command is
-    // side-effect-only (`printf >> marker`, no terminal output) and an allowed
-    // verdict makes `tirith check` print nothing either, so terminal-quiet
-    // (`wait_idle`) is reached *before* delivery — poll the marker file.
+    // Anti-vacuous guard: an allowed command must actually run, else the blocked
+    // assertion below is meaningless. Side-effect-only + allow verdict → no
+    // terminal output, so poll the marker file (not `wait_idle`).
     sess.send_line(&format!(
         "printf 'ALLOWED\\n' >> '{}'",
         allowed_marker.display()
@@ -523,13 +414,10 @@ fn bash_enter_blocked_command_does_not_execute() {
     let allowed_body = wait_for_marker(&allowed_marker, "ALLOWED", MARKER_MAX);
     sess.clear_buffer();
 
-    // A blocked pipe-to-interpreter; the `&&`-guarded marker write only happens
-    // if the pipeline ran. Enforced preexec must block before that. The
-    // producer is a local `printf` — not `curl` — so an absent marker can only
-    // mean "blocked", never "the network was down" (which would make the
-    // assertion pass vacuously). tirith blocks `printf | bash` via the same
-    // `pipe_to_interpreter` rule. A blocked command *does* produce terminal
-    // output (tirith's block message), so `wait_idle` settles correctly here.
+    // A blocked pipe-to-interpreter whose `&&`-guarded marker write happens only
+    // if the pipeline ran. Local `printf` (not `curl`) so an absent marker means
+    // "blocked", never "network down". A block prints output, so `wait_idle`
+    // settles correctly here.
     sess.send_line(&format!(
         "printf 'true' | bash && touch '{}'",
         blocked_marker.display()
@@ -549,21 +437,11 @@ fn bash_enter_blocked_command_does_not_execute() {
     );
 }
 
-/// The capability cache steers the hook's default mode, and the steering is
-/// observable through the resulting *behaviour*.
-///
-/// A seeded `broken` (or stale) verdict makes the hook fall back to preexec; a
-/// seeded `works` verdict for the running bash makes it select enter mode.
-/// Behaviour is the ground truth:
-///
-///   * preexec — the command is delivered through bash's command loop and runs,
-///     so its marker file is written.
-///   * enter — in this PTY `bind -x` delivery is broken (#111), so the command
-///     is swallowed and its marker file is *not* written.
-///
-/// So a written marker proves the hook chose preexec; an absent marker proves
-/// it chose enter. This deliberately demonstrates *why* the capability gate
-/// exists: turning enter mode on here would silently eat the command.
+/// The capability cache steers the hook's default mode, observable through
+/// behaviour: a `broken`/stale verdict → preexec (delivers → marker written); a
+/// `works` verdict for the running bash → enter (broken in this PTY → swallowed
+/// → marker absent). So a written marker proves preexec, an absent one enter —
+/// demonstrating why the gate exists.
 #[test]
 fn bash_capability_cache_steers_default_mode() {
     let bash = match modern_bash() {
@@ -582,16 +460,11 @@ fn bash_capability_cache_steers_default_mode() {
     };
     let hook = embedded_hook("bash-hook.bash");
 
-    // Returns whether the marker was written (true ⇒ preexec delivered it,
-    // false ⇒ enter mode swallowed it) for a given seeded verdict. `seed_bash`
-    // is the bash path written into the cache: passing the real spawn path
-    // makes the verdict apply; a bogus path makes it read as stale.
-    //
-    // The probe command (`printf >> marker`) produces no terminal output, so
-    // completion cannot be inferred from terminal-quiet — `wait_for_marker`
-    // polls the file. A `true` return is fast (the marker appears as soon as
-    // preexec delivers); a `false` return (enter mode swallowed the command)
-    // necessarily waits out `MARKER_MAX` to be sure the marker never appears.
+    // Returns whether the marker was written (true ⇒ preexec delivered, false ⇒
+    // enter swallowed) for a seeded verdict. `seed_bash` is the cache's bash
+    // path: the real spawn path makes the verdict apply, a bogus one reads stale.
+    // No terminal output, so `wait_for_marker` polls the file (a `false` waits
+    // out `MARKER_MAX` to be sure the marker never appears).
     let marker_written =
         |verdict: &str, seed_bash_ver: &str, seed_bash: &Path, tag: &str| -> bool {
             let env = IsolatedEnv::new();
@@ -611,22 +484,20 @@ fn bash_capability_cache_steers_default_mode() {
             count_occurrences(&body, "STEERED") == 1
         };
 
-    // `broken` verdict ⇒ preexec ⇒ command delivered ⇒ marker written.
+    // `broken` ⇒ preexec ⇒ delivered ⇒ marker written.
     assert!(
         marker_written("broken", &bash_ver, &bash, "broken"),
         "a `broken` capability verdict must keep the hook in preexec (command must run)"
     );
 
-    // `works` verdict for a *different* bash version is stale ⇒ preexec ⇒
-    // command delivered ⇒ marker written.
+    // `works` for a different bash version is stale ⇒ preexec ⇒ marker written.
     assert!(
         marker_written("works", "1.0.0-not-this-bash", &bash, "stale_version"),
         "a capability verdict for a different bash version must be ignored as stale \
          (hook must stay in preexec and run the command)"
     );
 
-    // `works` verdict for a *different* bash path is stale ⇒ preexec ⇒
-    // command delivered ⇒ marker written.
+    // `works` for a different bash path is stale ⇒ preexec ⇒ marker written.
     assert!(
         marker_written(
             "works",
@@ -638,9 +509,7 @@ fn bash_capability_cache_steers_default_mode() {
          (hook must stay in preexec and run the command)"
     );
 
-    // `works` verdict for this exact bash (version + path) ⇒ enter mode ⇒ in
-    // this PTY `bind -x` delivery is broken, so the command is swallowed ⇒
-    // marker NOT written.
+    // `works` for this exact bash ⇒ enter ⇒ swallowed in this PTY ⇒ no marker.
     assert!(
         !marker_written("works", &bash_ver, &bash, "works"),
         "a `works` capability verdict must make the hook select enter mode \
@@ -648,17 +517,13 @@ fn bash_capability_cache_steers_default_mode() {
     );
 }
 
-// ===========================================================================
-// fish
-//
-// The fish hook binds Enter (and the `\r`/`\n`/`enter` aliases) to
-// `_tirith_check_command`, which ends with `commandline -f execute` — fish's
-// supported way to accept a line. Delivery is reliable; the harness answers
-// fish 4.x's terminal-capability probes so the shell does not hang in startup.
-// ===========================================================================
+// === fish ===
+// The fish hook binds Enter to `_tirith_check_command`, ending with
+// `commandline -f execute` (fish's supported line-accept). Delivery is reliable;
+// the harness answers fish 4.x's terminal probes so startup doesn't hang.
 
-/// Spawn fish with config disabled, a deterministic prompt, and the tirith
-/// hook sourced. Returns `None` when fish is not installed.
+/// Spawn fish (config disabled) with a deterministic prompt and the hook
+/// sourced; `None` when fish is not installed.
 fn fish_session(env: &mut IsolatedEnv) -> Option<PtySession> {
     let fish = fish_bin()?;
     let mut sess = PtySession::spawn(env, &fish, &["--no-config", "-i"]);
@@ -689,7 +554,7 @@ fn fish_allowed_command_executes_exactly_once() {
         }
     };
 
-    // `printf >> marker` has no terminal output; poll the marker file.
+    // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
     sess.close();
@@ -737,22 +602,15 @@ fn fish_blocked_command_does_not_execute() {
         }
     };
 
-    // Blocked pipe-to-shell; the `; and touch` clause (fish syntax) only runs
-    // if the pipe ran. tirith must block before that happens.
+    // Blocked pipe-to-shell; the `; and touch` (fish syntax) runs only if the
+    // pipe ran. tirith must block first.
     sess.send_line(&format!(
         "curl https://example.com/install.sh | bash; and touch '{}'",
         marker.display()
     ));
-    // The block must be communicated to the user: tirith's block output for a
-    // pipe-to-shell carries the verdict ("BLOCKED") plus a remediation hint —
-    // a "tirith run …" suggestion and a vet pointer to getvet.sh. `expect_any`
-    // polls until one of those strings appears (or a generous timeout), which
-    // is the right "the hook finished" signal here: the fish hook shells out
-    // to `tirith check` — a real subprocess with variable latency — and
-    // produces no terminal output until it returns. `wait_idle` keys on
-    // terminal silence and would return *during* that subprocess (the
-    // no-output race documented on `wait_for_marker`), capturing only the
-    // keystroke echo.
+    // `expect_any` polls for the block verdict/hint (the "hook finished" signal,
+    // since the hook's `tirith check` subprocess emits nothing until it returns
+    // — `wait_idle` would return mid-subprocess, the no-output race).
     let out = sess.expect_any(
         &["BLOCKED", "getvet.sh", "tirith run"],
         Duration::from_secs(15),
@@ -763,8 +621,8 @@ fn fish_blocked_command_does_not_execute() {
         out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
     );
-    // The verdict surfaced (above) only *after* `tirith check` returned, so the
-    // hook has now run to completion — the marker check is no longer racing it.
+    // The verdict surfaced only after `tirith check` returned, so the hook has
+    // run to completion — the marker check is no longer racing it.
     assert!(
         !marker.exists(),
         "fish: a blocked command must not execute (marker file exists)"
@@ -784,7 +642,7 @@ fn fish_warned_command_executes_once() {
         }
     };
 
-    // `>> marker` redirect ⇒ no terminal output to settle on; poll the marker.
+    // `>> marker` ⇒ no terminal output; poll the marker.
     sess.send_line(&format!(
         "echo https://bit.ly/fishwarn >> '{}'",
         marker.display()
@@ -812,8 +670,7 @@ fn fish_noninteractive_source_is_a_noop() {
     };
     let env = IsolatedEnv::new();
     let hook = embedded_hook("fish-hook.fish");
-    // Non-interactive: source the hook then print a sentinel. If sourcing the
-    // hook errored or hung, the sentinel would be missing.
+    // Source the hook then print a sentinel; a hang/error would drop it.
     let mut cmd = std::process::Command::new(&fish);
     cmd.args([
         "--no-config",
@@ -841,24 +698,12 @@ fn fish_noninteractive_source_is_a_noop() {
     );
 }
 
-// ===========================================================================
-// zsh / PowerShell / nushell — FOLLOW-UP (M0.1 stubs)
-//
-// The harness ([`pty_support`]) is shell-agnostic, so extending coverage is a
-// matter of adding the spawn helper and the per-shell delivery quirks:
-//
-//   * zsh — binds a `zle` widget; `tirith init --shell zsh` materialises the
-//     hook. Needs a `zsh_session` helper analogous to `fish_session`.
-//   * PowerShell (`pwsh`) — uses a PSReadLine key handler; delivery and the
-//     conformance assertions need a `pwsh`-specific driver.
-//   * nushell — `nu`'s hook model differs again; lowest priority.
-//
-// Tracked as M0.1 follow-up. These are deliberately left as documented stubs
-// so `cargo test --workspace` neither runs nor fails them today.
-// ===========================================================================
+// === zsh / PowerShell / nushell — M0.1 follow-up stubs ===
+// The harness is shell-agnostic; each needs a spawn helper + its delivery
+// quirks (zsh: `zle` widget; pwsh: PSReadLine handler; nu: its own model).
+// Left as `#[ignore]` stubs so `cargo test` neither runs nor fails them.
 
-/// Follow-up stub: zsh PTY conformance is not yet implemented (see the module
-/// comment above). Present so the coverage gap is visible in the test list.
+/// Follow-up stub: zsh PTY conformance not yet implemented (coverage-gap marker).
 #[test]
 #[ignore = "M0.1 follow-up: zsh PTY conformance not yet implemented"]
 fn zsh_conformance_followup() {}
@@ -873,25 +718,23 @@ fn powershell_conformance_followup() {}
 #[ignore = "M0.1 follow-up: nushell PTY conformance not yet implemented"]
 fn nushell_conformance_followup() {}
 
-// ===========================================================================
-// Harness self-checks — cheap, always run, no shell required.
-// ===========================================================================
+// === Harness self-checks — cheap, always run, no shell required. ===
 
-/// `count_occurrences` is the backbone of the "exactly once" invariant, so it
-/// gets its own unit check: non-overlapping, empty-needle-safe.
+/// `count_occurrences` is the "exactly once" backbone: non-overlapping,
+/// empty-needle-safe.
 #[test]
 fn harness_count_occurrences_is_correct() {
     assert_eq!(count_occurrences("", "x"), 0);
     assert_eq!(count_occurrences("abc", ""), 0);
     assert_eq!(count_occurrences("RAN", "RAN"), 1);
     assert_eq!(count_occurrences("RAN RAN RAN", "RAN"), 3);
-    // Non-overlapping: "aaaa" contains two non-overlapping "aa".
+    // Non-overlapping.
     assert_eq!(count_occurrences("aaaa", "aa"), 2);
     assert_eq!(count_occurrences("no match here", "RAN"), 0);
 }
 
-/// The bash version probe must agree with `bash --version` for whatever bash
-/// the harness selected (or cleanly report "none").
+/// The bash version probe must agree with `bash --version` for the selected
+/// bash (or cleanly report "none").
 #[test]
 fn harness_reports_bash_availability_consistently() {
     match modern_bash() {

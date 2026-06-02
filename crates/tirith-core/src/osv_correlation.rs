@@ -1,28 +1,13 @@
 //! M6 ch6 — thin adapter over the shipping `threatdb_api.rs` OSV cache.
 //!
-//! The runtime threat-enrichment path (`crate::threatdb_api::enrich_command`)
-//! already implements OSV / deps.dev / Google Safe Browsing lookups under
-//! `ThreatIntelConfig::osv_enabled`, with on-disk caching and a 1-hour TTL.
-//! `package risk` / `install` / `ecosystem scan` benefit from the same data
-//! without registering a new `ThreatSource` variant (the contiguous-discriminant
-//! test in `threatdb.rs` stays green) and without introducing a second cache.
+//! [`for_package`] consults the same on-disk cache layout `threatdb_api.rs`
+//! uses (1-hour TTL) and falls through to a fresh OSV query on a cold cache,
+//! returning an [`OsvAdvisorySummary`] for the deterministic factor model.
 //!
-//! This module provides one public function — [`for_package`] — that consults
-//! the same on-disk cache layout `threatdb_api.rs` uses and falls through to
-//! a fresh OSV query when the cache is cold. It returns a small
-//! [`OsvAdvisorySummary`] shape that `ApiProvenance::osv_advisories` carries
-//! into the deterministic factor model.
-//!
-//! ## Honesty
-//!
-//! * No new `ThreatSource` variant. `tirith threat-db sources` is unchanged.
-//! * No new cache directory. Same `state_dir()/threatdb-api-cache/` as the
-//!   runtime threat-enrichment path; cached keys are namespaced (`osv:...`)
-//!   so we never collide with deps.dev or KEV rows.
-//! * Best-effort: any error (network, timeout, unparseable response) is a
-//!   silent `Vec::new()`, never a panic.
-//! * Read-only — never writes anything other than the cache file the shipping
-//!   path was already going to write.
+//! No new `ThreatSource` variant and no new cache dir (same
+//! `state_dir()/threatdb-api-cache/`, `osv2-`-namespaced keys). Best-effort: any
+//! error is a silent empty result, never a panic; read-only beyond the cache
+//! file the shipping path already writes.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,30 +18,23 @@ use crate::package_risk::OsvAdvisorySummary;
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
-/// Outcome of an OSV lookup. Distinguishes "we asked OSV and got no
-/// advisories" from "we couldn't ask" — they look identical to the score
-/// model when the result is just `Vec<…>` (both produce empty).
-///
-/// Surfaced through [`ApiProvenance::osv_state`] so the explainer can render
-/// `"(no advisories)"` honestly when verified, vs `"(OSV check
-/// unavailable: timeout)"` when the lookup failed.
+/// Outcome of an OSV lookup. Distinguishes "asked, got no advisories" from
+/// "couldn't ask" — both produce an empty `Vec`, so the explainer needs the
+/// state to render honestly (`(no advisories)` vs `(OSV check unavailable: …)`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", tag = "state", content = "reason")]
 pub enum OsvLookupState {
-    /// The lookup was not attempted (offline run, unsupported ecosystem, or
-    /// no version was supplied). The default.
+    /// Not attempted (offline, unsupported ecosystem, or no version). Default.
     #[default]
     NotChecked,
-    /// The lookup completed; the (possibly empty) advisory set is verified.
+    /// Completed; the (possibly empty) advisory set is verified.
     Verified,
-    /// The lookup was attempted but failed (network error, parse error,
-    /// timeout). The advisory set should be treated as unknown, not empty.
+    /// Attempted but failed — treat the advisory set as unknown, not empty.
     Unavailable(String),
 }
 
-/// Result of an OSV lookup. Pairs the advisory list with the state so the
-/// caller can record `osv_state: Unavailable(reason)` for failed lookups
-/// rather than treat an empty `Vec` as "clean".
+/// An OSV lookup's advisory list paired with its [`OsvLookupState`], so a failed
+/// lookup isn't treated as "clean".
 #[derive(Debug, Clone)]
 pub struct OsvLookupResult {
     pub advisories: Vec<OsvAdvisorySummary>,
@@ -78,37 +56,30 @@ impl OsvLookupResult {
     }
 }
 
-/// Reuse the shipping `threatdb_api.rs` TTL — 1 hour. Documented there as the
-/// freshness window for OSV; matching it keeps the two paths consistent.
+/// Reuse the `threatdb_api.rs` OSV TTL (1 hour) so the two paths stay consistent.
 const CACHE_TTL_SECS: u64 = 3600;
-/// Cap the per-call timeout. The CLI path is interactive; a degraded score
-/// beats a long hang.
+/// Per-call timeout — the CLI path is interactive; a degraded score beats a hang.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
-/// Resolve OSV advisories for `(eco, name, version)`, returning the
-/// advisory list AND the lookup state. This is the canonical entry point —
-/// it lets a caller distinguish "OSV says no advisories" (Verified, []) from
-/// "we couldn't reach OSV" (Unavailable, []), which the legacy
-/// [`for_package`] (returns `Vec` only) cannot.
+/// Resolve OSV advisories for `(eco, name, version)` with the lookup state — the
+/// canonical entry point. Distinguishes Verified-empty from Unavailable-empty,
+/// which the legacy [`for_package`] cannot.
 pub fn for_package_with_state(eco: Ecosystem, name: &str, version: &str) -> OsvLookupResult {
     let Some(eco_name) = osv_ecosystem_name(eco) else {
-        // No OSV mapping for distro/docker — this is a deterministic skip,
-        // not a failure. Render as Unavailable with an honest reason; the
-        // caller can suppress display when the ecosystem is known-unmapped.
+        // No OSV mapping for distro/docker — a deterministic skip, rendered as
+        // Unavailable with an honest reason.
         return OsvLookupResult::unavailable(format!(
             "{eco:?} has no OSV mapping; lookup deliberately skipped",
         ));
     };
     let cache_key = format!("{}:{name}:{version}", eco_label(eco));
 
-    // Cache hit?
     if let Some(cached) = load_cache::<Vec<OsvAdvisorySummary>>(&cache_key) {
         return OsvLookupResult::verified(cached);
     }
 
-    // Cache miss — issue the same POST the shipping `threatdb_api.rs` path
-    // makes. A `None` here means the network/parse step failed; we cannot
-    // claim "verified empty" from a failed lookup.
+    // Cache miss — query OSV. `None` means the lookup failed; don't claim
+    // "verified empty" from a failed lookup.
     let advs = match query_osv_sync(eco_name, name, version) {
         Some(v) => v,
         None => return OsvLookupResult::unavailable("osv.dev query failed (network/parse error)"),
@@ -118,16 +89,13 @@ pub fn for_package_with_state(eco: Ecosystem, name: &str, version: &str) -> OsvL
     OsvLookupResult::verified(advs)
 }
 
-/// Legacy shape — returns just the advisory list. Empty here can mean any
-/// of: ecosystem not mapped, offline, lookup failed, OR genuinely no
-/// advisories. New code should prefer [`for_package_with_state`].
+/// Legacy shape — the advisory list only (empty conflates several outcomes).
+/// New code should prefer [`for_package_with_state`].
 pub fn for_package(eco: Ecosystem, name: &str, version: &str) -> Vec<OsvAdvisorySummary> {
     for_package_with_state(eco, name, version).advisories
 }
 
-// ---------------------------------------------------------------------------
-// cache
-// ---------------------------------------------------------------------------
+// --- cache ---
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope<T> {
@@ -135,9 +103,8 @@ struct CacheEnvelope<T> {
     value: T,
 }
 
-/// Cache file path. Lives under `state_dir()/threatdb-api-cache/` with an
-/// `osv2-` prefix so it never collides with the rows the shipping
-/// `threatdb_api.rs` writes (which use `osv-`).
+/// Cache file path under `state_dir()/threatdb-api-cache/`, `osv2-`-prefixed so
+/// it never collides with `threatdb_api.rs`'s `osv-` rows.
 fn cache_path(key: &str) -> Option<std::path::PathBuf> {
     let state = policy::state_dir()?;
     let digest = sha2::Sha256::digest(format!("osv2:{key}").as_bytes());
@@ -181,9 +148,7 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// network query
-// ---------------------------------------------------------------------------
+// --- network query ---
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct OsvQueryResponse {
@@ -233,7 +198,7 @@ fn query_osv_sync(
         "version": version,
     });
 
-    let _ = deadline; // currently the global timeout is enforced by the client
+    let _ = deadline; // the client enforces the global timeout
     let resp = client
         .post("https://api.osv.dev/v1/query")
         .header("Content-Type", "application/json")
@@ -263,47 +228,29 @@ fn query_osv_sync(
     Some(summaries)
 }
 
-/// Parse the CVSS v3 base score out of an OSV `severity` array.
+/// Parse the CVSS v3 base score from an OSV `severity` array.
 ///
-/// OSV's `severity[].score` carries one of two shapes:
-///  * a bare numeric (`"7.5"`) — some advisory feeds emit this directly;
-///  * the standard CVSS v3 vector
-///    (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`) — overwhelmingly more
-///    common in real `/v1/query` responses.
-///
-/// We compute the base score from the vector when present so a real OSV
-/// response (vector-form) actually produces a usable score for the
-/// `block_osv_min_cvss` gate. Otherwise we fall back to parsing a bare
-/// numeric. Returns `None` only when the field is entirely unparseable —
-/// the rule then fires at its default Medium severity.
-///
-/// The implementation follows the CVSS v3.1 specification's base-score
-/// equations directly (FIRST.org's published formulas).
+/// `severity[].score` is either a bare numeric (`"7.5"`) or a CVSS v3 vector
+/// (the common case); the vector form is computed per the FIRST.org v3.1 base
+/// equations. Returns `None` only when wholly unparseable (rule then fires at
+/// default Medium).
 fn parse_cvss3_base(severity: &[OsvSeverity]) -> Option<f32> {
     severity
         .iter()
         .find(|s| s.sev_type.starts_with("CVSS_V3"))
         .and_then(|s| {
             let trimmed = s.score.trim();
-            // Bare numeric form ("7.5") — some advisories emit just a score.
             if let Ok(v) = trimmed.parse::<f32>() {
                 return Some(v);
             }
-            // Vector form — `CVSS:3.x/AV:N/AC:L/.../A:H`. Compute from the
-            // base metrics per the v3.1 spec.
             compute_cvss3_base_from_vector(trimmed)
         })
 }
 
-/// Compute the CVSS v3 base score from a vector string per the v3.1
-/// specification. Returns `None` if any required base metric is missing or
-/// the metric value is not in the spec's allowed enum.
-///
-/// Only base metrics (AV/AC/PR/UI/S/C/I/A) are read — temporal and
-/// environmental metrics, if present, are ignored. Scoped (S:C) PR scoring
-/// uses the changed-scope PR weights per the spec.
+/// Compute the CVSS v3 base score from a vector string per the v3.1 spec.
+/// Reads only base metrics (AV/AC/PR/UI/S/C/I/A); returns `None` on any missing
+/// or out-of-enum metric.
 fn compute_cvss3_base_from_vector(vector: &str) -> Option<f32> {
-    // Strip the `CVSS:3.x/` prefix and collect the metric pairs.
     let body = vector
         .strip_prefix("CVSS:3.1/")
         .or_else(|| vector.strip_prefix("CVSS:3.0/"))?;
@@ -399,13 +346,10 @@ fn compute_cvss3_base_from_vector(vector: &str) -> Option<f32> {
     Some(cvss_roundup(raw))
 }
 
-/// CVSS v3.1 roundup — round to the nearest one decimal place, away from
-/// zero. The spec specifies this exact operation (Section 7.1, Appendix A).
+/// CVSS v3.1 roundup (spec Section 7.1) — round up to the next 0.1.
 fn cvss_roundup(input: f32) -> f32 {
-    // Multiply by 100,000 and use integer arithmetic to avoid floating-point
-    // surprises. Per the spec: if the value is already at one decimal
-    // (mantissa is a multiple of 10,000), return as-is; otherwise round
-    // *up* to the next 0.1.
+    // Integer arithmetic to avoid float surprises: already-at-one-decimal
+    // (mantissa multiple of 10,000) returns as-is, else round up to 0.1.
     let int_input = (input * 100_000.0).round() as i64;
     if int_input % 10_000 == 0 {
         int_input as f32 / 100_000.0
@@ -415,7 +359,7 @@ fn cvss_roundup(input: f32) -> f32 {
 }
 
 fn eco_label(eco: Ecosystem) -> &'static str {
-    // Lowercase ASCII matches what `threatdb_api.rs` uses as the cache key.
+    // Lowercase ASCII, matching `threatdb_api.rs`'s cache key.
     match eco {
         Ecosystem::Npm => "npm",
         Ecosystem::PyPI => "pypi",
@@ -436,7 +380,7 @@ fn eco_label(eco: Ecosystem) -> &'static str {
 }
 
 fn osv_ecosystem_name(eco: Ecosystem) -> Option<&'static str> {
-    // OSV's canonical names — same mapping as `threatdb_api.rs::osv_ecosystem_name`.
+    // OSV canonical names — matches `threatdb_api.rs::osv_ecosystem_name`.
     match eco {
         Ecosystem::Npm => Some("npm"),
         Ecosystem::PyPI => Some("PyPI"),
@@ -477,8 +421,7 @@ mod tests {
 
     #[test]
     fn cvss_vector_form_incomplete_returns_none() {
-        // Missing required base metrics — vector parser must decline rather
-        // than fabricate a score.
+        // Missing base metrics — must decline, not fabricate a score.
         let sev = vec![OsvSeverity {
             sev_type: "CVSS_V3".to_string(),
             score: "CVSS:3.1/AV:N/AC:L".to_string(),
@@ -488,8 +431,7 @@ mod tests {
 
     #[test]
     fn cvss_vector_critical_full_impact_unchanged_scope() {
-        // CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H — the canonical "10.0
-        // critical" vector. Verifies the FIRST.org spec equations end-to-end.
+        // The canonical 10.0-critical vector — verifies the spec equations.
         let sev = vec![OsvSeverity {
             sev_type: "CVSS_V3".to_string(),
             score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
@@ -500,26 +442,23 @@ mod tests {
 
     #[test]
     fn cvss_vector_high_partial_impact() {
-        // CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:H/I:L/A:N — a real-world high.
+        // A real-world high; CVSS calculator gives ≈4.7.
         let sev = vec![OsvSeverity {
             sev_type: "CVSS_V3".to_string(),
             score: "CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:H/I:L/A:N".to_string(),
         }];
         let v = parse_cvss3_base(&sev).expect("vector should parse");
-        // CVSS calculator: ≈ 4.7. Verifies it's in a sensible Medium range
-        // (above 0, below 7).
         assert!((4.0..=5.5).contains(&v), "expected ≈4.7, got {v}");
     }
 
     #[test]
     fn cvss_vector_changed_scope_uses_pr_changed_weights() {
-        // S:C with PR:L → the changed-scope PR weight (0.68 not 0.62).
+        // S:C with PR:L → the changed-scope PR weight (0.68); calculator: 10.0.
         let sev = vec![OsvSeverity {
             sev_type: "CVSS_V3".to_string(),
             score: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H".to_string(),
         }];
         let v = parse_cvss3_base(&sev).expect("vector should parse");
-        // Per CVSS calculator: 10.0.
         assert!(v >= 9.5, "expected ≈10.0, got {v}");
     }
 
@@ -534,9 +473,8 @@ mod tests {
 
     #[test]
     fn for_package_offline_failure_is_empty_not_panic() {
-        // No network in tests; this exercises the graceful fallback path.
-        // We deliberately do NOT assert non-emptiness — the call may hit a
-        // cached row from a previous CI run, but more often returns empty.
+        // Graceful fallback path; no emptiness assertion (a cached CI row may
+        // exist).
         let _ = for_package(
             Ecosystem::Npm,
             "this-package-name-cannot-exist-xyzzy-12345",

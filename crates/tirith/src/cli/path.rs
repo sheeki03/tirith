@@ -1,16 +1,13 @@
 //! `tirith path audit|watch|which` (M9 ch5).
 //!
-//! `$PATH` shadowing analysis. `audit` enumerates the full `$PATH` and flags
-//! repo-local / `/tmp` / writable-before-system dirs and duplicate command
-//! names. `watch` re-runs `audit` on an interval. `which <cmd> [--secure]`
-//! resolves a command across `$PATH` and, with `--secure`, exits 1 when the
-//! first-resolved copy is NOT a system binary.
+//! `$PATH` shadowing analysis. `audit` flags repo-local / `/tmp` /
+//! writable-before-system dirs + duplicate command names; `watch` re-runs it on
+//! an interval; `which <cmd> [--secure]` resolves a command and (with `--secure`)
+//! exits 1 when the first-resolved copy is not a system binary.
 //!
-//! All of this is the COLD side — it reads `$PATH` and the filesystem directly
-//! and never runs on the engine hot path (the hot path's three cheap rules
-//! live in [`tirith_core::path_audit::classify_leader_path`]).
-//!
-//! Tests pass `$PATH` as a string and never mutate the process environment.
+//! The COLD side — never on the engine hot path (whose cheap rules live in
+//! [`tirith_core::path_audit::classify_leader_path`]). Tests pass `$PATH` as a
+//! string and never mutate the environment.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -84,7 +81,7 @@ pub fn watch(interval: u64, json: bool) -> i32 {
     let mut polls: u64 = 0;
 
     while !STOP.load(Ordering::Relaxed) {
-        // Sleep in 200ms slices so Ctrl-C stays responsive.
+        // 200ms slices so Ctrl-C stays responsive.
         let step = Duration::from_millis(200);
         let target = Duration::from_secs(interval);
         let mut slept = Duration::ZERO;
@@ -159,9 +156,8 @@ pub fn which(cmd: &str, secure: bool, json: bool) -> i32 {
     }
 }
 
-/// A stable string summarizing a report's findings, for change detection in
-/// `watch`. Order-independent within a poll because `audit_path_str` emits in
-/// a deterministic order.
+/// A stable signature of a report's findings, for `watch` change detection
+/// (`audit_path_str` emits in a deterministic order).
 fn signature_of(report: &PathAuditReport) -> String {
     report
         .findings
@@ -189,12 +185,9 @@ fn risk_label(risk: PathDirRisk) -> &'static str {
     }
 }
 
-// ─── human output ────────────────────────────────────────────────────────────
-
-/// On Windows the user-writability probe behind the writable-before-system
-/// rule is not implemented (it relies on the Unix `access(2)` W_OK check), so
-/// that one rule cannot fire. We say so explicitly rather than let a clean
-/// report imply full coverage. `None` on Unix (full coverage).
+/// On Windows the writable-before-system rule can't fire (its writability probe
+/// needs Unix `access(2)` W_OK), so we say so rather than imply full coverage.
+/// `None` on Unix.
 fn platform_note() -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -267,8 +260,6 @@ fn print_human_which(cmd: &str, hits: &[std::path::PathBuf], secure: bool, insec
         }
     }
 }
-
-// ─── SIGINT handling ──────────────────────────────────────────────────────────
 
 /// Set by the SIGINT handler to break the `watch` poll loop.
 static STOP: AtomicBool = AtomicBool::new(false);

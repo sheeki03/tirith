@@ -1,39 +1,19 @@
 //! Executable provenance (M9 ch5) — the COLD, off-hot-path side.
 //!
-//! Everything in this module is reachable ONLY from explicit `tirith exec
-//! check <bin>` / `tirith exec provenance <path>` (and the per-PATH-entry
-//! enumeration `tirith path audit` shares some helpers). NONE of it runs on
-//! the `engine::analyze` hot path — the hot path is limited to the three
-//! stat-free string compares in [`crate::path_audit::classify_leader_path`].
+//! Reachable ONLY from explicit `tirith exec check|provenance` (and shared by
+//! `tirith path audit`); NONE of it runs on the `engine::analyze` hot path,
+//! which is limited to [`crate::path_audit::classify_leader_path`].
 //!
-//! ## What "provenance" gathers
+//! Given an executable path, [`provenance_of`] collects stat bits (mtime ->
+//! recently-modified, mode -> world-writable, uid/gid), file type via `file
+//! --brief`, code signature via `codesign --verify --strict` (macOS only;
+//! Windows/Linux report not-applicable), and package-manager ownership by
+//! matching well-known install roots.
 //!
-//! Given a path to an executable, [`provenance_of`] collects:
-//!   * `stat`: mtime (-> "recently modified within 5 min"), Unix mode (->
-//!     "world-writable"), uid/gid (informational).
-//!   * file TYPE via `file --brief <path>` (2s timeout child process).
-//!   * code SIGNATURE via `codesign --verify --strict <path>` on macOS (2s
-//!     timeout). Windows Authenticode and Linux (no platform baseline) are
-//!     reported as "not applicable" rather than "unsigned".
-//!   * PACKAGE-MANAGER ownership by matching the path against well-known
-//!     install roots (`/opt/homebrew/Cellar`, `/usr/local/Cellar`,
-//!     `/nix/store`, `~/.cargo/bin`, `~/.rustup`, `~/.local/bin`,
-//!     `/home/linuxbrew/.linuxbrew`, ...).
-//!
-//! ## Why the child processes are bounded
-//!
-//! `codesign` in particular can stall on a notarization / Gatekeeper check.
-//! Both child processes use [`crate::util::run_shell_with_timeout`] with a
-//! 2-second deadline (risk #1 in the M9 ch5 plan), pass arguments as an array
-//! (no shell, no injection), and discard stderr. A timeout or a missing binary
-//! degrades to "unknown", never a hang.
-//!
-//! ## Known limitation — resolution-vs-execution race (TOCTOU)
-//!
-//! Provenance is gathered at ANALYSIS time. The file could be replaced before
-//! the shell actually executes it. tirith reports what it observed; it does
-//! not (and cannot, pre-exec) guarantee the same bytes run. Documented, not
-//! papered over.
+//! Both child processes are bounded by [`crate::util::run_shell_with_timeout`]
+//! (2s, args as an array — no shell/injection); a timeout or missing binary
+//! degrades to "unknown", never a hang. Provenance is gathered at ANALYSIS
+//! time — TOCTOU: the file could be replaced before the shell executes it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,11 +37,10 @@ const SHELL_POLL: Duration = Duration::from_millis(20);
 pub enum SignatureStatus {
     /// `codesign --verify` (macOS) / Authenticode (Windows) succeeded.
     Valid,
-    /// The platform supports signing but verification FAILED (no signature, or
-    /// an invalid one). -> [`RuleId::ExecUnsigned`].
+    /// Verification FAILED (no signature or an invalid one). -> [`RuleId::ExecUnsigned`].
     Invalid,
-    /// Signing is not a platform baseline here (Linux), or the verifier binary
-    /// was missing / timed out. Never produces a finding.
+    /// No platform signing baseline (Linux), or verifier missing/timed out.
+    /// Never produces a finding.
     NotApplicable,
 }
 
@@ -78,8 +57,7 @@ impl SignatureStatus {
 /// Which package manager owns the install root a path lives under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageOwner {
-    /// Short label (`homebrew`, `nix`, `cargo`, `rustup`, `linuxbrew`,
-    /// `user-local`).
+    /// Short label (`homebrew`, `nix`, `cargo`, `rustup`, `linuxbrew`, `user-local`).
     pub manager: String,
     /// The install root that matched (display form).
     pub root: String,
@@ -122,11 +100,10 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// Derive the COLD exec-provenance findings from this record. These are the
-    /// rules that NEVER fire on the hot path:
-    /// [`RuleId::ExecRecentlyModified`], [`RuleId::ExecWorldWritable`],
-    /// [`RuleId::ExecUnsigned`]. ([`RuleId::ExecShadowsSystemCommand`] needs
-    /// the full PATH and is produced by [`shadow_finding`], not here.)
+    /// Derive the COLD exec-provenance findings ([`RuleId::ExecRecentlyModified`],
+    /// [`RuleId::ExecWorldWritable`], [`RuleId::ExecUnsigned`]).
+    /// [`RuleId::ExecShadowsSystemCommand`] needs the full PATH —
+    /// see [`shadow_finding`].
     pub fn findings(&self) -> Vec<Finding> {
         let mut out = Vec::new();
         if !self.exists {
@@ -196,10 +173,8 @@ impl Provenance {
     }
 }
 
-/// Gather provenance for `path`. The single testable entry point — tests call
-/// it against a `tempfile::tempdir()` file, production calls it from the CLI
-/// after resolving a bare command name. Best-effort: every sub-probe degrades
-/// to a neutral value rather than erroring.
+/// Gather provenance for `path` (the single testable entry point). Best-effort:
+/// every sub-probe degrades to a neutral value rather than erroring.
 pub fn provenance_of(path: &Path) -> Provenance {
     let md = std::fs::metadata(path).ok();
     let exists = md.as_ref().map(|m| m.is_file()).unwrap_or(false);
@@ -233,16 +208,13 @@ pub fn provenance_of(path: &Path) -> Provenance {
     }
 }
 
-/// Build a [`RuleId::ExecShadowsSystemCommand`] (Medium) finding when the
-/// resolved binary `resolved` shares its file name with a command that ALSO
-/// exists in a system dir, and `resolved` is NOT that system copy. `command`
-/// is the bare name the user asked about. Returns `None` when no system copy
-/// exists or the resolved path IS the system one.
+/// Build a [`RuleId::ExecShadowsSystemCommand`] (Medium) finding when `resolved`
+/// shares its file name with a system-dir command but is NOT that system copy.
+/// Returns `None` when no system copy exists or `resolved` IS the system one.
 pub fn shadow_finding(command: &str, resolved: &Path) -> Option<Finding> {
     if crate::path_audit::is_system_path(resolved) {
         return None;
     }
-    // A system copy of the same name exists?
     let system_copy = crate::path_audit::SYSTEM_PATH_DIRS
         .iter()
         .map(|d| Path::new(d).join(command))
@@ -270,8 +242,6 @@ pub fn shadow_finding(command: &str, resolved: &Path) -> Option<Finding> {
         custom_rule_id: None,
     })
 }
-
-// ─── stat helpers ────────────────────────────────────────────────────────────
 
 /// Returns `(mode_octal, world_writable, uid, gid)`. All `None`/`false` on
 /// non-Unix or when metadata is unavailable.
@@ -308,8 +278,6 @@ fn modified_secs_ago(md: &std::fs::Metadata) -> Option<u64> {
     }
 }
 
-// ─── child-process probes ────────────────────────────────────────────────────
-
 /// `file --brief <path>` — the human file type. 2s timeout, stderr discarded.
 /// `None` on missing `file`, non-zero exit, or timeout.
 fn file_brief(path: &Path) -> Option<String> {
@@ -322,9 +290,7 @@ fn file_brief(path: &Path) -> Option<String> {
         std::process::Stdio::null(),
     ) {
         ShellTimeoutOutcome::Completed { status, stdout } if status.success() => {
-            // Collapse internal whitespace/newlines to a single space so a
-            // multi-arch Mach-O (whose `file` output spans several lines) stays
-            // a single line in the human report and the JSON value.
+            // Collapse whitespace so a multi-arch Mach-O stays a single line.
             let s = String::from_utf8_lossy(&stdout);
             let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
             if collapsed.is_empty() {
@@ -338,9 +304,7 @@ fn file_brief(path: &Path) -> Option<String> {
 }
 
 /// Verify a code signature. macOS: `codesign --verify --strict <path>` (exit 0
-/// = valid). Windows / Linux: [`SignatureStatus::NotApplicable`] (no portable
-/// verifier we run here — Linux has no platform baseline, Windows Authenticode
-/// verification is out of scope for the 2s child process). 2s timeout.
+/// = valid), 2s timeout. Windows/Linux: [`SignatureStatus::NotApplicable`].
 #[cfg(target_os = "macos")]
 fn verify_signature(path: &Path) -> SignatureStatus {
     let Some(path_str) = path.to_str() else {
@@ -361,27 +325,22 @@ fn verify_signature(path: &Path) -> SignatureStatus {
                 SignatureStatus::Invalid
             }
         }
-        // codesign missing / timed out / spawn error -> don't claim "unsigned".
+        // missing / timed out / spawn error -> don't claim "unsigned".
         _ => SignatureStatus::NotApplicable,
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn verify_signature(_path: &Path) -> SignatureStatus {
-    // Linux has no platform signing baseline; Windows Authenticode is out of
-    // scope for the bounded child process. Report not-applicable so no false
-    // `ExecUnsigned` fires on these platforms.
+    // No platform baseline here, so no false `ExecUnsigned`.
     SignatureStatus::NotApplicable
 }
-
-// ─── package-manager ownership ───────────────────────────────────────────────
 
 /// Match `path` against well-known package-manager install roots. Home-anchored
 /// roots (`~/.cargo/bin`, ...) are resolved against the real home dir.
 pub fn match_package_owner(path: &Path) -> Option<PackageOwner> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    // (label, absolute root). Static roots first.
     let mut roots: Vec<(&str, PathBuf)> = vec![
         ("homebrew", PathBuf::from("/opt/homebrew/Cellar")),
         ("homebrew", PathBuf::from("/opt/homebrew/bin")),
@@ -433,7 +392,7 @@ mod tests {
     fn recently_modified_binary_fires_high() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("payload");
-        mkexec(&p, 0o755); // just written -> mtime is "now"
+        mkexec(&p, 0o755);
         let prov = provenance_of(&p);
         assert!(prov.exists);
         assert!(prov.recently_modified, "just-written file is recent");
@@ -473,8 +432,7 @@ mod tests {
 
     #[test]
     fn shadow_finding_fires_for_non_system_copy() {
-        // /bin/sh exists on every Unix CI host. A "sh" resolving elsewhere
-        // shadows it.
+        // A "sh" resolving outside /bin shadows the system /bin/sh.
         if !Path::new("/bin/sh").exists() {
             eprintln!("skipping: no /bin/sh on this host");
             return;
@@ -487,14 +445,12 @@ mod tests {
 
     #[test]
     fn shadow_finding_silent_for_system_path() {
-        // The resolved path IS a system path -> not a shadow.
         let f = shadow_finding("sh", Path::new("/bin/sh"));
         assert!(f.is_none());
     }
 
     #[test]
     fn shadow_finding_silent_when_no_system_copy() {
-        // A made-up command name has no system copy -> nothing to shadow.
         let f = shadow_finding("definitely-not-a-real-cmd-xyz", Path::new("/opt/x/bin/foo"));
         assert!(f.is_none());
     }
@@ -502,8 +458,8 @@ mod tests {
     #[test]
     fn match_package_owner_recognizes_nix_store() {
         let owner = match_package_owner(Path::new("/nix/store/abc-foo/bin/foo"));
-        // /nix/store may not exist on the test host; canonicalize falls back to
-        // the literal path, so the prefix match still holds.
+        // Canonicalize falls back to the literal path, so the prefix match holds
+        // even when /nix/store is absent.
         assert!(owner.is_some(), "{owner:?}");
         assert_eq!(owner.unwrap().manager, "nix");
     }

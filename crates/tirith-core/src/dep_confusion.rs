@@ -1,22 +1,14 @@
-//! M6 ch6/ch7 — dependency-confusion heuristic.
+//! M6 ch6/ch7 — dependency-confusion heuristic. Offline, read-only.
 //!
-//! Returns a [`DepConfusionVerdict`] for a given `(eco, name, policy)` triple.
-//! Two heuristics are layered:
-//!
-//!  1. **Operator-supplied internal-name patterns.** When the policy carries
-//!     `package_policy.internal_package_names` (M6 ch7) and the public-registry
-//!     resolution matches one of those patterns, this is the textbook
-//!     dep-confusion shape (the 2021 `@<org>/<util>` attack). Each
-//!     [`InternalPackageSpec`] can optionally scope to a specific ecosystem.
-//!     Glob-style wildcard at the end of an `@<org>/*` pattern is supported.
-//!  2. **Registry-namespace shape.** Without the operator list, the heuristic
-//!     falls back to obvious `@<reserved-org>/<name>` patterns — npm scope
-//!     names whose `@<org>` portion is a known internal-org indicator
-//!     (`@my-company`, `@internal`, `@private`, etc.). Conservative on
-//!     purpose: false positives on legitimate scoped public packages are a
-//!     bigger UX harm than a missed signal here.
-//!
-//! Read-only; no I/O. The heuristic runs offline.
+//!  1. Operator-supplied internal-name patterns
+//!     (`package_policy.internal_package_names`, M6 ch7): a public-registry
+//!     resolution matching one is the textbook dep-confusion shape. Each
+//!     [`InternalPackageSpec`] may scope to an ecosystem; a trailing `@<org>/*`
+//!     wildcard is supported.
+//!  2. Registry-namespace shape: without the operator list, fall back to
+//!     `@<reserved-org>/<name>` npm scopes (`@internal`, `@private`, …).
+//!     Conservative — false positives on legit scoped packages hurt more than
+//!     a missed signal.
 
 use crate::package_risk::DepConfusionVerdict;
 use crate::policy::{InternalPackageSpec, Policy};
@@ -26,8 +18,7 @@ use crate::threatdb::Ecosystem;
 ///
 /// `risk == false` is the default; only a positive match flips it.
 pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerdict {
-    // Trim defensively. A name with leading/trailing whitespace would not
-    // resolve at the registry, so we treat it as a no-match.
+    // Whitespace-padded names don't resolve at the registry → no-match.
     let name = name.trim();
     if name.is_empty() {
         return DepConfusionVerdict {
@@ -36,11 +27,8 @@ pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerd
         };
     }
 
-    // (1) Operator-supplied internal-name patterns (ch7 location:
-    // `package_policy.internal_package_names`). Each entry is an
-    // `InternalPackageSpec { ecosystem, name }`; `ecosystem == None` matches
-    // every ecosystem (the M6 ch6 behavior). Patterns support a single
-    // trailing `*` wildcard.
+    // (1) Operator-supplied internal-name patterns. `ecosystem == None`
+    // matches every ecosystem; patterns support a single trailing `*`.
     for spec in &policy.package_policy.internal_package_names {
         if !ecosystem_matches(spec, eco) {
             continue;
@@ -58,8 +46,7 @@ pub fn evaluate(eco: Ecosystem, name: &str, policy: &Policy) -> DepConfusionVerd
         }
     }
 
-    // (2) Registry-namespace shape — npm scoped names whose `@<org>` portion
-    // looks like an internal-only scope. The fallback list is conservative.
+    // (2) Registry-namespace shape — npm scopes that look internal-only.
     if matches!(eco, Ecosystem::Npm) {
         if let Some(scope) = npm_scope(name) {
             if is_reserved_internal_scope(scope) {
@@ -99,9 +86,8 @@ fn npm_scope(name: &str) -> Option<&str> {
     Some(&name[..slash])
 }
 
-/// `true` when this spec is unscoped (matches every ecosystem) or its
-/// declared ecosystem string matches `eco`. Comparison is case-insensitive
-/// to match the spelling shipping `Ecosystem` serialization uses.
+/// `true` when this spec is unscoped (matches every ecosystem) or its declared
+/// ecosystem matches `eco` (case-insensitive, matching `Ecosystem` serialization).
 fn ecosystem_matches(spec: &InternalPackageSpec, eco: Ecosystem) -> bool {
     let Some(declared) = &spec.ecosystem else {
         return true;
@@ -113,8 +99,8 @@ fn ecosystem_matches(spec: &InternalPackageSpec, eco: Ecosystem) -> bool {
     declared.eq_ignore_ascii_case(&eco.to_string())
 }
 
-/// Scopes whose name shape is a strong "this is private" signal. Conservative
-/// list; ch7's `package_policy.internal_package_names` is the real surface.
+/// Scopes whose shape strongly signals "private". Conservative fallback;
+/// `package_policy.internal_package_names` is the real surface.
 const RESERVED_INTERNAL_SCOPES: &[&str] = &[
     "@internal",
     "@private",
@@ -214,7 +200,6 @@ mod tests {
 
     #[test]
     fn scoped_spec_matches_only_declared_ecosystem() {
-        // npm-scoped pattern must not flag a matching name in pypi
         let p = policy_with_scoped(&[(Some("npm"), "internal-tool")]);
         let v_npm = evaluate(Ecosystem::Npm, "internal-tool", &p);
         assert!(v_npm.risk);
@@ -227,7 +212,6 @@ mod tests {
 
     #[test]
     fn unscoped_spec_matches_all_ecosystems() {
-        // None (unscoped) must match every ecosystem
         let p = policy_with_scoped(&[(None, "internal-tool")]);
         assert!(evaluate(Ecosystem::Npm, "internal-tool", &p).risk);
         assert!(evaluate(Ecosystem::PyPI, "internal-tool", &p).risk);

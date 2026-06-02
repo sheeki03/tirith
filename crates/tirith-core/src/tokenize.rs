@@ -34,13 +34,9 @@ pub struct Segment {
     pub args: Vec<String>,
     /// The separator that preceded this segment (e.g., `|`, `&&`).
     pub preceding_separator: Option<String>,
-    /// Byte range of the *trimmed* segment content within the original input.
-    /// `input[segment.byte_range.clone()] == segment.raw` holds.
-    ///
-    /// Lets downstream rules carve out byte spans of specific segments (e.g.
-    /// args to `tirith diff/score/why`). Test helpers that construct `Segment`
-    /// directly can set any range; production code goes through `push_segment`
-    /// which derives it from `input`.
+    /// Byte range of the *trimmed* segment content in the original input:
+    /// `input[byte_range] == raw`. Lets downstream rules carve out per-segment
+    /// spans. Production code derives it in `push_segment`.
     pub byte_range: std::ops::Range<usize>,
 }
 
@@ -67,14 +63,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
         let ch = chars[i];
 
         match ch {
-            // Backslash escaping
             '\\' if i + 1 < len => {
                 current.push(chars[i]);
                 current.push(chars[i + 1]);
                 i += 2;
                 continue;
             }
-            // Single quotes: everything literal until closing quote
+            // Single quotes: everything literal until the closing quote.
             '\'' => {
                 current.push(ch);
                 i += 1;
@@ -83,12 +78,12 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     i += 1;
                 }
                 if i < len {
-                    current.push(chars[i]); // closing quote
+                    current.push(chars[i]);
                     i += 1;
                 }
                 continue;
             }
-            // Double quotes: allow backslash escaping inside
+            // Double quotes: backslash escaping allowed inside.
             '"' => {
                 current.push(ch);
                 i += 1;
@@ -103,15 +98,13 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     }
                 }
                 if i < len {
-                    current.push(chars[i]); // closing quote
+                    current.push(chars[i]);
                     i += 1;
                 }
                 continue;
             }
-            // Pipe operators
             '|' => {
                 if i + 1 < len && chars[i + 1] == '|' {
-                    // ||
                     push_segment(
                         &mut segments,
                         &current,
@@ -137,7 +130,6 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     i += 2;
                     continue;
                 } else {
-                    // |
                     push_segment(
                         &mut segments,
                         &current,
@@ -151,7 +143,6 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                     continue;
                 }
             }
-            // && operator
             '&' if i + 1 < len && chars[i + 1] == '&' => {
                 push_segment(
                     &mut segments,
@@ -165,7 +156,6 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                 i += 2;
                 continue;
             }
-            // Semicolon
             ';' => {
                 push_segment(
                     &mut segments,
@@ -179,7 +169,6 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
                 i += 1;
                 continue;
             }
-            // Newline
             '\n' => {
                 push_segment(
                     &mut segments,
@@ -211,10 +200,8 @@ fn tokenize_posix(input: &str) -> Vec<Segment> {
 }
 
 fn tokenize_fish(input: &str) -> Vec<Segment> {
-    // Fish is similar to POSIX but with some differences:
-    // - No backslash-newline continuation
-    // - Different quoting rules (but close enough for our purposes)
-    // For URL extraction, POSIX tokenization works well enough
+    // Fish differs slightly from POSIX, but POSIX tokenization is close enough
+    // for URL extraction.
     tokenize_posix(input)
 }
 
@@ -232,14 +219,14 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
         let (byte_off, ch) = indexed[i];
 
         match ch {
-            // Backtick escaping in PowerShell
+            // Backtick escaping in PowerShell.
             '`' if i + 1 < len => {
                 current.push(indexed[i].1);
                 current.push(indexed[i + 1].1);
                 i += 2;
                 continue;
             }
-            // Single quotes: literal
+            // Single quotes: literal.
             '\'' => {
                 current.push(ch);
                 i += 1;
@@ -253,7 +240,6 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            // Double quotes
             '"' => {
                 current.push(ch);
                 i += 1;
@@ -273,13 +259,10 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            // Pipe
             '|' => {
-                // PS 7+ logical-OR chain operator (|| — semantically equivalent
-                // to bash ||). Must be checked before the single-pipe arm so
-                // we don't consume `||` as two single pipes (which would split
-                // `a || b` into three segments and lose the chain-op semantics
-                // `check_inline_download_execute` relies on).
+                // PS 7+ `||` chain op — checked before the single-pipe arm so
+                // `a || b` is one separator, not two pipes (three segments),
+                // which `check_inline_download_execute` relies on.
                 if i + 1 < len && indexed[i + 1].1 == '|' {
                     push_segment(
                         &mut segments,
@@ -305,7 +288,6 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 i += 1;
                 continue;
             }
-            // Semicolon
             ';' => {
                 push_segment(
                     &mut segments,
@@ -319,11 +301,8 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 i += 1;
                 continue;
             }
-            // PS 7+ logical-AND chain operator (&& — semantically equivalent
-            // to bash &&). The guard on the match arm ensures a bare `&`
-            // (PowerShell's call/background operator) falls through to the
-            // catch-all and is kept as part of the current segment — it's
-            // not a chain op on its own and is out of scope for this rule.
+            // PS 7+ `&&` chain op. The arm guard lets a bare `&` (PS
+            // call/background operator) fall through to the catch-all.
             '&' if i + 1 < len && indexed[i + 1].1 == '&' => {
                 push_segment(
                     &mut segments,
@@ -337,7 +316,7 @@ fn tokenize_powershell(input: &str) -> Vec<Segment> {
                 i += 2;
                 continue;
             }
-            // Check for -and / -or operators (PowerShell logical)
+            // PowerShell logical `-and` / `-or` operators.
             '-' if current.ends_with(char::is_whitespace) || current.is_empty() => {
                 let remaining = &input[byte_off..];
                 if remaining.starts_with("-and")
@@ -427,7 +406,7 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 i += 2;
                 continue;
             }
-            // Double quotes (only quoting mechanism in cmd)
+            // Double quotes (cmd's only quoting mechanism).
             '"' => {
                 current.push(ch);
                 i += 1;
@@ -441,7 +420,6 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            // Pipe
             '|' => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     push_segment(
@@ -468,7 +446,6 @@ fn tokenize_cmd(input: &str) -> Vec<Segment> {
                 }
                 continue;
             }
-            // & and &&
             '&' => {
                 if i + 1 < len && chars[i + 1] == '&' {
                     push_segment(
@@ -543,10 +520,9 @@ fn push_segment(
         return;
     }
 
-    // The tokenizer copies input bytes verbatim into the accumulator, so
-    // `trimmed` must appear as a substring of `input` at or after
-    // `*search_cursor`. If it doesn't, callers constructed `raw` in an
-    // unexpected way — fall back to a range that preserves invariants.
+    // The tokenizer copies input bytes verbatim, so `trimmed` appears in
+    // `input` at or after `*search_cursor`. The `None` fallback (shouldn't
+    // happen) emits a zero-width range so downstream slicing never panics.
     let byte_range = match input.get(*search_cursor..).and_then(|s| s.find(trimmed)) {
         Some(rel_pos) => {
             let start = *search_cursor + rel_pos;
@@ -555,16 +531,13 @@ fn push_segment(
             start..end
         }
         None => {
-            // Shouldn't happen in normal flow; emit a zero-width placeholder
-            // rooted at the cursor so downstream code still gets a valid
-            // Range<usize> and doesn't panic on slicing.
             let cursor = (*search_cursor).min(input.len());
             cursor..cursor
         }
     };
 
     let words = split_words(trimmed);
-    // Skip leading environment variable assignments (VAR=VALUE)
+    // Skip leading `VAR=VALUE` assignments.
     let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
     let (command, args) = match first_non_assign {
         Some(idx) => {
@@ -577,7 +550,7 @@ fn push_segment(
             (cmd, args)
         }
         None => {
-            // All words are assignments, no command
+            // All words are assignments — no command.
             (None, Vec::new())
         }
     };
@@ -652,7 +625,6 @@ fn split_words(input: &str) -> Vec<String> {
                 words.push(current.clone());
                 current.clear();
                 i += 1;
-                // Skip whitespace
                 while i < len && (chars[i] == ' ' || chars[i] == '\t') {
                     i += 1;
                 }
@@ -949,15 +921,14 @@ mod tests {
 
     #[test]
     fn test_powershell_multibyte_and_operator_no_panic() {
-        // Regression test for fuzz crash: multi-byte UTF-8 before -and caused
-        // byte/char index mismatch panic in &input[i..] slicing.
+        // Fuzz-crash regression: multi-byte UTF-8 before `-and` once panicked
+        // the `&input[i..]` slicing on a byte/char index mismatch.
         let input = " ?]BB\u{07E7}\u{07E7} -\n-\r-and-~\0\u{c}-and-~\u{1d}";
         let _ = tokenize(input, ShellType::PowerShell);
     }
 
-    // Segment.byte_range invariant: `input[segment.byte_range.clone()] ==
-    // segment.raw` for every segment in every shell tokenizer. The range spans
-    // the TRIMMED content, not the raw accumulator (see push_segment for why).
+    // Segment.byte_range invariant: `input[byte_range] == raw` for every
+    // segment, over the TRIMMED content (see push_segment).
 
     fn assert_byte_ranges_match_raw(input: &str, segs: &[Segment]) {
         for (i, seg) in segs.iter().enumerate() {

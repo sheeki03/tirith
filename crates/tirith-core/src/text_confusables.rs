@@ -1,12 +1,9 @@
-//! Text-level confusable character lookup using embedded data from build.rs.
-//! Separate from `confusables.rs` which is used for hostname skeleton matching.
-//! This table covers Mathematical Alphanumeric Symbols (U+1D400–U+1D7FF)
-//! used in steganographic text attacks.
+//! Text-level confusable lookup (Math Alphanumeric Symbols U+1D400–U+1D7FF).
+//! Separate from `confusables.rs` (hostname skeleton matching).
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
-// Include generated text confusable table
 include!(concat!(env!("OUT_DIR"), "/text_confusables_gen.rs"));
 
 /// Map from text-confusable char to the ASCII char it resembles.

@@ -1,8 +1,5 @@
-/// Run the `tirith hook-event` subcommand.
-///
-/// Logs a hook telemetry event to the audit log and always exits 0.
-/// This is called by shell/Python/TypeScript hook scripts at every
-/// decision point to record what happened.
+/// Run `tirith hook-event`: log a hook telemetry event (always exits 0).
+/// Called by shell/Python/TypeScript hooks at each decision point.
 pub fn run(
     integration: &str,
     hook_type: &str,

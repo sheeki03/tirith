@@ -1,26 +1,13 @@
-//! `tirith preview -- "<cmd>"` — blast-radius simulator.
+//! `tirith preview -- "<cmd>"` — blast-radius simulator for `rm` / `mv` /
+//! `chmod -R` / `find … -delete` / `rsync --delete`.
 //!
-//! ## What this is
+//! Walks the filesystem (capped at depth 5 / 100k files), expands globs against
+//! cwd, and reports file/dir/symlink counts, largest file, repo-escape, and
+//! system-path writes.
 //!
-//! `tirith preview` answers "if I run this destructive command right now, what
-//! would it touch?" for `rm` / `mv` / `chmod -R` / `find … -delete` /
-//! `rsync --delete`. It **walks the filesystem** (capped at depth 5 / 100k
-//! files), expands globs against the current directory, and reports the file /
-//! directory / symlink counts, the largest file, whether any target escapes the
-//! repository, and whether it writes a system path.
-//!
-//! ## What this is NOT
-//!
-//! - It does NOT execute the command. It only simulates the filesystem impact.
-//! - It is NOT a sandbox or a security boundary — it reads the disk to count
-//!   impact and then exits.
-//! - It is the ONLY surface that walks the filesystem. The `tirith check` hot
-//!   path NEVER walks the disk; it runs only the cheap string-shape blast-radius
-//!   subset (`blast_radius::cheap_check`). See the `engine::analyze`
-//!   doc-comment for the hot/cold split.
-//!
-//! Globs expand against the current working directory, so the reported counts
-//! reflect the cwd at the time `tirith preview` runs.
+//! It does NOT execute the command and is NOT a sandbox. It is the ONLY surface
+//! that walks the filesystem — the `tirith check` hot path never does; it runs
+//! only the cheap string-shape subset (`blast_radius::cheap_check`).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -51,8 +38,8 @@ pub fn run(command: &str, json: bool) -> i32 {
 
     let env_map = blast_radius::env_snapshot();
 
-    // The full filesystem-walking simulation. This is the EXPENSIVE surface
-    // that ONLY `tirith preview` is allowed to run.
+    // The full filesystem-walking simulation — the expensive surface only
+    // `tirith preview` may run.
     let report = blast_radius::simulate(
         command,
         ShellType::Posix,
@@ -62,8 +49,7 @@ pub fn run(command: &str, json: bool) -> i32 {
     );
 
     // Merge the simulator-only findings with the cheap string-shape findings so
-    // the preview surfaces the full picture (e.g. a system-path target shows
-    // both BlastWritesSystemPath and any count signals).
+    // the preview surfaces the full picture.
     let mut findings = blast_radius::report_findings(&report);
     findings.extend(blast_radius::cheap_check(
         command,
@@ -98,7 +84,6 @@ fn print_human(
     println!("  command: {command}");
     println!();
 
-    // The core impact summary.
     let suffix = if report.walk_truncated { "+" } else { "" };
     println!("  files:    {}{suffix}", report.file_count);
     println!("  dirs:     {}{suffix}", report.dir_count);
@@ -113,7 +98,6 @@ fn print_human(
         );
     }
 
-    // The two headline yes/no answers the acceptance criteria call out.
     let outside = if report.unsafe_empty_var_glob {
         "yes (empty-variable path collapses to root)"
     } else if report.paths_outside_repo {
@@ -245,8 +229,6 @@ mod tests {
 
     #[test]
     fn preview_relative_dist_is_clean_exit() {
-        // Build a temp repo with a ./dist tree, cd into it, and confirm a
-        // repo-relative delete reports clean (exit 0).
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         let dist = dir.path().join("dist");
@@ -260,12 +242,9 @@ mod tests {
 
     #[test]
     fn preview_empty_var_glob_absent_is_advisory() {
-        // F2: `$TIRITH_PREVIEW_UNSET` is ABSENT from tirith's process env. Tirith
-        // cannot tell whether it is a benign non-exported shell-local or a truly
-        // unset var that would collapse `rm -rf "$VAR/"` to root, so the
-        // BlastEmptyVarGlob finding fires at Info (advisory) — NOT a Block.
-        // (A PRESENT-and-empty var is unambiguously High; that case is
-        // unit-tested in blast_radius.rs without a process-env mutation.)
+        // F2: an ABSENT var (possibly a benign shell-local) is ambiguous, so
+        // BlastEmptyVarGlob fires at Info, not Block. A PRESENT-and-empty var is
+        // unambiguously High (unit-tested in blast_radius.rs).
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         let _guard = CwdGuard::enter(dir.path());

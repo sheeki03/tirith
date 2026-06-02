@@ -1,28 +1,8 @@
 //! M13 ch5 — `tirith ai scan|diff|quarantine|explain-config|snapshot`.
 //!
-//! AI-config drift + risk surface for a repository an AI coding agent operates
-//! in. Five actions:
-//!
-//!  - `scan` — run the AI-config subset of the shipping scan engine (the
-//!    `ai-agent-repo` profile) over the repo's AI-config files. Reuses
-//!    [`crate::cli::scan::run`] — no scan engine is duplicated here.
-//!  - `diff` — compare each current AI-config file to the last-known-safe
-//!    snapshot (the per-repo file `snapshot_path()` resolves to:
-//!    `state_dir()/ai_config_snapshot-<hash>.json`, where `<hash>` disambiguates
-//!    repos) and report added / removed instructions plus the M13 ch5
-//!    `AiConfig*` findings (produced by
-//!    [`tirith_core::rules::aifile::diff_findings`]).
-//!  - `quarantine <file>` — **v1 default is COPY, not move**: copy the file to
-//!    `~/.cache/tirith/quarantine/<ts>-<sha256>-<basename>`, leaving the
-//!    original UNTOUCHED, and print the restore command. `--move` opts into the
-//!    destructive variant (with a confirmation prompt unless `--yes`).
-//!  - `explain-config <file>` — identify which AI tool a config file configures
-//!    and print what capabilities / risks its content grants.
-//!  - `snapshot [--update]` — show the current snapshot state, or (`--update`)
-//!    re-scan + record a fresh snapshot (refusing to bless a state with High+
-//!    issues unless forced).
-//!
-//! The snapshot store and the diff / risk detection live in the library
+//! AI-config drift + risk surface for a repo an AI coding agent operates in.
+//! `quarantine`'s v1 default is COPY (original UNTOUCHED); `--move` is the
+//! destructive variant. Detection lives in the library
 //! (`tirith_core::rules::aifile`, `tirith_core::scan`); this module is the CLI
 //! presenter + the quarantine filesystem op.
 
@@ -38,59 +18,45 @@ use tirith_core::verdict::Severity;
 
 use super::{confirm, write_file_atomic, write_json_stdout};
 
-// ===========================================================================
 // snapshot store
-// ===========================================================================
 
 /// One file's recorded content in the last-known-safe snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotEntry {
-    /// SHA-256 (hex) of the recorded content — a quick changed/unchanged check.
     sha256: String,
-    /// The full recorded content, so `ai diff` can compute a line-level diff.
     content: String,
 }
 
 /// The last-known-safe snapshot of a repo's AI-config files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Snapshot {
-    /// RFC3339 timestamp the snapshot was recorded.
     updated_at: String,
-    /// The repository root the snapshot was taken against (canonical display
-    /// path). `ai diff` / `ai snapshot` refuse to reuse a snapshot whose
-    /// recorded root does not match the current repo root, so a stale snapshot
-    /// from a DIFFERENT repo can never be silently compared against this one
-    /// (M13 PR #132 finding I).
+    /// Canonical repo root. `ai diff` / `ai snapshot` refuse to reuse a snapshot
+    /// whose recorded root differs from the current root (M13 PR #132 finding I).
     root: String,
-    /// Map of `root`-relative file path → recorded entry. A `BTreeMap` so the
-    /// on-disk JSON is deterministic (stable key order).
+    /// `root`-relative path → entry. `BTreeMap` for deterministic on-disk JSON.
     files: BTreeMap<String, SnapshotEntry>,
 }
 
-/// Per-repo snapshot path: `state_dir()/ai_config_snapshot-<hash>.json`, where
-/// `<hash>` is derived from the canonical repo root. Making the path
-/// repo-specific stops `tirith ai snapshot --update` in repo B from overwriting
-/// repo A's baseline, and stops `ai diff` from comparing against an unrelated
-/// snapshot (M13 PR #132 finding I).
+/// Per-repo snapshot path `state_dir()/ai_config_snapshot-<hash>.json`. Repo-
+/// specific so `--update` in repo B can't overwrite repo A's baseline, and
+/// `ai diff` can't compare against an unrelated snapshot (M13 PR #132 finding I).
 fn snapshot_path(root: &Path) -> Option<PathBuf> {
     let hash = root_hash(root);
     state_dir().map(|d| d.join(format!("ai_config_snapshot-{hash}.json")))
 }
 
-/// A short, filesystem-safe hex digest of the canonical repo root, used only to
-/// disambiguate per-repo snapshot files (not a security boundary — the recorded
-/// `root` inside the snapshot is the authoritative match check).
+/// Short hex digest of the canonical repo root, used only to disambiguate
+/// per-repo snapshot files (not a security boundary — the recorded `root` inside
+/// the snapshot is the authoritative match check).
 fn root_hash(root: &Path) -> String {
     let sha = tirith_core::clipboard::content_sha256_hex(root.to_string_lossy().as_bytes());
     sha[..sha.len().min(16)].to_string()
 }
 
-/// Load the snapshot for `root`, returning `Ok(None)` when no snapshot file
-/// exists yet. A snapshot whose recorded `root` differs from `root` is treated
-/// as absent (`Ok(None)`): it belongs to a different repo (e.g. a hash collision
-/// or a relocated tree) and must not be reused — the caller will report "no
-/// snapshot" and prompt a fresh `--update` rather than diffing against a
-/// foreign baseline (M13 PR #132 finding I).
+/// Load the snapshot for `root`, returning `Ok(None)` when none exists yet. A
+/// snapshot whose recorded `root` differs is also treated as absent: it belongs
+/// to a different repo and must not be reused (M13 PR #132 finding I).
 fn load_snapshot(root: &Path) -> std::io::Result<Option<Snapshot>> {
     let Some(path) = snapshot_path(root) else {
         return Err(std::io::Error::new(
@@ -106,8 +72,8 @@ fn load_snapshot(root: &Path) -> std::io::Result<Option<Snapshot>> {
                     format!("snapshot at {} is corrupt: {e}", path.display()),
                 )
             })?;
-            // Defense in depth against a hash collision / a stale file whose
-            // recorded root no longer matches: refuse to reuse it.
+            // Defense in depth: refuse to reuse a snapshot whose recorded root
+            // no longer matches (hash collision / stale file).
             if snap.root != root.display().to_string() {
                 return Ok(None);
             }
@@ -118,9 +84,8 @@ fn load_snapshot(root: &Path) -> std::io::Result<Option<Snapshot>> {
     }
 }
 
-/// Emit an operator error as `{"error": ...}` JSON on stdout in `--json` mode, or
-/// a human stderr line otherwise. Mirrors `cli::canary::emit_error`. Returns
-/// `false` only when the JSON write itself failed (broken pipe).
+/// Emit an operator error as `{"error": ...}` JSON in `--json` mode, else a human
+/// stderr line. Returns `false` only when the JSON write itself failed.
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         // JSON encodes control chars safely and machine consumers need the raw
@@ -128,25 +93,16 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
         let v = serde_json::json!({ "error": msg });
         write_json_stdout(&v, &format!("{ctx}: failed to write JSON output"))
     } else {
-        // Human stderr line: `msg` (and to a lesser degree `ctx`) can embed
-        // repo / AI-config-derived content (e.g. a path `Display`ed into the
-        // message, or a serde error quoting file bytes), which could carry
-        // ANSI/OSC/control sequences to spoof or rewrite terminal output. Route
-        // both through `sanitize_display` before printing — tirith must never
-        // itself emit the terminal injection it exists to detect.
+        // `msg`/`ctx` can embed AI-config-derived content carrying terminal
+        // escapes; sanitize before printing (tirith must not itself inject).
         eprintln!("{}: {}", sanitize_display(ctx), sanitize_display(msg));
         true
     }
 }
 
-/// Resolve the CANONICAL repo root to scan / snapshot. `tirith ai` is
-/// repo-scoped: we walk up to the `.git` boundary (the same discovery
-/// `tirith onboard` / `policy` use) and fall back to the current directory
-/// outside a git repo. The result is canonicalized so the per-repo snapshot
-/// path and the recorded `root` are stable regardless of how the user `cd`'d in
-/// (symlinks, `..`, `/var` → `/private/var` on macOS). Canonicalization is
-/// best-effort: if it fails (e.g. the dir was removed), the un-canonicalized
-/// path is used.
+/// Resolve the CANONICAL repo root to scan / snapshot. Walks up to the `.git`
+/// boundary, falling back to cwd outside a repo. Canonicalized (best-effort) so
+/// the snapshot path and recorded `root` are stable across symlinks / `..`.
 fn repo_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = tirith_core::policy::find_repo_root(Some(&cwd.to_string_lossy())).unwrap_or(cwd);
@@ -162,21 +118,12 @@ fn rel_key(root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
-// ===========================================================================
 // `tirith ai scan`
-// ===========================================================================
 
-/// `tirith ai scan` — run the `ai-agent-repo` scan profile over the repo's
-/// AI-config files. This is a thin wrapper over `tirith scan --profile
-/// ai-agent-repo`: the AI-config subset of the shipping scan engine, no
-/// duplicated detection. We scope the scan to the repo root and let the profile
-/// (together with the engine's own AI-file rules — `agent_instruction_hidden`,
-/// the config / notebook / svg checks) decide findings.
+/// `tirith ai scan` — thin wrapper over `tirith scan --profile ai-agent-repo`
+/// scoped to the repo root; no duplicated detection.
 pub fn scan(json: bool) -> i32 {
     let root = repo_root();
-    // Reuse the shipping scan command with the `ai-agent-repo` built-in profile.
-    // `fail_on` is set by the profile; we pass the same default the bare `scan`
-    // uses so the profile's `fail_on` (high) takes effect.
     super::scan::run(
         Some(&root.to_string_lossy()),
         None,   // file
@@ -192,29 +139,22 @@ pub fn scan(json: bool) -> i32 {
     )
 }
 
-// ===========================================================================
 // `tirith ai diff`
-// ===========================================================================
 
 /// How a tracked AI-config file changed between the snapshot and disk. The
-/// `#[serde(rename_all = "lowercase")]` keeps the JSON wire string byte-identical
-/// to the previous stringly-typed values (`"modified"` / `"added"` / `"removed"`)
-/// while making the producer in [`diff`] exhaustive (M13 PR #132 finding F3).
+/// lowercase rename keeps the JSON wire byte-identical to the prior stringly-
+/// typed values (M13 PR #132 finding F3).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum DiffStatus {
-    /// Present in BOTH the snapshot and on disk, with differing content.
     Modified,
-    /// Absent from the snapshot, present on disk now.
     Added,
-    /// Present in the snapshot, gone from disk now.
     Removed,
 }
 
 impl DiffStatus {
     /// The lowercase label — the SAME string the field serializes to and the
-    /// human-mode `[modified]` / `[added]` / `[removed]` tag prints, so the enum
-    /// changes neither the JSON wire nor the human output.
+    /// human-mode tag prints, so the enum changes neither wire nor human output.
     fn as_str(self) -> &'static str {
         match self {
             DiffStatus::Modified => "modified",
@@ -241,9 +181,7 @@ struct FileDiff {
 }
 
 /// `tirith ai diff` — compare each current AI-config file to the last-known-safe
-/// snapshot and report added / removed instruction lines plus any `AiConfig*`
-/// findings. With no snapshot, says so and suggests `tirith ai snapshot
-/// --update`.
+/// snapshot and report added / removed lines plus any `AiConfig*` findings.
 pub fn diff(json: bool) -> i32 {
     let root = repo_root();
     let snapshot = match load_snapshot(&root) {
@@ -292,10 +230,8 @@ pub fn diff(json: bool) -> i32 {
     let mut any_finding = false;
 
     for key in &keys {
-        // Compute PRESENCE on each side first. "missing" and "empty" are
-        // DIFFERENT states: a file may be absent from the snapshot yet present
-        // (even empty) on disk, or vice-versa. Collapsing them — as a bare
-        // `old == new` check does, since both render as "" — would hide the
+        // Track PRESENCE on each side: "missing" and "empty" are distinct states.
+        // A bare `old == new` check (both render as "") would hide the
         // creation/deletion of an empty AI-config (CodeRabbit M13 PR #132 R3-6).
         let existed_before = snapshot.files.contains_key(key);
         let exists_now = current_by_key.contains_key(key);
@@ -306,10 +242,8 @@ pub fn diff(json: bool) -> i32 {
             .map(|e| e.content.clone())
             .unwrap_or_default();
         let new = match current_by_key.get(key) {
-            // A file present on disk that we cannot read (I/O error or over the
-            // size cap) must NOT be treated as empty — that would fabricate an
-            // "added"/"modified" diff (a present-on-disk file is never "removed")
-            // for a file that is simply unreadable. Surface the error and exit
+            // A present-on-disk file we cannot read must NOT be treated as empty
+            // (that fabricates an added/modified diff); surface the error and exit
             // non-zero instead (M13 PR #132 finding J).
             Some(path) => match read_text(path) {
                 Ok(content) => content,
@@ -327,12 +261,10 @@ pub fn diff(json: bool) -> i32 {
             None => String::new(), // present in snapshot, gone on disk
         };
 
-        // Skip ONLY when the file exists on BOTH sides and its content is
-        // unchanged. An added file (absent before, present now) or a removed
-        // file (present before, absent now) is always reported — even when its
-        // content is empty on both notional sides.
+        // Skip ONLY when the file exists on BOTH sides with unchanged content;
+        // an added or removed file is always reported, even if empty.
         if existed_before && exists_now && old == new {
-            continue; // unchanged — skip
+            continue;
         }
 
         let status = if existed_before && exists_now {
@@ -381,9 +313,8 @@ pub fn diff(json: bool) -> i32 {
     );
     println!();
     for d in &diffs {
-        // Every displayed field below is AI-config-derived (path basenames, the
-        // instruction line bodies, finding titles) and is sanitized so a hostile
-        // config cannot inject terminal escapes into our output (R20).
+        // Every displayed field is AI-config-derived; sanitize so a hostile
+        // config cannot inject terminal escapes (R20).
         println!("  {} [{}]", sanitize_display(&d.path), d.status);
         for line in &d.added_instructions {
             println!("    + {}", sanitize_display(line));
@@ -411,10 +342,9 @@ pub fn diff(json: bool) -> i32 {
     0
 }
 
-/// Compute the added / removed instruction-shaped lines between `old` and `new`
-/// for human / JSON display. Uses the same normalization the diff producers use
-/// (via a public re-derivation): a line present in one side's normalized set but
-/// not the other. Whitespace-only churn is invisible. Returns `(added, removed)`.
+/// Compute the added / removed instruction-shaped lines between `old` and `new`.
+/// Whitespace-only churn is invisible (lines are trim_end'd + empty-filtered).
+/// Returns `(added, removed)`.
 fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     use std::collections::HashMap;
     let norm = |s: &str| -> Vec<String> {
@@ -425,9 +355,8 @@ fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     };
     let old_lines = norm(old);
     let new_lines = norm(new);
-    // Count-based diff: a line appearing more often on one side than the other
-    // contributes that many added/removed entries. A pure HashSet under-reports
-    // a line duplicated on one side but single on the other.
+    // Count-based diff (not a HashSet) so a line's surplus on one side is
+    // reported as that many added/removed entries.
     let mut old_counts: HashMap<&str, usize> = HashMap::new();
     for l in &old_lines {
         *old_counts.entry(l.as_str()).or_insert(0) += 1;
@@ -436,9 +365,8 @@ fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     for l in &new_lines {
         *new_counts.entry(l.as_str()).or_insert(0) += 1;
     }
-    // Added: for each new line, emit (new_count - old_count) copies, in first-seen
-    // order. Tracking how many of each line we have already emitted keeps the
-    // output stable and avoids re-emitting on later occurrences of the same line.
+    // Added: for each new line, emit (new_count - old_count) copies in first-seen
+    // order, tracking already-emitted counts to keep the output stable.
     let mut emitted_added: HashMap<&str, usize> = HashMap::new();
     let mut added: Vec<String> = Vec::new();
     for l in &new_lines {
@@ -453,7 +381,7 @@ fn added_removed(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
             added.push(truncate_line(l));
         }
     }
-    // Removed: symmetric — for each old line, emit (old_count - new_count) copies.
+    // Removed: symmetric.
     let mut emitted_removed: HashMap<&str, usize> = HashMap::new();
     let mut removed: Vec<String> = Vec::new();
     for l in &old_lines {
@@ -481,21 +409,11 @@ fn truncate_line(s: &str) -> String {
     format!("{cut}…")
 }
 
-/// Neutralize one untrusted string before printing it to the terminal in HUMAN
-/// mode (CodeRabbit M13 PR #132 R20 — raw terminal passthrough).
-///
-/// Everything `tirith ai` displays in human mode — diff line bodies, file paths
-/// (whose basenames are attacker-controlled), finding titles, `explain-config`
-/// risk detail — is derived from the very AI-config files tirith analyzes. A
-/// malicious config containing ANSI/CSI/OSC escape or other control sequences
-/// could otherwise spoof or rewrite terminal output the moment we `println!` it.
-/// Run every such field through tirith's own output sanitizer — the same
-/// `output_filter` the MCP gateway and `tirith paste` apply — which strips
-/// ANSI/OSC/APC/DCS escape sequences, bare CR, other C0 controls (except `\t`),
-/// DEL, and zero-width characters (tirith must never itself emit the terminal
-/// injection it exists to detect). Tabs/newlines that the sanitizer legitimately
-/// keeps are then flattened to spaces so a single display field stays on one
-/// line (callers already control line structure).
+/// Neutralize one untrusted, AI-config-derived string before printing it in HUMAN
+/// mode (CodeRabbit M13 PR #132 R20). Runs it through tirith's own
+/// `output_filter` (strips ANSI/OSC/APC/DCS, bare CR, C0 controls except `\t`,
+/// DEL, zero-width), then flattens kept tabs/newlines to spaces so one display
+/// field stays on a single line.
 fn sanitize_display(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
     tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
@@ -506,24 +424,19 @@ fn sanitize_display(s: &str) -> String {
         .collect()
 }
 
-/// The per-file read cap (10 MiB), matching the scan engine's per-file cap so a
-/// pathological file cannot exhaust memory. Shared by every read path in this
-/// module ([`read_text`], [`read_capped`]) so the bound is enforced uniformly.
+/// Per-file read cap (10 MiB), matching the scan engine's, enforced uniformly by
+/// every read path here.
 const READ_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
-/// Read a file's RAW bytes with the module's [`READ_MAX_BYTES`] cap.
+/// Read a file's RAW bytes with the [`READ_MAX_BYTES`] cap.
 ///
-/// The cap is enforced by reading through a `take`-bounded handle rather than
-/// stat-then-read: a `metadata().len()` check is a TOCTOU race — the file can
-/// grow between the stat and the read, so a stat-gated `std::fs::read` could
-/// still slurp an arbitrarily large file. Reading at most `MAX_BYTES + 1` bytes
-/// and rejecting when the buffer exceeds `MAX_BYTES` bounds memory regardless of
-/// concurrent growth.
+/// Uses a `take`-bounded read, not stat-then-read: a `metadata().len()` check is
+/// a TOCTOU race (the file can grow between stat and read). Reading at most
+/// `MAX_BYTES + 1` and rejecting over `MAX_BYTES` bounds memory regardless.
 fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
-    // Read one byte past the cap so an exactly-`MAX_BYTES` file is accepted while
-    // anything larger is detectable.
+    // One byte past the cap so an exactly-`MAX_BYTES` file is accepted.
     file.take(READ_MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > READ_MAX_BYTES {
@@ -535,28 +448,21 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read a file as UTF-8 (lossy), with the module's [`READ_MAX_BYTES`] cap.
-/// Thin wrapper over [`read_capped`].
+/// Read a file as UTF-8 (lossy) with the [`READ_MAX_BYTES`] cap.
 fn read_text(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&read_capped(path)?).into_owned())
 }
 
-// ===========================================================================
 // `tirith ai quarantine`
-// ===========================================================================
 
-/// `tirith ai quarantine <file>` — isolate a (suspected-poisoned) AI-config
-/// file. **v1 DEFAULT IS COPY**: the file is COPIED to
-/// `~/.cache/tirith/quarantine/<ts>-<sha256>-<basename>` and the ORIGINAL IS
-/// LEFT UNTOUCHED; the restore command is printed. `--move` opts into the
-/// destructive variant (copy, then remove the original) — which prompts for
-/// confirmation unless `--yes`, and refuses non-interactively without `--yes`.
+/// `tirith ai quarantine <file>` — isolate a (suspected-poisoned) AI-config file.
+/// **v1 DEFAULT IS COPY** to `~/.cache/tirith/quarantine/<ts>-<sha256>-<basename>`,
+/// leaving the original UNTOUCHED. `--move` is the destructive variant (copy then
+/// remove) — prompts unless `--yes`, refuses non-interactively without `--yes`.
 pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     let src = PathBuf::from(file);
-    // Capped read (R15-ai.rs:483): reuse the module's `READ_MAX_BYTES`-bounded
-    // reader rather than `std::fs::read`, so a huge AI-config file cannot force a
-    // full-file allocation before any validation. The sha below is computed from
-    // these capped bytes.
+    // Capped read (R15-ai.rs:483) so a huge file can't force a full-file
+    // allocation before validation; the sha below is over these capped bytes.
     let content = match read_capped(&src) {
         Ok(c) => c,
         Err(e) => {
@@ -571,11 +477,10 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         }
     };
 
-    // PROVISIONAL hash, computed from the bytes we just read. For the atomic
-    // `rename` move below this may go stale if the file changes between this read
-    // and the rename (the rename moves whatever is on disk at that instant), so
-    // after a successful move we RECOMPUTE from `dest` and correct the name +
-    // emitted sha (R15-ai.rs:516). `sha` is therefore `mut`.
+    // PROVISIONAL hash over the bytes just read. For the atomic `rename` move it
+    // may go stale (the rename moves whatever is on disk then), so after a
+    // successful move we RECOMPUTE from `dest` and correct the name + sha
+    // (R15-ai.rs:516) — hence `mut`.
     let mut sha = tirith_core::clipboard::content_sha256_hex(&content);
     let short_sha = sha[..sha.len().min(16)].to_string();
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -583,8 +488,7 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file")
-        // Defensive: a basename can never carry a path separator after
-        // `file_name()`, but sanitize anyway so the quarantine name is flat.
+        // Defensive: keep the quarantine name flat (no path separator).
         .replace(['/', '\\'], "_");
 
     let Some(qdir) = quarantine_dir() else {
@@ -597,8 +501,7 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         }
         return 1;
     };
-    // Create the quarantine dir with restrictive perms (0700 on Unix) — it holds
-    // copies of potentially-sensitive config.
+    // 0700 dir — it holds copies of potentially-sensitive config.
     if let Err(e) = create_quarantine_dir(&qdir) {
         if !emit_error(
             json,
@@ -610,20 +513,16 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         return 1;
     }
 
-    // Pick a non-clobbering destination: `<ts>-<short_sha>-<basename>` is not
-    // collision-free (same basename + same one-second ts + same short sha), and
-    // the atomic write below uses no-clobber semantics, so resolve a fresh slot
-    // up front rather than risk overwriting a DIFFERENT prior quarantine copy
-    // (CodeRabbit M13 PR #132 R22 — evidence loss). The COPY path uses this
-    // directly (its `write_file_atomic(.., overwrite=false)` publish is itself an
-    // atomic no-clobber, so the `.exists()` probe staying advisory is fine). The
-    // `--move` path instead ATOMICALLY RESERVES its slot via `reserve_dest` (R25)
-    // because `std::fs::rename` overwrites and would otherwise race the probe.
+    // Pick a non-clobbering destination — `<ts>-<short_sha>-<basename>` is not
+    // collision-free (CodeRabbit M13 PR #132 R22, evidence loss). The COPY path
+    // uses this advisory probe directly (its no-clobber `write_file_atomic` is
+    // the real guard); the `--move` path ATOMICALLY RESERVES via `reserve_dest`
+    // (R25) because `std::fs::rename` overwrites and would race the probe.
     let dest_base = format!("{ts}-{short_sha}-{basename}");
     let mut dest = unique_dest(&qdir, &dest_base);
 
-    // --move requires confirmation (it deletes the original). Decide this BEFORE
-    // copying so a refused move does not leave a stray quarantine copy.
+    // --move deletes the original; decide confirmation BEFORE copying so a
+    // refused move leaves no stray quarantine copy.
     if do_move
         && !confirm(
             &format!(
@@ -633,18 +532,11 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
             yes,
         )
     {
-        // `confirm` returns false in TWO distinct situations and we must NOT
-        // conflate them (CodeRabbit M13 PR #132 R3-7 / R20):
-        //   1. We COULD prompt (an interactive answer was possible) and the
-        //      operator answered "no" → an intentional abort; the original is kept
-        //      and exit 0 is success.
-        //   2. We COULD NOT prompt and `--yes` was not given → nothing was
-        //      confirmed; returning 0 here would make a no-op look successful to a
-        //      non-interactive caller. Fail non-zero (exit 2), matching the JSON
-        //      branch.
-        // `--yes` short-circuits `confirm` to true, so reaching this block always
-        // means `--yes` was absent; the only question is whether an interactive
-        // confirmation was actually possible.
+        // `confirm` returns false in TWO distinct situations we must not conflate
+        // (CodeRabbit M13 PR #132 R3-7 / R20): (1) an interactive "no" → intentional
+        // abort, keep the original, exit 0; (2) no prompt was possible and no
+        // `--yes` → nothing confirmed, fail non-zero (exit 2). `--yes` would have
+        // short-circuited to true, so reaching here means it was absent.
         let could_prompt = confirmation_possible();
         if json || !could_prompt {
             let _ = emit_error(
@@ -662,16 +554,11 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     let mut moved = false;
     if do_move {
         // ATOMICALLY RESERVE the destination before renaming (CodeRabbit M13 PR
-        // #132 R25). `unique_dest` above is only an advisory `.exists()` probe;
-        // `std::fs::rename` OVERWRITES its target on both Unix and Windows, so a
-        // concurrent quarantine run creating the same `<ts>-<short_sha>-<basename>`
-        // slot in the probe→rename window could be clobbered by — or could clobber
-        // — this move (evidence loss). `reserve_dest` claims the slot with
-        // `create_new` (atomic no-clobber) and re-picks on a race, so after it
-        // returns we EXCLUSIVELY own an (empty) placeholder at `dest`; the rename
-        // below merely replaces a file we already hold. Reserve only on the move
-        // path that has passed the confirm gate, so a refused `--move` leaves no
-        // stray placeholder. On exhaustion this fails non-zero (no panic).
+        // #132 R25): `std::fs::rename` OVERWRITES its target, so a concurrent run
+        // grabbing the same slot in the probe→rename window could clobber / be
+        // clobbered (evidence loss). `reserve_dest` claims it with `create_new`
+        // and re-picks on a race, so we exclusively own an empty placeholder at
+        // `dest`. Reserve only after the confirm gate; fails non-zero on exhaustion.
         match reserve_dest(&qdir, &dest_base) {
             Ok(reserved) => dest = reserved,
             Err(e) => {
@@ -688,30 +575,21 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 return 1;
             }
         }
-        // DESTRUCTIVE variant. Prefer an ATOMIC `rename` so there is NO
+        // DESTRUCTIVE variant. Prefer an ATOMIC `rename` so there is no
         // read→write→delete window (CodeRabbit M13 PR #132 R10-4): a concurrent
-        // edit between our earlier `read` and a later `remove_file` would
-        // otherwise discard the newer bytes (quarantine keeps the stale copy we
-        // read; the original is gone). `rename` moves the inode atomically, so
-        // whatever bytes the file holds at the instant of the move land in
-        // quarantine and the source vanishes in the same operation. It replaces
-        // the placeholder `reserve_dest` reserved (which we own), so no concurrent
-        // run can have taken `dest` out from under us.
+        // edit between our read and a later `remove_file` would otherwise discard
+        // the newer bytes. `rename` moves the inode atomically and replaces the
+        // placeholder we reserved.
         match std::fs::rename(&src, &dest) {
             Ok(()) => {
                 moved = true;
             }
             Err(e) if is_cross_device(&e) => {
-                // `rename` cannot cross filesystems (e.g. quarantine on a
-                // different mount than the source). Fall back to copy-then-delete,
-                // but CLOSE the TOCTOU: write the bytes we already read, then
-                // re-read + re-hash the source IMMEDIATELY before deleting it, and
-                // ABORT the delete if it changed since our initial read. We
-                // overwrite (`overwrite=true`) the placeholder `reserve_dest`
-                // exclusively reserved for us — NOT a stranger's copy — so this
-                // cannot clobber a colliding prior quarantine entry (a concurrent
-                // run's `create_new` for the same slot would have failed and it
-                // would have re-picked).
+                // `rename` can't cross filesystems. Fall back to copy-then-delete,
+                // but CLOSE the TOCTOU: re-read + re-hash the source immediately
+                // before deleting and ABORT if it changed since our initial read.
+                // We overwrite the placeholder reserved exclusively for us, so this
+                // cannot clobber a stranger's colliding entry.
                 if let Err(e) = write_file_atomic(&dest, &content, true) {
                     if !emit_error(
                         json,
@@ -722,11 +600,9 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                     }
                     return 1;
                 }
-                // Re-read the source as late as possible (just before the delete)
-                // and compare its hash to the bytes we quarantined. A mismatch
-                // means the file was edited after our first read; deleting now
-                // would lose the newer content, so we keep the original and fail.
-                // Capped read for the same memory-bound reason as the initial read.
+                // Re-read the source just before the delete and compare hashes; a
+                // mismatch means it was edited after our first read, so keep the
+                // original and fail rather than lose the newer content.
                 match read_capped(&src) {
                     Ok(current) => {
                         let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
@@ -748,9 +624,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                         }
                     }
                     Err(e) => {
-                        // Could not re-read to confirm the bytes are unchanged —
-                        // do NOT delete blindly. The copy exists; the original
-                        // stays. Exit non-zero, not a silent success.
+                        // Could not re-read to confirm unchanged — do NOT delete
+                        // blindly. The copy exists, the original stays, exit non-zero.
                         if !emit_error(
                             json,
                             "tirith ai quarantine",
@@ -767,9 +642,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                     }
                 }
                 if let Err(e) = std::fs::remove_file(&src) {
-                    // The copy succeeded but the original could not be removed —
-                    // report honestly: the file IS quarantined (a copy exists) but
-                    // the original remains. Exit 1, not a silent success.
+                    // Copy succeeded but the original couldn't be removed — report
+                    // honestly (a copy exists, the original remains), exit 1.
                     if !emit_error(
                         json,
                         "tirith ai quarantine",
@@ -786,8 +660,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 moved = true;
             }
             Err(e) => {
-                // A non-cross-device rename failure (permissions, source vanished,
-                // …). Report it; the original is untouched and no copy was made.
+                // Non-cross-device rename failure (permissions, vanished source).
+                // The original is untouched and no copy was made.
                 if !emit_error(
                     json,
                     "tirith ai quarantine",
@@ -803,11 +677,9 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
             }
         }
     } else {
-        // COPY default (round-1, non-`--move`): write the bytes into quarantine
-        // atomically and leave the original UNTOUCHED. No delete window exists
-        // here, so this path is unaffected by the TOCTOU fix above. No-clobber
-        // (`overwrite=false`) so a colliding prior quarantine copy is never
-        // silently overwritten (R22 — `dest` was chosen by `unique_dest`).
+        // COPY default: write atomically and leave the original UNTOUCHED.
+        // No-clobber (`overwrite=false`) so a colliding prior copy is never
+        // overwritten (R22 — `dest` chosen by `unique_dest`).
         if let Err(e) = write_file_atomic(&dest, &content, false) {
             if !emit_error(
                 json,
@@ -820,16 +692,12 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         }
     }
 
-    // R15-ai.rs:516 — after a successful MOVE, the file living at `dest` is
-    // whatever `std::fs::rename` moved at the instant of the move, which (on the
-    // atomic-rename branch) may differ from the bytes we read up front. The
-    // provisional `sha`/`short_sha`/`dest` then encode the OLD hash while the
-    // quarantined file holds newer bytes. Re-read `dest` (capped), recompute the
-    // hash, and — if it differs from the provisional short hash — atomically
-    // rename WITHIN the quarantine dir to the corrected `<ts>-<new_short>-<base>`
-    // name so the filename and the emitted `sha256` describe the bytes actually
-    // at `dest`. The cross-device fallback already proved `dest == sha` (it
-    // refused to delete otherwise), so for that branch this is a no-op confirm.
+    // R15-ai.rs:516 — after a MOVE, the bytes at `dest` (on the atomic-rename
+    // branch) may differ from the bytes we read up front, leaving the provisional
+    // sha/name stale. Re-read `dest`, recompute, and if it differs rename WITHIN
+    // the quarantine dir to the corrected `<ts>-<new_short>-<base>` so filename
+    // and emitted `sha256` match the on-disk bytes. The cross-device fallback
+    // already proved `dest == sha`, so for that branch this is a no-op confirm.
     if moved {
         match read_capped(&dest) {
             Ok(moved_bytes) => {
@@ -837,16 +705,10 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 if actual_sha != sha {
                     let new_short = actual_sha[..actual_sha.len().min(16)].to_string();
                     // ATOMICALLY RESERVE the recomputed-hash slot (CodeRabbit M13
-                    // PR #132 R25). Like the move above, this `std::fs::rename`
-                    // overwrites its target, so reserving with `create_new` (rather
-                    // than only an advisory `unique_dest` probe) closes the
-                    // probe→rename TOCTOU: another quarantine run can neither clobber
-                    // nor be clobbered by this in-store rename. `reserve_dest` always
-                    // returns a slot distinct from `dest` (which still holds our
-                    // moved bytes), so the rename never targets the file it moves
-                    // from. On reservation failure we fail non-zero — the original
-                    // is already gone, but the bytes remain at `dest` under its
-                    // provisional name (still hash-honest about the disk contents).
+                    // PR #132 R25): this `rename` overwrites, so `create_new`
+                    // closes the probe→rename TOCTOU. The slot is always distinct
+                    // from `dest`. On failure we fail non-zero — the bytes remain
+                    // at `dest` under the provisional (still hash-honest) name.
                     let corrected =
                         match reserve_dest(&qdir, &format!("{ts}-{new_short}-{basename}")) {
                             Ok(c) => c,
@@ -867,9 +729,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                                 return 1;
                             }
                         };
-                    // Atomic in-quarantine rename to the recomputed-hash name,
-                    // replacing the placeholder we just reserved. Both paths share
-                    // `qdir`, so this never crosses devices.
+                    // Atomic in-quarantine rename to the recomputed-hash name
+                    // (same `qdir`, never crosses devices).
                     if corrected != dest {
                         if let Err(e) = std::fs::rename(&dest, &corrected) {
                             if !emit_error(
@@ -893,10 +754,8 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 }
             }
             Err(e) => {
-                // The move succeeded but we cannot re-read the quarantined file to
-                // confirm/correct its hash. Emitting the provisional (possibly
-                // stale) sha would be dishonest, so fail rather than advertise an
-                // unverified hash. The original is already gone (moved into `dest`).
+                // Move succeeded but we can't re-read to confirm the hash; fail
+                // rather than advertise an unverified (possibly stale) sha.
                 if !emit_error(
                     json,
                     "tirith ai quarantine",
@@ -914,7 +773,6 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         }
     }
 
-    // Copy the quarantine copy (dest) back to the original location (src).
     let restore_cmd = restore_command(&dest, &src);
 
     if json {
@@ -941,15 +799,11 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
         return 0;
     }
 
-    // `src` is a user-supplied arg and `dest` embeds the (attacker-controllable)
-    // source basename, so sanitize both before printing (R20). `restore_cmd`
-    // embeds the same paths and is shell-QUOTED by `restore_command`, but
-    // shell-quoting does NOT strip ANSI/control bytes — a crafted filename could
-    // still inject terminal escapes through the printed hint (CodeRabbit M13 PR
-    // #132 R22 — round-20 follow-up). So sanitize the PRINTED form too. The JSON
-    // `restore_command` field and the value returned by `restore_command()` for
-    // actual execution are left UNCHANGED: only the human-readable hint is
-    // neutralized (sanitizing the executable form would corrupt the real path).
+    // `src`/`dest` carry attacker-controllable basenames; sanitize before printing
+    // (R20). Shell-quoting in `restore_command` does NOT strip ANSI/control bytes,
+    // so the PRINTED hint is sanitized too (CodeRabbit M13 PR #132 R22). The JSON
+    // field and the executable form are left UNCHANGED (sanitizing them would
+    // corrupt the real path).
     let src_disp = sanitize_display(&src.display().to_string());
     let dest_disp = sanitize_display(&dest.display().to_string());
     let sanitized_restore_cmd = sanitize_display(&restore_cmd);
@@ -968,33 +822,23 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
 }
 
 /// Whether an interactive confirmation could ACTUALLY have been obtained
-/// (CodeRabbit M13 PR #132 R20 — wrong stream for the interactivity check).
-///
-/// [`super::confirm`] writes its prompt to **stderr** but reads the answer from
-/// **stdin** (`std::io::stdin().read_line`). The decision of whether `confirm`'s
-/// `false` means "operator declined" vs "no prompt was possible" must therefore
-/// key off the stream the ANSWER comes from — stdin. We require BOTH: stdin a
-/// TTY (an answer can be read) AND stderr a TTY (the prompt is visible). Keying
-/// off stderr alone (the old bug) treated a stdin-piped/EOF run with a TTY
-/// stderr as a deliberate "no" (exit 0), when in fact no confirmation was ever
-/// possible — that case must fail non-zero instead.
+/// (CodeRabbit M13 PR #132 R20). [`super::confirm`] reads the answer from stdin,
+/// so we require BOTH stdin (answer readable) AND stderr (prompt visible) to be
+/// TTYs. Keying off stderr alone (the old bug) mistook a stdin-piped/EOF run for
+/// a deliberate "no" (exit 0); that case must fail non-zero instead.
 fn confirmation_possible() -> bool {
     is_terminal::is_terminal(std::io::stdin()) && is_terminal::is_terminal(std::io::stderr())
 }
 
-/// Whether a `std::fs::rename` error means the source and destination are on
-/// DIFFERENT filesystems (so an atomic rename is impossible and the caller must
-/// fall back to copy-then-delete). We match the raw OS error code rather than
-/// `ErrorKind::CrossesDevices` because that `ErrorKind` was only stabilized in
-/// Rust 1.85 and this crate's MSRV is 1.83. `EXDEV` (18 on Linux/macOS) is the
-/// POSIX cross-device code; `ERROR_NOT_SAME_DEVICE` (17) is the Windows
-/// equivalent.
+/// Whether a `std::fs::rename` error means source and destination are on
+/// DIFFERENT filesystems (atomic rename impossible → copy-then-delete fallback).
+/// Matches the raw OS code, not `ErrorKind::CrossesDevices` (stabilized in 1.85;
+/// MSRV is 1.83): `EXDEV` on POSIX, `ERROR_NOT_SAME_DEVICE` (17) on Windows.
 fn is_cross_device(err: &std::io::Error) -> bool {
     match err.raw_os_error() {
         #[cfg(unix)]
         Some(code) => code == libc::EXDEV,
         #[cfg(windows)]
-        // ERROR_NOT_SAME_DEVICE = 17.
         Some(code) => code == 17,
         #[cfg(not(any(unix, windows)))]
         Some(_) => false,
@@ -1007,24 +851,12 @@ fn quarantine_dir() -> Option<PathBuf> {
     cache_dir().map(|c| c.join("tirith").join("quarantine"))
 }
 
-/// Pick a NON-CLOBBERING destination path inside `qdir` for a quarantine entry
-/// named `base_name` (`<ts>-<short_sha>-<basename>`) (CodeRabbit M13 PR #132 R22
-/// — evidence loss). The `<ts>-<short_sha>-<basename>` triple is NOT collision-
-/// free: two files sharing a basename quarantined within the same one-second
-/// timestamp granularity (and the same 16-hex short sha — e.g. identical bytes
-/// re-quarantined, or a short-sha prefix clash) would otherwise map to the SAME
-/// path, and the atomic write would silently overwrite the FIRST quarantined
-/// file (losing its evidence). Walk a numeric `-1`, `-2`, … suffix appended to
-/// the END of the readable name until a path that does not yet exist on disk is
-/// found, and return that. A trailing counter keeps the name operator-legible
-/// (the timestamp/hash/basename still read left-to-right) while guaranteeing a
-/// fresh slot. The selection is advisory only — the actual write still uses
-/// `write_file_atomic(.., overwrite=false)` (no-clobber `persist_noclobber`), so
-/// a file racing into the chosen path between this check and the write fails
-/// loudly with `AlreadyExists` rather than clobbering a different prior copy.
-/// A finite `u32` bound keeps a pathological store from looping forever; on
-/// exhaustion the un-suffixed base is returned and the no-clobber write surfaces
-/// the collision as an error.
+/// Pick a NON-CLOBBERING destination inside `qdir` for `base_name`
+/// (`<ts>-<short_sha>-<basename>`) (CodeRabbit M13 PR #132 R22, evidence loss).
+/// The triple is not collision-free, so walk a trailing `-1`, `-2`, … suffix
+/// (kept operator-legible) until a free path is found. Advisory only — the write
+/// still uses no-clobber `write_file_atomic`, which fails loudly on a race. A
+/// finite `u32` bound prevents looping; on exhaustion the bare base is returned.
 fn unique_dest(qdir: &Path, base_name: &str) -> PathBuf {
     let first = qdir.join(base_name);
     if !first.exists() {
@@ -1039,32 +871,19 @@ fn unique_dest(qdir: &Path, base_name: &str) -> PathBuf {
     first
 }
 
-/// Maximum number of times [`reserve_dest`] re-picks a quarantine slot when a
-/// concurrent run grabs the candidate between the probe and the atomic reserve.
-/// Bounded so a pathological store (or an adversary spamming quarantine names)
-/// cannot loop forever; on exhaustion we surface a clean error rather than spin.
+/// Bound on [`reserve_dest`] re-picks when a concurrent run keeps grabbing the
+/// candidate; on exhaustion we surface a clean error rather than spin.
 const RESERVE_MAX_RETRIES: u32 = 64;
 
-/// ATOMICALLY reserve a fresh quarantine slot inside `qdir` for a `base_name`
-/// (`<ts>-<short_sha>-<basename>`), returning the reserved path. The `--move`
-/// path then `rename`s the source onto the placeholder we own here — closing the
-/// TOCTOU between [`unique_dest`]'s advisory `.exists()` probe and the rename
-/// (CodeRabbit M13 PR #132 R25). `std::fs::rename` OVERWRITES its destination on
-/// both Unix and Windows, so a name picked only by `.exists()` could be clobbered
-/// (or could clobber) a DIFFERENT quarantine copy that a concurrent run created
-/// in the probe→rename window — evidence loss either way.
-///
-/// We close the gap by atomically claiming the candidate with
-/// `OpenOptions::create_new(true)`, which fails with [`AlreadyExists`] if the path
-/// exists at the instant of the `open` (the cross-platform atomic no-clobber
-/// primitive — `O_EXCL` on Unix, `CREATE_NEW` on Windows). On a race we re-pick
-/// via [`unique_dest`] and retry, bounded by [`RESERVE_MAX_RETRIES`]; on
-/// exhaustion we return the last `AlreadyExists` error so the caller fails
-/// non-zero (never a panic). The returned placeholder is a zero-byte file the
-/// caller now exclusively owns: the subsequent `rename` replaces it (the source
-/// inode lands at the reserved name), and the EXDEV copy-then-delete fallback
-/// overwrites it (safe — the reservation already proved exclusivity, so
-/// `overwrite=true` there cannot clobber a stranger's copy).
+/// ATOMICALLY reserve a fresh quarantine slot inside `qdir` for `base_name`,
+/// returning the reserved path. Closes the TOCTOU between [`unique_dest`]'s
+/// advisory probe and the `--move` `rename` (CodeRabbit M13 PR #132 R25):
+/// `std::fs::rename` OVERWRITES, so a probe-only name could clobber / be clobbered
+/// by a concurrent run. We claim the candidate with `create_new(true)` (`O_EXCL` /
+/// `CREATE_NEW`), re-picking on [`AlreadyExists`] up to [`RESERVE_MAX_RETRIES`]
+/// (else returning the error, never panicking). The returned zero-byte placeholder
+/// is exclusively owned: the rename replaces it, and the EXDEV fallback safely
+/// overwrites it.
 ///
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 fn reserve_dest(qdir: &Path, base_name: &str) -> std::io::Result<PathBuf> {
@@ -1076,22 +895,18 @@ fn reserve_dest(qdir: &Path, base_name: &str) -> std::io::Result<PathBuf> {
             .create_new(true)
             .open(&candidate)
         {
-            // Claimed the slot atomically; we now own this (empty) placeholder.
+            // Claimed atomically; we own this empty placeholder.
             Ok(_file) => return Ok(candidate),
-            // A concurrent run grabbed this exact slot between the `unique_dest`
-            // probe and our `open`. Re-pick (it will now skip the freshly-taken
-            // name) and retry.
+            // A concurrent run grabbed this slot; re-pick and retry.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 last_err = Some(e);
                 continue;
             }
-            // A different failure (permissions, the dir vanished, …) is not a
-            // race we can win by retrying — surface it immediately.
+            // Other failures (permissions, vanished dir) aren't retry-able.
             Err(e) => return Err(e),
         }
     }
-    // Exhausted retries: every candidate kept being taken out from under us.
-    // Return a clean error (not a panic) so the caller exits non-zero.
+    // Exhausted retries: return a clean error (no panic).
     Err(last_err.unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -1101,14 +916,8 @@ fn reserve_dest(qdir: &Path, base_name: &str) -> std::io::Result<PathBuf> {
 }
 
 /// The user's cache base dir (`$XDG_CACHE_HOME` or `~/.cache`). `XDG_CACHE_HOME`
-/// is honored ONLY when it is non-empty AND ABSOLUTE; an empty or relative value
-/// (e.g. `""`, `.`, `cache`) is ignored and we fall back to `~/.cache` (CodeRabbit
-/// M13 PR #132 R22 — path escape). The XDG Base Directory spec itself requires
-/// these paths be absolute, and a relative value would otherwise root the
-/// quarantine store under the CURRENT WORKING DIRECTORY rather than a stable
-/// location — so a `tirith ai quarantine` run from a different cwd would scatter
-/// (or fail to find) quarantined evidence. This mirrors the absolute-path
-/// discipline `home_base` (onboard.rs) and `state_dir` (policy.rs) already apply.
+/// is honored ONLY when non-empty AND ABSOLUTE; a relative value would otherwise
+/// root the quarantine store under cwd (CodeRabbit M13 PR #132 R22, path escape).
 fn cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         let p = PathBuf::from(&xdg);
@@ -1116,15 +925,10 @@ fn cache_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // `home::home_dir()` can ALSO yield a non-absolute path: on Unix it reads
-    // `$HOME` directly, so a RELATIVE `HOME` (e.g. `HOME=.`) comes back verbatim,
-    // and an empty `$HOME` can surface as `Some("")` on some runners. Either case
-    // would root `~/.cache/tirith/quarantine` under the CURRENT WORKING DIRECTORY
-    // (the exact escape the XDG branch above guards). Filter the fallback to
-    // ABSOLUTE paths only — mirroring `home_base` (onboard.rs) — so a non-absolute
-    // home base yields `None`; the caller (`quarantine_dir` → `run_quarantine`)
-    // already treats `None` as "cannot determine the cache directory" and exits
-    // non-zero rather than writing under cwd (CodeRabbit M13 PR #132 R26).
+    // `home::home_dir()` can also be non-absolute (Unix reads `$HOME` verbatim;
+    // empty `$HOME` → `Some("")`), which would likewise escape under cwd. Filter
+    // the fallback to absolute paths; `None` is handled as "no cache dir" by the
+    // caller (CodeRabbit M13 PR #132 R26).
     home::home_dir()
         .filter(|h| h.is_absolute())
         .map(|h| h.join(".cache"))
@@ -1141,10 +945,8 @@ fn create_quarantine_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Single-quote a path for the printed restore command so a path with spaces /
-/// shell metacharacters round-trips. Embedded single quotes become `'\''`.
-/// (Used by the POSIX [`restore_command`]; gated to non-Windows so the Windows
-/// build doesn't warn it unused.)
+/// Single-quote a path for the printed POSIX restore command (embedded single
+/// quotes become `'\''`). Non-Windows only so the Windows build doesn't warn.
 #[cfg(not(windows))]
 fn shell_quote(p: &Path) -> String {
     let s = p.to_string_lossy();
@@ -1156,27 +958,20 @@ fn shell_quote(p: &Path) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Single-quote a path for a PowerShell literal string. PowerShell escapes an
-/// embedded single quote by DOUBLING it (`'` → `''`); backslashes are literal
-/// inside single quotes, so a Windows path round-trips as-is. Always quoted (no
-/// bare-word shortcut) — `-LiteralPath` takes the value verbatim.
+/// Single-quote a path for a PowerShell literal string (embedded `'` doubled to
+/// `''`; backslashes are literal inside single quotes). Always quoted.
 #[cfg(windows)]
 fn powershell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "''"))
 }
 
 /// The shell command that restores a quarantined file by copying it back from
-/// `from` (the quarantine copy) to `to` (the original location). OS-aware: a
-/// POSIX `cp` on Unix, a PowerShell `Copy-Item -LiteralPath` on Windows (where
-/// `cp` is not a native command and POSIX `'\''`-escaping is wrong). (CodeRabbit
-/// M13 round-2 R7.)
+/// `from` to `to`. OS-aware: POSIX `cp` on Unix, PowerShell `Copy-Item
+/// -LiteralPath` on Windows (CodeRabbit M13 round-2 R7).
 #[cfg(not(windows))]
 fn restore_command(from: &Path, to: &Path) -> String {
-    // Insert the literal `--` before the path operands (R15-ai.rs:780). Without
-    // it, `shell_quote` leaves a safe-looking dash-prefixed path bare (e.g.
-    // `-backup/.cursorrules`), so `cp` would parse it as an OPTION instead of a
-    // source/destination. `--` ends option parsing so any path is treated as an
-    // operand.
+    // Literal `--` before the operands (R15-ai.rs:780) so a dash-prefixed path
+    // (left bare by `shell_quote`) isn't parsed as a `cp` option.
     format!("cp -- {} {}", shell_quote(from), shell_quote(to))
 }
 
@@ -1189,9 +984,7 @@ fn restore_command(from: &Path, to: &Path) -> String {
     )
 }
 
-// ===========================================================================
 // `tirith ai explain-config`
-// ===========================================================================
 
 /// `tirith ai explain-config <file>` — identify which AI tool a config file
 /// configures and print the capabilities / risks its content grants.
@@ -1248,9 +1041,8 @@ pub fn explain_config(file: &str, json: bool) -> i32 {
         return 0;
     }
 
-    // `path` is a user-supplied arg and `r.detail` embeds raw snippets lifted
-    // from the (untrusted) config content, so both are sanitized before display
-    // (R20). `t.label()` and `r.id` are fixed internal strings, left as-is.
+    // `path` and `r.detail` (raw untrusted config snippets) are sanitized before
+    // display (R20); `t.label()` / `r.id` are fixed internal strings.
     let display_path = sanitize_display(&path.display().to_string());
     match tool {
         Some(t) => println!("{display_path} configures {}.", t.label()),
@@ -1272,13 +1064,10 @@ pub fn explain_config(file: &str, json: bool) -> i32 {
     0
 }
 
-// ===========================================================================
 // `tirith ai snapshot [--update]`
-// ===========================================================================
 
-/// `tirith ai snapshot` — show the current snapshot state (path, age, file
-/// count). `--update` re-scans the AI-config files and records a fresh snapshot,
-/// refusing to bless a state with High+ scan issues unless `force`.
+/// `tirith ai snapshot` — show the current snapshot state. `--update` re-scans
+/// and records a fresh snapshot, refusing High+ scan issues unless `force`.
 pub fn snapshot(update: bool, force: bool, json: bool) -> i32 {
     if !update {
         return snapshot_status(json);
@@ -1326,8 +1115,8 @@ fn snapshot_status(json: bool) -> i32 {
 
     match snap {
         Some(s) => {
-            // `root` is read back from the on-disk snapshot (a repo path); sanitize
-            // it before display for the same reason as the other AI-derived fields.
+            // `root` is read back from the on-disk snapshot; sanitize like the
+            // other AI-derived fields.
             println!("AI-config snapshot:");
             println!("  path:       {path_str}");
             println!("  recorded:   {}", s.updated_at);
@@ -1348,10 +1137,8 @@ fn snapshot_status(json: bool) -> i32 {
 }
 
 /// Exit-code policy for an un-scannable file during `snapshot --update`
-/// (CodeRabbit M13 PR #132 R7-3). A `None` scan means the file could not be
-/// analyzed, so it must never be recorded; the whole update aborts non-zero.
-/// Mirrors the surrounding `emit_error` convention: emit the operator error,
-/// then return 2 when the `--json` write itself failed (broken pipe), else 1.
+/// (CodeRabbit M13 PR #132 R7-3): a `None` scan is never recorded and aborts the
+/// update non-zero (2 on a failed `--json` write, else 1).
 fn snapshot_scan_failed_code(json: bool, file: &Path) -> i32 {
     if !emit_error(
         json,
@@ -1371,31 +1158,20 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
     let root = repo_root();
     let files = tirith_core::scan::collect_ai_config_files(&root);
 
-    // Refuse to bless a compromised state: scan each AI-config file and abort if
-    // any High+ finding is present (unless --force). This reuses the shipping
-    // single-file scan engine (`scan_single_file`), the same detection
-    // `tirith scan` uses — no new detection here.
+    // Refuse to bless a compromised state: scan each file and abort on any High+
+    // finding (unless --force), reusing `scan_single_file` — no new detection.
     let mut blocking: Vec<(String, Severity, String)> = Vec::new();
     let mut entries: BTreeMap<String, SnapshotEntry> = BTreeMap::new();
     for f in &files {
-        // R3-8 (CodeRabbit M13 PR #132): make the read-scan-record sequence
-        // single-read-safe. `scan_single_file` does its OWN fresh disk read, so a
-        // concurrent edit between our `read_text` and the scan could validate one
-        // version of the file while we record a DIFFERENT version as the trusted
-        // baseline. `scan_single_file` doesn't accept already-read bytes, so we
-        // bracket the scan with a hash on each side and ABORT on any change:
-        //   1. read once  → `content` (the bytes we intend to record) + `pre_hash`
-        //   2. scan (its own read happens between the two hashes)
-        //   3. re-read    → `post_hash`
-        //   4. pre_hash != post_hash ⇒ the file changed during the validation
-        //      window; the scanned bytes and the about-to-be-recorded bytes may
-        //      diverge, so refuse to record an unvalidated baseline.
-        // A file stable across the whole window guarantees the scan saw the same
-        // bytes we record; any change aborts rather than risking a TOCTOU bless.
+        // R3-8 (CodeRabbit M13 PR #132): make read-scan-record single-read-safe.
+        // `scan_single_file` does its own fresh read, so a concurrent edit could
+        // validate one version while we record another. Since it can't take
+        // already-read bytes, we bracket the scan with a hash on each side
+        // (pre/post) and ABORT on any change rather than bless an unvalidated
+        // baseline.
         let content = match read_text(f) {
             Ok(c) => c,
             Err(e) => {
-                // A file we cannot read cannot be blessed; surface and abort.
                 if !emit_error(
                     json,
                     "tirith ai snapshot",
@@ -1409,12 +1185,8 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         let pre_hash = tirith_core::clipboard::content_sha256_hex(content.as_bytes());
 
         // A `None` scan is a HARD failure, not a silent skip (CodeRabbit M13 PR
-        // #132 R7-3). `scan_single_file` returns `None` when the file could not be
-        // analyzed (metadata/read error, or it exceeds the scan size cap). We must
-        // NOT record an un-scanned file into the trusted baseline — blessing a file
-        // whose risk was never assessed would defeat the whole point of the
-        // snapshot. Abort the entire update so the operator fixes the unreadable
-        // file and re-runs, rather than recording a partial, half-validated set.
+        // #132 R7-3): recording an un-scanned file would bless un-assessed risk.
+        // Abort the whole update rather than record a half-validated set.
         let result = match tirith_core::scan::scan_single_file(f) {
             Some(r) => r,
             None => return snapshot_scan_failed_code(json, f),
@@ -1429,8 +1201,8 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
             }
         }
 
-        // Re-read and re-hash AFTER scanning. If the bytes changed, the scan we
-        // just trusted no longer describes what we would record — abort.
+        // Re-read and re-hash AFTER scanning; if changed, the scan no longer
+        // describes what we would record — abort.
         let post = match read_text(f) {
             Ok(c) => c,
             Err(e) => {
@@ -1496,11 +1268,8 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         } else {
             eprintln!("tirith ai snapshot: {msg}");
             for (p, s, r) in &blocking {
-                // `p` is a repo-derived path/filename (attacker-controlled
-                // basename) — sanitize it so a hostile filename can't spoof
-                // terminal output. `s` (Severity) and `r` (RuleId) are
-                // tirith-internal enums with no attacker influence, so they are
-                // printed as-is.
+                // `p` is a repo-derived path (attacker-controlled basename);
+                // sanitize it. `s`/`r` are tirith-internal enums, printed as-is.
                 eprintln!("  - {}: {r} ({s})", sanitize_display(p));
             }
         }
@@ -1523,7 +1292,7 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         }
         return 1;
     };
-    // Ensure the state dir exists, then write atomically (reuse write_file_atomic).
+    // Ensure the state dir exists, then write atomically.
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             if !emit_error(
@@ -1589,12 +1358,9 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
 mod tests {
     use super::*;
 
-    // CodeRabbit M13 PR #132 R20: every untrusted, AI-config-derived string that
-    // `tirith ai` prints in human mode is routed through `sanitize_display`,
-    // which must strip raw terminal-control bytes so a hostile config cannot
-    // spoof terminal output. Assert the load-bearing property directly: a field
-    // carrying a CSI colour escape (`\x1b[31m…`) is rendered with NO raw ESC
-    // (0x1B) byte, while the visible text survives.
+    // CodeRabbit M13 PR #132 R20: `sanitize_display` must strip raw terminal-
+    // control bytes (CSI/OSC) while keeping visible text, so a hostile config
+    // can't spoof terminal output.
     #[test]
     fn sanitize_display_strips_terminal_escapes() {
         let hostile = "\x1b[31mFAKE ALERT\x1b[0m drop tables";
@@ -1603,7 +1369,7 @@ mod tests {
             !safe.contains('\u{1b}'),
             "sanitized output must contain no raw ESC byte, got: {safe:?}"
         );
-        // The CSI sequences are gone but the human-readable payload remains.
+        // The CSI sequences are gone but the payload remains.
         assert!(
             safe.contains("FAKE ALERT") && safe.contains("drop tables"),
             "visible text must survive sanitization, got: {safe:?}"
@@ -1613,8 +1379,7 @@ mod tests {
             "the CSI bodies must be consumed with the ESC, got: {safe:?}"
         );
 
-        // A bare OSC sequence (used for e.g. clipboard write / title spoofing) is
-        // also fully removed — ESC, the `]…`, and the BEL terminator.
+        // A bare OSC sequence is also fully removed (ESC, `]…`, BEL terminator).
         let osc = "before\x1b]0;pwned\x07after";
         let safe_osc = sanitize_display(osc);
         assert!(
@@ -1626,40 +1391,26 @@ mod tests {
             "text around the OSC sequence must survive, got: {safe_osc:?}"
         );
 
-        // Embedded newlines/tabs (which the underlying filter keeps) are flattened
-        // to spaces so one display field stays on a single line.
+        // Kept newlines/tabs are flattened to spaces (one display field, one line).
         let multiline = "line1\nline2\tcol";
         assert_eq!(sanitize_display(multiline), "line1 line2 col");
     }
 
-    // CodeRabbit M13 PR #132 R28 (F1): `emit_error`'s HUMAN branch interpolates
-    // `ctx` and `msg` into a stderr line. `msg` routinely embeds repo /
-    // AI-config-derived content (e.g. a `Path::display()` or a serde error
-    // quoting file bytes — see the corrupt-snapshot / re-read error paths), so a
-    // hostile filename or config could smuggle ANSI/OSC/control sequences to
-    // spoof terminal output. The R28 fix routes BOTH fields through
-    // `sanitize_display` before the `eprintln!`. The `eprintln!` to stderr isn't
-    // capturable in a unit test, so we pin the load-bearing seam: the exact
-    // string the human branch now composes carries no raw ESC byte, while the
-    // visible context/message text survives. (The JSON path is deliberately left
-    // raw — verified by NOT sanitizing in that branch — so machine consumers get
-    // the unmodified value, which JSON encodes safely.)
+    // CodeRabbit M13 PR #132 R28 (F1): `emit_error`'s human branch sanitizes BOTH
+    // `ctx` and `msg` (which embed AI-config-derived content) before `eprintln!`.
+    // Pin the composed string carries no raw ESC while visible text survives.
+    // (The JSON path is left raw on purpose — JSON encodes it safely.)
     #[test]
     fn emit_error_human_line_is_sanitized() {
-        // A `ctx` that a static caller would never produce, plus an attacker-
-        // influenced `msg` carrying a CSI escape (as a crafted path would when
-        // `Display`ed into the error string).
         let ctx = "tirith ai \x1b[31msnapshot\x1b[0m";
         let msg = "cannot re-read \x1b]0;pwned\x07/repo/\x1b[2Jevil.md: oops";
-        // Reproduce exactly what the human branch builds:
-        //   eprintln!("{}: {}", sanitize_display(ctx), sanitize_display(msg))
+        // Reproduce exactly what the human branch builds.
         let line = format!("{}: {}", sanitize_display(ctx), sanitize_display(msg));
         assert!(
             !line.contains('\u{1b}') && !line.contains('\u{7}'),
             "composed emit_error human line must contain no raw ESC/BEL byte, got: {line:?}"
         );
-        // The human-readable parts survive so the operator still sees a useful
-        // diagnostic.
+        // The human-readable parts survive.
         assert!(
             line.contains("snapshot")
                 && line.contains("cannot re-read")
@@ -1669,21 +1420,15 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 PR #132 R28 (F2): the blocking-snapshot summary loop prints
-    // one stderr line per High+ finding as `"  - {path}: {rule} ({severity})"`.
-    // The path is repo-derived (`rel_key` over a scanned file whose basename is
-    // attacker-controlled), so the R28 fix sanitizes it; `rule`/`severity` are
-    // tirith-internal enums and are printed as-is. The loop's `eprintln!` isn't
-    // unit-capturable, so we pin the same per-row seam the loop now uses — the
-    // formatted row for a hostile path carries no raw ESC byte while the path's
-    // visible text, the rule, and the severity all survive.
+    // CodeRabbit M13 PR #132 R28 (F2): the blocking-snapshot summary loop
+    // sanitizes the repo-derived path (`rule`/`severity` are internal enums).
+    // Pin the per-row seam carries no raw ESC while path/rule/severity survive.
     #[test]
     fn blocking_snapshot_row_path_is_sanitized() {
         let p = ".claude/\x1b[31mhooks\x1b[0m/\x1b]0;pwn\x07evil.sh".to_string();
         let s = Severity::High;
         let r = "agent_instruction_hidden".to_string();
-        // Reproduce exactly what the loop builds:
-        //   eprintln!("  - {}: {r} ({s})", sanitize_display(p))
+        // Reproduce exactly what the loop builds.
         let row = format!("  - {}: {r} ({s})", sanitize_display(&p));
         assert!(
             !row.contains('\u{1b}') && !row.contains('\u{7}'),
@@ -1698,17 +1443,9 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 PR #132 R20: the `--move` confirmation gate must key its
-    // "could we prompt?" decision off the stream `confirm` reads the ANSWER from
-    // (stdin), not just stderr. The predicate is the conjunction stdin-TTY AND
-    // stderr-TTY, so the only deterministic assertion in a unit test (cargo runs
-    // tests with BOTH stdin and stderr piped, i.e. not TTYs) is that it returns
-    // `false` here — exactly the non-interactive case that must fail non-zero
-    // (exit 2) rather than be mistaken for a deliberate "no" (exit 0). A full
-    // TTY-vs-EOF end-to-end check is not unit-testable without a pty, so we pin
-    // the decision seam itself: in a non-interactive context confirmation is
-    // impossible, which is what routes `quarantine --move` (without `--yes`) to
-    // the emit_error + return 2 branch.
+    // CodeRabbit M13 PR #132 R20: cargo runs tests with stdin/stderr piped, so
+    // `confirmation_possible` must report `false` — the non-interactive case that
+    // routes `--move` (without `--yes`) to emit_error + exit 2, not a silent "no".
     #[test]
     fn confirmation_impossible_without_a_tty() {
         assert!(
@@ -1718,9 +1455,8 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 round-2 R7: the quarantine restore hint must be OS-aware.
-    // R15-ai.rs:780: the command must include a literal `--` before the path
-    // operands so a dash-prefixed path can never be parsed as a `cp` option.
+    // CodeRabbit M13 round-2 R7 / R15-ai.rs:780: the restore hint is OS-aware and
+    // includes a literal `--` so a dash-prefixed path can't parse as a `cp` option.
     #[cfg(not(windows))]
     #[test]
     fn restore_command_unix_uses_cp_with_posix_quoting() {
@@ -1871,20 +1607,11 @@ mod tests {
 
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
-    /// RAII guard that points `XDG_CACHE_HOME` at `dir` for the duration of a
-    /// test and restores the previous value (even on panic), so the quarantine
-    /// store resolves into an isolated temp dir.
-    ///
-    /// `XDG_CACHE_HOME` is process-global and cargo runs unit tests in parallel,
-    /// so the mutation must be serialized against EVERY other env-mutating test
-    /// in the crate — not just the other cache tests. We therefore hold the
-    /// SINGLE crate-wide `crate::cli::test_harness::ENV_LOCK` (the same mutex
-    /// onboard's `home_base_*` tests and the dashboard serve test take) rather
-    /// than a module-local lock: two independent locks guarding the same global
-    /// env would let a test holding one run concurrently with a test holding the
-    /// other and clobber each other's `HOME`/`XDG_CACHE_HOME` (M13 PR #132 — the
-    /// cross-lock-domain race class already fixed for onboard and the dashboard
-    /// serve test). The inner `EnvGuard` performs the failure-safe save/restore.
+    /// RAII guard pointing `XDG_CACHE_HOME` at `dir` (failure-safe restore) so the
+    /// quarantine store resolves into an isolated temp dir. Holds the SINGLE
+    /// crate-wide `ENV_LOCK` (not a module-local one) so this process-global
+    /// mutation can't race other env-mutating tests sharing the same global
+    /// (M13 PR #132 cross-lock-domain race class).
     struct CacheHomeGuard {
         _xdg: EnvGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -1893,9 +1620,6 @@ mod tests {
     impl CacheHomeGuard {
         fn set(dir: &Path) -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // `EnvGuard::set` snapshots the prior value and restores it on Drop,
-            // even on panic — same save/restore semantics as before, now under
-            // the shared lock.
             let xdg = EnvGuard::set("XDG_CACHE_HOME", dir);
             Self {
                 _xdg: xdg,
@@ -1905,11 +1629,7 @@ mod tests {
     }
 
     /// R15-ai.rs:516: a stable file quarantined via `--move --yes` must report a
-    /// sha that matches the bytes actually at `dest`, and the quarantined
-    /// filename (`<ts>-<short_sha>-<basename>`) must encode that same hash. For a
-    /// file that does not change during the move the provisional and recomputed
-    /// hashes coincide, so this confirms the emitted/encoded hash describes the
-    /// moved bytes — the property the recompute path guarantees.
+    /// sha matching the bytes at `dest`, and the filename must encode that hash.
     #[cfg(unix)]
     #[test]
     fn quarantine_move_reports_sha_matching_dest_bytes() {
@@ -1971,10 +1691,8 @@ mod tests {
     }
 
     // CodeRabbit M13 PR #132 R22 (evidence loss): `unique_dest` must never return
-    // a path that already exists, walking a `-1`, `-2`, … suffix until a free
-    // slot is found. This is the deterministic core of the no-clobber guarantee
-    // (the end-to-end test below depends on sub-second timing to *also* exercise
-    // the same-`<ts>` collision, so pin the dedup logic directly here).
+    // an existing path, walking a `-1`, `-2`, … suffix to a free slot — the
+    // deterministic core of the no-clobber guarantee.
     #[test]
     fn unique_dest_walks_numeric_suffix_past_existing_files() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2001,19 +1719,15 @@ mod tests {
     }
 
     // CodeRabbit M13 PR #132 R25 (TOCTOU): `reserve_dest` must ATOMICALLY claim a
-    // free slot — skipping any already-occupied name AND actually creating the
-    // placeholder file it returns (so the subsequent `rename` replaces a path we
-    // own, not one a concurrent run could still grab). Deterministic core of the
-    // no-clobber-on-move guarantee; the end-to-end test below depends on timing to
-    // ALSO exercise a same-`<ts>` collision, so pin the reservation here.
+    // free slot — skipping occupied names AND creating the placeholder it returns
+    // (so the `rename` replaces a path we own). Core of the no-clobber-on-move guarantee.
     #[test]
     fn reserve_dest_atomically_claims_a_free_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = "20260101T000000Z-deadbeefdeadbeef-.cursorrules";
 
-        // First reservation takes the un-suffixed base and CREATES it (the
-        // placeholder must exist on disk afterward — that is what makes the claim
-        // atomic rather than advisory).
+        // First reservation takes the base and CREATES it (the placeholder must
+        // exist — that is what makes the claim atomic, not advisory).
         let r0 = reserve_dest(dir.path(), base).expect("first reserve");
         assert_eq!(r0, dir.path().join(base));
         assert!(
@@ -2021,8 +1735,7 @@ mod tests {
             "reserve_dest must create the placeholder it returns, got missing: {r0:?}"
         );
 
-        // The base is now occupied by our placeholder, so the next reservation
-        // must skip past it to `<base>-1` (and create that one too).
+        // The base is now occupied, so the next reservation skips to `<base>-1`.
         let r1 = reserve_dest(dir.path(), base).expect("second reserve");
         assert_eq!(
             r1,
@@ -2034,14 +1747,9 @@ mod tests {
     }
 
     // CodeRabbit M13 PR #132 R25 (TOCTOU evidence loss on `--move`): a `--move`
-    // whose computed destination ALREADY EXISTS must NOT clobber that pre-existing
-    // file. `std::fs::rename` overwrites on both Unix and Windows, so without the
-    // atomic `reserve_dest` reservation the move would silently destroy a prior
-    // quarantine entry sitting at the same `<ts>-<short_sha>-<basename>` slot. We
-    // pre-seed a SENTINEL at the exact base path the move will compute (with
-    // distinct bytes, so a clobber is detectable), then move a real source. The
-    // moved file must land at a DISTINCT path and the sentinel's bytes must be
-    // intact.
+    // whose computed destination ALREADY EXISTS must NOT clobber it. Pre-seed a
+    // SENTINEL (distinct bytes) at the computed base path, move a real source, and
+    // assert the moved file lands at a distinct path with the sentinel intact.
     #[cfg(unix)]
     #[test]
     fn quarantine_move_does_not_clobber_existing_dest() {
@@ -2053,10 +1761,9 @@ mod tests {
 
         let _guard = CacheHomeGuard::set(cache.path());
 
-        // Reconstruct the destination base name EXACTLY as `quarantine` derives it
-        // (`<ts>-<short_sha>-<basename>`). `ts` has one-second granularity and is
-        // sampled microseconds before the call below, so it matches in practice;
-        // the durable assertions hold even if a second boundary intervenes.
+        // Reconstruct the destination base name EXACTLY as `quarantine` derives it.
+        // `ts` (one-second granularity) matches in practice; the durable assertions
+        // hold even across a second boundary.
         let qdir = cache.path().join("tirith").join("quarantine");
         create_quarantine_dir(&qdir).expect("create qdir");
         let sha = tirith_core::clipboard::content_sha256_hex(body);
@@ -2114,14 +1821,9 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 PR #132 R22 (evidence loss): quarantining two DISTINCT source
-    // files that map to the SAME base destination must yield two DISTINCT files on
-    // disk — the second must NOT clobber the first. We use two sources in separate
-    // dirs that share a basename AND identical bytes, so they compute the same
-    // `<ts>-<short_sha>-<basename>` base (within one timestamp second they collide
-    // exactly; across a second boundary the names differ but the no-clobber
-    // property still holds). The load-bearing assertion is that the store holds
-    // TWO entries afterward — a clobber would leave ONE.
+    // CodeRabbit M13 PR #132 R22 (evidence loss): two DISTINCT sources that map to
+    // the SAME base destination (shared basename + identical bytes) must yield TWO
+    // DISTINCT files — a clobber would leave one.
     #[cfg(unix)]
     #[test]
     fn quarantine_two_colliding_files_yields_two_distinct_copies() {
@@ -2137,8 +1839,7 @@ mod tests {
 
         let _guard = CacheHomeGuard::set(cache.path());
 
-        // COPY mode (default): originals are left untouched, two copies land in
-        // the store.
+        // COPY mode: originals untouched, two copies land in the store.
         let code_a = quarantine(src_a.to_str().unwrap(), false, false, true);
         assert_eq!(code_a, 0, "first quarantine must succeed");
         let code_b = quarantine(src_b.to_str().unwrap(), false, false, true);
@@ -2176,21 +1877,15 @@ mod tests {
         }
     }
 
-    // CodeRabbit M13 PR #132 R22 (path escape): `cache_dir` must honor
-    // `XDG_CACHE_HOME` ONLY when it is non-empty AND absolute; an empty or
-    // relative value is ignored and falls back to `~/.cache`. A relative value
-    // would otherwise root the quarantine store under the current working dir.
+    // CodeRabbit M13 PR #132 R22 (path escape): `cache_dir` honors `XDG_CACHE_HOME`
+    // ONLY when non-empty AND absolute; a relative value would root the store under
+    // cwd, so it falls back to `~/.cache`.
     #[test]
     fn cache_dir_ignores_relative_and_empty_xdg() {
-        // Hold the shared `ENV_LOCK` for the WHOLE test (not per-block via
-        // `CacheHomeGuard`) so the `home_dir()` baseline AND every `cache_dir()`
-        // call observe the SAME, un-mutated `HOME`. The sibling
-        // `cache_dir_fallback_rejects_relative_home` sets `HOME=relative-home`
-        // under this same lock; reading `home_dir()` outside it (or releasing the
-        // lock between sub-cases via a per-block guard) let that mutation leak in
-        // and flaked CI (M13 PR #132). `EnvGuard::set` snapshots/restores
-        // `XDG_CACHE_HOME` per sub-case WITHOUT re-locking — the lock is already
-        // held here, and the Mutex is not reentrant.
+        // Hold `ENV_LOCK` for the WHOLE test (not per-block) so the `home_dir()`
+        // baseline and every `cache_dir()` call observe the same un-mutated `HOME`;
+        // a per-block guard let a sibling's `HOME` mutation leak in and flaked CI
+        // (M13 PR #132). `EnvGuard::set` restores per sub-case without re-locking.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = home::home_dir().map(|h| h.join(".cache"));
 
@@ -2240,49 +1935,32 @@ mod tests {
         }
     }
 
-    // CodeRabbit M13 PR #132 R26 (path escape, round-25 follow-up): the fallback
-    // branch of `cache_dir` must ALSO reject a non-absolute home base. Round-25
-    // guarded `XDG_CACHE_HOME`, but `home::home_dir()` can itself return a
-    // RELATIVE path — on Unix it reads `$HOME` verbatim — so with `XDG_CACHE_HOME`
-    // unset and a relative `HOME`, the unfiltered fallback would root the
-    // quarantine store under the current working directory. After the absolute
-    // filter, `cache_dir` returns `None` (or an absolute path) but NEVER a
-    // relative one. On Unix this exercises the `home::home_dir()` branch directly
-    // (it reads `$HOME`); on other platforms `home_dir()` may ignore `$HOME`, so
-    // we assert the invariant that holds everywhere: the result is never relative.
+    // CodeRabbit M13 PR #132 R26 (path escape, round-25 follow-up): the `cache_dir`
+    // fallback must ALSO reject a non-absolute home base — `home::home_dir()` reads
+    // `$HOME` verbatim on Unix, so a relative `HOME` would root the store under cwd.
+    // After the absolute filter the result is None or absolute, never relative.
     #[test]
     fn cache_dir_fallback_rejects_relative_home() {
-        // Hold the SINGLE crate-wide `ENV_LOCK` (the same lock `CacheHomeGuard`,
-        // onboard's `home_base_*` tests, and the dashboard serve test take) so
-        // these `XDG_CACHE_HOME`/`HOME`/`USERPROFILE` mutations can't interleave
-        // with ANY other env-mutating test in the crate — not just the other
-        // cache tests (M13 PR #132 cross-lock-domain race fix).
+        // Hold the crate-wide `ENV_LOCK` so these HOME/XDG/USERPROFILE mutations
+        // can't interleave with any other env-mutating test (M13 PR #132).
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Mutate the env inside an inner scope so the `EnvGuard`s restore the
-        // prior values (failure-safe, even on panic) BEFORE the assertions run —
-        // a failing assert can never leak the relative env into sibling tests.
-        // `resolved` is captured while the relative env is in effect.
+        // Mutate inside an inner scope so the `EnvGuard`s restore BEFORE the
+        // assertions run (a failing assert can't leak the relative env).
         let resolved = {
-            // XDG unset so resolution must fall through to the home_dir() branch;
-            // a clearly-relative home on every OS. `EnvGuard` snapshots + restores
-            // each var on Drop at the end of this block.
             let _xdg = EnvGuard::remove("XDG_CACHE_HOME");
             let _home = EnvGuard::set("HOME", Path::new("relative-home"));
             let _userprofile = EnvGuard::set("USERPROFILE", Path::new("relative-home"));
             cache_dir()
         };
 
-        // It must not echo back a cwd-relative cache base built from the relative
-        // HOME...
+        // Must not echo back a cwd-relative cache base from the relative HOME...
         assert_ne!(
             resolved.as_deref(),
             Some(Path::new("relative-home").join(".cache").as_path()),
             "cache_dir must not build its fallback from a relative HOME"
         );
-        // ...and whatever it returns must be absolute (or absent). On Unix, where
-        // home_dir() reads $HOME verbatim, this is None; elsewhere it is whatever
-        // the OS passwd entry yields (absolute) — never relative.
+        // ...and whatever it returns must be absolute (or absent), never relative.
         if let Some(p) = &resolved {
             assert!(
                 p.is_absolute(),
@@ -2292,21 +1970,14 @@ mod tests {
     }
 
     // CodeRabbit M13 PR #132 R22 (terminal injection, round-20 follow-up): the
-    // PRINTED restore hint runs through `sanitize_display`, so a `restore_cmd`
-    // carrying an ANSI/CSI escape (which shell-quoting does NOT strip) prints with
-    // no raw ESC byte. We assert the property on the exact transform the print
-    // site applies — `sanitize_display(&restore_cmd)` — over a restore command
-    // built from a filename embedding `\x1b[`.
+    // PRINTED restore hint runs through `sanitize_display` — shell-quoting does NOT
+    // strip ANSI escapes, so the printed form must drop the raw ESC.
     #[test]
     fn printed_restore_command_strips_terminal_escapes() {
-        // A quarantine dest whose basename carries a CSI colour escape; the real
-        // `restore_command` shell-quotes it (preserving the ESC for execution),
-        // but the PRINTED form must be sanitized.
         let from = PathBuf::from("/q/\x1b[31mevil\x1b[0m.cursorrules");
         let to = PathBuf::from("/repo/.cursorrules");
         let restore_cmd = restore_command(&from, &to);
-        // Precondition: the executable form still carries the raw ESC (we do NOT
-        // sanitize what gets run) — otherwise the test would pass vacuously.
+        // Precondition: the executable form keeps the raw ESC (else vacuous).
         assert!(
             restore_cmd.contains('\u{1b}'),
             "restore_command itself must keep the raw bytes for execution: {restore_cmd:?}"

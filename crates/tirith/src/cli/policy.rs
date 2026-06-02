@@ -116,68 +116,58 @@ allowlist: []
 blocklist: []
 "#;
 
-/// `individual` — sensible defaults for a single developer on their own machine.
-/// Stays out of the way (fail-open, paranoia 1) but escalates the noisiest
-/// pipe-to-shell rule and ships an empty allowlist ready to fill in.
-///
-/// The body lives in `crates/tirith/assets/policy_templates/individual.yaml`
-/// (same crate as this CLI, so the asset is bundled in the crate tarball the
-/// same way `assets/shell/*` are — see [`crate::assets`]). `include_str!`
-/// resolves it at compile time, so the on-disk `.yaml` is the single source of
-/// truth shared by the template body and the `assert_template_valid` test.
+/// `individual` — defaults for a single developer (fail-open, paranoia 1, the
+/// noisiest pipe-to-shell rule escalated, empty allowlist). Body lives in
+/// `assets/policy_templates/individual.yaml`, resolved via `include_str!` so the
+/// on-disk `.yaml` is the single source of truth (shared with the validity test).
 const TEMPLATE_INDIVIDUAL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/individual.yaml"
 ));
 
-/// `ci-strict` — locked-down settings for an automated CI environment.
-/// Fail-closed, no bypass at all, strict warn handling, and a `scan.fail_on`
-/// threshold so `tirith scan` fails the build on high-severity findings.
+/// `ci-strict` — locked-down CI settings: fail-closed, no bypass, strict warn,
+/// and a `scan.fail_on` threshold that fails the build on high-severity findings.
 const TEMPLATE_CI_STRICT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/ci-strict.yaml"
 ));
 
-/// `ai-agent-heavy` — tuned for environments where AI agents run many
-/// commands. Keeps fail-open so an agent is not wedged by an internal error,
-/// but raises paranoia, disables the non-interactive bypass (an agent must not
-/// be able to bypass tirith), requires approval for the highest-risk rules,
-/// and escalates on repeated warnings.
+/// `ai-agent-heavy` — for environments where AI agents run many commands.
+/// Fail-open (so an agent isn't wedged by an internal error) but raised
+/// paranoia, no non-interactive bypass, approval for the highest-risk rules, and
+/// escalation on repeated warnings.
 const TEMPLATE_AI_AGENT_HEAVY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/ai-agent-heavy.yaml"
 ));
 
-/// `oss-maintainer` — for the maintainer of a public open-source repository.
-/// Moderate strictness (paranoia 2, fail-open) with the untrusted-contributor
-/// threat model in focus: typosquat, install-script, and untrusted-registry
-/// rules escalated for reviewing contributor branches.
+/// `oss-maintainer` — for a public OSS repo maintainer. Moderate (paranoia 2,
+/// fail-open) with the untrusted-contributor threat model in focus: typosquat,
+/// install-script, and untrusted-registry rules escalated.
 const TEMPLATE_OSS_MAINTAINER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/oss-maintainer.yaml"
 ));
 
-/// `startup` — for a small team moving fast. Balanced and a notch stricter
-/// than `individual` (paranoia 2, strict-warn on, the noisiest pipe-to-shell
-/// rules escalated) without failing closed.
+/// `startup` — for a small fast team: a notch stricter than `individual`
+/// (paranoia 2, strict-warn on, noisiest pipe-to-shell rules escalated) but not
+/// fail-closed.
 const TEMPLATE_STARTUP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/startup.yaml"
 ));
 
-/// `enterprise` — strict, audit-friendly defaults for a larger organization.
-/// Fail-closed, no bypass, paranoia 3, and — uniquely among the templates — an
-/// ACTIVE (uncommented) `package_policy:` block with strict supply-chain
-/// thresholds enforced out of the box.
+/// `enterprise` — strict, audit-friendly defaults: fail-closed, no bypass,
+/// paranoia 3, and (uniquely) an ACTIVE `package_policy:` block with strict
+/// supply-chain thresholds out of the box.
 const TEMPLATE_ENTERPRISE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/enterprise.yaml"
 ));
 
-/// `mcp-strict` — a locked-down posture for environments that lean heavily on
-/// MCP servers. Fail-closed, paranoia 3, and every MCP config rule
-/// (insecure / untrusted / overly-permissive / suspicious-args / drift)
-/// escalated so an MCP change cannot pass quietly.
+/// `mcp-strict` — locked-down for MCP-heavy environments: fail-closed,
+/// paranoia 3, every MCP config rule (insecure / untrusted / overly-permissive /
+/// suspicious-args / drift) escalated.
 const TEMPLATE_MCP_STRICT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/policy_templates/mcp-strict.yaml"
@@ -196,12 +186,9 @@ pub enum PolicyTemplate {
 }
 
 impl PolicyTemplate {
-    /// Every template variant, in the canonical display order. The single source
-    /// of truth for "which templates exist" (CodeRabbit M13 PR #132 R20): the
-    /// `--template` help list is BUILT from this via [`canonical_name`], so
-    /// adding or renaming a variant can never leave the help string stale.
-    ///
-    /// [`canonical_name`]: PolicyTemplate::canonical_name
+    /// Every variant, in canonical display order. The single source of truth for
+    /// "which templates exist" (R20): the `--template` help list is built from
+    /// this via [`PolicyTemplate::canonical_name`], so it can never go stale.
     pub const ALL: &'static [PolicyTemplate] = &[
         Self::Individual,
         Self::CiStrict,
@@ -212,10 +199,8 @@ impl PolicyTemplate {
         Self::McpStrict,
     ];
 
-    /// The comma-separated list of canonical template names for help / error
-    /// text, derived from [`ALL`] so it stays in lock-step with the enum.
-    ///
-    /// [`ALL`]: PolicyTemplate::ALL
+    /// Comma-separated canonical template names for help/error text, derived from
+    /// [`PolicyTemplate::ALL`] so it stays in lock-step with the enum.
     fn names_csv() -> String {
         Self::ALL
             .iter()
@@ -224,12 +209,8 @@ impl PolicyTemplate {
             .join(", ")
     }
 
-    /// Parse a `--template` value. Returns `None` for an unrecognized name.
-    ///
-    /// `personal` is accepted as an ALIAS for `individual`: `personal` is the
-    /// spec/persona word, `individual` is the shipping name. Both are supported
-    /// and resolve to the same template body — the rename is additive, the
-    /// original name is never dropped.
+    /// Parse a `--template` value (`None` if unrecognized). `personal` is an alias
+    /// for `individual` (the shipping name); both resolve to the same body.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "individual" | "personal" => Some(Self::Individual),
@@ -243,12 +224,9 @@ impl PolicyTemplate {
         }
     }
 
-    /// The canonical hyphenated name (`individual` / `ci-strict` /
-    /// `ai-agent-heavy` / `oss-maintainer` / `startup` / `enterprise` /
-    /// `mcp-strict`). Round-trips through [`PolicyTemplate::parse`], so a
-    /// recommender (`tirith onboard`) can pass it straight to
-    /// `tirith policy init --template <name>`. Note the `personal` alias maps
-    /// to `Individual`, so its canonical name is `individual`.
+    /// The canonical hyphenated name. Round-trips through [`PolicyTemplate::parse`]
+    /// so `tirith onboard` can pass it to `policy init --template <name>`. The
+    /// `personal` alias maps to `Individual`, so its canonical name is `individual`.
     pub fn canonical_name(self) -> &'static str {
         match self {
             Self::Individual => "individual",
@@ -276,15 +254,13 @@ impl PolicyTemplate {
 }
 
 pub fn init(force: bool, minimal: bool, template: Option<&str>) -> i32 {
-    // Resolve the template selection before touching the filesystem so a typo
-    // fails fast with the list of valid names.
+    // Resolve the template before touching the filesystem so a typo fails fast.
     let selected_template = match template {
         Some(name) => match PolicyTemplate::parse(name) {
             Some(t) => Some(t),
             None => {
                 eprintln!("tirith policy init: unknown template '{name}'");
-                // Derived from `PolicyTemplate::ALL` so this list can never drift
-                // from the actual variants (R20).
+                // Derived from `PolicyTemplate::ALL` so it can't drift (R20).
                 eprintln!("  valid templates: {}", PolicyTemplate::names_csv());
                 eprintln!("  ('personal' is accepted as an alias of 'individual')");
                 return 1;
@@ -308,7 +284,7 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     let repo_root = match tirith_core::policy::find_repo_root(cwd.as_deref()) {
         Some(r) => r,
         None => {
-            // No git repo — fall back to cwd so `tirith policy init` still works.
+            // No git repo — fall back to cwd.
             match std::env::current_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -330,11 +306,9 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         return 1;
     }
 
-    // Note whether `.tirith` already existed: if we create it on a fresh repo, the
-    // new directory entry in `repo_root` must itself be fsync'd, or a crash could
-    // lose `.tirith` (and the `policy.yaml` inside it) even though init returned
-    // success. `write_file_atomic` below only fsyncs `.tirith` (policy.yaml's
-    // parent), not `repo_root` (.tirith's parent). CodeRabbit R13b.
+    // If we create `.tirith` on a fresh repo, its new entry in `repo_root` must be
+    // fsync'd too, or a crash could lose it — `write_file_atomic` only fsyncs
+    // `.tirith` (policy.yaml's parent), not `repo_root`. CodeRabbit R13b.
     let tirith_dir_existed = tirith_dir.exists();
     if let Err(e) = std::fs::create_dir_all(&tirith_dir) {
         eprintln!(
@@ -353,12 +327,10 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         (None, false) => FULL_TEMPLATE,
     };
 
-    // Write the policy ATOMICALLY (temp-in-same-dir → fsync → rename → parent
-    // fsync): with `--force` this overwrites an existing policy, and a crash
-    // mid-write must never lose the prior policy or leave a half-written one.
-    // Without `--force`, `overwrite=false` makes the publish no-clobber, so a
-    // policy created in the race window after the `exists()` check above is NOT
-    // silently clobbered (it surfaces as a write error instead).
+    // Write the policy ATOMICALLY (temp → fsync → rename → parent fsync), so a
+    // crash mid-write never loses the prior policy. Without `--force`,
+    // `overwrite=false` makes it no-clobber, so a policy created in the race window
+    // after the `exists()` check surfaces as a write error instead of being lost.
     if let Err(e) = super::write_file_atomic(&policy_path, template_body.as_bytes(), force) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",
@@ -571,19 +543,14 @@ fn test_file(file_path: &str, json: bool) -> i32 {
     if result.findings.is_empty() {
         0
     } else if result.findings.iter().any(|f| f.severity >= Severity::High) {
-        // Block-equivalent exit code for high+ severity.
-        1
+        1 // block-equivalent
     } else {
-        // Warn-equivalent exit code for medium/low severity.
-        2
+        2 // warn-equivalent
     }
 }
 
-/// Run `tirith policy tune --from-audit`.
-///
-/// Reads the local audit log, rolls up per-rule statistics, and prints
-/// conservative, deterministic tuning suggestions. It never edits the policy —
-/// the user reviews each suggestion and applies it by hand.
+/// Run `tirith policy tune --from-audit`: roll up per-rule audit-log statistics
+/// and print deterministic tuning suggestions. Never edits the policy.
 pub fn tune(from_audit: bool, json: bool) -> i32 {
     if !from_audit {
         eprintln!("tirith policy tune: specify a source — currently only --from-audit");
@@ -611,10 +578,8 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
     let result = match tirith_core::audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
-            // `read_log` only fails on an I/O error reading the file (malformed
-            // JSONL lines are skipped, not errored), so name the path and the
-            // likely cause. Re-probe the file to distinguish a permissions
-            // problem — the one a user can actually act on — from other I/O.
+            // `read_log` only fails on an I/O error (malformed lines are skipped),
+            // so re-probe to distinguish an actionable permissions problem.
             eprintln!(
                 "tirith policy tune: could not read the audit log at {}",
                 log_path.display()
@@ -644,7 +609,7 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
         );
     }
 
-    // Every rule tirith can emit — used to point out rules that never fired.
+    // Every rule tirith can emit — to point out rules that never fired.
     let known_rules: Vec<&str> = tirith_core::rule_explanations::list_all()
         .iter()
         .map(|r| r.id)
@@ -872,11 +837,9 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // Existence-based local discovery — the same resolver the engine and
-    // `doctor` use. `Policy::discover` would parse the policy and, on a parse
-    // error, drop the path, so `validate` could not even locate a corrupt
-    // policy to report on; it would also resolve to an unreadable `remote:` URL
-    // when a remote policy server is configured.
+    // Existence-based local discovery (same resolver engine/`doctor` use).
+    // `Policy::discover` would drop the path on a parse error, so `validate` could
+    // not locate a corrupt policy to report on, and could resolve a `remote:` URL.
     tirith_core::policy::discover_local_policy_path(None)
 }
 
@@ -885,9 +848,9 @@ mod tests {
     use super::*;
     use tirith_core::policy_validate::{self, IssueLevel};
 
-    /// Every curated template must pass `tirith policy validate` cleanly —
-    /// no errors AND no warnings (warnings include the unknown-field typo
-    /// guard, so this also proves every key is a real schema key).
+    /// Every curated template must validate cleanly — no errors AND no warnings
+    /// (warnings include the unknown-field typo guard, so this proves every key
+    /// is a real schema key).
     fn assert_template_valid(name: &str, body: &str) {
         let issues = policy_validate::validate(body);
         let errors: Vec<_> = issues
@@ -914,11 +877,8 @@ mod tests {
         assert_template_valid("individual", TEMPLATE_INDIVIDUAL);
     }
 
-    // CodeRabbit M13 PR #132 R20: the `--template` help/error list is DERIVED
-    // from `PolicyTemplate::ALL` via `canonical_name`, not hand-maintained, so it
-    // can never drift from the actual variants. Assert the derived CSV contains
-    // every canonical name AND that every name in it round-trips through `parse`
-    // back to a variant (so a stale/typo'd entry can't sneak in).
+    // R20: the help/error list is derived from `PolicyTemplate::ALL`, so assert
+    // the CSV contains every canonical name and each round-trips through `parse`.
     #[test]
     fn template_names_csv_covers_every_variant() {
         let csv = PolicyTemplate::names_csv();
@@ -1067,14 +1027,12 @@ mod tests {
         assert_eq!(PolicyTemplate::parse("default"), None);
     }
 
-    /// Every curated template body must deserialize cleanly through the same
-    /// `serde_yaml::from_str::<Policy>` path `Policy::load` uses — i.e. it
-    /// round-trips into the real `Policy` struct, not just the validator.
+    /// Every template body must deserialize through the same
+    /// `serde_yaml::from_str::<Policy>` path `Policy::load` uses (not just the
+    /// validator).
     #[test]
     fn all_templates_deserialize_into_policy() {
-        // Iterate `PolicyTemplate::ALL` (the single source of truth, R20) rather
-        // than a hand-maintained list, so a newly-added template is automatically
-        // covered by this deserialize check (CodeRabbit M13 PR #132 round-21).
+        // Iterate `PolicyTemplate::ALL` (R20) so a new template is auto-covered.
         for t in PolicyTemplate::ALL {
             let body = t.body();
             let parsed: Result<tirith_core::policy::Policy, _> = serde_yaml::from_str(body);

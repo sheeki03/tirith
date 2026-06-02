@@ -1,22 +1,12 @@
 //! Deterministic policy-tuning suggestions derived from the local audit log.
 //!
-//! `policy tune --from-audit` reads the JSONL audit log and proposes concrete,
-//! conservative policy adjustments — and *only* suggests; it never rewrites the
-//! policy. The user reviews each suggestion and applies it by hand.
+//! `policy tune --from-audit` reads the JSONL audit log and proposes
+//! conservative adjustments — it only suggests, never rewrites the policy.
 //!
-//! ## What this is not
-//!
-//! There is no model here. Every suggestion is a fixed rule over plain counts:
-//! "rule X fired N times and the user bypassed it every time" is an arithmetic
-//! fact about the log, not an inference. The thresholds below are constants,
-//! documented inline, so a suggestion is fully reproducible from the log.
-//!
-//! ## Honesty about thin data
-//!
-//! A suggestion is only emitted when the log carries enough observations to
-//! support it (`MIN_OBSERVATIONS`). When the log is too small, [`analyze`]
-//! returns an empty suggestion list and sets `data_is_thin`, so the caller can
-//! say plainly "not enough data" instead of guessing.
+//! No model: every suggestion is a fixed rule over plain counts (reproducible
+//! from the log). A suggestion is emitted only with enough observations
+//! (`MIN_OBSERVATIONS`); below that, [`analyze`] returns an empty list and sets
+//! `data_is_thin` so the caller says "not enough data" rather than guessing.
 
 use std::collections::BTreeMap;
 
@@ -24,17 +14,15 @@ use serde::Serialize;
 
 use crate::audit_aggregator::AuditRecord;
 
-/// Minimum number of `verdict` records in the log before any suggestion is
-/// emitted. Below this the sample is too small to be meaningful.
+/// Minimum `verdict` records before any suggestion is emitted (below this the
+/// sample is too small to be meaningful).
 pub const MIN_OBSERVATIONS: usize = 20;
 
-/// Minimum times a single rule must fire before a per-rule suggestion is made.
-/// A rule seen only once or twice is noise, not a pattern.
+/// Minimum firings of a single rule before a per-rule suggestion (fewer is noise).
 pub const MIN_RULE_FIRINGS: usize = 5;
 
-/// Largest "never fired" rule list that is still useful to print. Above this,
-/// the unused set is so large the sample is simply too narrow to say anything,
-/// so the never-fired note is suppressed entirely rather than dumped.
+/// Largest "never fired" list still worth printing — above it the unused set is
+/// too large to say anything, so the note is suppressed.
 pub const NEVER_FIRED_MAX_LIST: usize = 12;
 
 /// Per-rule firing statistics rolled up from the audit log.
@@ -42,25 +30,22 @@ pub const NEVER_FIRED_MAX_LIST: usize = 12;
 pub struct RuleStats {
     /// Rule ID (snake_case, as stored in the log).
     pub rule_id: String,
-    /// Total number of verdict records this rule appeared in.
+    /// Total verdict records this rule appeared in.
     pub total: usize,
-    /// Records where the final action was `Allow`.
     pub allowed: usize,
     /// Records where the final action was `Warn` or `WarnAck`.
     pub warned: usize,
-    /// Records where the final action was `Block`.
     pub blocked: usize,
-    /// Records where the user requested a `TIRITH=0` bypass that was honored.
+    /// Records with an honored `TIRITH=0` bypass.
     pub bypassed: usize,
 }
 
 impl RuleStats {
-    /// Records where the user effectively waved the finding through: either the
-    /// final action was `Allow`, or a bypass was honored. This is the signal
-    /// that the rule is firing on something the user does not consider a threat.
+    /// Records the user effectively waved through (`Allow` or honored bypass) —
+    /// the signal the rule is firing on something the user doesn't see as a threat.
     fn waved_through(&self) -> usize {
-        // `allowed` and `bypassed` can overlap (a bypassed command is logged as
-        // Allow). Take the max so an honored-bypass Allow is not double-counted.
+        // `allowed` and `bypassed` overlap (a bypass is logged as Allow); max
+        // avoids double-counting.
         self.allowed.max(self.bypassed)
     }
 }
@@ -75,22 +60,17 @@ pub enum Confidence {
     Moderate,
 }
 
-/// A single concrete, conservative policy-tuning suggestion.
-///
-/// Every field is plain text or a count — there is nothing here the user cannot
-/// trace back to the log. The suggestion is advisory; applying it is a manual
-/// edit the user makes after reviewing.
+/// A single conservative, advisory policy-tuning suggestion. Every field is
+/// plain text or a count the user can trace back to the log.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TuneSuggestion {
-    /// Stable machine kind, e.g. `"frequently_bypassed"` or `"never_fired"`.
+    /// Stable machine kind, e.g. `"frequently_bypassed"` / `"never_fired"`.
     pub kind: &'static str,
-    /// The rule this suggestion is about.
     pub rule_id: String,
-    /// How strongly the data supports the suggestion.
     pub confidence: Confidence,
     /// One-line headline of what was observed.
     pub observation: String,
-    /// The concrete adjustment the user could make, in plain language.
+    /// The concrete adjustment, in plain language.
     pub recommendation: String,
     /// A copy-pasteable policy YAML snippet, when one applies.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,23 +80,18 @@ pub struct TuneSuggestion {
 /// The full result of analysing an audit log for tuning opportunities.
 #[derive(Debug, Clone, Serialize)]
 pub struct TuneReport {
-    /// Number of `verdict` records considered.
     pub records_analyzed: usize,
-    /// True when there were fewer than [`MIN_OBSERVATIONS`] records — no
-    /// suggestion is trustworthy and the list below is empty.
+    /// True when fewer than [`MIN_OBSERVATIONS`] records — no suggestion is
+    /// trustworthy, `suggestions` is empty.
     pub data_is_thin: bool,
-    /// Per-rule firing statistics, sorted by total firings descending.
+    /// Per-rule stats, sorted by total firings descending.
     pub rule_stats: Vec<RuleStats>,
-    /// The concrete suggestions, most actionable first. Empty when the data is
-    /// thin or when nothing in the log warrants a change.
+    /// Suggestions, most actionable first; empty when data is thin or nothing warrants a change.
     pub suggestions: Vec<TuneSuggestion>,
 }
 
-/// Roll up per-rule statistics from a slice of audit records.
-///
-/// Only `verdict` records are counted; `hook_telemetry` and `trust_change`
-/// entries are ignored. Returned vec is sorted by `total` descending, then by
-/// `rule_id` for a stable order.
+/// Roll up per-rule statistics from audit records. Only `verdict` records are
+/// counted; returned sorted by `total` descending, then `rule_id`.
 pub fn compute_rule_stats(records: &[AuditRecord]) -> Vec<RuleStats> {
     let mut by_rule: BTreeMap<String, RuleStats> = BTreeMap::new();
 
@@ -153,14 +128,13 @@ fn is_verdict(r: &AuditRecord) -> bool {
 }
 
 /// Analyse audit records and produce conservative tuning suggestions.
-///
-/// `known_rule_ids` is the set of every rule ID tirith can emit, used to point
-/// out rules that have *never* fired. Pass an empty slice to skip that check.
+/// `known_rule_ids` (every rule tirith can emit) drives the never-fired check;
+/// pass empty to skip it.
 pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
     let verdict_count = records.iter().filter(|r| is_verdict(r)).count();
     let rule_stats = compute_rule_stats(records);
 
-    // Thin data: report stats but make no suggestions. Honesty over guessing.
+    // Thin data: report stats but make no suggestions.
     if verdict_count < MIN_OBSERVATIONS {
         return TuneReport {
             records_analyzed: verdict_count,
@@ -172,16 +146,14 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
 
     let mut suggestions = Vec::new();
 
-    // Suggestion 1 — a rule that fires often and is waved through every time,
-    // or nearly every time. This is the strongest, most useful signal: the rule
-    // is producing findings the user consistently does not act on.
+    // Suggestion 1 — a rule that fires often and is (nearly) always waved
+    // through: the strongest signal the user isn't acting on it.
     for stats in &rule_stats {
         if stats.total < MIN_RULE_FIRINGS {
             continue;
         }
         let waved = stats.waved_through();
-        // Only suggest when the rule was NEVER blocked — a rule the user
-        // sometimes blocks on is doing its job and must not be downgraded.
+        // Never suggest downgrading a rule the user sometimes blocks on.
         if stats.blocked > 0 {
             continue;
         }
@@ -204,7 +176,7 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
                 policy_snippet: Some(severity_override_snippet(&stats.rule_id)),
             });
         } else if waved >= (stats.total * 4).div_ceil(5) {
-            // >= 80% waved through (ceil division), never blocked: moderate.
+            // >= 80% waved through, never blocked: moderate.
             suggestions.push(TuneSuggestion {
                 kind: "frequently_bypassed",
                 rule_id: stats.rule_id.clone(),
@@ -223,13 +195,9 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
         }
     }
 
-    // Suggestion 2 — rules that have never fired. Purely informational: it
-    // never recommends disabling a rule (a rule that has not fired may simply
-    // not have been provoked yet). It is only emitted when it is genuinely
-    // informative — i.e. the command history exercises *most* rules and only a
-    // short, nameable list is unused. When the log is small relative to the
-    // rule set (the common case), "never fired" is just "you have not used
-    // tirith much" and is silently skipped rather than dumping a huge list.
+    // Suggestion 2 — never-fired rules. Purely informational (never recommends
+    // disabling); emitted only when most rules fired and a short list is unused,
+    // else it's just "you haven't used tirith much" and is skipped.
     if !known_rule_ids.is_empty() {
         let fired: std::collections::HashSet<&str> =
             rule_stats.iter().map(|s| s.rule_id.as_str()).collect();
@@ -239,9 +207,7 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
             .filter(|id| !fired.contains(id))
             .collect();
         never.sort_unstable();
-        // Only informative when at most NEVER_FIRED_MAX_LIST rules are unused —
-        // a short list the user can actually scan. A larger unused set means
-        // the sample is just too narrow to say anything about those rules.
+        // Only informative with a short, scannable unused list (≤ the max).
         if !never.is_empty() && never.len() <= NEVER_FIRED_MAX_LIST {
             suggestions.push(TuneSuggestion {
                 kind: "never_fired",
@@ -262,7 +228,7 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
         }
     }
 
-    // Most actionable first: strong before moderate, then by kind.
+    // Most actionable first: strong before moderate, then by kind, then rule_id.
     suggestions.sort_by(|a, b| {
         confidence_rank(b.confidence)
             .cmp(&confidence_rank(a.confidence))
@@ -285,9 +251,8 @@ fn confidence_rank(c: Confidence) -> u8 {
     }
 }
 
-/// A commented `severity_overrides` snippet for a rule. The user fills in the
-/// target severity — tirith deliberately does not pick one, because lowering a
-/// severity is a judgement call only the user can make.
+/// A commented `severity_overrides` snippet — the user fills in the target
+/// severity (lowering one is a judgement call only they can make).
 fn severity_override_snippet(rule_id: &str) -> String {
     format!(
         "# Reviewed and trusted? Lower the severity (pick LOW/MEDIUM yourself):\nseverity_overrides:\n  {rule_id}: LOW   # or MEDIUM — your call after reviewing the commands"
@@ -337,7 +302,6 @@ mod tests {
 
     #[test]
     fn thin_data_makes_no_suggestions() {
-        // Below MIN_OBSERVATIONS: data_is_thin, empty suggestions.
         let records = n_records(10, "Block", "curl_pipe_shell", false);
         let report = analyze(&records, &[]);
         assert!(report.data_is_thin);
@@ -354,7 +318,7 @@ mod tests {
 
     #[test]
     fn rule_always_allowed_yields_strong_suggestion() {
-        // 25 records, rule always Allow, never blocked → strong suggestion.
+        // Always Allow, never blocked → strong.
         let records = n_records(25, "Allow", "shortened_url", false);
         let report = analyze(&records, &[]);
         let s = report
@@ -369,7 +333,7 @@ mod tests {
 
     #[test]
     fn rule_bypassed_via_honored_bypass_counts_as_waved_through() {
-        // Bypassed commands are logged as Allow with bypass_honored=true.
+        // A bypass is logged as Allow with bypass_honored=true.
         let records = n_records(25, "Allow", "curl_pipe_shell", true);
         let report = analyze(&records, &[]);
         let s = report
@@ -378,7 +342,7 @@ mod tests {
             .find(|s| s.rule_id == "curl_pipe_shell")
             .expect("bypassed rule should yield a suggestion");
         assert_eq!(s.confidence, Confidence::Strong);
-        // waved_through must not double-count Allow + honored-bypass.
+        // waved_through must not double-count Allow + honored bypass.
         let stats = report
             .rule_stats
             .iter()
@@ -389,8 +353,7 @@ mod tests {
 
     #[test]
     fn rule_sometimes_blocked_is_never_suggested_for_downgrade() {
-        // 20 Allow + 5 Block of the same rule: the rule IS catching real
-        // things, so it must NOT be suggested for a downgrade.
+        // 20 Allow + 5 Block: the rule IS catching real things → no downgrade.
         let mut records = n_records(20, "Allow", "curl_pipe_shell", false);
         records.extend(n_records(5, "Block", "curl_pipe_shell", false));
         let report = analyze(&records, &[]);
@@ -405,7 +368,7 @@ mod tests {
 
     #[test]
     fn mostly_waved_through_yields_moderate_suggestion() {
-        // 22 Allow + 3 Warn (no Block) of the same rule = 88% waved through.
+        // 22 Allow + 3 Warn (no Block) = 88% waved through → moderate.
         let mut records = n_records(22, "Allow", "non_standard_port", false);
         records.extend(n_records(3, "Warn", "non_standard_port", false));
         let report = analyze(&records, &[]);
@@ -419,8 +382,7 @@ mod tests {
 
     #[test]
     fn warned_but_not_allowed_rule_is_not_suggested() {
-        // 25 Warn records, never Allow, never Block: not waved through,
-        // not blocked — no downgrade suggestion (only ~0% waved).
+        // 25 Warn, never Allow/Block → not waved through, no downgrade.
         let records = n_records(25, "Warn", "shortened_url", false);
         let report = analyze(&records, &[]);
         assert!(
@@ -434,8 +396,7 @@ mod tests {
 
     #[test]
     fn rule_below_min_firings_is_not_suggested() {
-        // 22 records: 3 fire shortened_url (always Allow), 19 fire something
-        // else. shortened_url is below MIN_RULE_FIRINGS so no suggestion.
+        // shortened_url fires only 3× (< MIN_RULE_FIRINGS) → no suggestion.
         let mut records = n_records(3, "Allow", "shortened_url", false);
         records.extend(n_records(19, "Allow", "plain_http_to_sink", false));
         let report = analyze(&records, &[]);
@@ -458,11 +419,10 @@ mod tests {
             .iter()
             .find(|s| s.kind == "never_fired")
             .expect("never-fired suggestion expected");
-        // curl_pipe_shell and raw_ip_url never fired.
         assert!(nf.recommendation.contains("curl_pipe_shell"));
         assert!(nf.recommendation.contains("raw_ip_url"));
         assert!(!nf.recommendation.contains("shortened_url"));
-        // It must be explicitly informational, never a disable recommendation.
+        // Must be informational, never a disable recommendation.
         assert!(nf.recommendation.to_lowercase().contains("informational"));
     }
 
@@ -475,9 +435,7 @@ mod tests {
 
     #[test]
     fn never_fired_suppressed_when_unused_list_is_too_large() {
-        // Only `shortened_url` fired; a known set far larger than
-        // NEVER_FIRED_MAX_LIST has not. The never-fired note must be SKIPPED
-        // rather than dumping a huge, useless list.
+        // Unused set > NEVER_FIRED_MAX_LIST → the note is SKIPPED.
         let records = n_records(25, "Allow", "shortened_url", false);
         let mut known: Vec<String> = (0..NEVER_FIRED_MAX_LIST + 5)
             .map(|i| format!("rule_{i}"))
@@ -498,8 +456,7 @@ mod tests {
 
     #[test]
     fn never_fired_emitted_when_unused_list_is_small() {
-        // Exactly NEVER_FIRED_MAX_LIST unused rules — at the boundary, still
-        // emitted (the list is short enough to scan).
+        // Exactly NEVER_FIRED_MAX_LIST unused rules — boundary, still emitted.
         let records = n_records(25, "Allow", "shortened_url", false);
         let mut known: Vec<String> = (0..NEVER_FIRED_MAX_LIST)
             .map(|i| format!("rule_{i}"))
@@ -515,8 +472,7 @@ mod tests {
 
     #[test]
     fn strong_suggestions_sort_before_moderate() {
-        // shortened_url: 25/25 Allow → strong. non_standard_port: 22 Allow +
-        // 3 Warn → moderate. Strong must come first.
+        // shortened_url (strong) must sort before non_standard_port (moderate).
         let mut records = n_records(25, "Allow", "shortened_url", false);
         records.extend(n_records(22, "Allow", "non_standard_port", false));
         records.extend(n_records(3, "Warn", "non_standard_port", false));

@@ -51,9 +51,9 @@ const KNOWN_CONFIG_DIRS: &[(&str, &str)] = &[
     (".amazonq", "mcp.json"),
 ];
 
-/// Deep directory patterns: (dir_path_components, allowed_extensions).
-/// Matches files like `.claude/skills/foo.md` where parent path starts with
-/// the dir components and file extension matches one of the allowed extensions.
+/// Deep directory patterns: (dir_path_components, allowed_extensions). Matches
+/// e.g. `.claude/skills/foo.md` — parent starts with the components, extension
+/// is allowed.
 const KNOWN_CONFIG_DEEP_DIRS: &[(&[&str], &[&str])] = &[
     (&[".claude", "skills"], &["md"]),
     (&[".claude", "plugins"], &["md", "json"]),
@@ -161,10 +161,9 @@ impl ConfigPathMatcher {
         &self.repo_root
     }
 
-    /// Classify a file by extension alone within an already-identified config
-    /// directory (e.g., `.claude` inside `vendor/pkg/` found by the excluded-tree
-    /// probe). Root-anchoring is bypassed because the caller already verified
-    /// the directory identity. `file_path` is relative to the config dir root.
+    /// Classify a file by extension within an already-identified config dir
+    /// (root-anchoring bypassed because the caller verified the dir identity).
+    /// `file_path` is relative to the config dir root.
     pub fn is_valid_config_extension_for_dir(
         &self,
         file_path: &Path,
@@ -278,9 +277,8 @@ impl ConfigPathMatcher {
             }
         }
 
-        // Deep-directory fragments are root-anchored: they must start at the
-        // first component of the repo-relative path, otherwise a path like
-        // `docs/examples/.claude/skills/demo.md` would false-positive.
+        // Deep-directory fragments are root-anchored (must start at the first
+        // component), else `docs/examples/.claude/skills/demo.md` false-positives.
         if let Some(ext) = relative.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_ascii_lowercase();
             for (frag_components, frag_exts) in &self.deep_dir_fragments {
@@ -409,11 +407,10 @@ static WEAK_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     .collect()
 });
 
-/// Legacy injection patterns — kept for backward compatibility with existing rules.
-/// These are the original patterns from the initial implementation.
+/// Legacy injection patterns — the original set, kept for backward compatibility.
 static LEGACY_INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     [
-        // Instruction override (10 patterns from wysiwyg)
+        // Instruction override
         (
             r"(?i)ignore\s+(previous|above|all)\s+(instructions|rules|guidelines)",
             "Instruction override",
@@ -436,7 +433,7 @@ static LEGACY_INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|
         (r"(?i)override\s+(previous|system)", "Override attempt"),
         (r"(?i)act\s+as\s+(if|though)", "Persona manipulation"),
         (r"(?i)pretend\s+(you|to\s+be)", "Persona manipulation"),
-        // Tool-calling injection (3 patterns)
+        // Tool-calling injection
         (
             r"(?i)execute\s+(this|the\s+following)\s+(command|script|code)",
             "Command execution",
@@ -449,13 +446,13 @@ static LEGACY_INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|
             r"(?i)use\s+the\s+(bash|terminal|shell|exec)\s+tool",
             "Tool invocation",
         ),
-        // Exfiltration (2 patterns)
+        // Exfiltration
         (r"(?i)(curl|wget|fetch)\s+.*--data", "Data exfiltration"),
         (
             r"(?i)send\s+(this|the|all)\s+(to|via)\s+(https?|webhook|slack|api)",
             "Exfiltration",
         ),
-        // Privilege escalation (3 patterns)
+        // Privilege escalation
         (
             r"(?i)with\s+(root|admin|elevated)\s+(access|permissions|privileges)",
             "Privilege escalation",
@@ -489,15 +486,13 @@ static EXCEPTION_RE: Lazy<Regex> =
 static SHELL_METACHAR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[;|&`$]").expect("shell metachar regex"));
 
-/// Check file content for config poisoning issues.
+/// Check file content for config poisoning issues (prompt injection, invisible
+/// unicode, non-ASCII, MCP issues).
 ///
-/// `file_path` is used to identify known AI config files by name.
-/// `repo_root` enables absolute-to-relative path normalization for correct classification.
-/// `trusted_mcp_servers` is `policy.scan.trusted_mcp_servers`: a server name
-/// listed there suppresses every per-server MCP config finding for that
-/// server (insecure transport, raw IP, suspicious args, wildcard tools, and
-/// duplicate-name when the duplicate's name is itself trusted).
-/// Returns findings for prompt injection, invisible unicode, non-ASCII, and MCP issues.
+/// `file_path` identifies known config files; `repo_root` normalizes absolute
+/// paths. `trusted_mcp_servers` (`policy.scan.trusted_mcp_servers`): a listed
+/// server name suppresses every per-server MCP finding (transport, raw IP,
+/// args, wildcard tools — but NOT duplicate-name).
 pub fn check(
     content: &str,
     file_path: Option<&Path>,
@@ -513,9 +508,8 @@ pub fn check(
             .unwrap_or(false);
     let is_mcp = file_path.map(is_mcp_config_file).unwrap_or(false);
 
-    // Invisible-unicode detection runs only on known config files. Non-config
-    // files reach this through the FileScan path's byte-level scan in
-    // `terminal::check_bytes`, so re-running here would double-report.
+    // Invisible-unicode runs only on known config files; non-config files get it
+    // via `terminal::check_bytes` in the FileScan path, so re-running here double-reports.
     if is_known || is_mcp {
         check_invisible_unicode(content, is_known || is_mcp, &mut findings);
     }
@@ -532,10 +526,8 @@ pub fn check(
         }
     }
 
-    // M8 ch5 — `.devcontainer/devcontainer.json` (or `.devcontainer.json`) is
-    // a known config file. Scan its `runArgs` / `mounts` arrays for
-    // `--privileged` and sensitive bind-mount sources. Uses the shared
-    // strip-then-parse JSONC tolerant reader.
+    // M8 ch5 — scan a devcontainer.json's `runArgs` / `mounts` for `--privileged`
+    // and sensitive bind-mount sources.
     if let Some(path) = file_path {
         if is_devcontainer_file(path) {
             check_devcontainer_config(content, &mut findings);
@@ -557,20 +549,15 @@ fn is_devcontainer_file(path: &Path) -> bool {
         return true;
     }
     if basename == "devcontainer.json" {
-        // Accept any path whose basename is devcontainer.json — covers
-        // `.devcontainer/devcontainer.json` (the most common layout) as
-        // well as nested feature variants like
-        // `.devcontainer/dev/devcontainer.json` that the VS Code remote
-        // extension also recognizes.
+        // Any devcontainer.json basename — covers `.devcontainer/devcontainer.json`
+        // and nested feature variants the VS Code remote extension recognizes.
         return true;
     }
     false
 }
 
-/// M8 ch5 — scan a devcontainer.json's `runArgs` and `mounts` arrays
-/// for high-risk container-runtime settings. Uses the shared
-/// `strip_jsonc_comments` helper so JSONC comments / trailing commas
-/// don't break the parser.
+/// M8 ch5 — scan a devcontainer.json's `runArgs`/`mounts` for high-risk
+/// container-runtime settings. Strips JSONC comments first so the parser holds.
 fn check_devcontainer_config(content: &str, findings: &mut Vec<Finding>) {
     let stripped = crate::devcontainer_writer::strip_jsonc_comments(content);
     let value: serde_json::Value = match serde_json::from_str(&stripped) {
@@ -607,9 +594,7 @@ fn check_devcontainer_config(content: &str, findings: &mut Vec<Finding>) {
             });
         }
 
-        // -v / --volume entries inside runArgs too. The shape is
-        // `runArgs: ["-v", "/var/run/docker.sock:/var/run/docker.sock", ...]`
-        // OR `["--volume=/etc:/host/etc", ...]`.
+        // -v / --volume bind mounts inside runArgs too.
         if let Some(src) = devcontainer_run_args_bind_mount(args) {
             findings.push(Finding {
                 rule_id: RuleId::DockerRunSensitiveBindMount,
@@ -634,9 +619,8 @@ fn check_devcontainer_config(content: &str, findings: &mut Vec<Finding>) {
         }
     }
 
-    // The dedicated `mounts` array uses the same `type=bind,source=…`
-    // shape as `docker run --mount`. Each entry is a string OR an object
-    // with a `source` / `src` field.
+    // The `mounts` array uses the `docker run --mount` shape; each entry is a
+    // string OR an object with a `source`/`src` field.
     if let Some(mounts) = value.get("mounts").and_then(|v| v.as_array()) {
         if let Some(src) = devcontainer_mounts_sensitive(mounts) {
             findings.push(Finding {
@@ -824,7 +808,6 @@ fn is_mcp_config_file(path: &Path) -> bool {
         return true;
     }
 
-    // Parent dir patterns for MCP configs
     // Some IDEs ship the MCP file under a host dir (e.g. `.vscode/mcp.json`).
     if let Some(parent) = path.parent() {
         let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -988,9 +971,8 @@ fn is_negated(content: &str, match_start: usize, match_end: usize) -> bool {
         return false;
     }
 
-    // Intervening verb/clause breaks negation scope. Example: "Don't hesitate to
-    // bypass" — "hesitate" sits between the negation and the matched action and
-    // inverts the meaning so the match should still fire.
+    // An intervening verb/clause breaks negation scope, e.g. "Don't hesitate to
+    // bypass" — "hesitate" inverts the meaning so the match should still fire.
     static INTERVENING_VERB_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
             r"(?i)\b(?:and\s+then|but\s+instead|however|then|hesitate|try|want|need|wish|plan|decide|choose|proceed|continue|start|begin|feel\s+free|go\s+ahead)\b"
@@ -1013,8 +995,8 @@ fn is_negated(content: &str, match_start: usize, match_end: usize) -> bool {
 /// Check for prompt injection patterns in file content.
 /// Uses strong/weak pattern separation with negation post-filter.
 fn check_prompt_injection(content: &str, is_known: bool, findings: &mut Vec<Finding>) {
-    // Iterate every match per pattern, not just the first: a leading negated match
-    // ("never bypass") shouldn't suppress a later malicious match on the same line.
+    // Iterate every match per pattern: a leading negated match ("never bypass")
+    // must not suppress a later malicious match on the same line.
     let mut strong_found = false;
     for (regex, description) in STRONG_PATTERNS.iter() {
         for m in regex.find_iter(content) {
@@ -1163,13 +1145,9 @@ fn check_mcp_config(
     };
 
     for (name, config) in servers {
-        // Policy suppression: a trusted MCP server name silences all per-server
-        // config findings (insecure transport, raw IP, suspicious args,
-        // wildcard tools). The trust list is a deliberate operator decision;
-        // every finding it suppresses is something the operator has reviewed
-        // and accepted. Drift detection — the `mcp_server_drift` rule — is
-        // handled separately in `mcpdrift.rs`; this only short-circuits the
-        // configfile rules.
+        // A trusted MCP server name silences all per-server config findings
+        // (deliberate operator decision). Drift detection (`mcp_server_drift`) is
+        // separate in `mcpdrift.rs`; this only short-circuits the configfile rules.
         if is_trusted_mcp_server(name, trusted_servers) {
             continue;
         }
@@ -1188,27 +1166,19 @@ fn check_mcp_config(
     }
 }
 
-/// `true` when `name` is in the policy's `trusted_mcp_servers` list.
-/// Exact case-sensitive match — MCP server names are arbitrary
-/// identifiers, not URLs, so locale-insensitive folding is not
-/// appropriate.
+/// `true` when `name` is in `trusted_mcp_servers`. Exact case-sensitive match —
+/// MCP server names are identifiers, not URLs, so no case folding.
 fn is_trusted_mcp_server(name: &str, trusted: &[String]) -> bool {
     trusted.iter().any(|t| t == name)
 }
 
-/// Detect duplicate server names by raw JSON token scanning; `serde_json`
-/// deduplicates object keys silently so duplicates must be caught beforehand.
+/// Detect duplicate server names by raw JSON token scanning (serde_json silently
+/// dedups object keys, so duplicates must be caught beforehand).
 ///
-/// **Trust does NOT suppress this finding.** A duplicate server name is a
-/// structural ambiguity — which entry wins when the MCP client reads the
-/// config? `trusted_mcp_servers` declares that the operator accepts a
-/// server's *surface*, but trust on one of two collisions does not
-/// resolve the collision: the consumer still picks one entry over the
-/// other in an order-dependent way. The hazard the duplicate finding
-/// reports (tool shadowing, definition override) is independent of
-/// whether the operator trusted either side. PR #121 item 15 fixes
-/// this; the parameter is no longer consulted here (kept for signature
-/// stability).
+/// **Trust does NOT suppress this finding** (PR #121 item 15): a duplicate name
+/// is a structural ambiguity (which entry wins?) that trust on one collision
+/// cannot resolve. The `_trusted_servers` param is unused, kept for signature
+/// stability.
 fn check_mcp_duplicate_names(
     content: &str,
     path: &Path,
@@ -1298,10 +1268,7 @@ fn check_mcp_duplicate_names(
     let path_str = path.display().to_string();
     for key in &keys {
         if seen.contains(&key.as_str()) {
-            // PR #121 item 15 — duplicates always report, regardless of
-            // trust. A duplicate is a structural ambiguity (which entry
-            // wins?) that trust on one of the colliding names does not
-            // resolve.
+            // PR #121 item 15 — duplicates always report, regardless of trust.
             findings.push(Finding {
                 rule_id: RuleId::McpDuplicateServerName,
                 severity: Severity::High,
@@ -1965,12 +1932,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Chunk 3 — policy-aware MCP suppression: a server name in
-    // `policy.scan.trusted_mcp_servers` silences every per-server MCP config
-    // finding (insecure transport, raw IP, suspicious args, wildcard tools,
-    // and duplicate-name when the duplicate's name is trusted).
-    // -----------------------------------------------------------------------
+    // Chunk 3 — policy-aware MCP suppression: a trusted_mcp_servers name silences
+    // per-server MCP config findings (but not duplicate-name).
 
     #[test]
     fn test_trusted_mcp_server_suppresses_insecure_url_finding() {
@@ -2026,10 +1989,8 @@ mod tests {
 
     #[test]
     fn test_trusted_mcp_server_does_not_suppress_duplicate_name_finding() {
-        // PR #121 item 15 — A duplicate name is a structural ambiguity
-        // (which entry wins?) that trust on one of the colliding names
-        // does not resolve. The duplicate finding must fire regardless
-        // of trust.
+        // PR #121 item 15 — a duplicate name is structural ambiguity that trust
+        // cannot resolve; the finding must fire regardless of trust.
         let content = r#"{"mcpServers":{"server-a":{"command":"a"},"server-a":{"command":"b"}}}"#;
         let trusted = vec!["server-a".to_string()];
         let findings = check(content, Some(Path::new("mcp.json")), None, false, &trusted);

@@ -4,11 +4,8 @@ use tirith_core::output;
 use tirith_core::scoring::{self, ScoreBreakdown};
 use tirith_core::tokenize::ShellType;
 
-/// Run `tirith score <url>`.
-///
-/// `explain` switches on the full deterministic factor breakdown — exactly how
-/// the risk score was derived, factor by factor, so a user can reproduce the
-/// number by hand.
+/// Run `tirith score <url>`. `explain` adds the full deterministic factor
+/// breakdown so a user can reproduce the score by hand.
 pub fn run(url: &str, json: bool, explain: bool) -> i32 {
     let ctx = AnalysisContext {
         input: url.to_string(),
@@ -29,9 +26,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
 
     let verdict = engine::analyze(&ctx);
     let breakdown = scoring::score_verdict(&verdict);
-    // Defence in depth: the breakdown is the public contract that the factors
-    // sum to the score. score_findings guarantees this; assert it in debug so a
-    // future factor that breaks the invariant is caught immediately.
+    // Defence in depth: assert the factors-sum-to-score invariant in debug.
     debug_assert!(
         breakdown.verify(),
         "score breakdown factors must sum to the final score"
@@ -58,7 +53,7 @@ fn print_json(
         score: u32,
         risk_level: &'a str,
         findings: &'a [tirith_core::verdict::Finding],
-        /// Full factor breakdown — present only with `--explain`.
+        /// Full factor breakdown — only with `--explain`.
         #[serde(skip_serializing_if = "Option::is_none")]
         score_breakdown: Option<&'a ScoreBreakdown>,
     }
@@ -99,17 +94,14 @@ fn print_human(
     }
 }
 
-/// Render the factor breakdown so the reader can reproduce the score by hand:
-/// each factor's contribution is printed, then the running total, then the
-/// final score with an explicit "sum of the above" note.
+/// Render the factor breakdown to stderr so the reader can reproduce the score
+/// by hand. Formatting lives in [`write_breakdown_human`] for testability.
 fn print_breakdown_human(breakdown: &ScoreBreakdown) {
-    // Render to a locked stderr handle. The actual formatting lives in
-    // `write_breakdown_human` so it can be unit-tested against a buffer.
     let _ = write_breakdown_human(breakdown, &mut std::io::stderr().lock());
 }
 
 /// Write the factor breakdown to `w`. Separated from [`print_breakdown_human`]
-/// purely so tests can capture the rendered text; the output is identical.
+/// so tests can capture the rendered text; output is identical.
 fn write_breakdown_human(
     breakdown: &ScoreBreakdown,
     w: &mut impl std::io::Write,
@@ -122,7 +114,7 @@ fn write_breakdown_human(
     let mut running: i32 = 0;
     for factor in &breakdown.factors {
         running += factor.points;
-        // `+NN` for positive contributions, `-NN` for the clamp factor.
+        // `+NN` for positive contributions, bare `-NN` for the clamp factor.
         let sign = if factor.points >= 0 { "+" } else { "" };
         writeln!(
             w,
@@ -170,8 +162,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_clean_zero_finding_url() {
-        // `score --explain` on a URL with no findings: the breakdown still
-        // renders, every factor is +0, and the total line reads 0/100 (low).
+        // No findings: the breakdown still renders, every factor +0, total 0/100.
         let breakdown = scoring::score_findings(&[]);
         assert_eq!(breakdown.score, 0);
         let out = render(&breakdown);
@@ -180,12 +171,11 @@ mod tests {
             out.contains("score breakdown"),
             "must print the breakdown header: {out}"
         );
-        // Base severity factor: +0 for no findings.
         assert!(
             out.contains("+0"),
             "a zero-finding breakdown must show a +0 factor: {out}"
         );
-        // No factor should render with a negative sign on a clean URL.
+        // No factor should render negative on a clean URL.
         assert!(
             !out.contains("    -"),
             "a clean URL has no negative (clamp) factor: {out}"
@@ -202,9 +192,8 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_negative_clamp_factor() {
-        // 5 critical findings: 90 base + 4*5 = 110 raw → clamps to 100 with an
-        // explicit -10 clamp factor. The renderer must show that -10 without a
-        // leading '+', and the total line must read 100/100.
+        // 5 critical findings: 110 raw → clamps to 100 with an explicit -10
+        // factor rendered without a leading '+'; total reads 100/100.
         let findings: Vec<Finding> = (0..5)
             .map(|_| finding(RuleId::CurlPipeShell, Severity::Critical))
             .collect();

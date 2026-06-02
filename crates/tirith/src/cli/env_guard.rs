@@ -1,35 +1,18 @@
-//! `tirith env guard|diff|explain` (M9 ch4).
+//! `tirith env guard|diff|explain` (M9 ch4). Thin presenter over
+//! [`tirith_core::env_guard`] — output, snapshot persistence, and the
+//! `policy.env_guard_enabled` toggle; the list/snapshot/diff/scan logic lives
+//! in the library. **Variable VALUES are never read into argv or printed**
+//! anywhere here.
 //!
-//! Thin presenter over [`tirith_core::env_guard`]. The sensitive-variable
-//! list, snapshot/diff logic, and rc-file `explain` scan all live in the
-//! library; this module is output, snapshot persistence, and the
-//! `policy.env_guard_enabled` flag toggle.
-//!
-//! ## `guard on|off|status`
-//!
-//! Flips `policy.env_guard_enabled` (append-or-rewrite a single line in the
-//! local `policy.yaml`, mirroring `tirith context guard`). When ON, the two
-//! exec-path env-guard rules fire from `engine::analyze`. `status` prints the
-//! current flag without modifying anything.
-//!
-//! ## `diff [--reset]`
-//!
-//! Compares the sensitive vars currently set in this process against the
-//! shell-start snapshot at `state_dir()/env_snapshot.json`, reporting which
-//! sensitive vars are newly-set or value-changed. **Values are never printed.**
-//! `--reset` rewrites the snapshot from the current environment (re-baseline).
-//!
-//! ## `explain <VAR>`
-//!
-//! Locates where `<VAR>` is `export`ed across the user's rc/profile files
-//! (file + line), with the value MASKED to `****`, and reports whether it is
-//! currently set in the process. **The value is never read or printed.**
-//!
-//! ## `_snapshot` (hidden)
-//!
-//! Writes the shell-start snapshot. The shell hook execs this child once per
-//! session; the child reads its OWN inherited environment and stores variable
-//! NAMES + 8-char value-hash prefixes — no value ever crosses an argv boundary.
+//! - `guard on|off|status`: flip / report `policy.env_guard_enabled` (when ON,
+//!   the two exec-path env-guard rules fire from `engine::analyze`).
+//! - `diff [--reset]`: compare sensitive vars set now vs the shell-start
+//!   snapshot at `state_dir()/env_snapshot.json` (names/deltas only); `--reset`
+//!   re-baselines.
+//! - `explain <VAR>`: locate where `<VAR>` is exported (file + line), value
+//!   MASKED to `****`.
+//! - `_snapshot` (hidden): the shell hook execs this child once per session; it
+//!   reads its OWN environment and stores NAMES + 8-char value-hash prefixes.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -38,8 +21,6 @@ use tirith_core::env_guard::{self, EnvSnapshot};
 use tirith_core::policy::{self as policy_mod, Policy};
 
 use super::write_json_stdout;
-
-// ─── guard on|off|status ─────────────────────────────────────────────────────
 
 /// `tirith env guard on|off|status` — flip / report `policy.env_guard_enabled`.
 pub fn guard(action: &str, json: bool) -> i32 {
@@ -88,8 +69,7 @@ pub fn guard(action: &str, json: bool) -> i32 {
 fn guard_status(json: bool) -> i32 {
     let policy = Policy::discover_partial(None);
     let sensitive = env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
-    // Scan rc/profile files for persisted sensitive exports — this is the
-    // producer for RuleId::EnvSensitivePersistedInShellRc. Values are masked.
+    // Producer for RuleId::EnvSensitivePersistedInShellRc (values masked).
     let rc_findings =
         env_guard::scan_rc_for_sensitive_exports(&sensitive, home::home_dir().as_deref());
 
@@ -130,7 +110,7 @@ fn guard_status(json: bool) -> i32 {
             );
         }
     }
-    // Exit 1 when a persisted secret is found so a script / CI can gate on it.
+    // Exit 1 on a persisted secret so a script / CI can gate on it.
     if rc_findings.is_empty() {
         0
     } else {
@@ -149,9 +129,8 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set / update the `env_guard_enabled` line in a policy YAML
-/// file. Append-or-rewrite — never touches other lines (mirrors
-/// `cli::context::update_policy_guard_key`).
+/// Idempotently append-or-rewrite the `env_guard_enabled` line in a policy YAML,
+/// never touching other lines (mirrors `cli::context::update_policy_guard_key`).
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -190,12 +169,9 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     f.write_all(out.as_bytes())
 }
 
-// ─── diff ──────────────────────────────────────────────────────────────────
-
 /// `tirith env diff [--reset]` — show sensitive vars set/changed since shell
-/// start. Exit 1 if any sensitive var newly-appeared (a credential entered the
-/// shell after start is worth a non-zero exit for scripting); 0 otherwise.
-/// `--reset` re-baselines the snapshot and exits 0.
+/// start. Exit 1 if any newly appeared (worth a non-zero exit for scripting),
+/// else 0. `--reset` re-baselines and exits 0.
 pub fn diff(reset: bool, json: bool) -> i32 {
     let policy = Policy::discover_partial(None);
     let sensitive = env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
@@ -255,8 +231,8 @@ fn print_human_diff(
             "  The shell hook records one at shell start; run `tirith env diff --reset` to \
              baseline now, or open a new shell with the hook installed."
         );
-        // Still report what's currently set (treated as newly-set vs the
-        // empty baseline) so the command is useful without a snapshot.
+        // Still report what's currently set (vs the empty baseline) so the
+        // command is useful without a snapshot.
     }
     if entries.is_empty() {
         eprintln!("tirith env diff: no sensitive environment variables set since shell start.");
@@ -276,8 +252,8 @@ fn print_human_diff(
     eprintln!("\nRun `tirith env explain <VAR>` to see where a variable is set (value masked).");
 }
 
-/// `tirith env diff --reset` — re-baseline the snapshot from the current
-/// environment. Writes NAMES + 8-char value-hash prefixes only.
+/// `tirith env diff --reset` — re-baseline from the current environment
+/// (NAMES + 8-char value-hash prefixes only).
 fn reset_snapshot(json: bool) -> i32 {
     let snap_path = match env_guard::snapshot_path() {
         Some(p) => p,
@@ -318,12 +294,9 @@ fn reset_snapshot(json: bool) -> i32 {
     0
 }
 
-// ─── explain ─────────────────────────────────────────────────────────────────
-
 /// `tirith env explain <VAR>` — show where a variable is set (value masked).
-/// Always exits 0 (informational), except exit 2 when the variable is neither
-/// set in the process NOR found in any rc file, so a script can distinguish
-/// "not configured anywhere" from "found".
+/// Exit 0, except 2 when the var is neither set in the process nor in any rc
+/// file, so a script can tell "not configured anywhere" from "found".
 pub fn explain(var: &str, json: bool) -> i32 {
     let ex = env_guard::explain_var(var);
 
@@ -360,20 +333,16 @@ fn print_human_explain(ex: &env_guard::EnvExplain) {
     }
     eprintln!("  exported in:");
     for src in &ex.sources {
-        // The masked_line already has the value replaced with ****.
+        // masked_line already has the value replaced with ****.
         eprintln!("    {}:{}  {}", src.file, src.line, src.masked_line);
     }
     eprintln!("\nThe value is never read or printed — only the location and a masked placeholder.");
 }
 
-// ─── hidden snapshot writer (shell hook) ─────────────────────────────────────
-
 /// `tirith env _snapshot` — write the shell-start snapshot from THIS process's
-/// inherited environment. Invoked by the shell hook once per session. Stores
-/// variable NAMES + 8-char value-hash prefixes only; no value crosses an argv
-/// boundary because the child reads its own `std::env`. Silent on success
-/// (the hook runs it in the background); always exits 0 so a write failure
-/// never disrupts the shell.
+/// inherited environment (NAMES + 8-char value-hash prefixes only; no value
+/// crosses argv). Invoked by the hook once per session; always exits 0 so a
+/// write failure never disrupts the shell.
 pub fn snapshot_write() -> i32 {
     if let Some(path) = env_guard::snapshot_path() {
         let snapshot = EnvSnapshot::from_current_process();

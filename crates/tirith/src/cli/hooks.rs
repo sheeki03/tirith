@@ -1,35 +1,16 @@
 //! `tirith hooks scan|guard|explain` (M9 ch6).
 //!
-//! Thin presenter over [`tirith_core::repo_hooks`]. Inventory + classification
-//! live entirely in the library; this module is output, the
-//! `policy.hooks_guard_enabled` flag toggle, and body redaction.
+//! Thin presenter over [`tirith_core::repo_hooks`] (inventory + classification
+//! live in the library): output, the `policy.hooks_guard_enabled` toggle, and
+//! body redaction.
 //!
-//! ## `scan`
-//!
-//! Inventories every hook + automation surface in the current repo
-//! (`.git/hooks/*`, `.husky/*`, `lefthook.yml`, `.pre-commit-config.yaml`,
-//! `package.json` lifecycle scripts, `.envrc`, `mise`/`asdf`, `Makefile`,
-//! `justfile`, `Taskfile`) and reports each with its risk classification.
-//! Hooks (auto-executed) and automation (run by hand) are listed separately.
-//! Static read only — a hook is never executed.
-//!
-//! Exit codes:
-//! - `0` — no High/Critical finding.
-//! - `1` — at least one High/Critical finding.
-//!
-//! ## `guard on|off|status`
-//!
-//! Flips `policy.hooks_guard_enabled` (append-or-rewrite a single line in the
-//! local `policy.yaml`, mirroring `tirith env guard`). When ON, the exec hot
-//! path warns when a hook-triggering command (`git commit`, `npm install`, …)
-//! runs in a repo whose triggered hooks make a network call / read credentials
-//! / use sudo. `status` prints the current flag.
-//!
-//! ## `explain <name>`
-//!
-//! Shows the body of every surface matching `<name>` (a name like `pre-commit`
-//! can exist under `.git/hooks`, `.husky`, AND `lefthook.yml`), with the body
-//! CREDENTIAL-REDACTED, plus any findings against it.
+//! - `scan` — inventory + risk-classify every hook/automation surface in the
+//!   repo (static read only; never executes a hook). Exit 1 if any High/Critical.
+//! - `guard on|off|status` — flip `policy.hooks_guard_enabled` (append-or-rewrite
+//!   one line, like `tirith env guard`); ON makes the exec path warn when a
+//!   hook-triggering command runs in a repo whose hooks network/read-creds/sudo.
+//! - `explain <name>` — show every matching surface's body, CREDENTIAL-REDACTED,
+//!   plus findings.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,8 +21,6 @@ use tirith_core::repo_hooks::{self, HookCategory, RepoHookEntry, RepoHookFinding
 use tirith_core::verdict::Severity;
 
 use super::write_json_stdout;
-
-// ─── scan ──────────────────────────────────────────────────────────────────────
 
 /// `tirith hooks scan` — inventory + classify. Exit 1 if any High/Critical.
 pub fn scan(json: bool) -> i32 {
@@ -83,7 +62,7 @@ fn print_human_scan(scan: &RepoHookScan) {
         return;
     }
 
-    // Hooks first (the auto-exec attack surface), then automation.
+    // Hooks (the auto-exec attack surface) first, then automation.
     print_category(scan, HookCategory::Hook, "Hooks (auto-executed):");
     print_category(scan, HookCategory::Automation, "Automation (run by hand):");
 
@@ -128,8 +107,6 @@ fn print_category(scan: &RepoHookScan, category: HookCategory, header: &str) {
     }
     eprintln!();
 }
-
-// ─── guard on|off|status ─────────────────────────────────────────────────────
 
 /// `tirith hooks guard on|off|status` — flip / report `policy.hooks_guard_enabled`.
 pub fn guard(action: &str, json: bool) -> i32 {
@@ -216,9 +193,8 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set / update the `hooks_guard_enabled` line in a policy YAML
-/// file. Append-or-rewrite — never touches other lines (mirrors
-/// `cli::env_guard::update_policy_guard_key`).
+/// Idempotently set the `hooks_guard_enabled` line (append-or-rewrite, never
+/// touching other lines; mirrors `cli::env_guard::update_policy_guard_key`).
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -257,11 +233,8 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     f.write_all(out.as_bytes())
 }
 
-// ─── explain ─────────────────────────────────────────────────────────────────
-
 /// `tirith hooks explain <name>` — show a surface's redacted body + analysis.
-/// Always exits 0 (informational); exit 2 if the name is unknown so a script
-/// can distinguish "no such hook" from "found, clean".
+/// Exit 0 (informational), or 2 if the name is unknown.
 pub fn explain(name: &str, json: bool) -> i32 {
     let matches = repo_hooks::explain_for_cwd(name);
 
@@ -302,7 +275,7 @@ fn print_human_explain(name: &str, matches: &[RepoHookEntry]) {
         if e.body.trim().is_empty() {
             eprintln!("    body: (empty / not captured)");
         } else {
-            // Redact body before display — a hook body may inline a secret.
+            // Redact before display — a hook body may inline a secret.
             let redacted = redact(&e.body);
             for line in redacted.lines() {
                 eprintln!("    | {line}");
@@ -321,8 +294,6 @@ fn print_human_explain(name: &str, matches: &[RepoHookEntry]) {
         print_one_finding(f);
     }
 }
-
-// ─── shared output ─────────────────────────────────────────────────────────────
 
 fn print_one_finding(f: &RepoHookFinding) {
     eprintln!(
@@ -345,8 +316,6 @@ fn severity_label(sev: Severity) -> &'static str {
         Severity::Critical => "CRITICAL",
     }
 }
-
-// ─── JSON output ─────────────────────────────────────────────────────────────
 
 fn scan_json_body(scan: &RepoHookScan) -> serde_json::Value {
     let findings = scan.all_findings();
@@ -376,8 +345,7 @@ fn explain_json_body(name: &str, matches: &[RepoHookEntry]) -> serde_json::Value
     })
 }
 
-/// Serialize an entry for JSON output with its body credential-redacted (the
-/// body can inline a secret; the JSON consumer must not receive it verbatim).
+/// Serialize an entry for JSON, body credential-redacted (it can inline a secret).
 fn hook_entry_json(e: &RepoHookEntry) -> serde_json::Value {
     serde_json::json!({
         "name": e.name,

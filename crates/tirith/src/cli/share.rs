@@ -1,12 +1,8 @@
-//! `tirith share <file>` and `tirith redact` — audience-aware output
-//! redaction (M7 ch2).
-//!
-//! Both subcommands feed the input through
-//! [`tirith_core::redact::redact_for_audience_with_custom`] (or
-//! [`tirith_core::redact::redact_for_audience`] when no policy is
-//! configured) and emit the redacted content to stdout. A summary of
-//! per-label counts goes to stderr; `--json` swaps the human summary for
-//! the documented JSON envelope.
+//! `tirith share <file>` and `tirith redact` — audience-aware output redaction
+//! (M7 ch2). Both feed input through the audience-aware redactor and emit
+//! redacted content to stdout, a per-label summary to stderr (or a JSON envelope
+//! with `--json`). `share` reads a file path (or `-` for stdin); `redact` always
+//! reads stdin. Exit 0 on success, 1 on I/O error.
 //!
 //! ## Audiences (CLI value → behavior)
 //!
@@ -17,9 +13,6 @@
 //! | `llm`          | secrets only; preserves stack traces + paths + line numbers |
 //! | `public-paste` | most aggressive: also `/home/<u>`, `/Users/<u>`, RFC1918 IPs in hostname context |
 //! | `generic`      | same as llm — the safe default |
-//!
-//! `share` reads from a file path (or `-` for stdin); `redact` always
-//! reads stdin. Both exit 0 on success and 1 on I/O errors.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -30,23 +23,16 @@ use tirith_core::redact::{
     redact_for_audience_with_custom, RedactReport, RedactionCount, ShareAudience,
 };
 
-/// Output of `tirith share` and `tirith redact` in `--json` mode.
-///
-/// Kept stable on purpose so wrappers can pipe `tirith share --json` into
-/// jq filters without breaking. Matches the M7 ch2 spec:
-/// `{ redacted_content, redactions: [{ label, count }, ...] }`.
+/// `--json` output of `tirith share`/`redact`. Kept stable so wrappers can pipe
+/// it into jq: `{ redacted_content, redactions: [{ label, count }, ...] }`.
 #[derive(serde::Serialize)]
 struct JsonOut<'a> {
     redacted_content: &'a str,
     redactions: &'a [RedactionCount],
 }
 
-/// `tirith share <path>` entry point.
-///
-/// Returns the process exit code: 0 on success, 1 on I/O failure.
-/// Reads `path` (or stdin when `path == None` or `path == "-"`), runs the
-/// audience-aware redactor, and writes the redacted content to
-/// `out_path` (or stdout when `out_path == None`).
+/// `tirith share <path>` entry point. Reads `path` (or stdin when `None`/`-`),
+/// redacts, writes to `out_path` (or stdout). Exit 0 on success, 1 on I/O failure.
 pub fn share(
     path: Option<&Path>,
     out_path: Option<&Path>,
@@ -100,17 +86,9 @@ pub fn redact_stdin(audience: ShareAudience, json: bool) -> i32 {
 }
 
 /// Resolve `policy.share.customer_id_patterns` from the nearest discovered
-/// policy. Failure to discover or load the policy is non-fatal: this is
-/// off-hot-path utility code, and an empty list is the safe default.
-///
-/// We use [`Policy::discover_partial`] equivalent semantics by reading
-/// only the local discovery path — the remote policy server is not in
-/// scope for off-hot-path utility commands.
+/// policy via [`Policy::discover_partial`] (local-only, no remote fetch).
+/// Discovery/load failure is non-fatal — an empty list is the safe default.
 fn load_customer_id_patterns() -> Vec<String> {
-    // `Policy::discover_local` is the private cousin of `discover`; the
-    // public surface is `discover_partial`, which loads the same struct
-    // shape (no remote fetch). For an empty `policy.share.customer_id_patterns`
-    // section the default is the empty `Vec`.
     Policy::discover_partial(None).share.customer_id_patterns
 }
 
@@ -153,9 +131,8 @@ fn write_output(out_path: Option<&Path>, content: &str) -> Result<(), i32> {
                 eprintln!("tirith share: failed to write to stdout (broken pipe?)");
                 return Err(1);
             }
-            // Match `view`'s contract: append a newline when the content
-            // didn't end in one. Avoids surprises in shells where the
-            // prompt redraw would otherwise clobber the last line.
+            // Match `view`: append a newline when missing, so a prompt redraw
+            // doesn't clobber the last line.
             if !content.ends_with('\n') {
                 let _ = writeln!(stdout);
             }
@@ -178,12 +155,8 @@ fn emit_json(report: &RedactReport, audience: ShareAudience) -> i32 {
     0
 }
 
-/// Print the per-label summary to stderr.
-///
-/// Format: `tirith share: target=<aud>; removed N <label1>, M <label2>, ...`
-///
-/// When the report is empty we still print the target line so callers
-/// piping `share` into `tee` get a confirmation that the run completed.
+/// Print the per-label summary to stderr (`target=<aud>; removed N <label>, …`).
+/// Prints the target line even when empty so a `tee` pipeline gets confirmation.
 fn print_human_summary(report: &RedactReport, audience: ShareAudience) {
     let target = match audience {
         ShareAudience::GithubIssue => "github-issue",

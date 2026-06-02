@@ -1,10 +1,9 @@
 //! M13 ch4 — the custom-rule DSL (semantic predicates).
 //!
-//! A custom rule in `.tirith/policy.yaml` may carry EITHER a `pattern:` regex
-//! (the M-earlier [`crate::rules::custom`] path) OR a `when:` clause — a small
-//! boolean tree of semantic predicates evaluated against the engine's
-//! already-extracted analysis data (URLs, command tokens, packages, the scanned
-//! file path). The two are mutually exclusive: a rule has EXACTLY ONE of them.
+//! A custom rule in `.tirith/policy.yaml` carries EITHER a `pattern:` regex
+//! ([`crate::rules::custom`]) XOR a `when:` clause — a boolean tree of semantic
+//! predicates evaluated against the engine's already-extracted analysis data
+//! (URLs, command tokens, packages, scanned file path).
 //!
 //! # Shape
 //!
@@ -16,63 +15,27 @@
 //!     - url.domain_not_in: [company.com, github.com]
 //! ```
 //!
-//! `all` / `any` / `not` are the logical combinators; everything else is a
-//! leaf predicate. The serde representation is a **key-dispatched** (externally
-//! tagged) enum — each YAML key maps to exactly one [`WhenClause`] variant — so
-//! the shape round-trips without the ambiguity an `#[serde(untagged)]` tree
-//! would carry (`url.host` vs `url.host_matches` would otherwise both try to
-//! deserialize a bare string).
+//! `all` / `any` / `not` are the logical combinators; everything else is a leaf
+//! predicate. The serde representation is a key-dispatched (externally tagged)
+//! enum — each YAML key maps to exactly one [`WhenClause`] variant — implemented
+//! by hand below to avoid the ambiguity an `#[serde(untagged)]` tree would carry.
 //!
-//! # Predicate -> data binding (v1)
-//!
-//! Each leaf binds to REAL extracted data carried in [`DslEvalContext`], which
-//! the engine fills from the same extraction the production rules already ran:
-//!
-//! | Predicate                  | Binds to                                                              |
-//! |----------------------------|-----------------------------------------------------------------------|
-//! | `command.has_pipeline_to`  | a `|`-pipeline segment whose resolved interpreter (sudo/env-aware) is in the list |
-//! | `command.uses_sudo`        | any segment whose resolved leader is `sudo`                           |
-//! | `command.cwd_in`           | `ctx.cwd` is at/under one of the listed paths                          |
-//! | `url.host`                 | any extracted URL's canonical host equals (case-insensitive)           |
-//! | `url.host_matches`         | any extracted URL's host matches the regex                             |
-//! | `url.scheme`               | any extracted URL's scheme equals (case-insensitive)                   |
-//! | `url.reputation`           | `known` = built-in known-domains table; `malicious` = threat-DB hostname hit; `unknown` = neither |
-//! | `url.domain_not_in`        | at least one extracted URL whose host is NOT at/under any listed domain |
-//! | `package.ecosystem`        | an extracted install package in that ecosystem                          |
-//! | `package.name_matches`     | an extracted package whose name matches the regex                       |
-//! | `package.reputation`       | `malicious` = threat-DB package hit; `known` = known-popular package the DB vouches for; `unknown` = no DB, or a DB that lists the package in neither index |
-//! | `file.path_matches`        | `ctx.file_path` matches the regex                                       |
-//! | `agent.kind`               | parsed but REJECTED at validate (see v1 limitation)                     |
-//! | `mcp.tool`                 | parsed but REJECTED at validate (see v1 limitation)                     |
+//! Each leaf binds to REAL extracted data carried in [`DslEvalContext`], filled
+//! by the engine from the same extraction the production rules ran.
 //!
 //! ## v1 limitations (parsed, but REJECTED by the validators)
 //!
-//! * **`agent.kind` / `mcp.tool`** — the exec/paste hot path
-//!   ([`crate::engine::analyze`]) has NO structured "current agent kind" or
-//!   "current MCP tool" in scope (agent/MCP signals live in separate flows:
-//!   `mcpdrift` runs over lockfiles in FileScan, agent governance lives in the
-//!   `agent_rules` / `AgentMatcher` flow, and agent annotations are rich-text
-//!   `agent_view` enrichment). `DslEvalContext::agent_kind` / `mcp_tool` are
-//!   hard-coded `None` on every engine path, so a DSL clause using either
-//!   predicate would validate and load yet NEVER match — a dead rule. Both
-//!   predicates are therefore REJECTED up front by `policy validate` and `rule
-//!   validate` (see [`clause_uses_unsupported_predicate`]); they are still
-//!   parsed so the error is precise. For per-agent control, use `agent_rules`
-//!   (CodeRabbit M13 round-3 R3-3 for `mcp.tool`, round-8 R8-1 for
-//!   `agent.kind`).
-//! * **`url.reputation` / `package.reputation`** — bound to the LOCAL signed
-//!   threat-DB + built-in known-domains table reachable on the hot path; NO
-//!   network lookup happens at eval time (matching the rest of the engine's
-//!   local-first hot path). When no threat-DB is loaded, `malicious` is `false`
-//!   and every host/package is `unknown` (fail-open, never blocks the user).
-//!   When a DB IS loaded, `package.reputation` is a real tri-state (see
-//!   [`PkgReputation`]): `malicious` for a threat-DB hit, `known` for a
-//!   known-popular package the DB vouches for, and `unknown` for a package the
-//!   DB lists in neither index — so `unknown` stays reachable with a DB loaded.
-//! * **`package.*`** — packages come from [`crate::rules::threatintel::extract_packages`]
-//!   (install/add commands: pip (incl. `uv`)/npm/yarn/pnpm/bun/npx/cargo/gem/go/composer/dotnet),
-//!   plus Docker image refs surfaced as the `docker` ecosystem. A command with
-//!   no recognized install leader yields no packages, so `package.*` is `false`.
+//! * `agent.kind` / `mcp.tool` — no scan context wires up an "agent kind" or
+//!   "current MCP tool" signal ([`DslEvalContext::agent_kind`] / `mcp_tool` are
+//!   hard-coded `None`), so such a clause would load yet never match — a dead
+//!   rule. Both are rejected up front (see [`clause_uses_unsupported_predicate`]);
+//!   for per-agent control use `agent_rules`.
+//! * `url.reputation` / `package.reputation` — bound to the LOCAL signed
+//!   threat-DB + known-domains table; NO network lookup at eval time. With no DB
+//!   loaded, `malicious` is `false` and everything is `unknown` (fail-open). With
+//!   a DB, `package.reputation` is a real tri-state (see [`PkgReputation`]).
+//! * `package.*` — packages come from [`crate::rules::threatintel::extract_packages`]
+//!   (install/add commands plus Docker image refs as the `docker` ecosystem).
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -84,36 +47,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::extract::ScanContext;
 
-/// One node of a `when:` clause — a **key-dispatched** node: serialized as a
-/// single-key YAML mapping whose key (`all`, `any`, `not`, or a leaf predicate
-/// name like `command.has_pipeline_to`) selects exactly one variant and whose
-/// value is that variant's payload.
-///
-/// `serde`'s built-in externally-tagged enum representation uses YAML `!tag`
-/// syntax under `serde_yaml` 0.9, which is NOT the `{ key: value }` mapping the
-/// policy shape uses — so `Serialize`/`Deserialize` are implemented by hand
-/// below to produce/consume single-key maps. The variant set and payloads are
-/// otherwise an ordinary enum.
+/// One node of a `when:` clause — serialized as a single-key YAML mapping whose
+/// key (`all`/`any`/`not` or a leaf predicate name) selects the variant and
+/// whose value is its payload. `Serialize`/`Deserialize` are hand-written below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhenClause {
-    /// All sub-clauses must match (logical AND). Empty list is vacuously true.
+    /// Logical AND. Empty list is vacuously true.
     All(Vec<WhenClause>),
-    /// Any sub-clause must match (logical OR). Empty list is vacuously false.
+    /// Logical OR. Empty list is vacuously false.
     Any(Vec<WhenClause>),
-    /// The sub-clause must NOT match (logical negation).
+    /// Logical negation.
     Not(Box<WhenClause>),
 
-    // ---- command.* leaves ----
     /// `command.has_pipeline_to: [sh, bash, ...]` — a `|`-pipeline whose
     /// resolved interpreter is one of the named shells/interpreters.
     CommandHasPipelineTo(Vec<String>),
     /// `command.uses_sudo: true` — the command escalates via `sudo`.
     CommandUsesSudo(bool),
-    /// `command.cwd_in: [paths]` — the current working directory is at/under
-    /// one of the listed paths.
+    /// `command.cwd_in: [paths]` — cwd is at/under one of the listed paths.
     CommandCwdIn(Vec<String>),
 
-    // ---- url.* leaves ----
     /// `url.host: <h>` — an extracted URL's canonical host equals `<h>`.
     UrlHost(String),
     /// `url.host_matches: <regex>` — an extracted URL's host matches the regex.
@@ -126,7 +79,6 @@ pub enum WhenClause {
     /// is NOT at/under any listed registrable domain.
     UrlDomainNotIn(Vec<String>),
 
-    // ---- package.* leaves ----
     /// `package.ecosystem: <e>` — an extracted package in ecosystem `<e>`.
     PackageEcosystem(String),
     /// `package.name_matches: <regex>` — an extracted package name matches.
@@ -134,16 +86,13 @@ pub enum WhenClause {
     /// `package.reputation: known|unknown|malicious`.
     PackageReputation(Reputation),
 
-    // ---- file.* leaves ----
     /// `file.path_matches: <regex>` — the scanned file path matches the regex.
     FilePathMatches(String),
 
-    // ---- agent.* / mcp.* leaves ----
-    /// `agent.kind: <k>` — parsed but REJECTED at validate (no agent-kind signal
-    /// is wired into the scan context; use `agent_rules`). See module docs.
+    /// `agent.kind: <k>` — parsed but REJECTED at validate (no signal wired; use
+    /// `agent_rules`).
     AgentKind(String),
-    /// `mcp.tool: <t>` — parsed but REJECTED at validate (no MCP-tool signal is
-    /// wired into any scan context, so it can never match). See module docs.
+    /// `mcp.tool: <t>` — parsed but REJECTED at validate (no signal wired).
     McpTool(String),
 }
 
@@ -199,21 +148,14 @@ impl Serialize for WhenClause {
     }
 }
 
-/// Maximum nesting depth of a `when:` clause tree, enforced DURING
-/// deserialization. The `all`/`any`/`not` combinators recurse, so a hostile
-/// repo-local `.tirith/policy.yaml` with deeply-nested `{not: {not: {not: …}}}`
-/// could otherwise stack-overflow `policy validate` / `rule validate` while
-/// deserializing untrusted input (DoS). 64 is comfortably above any real rule
-/// (the env-`-S` wrapper cap is 32) yet far below a depth that would exhaust the
-/// stack. The root clause is depth 1; each combinator's children are one deeper.
-/// (CodeRabbit M13 round-20 custom_rule_dsl.rs:202-264.)
+/// Max nesting depth of a `when:` clause tree, enforced DURING deserialization
+/// so a hostile deeply-nested `{not: {not: …}}` cannot stack-overflow the
+/// validators (DoS). Root clause is depth 1; children are one deeper.
 const MAX_CLAUSE_DEPTH: usize = 64;
 
-/// A [`DeserializeSeed`] that threads the current nesting depth through the
-/// recursive `all`/`any`/`not` cases so the [`MAX_CLAUSE_DEPTH`] bound is
-/// enforced as the tree is built (not after — by which point the recursion has
-/// already run and possibly overflowed the stack). Each combinator deserializes
-/// its children with `depth + 1`; leaf predicates do not recurse.
+/// A [`DeserializeSeed`] threading the nesting depth through the recursive
+/// `all`/`any`/`not` cases so [`MAX_CLAUSE_DEPTH`] is enforced as the tree is
+/// built (before the recursion can overflow the stack).
 struct ClauseSeed {
     depth: usize,
 }
@@ -231,9 +173,8 @@ impl<'de> de::DeserializeSeed<'de> for ClauseSeed {
     }
 }
 
-/// Deserializes a `Vec<WhenClause>` (the `all` / `any` children) such that each
-/// element carries the parent's `depth` — i.e. the children are one level deeper
-/// than the combinator node itself.
+/// Deserializes a `Vec<WhenClause>` (the `all` / `any` children), each element
+/// carrying the parent's `depth`.
 struct ClauseVecSeed {
     depth: usize,
 }
@@ -262,8 +203,8 @@ impl<'de> de::DeserializeSeed<'de> for ClauseVecSeed {
     }
 }
 
-/// The map visitor for a single clause node. Carries `depth` so its recursive
-/// `all`/`any`/`not` values are deserialized at `depth + 1` (see [`ClauseSeed`]).
+/// Map visitor for a single clause node; carries `depth` so its recursive
+/// values are deserialized at `depth + 1`.
 struct ClauseVisitor {
     depth: usize,
 }
@@ -280,14 +221,12 @@ impl<'de> Visitor<'de> for ClauseVisitor {
             .next_key()?
             .ok_or_else(|| de::Error::custom("when-clause must have exactly one key"))?;
 
-        // Helper macro to deserialize the value as a concrete (non-recursive) type.
         macro_rules! val {
             ($t:ty) => {{
                 let v: $t = map.next_value()?;
                 v
             }};
         }
-        // Depth at which this node's CHILDREN live (one deeper than this node).
         let child_depth = self.depth + 1;
 
         let clause = match key.as_str() {
@@ -317,7 +256,7 @@ impl<'de> Visitor<'de> for ClauseVisitor {
             }
         };
 
-        // Reject a second key — a clause node is exactly one predicate.
+        // A clause node is exactly one predicate.
         if map.next_key::<String>()?.is_some() {
             return Err(de::Error::custom(
                 "when-clause node must have exactly one key (wrap multiple in `all:`/`any:`)",
@@ -329,7 +268,6 @@ impl<'de> Visitor<'de> for ClauseVisitor {
 
 impl<'de> Deserialize<'de> for WhenClause {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // The root clause is depth 1; the bound is enforced inside [`ClauseSeed`].
         de::DeserializeSeed::deserialize(ClauseSeed { depth: 1 }, deserializer)
     }
 }
@@ -344,29 +282,9 @@ pub enum Reputation {
 }
 
 /// Tri-state-plus package reputation, derived once by the engine from the LOCAL
-/// signed threat-DB.
-///
-/// The earlier `Option<bool>` collapsed two genuinely different states — "DB
-/// loaded but this package is absent" and "no DB loaded" — onto `Some(false)` /
-/// `None` in a way that made `package.reputation: unknown` unreachable once a DB
-/// was loaded and mislabeled every unseen package as `known` (CodeRabbit M13
-/// finding C). The four states are now distinct so the predicate maps them
-/// correctly:
-///
-/// * [`NoDb`](PkgReputation::NoDb) — no threat-DB was loaded; nothing can be
-///   classified (fail-open). The `unknown` predicate matches here.
-/// * [`Unknown`](PkgReputation::Unknown) — a DB IS loaded but this package
-///   appears in neither the malicious index nor the known-popular index. The
-///   `unknown` predicate matches.
-/// * [`Known`](PkgReputation::Known) — a DB is loaded and this package is in the
-///   known-popular (good) index and NOT flagged malicious. The `known`
-///   predicate matches.
-/// * [`Malicious`](PkgReputation::Malicious) — the threat-DB flags this package
-///   (a `check_package` hit). The `malicious` predicate matches.
-///
-/// `NoDb` and `Unknown` are kept separate (rather than collapsed) so callers /
-/// future predicates can tell "we have no data source" from "we looked and it
-/// isn't notable"; both currently satisfy the `unknown` predicate.
+/// signed threat-DB. The four states are kept distinct so `package.reputation:
+/// unknown` stays reachable with a DB loaded (CodeRabbit M13 finding C); `NoDb`
+/// and `Unknown` both satisfy the `unknown` predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkgReputation {
     /// No threat-DB loaded — cannot classify (fail-open).
@@ -380,9 +298,6 @@ pub enum PkgReputation {
 }
 
 /// A package reference as seen by the DSL evaluator (ecosystem + name).
-///
-/// Mirrors the fields of [`crate::rules::threatintel::PackageRef`] the
-/// predicates need; the engine builds these from the same extractor.
 #[derive(Debug, Clone)]
 pub struct DslPackage<'a> {
     /// Lowercase ecosystem name (`npm`, `pypi`, `crates.io`, `docker`, ...).
@@ -405,8 +320,8 @@ pub struct DslUrl<'a> {
 }
 
 /// References to the already-extracted analysis data the predicates evaluate
-/// against. Borrows everything — the engine builds this only when at least one
-/// DSL rule exists, so the no-DSL hot path pays nothing.
+/// against. The engine builds this only when a DSL rule exists, so the no-DSL
+/// hot path pays nothing.
 #[derive(Debug, Default)]
 pub struct DslEvalContext<'a> {
     /// Interpreter names that appear as a `|`-pipeline target, sudo/env-aware
@@ -428,47 +343,26 @@ pub struct DslEvalContext<'a> {
     pub mcp_tool: Option<&'a str>,
 }
 
-/// The set of [`ScanContext`]s in which a clause CAN be fully evaluated — i.e.
-/// every fact the clause references is populated by [`build_dsl_backing`] for
-/// that context. This is the clause's **satisfiable-context set** (CodeRabbit
-/// M13 round-9 R9-1).
+/// The set of [`ScanContext`]s in which a clause CAN be fully evaluated — every
+/// fact it references is populated by [`build_dsl_backing`] for that context.
+/// The clause's satisfiable-context set (CodeRabbit M13 round-9 R9-1).
 ///
-/// Drives the tier-1 validation invariant. The old `RequiredTriggerSet`
-/// flattened every leaf's context family into one conjunction-of-disjunctions,
-/// which was unsound for combinators:
+/// Computed PER CLAUSE so combinators compose correctly (an earlier flatten was
+/// unsound, e.g. it accepted `all(command.*, file.*)` for `[exec, file]` though
+/// no single scan has both):
+/// * leaf → contexts where that fact exists (`command.*`/`url.*`/`package.*` →
+///   {Exec, Paste}; `file.path_matches` → {FileScan}).
+/// * `all` → INTERSECTION; `any` → UNION; `not(child)` → the child's set.
 ///
-/// * `all(command.uses_sudo, file.path_matches)` was wrongly ACCEPTED for
-///   `context: [exec, file]` — but NO single scan populates BOTH command facts
-///   and a file path, so the rule could never fire (a dead rule).
-/// * `any(command.uses_sudo, file.path_matches)` was wrongly REJECTED for
-///   `context: [exec]` — but the `command.*` branch IS evaluable there.
+/// `agent.kind`/`mcp.tool` contribute EMPTY but are rejected up front by
+/// [`clause_uses_unsupported_predicate`]; their empty set only serves as the
+/// any/not identity. An empty `all`/`any` needs no facts → universal set.
 ///
-/// The set is now computed PER CLAUSE so combinators compose correctly:
-/// * leaf → the contexts where that fact exists (`command.*`/`url.*`/`package.*`
-///   → {Exec, Paste}; `file.path_matches` → {FileScan}).
-/// * `all(children)` → INTERSECTION (the whole AND can only be evaluated where
-///   EVERY child can).
-/// * `any(children)` → UNION (the OR is evaluable wherever ANY child is).
-/// * `not(child)` → the child's set (negation doesn't change evaluability).
-///
-/// `agent.kind` and `mcp.tool` contribute the EMPTY set (no scan context wires
-/// up their signal), but they are rejected up front by
-/// [`clause_uses_unsupported_predicate`] BEFORE this is ever consulted for a
-/// loaded rule — so a loaded rule never sees their empty contribution. Their
-/// empty set here only matters as the identity for `any`/`not` composition.
-///
-/// An empty `all`/`any` combinator needs no facts and so is evaluable in EVERY
-/// context (the universal set) — a degenerate case that keeps a vacuous clause
-/// from being mislabeled unsatisfiable.
-///
-/// Validity then has two parts (see `policy_validate` / `rule validate` /
-/// [`crate::rules::custom::compile_rules`], which all route through here):
-/// 1. An EMPTY satisfiable set means the clause needs facts from contexts that
-///    never co-occur in a single scan (e.g. `command.*` AND `file.*`) — it can
-///    never match and is rejected as UNSATISFIABLE.
-/// 2. Otherwise the rule is valid iff the DECLARED context set intersects the
-///    satisfiable set (`declared ∩ satisfiable ≠ ∅`): at least one declared
-///    context can actually evaluate the clause.
+/// Validity (shared by `policy validate` / `rule validate` /
+/// [`crate::rules::custom::compile_rules`]):
+/// 1. EMPTY satisfiable set → UNSATISFIABLE (facts from contexts that never
+///    co-occur), rejected.
+/// 2. Otherwise valid iff `declared ∩ satisfiable ≠ ∅`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextSet {
     exec: bool,
@@ -483,8 +377,8 @@ impl ContextSet {
         paste: false,
         file: false,
     };
-    /// The universal set — every context can evaluate the clause (used as the
-    /// `all`-intersection identity and for fact-free vacuous combinators).
+    /// The universal set — the `all`-intersection identity, and what fact-free
+    /// vacuous combinators yield.
     pub const ALL: ContextSet = ContextSet {
         exec: true,
         paste: true,
@@ -533,23 +427,20 @@ impl ContextSet {
         }
     }
 
-    /// `true` when no context can evaluate the clause (UNSATISFIABLE — needs
-    /// facts from contexts that never co-occur in a single scan).
+    /// `true` when no context can evaluate the clause (UNSATISFIABLE).
     pub fn is_empty(&self) -> bool {
         !self.exec && !self.paste && !self.file
     }
 
-    /// `true` when the rule's DECLARED contexts share at least one context with
-    /// this satisfiable set — i.e. at least one declared context can actually
-    /// evaluate the clause. (`declared ∩ satisfiable ≠ ∅`.)
+    /// `true` when `declared ∩ satisfiable ≠ ∅` — at least one declared context
+    /// can actually evaluate the clause.
     pub fn intersects_declared(&self, declared: &[ScanContext]) -> bool {
         declared.iter().any(|c| self.contains(*c))
     }
 
-    /// The contexts in this set as a [`ScanContext`] list, in a stable order
-    /// (exec, paste, file). The inverse of [`ContextSet::from_contexts`]; used by
-    /// [`compile_rules`](crate::rules::custom::compile_rules) to store the CLAMPED
-    /// runtime contexts of a DSL rule.
+    /// The contexts in this set, in stable order (exec, paste, file). Used by
+    /// [`compile_rules`](crate::rules::custom::compile_rules) to store a DSL
+    /// rule's CLAMPED runtime contexts.
     pub fn to_contexts(self) -> Vec<ScanContext> {
         let mut v = Vec::new();
         if self.exec {
@@ -564,7 +455,7 @@ impl ContextSet {
         v
     }
 
-    /// The contexts in this set, in a stable order, as lowercase names — for
+    /// The contexts in this set, in stable order, as lowercase names — for
     /// error text (e.g. "exec or paste").
     fn names(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
@@ -585,8 +476,7 @@ impl ContextSet {
     pub fn describe(&self) -> String {
         let names = self.names();
         if names.is_empty() {
-            // Unsatisfiable clauses are reported via their own dedicated message,
-            // never through this coverage path, so this is defensive only.
+            // Defensive: unsatisfiable clauses are reported via their own message.
             "(no scan context)".to_string()
         } else {
             names.join(" or ")
@@ -594,84 +484,39 @@ impl ContextSet {
     }
 }
 
-/// Compute the [`ContextSet`] in which a clause can be FULLY evaluated — the set
-/// of scan contexts where every fact the clause references is populated.
+/// Compute the [`ContextSet`] in which a clause can be FULLY evaluated.
 ///
-/// Combinators compose by set algebra so `all`/`any`/`not` keep their proper
-/// semantics (CodeRabbit M13 round-9 R9-1):
-/// * `all(children)` → INTERSECTION (evaluable only where EVERY child is).
-/// * `any(children)` → UNION (evaluable wherever ANY child is).
-/// * `not(child)` → the child's set (negation doesn't change evaluability).
-///
-/// Empty combinators follow their `evaluate` truth value, not just the set
-/// identity, so a dead clause is reported as such:
-/// * An empty `all` is vacuously TRUE in `evaluate`, so it yields the universal
-///   set (it can be evaluated anywhere) — the intersection identity coincides.
-/// * An empty `any` is vacuously FALSE in `evaluate` (it can never match), so it
-///   yields the EMPTY set — the union identity — and is rejected as
-///   unsatisfiable rather than mislabeled runnable (CodeRabbit M13 round-10
-///   R10-1).
-///
-/// `agent.kind` / `mcp.tool` yield the empty set, but they are rejected by
-/// [`clause_uses_unsupported_predicate`] before this is consulted for a loaded
-/// rule.
+/// Combinators compose by set algebra (round-9 R9-1): `all` → INTERSECTION,
+/// `any` → UNION, `not(child)` → the child's set. Empty combinators follow their
+/// `evaluate` truth value, not just the set identity: empty `all` is vacuously
+/// TRUE → universal set; empty `any` is vacuously FALSE → EMPTY (round-10 R10-1).
+/// `agent.kind`/`mcp.tool` yield EMPTY but are rejected earlier for a loaded rule.
 pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
     use ScanContext::{Exec, FileScan, Paste};
     match clause {
-        // INTERSECTION: an empty `all` is vacuously true and fact-free, so it is
-        // evaluable in every context (intersection identity = universal set).
+        // INTERSECTION (empty `all` is vacuously true → universal set).
         WhenClause::All(cs) => cs
             .iter()
             .map(satisfiable_contexts)
             .fold(ContextSet::ALL, ContextSet::intersect),
-        // UNION: an empty `any` is the union identity (EMPTY). It is also
-        // VACUOUSLY FALSE in `evaluate` (`[].iter().any(..)` is `false`), so it
-        // can never match in any context — a dead rule. Returning EMPTY here makes
-        // the satisfiability check reject/drop it (consistent with the round-9
-        // empty-satisfiable-set rejection), rather than mislabeling it runnable.
-        // Real `any` clauses always have children, so this only guards the
-        // degenerate empty case (CodeRabbit M13 round-10 R10-1). Contrast `all`:
-        // an empty `all` is vacuously TRUE in `evaluate`, so its identity (ALL)
-        // is correct above.
+        // UNION; empty `any` is vacuously FALSE → EMPTY so it is rejected as a
+        // dead rule rather than mislabeled runnable (round-10 R10-1).
         WhenClause::Any(cs) => cs
             .iter()
             .map(satisfiable_contexts)
             .fold(ContextSet::EMPTY, ContextSet::union),
-        // `not(child)` is evaluable wherever `child` is, so it returns the
-        // child's set UNCHANGED for any normal (non-degenerate) child. This is
-        // what makes the round-15 clamp work: `not(file.path_matches)` yields
-        // `{FileScan}` only, NOT the complement — so it never fires in exec where
-        // `file_path` is unset (a `not(file)` false-positive). We deliberately do
-        // NOT apply CodeRabbit's blanket "complement" suggestion, which would
-        // reintroduce exactly that bug.
+        // `not(child)` returns the CHILD's set, NOT the complement — the round-15
+        // clamp: `not(file.path_matches)` stays {FileScan} only, never a
+        // `not(file)` exec false-positive.
         //
-        // The ONLY divergence from `evaluate` is the two DEGENERATE EMPTY
-        // combinators nested under a `Not` chain, whose set identity and truth
-        // value disagree:
-        //   * `not(any: [])` == `not(false)` == constant-TRUE in `evaluate`, but
-        //     `any:[]`→EMPTY would make the child-set look UNSATISFIABLE. A
-        //     constant-true clause runs EVERYWHERE → `ContextSet::ALL`.
-        //   * `not(all: [])` == `not(true)` == constant-FALSE in `evaluate`, but
-        //     `all:[]`→ALL would make the child-set look RUNNABLE. A constant-false
-        //     clause can NEVER match → `ContextSet::EMPTY` (unsatisfiable)
-        //     (CodeRabbit M13 PR #132 R17-1).
-        //
-        // This must hold for ANY nesting depth, not just one `Not` (CodeRabbit M13
-        // PR #132 R21): a double-negation re-flips the truth value, so
-        // `not(not(any: []))` is constant-FALSE → EMPTY (NOT ALL, which the old
-        // one-level match returned because the inner `not(any: [])` fell through to
-        // the `other` arm). We PEEL the chain of consecutive `Not`s, counting `k`,
-        // to reach the innermost non-`Not` node, then apply the `evaluate`-derived
-        // parity table:
-        //   * innermost `any: []` (constant-FALSE): EMPTY if `k` even, ALL if odd.
-        //   * innermost `all: []` (constant-TRUE):  ALL if `k` even, EMPTY if odd.
-        //   * any other (non-degenerate) innermost node: the innermost node's own
-        //     set, REGARDLESS of `k`. `Not` returns the CHILD's set, NOT the
-        //     complement — so e.g. `not(file.path_matches)` stays {FileScan} and
-        //     never becomes a `not(file)` exec false-positive (the round-15 clamp).
-        //     CodeRabbit's "peel then run the existing match" prose is imprecise:
-        //     it would wrongly turn single-level `not(any: [])` into EMPTY. The
-        //     parity table is correct for both k=1 (old behavior) and k≥2.
+        // The one divergence is degenerate EMPTY combinators nested under `Not`,
+        // whose set identity and `evaluate` truth value disagree, and this must
+        // hold at ANY nesting depth (R21): `not(not(any: []))` is constant-FALSE
+        // → EMPTY, not ALL. So peel the chain of `Not`s (count `k`) to the
+        // innermost non-`Not` node and apply the parity table (R17-1):
+        //   * innermost `any: []` (const-FALSE): EMPTY if k even, ALL if odd.
+        //   * innermost `all: []` (const-TRUE):  ALL if k even, EMPTY if odd.
+        //   * other innermost node: its own set, regardless of `k`.
         WhenClause::Not(_) => {
             let mut k: u32 = 0;
             let mut inner = clause;
@@ -702,18 +547,9 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
             }
         }
 
-        // `command.has_pipeline_to` / `command.cwd_in` carry a LIST. An EMPTY
-        // list can never match (`evaluate` does `any(|t| wanted.contains(t))` /
-        // `paths.iter().any(..)` over an empty set, which is always `false`), so
-        // advertising {Exec, Paste} for an empty list would mislabel a dead rule
-        // as runnable — it would pass context resolution / `policy validate` yet
-        // never fire. An empty list therefore yields the EMPTY set, which
-        // `resolve_runtime_contexts` clamps to empty and `compile_rules` /
-        // `policy validate` / `rule validate` then reject as unsatisfiable
-        // (CodeRabbit M13 round-24 custom_rule_dsl.rs:709-712). A NON-empty list
-        // is evaluable in Exec OR Paste: `build_dsl_backing` populates
-        // `pipeline_targets` / `cwd` for EVERY non-`FileScan` context (round-3
-        // R3-1); FileScan never extracts command facts.
+        // `command.*` list predicates: an EMPTY list can never match, so it
+        // yields EMPTY (a dead rule, rejected) rather than mislabeling itself
+        // runnable (round-24); a NON-empty list is evaluable in Exec OR Paste.
         WhenClause::CommandHasPipelineTo(patterns) => {
             if patterns.is_empty() {
                 ContextSet::EMPTY
@@ -728,68 +564,43 @@ pub fn satisfiable_contexts(clause: &WhenClause) -> ContextSet {
                 ContextSet::from_contexts(&[Exec, Paste])
             }
         }
-        // `command.uses_sudo` carries a BOOL, not a list — BOTH `true` and
-        // `false` are matchable against `ctx.uses_sudo`, so it is always
-        // satisfiable in Exec OR Paste (no empty-collection case to clamp).
+        // `command.uses_sudo` is a bool — always satisfiable in Exec OR Paste.
         WhenClause::CommandUsesSudo(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
-        // `url.*` is evaluable in Exec OR Paste (URLs are extracted in both).
+        // `url.*` / `package.*` are evaluable in Exec OR Paste; `build_dsl_backing`
+        // extracts both for every non-`FileScan` context (round-3 R3-1).
         WhenClause::UrlHost(_)
         | WhenClause::UrlHostMatches(_)
         | WhenClause::UrlScheme(_)
         | WhenClause::UrlReputation(_)
         | WhenClause::UrlDomainNotIn(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
-        // `package.*` is evaluable in Exec OR Paste — `build_dsl_backing`
-        // extracts package facts off the command line for every non-`FileScan`
-        // context (round-3 R3-1); FileScan never populates `packages`.
         WhenClause::PackageEcosystem(_)
         | WhenClause::PackageNameMatches(_)
         | WhenClause::PackageReputation(_) => ContextSet::from_contexts(&[Exec, Paste]),
 
-        // `file.path_matches` is evaluable only in FileScan (the only context
-        // that sets `file_path`).
+        // `file.path_matches` is evaluable only in FileScan.
         WhenClause::FilePathMatches(_) => ContextSet::from_contexts(&[FileScan]),
 
-        // `mcp.tool` / `agent.kind`: no scan context wires up their signal, so
-        // their satisfiable set is EMPTY. Both are rejected up front by
-        // `clause_uses_unsupported_predicate` (round-3 R3-3 / round-8 R8-1)
-        // BEFORE this is consulted for a loaded rule; the empty set here only
-        // serves as the identity for `any`/`not` composition.
+        // No scan context wires up these signals → EMPTY (rejected earlier for a
+        // loaded rule; the empty set only serves as the any/not identity).
         WhenClause::McpTool(_) | WhenClause::AgentKind(_) => ContextSet::EMPTY,
     }
 }
 
-/// The SINGLE context-resolution model shared by every DSL consumer
-/// (CodeRabbit M13 round-15 coherence): the engine's
-/// [`compile_rules`](crate::rules::custom::compile_rules), `tirith policy
-/// validate`, and `tirith rule validate` MUST classify and run a DSL rule
-/// IDENTICALLY, so they all call this one function rather than each re-deriving
-/// the rule's contexts.
+/// The SINGLE context-resolution model shared by every DSL consumer (round-15
+/// coherence): [`compile_rules`](crate::rules::custom::compile_rules), `policy
+/// validate`, and `rule validate` all call this rather than re-deriving contexts.
 ///
-/// Given a rule's DECLARED contexts (already resolved by serde's
-/// empty-→-`[exec, paste]` default for an OMITTED `context:`; see
-/// `default_custom_rule_contexts` in `policy.rs`) and its `when:` clause, this
-/// returns the contexts in which the rule both is DECLARED to run AND can be
-/// FULLY evaluated — i.e. `declared ∩ satisfiable_contexts(clause)`:
+/// Returns `declared ∩ satisfiable_contexts(clause)`. `compile_rules` stores this
+/// clamped set as the rule's runtime contexts, so the clause is only ever
+/// evaluated where every fact it reads is populated (without the clamp,
+/// `not(file.path_matches)` declared `[exec, file]` would false-positive in Exec
+/// where `file_path` is `None`). Both validators treat NON-EMPTY as valid — the
+/// same condition under which `compile_rules` keeps the rule.
 ///
-/// * `compile_rules` STORES this clamped set as the rule's runtime
-///   [`CompiledCustomRule::contexts`](crate::rules::custom::CompiledCustomRule),
-///   so [`check_dsl`](crate::rules::custom::check_dsl) only ever evaluates the
-///   clause in a context where every fact it reads is populated. (Without the
-///   clamp, a `not(file.path_matches)` rule declared `context: [exec, file]`
-///   would run in Exec — where `file_path` is `None` so `file.path_matches` is
-///   `false` and `not` flips it to `true` — a FALSE POSITIVE. R15-custom.rs:172.)
-/// * Both validators treat the rule as VALID iff this set is NON-EMPTY — exactly
-///   the condition under which `compile_rules` keeps and runs the rule — so a
-///   rule the engine compiles is never rejected by a validator and vice versa.
-///
-/// This does NOT pre-screen for the unsatisfiable (`satisfiable.is_empty()`) or
-/// unsupported-predicate (`agent.kind` / `mcp.tool`) cases; callers report those
-/// with their own dedicated messages BEFORE consulting this, so the error text
-/// stays specific. When the satisfiable set is empty this returns the empty set
-/// too (the intersection with anything is empty), which is consistent — a
-/// caller that skips the dedicated pre-checks still treats the rule as invalid.
+/// Does NOT pre-screen the unsatisfiable / unsupported-predicate cases; callers
+/// report those with dedicated messages first.
 pub fn resolve_runtime_contexts(declared: &[ScanContext], clause: &WhenClause) -> Vec<ScanContext> {
     let satisfiable = satisfiable_contexts(clause);
     ContextSet::from_contexts(declared)
@@ -797,27 +608,11 @@ pub fn resolve_runtime_contexts(declared: &[ScanContext], clause: &WhenClause) -
         .to_contexts()
 }
 
-/// Scan a clause tree for a predicate that is parsed and type-checked but can
-/// NEVER match because no scan context wires up the signal it reads. Returns a
-/// clear, user-facing reason for the FIRST such predicate found, or `None` when
-/// every predicate is satisfiable.
-///
-/// Two predicates are unsupported today, both because their backing field in
-/// [`DslEvalContext`] is hard-coded `None` on every engine path:
-///
-/// * **`mcp.tool`** — [`DslEvalContext::mcp_tool`] is always `None` (the
-///   exec/paste hot path has no current-MCP-tool in scope, and the FileScan path
-///   scans file content, not a live tool invocation).
-/// * **`agent.kind`** — [`DslEvalContext::agent_kind`] is always `None` (the
-///   exec/paste hot path has no structured "current agent kind"; agent control
-///   lives in the separate `agent_rules` / `AgentMatcher` flow from M13 chunk 5,
-///   which is the supported way to gate per agent). A DSL `agent.kind` clause
-///   would validate and load yet be a permanent no-op, so it is rejected rather
-///   than left as a dead rule (CodeRabbit M13 round-8 R8-1).
-///
-/// Both validators (`policy validate` and `rule validate`) call this and REJECT
-/// such a rule rather than silently accept a dead rule (CodeRabbit M13 round-3
-/// R3-3 for `mcp.tool`; round-8 R8-1 for `agent.kind`).
+/// Scan a clause tree for a predicate that parses but can NEVER match because no
+/// scan context wires up its signal. Returns a user-facing reason for the first
+/// such predicate, or `None`. Today: `mcp.tool` and `agent.kind` (both backed by
+/// a hard-coded `None` in [`DslEvalContext`]). Both validators reject such a rule
+/// rather than load a dead one (round-3 R3-3 / round-8 R8-1).
 pub fn clause_uses_unsupported_predicate(clause: &WhenClause) -> Option<&'static str> {
     match clause {
         WhenClause::All(cs) | WhenClause::Any(cs) => {
@@ -856,9 +651,8 @@ pub fn validate_regexes(clause: &WhenClause) -> Result<(), String> {
 }
 
 fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
-    // Measure the cap in CHARACTERS, not UTF-8 BYTES, so a multibyte pattern is
-    // not rejected early and the "{} chars" count is accurate (CodeRabbit M13
-    // round-26). Mirrors the char-count cap in `rules::custom::compile_rules`.
+    // Cap measured in CHARACTERS, not UTF-8 bytes (round-26) — mirrors the
+    // char-count cap in `rules::custom::compile_rules`.
     if pattern.chars().count() > 1024 {
         return Err(format!(
             "{field}: regex too long ({} chars, max 1024)",
@@ -871,19 +665,13 @@ fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
 }
 
 thread_local! {
-    /// Per-thread compiled-regex cache for the DSL `*_matches` predicates.
-    /// Patterns are already validated at load (`validate_regexes`), so this only
-    /// avoids recompiling the SAME pattern on every `evaluate()` (which the hot
-    /// path calls once per command / file when a DSL rule runs). Cloning a
-    /// compiled `Regex` is cheap (it is `Arc`-backed), so the cache hands back a
-    /// clone and never lends a borrow across the match.
+    /// Per-thread compiled-regex cache for the DSL `*_matches` predicates,
+    /// avoiding recompiling the same pattern on every `evaluate()`.
     static REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
 }
 
-/// Compile `pat` once per thread and return a (cheap) clone of the cached
-/// `Regex`. Returns `None` if the pattern fails to compile — identical
-/// behavior to the previous inline `Regex::new(pat)` (a bad pattern yields no
-/// match), and validated patterns never hit that path.
+/// Compile `pat` once per thread and return a cheap clone of the cached `Regex`.
+/// `None` if it fails to compile (validated patterns never hit that path).
 fn cached_regex(pat: &str) -> Option<Regex> {
     REGEX_CACHE.with(|cache| {
         if let Some(re) = cache.borrow().get(pat) {
@@ -927,9 +715,8 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
         WhenClause::UrlScheme(s) => ctx.urls.iter().any(|u| u.scheme.eq_ignore_ascii_case(s)),
         WhenClause::UrlReputation(rep) => ctx.urls.iter().any(|u| u.reputation == *rep),
         WhenClause::UrlDomainNotIn(domains) => {
-            // Fires when AT LEAST ONE extracted URL's host is outside every
-            // listed registrable domain — the "talking to a domain we didn't
-            // allow" shape. With no URLs there is nothing outside the list.
+            // Fires when at least one extracted URL's host is outside every
+            // listed domain. With no URLs there is nothing outside the list.
             ctx.urls
                 .iter()
                 .any(|u| !domains.iter().any(|d| host_is_under_domain(u.host, d)))
@@ -947,12 +734,8 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
         },
         WhenClause::PackageReputation(rep) => ctx.packages.iter().any(|p| match rep {
             Reputation::Malicious => p.reputation == PkgReputation::Malicious,
-            // `known` = a known-popular package the DB vouches for (and which is
-            // not flagged malicious).
             Reputation::Known => p.reputation == PkgReputation::Known,
-            // `unknown` = either no DB loaded, OR a DB is loaded but the package
-            // is in neither the malicious nor the known-popular index. Both are
-            // "we can't vouch for this", which is what `unknown` means.
+            // `unknown` = no DB loaded, or loaded but the package is in neither index.
             Reputation::Unknown => {
                 matches!(p.reputation, PkgReputation::NoDb | PkgReputation::Unknown)
             }
@@ -969,8 +752,8 @@ pub fn evaluate(clause: &WhenClause, ctx: &DslEvalContext) -> bool {
 }
 
 /// Normalize an ecosystem alias to its canonical [`crate::threatdb::Ecosystem`]
-/// display string when recognized; otherwise lowercase the input. This lets
-/// `crates`/`cargo` match `crates.io`, etc.
+/// display string when recognized, else lowercase it — so `crates`/`cargo`
+/// match `crates.io`.
 fn normalize_ecosystem(s: &str) -> String {
     match crate::threatdb::Ecosystem::from_name(s) {
         Some(e) => e.to_string(),
@@ -978,53 +761,36 @@ fn normalize_ecosystem(s: &str) -> String {
     }
 }
 
-/// Heuristic: does this look like a Windows path? `true` for a leading
-/// drive-letter spec (`C:\…`, `c:/…`, or even drive-RELATIVE `C:rel`) or a
-/// UNC/`//`-rooted path. Windows file systems are case-insensitive, so such
-/// paths are lowercased before lexical comparison; POSIX paths are left
-/// untouched because they ARE case-sensitive.
-///
-/// NOTE: this matches drive-RELATIVE forms like `C:relative` (no separator), so
-/// it must NOT be used to decide root-containment — use
-/// [`is_windows_absolute_path`] there. It is only used for case-normalization,
-/// where treating a drive-relative path as "Windows" (and thus lower-casing it)
-/// is harmless.
+/// Heuristic: does this look like a Windows path? `true` for a leading drive
+/// letter (`C:…`, incl. drive-RELATIVE `C:rel`) or a `//`-rooted/UNC path. Used
+/// ONLY for case-normalization (Windows is case-insensitive) — NOT for
+/// root-containment, where drive-relative forms must be excluded; use
+/// [`is_windows_absolute_path`] there.
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Drive letter: `X:` (possibly followed by anything, incl. nothing).
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
-    // UNC / double-separator root (already back-slash-normalized to `/`).
     s.starts_with("//")
 }
 
-/// `true` only when `s` is an ABSOLUTE Windows path: a drive letter + `:`
-/// followed by a separator (slash/backslash) — `C:/…`, `c:\…` — or a leading
-/// `//` UNC / double-separator root. Unlike [`looks_like_windows_path`], this
-/// rejects drive-RELATIVE forms: BOTH a bare `C:` and `C:relative` are relative
-/// to the drive's current directory in Windows path semantics (Rust's
-/// `Path::new("C:").is_absolute()` is `false`), so neither is absolute and
-/// neither may be treated as root-contained (CodeRabbit M13 round-20
-/// custom_rule_dsl.rs:872-879, correcting the round-19 fix that wrongly accepted
-/// bare `C:`).
+/// `true` only when `s` is an ABSOLUTE Windows path: drive letter + `:` +
+/// separator (`C:/…`, `c:\…`) or a leading `//` UNC root. Unlike
+/// [`looks_like_windows_path`], rejects drive-RELATIVE forms — both bare `C:` and
+/// `C:relative` are relative to the drive's cwd, so neither is root-contained
+/// (round-20, correcting round-19 which wrongly accepted bare `C:`).
 fn is_windows_absolute_path(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Drive-letter ROOT requires a drive letter, `:`, AND a separator — a bare
-    // `C:` (len == 2) or `C:relative` (no separator at byte 2) is drive-relative,
-    // NOT absolute. (Back-slashes are normalized to `/` before this is reached,
-    // but accept both so the helper is correct independent of that pre-pass.)
+    // Drive ROOT requires drive letter, `:`, AND a separator (accept both forms
+    // independent of the back-slash→`/` pre-pass).
     if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return bytes[2] == b'/' || bytes[2] == b'\\';
     }
-    // UNC / double-separator root (already back-slash-normalized to `/`).
     s.starts_with("//")
 }
 
-/// Normalize a path for purely-lexical "is-under" matching: back-slashes →
-/// `/`, and (only when [`looks_like_windows_path`]) lowercased so a
-/// case-insensitive Windows file system matches `C:\repo` against
-/// `c:\repo\sub`. POSIX paths keep their case.
+/// Normalize a path for lexical "is-under" matching: back-slashes → `/`, and
+/// (only when [`looks_like_windows_path`]) lowercased. POSIX paths keep case.
 fn normalize_for_lexical_path_match(s: &str) -> String {
     let slashed = s.replace('\\', "/");
     if looks_like_windows_path(&slashed) {
@@ -1034,40 +800,25 @@ fn normalize_for_lexical_path_match(s: &str) -> String {
     }
 }
 
-/// `true` when `path` is `base` or a descendant of it. Both are compared as
-/// `/`-separated component sequences (purely lexical — no filesystem access),
-/// so `/home/x` is under `/home` but `/home-other` is not.
-///
-/// Windows back-slashes are normalized to `/` first, and Windows-looking paths
-/// are lowercased, so `cwd_in: ["C:\\repo"]` matches `c:\\repo\\sub` on a
-/// case-insensitive file system (CodeRabbit M13 findings B/R1). POSIX paths
-/// remain case-sensitive — `/Home` is NOT a parent of `/home/x`.
+/// `true` when `path` is `base` or a descendant — compared as `/`-separated
+/// component sequences (lexical, no filesystem access), so `/home/x` is under
+/// `/home` but `/home-other` is not. Windows paths are back-slash-normalized and
+/// case-folded (findings B/R1); POSIX paths stay case-sensitive.
 fn path_is_under(path: &str, base: &str) -> bool {
     let path = normalize_for_lexical_path_match(path);
     let base = normalize_for_lexical_path_match(base);
-    // Trim the BASE only to detect the root sentinel `cwd_in: ["/"]` (which
-    // trims to empty). The absolute-path check below MUST run on the UNTRIMMED
-    // `path`: trailing-slash trimming turns a bare drive ROOT `c:/` into `c:`,
-    // and `is_windows_absolute_path("c:")` is FALSE (round-20 requires a
-    // separator after the drive colon), so trimming the PATH first would make
-    // `cwd_in: ["/"]` fail to root-contain `C:/` (CodeRabbit M13 round-25
-    // custom_rule_dsl.rs:1042).
+    // Trim the BASE only, to detect the root sentinel `cwd_in: ["/"]` (trims to
+    // empty). The absolute-path check below runs on the UNTRIMMED `path` because
+    // trimming would turn a bare drive ROOT `c:/` into `c:`, which
+    // `is_windows_absolute_path` rejects (round-25).
     let base_trimmed = base.trim_end_matches('/');
     if base_trimmed.is_empty() {
-        // `cwd_in: ["/"]` — the root sentinel contains every ABSOLUTE path. After
-        // `normalize_for_lexical_path_match` a POSIX absolute and a `//`-rooted
-        // UNC share both start with `/`, and a Windows drive path is `c:/…`. An
-        // empty or relative `path` is NOT root-contained (CodeRabbit M13
-        // round-15 custom_rule_dsl.rs:810). Use the strict
-        // `is_windows_absolute_path` (NOT `looks_like_windows_path`, which also
-        // matches drive-RELATIVE `c:rel`) so a non-absolute path is never treated
-        // as root-contained (CodeRabbit M13 round-19 custom_rule_dsl.rs:884-891).
-        // `path` is the UNTRIMMED normalized form so a bare-root `C:/`/`C:\` is
-        // still recognized as absolute.
+        // Root sentinel contains every ABSOLUTE path. Strict
+        // `is_windows_absolute_path` (not the looser `looks_like_windows_path`)
+        // so drive-relative `c:rel` is NOT root-contained (round-15/19).
         return path.starts_with('/') || is_windows_absolute_path(&path);
     }
-    // Non-root base: trim the path too for the prefix comparison (so
-    // `/home/user/` and `/home/user` match).
+    // Non-root base: trim the path too so `/home/user/` and `/home/user` match.
     let path = path.trim_end_matches('/');
     if path == base_trimmed {
         return true;
@@ -1099,10 +850,9 @@ fn host_is_under_domain(host: &str, domain: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The seven shipping example DSL rules
-    /// (`tests/fixtures/custom_rules_dsl.yaml`) must all load via `Policy`, have
-    /// a valid pattern-XOR-when shape, valid inner regexes, and a declared
-    /// context that covers each clause's required triggers.
+    /// The seven shipping example DSL rules must all load via `Policy` with a
+    /// valid pattern-XOR-when shape, valid regexes, and a context that covers
+    /// each clause.
     #[test]
     fn test_seven_example_dsl_rules_round_trip() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1116,8 +866,7 @@ mod tests {
         let yaml = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-        // Use the strict parser so a fixture typo is a hard test failure
-        // (the production `load_from_yaml` warn-and-defaults to empty).
+        // Strict parser so a fixture typo is a hard test failure.
         let policy = crate::policy::Policy::try_parse_yaml(&yaml)
             .unwrap_or_else(|e| panic!("fixture parse error: {e}"));
         assert_eq!(
@@ -1189,7 +938,6 @@ all:
   - url.domain_not_in: [company.com, github.com]
 "#;
         let clause: WhenClause = serde_yaml::from_str(yaml).expect("parse");
-        // Re-serialize and re-parse to prove a clean round-trip.
         let out = serde_yaml::to_string(&clause).expect("serialize");
         let clause2: WhenClause = serde_yaml::from_str(&out).expect("reparse");
         assert_eq!(clause, clause2);
@@ -1227,8 +975,7 @@ all:
         });
         assert!(evaluate(&clause, &ctx), "evil-domain curl|bash should fire");
 
-        // A github.com URL is in the allow list -> domain_not_in is false ->
-        // whole `all` is false.
+        // github.com is allow-listed -> domain_not_in false -> `all` false.
         let mut ctx2 = DslEvalContext::default();
         ctx2.pipeline_targets.insert("bash".to_string());
         ctx2.urls.push(DslUrl {
@@ -1256,8 +1003,7 @@ any:
         };
         assert!(evaluate(&clause, &ctx));
 
-        // No sudo, only an https URL -> not(scheme https) is false, sudo is
-        // false -> any() false.
+        // No sudo, https URL -> not(scheme https) false -> any() false.
         let mut ctx2 = DslEvalContext::default();
         ctx2.urls.push(DslUrl {
             host: "x.com",
@@ -1266,7 +1012,7 @@ any:
         });
         assert!(!evaluate(&clause, &ctx2));
 
-        // No sudo, a plain http URL -> not(scheme https) is true -> any() true.
+        // No sudo, http URL -> not(scheme https) true -> any() true.
         let mut ctx3 = DslEvalContext::default();
         ctx3.urls.push(DslUrl {
             host: "x.com",
@@ -1278,11 +1024,9 @@ any:
 
     #[test]
     fn test_deeply_nested_clause_is_rejected_with_depth_error() {
-        // CodeRabbit M13 round-20 custom_rule_dsl.rs:202-264 (DoS): the recursive
-        // `not`/`all`/`any` cases must be depth-bounded DURING deserialization so a
-        // hostile repo-local policy cannot stack-overflow `policy validate`.
-        // Build `not: { not: { not: ... { url.scheme: https } } }` nested well past
-        // the cap, as flow-style YAML.
+        // DoS (round-20): nesting must be depth-bounded DURING deserialization so
+        // a hostile policy cannot stack-overflow `policy validate`. Build a tree
+        // nested well past the cap.
         let over = MAX_CLAUSE_DEPTH + 5;
         let mut yaml = String::new();
         for _ in 0..over {
@@ -1300,12 +1044,8 @@ any:
             "expected the depth error, got: {msg}"
         );
 
-        // A tree AT the cap still parses. The root clause is depth 1 and each
-        // `not:` wrapper is its own clause NODE, so K wrappers occupy depths
-        // 1..=K and the innermost leaf node (`url.scheme: …`) is at depth K+1.
-        // The deepest node must satisfy `depth <= MAX_CLAUSE_DEPTH`, so the
-        // boundary is K+1 == MAX_CLAUSE_DEPTH, i.e. (MAX_CLAUSE_DEPTH - 1)
-        // wrappers around the leaf. That case must be ACCEPTED.
+        // A tree AT the cap still parses: K wrappers occupy depths 1..=K and the
+        // leaf is at K+1, so the boundary is (MAX_CLAUSE_DEPTH - 1) wrappers.
         let at_cap_wrappers = MAX_CLAUSE_DEPTH - 1;
         let mut ok = String::new();
         for _ in 0..at_cap_wrappers {
@@ -1319,10 +1059,8 @@ any:
             .expect("a clause nested exactly at the cap must still parse");
     }
 
-    // CodeRabbit M13 round-4 N5: `*_matches` predicates compile their regex
-    // through a per-thread cache instead of recompiling on every `evaluate()`.
-    // Repeated evaluation of the SAME `url.host_matches` rule must keep identical
-    // match / non-match semantics across calls (the cache is transparent).
+    // round-4 N5: the per-thread regex cache must be transparent — repeated
+    // evaluation of the same rule keeps identical match/non-match semantics.
     #[test]
     fn test_host_matches_regex_cache_preserves_semantics() {
         let clause = WhenClause::UrlHostMatches(r"\.evil\.com$".to_string());
@@ -1340,8 +1078,7 @@ any:
             reputation: Reputation::Known,
         });
 
-        // Evaluate repeatedly to exercise the cache hit path; the verdict is
-        // stable and the cache never flips a match into a non-match.
+        // Repeat to exercise the cache hit path; the verdict must stay stable.
         for _ in 0..3 {
             assert!(evaluate(&clause, &hit), "matching host should fire");
             assert!(
@@ -1353,10 +1090,8 @@ any:
 
     #[test]
     fn test_satisfiable_command_needs_exec_or_paste() {
-        // CodeRabbit M13 round-3 R3-1: `command.*` predicates evaluate on BOTH
-        // exec and paste input (`build_dsl_backing` fills pipeline/sudo/cwd for
-        // every non-FileScan context), so a `[paste]` command rule must validate.
-        // FileScan still does not (it never extracts command facts).
+        // round-3 R3-1: `command.*` evaluates on BOTH exec and paste, so a
+        // `[paste]` command rule must validate; FileScan still does not.
         let clause = WhenClause::CommandUsesSudo(true);
         let sat = satisfiable_contexts(&clause);
         assert!(!sat.is_empty());
@@ -1367,12 +1102,9 @@ any:
 
     #[test]
     fn test_satisfiable_empty_list_command_predicate_is_unsatisfiable() {
-        // CodeRabbit M13 round-24 custom_rule_dsl.rs:709-712: a `command.*`
-        // predicate whose LIST is empty can never match (`evaluate` runs
-        // `any(..)` over an empty set, always `false`), so it must NOT advertise
-        // {Exec, Paste} — that would mislabel a dead rule as runnable and let it
-        // pass context resolution / `policy validate`. An empty list yields the
-        // EMPTY satisfiable set so the rule is treated as non-runnable / invalid.
+        // round-24: an empty-list `command.*` predicate can never match, so it
+        // yields the EMPTY satisfiable set (dead rule, rejected) rather than
+        // mislabeling itself runnable.
         for clause in [
             WhenClause::CommandHasPipelineTo(vec![]),
             WhenClause::CommandCwdIn(vec![]),
@@ -1382,7 +1114,6 @@ any:
                 sat.is_empty(),
                 "an empty-list command predicate must be unsatisfiable (EMPTY set), got {sat:?} for {clause:?}"
             );
-            // No declared context can rescue it — it is dead everywhere.
             assert!(
                 !sat.intersects_declared(&[
                     ScanContext::Exec,
@@ -1391,8 +1122,7 @@ any:
                 ]),
                 "empty-list command predicate must not intersect any declared context: {clause:?}"
             );
-            // The satisfiability verdict agrees with `evaluate`: a fully-populated
-            // command context still never matches an empty-list predicate.
+            // Agrees with `evaluate`: even a populated ctx never matches.
             let mut ctx = DslEvalContext {
                 uses_sudo: true,
                 cwd: Some("/home/user/repo"),
@@ -1403,9 +1133,8 @@ any:
                 !evaluate(&clause, &ctx),
                 "empty-list command predicate must never fire, even on a populated ctx: {clause:?}"
             );
-            // And `resolve_runtime_contexts` clamps it to empty under the default
-            // [exec, paste] declaration — exactly what makes `compile_rules` drop
-            // it and both validators reject it.
+            // `resolve_runtime_contexts` clamps it to empty under default
+            // [exec, paste] — so `compile_rules`/validators reject it.
             assert!(
                 resolve_runtime_contexts(&[ScanContext::Exec, ScanContext::Paste], &clause)
                     .is_empty(),
@@ -1416,9 +1145,8 @@ any:
 
     #[test]
     fn test_satisfiable_nonempty_list_command_predicate_is_exec_or_paste() {
-        // Companion to the empty-list check: a NON-empty `command.has_pipeline_to`
-        // / `command.cwd_in` list is still evaluable in Exec OR Paste (and never
-        // FileScan), unchanged by the round-24 empty-list clamp.
+        // Companion to the empty-list check: a NON-empty list is still evaluable
+        // in Exec OR Paste (never FileScan).
         for clause in [
             WhenClause::CommandHasPipelineTo(vec!["bash".to_string()]),
             WhenClause::CommandCwdIn(vec!["/home/user/repo".to_string()]),
@@ -1454,14 +1182,8 @@ any:
 
     #[test]
     fn test_satisfiable_package_needs_exec_or_paste() {
-        // Regression (CodeRabbit M13 round-1 finding A + round-3 R3-1):
-        // `package.*` is evaluable in Exec OR Paste — the engine's
-        // `build_dsl_backing` extracts package facts off the command line for
-        // every non-FileScan context (both exec and paste), so a `[paste]`
-        // package rule sees its data at runtime and must validate. FileScan is
-        // still rejected (it never populates `DslEvalContext::packages`, so a
-        // `context: [file]` package rule would be dead at runtime). Cover all
-        // three package predicates.
+        // Regression (round-1 finding A + round-3 R3-1): `package.*` is evaluable
+        // in Exec OR Paste, never FileScan. Cover all three package predicates.
         for clause in [
             WhenClause::PackageEcosystem("npm".to_string()),
             WhenClause::PackageNameMatches("^left-pad$".to_string()),
@@ -1493,10 +1215,9 @@ any:
 
     #[test]
     fn test_satisfiable_all_command_and_file_is_empty_unsatisfiable() {
-        // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` is UNSATISFIABLE —
-        // NO single scan populates BOTH command facts and a file path, so the
-        // INTERSECTION of {Exec, Paste} and {FileScan} is empty. The old flatten
-        // wrongly ACCEPTED this for `context: [exec, file]` (a dead rule).
+        // round-9 R9-1: `all(command.*, file.*)` is UNSATISFIABLE — no single scan
+        // has both, so {Exec, Paste} ∩ {FileScan} is empty. The old flatten
+        // wrongly accepted it for `[exec, file]`.
         let clause = WhenClause::All(vec![
             WhenClause::CommandUsesSudo(true),
             WhenClause::FilePathMatches(r"x".to_string()),
@@ -1506,17 +1227,14 @@ any:
             sat.is_empty(),
             "all(command, file) must be unsatisfiable (empty intersection), got {sat:?}"
         );
-        // Even declaring both contexts cannot rescue it — no single scan has both.
         assert!(!sat.intersects_declared(&[ScanContext::Exec, ScanContext::FileScan]));
     }
 
     #[test]
     fn test_satisfiable_any_command_or_file_is_union() {
-        // CodeRabbit M13 round-9 R9-1: `any(command.*, file.*)` is evaluable
-        // wherever EITHER branch is — the UNION {Exec, Paste, FileScan}. The old
-        // flatten wrongly REJECTED this for `context: [exec]` even though the
-        // command branch is evaluable there. It must be ACCEPTED for `[exec]` AND
-        // for `[file]`.
+        // round-9 R9-1: `any(command.*, file.*)` is evaluable wherever EITHER
+        // branch is — the UNION {Exec, Paste, FileScan}. The old flatten wrongly
+        // rejected it for `[exec]`.
         let clause = WhenClause::Any(vec![
             WhenClause::CommandUsesSudo(true),
             WhenClause::FilePathMatches(r"\.env$".to_string()),
@@ -1539,25 +1257,20 @@ any:
 
     #[test]
     fn test_satisfiable_empty_any_is_unsatisfiable() {
-        // CodeRabbit M13 round-10 R10-1: a degenerate empty `any: []` is VACUOUSLY
-        // FALSE in `evaluate` (`[].iter().any(..)` is `false`), so it can never
-        // match — a dead rule. `satisfiable_contexts` must return EMPTY so the
-        // validators/compile reject/drop it as unsatisfiable, consistent with the
-        // round-9 empty-satisfiable-set rejection.
+        // round-10 R10-1: empty `any: []` is vacuously FALSE → EMPTY so the
+        // validators reject it as a dead rule.
         let any_empty = WhenClause::Any(vec![]);
         let sat = satisfiable_contexts(&any_empty);
         assert!(
             sat.is_empty(),
             "empty `any: []` must be unsatisfiable (EMPTY set), got {sat:?}"
         );
-        // No declared context can rescue it — it is dead everywhere.
         assert!(!sat.intersects_declared(&[
             ScanContext::Exec,
             ScanContext::Paste,
             ScanContext::FileScan,
         ]));
-        // And the satisfiability verdict matches `evaluate`: an empty `any` is
-        // false on a fully-empty context (it would be false on ANY context).
+        // Matches `evaluate`: empty `any` is false on any context.
         assert!(
             !evaluate(&any_empty, &DslEvalContext::default()),
             "empty `any` must evaluate to false"
@@ -1566,11 +1279,8 @@ any:
 
     #[test]
     fn test_satisfiable_empty_all_is_universal_and_vacuously_true() {
-        // CodeRabbit M13 round-10 R10-1 (companion check): an empty `all: []` is
-        // VACUOUSLY TRUE in `evaluate` (`[].iter().all(..)` is `true`), so the
-        // intersection identity (ALL) is the correct satisfiable set — it is
-        // evaluable in every context. This contrasts with empty `any` above and
-        // must be left as-is.
+        // round-10 R10-1 companion: empty `all: []` is vacuously TRUE → universal
+        // set (contrasts with empty `any` above).
         let all_empty = WhenClause::All(vec![]);
         let sat = satisfiable_contexts(&all_empty);
         assert!(
@@ -1580,7 +1290,7 @@ any:
         assert!(sat.intersects_declared(&[ScanContext::Exec]));
         assert!(sat.intersects_declared(&[ScanContext::Paste]));
         assert!(sat.intersects_declared(&[ScanContext::FileScan]));
-        // The satisfiability verdict matches `evaluate`: an empty `all` is true.
+        // Matches `evaluate`: empty `all` is true.
         assert!(
             evaluate(&all_empty, &DslEvalContext::default()),
             "empty `all` must evaluate to true (vacuous)"
@@ -1589,11 +1299,10 @@ any:
 
     #[test]
     fn test_satisfiable_not_preserves_child_set() {
-        // `not(child)` keeps the child's evaluability — negation only flips the
-        // verdict, it doesn't change which context has the facts. This is the
-        // round-15 clamp: `not(file.path_matches)` is evaluable ONLY in FileScan,
-        // NOT the complement {Exec, Paste} (which would reintroduce a `not(file)`
-        // false-positive in exec, where `file_path` is unset).
+        // The round-15 clamp: `not(child)` keeps the child's set, so
+        // `not(file.path_matches)` is evaluable ONLY in FileScan, not the
+        // complement {Exec, Paste} (which would be a `not(file)` exec
+        // false-positive).
         let clause = WhenClause::Not(Box::new(WhenClause::FilePathMatches(r"x".to_string())));
         let sat = satisfiable_contexts(&clause);
         assert_eq!(
@@ -1607,29 +1316,18 @@ any:
 
     #[test]
     fn test_satisfiable_not_of_degenerate_empty_combinators_follow_truth_value() {
-        // CodeRabbit M13 PR #132 R17-1: the ONLY place `satisfiable_contexts` may
-        // diverge from `satisfiable_contexts(child)` for a `Not` is the two
-        // DEGENERATE directly-nested EMPTY combinators, whose set identity and
-        // `evaluate` truth value disagree:
-        //
-        //   * `not(any: [])` == `not(false)` == constant-TRUE → runs everywhere →
-        //     ContextSet::ALL. (Naively returning the child's set would give EMPTY,
-        //     mislabeling a constant-true clause as unsatisfiable.)
-        //   * `not(all: [])` == `not(true)` == constant-FALSE → never matches →
-        //     ContextSet::EMPTY (unsatisfiable). (The child's set is ALL, which
-        //     would mislabel a dead clause as runnable.)
-        //
-        // We did NOT apply CodeRabbit's blanket "complement" suggestion: a
-        // complement would flip `not(file.path_matches)` from {FileScan} to
-        // {Exec, Paste} and reintroduce the round-15 `not(file)` exec
-        // false-positive (asserted in `test_satisfiable_not_preserves_child_set`).
+        // R17-1: the only `Not` divergence from the child's set is the two
+        // degenerate directly-nested EMPTY combinators:
+        //   * `not(any: [])` == constant-TRUE → ALL.
+        //   * `not(all: [])` == constant-FALSE → EMPTY.
+        // A blanket "complement" was NOT applied (it would reintroduce the
+        // round-15 `not(file)` exec false-positive).
         let not_empty_any = WhenClause::Not(Box::new(WhenClause::Any(vec![])));
         assert_eq!(
             satisfiable_contexts(&not_empty_any),
             ContextSet::ALL,
             "not(any: []) is constant-true -> ALL"
         );
-        // The set verdict agrees with `evaluate`: constant-true on any context.
         assert!(
             evaluate(&not_empty_any, &DslEvalContext::default()),
             "not(any: []) must evaluate to true"
@@ -1641,14 +1339,12 @@ any:
             ContextSet::EMPTY,
             "not(all: []) is constant-false -> EMPTY (unsatisfiable)"
         );
-        // The set verdict agrees with `evaluate`: constant-false on any context.
         assert!(
             !evaluate(&not_empty_all, &DslEvalContext::default()),
             "not(all: []) must evaluate to false"
         );
 
-        // A NON-degenerate `not(any: [...])` is unaffected — it still returns the
-        // child's (union) set, not ALL. `any(command.*)` is {Exec, Paste}.
+        // A NON-degenerate `not(any: [...])` still returns the child's set, not ALL.
         let not_nonempty_any = WhenClause::Not(Box::new(WhenClause::Any(vec![
             WhenClause::CommandUsesSudo(true),
         ])));
@@ -1661,17 +1357,11 @@ any:
 
     #[test]
     fn test_satisfiable_nested_not_follows_parity_of_evaluate() {
-        // CodeRabbit M13 PR #132 R21: nested `Not` must be evaluate-consistent at
-        // ANY depth, not just one level. The old one-level match special-cased only
-        // `not(any: [])`/`not(all: [])` and let any deeper `Not` fall through to the
-        // child-set arm, so `not(not(any: []))` wrongly returned ALL instead of
-        // EMPTY. We peel the `Not` chain and apply the parity table derived from
-        // `evaluate` (`any:[]`=const-false, `all:[]`=const-true, each `Not` flips).
-        //
-        // Cross-check: a clause is constant-true in `evaluate` iff it runs
-        // everywhere (ALL), constant-false iff it never matches (EMPTY). We assert
-        // the satisfiable set AND that it agrees with `evaluate` on a default ctx
-        // (the truth value is context-independent for these degenerate clauses).
+        // R21: nested `Not` must be evaluate-consistent at ANY depth. The old
+        // one-level match let `not(not(any: []))` wrongly return ALL instead of
+        // EMPTY. Peel the chain and apply the parity table (`any:[]`=const-false,
+        // `all:[]`=const-true, each `Not` flips). Assert the set AND that it
+        // agrees with `evaluate`.
         let ctx = DslEvalContext::default();
 
         // Build `Not^n(inner)`.
@@ -1683,8 +1373,7 @@ any:
             c
         }
 
-        // innermost `any: []` is constant-FALSE: EMPTY at even depth, ALL at odd.
-        // k=1: not(any: []) -> ALL (single-level; old behavior preserved).
+        // innermost `any: []` is const-FALSE: EMPTY at even depth, ALL at odd.
         let c = wrap_not(WhenClause::Any(vec![]), 1);
         assert_eq!(
             satisfiable_contexts(&c),
@@ -1693,7 +1382,7 @@ any:
         );
         assert!(evaluate(&c, &ctx), "not(any: []) evaluates true");
 
-        // k=2: not(not(any: [])) -> EMPTY (THE BUG: old code returned ALL).
+        // k=2: not(not(any: [])) -> EMPTY (the R21 bug: old code returned ALL).
         let c = wrap_not(WhenClause::Any(vec![]), 2);
         assert_eq!(
             satisfiable_contexts(&c),
@@ -1702,7 +1391,7 @@ any:
         );
         assert!(!evaluate(&c, &ctx), "not(not(any: [])) evaluates false");
 
-        // k=3: not(not(not(any: []))) -> ALL.
+        // k=3 -> ALL.
         let c = wrap_not(WhenClause::Any(vec![]), 3);
         assert_eq!(
             satisfiable_contexts(&c),
@@ -1711,8 +1400,7 @@ any:
         );
         assert!(evaluate(&c, &ctx), "not^3(any: []) evaluates true");
 
-        // innermost `all: []` is constant-TRUE: ALL at even depth, EMPTY at odd.
-        // k=1: not(all: []) -> EMPTY (single-level; old behavior preserved).
+        // innermost `all: []` is const-TRUE: ALL at even depth, EMPTY at odd.
         let c = wrap_not(WhenClause::All(vec![]), 1);
         assert_eq!(
             satisfiable_contexts(&c),
@@ -1721,7 +1409,7 @@ any:
         );
         assert!(!evaluate(&c, &ctx), "not(all: []) evaluates false");
 
-        // k=2: not(not(all: [])) -> ALL.
+        // k=2 -> ALL.
         let c = wrap_not(WhenClause::All(vec![]), 2);
         assert_eq!(
             satisfiable_contexts(&c),
@@ -1730,10 +1418,8 @@ any:
         );
         assert!(evaluate(&c, &ctx), "not(not(all: [])) evaluates true");
 
-        // A real leaf with a KNOWN non-ALL family: `file.path_matches` -> {FileScan}.
-        // `Not` returns the CHILD's set (not the complement) at every depth, so
-        // both `not(leaf)` and `not(not(leaf))` keep the leaf's family — this is the
-        // round-15 clamp that stops a `not(file)` exec false-positive.
+        // A real leaf keeps its family at every depth (`Not` returns the child's
+        // set, not the complement) — the round-15 clamp.
         let file_family = ContextSet::from_contexts(&[ScanContext::FileScan]);
         let leaf = || WhenClause::FilePathMatches(r"secrets".to_string());
 
@@ -1760,10 +1446,8 @@ any:
 
     #[test]
     fn test_satisfiable_all_within_one_family_intersects_to_that_family() {
-        // `all(command.*, command.*)` and `all(command.*, url.*)` both stay in
-        // {Exec, Paste}: the intersection of two {Exec, Paste} sets is itself
-        // {Exec, Paste}, so a `[exec]` rule is accepted (regression for the
-        // 7-rule fixture rules 1-4 and 7, which are intra-{exec,paste} `all`s).
+        // An `all` of two {Exec, Paste} predicates stays {Exec, Paste}, so a
+        // `[exec]` rule is accepted (regression for fixture rules 1-4 and 7).
         let clause = WhenClause::All(vec![
             WhenClause::CommandUsesSudo(true),
             WhenClause::UrlReputation(Reputation::Unknown),
@@ -1776,14 +1460,11 @@ any:
 
     #[test]
     fn test_resolve_runtime_contexts_clamps_and_unifies() {
-        // CodeRabbit M13 round-15 coherence: the SINGLE shared model
-        // `resolve_runtime_contexts` returns `declared ∩ satisfiable`, which is
-        // exactly what `compile_rules` stores and what both validators test for
-        // emptiness. Cover the load-bearing cases:
+        // round-15: `resolve_runtime_contexts` returns `declared ∩ satisfiable`.
+        // Cover the load-bearing cases.
         use ScanContext::{Exec, FileScan, Paste};
 
-        // `command.*` declared `[exec, paste]` (serde's omitted-context default)
-        // resolves to {exec, paste} — accepted, runs in both.
+        // `command.*` under default [exec, paste] resolves to both.
         let cmd = WhenClause::CommandUsesSudo(true);
         assert_eq!(
             resolve_runtime_contexts(&[Exec, Paste], &cmd),
@@ -1791,9 +1472,8 @@ any:
             "command.* under default [exec, paste] resolves to {{exec, paste}}"
         );
 
-        // `file.path_matches` declared `[exec, paste]` (the omitted-context
-        // default) resolves to the EMPTY intersection — correctly rejected as a
-        // dead no-context file rule (the round-15 rule.rs:338 point).
+        // `file.path_matches` under default [exec, paste] resolves to EMPTY —
+        // a dead no-context file rule, rejected (round-15 rule.rs:338).
         let file = WhenClause::FilePathMatches(r"\.env$".into());
         assert!(
             resolve_runtime_contexts(&[Exec, Paste], &file).is_empty(),
@@ -1826,10 +1506,8 @@ any:
 
     #[test]
     fn test_satisfiable_agent_kind_is_empty() {
-        // `agent.kind` / `mcp.tool` have an EMPTY satisfiable set (no scan wires
-        // up their signal). They are rejected by
-        // `clause_uses_unsupported_predicate` BEFORE this is consulted for a
-        // loaded rule, so the empty set only serves as the any/not identity.
+        // `agent.kind` / `mcp.tool` have an EMPTY satisfiable set (rejected
+        // earlier; the empty set only serves as the any/not identity).
         assert!(satisfiable_contexts(&WhenClause::AgentKind("claude-code".to_string())).is_empty());
         assert!(satisfiable_contexts(&WhenClause::McpTool("read_file".to_string())).is_empty());
     }
@@ -1844,16 +1522,9 @@ any:
 
     #[test]
     fn test_check_regex_length_cap_counts_chars_not_bytes() {
-        // CodeRabbit M13 round-26: `check_regex` (reached here via the public
-        // `validate_regexes` through a `*_matches` predicate) must measure its
-        // 1024 cap in CHARACTERS, not UTF-8 BYTES. A multibyte pattern that is
-        // <=1024 CHARS but >1024 BYTES used to be rejected early on byte length;
-        // it must now be ACCEPTED, with any over-limit error reporting a CHAR
-        // count.
-        //
-        // 'é' (U+00E9) is 2 bytes in UTF-8. 600 of them is 600 chars / 1200
-        // bytes: under the 1024-CHAR cap, over a 1024-BYTE one. A repeated
-        // literal is a trivially-cheap, valid regex (keeps the test fast).
+        // round-26: the 1024 cap is measured in CHARACTERS, not UTF-8 bytes. 600
+        // 'é' (2 bytes each) is 600 chars / 1200 bytes — under the char cap, over
+        // a byte cap — so it must be ACCEPTED.
         let multibyte = "é".repeat(600);
         assert_eq!(multibyte.chars().count(), 600, "600 chars");
         assert!(multibyte.len() > 1024, "but >1024 bytes");
@@ -1862,9 +1533,8 @@ any:
             "a <=1024-CHAR regex must pass even when its byte length exceeds 1024"
         );
 
-        // A pattern of >1024 CHARACTERS is still rejected, and the message
-        // reports the CHAR count (1025), not a byte count. Single-byte chars make
-        // this unambiguously a char-count trip.
+        // A >1024-CHAR pattern is still rejected, with the message reporting the
+        // CHAR count (1025).
         let over = "a".repeat(1025);
         assert_eq!(over.chars().count(), 1025, "1025 chars");
         let err = validate_regexes(&WhenClause::UrlHostMatches(over))
@@ -1877,10 +1547,8 @@ any:
 
     #[test]
     fn test_unsupported_predicate_detects_mcp_tool_and_agent_kind() {
-        // CodeRabbit M13 round-3 R3-3 + round-8 R8-1: `mcp.tool` AND `agent.kind`
-        // are parsed + type-checked but no scan context populates `mcp_tool` /
-        // `agent_kind`, so they can never match. The helper must flag BOTH (nested
-        // inside combinators too) and NOT flag any satisfiable predicate.
+        // round-3 R3-3 + round-8 R8-1: the helper must flag both `mcp.tool` and
+        // `agent.kind` (nested too) and NOT flag any satisfiable predicate.
         let bare = WhenClause::McpTool("read_file".to_string());
         let reason = clause_uses_unsupported_predicate(&bare).expect("mcp.tool must be flagged");
         assert!(
@@ -1888,8 +1556,7 @@ any:
             "reason must name mcp.tool clearly: {reason}"
         );
 
-        // `agent.kind` is now also rejected (round-8 R8-1), with a message that
-        // names the predicate and points at `agent_rules`.
+        // `agent.kind` is also rejected (round-8 R8-1), pointing at `agent_rules`.
         let agent = WhenClause::AgentKind("claude-code".to_string());
         let agent_reason =
             clause_uses_unsupported_predicate(&agent).expect("agent.kind must be flagged (R8-1)");
@@ -1937,10 +1604,8 @@ any:
 
     #[test]
     fn test_path_is_under_root_sentinel_matches_windows_absolutes() {
-        // CodeRabbit M13 round-15 custom_rule_dsl.rs:810: the root sentinel
-        // `cwd_in: ["/"]` (base normalizes to empty) must contain ANY absolute
-        // path, not just POSIX `/`-rooted ones. Windows drive-letter and UNC
-        // absolutes count too.
+        // round-15: the root sentinel `cwd_in: ["/"]` must contain ANY absolute
+        // path — Windows drive-letter and UNC absolutes too, not just POSIX.
         assert!(
             path_is_under(r"C:\repo\sub", "/"),
             "Windows drive-letter absolute must be root-contained"
@@ -1968,12 +1633,9 @@ any:
 
     #[test]
     fn test_path_is_under_root_sentinel_rejects_drive_relative() {
-        // CodeRabbit M13 round-20 custom_rule_dsl.rs:872-879 (correcting round-19):
-        // the root sentinel must treat ONLY genuinely-absolute Windows paths as
-        // root-contained. `C:/x` / `C:\x` (drive + separator) are absolute; a bare
-        // `C:` and `C:relative` are drive-RELATIVE (relative to the drive's current
-        // dir) and must NOT be root-contained.
-        // Drive-letter ABSOLUTES (with a separator) count:
+        // round-20 (correcting round-19): only genuinely-absolute Windows paths
+        // (drive + separator) are root-contained; bare `C:` and `C:relative` are
+        // drive-RELATIVE and must NOT be.
         assert!(
             path_is_under("C:/x", "/"),
             "drive-letter absolute (with separator) is root-contained"
@@ -2003,13 +1665,9 @@ any:
 
     #[test]
     fn test_path_is_under_root_sentinel_untrimmed_bare_roots() {
-        // CodeRabbit M13 round-25 custom_rule_dsl.rs:1042: the root-sentinel
-        // empty-base absolute check must run on the UNTRIMMED normalized values.
-        // Trailing-slash trimming would turn a bare drive ROOT `C:/` into `C:`,
-        // which `is_windows_absolute_path` correctly rejects (drive-relative) —
-        // so trimming BEFORE the sentinel check wrongly excluded `C:/` and `C:\`.
-        // TRUE cases — absolute forms, including bare roots WITH a trailing
-        // separator (the regression):
+        // round-25: the sentinel's absolute check runs on the UNTRIMMED values —
+        // trimming would turn bare drive root `C:/` into `C:` (rejected as
+        // drive-relative), wrongly excluding `C:/` and `C:\`.
         assert!(path_is_under("/x", "/"), "POSIX absolute is root-contained");
         assert!(
             path_is_under("/", "/"),
@@ -2042,9 +1700,8 @@ any:
 
     #[test]
     fn test_path_is_under_non_root_base_unaffected_by_reorder() {
-        // CodeRabbit M13 round-25: the empty-base reorder must NOT change
-        // non-root prefix matching. A real `cwd_in: ["/home/user"]` still
-        // contains its descendants but not a sibling-prefix sharer.
+        // round-25: the empty-base reorder must NOT change non-root prefix
+        // matching — descendants match, sibling-prefix sharers do not.
         assert!(
             path_is_under("/home/user/x", "/home/user"),
             "descendant of a real base still matches"
@@ -2075,33 +1732,27 @@ any:
         assert!(is_windows_absolute_path("C:/x"));
         assert!(is_windows_absolute_path(r"C:\x"));
         assert!(is_windows_absolute_path("c:/x")); // lower-case drive letter
-                                                   // UNC / double-separator root.
         assert!(is_windows_absolute_path("//host/share"));
-        // Extended-length / verbatim prefix `\\?\C:\x`: callers backslash-normalize
-        // to `//?/C:/x` before this check, where the leading `//` UNC arm catches it
-        // (treated as absolute). Pass the already-normalized `/`-form as callers do.
+        // Verbatim `\\?\C:\x` is backslash-normalized to `//?/C:/x` first, caught
+        // by the leading `//` UNC arm.
         assert!(is_windows_absolute_path("//?/C:/x"));
-        // Round-20 correction: a bare `C:` (drive + colon, no separator) is
-        // drive-RELATIVE in Windows path semantics (`Path::new("C:").is_absolute()`
-        // is false), so it is NOT absolute.
+        // round-20: bare `C:` and `C:relative` (no separator) are drive-RELATIVE,
+        // NOT absolute.
         assert!(!is_windows_absolute_path("C:"));
-        // Drive-RELATIVE (no separator after colon) is NOT absolute.
         assert!(!is_windows_absolute_path("C:relative"));
-        // POSIX and bare-relative inputs are not Windows-absolute.
-        assert!(!is_windows_absolute_path("/home/x")); // POSIX absolute, handled by `starts_with('/')`
+        assert!(!is_windows_absolute_path("/home/x")); // POSIX, handled by starts_with('/')
         assert!(!is_windows_absolute_path("relative"));
         assert!(!is_windows_absolute_path(""));
-        // `looks_like_windows_path` is the LOOSER check and DOES match BOTH bare
-        // `C:` and `C:relative` — confirming why the strict variant is needed for
-        // the sentinel.
+        // The looser `looks_like_windows_path` DOES match both — why the strict
+        // variant is needed for the sentinel.
         assert!(looks_like_windows_path("C:"));
         assert!(looks_like_windows_path("C:relative"));
     }
 
     #[test]
     fn test_path_is_under_windows_separators() {
-        // Regression (CodeRabbit M13 finding B): Windows back-slashed paths must
-        // be normalized so `cwd_in: ["C:\\repo"]` matches a descendant.
+        // Regression (finding B): Windows back-slashed paths are normalized so a
+        // base matches its descendant.
         assert!(path_is_under(r"C:\repo\sub", r"C:\repo"));
         assert!(path_is_under(r"C:\repo", r"C:\repo"));
         assert!(path_is_under(r"C:\repo\deep\nested", r"C:\repo"));
@@ -2116,8 +1767,8 @@ any:
 
     #[test]
     fn test_path_is_under_windows_case_insensitive() {
-        // Regression (CodeRabbit M13 finding R1): a case-insensitive Windows
-        // file system must match `cwd_in: ["C:\\repo"]` against `c:\repo\sub`.
+        // Regression (finding R1): a case-insensitive Windows file system matches
+        // across case.
         assert!(path_is_under(r"c:\repo\sub", r"C:\repo"));
         assert!(path_is_under(r"C:\Repo\Sub", r"c:\repo"));
         assert!(path_is_under(r"c:/repo/sub", "C:/REPO"));
@@ -2168,9 +1819,8 @@ all:
 
     #[test]
     fn test_package_reputation_tristate() {
-        // Regression (CodeRabbit M13 finding C): `unknown`, `known`, and
-        // `malicious` must all be independently matchable, including `unknown`
-        // when a DB is loaded but the package is absent from both indices.
+        // Regression (finding C): `unknown`/`known`/`malicious` must each be
+        // independently matchable, incl. `unknown` with a DB loaded.
         let unknown_clause = WhenClause::PackageReputation(Reputation::Unknown);
         let known_clause = WhenClause::PackageReputation(Reputation::Known);
         let malicious_clause = WhenClause::PackageReputation(Reputation::Malicious);

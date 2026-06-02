@@ -1,17 +1,13 @@
-//! Windows filesystem helpers for `tirith setup`.
-//!
-//! Provides the same public API as `fs_helpers.rs` but without Unix-specific
-//! permission handling. NTFS ACLs default to owner-only for user-created files,
-//! so explicit chmod is unnecessary on Windows.
+//! Windows filesystem helpers for `tirith setup` — the same public API as
+//! `fs_helpers.rs` without the Unix permission handling (NTFS ACLs default to
+//! owner-only, so explicit chmod is unnecessary).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Write `content` to `path` atomically via temp+rename.
-///
-/// The `mode` parameter is accepted for API compatibility but ignored on Windows
-/// (NTFS ACLs handle permissions).
+/// Write `content` to `path` atomically via temp+rename. `mode` is accepted for
+/// API compatibility but ignored on Windows.
 pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String> {
     let parent = path
         .parent()
@@ -77,8 +73,7 @@ pub fn atomic_write(path: &Path, content: &str, _mode: u32) -> Result<(), String
     Ok(())
 }
 
-/// Write a hook script. On Windows, executable permission is not needed
-/// (executability is determined by file extension, not mode bits).
+/// Write a hook script. No executable bit needed on Windows.
 pub fn write_hook_script(
     path: &Path,
     content: &str,

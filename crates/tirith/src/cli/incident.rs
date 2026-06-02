@@ -1,24 +1,20 @@
 //! M11 ch5 — `tirith incident start|stop|status|report` (L2 #21).
 //!
-//! Incident mode is a manually-declared "we may be under attack" posture. While
-//! it is active, the runtime policy is forced fail-closed, the `TIRITH=0` env
-//! bypass is disabled, and a curated set of already-shipping rules is elevated
-//! (see [`tirith_core::incident`]). All of the state + override logic lives in
-//! the library; this module is the CLI presenter plus the `report` writer.
+//! Incident mode is a manually-declared "we may be under attack" posture that
+//! forces the runtime policy fail-closed, disables the `TIRITH=0` bypass, and
+//! elevates a curated rule set (see [`tirith_core::incident`]). State + override
+//! logic lives in the library; this module is the CLI presenter + `report` writer.
 //!
 //! # Lockout safety (CRITICAL)
 //!
-//! `stop` is a DIRECT deletion of the flag file ([`tirith_core::incident::stop`])
-//! — it is NOT gated by the incident's own fail-closed policy and therefore can
-//! ALWAYS recover a stuck incident, even with `allow_bypass_env: false`. It
-//! never runs a `check`. The CLI integration test `incident_*` pins this.
+//! `stop` is a DIRECT deletion of the flag file, NOT gated by the incident's own
+//! fail-closed policy, so it can ALWAYS recover a stuck incident even with
+//! `allow_bypass_env: false`. The CLI integration test `incident_*` pins this.
 //!
 //! # Report privacy
 //!
-//! `report` reads the local audit log, whose `command_redacted` field was
-//! already run through the shipping credential redactor at write time. The
-//! report copies that redacted preview verbatim and NEVER reconstructs a full
-//! command. Persistence / hook "added lines" are likewise redacted at source.
+//! `report` copies the audit log's already-redacted `command_redacted` preview
+//! verbatim and NEVER reconstructs a full command.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -27,16 +23,10 @@ use tirith_core::incident::{self, IncidentState, StartError};
 
 use super::{confirm, write_json_stdout};
 
-/// Emit a fatal operator error as a machine-readable `{"error": ...}` JSON
-/// object on stdout when `--json`, or a human line on stderr otherwise. Keeps
-/// the `--json` surface parseable on the FATAL branches of start/stop/report
-/// (e.g. an unwritable state dir) instead of leaking plain stderr a JSON
-/// consumer cannot parse (CodeRabbit R7 #5). Mirrors `cli::canary::emit_error`.
-///
-/// Returns `false` when the JSON write itself failed (broken pipe / truncated
-/// output) so a `--json` caller can surface that as a distinct write-failure exit
-/// instead of pairing a semantic exit code with no JSON delivered (CodeRabbit R11
-/// #6). Human mode always returns `true` — the stderr line is best-effort.
+/// Emit a fatal operator error as `{"error": ...}` JSON on stdout (`--json`) or
+/// a human stderr line, keeping the `--json` surface parseable on fatal branches.
+/// Returns `false` when the JSON write itself failed so the caller can use a
+/// distinct write-failure exit; human mode always returns `true` (best-effort).
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
@@ -47,12 +37,9 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     }
 }
 
-/// `tirith incident start [--reason "…"]` — declare an incident: flip the
-/// runtime policy fail-closed and disable the `TIRITH=0` bypass.
-///
-/// A second `start` while one is already active fails (exit 1) with
-/// "already active since X" — it never overwrites the original reason or
-/// start time.
+/// `tirith incident start [--reason "…"]` — declare an incident (fail-closed +
+/// `TIRITH=0` disabled). A second `start` fails (exit 1) without overwriting the
+/// original reason / start time.
 pub fn start(reason: Option<String>, json: bool) -> i32 {
     let reason = reason.unwrap_or_default();
     match incident::start(reason) {
@@ -98,11 +85,9 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
                     started_at_display: String,
                     reason: &'a str,
                 }
-                // A failed JSON write must surface non-zero distinctly from the
-                // "already active" exit 1: a piped consumer that saw truncated
-                // JSON must not read a clean already-active record. Exit 2
-                // mirrors the other incident JSON branches (start/stop/status/
-                // report) which all return 2 on a write failure.
+                // A failed JSON write returns exit 2 (write-failure), distinct
+                // from the "already active" exit 1, so a piped consumer never
+                // reads a clean record from truncated JSON.
                 if !write_json_stdout(
                     &AlreadyOut {
                         started: false,
@@ -130,9 +115,7 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
             1
         }
         Err(e) => {
-            // A failed JSON write surfaces as the write-failure exit (2),
-            // distinct from the semantic fatal exit (1), so a piped consumer
-            // never reads a clean error record that was truncated mid-write.
+            // Failed JSON write → write-failure exit 2, distinct from fatal exit 1.
             if !emit_error(json, "tirith incident start", &e.to_string()) {
                 return 2;
             }
@@ -141,20 +124,17 @@ pub fn start(reason: Option<String>, json: bool) -> i32 {
     }
 }
 
-/// `tirith incident stop [--yes]` — end the active incident: delete the flag
-/// file and restore the normal policy. Prompts for confirmation unless `--yes`.
-/// Logs the stop to the audit log.
+/// `tirith incident stop [--yes]` — end the active incident (delete the flag,
+/// restore the policy, audit-log it). Prompts unless `--yes`.
 ///
-/// LOCKOUT SAFETY: this performs a plain filesystem deletion via
-/// [`tirith_core::incident::stop`] with NO `check` and NO policy gating, so it
-/// always works even when the incident has the policy fail-closed.
+/// LOCKOUT SAFETY: a plain filesystem deletion via [`tirith_core::incident::stop`]
+/// with NO `check` and NO policy gating, so it works even when fail-closed.
 pub fn stop(yes: bool, json: bool) -> i32 {
     let existing = incident::read_state();
     if existing.is_none() {
         if json {
-            // A failed JSON write must surface non-zero so a piped consumer never
-            // pairs truncated/absent JSON with a success exit (mirrors
-            // command-card sign/verify and `incident report`).
+            // Failed JSON write → non-zero, so a consumer never pairs truncated
+            // JSON with a success exit.
             if !write_json_stdout(
                 &StoppedOut {
                     stopped: false,
@@ -173,11 +153,8 @@ pub fn stop(yes: bool, json: bool) -> i32 {
     // Confirmation. In JSON mode require --yes (no prompt on a machine surface).
     if json {
         if !yes {
-            // Route the fatal "--yes required" branch through the JSON-error path
-            // so `incident stop --json` stays parseable (CodeRabbit R8 #6); a plain
-            // stderr line here left the `--json` surface non-parseable. Exit code
-            // is 2 whether or not the JSON write itself succeeds (a failed write is
-            // already the write-failure exit, also 2), so the bool is moot here.
+            // Route "--yes required" through the JSON-error path so `--json` stays
+            // parseable. Exit 2 either way (the bool is moot here).
             let _ = emit_error(
                 json,
                 "tirith incident stop",
@@ -195,17 +172,14 @@ pub fn stop(yes: bool, json: bool) -> i32 {
 
     match incident::stop() {
         Ok(removed) => {
-            // RACE HANDLING (CodeRabbit R18 #3): `read_state()` above saw an active
-            // incident, but `stop()` returns `removed == false` when the flag was
-            // ALREADY GONE by the time we deleted it — i.e. another process (a
-            // concurrent `incident stop`) cleared it in between. In that case THIS
-            // invocation did not stop anything; the end state is still "inactive",
-            // but we must not claim this call restored the policy (a false audit /
-            // operator message). Exit stays 0 (the posture IS inactive), but the
-            // audit event and message report the already-cleared outcome honestly.
+            // RACE (CodeRabbit R18 #3): `read_state()` saw an active incident but
+            // `stop()` returns `removed == false` when a concurrent process cleared
+            // the flag first. Exit stays 0 (posture IS inactive), but the audit
+            // event + message must report the already-cleared outcome, not claim
+            // this call restored the policy.
             let (audit_event, detail) =
                 stop_outcome(removed, existing.as_ref().map(|s| s.started_at_display()));
-            // Best-effort audit trail of the stop (non-blocking; never gates).
+            // Best-effort audit trail (non-blocking; never gates).
             tirith_core::audit::log_hook_event(
                 "incident",
                 "stop",
@@ -215,11 +189,8 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             );
 
             if json {
-                // Surface a failed JSON write as non-zero (see the no-incident
-                // branch above): a piped consumer must not read success with
-                // truncated/absent JSON. `stopped` reflects whether THIS call did
-                // the removal (false on the race), so the consumer can tell an
-                // actual stop from an already-cleared no-op.
+                // `stopped` reflects whether THIS call removed the flag (false on
+                // the race), so a consumer can tell a real stop from a no-op.
                 if !write_json_stdout(
                     &StoppedOut {
                         stopped: removed,
@@ -235,8 +206,7 @@ pub fn stop(yes: bool, json: bool) -> i32 {
                 println!("Incident ended — normal policy restored.");
                 println!("The TIRITH=0 bypass and your configured fail_mode are in effect again.");
             } else {
-                // The flag was cleared by a racing process between our status read
-                // and our delete — do NOT claim this call restored the policy.
+                // Cleared by a racing process — do NOT claim this call restored it.
                 println!(
                     "Incident was already inactive — cleared by another process; nothing to stop."
                 );
@@ -244,8 +214,7 @@ pub fn stop(yes: bool, json: bool) -> i32 {
             0
         }
         Err(e) => {
-            // A failed JSON write surfaces as the write-failure exit (2), distinct
-            // from the semantic fatal exit (1).
+            // Failed JSON write → write-failure exit 2, distinct from fatal exit 1.
             if !emit_error(json, "tirith incident stop", &e) {
                 return 2;
             }
@@ -254,18 +223,11 @@ pub fn stop(yes: bool, json: bool) -> i32 {
     }
 }
 
-/// Select the audit `(event, detail)` for an `incident stop` whose `read_state()`
-/// saw an active incident, given whether `incident::stop()` actually `removed`
-/// the flag.
-///
-/// `removed == true` → THIS call cleared the flag (the normal case). `removed ==
-/// false` → the flag was ALREADY gone when `stop()` ran, i.e. a racing process
-/// cleared it between our status read and our delete (CodeRabbit R18 #3); we must
-/// NOT record a false `incident_stopped` claiming this call restored the policy.
-/// Pure so the race-vs-normal audit selection is unit-testable without forcing
-/// the (single-process) TOCTOU window (mirrors the `commands::json_refusal_exit_code`
-/// seam). `started_at_display` is the prior state's start time, used only in the
-/// normal-case detail line.
+/// Select the audit `(event, detail)` for an `incident stop`. `removed == true`
+/// → THIS call cleared the flag (`incident_stopped`); `removed == false` → a
+/// racing process cleared it first (CodeRabbit R18 #3), so we record
+/// `incident_already_inactive` rather than a false stop. Pure, so the
+/// race-vs-normal selection is unit-testable without forcing the TOCTOU window.
 fn stop_outcome(removed: bool, started_at_display: Option<String>) -> (&'static str, String) {
     if removed {
         let detail = started_at_display
@@ -280,8 +242,8 @@ fn stop_outcome(removed: bool, started_at_display: Option<String>) -> (&'static 
     }
 }
 
-/// `tirith incident status` — show whether an incident is active, and if so its
-/// reason + start time.
+/// `tirith incident status` — show whether an incident is active (and its
+/// reason + start time if so).
 pub fn status(json: bool) -> i32 {
     let state = incident::read_state();
     let flag = incident::flag_path()
@@ -354,13 +316,10 @@ pub fn status(json: bool) -> i32 {
     0
 }
 
-/// `tirith incident report [--out <path>]` — write (or print) a markdown
-/// incident report: timeline since the incident started, plus live persistence
-/// / env / path / hook / canary state and the top recent findings, with an
-/// "actions taken" section for the operator to fill in.
-///
-/// All embedded command text comes from the already-redacted audit
-/// `command_redacted` field — full commands are never reconstructed.
+/// `tirith incident report [--out <path>]` — write (or print) a markdown report:
+/// timeline since the incident started, live persistence/env/path/hook/canary
+/// state, top recent findings, and an operator "actions taken" section. All
+/// embedded command text comes from the already-redacted audit field.
 pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
     let state = incident::read_state();
     let body = build_report(state.as_ref());
@@ -396,8 +355,7 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
                 0
             }
             Err(e) => {
-                // A failed JSON write surfaces as the write-failure exit (2),
-                // distinct from the semantic fatal exit (1).
+                // Failed JSON write → write-failure exit 2, distinct from fatal 1.
                 if !emit_error(json, "tirith incident report", &e) {
                     return 2;
                 }
@@ -405,11 +363,8 @@ pub fn report(out: Option<PathBuf>, json: bool) -> i32 {
             }
         },
         None => {
-            // No --out. In `--json` mode emit a structured, machine-readable
-            // object (the markdown carried as a string field) so a JSON consumer
-            // never receives raw Markdown on a surface it asked to be JSON —
-            // consistent with the `--out` JSON branch above. Otherwise print the
-            // raw markdown for piping/redirection.
+            // No --out: `--json` carries the markdown as a string field (never
+            // raw Markdown on a JSON surface); otherwise print raw for piping.
             if json {
                 #[derive(serde::Serialize)]
                 struct ReportStdoutOut {
@@ -452,19 +407,10 @@ fn write_report_file(path: &std::path::Path, body: &str) -> Result<(), String> {
     let mut f = opts
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
-    // `OpenOptionsExt::mode(0o600)` only applies when the file is CREATED. When
-    // `--out` points at a pre-existing file, the open above truncates it in place
-    // but keeps its old (possibly group/other-readable) mode. Re-assert 0600
-    // explicitly so an incident report — which may carry repo-internal paths /
-    // hostnames — is never left world-readable (mirrors audit.rs's post-open
-    // chmod).
-    //
-    // PROPAGATE the chmod result (CodeRabbit R11 #7): dropping it let
-    // `incident report --out` report SUCCESS while leaving a world-readable file
-    // full of repo-internal paths/hostnames. We chmod BEFORE writing the body (the
-    // open already truncated the old content to empty), so a chmod failure aborts
-    // the write — sensitive content is never placed into a file we could not lock
-    // down. The error is surfaced; the command returns non-zero.
+    // `mode(0o600)` only applies on CREATE; a pre-existing `--out` file keeps its
+    // old (possibly world-readable) mode. Re-assert 0600 BEFORE writing the body
+    // and PROPAGATE the error (CodeRabbit R11 #7) so a chmod failure aborts the
+    // write — sensitive repo-internal paths/hostnames are never left readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -480,26 +426,17 @@ const REPORT_TOP_FINDINGS: usize = 25;
 /// How many timeline rows the report surfaces.
 const REPORT_TIMELINE_ROWS: usize = 50;
 
-/// Assemble the full markdown report. Each section is best-effort: a subsystem
-/// that errors degrades to a one-line "unavailable" note rather than aborting
-/// the report.
 /// Escape a single-line value for safe inline embedding in the Markdown report.
-///
-/// Two distinct hazards are neutralized:
-/// * STRUCTURE: any CR/LF is collapsed to a single space, so a multi-line value
-///   (e.g. a `--reason` carrying a newline) cannot break out of its list item or
-///   inject a new heading/section. This is the load-bearing fix — a lone `#` on
-///   its own line would otherwise render as an `<h1>`.
-/// * RENDERING: the inline Markdown-significant characters that could distort the
-///   line (`` ` `` `*` `_` `[` `]` `<` `>` `\` `#` `|`) are backslash-escaped.
-///   `#` is escaped too so a value beginning with it is not read as a heading
-///   even after the newline collapse leaves it mid-line.
+/// Neutralizes two hazards: STRUCTURE — CR/LF collapse to a space so a
+/// multi-line value (e.g. a `--reason` with a newline) can't break its list item
+/// or inject a `#` heading (the load-bearing fix); RENDERING — inline
+/// Markdown-significant chars (`` ` `` `*` `_` `[` `]` `<` `>` `\` `#` `|`) are
+/// backslash-escaped.
 fn md_inline_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
-            // Collapse every line break (and a bare CR) to a space so the value
-            // stays on one line. A `\r\n` becomes two spaces — harmless.
+            // Collapse line breaks to a space (a `\r\n` → two spaces, harmless).
             '\n' | '\r' => out.push(' '),
             '`' | '*' | '_' | '[' | ']' | '<' | '>' | '\\' | '#' | '|' => {
                 out.push('\\');
@@ -511,6 +448,8 @@ fn md_inline_escape(value: &str) -> String {
     out
 }
 
+/// Assemble the full markdown report; each section is best-effort (degrades to
+/// a one-line "unavailable" note rather than aborting).
 fn build_report(state: Option<&IncidentState>) -> String {
     let mut s = String::new();
     let now = chrono::Utc::now().to_rfc3339();
@@ -522,11 +461,8 @@ fn build_report(state: Option<&IncidentState>) -> String {
         Some(st) => {
             s.push_str("Status: **ACTIVE**\n\n");
             s.push_str(&format!("- Started at: {}\n", st.started_at_display()));
-            // `started_by` (from $USER/$LOGNAME/$USERNAME) and `reason` (from
-            // `--reason`) are operator/environment-controlled, so escape them
-            // before embedding: a newline in `--reason` would otherwise break the
-            // list structure or inject new Markdown sections (e.g. a `#` heading),
-            // and `*`/`_`/`` ` ``/`[` could distort rendering.
+            // `started_by` and `reason` are operator/env-controlled — escape them
+            // so a newline can't break the list or inject a Markdown heading.
             s.push_str(&format!(
                 "- Started by: {}\n",
                 md_inline_escape(&st.started_by)
@@ -599,7 +535,7 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
     rows.reverse();
 
     if rows.is_empty() {
-        // CodeRabbit R9 #K: only call it an "incident window" when there IS one.
+        // CodeRabbit R9 #K: only call it an "incident window" when there is one.
         if since.is_some() {
             s.push_str("_No audit entries in the incident window._\n\n");
         } else {
@@ -609,10 +545,7 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
     }
 
     let shown = rows.len().min(REPORT_TIMELINE_ROWS);
-    // CodeRabbit R9 #K: when there is NO active incident (`since` is None) the
-    // rows are simply the most recent entries, not entries "since incident
-    // start" — use a no-incident-appropriate label so the report doesn't claim a
-    // window that doesn't exist.
+    // No active incident → "recent entries", not "since incident start".
     let plural = if rows.len() == 1 { "y" } else { "ies" };
     if since.is_some() {
         s.push_str(&format!(
@@ -644,16 +577,10 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
     s.push('\n');
 }
 
-/// Defensively re-run the shipping credential redactor over an audit
-/// `command_redacted` field before embedding it in the report.
-///
-/// The audit log's redaction at write time scrubs DLP patterns and URL
-/// userinfo, but it does NOT scrub shell-assignment *values* (e.g.
-/// `AWS_SECRET_ACCESS_KEY=…`). [`tirith_core::redact::redact_command_text`]
-/// scrubs assignment values FIRST and then applies the DLP patterns — exactly
-/// the belt-and-suspenders the report's privacy contract requires ("apply the
-/// shipping credential redactor; never embed full commands"). Idempotent on
-/// already-redacted text, so double-redacting a clean field is harmless.
+/// Re-run the shipping credential redactor over an audit `command_redacted`
+/// field before embedding. The write-time redaction scrubs DLP patterns + URL
+/// userinfo but NOT shell-assignment values (`AWS_SECRET_ACCESS_KEY=…`);
+/// `redact_command_text` scrubs those first, then the DLP patterns. Idempotent.
 fn redact_preview(already_redacted: &str) -> String {
     tirith_core::redact::redact_command_text(already_redacted, &[])
 }
@@ -693,7 +620,6 @@ fn append_top_findings(s: &mut String, since: Option<u64>) {
         }
     }
     if counts.is_empty() {
-        // CodeRabbit R9 #K: match the timeline's no-incident wording.
         if since.is_some() {
             s.push_str("_No findings recorded in the incident window._\n\n");
         } else {
@@ -712,9 +638,8 @@ fn append_top_findings(s: &mut String, since: Option<u64>) {
     s.push('\n');
 }
 
-/// Live persistence surfaces (crontab, shell rc, launch agents, .envrc, …).
-/// We report the current inventory; "added lines" diffing requires a prior
-/// snapshot (see `tirith persistence snapshot`).
+/// Live persistence surfaces (crontab, shell rc, launch agents, .envrc, …) —
+/// current inventory only; "added lines" diffing needs a prior snapshot.
 fn append_persistence(s: &mut String) {
     s.push_str("## Persistence surfaces\n\n");
     let entries = tirith_core::persistence::scan();
@@ -773,7 +698,7 @@ fn append_path(s: &mut String) {
         if tirith_core::path_audit::is_system_path(dir) {
             continue;
         }
-        // A non-system dir that precedes a later system dir is the classic
+        // A non-system dir before a later system dir is the classic
         // writable-before-system shadow risk.
         let precedes_system = dirs
             .iter()
@@ -868,8 +793,7 @@ fn append_actions_taken(s: &mut String) {
     s.push_str("_(your notes here)_\n");
 }
 
-/// Escape a value for a Markdown table cell: collapse newlines and escape the
-/// pipe so the row never breaks the table.
+/// Escape a Markdown table cell: collapse newlines, escape `|` so the row holds.
 fn md_cell(raw: &str) -> String {
     let collapsed: String = raw
         .chars()
@@ -920,16 +844,11 @@ mod tests {
     use super::{build_report, md_inline_escape, stop_outcome};
     use tirith_core::incident::IncidentState;
 
-    /// CodeRabbit R18 #3: when `incident stop`'s `read_state()` saw an active
-    /// incident but `incident::stop()` reports `removed == false` (a racing
-    /// process cleared the flag first), the audit/message must report the
-    /// already-cleared outcome — NOT a false "this call stopped it". A genuine
-    /// removal keeps the normal `incident_stopped` event with the start-time
-    /// detail.
+    /// CodeRabbit R18 #3: a `removed == false` stop (racing process cleared the
+    /// flag first) must report the already-cleared outcome, not a false stop.
     #[test]
     fn stop_outcome_distinguishes_real_stop_from_race() {
-        // Real stop: this call removed the flag → `incident_stopped` + a detail
-        // naming the prior start time.
+        // Real stop: removed → `incident_stopped` + detail naming the start time.
         let (event, detail) = stop_outcome(true, Some("2026-05-30T00:00:00+00:00".to_string()));
         assert_eq!(event, "incident_stopped");
         assert!(
@@ -937,8 +856,8 @@ mod tests {
             "a real stop must record the stopped event with the start time, got: {detail}"
         );
 
-        // Race: the flag was already gone → a distinct already-inactive event,
-        // and the detail must NOT claim this call stopped/restored anything.
+        // Race: flag already gone → distinct already-inactive event; detail must
+        // NOT claim this call stopped anything.
         let (event, detail) = stop_outcome(false, Some("2026-05-30T00:00:00+00:00".to_string()));
         assert_eq!(
             event, "incident_already_inactive",
@@ -968,9 +887,8 @@ mod tests {
 
     #[test]
     fn report_escapes_reason_with_newline_and_heading_injection() {
-        // CodeRabbit R6 #11: a `--reason` carrying a newline + `#` must NOT break
-        // the report structure or inject a new heading. Before the fix the raw
-        // reason was embedded verbatim, so the injected line rendered as content.
+        // CodeRabbit R6 #11: a `--reason` with a newline + `#` must NOT break the
+        // report structure or inject a heading.
         let state = IncidentState {
             started_at: 1_700_000_000,
             started_by: "alice\n# Injected Heading".to_string(),

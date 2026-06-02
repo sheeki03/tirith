@@ -1,34 +1,16 @@
 //! `tirith intend` — intent-vs-command heuristic (M10 ch4).
 //!
-//! ## What this is
+//! A pure-Rust, no-LLM heuristic that flags when a stated intent ("install a
+//! formatter") doesn't justify what the command does (pipe a remote script into
+//! a shell). [`IntentBehaviorReport`] has three parts: `intent_signals` (which
+//! keyword groups the intent matched), `command_signals` (high-impact behaviors,
+//! derived by running [`crate::engine::analyze`] and mapping each fired
+//! [`RuleId`](crate::verdict::RuleId)), and `mismatches` (high-impact signals no
+//! matched intent justifies — the output).
 //!
-//! A **pure-Rust, no-LLM** heuristic that flags when a *stated intent* ("install
-//! a formatter") doesn't justify what the command *actually does* (pipe a remote
-//! script straight into a shell). It computes an [`IntentBehaviorReport`] with
-//! three parts:
-//!
-//! - `intent_signals`  — which intent keyword groups the stated intent matched
-//!   (e.g. `install`, `test`, `build`). One natural-language sentence can match
-//!   several.
-//! - `command_signals` — the high-impact behaviors the command exhibits, derived
-//!   from the SHIPPING engine rules. `intend` runs [`crate::engine::analyze`] on
-//!   the command and maps each [`RuleId`](crate::verdict::RuleId) that fired to a
-//!   named [`CommandSignal`]. This keeps the signals consistent with the rest of
-//!   tirith rather than re-implementing detection.
-//! - `mismatches`      — every command signal that is HIGH-IMPACT *and* not
-//!   justified by any matched intent. A mismatch is the heuristic's output.
-//!
-//! ## What this is NOT
-//!
-//! - It is **advisory and Info-level only**. It NEVER blocks. The command's real
-//!   security verdict comes from `tirith check`; `intend` only answers "does the
-//!   thing you said you wanted match the thing this command does?".
-//! - It is a HEURISTIC. Natural-language intent classification by keyword is
-//!   necessarily incomplete — a phrasing it doesn't recognize yields no intent
-//!   signals, so EVERY high-impact command signal then reads as unjustified. The
-//!   caller renders this honestly.
-//! - There is NO LLM call here and none is wired. A future `--llm-explain` wave
-//!   may add one; M10 is pure heuristic.
+//! Advisory / Info-only — NEVER blocks; the real verdict comes from `tirith
+//! check`. It is a heuristic: an unrecognized phrasing yields no intent signals,
+//! so every high-impact signal then reads as unjustified.
 
 use serde::Serialize;
 
@@ -37,32 +19,25 @@ use crate::extract::ScanContext;
 use crate::tokenize::ShellType;
 use crate::verdict::RuleId;
 
-/// A high-impact behavior the analyzed command exhibits, derived from the
-/// engine rule that fired. The mapping from [`RuleId`] to `CommandSignal` is in
-/// [`CommandSignal::from_rule`]. Signals that share an intuitive meaning
-/// (every "pipe a download into an interpreter" rule) collapse to one variant
-/// so the user-facing report stays readable.
+/// A high-impact behavior the command exhibits, derived from the fired engine
+/// rule (mapping in [`CommandSignal::from_rule`]). Related rules collapse to one
+/// variant so the report stays readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSignal {
-    /// A remote download is piped straight into a shell / interpreter
-    /// (`curl … | bash`, `iwr … | iex`, `wget -O- | sh`).
+    /// A remote download piped into a shell (`curl … | bash`, `iwr … | iex`).
     DownloadPipe,
-    /// The command escalates privileges with `sudo` (any of the M8 ch4 sudo
-    /// rules fired).
+    /// Privilege escalation with `sudo` (any M8 ch4 sudo rule).
     Sudo,
-    /// The command reads/sweeps credential files or exfiltrates data over the
-    /// network (`DataExfiltration`, `CredentialFileSweep`, sensitive-env export
-    /// into a sink).
+    /// Reads credential files or exfiltrates data over the network.
     EnvOrCredentialExfil,
-    /// The command writes to a shell rc / profile (a persistence foothold).
+    /// Writes to a shell rc/profile (a persistence foothold).
     ShellRcWrite,
-    /// The command runs a package-manager install (`pip install`, `npm install`,
-    /// remote `pip`/`npm` URL install, untrusted Docker registry, etc.).
+    /// Runs a package-manager install (`pip`/`npm`/Docker/etc.).
     PackageInstall,
-    /// The command decodes a base64 blob and executes it.
+    /// Decodes a base64 blob and executes it.
     Base64Execute,
-    /// The command opens an interactive root shell (`sudo bash`).
+    /// Opens an interactive root shell (`sudo bash`).
     RootShell,
 }
 
@@ -93,11 +68,10 @@ impl CommandSignal {
         }
     }
 
-    /// Whether this signal is "high impact" — i.e. worth flagging when the
-    /// stated intent does not justify it. `PackageInstall` is intentionally NOT
-    /// high-impact: installing a package is exactly what most build/test/install
-    /// intents are FOR, and flagging it would drown the signal. The high-impact
-    /// set is the surprising, persistence-/exfil-/privilege-shaped behaviors.
+    /// Whether this signal is worth flagging when the intent does not justify it.
+    /// `PackageInstall` is NOT high-impact (it's what most install/build intents
+    /// are FOR); the high-impact set is the surprising persistence/exfil/privilege
+    /// behaviors.
     pub fn is_high_impact(self) -> bool {
         match self {
             CommandSignal::DownloadPipe
@@ -110,14 +84,11 @@ impl CommandSignal {
         }
     }
 
-    /// Map an engine [`RuleId`] to a `CommandSignal`, or `None` when the rule
-    /// is not one of the behaviors `intend` reasons about (homograph hostnames,
-    /// terminal-deception bytes, file-scan findings, etc. are out of scope —
-    /// `intend` is about *what the command does to the machine*, which the
-    /// command-shape / ecosystem / sudo rules capture).
+    /// Map an engine [`RuleId`] to a `CommandSignal`, or `None` for rules outside
+    /// `intend`'s scope (homograph hostnames, terminal bytes, file-scan findings —
+    /// `intend` reasons only about what the command does to the machine).
     pub fn from_rule(rule: RuleId) -> Option<CommandSignal> {
         match rule {
-            // Download-pipe family.
             RuleId::PipeToInterpreter
             | RuleId::CurlPipeShell
             | RuleId::WgetPipeShell
@@ -125,10 +96,8 @@ impl CommandSignal {
             | RuleId::XhPipeShell
             | RuleId::PsInlineDownloadExecute => Some(CommandSignal::DownloadPipe),
 
-            // Base64 decode-and-execute.
             RuleId::Base64DecodeExecute => Some(CommandSignal::Base64Execute),
 
-            // Credential sweep / data exfiltration / sensitive-env into a sink.
             RuleId::CredentialFileSweep
             | RuleId::DataExfiltration
             | RuleId::SensitiveEnvExport
@@ -141,7 +110,6 @@ impl CommandSignal {
             | RuleId::SudoDownloadInstall
             | RuleId::SudoRecursivePermsBroadPath => Some(CommandSignal::Sudo),
 
-            // Package-manager install family.
             RuleId::PipUrlInstall
             | RuleId::NpmUrlInstall
             | RuleId::DockerUntrustedRegistry
@@ -155,10 +123,9 @@ impl CommandSignal {
     }
 }
 
-/// A coarse classification of the stated intent, derived from keyword groups.
-/// One sentence can match several (so `IntentBehaviorReport::intent_signals` is
-/// a set). Each class declares which [`CommandSignal`]s it *justifies* via
-/// [`IntentClass::justifies`].
+/// A coarse classification of the stated intent from keyword groups (one
+/// sentence can match several). Each class declares which [`CommandSignal`]s it
+/// justifies via [`IntentClass::justifies`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentClass {
@@ -198,9 +165,8 @@ impl IntentClass {
         }
     }
 
-    /// The keyword stems that, when present as a whole word in the stated
-    /// intent, classify it into this group. Matching is whole-word and
-    /// case-insensitive (see [`classify_intent`]).
+    /// The keyword stems that classify an intent into this group (whole-word,
+    /// case-insensitive — see [`classify_intent`]).
     fn keywords(self) -> &'static [&'static str] {
         match self {
             IntentClass::Install => &[
@@ -275,21 +241,13 @@ impl IntentClass {
         }
     }
 
-    /// The command signals this intent class JUSTIFIES — i.e. signals that, when
-    /// they fire, are an expected consequence of doing the stated thing and so do
-    /// NOT count as a mismatch.
-    ///
-    /// The discipline is narrow on purpose (per the project's "narrow carveouts"
-    /// rule): a class justifies only what its name plainly implies. "install" /
-    /// "download" / "run a script" justify the download-pipe shape (that IS how
-    /// many installers work); "deploy" additionally justifies privilege use.
-    /// "format" / "test" / "build" / "clean" justify a package install (a
-    /// formatter is a package) but NOT piping a remote script to a shell, NOT
-    /// sudo, NOT exfil.
+    /// The command signals this intent class JUSTIFIES (an expected consequence,
+    /// so not a mismatch). Deliberately narrow: a class justifies only what its
+    /// name implies. "install"/"download"/"run a script" justify the download-pipe
+    /// shape; "deploy" also privilege; "format"/"test"/"build"/"clean" justify a
+    /// package install but NOT a remote pipe-to-shell / sudo / exfil.
     fn justifies(self) -> &'static [CommandSignal] {
         match self {
-            // Explicitly download-and-run intents justify the pipe-to-shell shape
-            // and the package install that usually follows.
             IntentClass::Install => &[CommandSignal::PackageInstall],
             IntentClass::Download => &[CommandSignal::DownloadPipe],
             IntentClass::RunScript => &[CommandSignal::DownloadPipe, CommandSignal::Base64Execute],
@@ -301,11 +259,8 @@ impl IntentClass {
                 CommandSignal::ShellRcWrite,
             ],
 
-            // Configure justifies writing config (incl. a shell rc).
             IntentClass::Configure => &[CommandSignal::ShellRcWrite],
 
-            // Build/test/format/clean justify installing a package (the tool is a
-            // package) but nothing surprising.
             IntentClass::Test | IntentClass::Build | IntentClass::Format | IntentClass::Clean => {
                 &[CommandSignal::PackageInstall]
             }
@@ -378,9 +333,8 @@ impl IntentBehaviorReport {
     }
 }
 
-/// Split the stated intent into lowercase ASCII alphanumeric words. Punctuation
-/// becomes a separator so `"format,lint"` yields two words. Hyphens split too,
-/// so `"set-up"` matches the `set` / `up` stems.
+/// Split the intent into lowercase ASCII-alphanumeric words (punctuation and
+/// hyphens are separators, so `"format,lint"` → two words, `"set-up"` → `set`/`up`).
 fn intent_words(intent: &str) -> Vec<String> {
     intent
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -389,9 +343,8 @@ fn intent_words(intent: &str) -> Vec<String> {
         .collect()
 }
 
-/// Classify the stated intent into a set of [`IntentSignal`]s by whole-word
-/// keyword match. Deterministic order: classes in [`IntentClass::ALL`] order,
-/// first matching keyword per class.
+/// Classify the intent into [`IntentSignal`]s by whole-word keyword match, in
+/// [`IntentClass::ALL`] order (first matching keyword per class).
 pub fn classify_intent(intent: &str) -> Vec<IntentSignal> {
     let words = intent_words(intent);
     let mut signals = Vec::new();
@@ -410,10 +363,9 @@ pub fn classify_intent(intent: &str) -> Vec<IntentSignal> {
     signals
 }
 
-/// Derive the deduped, sorted set of [`CommandSignal`]s for `command` by running
-/// the shipping engine and mapping each fired rule. This reuses
-/// [`crate::engine::analyze`] so the signals stay consistent with `tirith
-/// check` rather than re-implementing detection.
+/// The deduped, sorted [`CommandSignal`]s for `command`, derived by running
+/// [`crate::engine::analyze`] and mapping each fired rule (so signals stay
+/// consistent with `tirith check`).
 pub fn command_signals(command: &str, shell: ShellType) -> Vec<CommandSignal> {
     let ctx = AnalysisContext {
         input: command.to_string(),

@@ -1,11 +1,8 @@
-//! `tirith exec check|provenance` (M9 ch5).
-//!
-//! The COLD, off-hot-path provenance surface. `check <bin>` resolves a bare
-//! command name against `$PATH` (taking the first hit, what the shell runs),
-//! then reports the full provenance record plus shadowing. `provenance <path>`
-//! inspects a specific path directly. Both run the expensive probes (stat,
-//! `file --brief`, `codesign`) that NEVER run on the engine hot path — see
-//! [`tirith_core::exec_provenance`] and the `engine::analyze` doc-comment.
+//! `tirith exec check|provenance` (M9 ch5) — the COLD, off-hot-path provenance
+//! surface. `check <bin>` resolves a bare name on `$PATH` (first hit) and reports
+//! provenance + shadowing; `provenance <path>` inspects a path directly. Both run
+//! the expensive probes (stat, `file --brief`, `codesign`) that NEVER run on the
+//! engine hot path — see [`tirith_core::exec_provenance`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,14 +14,11 @@ use tirith_core::verdict::{Finding, Severity};
 
 use super::write_json_stdout;
 
-// ─── guard on|off|status ─────────────────────────────────────────────────────
-
 /// `tirith exec guard on|off|status` — flip / report `policy.exec_guard_enabled`.
 ///
-/// When ON, the engine's exec hot path runs the THREE cheap leader-provenance
-/// rules (`ExecInTmp`, `ExecInRepoBin`, `PathWritableDirBeforeSystem`). Off by
-/// default. Mirrors `tirith hooks guard` / `tirith env guard` (append-or-rewrite
-/// a single line in the local `policy.yaml`, 0600, other lines untouched).
+/// When ON, the exec hot path runs the three cheap leader-provenance rules
+/// (`ExecInTmp`, `ExecInRepoBin`, `PathWritableDirBeforeSystem`); off by default.
+/// Mirrors `tirith hooks guard` (append-or-rewrite one line in local `policy.yaml`, 0600).
 pub fn guard(action: &str, json: bool) -> i32 {
     let enable = match action {
         "on" | "enable" | "true" => true,
@@ -110,9 +104,8 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set / update the `exec_guard_enabled` line in a policy YAML
-/// file. Append-or-rewrite — never touches other lines (mirrors
-/// `cli::hooks::update_policy_guard_key`).
+/// Idempotently set the `exec_guard_enabled` line in a policy YAML, leaving
+/// other lines untouched (mirrors `cli::hooks::update_policy_guard_key`).
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -152,9 +145,7 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
 }
 
 /// `tirith exec check <bin>` — resolve `bin` on `$PATH`, report provenance +
-/// shadowing. Exit 1 if any High-severity finding fires (recently-modified,
-/// world-writable, writable-dir-before-system path hijack), 0 otherwise, 2 if
-/// the command does not resolve on `$PATH` at all.
+/// shadowing. Exit 1 on any High finding, 0 otherwise, 2 if `bin` does not resolve.
 pub fn check(bin: &str, json: bool) -> i32 {
     let path_value = std::env::var("PATH").unwrap_or_default();
     let hits = path_audit::which_all(bin, &path_value);
@@ -200,8 +191,8 @@ pub fn check(bin: &str, json: bool) -> i32 {
     exit_for(&findings)
 }
 
-/// `tirith exec provenance <path>` — inspect a specific path's provenance.
-/// Exit 1 on a High-severity finding, 0 otherwise, 2 if the path is not a file.
+/// `tirith exec provenance <path>` — inspect a path's provenance. Exit 1 on a
+/// High finding, 0 otherwise, 2 if the path is not a file.
 pub fn provenance(path: &str, json: bool) -> i32 {
     let p = expand_path(path);
     let prov = exec_provenance::provenance_of(&p);
@@ -242,8 +233,7 @@ pub fn provenance(path: &str, json: bool) -> i32 {
     exit_for(&findings)
 }
 
-/// Expand a leading `~/` against the home dir; otherwise return the path as-is
-/// (relative paths resolve against the process cwd via the FS later).
+/// Expand a leading `~/` against the home dir; otherwise return the path as-is.
 fn expand_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = home::home_dir() {
@@ -264,8 +254,6 @@ fn exit_for(findings: &[Finding]) -> i32 {
         0
     }
 }
-
-// ─── human output ────────────────────────────────────────────────────────────
 
 fn print_human_check(
     bin: &str,
@@ -344,9 +332,7 @@ mod tests {
 
     #[test]
     fn expand_path_handles_tilde_and_plain() {
-        // Plain path unchanged.
         assert_eq!(expand_path("/usr/bin/git"), PathBuf::from("/usr/bin/git"));
-        // ~/ expands when home resolves (it does in CI).
         if let Some(home) = home::home_dir() {
             assert_eq!(expand_path("~/bin/x"), home.join("bin/x"));
         }

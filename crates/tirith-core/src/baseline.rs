@@ -1,68 +1,37 @@
-//! M10 ch5 — per-user anomaly-detection baseline (design-decision **D2**).
+//! M10 ch5 — per-user anomaly-detection baseline (design-decision D2).
 //!
-//! An OPT-IN sliding window of finding *observations*. When
+//! An OPT-IN sliding window of finding observations. When
 //! `policy.baseline_enabled` is set (default **false**), the engine records one
-//! observation every time a detection rule fires and, before recording, asks
-//! whether the observation's *pattern* has been seen before. A first-time or
-//! rarely-seen pattern surfaces an extra Info finding
-//! ([`crate::verdict::RuleId::AnomalyFirstTimeInThisRepo`] /
-//! [`AnomalyRareInBaseline`](crate::verdict::RuleId::AnomalyRareInBaseline))
-//! alongside the normal verdict. The anomaly findings are **Info** — they never
-//! change the action; they annotate "this is new for you".
-//!
-//! # Default OFF (D2)
-//!
-//! The decision recorded in `M6_TO_M14_PLAN.md` §D2 is **opt-in only**: a fresh
-//! install does nothing here. `tirith baseline learn` flips
-//! `policy.baseline_enabled` to `true`. When the flag is off, the engine never
-//! reads or writes this store on the hot path (`engine::apply_baseline` returns
-//! immediately on `!policy.baseline_enabled`), so a machine that never opted in
-//! pays nothing.
+//! observation per detection-rule firing and, before recording, checks whether
+//! the pattern is new/rare — surfacing an extra **Info** anomaly finding that
+//! never changes the action. When the flag is off the engine never touches this
+//! store on the hot path, so a machine that never opted in pays nothing.
 //!
 //! # Privacy model (D2 — salted hashes, NEVER raw values)
 //!
-//! The store must be safe to read, sync, or attach to a bug report without
-//! leaking which hosts you contact or which repositories you work in.
-//! Therefore it records **no raw hostnames and no raw paths**. Specifically:
+//! The store must be safe to sync or attach to a bug report, so it records NO
+//! raw hostnames and NO raw paths:
 //!
-//! * **Hostname** → `sha256(salt || host)`, hex, first 16 chars. The salt is a
-//!   per-install 32-byte random value at `state_dir()/baseline.salt` (mode
-//!   `0600`), generated on first use. Without the salt, the hashes are not
-//!   reversible via a precomputed rainbow table of common hostnames, and two
-//!   installs never produce the same hash for the same host.
-//! * **cwd / repo** → the same salted-sha256, first 8 chars, of the repository
-//!   root (the nearest `.git` ancestor of the cwd, resolved in-process by
-//!   [`crate::policy::find_repo_root`] — NOT a `git` subprocess, so the hot path
-//!   never forks). When the cwd is not inside a repo, the cwd itself is hashed.
-//! * **ecosystem** (`npm` / `pypi` / `docker` / …) and **sudo flag** are
-//!   low-cardinality, non-identifying categoricals and are stored in the clear.
-//! * **rule_id** is the public rule name, stored in the clear.
+//! * Hostname → `sha256(salt || host)`, first 16 hex chars.
+//! * cwd / repo → same salted-sha256, first 8 chars, of the repo root (nearest
+//!   `.git` ancestor, resolved in-process — no `git` subprocess); cwd hashed
+//!   when not in a repo.
+//! * ecosystem + sudo flag — low-cardinality categoricals, stored in the clear.
+//! * rule_id — the public rule name, in the clear.
 //!
-//! The salt never leaves the machine and is never logged. The hashes are
-//! one-way; this module offers no reverse lookup.
+//! The per-install 32-byte salt (`state_dir()/baseline.salt`, mode `0600`,
+//! generated on first use) never leaves the machine and is never logged, so the
+//! hashes are not reversible via a rainbow table and two installs never collide.
 //!
 //! # Storage model
 //!
-//! JSONL at `state_dir()/baseline.jsonl`: one [`Observation`] object per line,
-//! appended on `record`. Two bounds keep it from growing without limit:
+//! JSONL at `state_dir()/baseline.jsonl`, one [`Observation`] per line. Bounded
+//! by a 90-day window ([`WINDOW_DAYS`]) and a 100k-entry LRU cap
+//! ([`MAX_ENTRIES`]); compaction runs lazily past a line-count threshold and on
+//! `reset`. SQLite is the reserved backend if the linear scan ever bottlenecks.
 //!
-//! * **Window 90 days** — observations older than [`WINDOW_DAYS`] are dropped on
-//!   the next compaction and never counted by [`lookup_at`].
-//! * **Cap 100k entries** — at [`MAX_ENTRIES`] the oldest entries are evicted
-//!   (LRU by `seen_at`). Compaction (window-prune + cap-evict) runs lazily when
-//!   the file's line count crosses a threshold on append, and unconditionally on
-//!   `reset`.
-//!
-//! If a future workload makes the linear scan a bottleneck, SQLite is the
-//! reserved backend (the `record` / `lookup` / `status` / `reset` API is the
-//! migration boundary). JSONL is chosen for v1 to stay human-inspectable.
-//!
-//! # Test entry points
-//!
-//! Every function has a `*_at(dir, …)` form that takes an explicit state
-//! directory, so tests run against a `tempfile::tempdir()` with NO writes to the
-//! real `state_dir()` and NO env mutation. The production wrappers resolve
-//! `state_dir()` and delegate.
+//! Every function has a `*_at(dir, …)` form taking an explicit state directory
+//! so tests run against a `tempdir()` with no writes to the real `state_dir()`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,18 +49,16 @@ pub const WINDOW_DAYS: i64 = 90;
 /// (LRU by `seen_at`) so the JSONL never grows without bound.
 pub const MAX_ENTRIES: usize = 100_000;
 
-/// A pattern seen fewer than this many times in the window is "rare". A pattern
-/// seen zero times is "first time". The engine uses these to pick which anomaly
-/// rule (if any) to surface. Three matches the plan's "seen < 3 times" rule.
+/// A pattern seen fewer than this many times in the window is "rare"; zero is
+/// "first time". Matches the plan's "seen < 3 times" rule.
 pub const RARE_THRESHOLD: u32 = 3;
 
-/// Below this many total observations, `doctor` reports "early-baseline mode":
-/// the window is too sparse to trust anomaly signals (everything looks new).
+/// Below this many observations, `doctor` reports "early-baseline mode" (too
+/// sparse to trust anomaly signals).
 pub const EARLY_BASELINE_ENTRIES: usize = 30;
 
-/// Compact (prune-window + cap-evict) when the on-disk line count exceeds this.
-/// Slightly above [`MAX_ENTRIES`] so a steady-state store compacts occasionally
-/// rather than on every append.
+/// Compact when the on-disk line count exceeds this — slightly above
+/// [`MAX_ENTRIES`] so a steady-state store compacts occasionally, not every append.
 const COMPACT_TRIGGER: usize = MAX_ENTRIES + 1_000;
 
 /// One recorded observation: a detection rule firing, with the identifying
@@ -213,38 +180,30 @@ fn salt_in(dir: &Path) -> PathBuf {
 
 // ─── salt ──────────────────────────────────────────────────────────────────--
 
-/// Fixed salt length. The salt file must be EXACTLY this many bytes; a
-/// shorter file (truncated, crash mid-write, or attacker-shrunk) is rejected and
-/// regenerated, so the documented 32-byte privacy guarantee can never silently
-/// degrade to a weak salt.
+/// Fixed salt length. A file of the wrong length (truncated, crash mid-write,
+/// attacker-shrunk) is rejected and regenerated, so the 32-byte privacy
+/// guarantee never silently degrades to a weak salt.
 const SALT_LEN: usize = 32;
 
-/// Read cap for the salt file (CodeRabbit R11 #4). The salt is exactly
-/// [`SALT_LEN`] (32) bytes; 4 KiB is generous slack so a slightly-larger file is
-/// still read (and then rejected as the wrong length), while a genuinely
-/// oversized / attacker-grown `baseline.salt` is refused BEFORE it is allocated
-/// rather than buffered whole.
+/// Read cap for the salt file (R11 #4) — generous slack over [`SALT_LEN`] so an
+/// oversized `baseline.salt` is refused BEFORE allocation, not buffered whole.
 const SALT_READ_CAP: u64 = 4 * 1024;
 
-/// Per-process salt state. Resolved once (I1: no N+1 file reads on the hot path)
-/// and cached, keyed on the salt path so test entry points with distinct temp
-/// paths each resolve their own salt.
+/// Per-process salt state, resolved once and cached keyed on the salt path.
 enum SaltState {
     /// A usable salt (read from disk or freshly generated AND persisted).
     Ready(Vec<u8>),
-    /// The salt is corrupt/unreadable AND could not be persisted, so a fresh
-    /// per-run salt would churn every hash and make EVERY pattern look
-    /// "first time" forever (F4). Baseline is disabled for the session.
+    /// Salt corrupt/unreadable AND unpersistable — a fresh per-run salt would
+    /// churn every hash and fire `AnomalyFirstTimeInThisRepo` forever (F4), so
+    /// baseline is disabled for the session.
     Disabled,
 }
 
-/// Cache of `(salt_path, state)`. Reloads only when the path differs (production
-/// always passes the same `state_dir()/baseline.salt`, so it loads once).
+/// Cache of `(salt_path, state)`; reloads only when the path differs.
 static SALT_CACHE: std::sync::Mutex<Option<(PathBuf, std::sync::Arc<SaltState>)>> =
     std::sync::Mutex::new(None);
 
-/// One-shot guard so the "baseline disabled" warning prints at most once per
-/// process even if many findings fire.
+/// One-shot guard so the "baseline disabled" warning prints at most once.
 static SALT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Resolve the per-install salt for `salt_file`, caching the result for the
@@ -264,38 +223,27 @@ fn salt_state(salt_file: &Path) -> std::sync::Arc<SaltState> {
 /// Read the salt from `salt_file` (must be exactly [`SALT_LEN`] bytes), or
 /// generate a fresh 32-byte salt and persist it atomically at `0600`.
 ///
-/// Fail-open with a floor: if the file is absent/corrupt AND the fresh salt
-/// cannot be persisted, returns [`SaltState::Disabled`] (with a one-time stderr
-/// warning) rather than handing back an unpersisted salt that would churn every
-/// hash and fire `AnomalyFirstTimeInThisRepo` forever (F4).
+/// Fail-open with a floor: if absent/corrupt AND unpersistable, returns
+/// [`SaltState::Disabled`] (with a one-time warning) rather than an unpersisted
+/// salt that would churn every hash forever (F4).
 fn load_salt_state(salt_file: &Path) -> SaltState {
     let mut existing_is_corrupt = false;
-    // CodeRabbit R9 #C + R11 #1/#4: read the salt through the shared, race-free
-    // capped helper. A FIFO/device at the salt path would block a plain
-    // `std::fs::read` forever, and an oversized `baseline.salt` would be fully
-    // allocated before any length check. `read_regular_capped` opens with
-    // O_NONBLOCK, fstats the OPEN fd (closing the metadata→open TOCTOU), rejects
-    // non-regular files, and caps the read at SALT_READ_CAP (the salt is exactly
-    // SALT_LEN bytes; the cap is generous slack, so anything over it is corrupt).
-    //   * NotFound          → absent: fall through to fresh-salt generation.
-    //   * exactly SALT_LEN  → adopt the on-disk salt.
-    //   * any other length, non-regular, oversized, or I/O error → corrupt:
-    //     OVERWRITE it (I2), never adopt and never block.
+    // R9 #C + R11 #1/#4: read through the race-free capped helper (O_NONBLOCK +
+    // fstat of the open fd) so a FIFO/device cannot block and an oversized file
+    // is not buffered whole. NotFound → generate fresh; exactly SALT_LEN → adopt;
+    // any other length / non-regular / I/O error → corrupt, OVERWRITE (I2).
     match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
         Ok(bytes) if bytes.len() == SALT_LEN => return SaltState::Ready(bytes),
-        // A short/oversized/non-regular/unreadable salt file is corrupt — must be
-        // OVERWRITTEN, not adopted (I2). Remember this so persist replaces it
-        // atomically rather than treating `AlreadyExists` as "another process won
-        // the race".
+        // Corrupt: remember it so persist replaces atomically rather than
+        // treating `AlreadyExists` as a lost race.
         Ok(_) => existing_is_corrupt = true,
         Err(crate::util::OpenRegularError::NotFound) => {}
         Err(_) => existing_is_corrupt = true,
     }
 
-    // Generate a fresh 32-byte salt from the OS RNG. On the (extremely unlikely)
-    // event that the OS entropy source fails, fall back to a time-derived salt
-    // so hashing never aborts — fail-open, since a weak salt only weakens the
-    // privacy guarantee for this one process, it never crashes.
+    // Fresh 32-byte salt from the OS RNG; on entropy failure fall back to a
+    // time-derived salt so hashing never aborts (fail-open — a weak salt only
+    // weakens privacy for this process, never crashes).
     let mut salt = [0u8; SALT_LEN];
     if getrandom::fill(&mut salt).is_err() {
         let nanos = std::time::SystemTime::now()
@@ -309,44 +257,33 @@ fn load_salt_state(salt_file: &Path) -> SaltState {
     match persist_salt(salt_file, &salt, existing_is_corrupt) {
         Ok(persisted) => SaltState::Ready(persisted),
         Err(_) => {
-            // Could neither read a stable salt nor write a fresh one. A per-run
-            // salt would make every pattern look new on every invocation,
-            // turning the anomaly signal into perpetual noise — so disable
-            // baseline for this session and tell the user once.
+            // Neither readable nor writable: a per-run salt would make every
+            // pattern look new forever, so disable baseline this session (F4).
             warn_baseline_disabled_once(salt_file);
             SaltState::Disabled
         }
     }
 }
 
-/// Install `salt` at `salt_file` (mode `0600`) and return the salt that is now
-/// ON DISK.
+/// Install `salt` at `salt_file` (mode `0600`) and return the salt now ON DISK.
 ///
-/// Two cases:
-///   * `replace_corrupt == false` (the file was ABSENT): claim it exclusively
-///     with `create_new`. If another process created it first (greptile #4
-///     concurrent-first-use race), ADOPT that process's salt by reading it back
-///     instead of clobbering it — so two processes that start together never
-///     diverge (one salt in memory, a different one on disk).
-///   * `replace_corrupt == true` (the file existed but was the wrong length):
-///     overwrite it atomically via a sibling temp file + rename (I2), so a
-///     short/truncated salt is regenerated rather than adopted.
+/// * `replace_corrupt == false` (absent): claim it exclusively with
+///   `create_new`; if another process won the race, ADOPT its salt rather than
+///   clobber it, so two co-starting processes never diverge.
+/// * `replace_corrupt == true` (wrong-length): overwrite atomically via temp +
+///   rename (I2) so a short salt is regenerated, not adopted.
 ///
-/// In both cases a crash mid-write never leaves a half-written salt, and BOTH
-/// paths fsync the salt body AND the parent directory so the salt (and its
-/// directory entry) are crash-durable. The absent path's exclusive `create_new`
-/// followed by one `write_all` is the only writer of a fresh file, and the
-/// replace path renames a fully-written temp file into place.
+/// Both paths are crash-durable: a mid-write crash never leaves a half-written
+/// salt, and both fsync the body AND the parent directory.
 fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io::Result<Vec<u8>> {
     if let Some(parent) = salt_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     if replace_corrupt {
-        // Atomic overwrite of a corrupt (wrong-length) salt. Resolve a symlinked
-        // salt path to its real target so the rewrite writes THROUGH the link
-        // rather than replacing it with a regular file (CodeRabbit R13b); the temp
-        // must live in the resolved target's dir for the rename to stay atomic.
+        // Atomic overwrite. Resolve a symlinked path to its real target so the
+        // rewrite writes THROUGH the link (R13b); the temp must live in the
+        // target's dir for the rename to stay atomic.
         let dest = crate::util::resolve_symlink_target(salt_file);
         let dir = dest.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -357,19 +294,15 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         tmp.write_all(salt)?;
-        // Durability (CodeRabbit R9 #B): fsync the new salt to stable storage
-        // BEFORE the rename publishes it, then fsync the parent dir so the
-        // rename's directory entry is durable too. A lost overwrite would leave
-        // the corrupt salt in place; a body synced but entry lost would lose the
-        // new salt. Best-effort parent fsync (unix-only).
+        // Durability (R9 #B): fsync the body BEFORE the rename publishes it, then
+        // fsync the parent dir so the rename's directory entry is durable too.
         tmp.as_file().sync_all()?;
         tmp.persist(&dest).map_err(|e| e.error)?;
         crate::util::fsync_parent_dir_logged(&dest, "baseline salt");
         return Ok(salt.to_vec());
     }
 
-    // Absent file: try to claim it exclusively so concurrent first-use does not
-    // produce two diverging salts.
+    // Absent file: claim it exclusively so concurrent first-use does not diverge.
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -380,54 +313,44 @@ fn persist_salt(salt_file: &Path, salt: &[u8], replace_corrupt: bool) -> std::io
     match opts.open(salt_file) {
         Ok(mut f) => {
             f.write_all(salt)?;
-            // Durability (CodeRabbit R12 #C): fsync the salt BODY to stable
-            // storage, then fsync the PARENT directory so the freshly-created
-            // file's directory entry survives a crash too — exactly like the
-            // `replace_corrupt` rename path above. Without the parent fsync, a
-            // crash right after `create_new` + write could lose the new
-            // file→inode entry entirely, so the next run sees no salt and
-            // regenerates a DIFFERENT one (every baseline hash then mismatches).
+            // Durability (R12 #C): fsync the body, then the parent dir so the
+            // freshly-created file's directory entry survives a crash — without
+            // it the next run would regenerate a DIFFERENT salt.
             f.sync_all()?;
             crate::util::fsync_parent_dir_logged(salt_file, "baseline salt");
             Ok(salt.to_vec())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost the race — adopt the salt the winner is writing.
+            // Lost the race — adopt the winner's salt.
             adopt_concurrent_salt(salt_file)
         }
         Err(e) => Err(e),
     }
 }
 
-/// Bounded re-read budget for adopting a concurrently-created salt. The winner of
-/// the `create_new` race creates a 0-byte file and only THEN `write_all`s the 32
-/// salt bytes; a loser that reads in the gap between those two syscalls sees a
-/// short/empty file. Retrying briefly (rather than declaring the salt corrupt on
-/// the first short read) keeps a transient race from disabling baseline for the
-/// whole session. ~100 ms worst case, only on the rare losing side of a race.
+/// Bounded re-read budget for adopting a concurrently-created salt: the race
+/// winner creates a 0-byte file and only THEN writes the salt, so a loser may
+/// see a short file. Retrying briefly keeps a transient race from disabling
+/// baseline. ~100 ms worst case, only on the rare losing side.
 const SALT_ADOPT_ATTEMPTS: usize = 10;
 const SALT_ADOPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Read the salt written by the process that won the `create_new` race, tolerating
-/// the brief window where it has created but not yet written the file (CodeRabbit
-/// R13 #J). Reads through the race-free capped helper (R11 #1) so a FIFO/device
-/// that won the race cannot block this read-back and an oversized file cannot be
-/// buffered whole. A short read is treated as "not written yet" and retried; a
-/// wrong-but-stable length, a non-regular file, or exhausting the retries is
-/// surfaced as an error so the caller disables baseline (fail toward less
-/// functionality, never a wrong salt).
+/// Read the salt written by the `create_new` race winner, tolerating the brief
+/// created-but-not-yet-written window (R13 #J). Reads through the race-free
+/// capped helper (R11 #1). A short read is retried; a wrong-but-stable length,
+/// non-regular file, or exhausted retries errors so the caller disables baseline
+/// (never adopts a wrong salt).
 fn adopt_concurrent_salt(salt_file: &Path) -> std::io::Result<Vec<u8>> {
     for attempt in 0..SALT_ADOPT_ATTEMPTS {
         match crate::util::read_regular_capped(salt_file, SALT_READ_CAP) {
             Ok(bytes) if bytes.len() == SALT_LEN => return Ok(bytes),
-            // Short/empty: the winner created the file but has not finished its
-            // `write_all` yet. Wait briefly and retry (but not after the last try).
+            // Short/empty: winner not done writing yet — retry (not after the last).
             Ok(bytes) if bytes.len() < SALT_LEN => {
                 if attempt + 1 < SALT_ADOPT_ATTEMPTS {
                     std::thread::sleep(SALT_ADOPT_BACKOFF);
                 }
             }
-            // Longer than a salt is a genuinely corrupt file, not a partial write.
+            // Longer than a salt is genuinely corrupt, not a partial write.
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -443,8 +366,7 @@ fn adopt_concurrent_salt(salt_file: &Path) -> std::io::Result<Vec<u8>> {
             }
         }
     }
-    // Only ever saw short reads: the winner never completed (e.g. crashed
-    // mid-write). Treat as corrupt so the caller disables baseline this session.
+    // Only short reads: the winner never completed (e.g. crashed mid-write).
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         "concurrent salt file did not reach full length",
@@ -454,8 +376,8 @@ fn adopt_concurrent_salt(salt_file: &Path) -> std::io::Result<Vec<u8>> {
 fn warn_baseline_disabled_once(salt_file: &Path) {
     use std::sync::atomic::Ordering;
     if !SALT_WARNED.swap(true, Ordering::Relaxed) {
-        // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
-        // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+        // Write fallibly so a closed/broken stderr cannot panic this helper
+        // (R22 #4) — `eprintln!` would.
         let _ = writeln!(
             std::io::stderr(),
             "tirith: WARNING: baseline salt at {} is unreadable and could not be \
@@ -466,9 +388,9 @@ fn warn_baseline_disabled_once(salt_file: &Path) {
     }
 }
 
-/// `true` when the baseline is disabled for this session because the salt is
-/// neither readable nor writable. The engine consults this to skip the whole
-/// baseline block rather than emit perpetual false `first-time` anomalies (F4).
+/// `true` when baseline is disabled this session (salt neither readable nor
+/// writable). The engine skips the whole baseline block rather than emit
+/// perpetual false `first-time` anomalies (F4).
 pub fn session_disabled() -> bool {
     match salt_path() {
         Some(sp) => matches!(*salt_state(&sp), SaltState::Disabled),
@@ -519,10 +441,8 @@ pub fn hash_cwd_at(salt_file: &Path, cwd: Option<&str>) -> Option<String> {
 
 /// Parse the JSONL store, skipping blank / unparseable lines (fail-open).
 fn parse_store(path: &Path) -> Vec<Observation> {
-    // `read_store_lines` skips blank lines, skips a single recoverable
-    // invalid-UTF-8 line, and BREAKS on any other (persistent) read error so a
-    // corrupt store cannot spin the reader forever. We then drop lines that fail
-    // to parse as an `Observation` (fail-open).
+    // `read_store_lines` skips blank/recoverable-bad lines and breaks on a
+    // persistent read error (never spins); we then drop unparseable lines.
     crate::util::read_store_lines(path)
         .iter()
         .filter_map(|line| serde_json::from_str::<Observation>(line).ok())
@@ -536,12 +456,9 @@ fn parse_seen_at(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
-/// `true` when `seen_at` is within `WINDOW_DAYS` of `now`. An unparseable
-/// timestamp is treated as out-of-window (dropped) so a corrupt row can't
-/// inflate a count forever. A FUTURE-dated row (negative age — clock skew or a
-/// tampered store) is also dropped: without the `age_days >= 0` guard such rows
-/// would be permanently in-window and could crowd out real observations under
-/// the LRU cap.
+/// `true` when `seen_at` is within `WINDOW_DAYS` of `now`. Unparseable or
+/// FUTURE-dated rows (clock skew / tampered store — negative age) are dropped so
+/// a corrupt row can't stay permanently in-window and crowd out real entries.
 fn in_window(seen_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
     match parse_seen_at(seen_at) {
         Some(ts) => {
@@ -555,10 +472,8 @@ fn in_window(seen_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
 /// Apply the window-prune and the LRU cap to a parsed observation list.
 /// Returns the retained observations in chronological order (oldest first).
 fn compact(mut obs: Vec<Observation>, now: chrono::DateTime<chrono::Utc>) -> Vec<Observation> {
-    // 1. Window prune.
     obs.retain(|o| in_window(&o.seen_at, now));
-    // 2. LRU cap: keep the newest MAX_ENTRIES. Sort oldest→newest by seen_at;
-    //    rows with unparseable timestamps already pruned above.
+    // LRU cap: keep the newest MAX_ENTRIES (sort oldest→newest by seen_at).
     if obs.len() > MAX_ENTRIES {
         obs.sort_by(|a, b| {
             let ta = parse_seen_at(&a.seen_at);
@@ -589,14 +504,12 @@ fn append_observation(store: &Path, obs: &Observation) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Atomically rewrite the store to exactly the given pre-serialized JSONL
-/// `lines`. Writes a sibling temp file then renames over the target so a crash
-/// mid-write never truncates the store. This is the line-preserving primitive
-/// `record_at` compaction uses so a valid-but-unparseable line survives the
-/// rewrite VERBATIM rather than being silently dropped (CodeRabbit R12 #F).
+/// Atomically rewrite the store to exactly the given pre-serialized JSONL lines
+/// (temp file + rename, so a crash never truncates). The line-preserving
+/// primitive compaction uses so an unparseable line survives VERBATIM (R12 #F).
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     // Resolve a symlinked store to its real target so the rewrite writes THROUGH
-    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    // the link, not replacing it with a regular file (R13b).
     let dest = crate::util::resolve_symlink_target(store);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -612,11 +525,8 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     for line in lines {
         writeln!(tmp, "{line}")?;
     }
-    // Durability (CodeRabbit R9 #B): fsync the compacted body to stable storage
-    // BEFORE the rename, then fsync the parent dir so the rename's directory
-    // entry is durable too — otherwise a crash could leave the store renamed
-    // into place over zero/partial bytes, or lose the new entry entirely.
-    // Best-effort parent fsync (unix-only).
+    // Durability (R9 #B): fsync the body BEFORE the rename, then the parent dir
+    // so the rename's directory entry is durable too.
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(&dest).map_err(|e| e.error)?;
@@ -624,15 +534,10 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Cheap on-disk line count (number of `\n`), used to decide whether to compact.
-/// Skips lines that fail to read (invalid UTF-8) rather than stopping at the
-/// first error, so a single bad byte cannot make the count short and starve the
+/// Cheap on-disk line count, used to decide whether to compact. Skips
+/// unreadable lines rather than stopping early, so a bad byte cannot starve the
 /// compaction trigger (unbounded growth).
 fn line_count(store: &Path) -> usize {
-    // Same bounded-read contract as `parse_store`: a recoverable invalid-UTF-8
-    // line is skipped, a persistent read error breaks the loop (never stops the
-    // count short in a way that would starve the compaction trigger, and never
-    // spins). `read_store_lines` already drops blank lines.
     crate::util::read_store_lines(store).len()
 }
 
@@ -649,18 +554,14 @@ pub fn lookup_at(store: &Path, key: &PatternKey) -> SeenCount {
     SeenCount::from_count(count)
 }
 
-/// Record `key` as a new observation in the store at `store`. Appends one line,
-/// then compacts (window-prune + cap-evict) when the line count crosses the
-/// trigger so the file stays bounded.
+/// Record `key` as a new observation: append one line, then compact past the
+/// line-count trigger so the file stays bounded.
 ///
-/// CROSS-PROCESS LOCK (CodeRabbit R13f): the append + (conditional) compaction is
-/// held under the shared [`crate::canary::StoreLock`] for the whole sequence.
-/// Without it, two concurrent `record_at` calls could race so that one process's
-/// compaction (a rewrite from a snapshot read before the other's append) silently
-/// drops that append — permanently undercounting the baseline. Records only happen
-/// on a detection-rule firing while `baseline_enabled`, so lock contention is low.
-/// On a platform without advisory locking the guard degrades to best-effort and
-/// the atomic rewrite still prevents torn files.
+/// CROSS-PROCESS LOCK (R13f): append + (conditional) compaction run under the
+/// shared [`crate::canary::StoreLock`] for the whole sequence — without it, a
+/// concurrent compaction (a rewrite from a pre-append snapshot) could silently
+/// drop the append and undercount the baseline. Degrades to best-effort where
+/// advisory locking is absent (the atomic rewrite still prevents torn files).
 pub fn record_at(store: &Path, key: PatternKey) -> std::io::Result<()> {
     let _lock = crate::canary::StoreLock::acquire(store)?;
     let obs = key.into_observation();
@@ -671,28 +572,20 @@ pub fn record_at(store: &Path, key: PatternKey) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Compact the store in place: window-prune + LRU-cap the PARSED observations
-/// and atomically rewrite. Factored out of [`record_at`] (which only calls it
-/// past the line-count trigger) so the data-preservation contract is unit-
-/// testable on a small store without writing >100k lines.
+/// Compact in place: window-prune + LRU-cap the PARSED observations and
+/// atomically rewrite. Factored out of [`record_at`] so the data-preservation
+/// contract is testable without writing >100k lines.
 ///
-/// Compaction is intentionally lossy for PARSED rows (out-of-window prune + LRU
-/// cap), but it must NEVER silently drop a valid-but-momentarily-unparseable
-/// line — a future schema field, a transient hiccup (CodeRabbit R12 #F). Such
-/// lines are carried THROUGH the rewrite VERBATIM: they are rare, the line-count
-/// trigger still bounds total growth, and preserving an inert line the reader
-/// skips anyway is strictly safer than deleting a real observation that merely
-/// failed to parse this once.
+/// Lossy for PARSED rows, but a valid-but-momentarily-unparseable line (future
+/// schema field, transient hiccup) is carried THROUGH the rewrite VERBATIM
+/// (R12 #F) — strictly safer than deleting a real observation that failed to
+/// parse once.
 fn compact_store_at(store: &Path, now: chrono::DateTime<chrono::Utc>) -> std::io::Result<()> {
-    // PARTIAL-READ GUARD (CodeRabbit R13 #1): compaction REWRITES the store from
-    // the lines it just read. If the read broke early on a real mid-file I/O fault
-    // (not a recoverable skipped-UTF-8 line), those lines are a truncated prefix —
-    // rewriting from them would PERMANENTLY DROP the unread tail. When the read is
-    // incomplete, SKIP compaction this cycle and leave the store intact; the
-    // append already succeeded and the next `record_at` past the trigger retries.
-    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable line is preserved
-    // verbatim through the rewrite, so it must keep its surrounding whitespace.
-    // Parseable `Observation` lines are unaffected — `serde_json` tolerates it.
+    // PARTIAL-READ GUARD (R13 #1): compaction rewrites from the lines just read,
+    // so an incomplete read (a real mid-file I/O fault) would PERMANENTLY DROP
+    // the unread tail — skip compaction and leave the store intact; the append
+    // already succeeded and the next `record_at` retries. RAW (untrimmed) read
+    // (R15 #3) so a preserved unparseable line keeps its whitespace.
     let (lines, complete) = crate::util::read_store_lines_raw_complete(store);
     if !complete {
         return Ok(());
@@ -766,10 +659,9 @@ pub fn entry_count_at(store: &Path) -> usize {
         .count()
 }
 
-/// Zero the store at `store` by removing the JSONL file. The salt is left in
-/// place (re-using it keeps existing-but-cleared hashes stable; removing it
-/// would only churn the salt for no privacy gain). Returns the number of
-/// entries removed.
+/// Zero the store by removing the JSONL file (the salt is left in place — re-use
+/// keeps cleared hashes stable, removal gains no privacy). Returns the count
+/// removed.
 pub fn reset_at(store: &Path) -> std::io::Result<usize> {
     let removed = line_count(store);
     match std::fs::remove_file(store) {
@@ -781,9 +673,9 @@ pub fn reset_at(store: &Path) -> std::io::Result<usize> {
 
 // ─── production wrappers ──────────────────────────────────────────────────────
 
-/// `true` when the default store exists and has at least one byte. The engine's
-/// tier-1 force-past consults this so a baseline-enabled-but-empty store still
-/// reaches the record path (so the FIRST observation can be the first-time one).
+/// `true` when the default store exists and is non-empty. The engine's tier-1
+/// force-past consults this so an enabled-but-empty store still reaches the
+/// record path (the FIRST observation can be the first-time one).
 pub fn store_nonempty() -> bool {
     store_path()
         .map(|p| std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false))
@@ -874,13 +766,9 @@ mod tests {
         }
     }
 
-    /// CodeRabbit R13 #1: `compact_store_at` REWRITES the store from the lines it
-    /// reads, so an incomplete read (a real I/O fault leaving the tail unread)
-    /// must SKIP compaction rather than truncate the store. A FIFO store is
-    /// reported incomplete by `read_store_lines_complete` (not a readable regular
-    /// file), so compaction is skipped (returns Ok, no rewrite) and the FIFO is
-    /// left intact — never replaced by a truncated regular file. Unix-only (needs
-    /// mkfifo); cannot hang (O_NONBLOCK open returns immediately).
+    /// R13 #1: an incomplete read must SKIP compaction rather than truncate the
+    /// store. A FIFO is reported incomplete, so compaction is a no-op and the
+    /// FIFO is left intact. Unix-only; cannot hang (O_NONBLOCK).
     #[cfg(unix)]
     #[test]
     fn compact_skips_on_incomplete_read_no_truncation() {
@@ -893,8 +781,7 @@ mod tests {
             eprintln!("skipping: mkfifo unsupported here");
             return;
         }
-        // Compaction must be a no-op (Ok) and must NOT rewrite the FIFO into a
-        // regular file.
+        // Must be a no-op and must NOT rewrite the FIFO into a regular file.
         compact_store_at(&store, chrono::Utc::now()).expect("incomplete read skips, returns Ok");
         assert!(
             std::fs::symlink_metadata(&store)
@@ -950,7 +837,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let mut k2 = key("curl_pipe_shell");
-        k2.sudo_flag = true; // different tuple
+        k2.sudo_flag = true;
         record_at(&store, key("curl_pipe_shell")).unwrap();
         record_at(&store, key("curl_pipe_shell")).unwrap();
         record_at(&store, k2.clone()).unwrap();
@@ -963,7 +850,7 @@ mod tests {
     fn out_of_window_observations_are_not_counted() {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
-        // Write one old (out-of-window) and one recent observation by hand.
+        // One old (out-of-window) observation by hand.
         let old = Observation {
             rule_id: "curl_pipe_shell".to_string(),
             host_hash: Some("abc123".to_string()),
@@ -973,7 +860,7 @@ mod tests {
             seen_at: (chrono::Utc::now() - chrono::Duration::days(WINDOW_DAYS + 5)).to_rfc3339(),
         };
         rewrite_store_lines(&store, &[serde_json::to_string(&old).unwrap()]).unwrap();
-        // The old one is out of window → first time again.
+        // Out of window → first time again.
         let seen = lookup_at(&store, &key("curl_pipe_shell"));
         assert_eq!(seen.count, 0);
         assert!(seen.first_time);
@@ -1029,12 +916,9 @@ mod tests {
 
     #[test]
     fn compaction_preserves_unparseable_lines_and_prunes_parsed() {
-        // CodeRabbit R12 #F: compaction's REWRITE must window-prune PARSED rows
-        // (intentionally lossy) WITHOUT silently dropping a line the lenient
-        // reader skips. Hand-build a store with: one in-window observation, one
-        // out-of-window observation (must be pruned), and one unparseable line
-        // (must be PRESERVED verbatim). Drive `compact_store_at` directly so the
-        // contract is testable without writing >100k lines to hit the trigger.
+        // R12 #F: compaction window-prunes PARSED rows without dropping an
+        // unparseable line. Hand-build a store with one in-window obs, one
+        // out-of-window (pruned), and one unparseable line (preserved verbatim).
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let now = chrono::Utc::now();
@@ -1106,13 +990,10 @@ mod tests {
         assert!(!h1.contains("github"));
     }
 
-    /// CodeRabbit R12 #C: the FIRST-CREATE (absent-file) `persist_salt` path is
-    /// now crash-durable like the overwrite path — it fsyncs the body AND the
-    /// parent directory. fsync is not directly observable in a unit test, but
-    /// this exercises the absent path's full success contract on every run (a
-    /// `sync_all()` error now propagates via `?` and fails the `.unwrap()`),
-    /// and proves the salt persists exactly and is returned unchanged. A nested
-    /// dir forces the parent-dir creation + fsync path too.
+    /// R12 #C: the first-create (absent-file) `persist_salt` path is crash-durable
+    /// like the overwrite path (fsyncs body + parent dir). fsync isn't observable,
+    /// but this proves the salt persists exactly. A nested dir forces the
+    /// parent-dir creation + fsync path.
     #[test]
     fn persist_salt_first_create_persists_exactly_and_is_durable() {
         let dir = tempdir().unwrap();
@@ -1151,9 +1032,8 @@ mod tests {
 
     #[test]
     fn adopt_concurrent_salt_rejects_oversized_without_retrying() {
-        // A file LONGER than a salt is genuinely corrupt, not a partial write, so
-        // adopt fails immediately (no retry budget burned). The capped helper also
-        // refuses a file over SALT_READ_CAP before buffering it whole.
+        // A file LONGER than a salt is corrupt, not a partial write, so adopt
+        // fails immediately (no retry burned; the capped helper refuses it).
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         std::fs::write(&salt_file, vec![0u8; (SALT_READ_CAP as usize) + 4096]).unwrap();
@@ -1163,11 +1043,9 @@ mod tests {
 
     #[test]
     fn adopt_concurrent_salt_waits_for_in_progress_write() {
-        // CodeRabbit R13 #J: the loser of the `create_new` race must NOT declare
-        // the salt corrupt just because the winner has created but not yet finished
-        // writing it. A background writer completes the file to SALT_LEN well within
-        // adopt's ~100 ms retry budget; adopt must RETRY and return the completed
-        // salt rather than returning InvalidData and disabling baseline.
+        // R13 #J: the race loser must not declare the salt corrupt while the
+        // winner is mid-write. A background writer completes within the retry
+        // budget; adopt must RETRY and return the completed salt.
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         let full = [9u8; SALT_LEN];
@@ -1187,8 +1065,7 @@ mod tests {
 
     #[test]
     fn salt_file_is_32_bytes() {
-        // I2 regression: the persisted salt must be exactly 32 bytes (the
-        // documented length), not 16.
+        // I2 regression: the persisted salt must be exactly 32 bytes, not 16.
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         let _ = hash_host_at(&salt_file, "github.com").unwrap();
@@ -1198,9 +1075,8 @@ mod tests {
 
     #[test]
     fn short_salt_file_is_regenerated() {
-        // I2 regression: a truncated/short salt file (e.g. 16 bytes from an old
-        // version or a crash mid-write) must be rejected and regenerated to the
-        // full 32 bytes, not accepted as-is.
+        // I2 regression: a truncated/short salt file must be rejected and
+        // regenerated to the full 32 bytes, not accepted as-is.
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         std::fs::write(&salt_file, [0u8; 16]).unwrap();
@@ -1225,15 +1101,11 @@ mod tests {
 
     #[test]
     fn oversized_salt_file_is_rejected_and_regenerated() {
-        // CodeRabbit R11 #4: an oversized `baseline.salt` must NOT be allocated
-        // whole before the length check. The capped helper refuses it (over the
-        // SALT_READ_CAP), so it is treated as corrupt and OVERWRITTEN with a fresh
-        // 32-byte salt — hashing still works, and the on-disk file is back to
-        // SALT_LEN. We isolate the salt cache by using a unique temp path.
+        // R11 #4: an oversized `baseline.salt` is refused by the capped helper
+        // before allocation, treated as corrupt, and OVERWRITTEN with a fresh
+        // 32-byte salt. Unique temp path isolates the salt cache.
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
-        // Far larger than SALT_READ_CAP — a naive `std::fs::read` would buffer all
-        // of it; the cap refuses it before allocation.
         std::fs::write(&salt_file, vec![0u8; (SALT_READ_CAP as usize) + 4096]).unwrap();
 
         let h = hash_host_at(&salt_file, "github.com").expect("hash succeeds after regen");
@@ -1248,10 +1120,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn corrupt_salt_regen_through_symlink_updates_target_not_link() {
-        // CodeRabbit R13b: the corrupt-salt rewrite (persist_salt replace path)
-        // must write THROUGH a symlinked salt path to the real target, not replace
-        // the symlink with a regular file. Seed a SHORT (corrupt) salt at the
-        // target, point a symlink at it, then trigger regeneration via hashing.
+        // R13b: the corrupt-salt rewrite must write THROUGH a symlinked path to
+        // the real target, not replace the symlink. Seed a short (corrupt) salt
+        // at the target, symlink to it, regenerate via hashing.
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         let target_dir = dir.path().join("real");
@@ -1280,10 +1151,9 @@ mod tests {
         );
     }
 
-    /// CodeRabbit R11 #1: a FIFO at the salt path must NOT block the salt read.
-    /// The capped helper opens with O_NONBLOCK and rejects the FIFO, so the salt
-    /// is treated as corrupt and regenerated atomically (overwriting the FIFO).
-    /// A regression to a blocking `std::fs::read` would HANG here. Unix-only.
+    /// R11 #1: a FIFO at the salt path must NOT block the read. The capped helper
+    /// (O_NONBLOCK) rejects it, so the salt is regenerated atomically. A blocking
+    /// `std::fs::read` regression would HANG here. Unix-only.
     #[cfg(unix)]
     #[test]
     fn fifo_salt_does_not_hang_and_regenerates() {
@@ -1295,10 +1165,8 @@ mod tests {
             eprintln!("skipping: mkfifo unsupported here");
             return;
         }
-        // Must complete promptly; a blocking read on the FIFO would hang. The
-        // FIFO is corrupt → the salt is regenerated (the persist path replaces it
-        // atomically), so hashing returns a value and the file is now a regular
-        // 32-byte salt.
+        // Must complete promptly (a blocking read would hang); the FIFO is
+        // regenerated into a regular 32-byte salt.
         let h = hash_host_at(&salt_file, "github.com").expect("hash succeeds, no hang");
         assert_eq!(h.len(), 16);
         let meta = std::fs::metadata(&salt_file).unwrap();
@@ -1330,11 +1198,9 @@ mod tests {
 
     #[test]
     fn unwritable_corrupt_salt_disables_baseline() {
-        // F4 regression: when the salt is unreadable AND cannot be created
-        // (parent path is a FILE, not a dir → both read and create_dir_all
-        // fail), hashing returns None and the session is marked disabled —
-        // instead of churning a fresh per-run salt that fires
-        // AnomalyFirstTimeInThisRepo forever.
+        // F4 regression: when the salt is unreadable AND unwritable (parent is a
+        // FILE), hashing returns None and the session is disabled — instead of
+        // churning a per-run salt that fires AnomalyFirstTimeInThisRepo forever.
         let dir = tempdir().unwrap();
         // Make the salt's parent a regular file so create_dir_all/persist fail.
         let blocker = dir.path().join("blocker");
@@ -1355,8 +1221,7 @@ mod tests {
     fn corrupt_line_is_skipped_not_fatal() {
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
-        // A valid, recent (in-window, NOT future-dated) observation alongside a
-        // junk line and a blank line.
+        // A valid recent observation alongside a junk line and a blank line.
         let recent = chrono::Utc::now().to_rfc3339();
         std::fs::write(
             &store,
@@ -1378,8 +1243,8 @@ mod tests {
 
     #[test]
     fn future_dated_observation_is_out_of_window() {
-        // Greptile P2 regression: a future-dated row (clock skew / tampered
-        // store) must NOT count as in-window forever.
+        // Greptile P2 regression: a future-dated row (clock skew / tampered store)
+        // must NOT count as in-window forever.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let future = (chrono::Utc::now() + chrono::Duration::days(10)).to_rfc3339();

@@ -1,9 +1,8 @@
 //! Install `eval "$(tirith init)"` into the user's shell profile.
 //!
-//! Manages a BEGIN/END marker block in `~/.zshrc`, `~/.bashrc`,
-//! `~/.config/fish/config.fish`, `~/.config/nushell/config.nu`, or the
-//! PowerShell profile so the hook can be installed idempotently and
-//! updated or removed without corrupting user content.
+//! Manages a BEGIN/END marker block in the shell's rc file (zsh/bash/fish/
+//! nushell/PowerShell) so the hook installs idempotently and updates/removes
+//! without corrupting user content.
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,18 +43,15 @@ fn needs_quoting(s: &str) -> bool {
     })
 }
 
-/// Quote a path for safe interpolation into a shell command.
-///
-/// Uses single-quote wrapping with per-shell escaping for embedded
-/// single quotes. Returns the path unchanged if no special characters.
+/// Single-quote a path for safe shell interpolation (per-shell escaping for an
+/// embedded `'`). Returned unchanged when no special characters.
 pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
     if !needs_quoting(path) {
         return path.to_string();
     }
     match shell {
-        // PowerShell: single quotes, double a literal ' to escape
+        // PowerShell doubles a literal ' to escape; POSIX/fish break out of the quote.
         "powershell" => format!("'{}'", path.replace('\'', "''")),
-        // POSIX (bash/zsh) and fish: single quotes, break out for literal '
         _ => format!("'{}'", path.replace('\'', "'\\''")),
     }
 }
@@ -107,10 +103,8 @@ fn detect_shell_profile() -> Option<(&'static str, PathBuf)> {
     Some((shell, profile))
 }
 
-/// Check for a manually-added tirith init invocation (uncommented executable line).
-///
-/// Skips comments and empty lines to avoid false positives on documentation
-/// like `# TODO: tirith init` or `# removed tirith init`.
+/// Detect a manually-added `tirith init` (uncommented executable line). Skips
+/// comments/blanks to avoid false positives on `# TODO: tirith init`.
 fn has_executable_tirith_init(content: &str) -> bool {
     content.lines().any(|line| {
         let trimmed = line.trim();
@@ -124,10 +118,8 @@ fn has_executable_tirith_init(content: &str) -> bool {
     })
 }
 
-/// Validate that each BEGIN marker has a matching END marker.
-///
-/// Returns Err on unbalanced or nested markers so that `remove_hook_blocks`
-/// never silently drops trailing user content.
+/// Validate that each BEGIN marker has a matching END marker. Err on unbalanced
+/// or nested markers so `remove_hook_blocks` never silently drops user content.
 fn validate_marker_pairing(content: &str) -> Result<(), String> {
     let mut in_block = false;
     for line in content.lines() {
@@ -182,23 +174,18 @@ fn extract_managed_block(content: &str) -> Option<String> {
     }
 }
 
-/// Install the tirith shell hook into the user's shell profile.
+/// Install the tirith shell hook (a managed block with the detected shell's init
+/// line) into the user's profile. Idempotent: skips a matching block unless
+/// `force`, reports drift when content differs.
 ///
-/// Appends a managed block containing the appropriate init line for the
-/// detected shell. Idempotent: skips if block already exists with matching
-/// content (unless `force`). Reports drift when block content differs.
-///
-/// When the detected shell is bash and this is not a dry run, also runs the
-/// bash enter-mode delivery self-test (issue #111) and caches the verdict, so
-/// the hook can decide enter-vs-preexec correctly on the next shell. The probe
-/// is best-effort — a failure there never fails the setup.
+/// For bash (non-dry-run) also runs the enter-mode delivery self-test (issue
+/// #111) and caches the verdict so the next shell picks enter-vs-preexec
+/// correctly. The probe is best-effort and never fails the setup.
 pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
     let result = install_shell_hook_inner(tirith_bin, force, dry_run);
 
-    // Refresh the bash enter-mode capability cache after a successful install.
-    // `detect_shell_profile` is cheap and idempotent; calling it again here
-    // keeps the probe scoped to bash users without threading the shell name
-    // through every early return inside the inner function.
+    // Refresh the bash enter-mode capability cache after a successful install,
+    // scoped to bash users without threading the shell name through the inner fn.
     #[cfg(unix)]
     if result.is_ok() && !dry_run {
         if let Some(("bash", _)) = detect_shell_profile() {
@@ -365,11 +352,9 @@ fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Res
     Ok(())
 }
 
-/// Remove all lines between BEGIN and END tirith-hook markers (inclusive).
-///
-/// SAFETY: Caller must call `validate_marker_pairing` first. This function
-/// does not re-validate; if markers are unbalanced it will drop trailing
-/// content (which is why the validation gate exists).
+/// Remove all lines between BEGIN/END markers (inclusive). Caller MUST call
+/// `validate_marker_pairing` first — this does not re-validate, and unbalanced
+/// markers would drop trailing content.
 fn remove_hook_blocks(content: &str) -> String {
     let mut result = Vec::new();
     let mut suppressing = false;

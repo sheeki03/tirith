@@ -1,16 +1,10 @@
-/// Webhook event dispatcher for finding notifications.
-///
-/// Non-blocking: fires in a background thread so it never delays the verdict
-/// exit code.
+/// Webhook event dispatcher for finding notifications. Non-blocking: fires in
+/// a background thread so it never delays the verdict exit code.
 use crate::policy::WebhookConfig;
 use crate::verdict::{Severity, Verdict};
 
-/// Dispatch webhook notifications for a verdict, if configured.
-///
-/// Spawns a background thread per webhook endpoint. The main thread is never
-/// blocked. Auxiliary delivery/configuration diagnostics are debug-only so
-/// shell hooks don't turn best-effort webhook failures into native-command
-/// noise.
+/// Dispatch webhook notifications for a verdict, if configured. Spawns a
+/// background thread per endpoint; the main thread is never blocked.
 pub fn dispatch(
     verdict: &Verdict,
     command_preview: &str,
@@ -21,7 +15,6 @@ pub fn dispatch(
         return;
     }
 
-    // Apply DLP redaction: built-in patterns + custom policy patterns (Team)
     let redacted_preview = crate::redact::redact_with_custom(command_preview, custom_dlp_patterns);
 
     let max_severity = verdict
@@ -36,7 +29,7 @@ pub fn dispatch(
             continue;
         }
 
-        // SSRF protection: validate webhook URL
+        // SSRF protection: validate webhook URL.
         if let Err(reason) = crate::url_validate::validate_server_url(&wh.url) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: webhook: skipping {}: {reason}",
@@ -86,7 +79,7 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
                 &sanitize_for_json(&max_severity.to_string()),
             )
             .replace("{{finding_count}}", &verdict.findings.len().to_string());
-        // Only use template result if it's valid JSON
+        // Only use the template result if it parsed as valid JSON.
         if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
             return result;
         }
@@ -95,7 +88,7 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
         );
     }
 
-    // Default JSON payload (also used as fallback when template produces invalid JSON)
+    // Default JSON payload (also the fallback when a template produces invalid JSON).
     let rule_ids: Vec<String> = verdict
         .findings
         .iter()
@@ -161,8 +154,8 @@ fn expand_env_value(input: &str) -> String {
                     }
                 }
             } else {
-                // peek() (not next()) so the delimiter that ends the variable
-                // name stays in the stream for the outer loop to handle.
+                // peek() (not next()) so the delimiter ending the var name stays
+                // in the stream for the outer loop.
                 let mut var_name = String::new();
                 while let Some(&ch) = chars.peek() {
                     if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -259,9 +252,8 @@ fn send_with_retry(
 /// Sanitize a string for safe embedding in JSON (limit length, escape special chars).
 fn sanitize_for_json(input: &str) -> String {
     let truncated: String = input.chars().take(200).collect();
-    // Use serde_json to properly escape the string
+    // Escape via serde_json, then strip the surrounding quotes.
     let json_val = serde_json::Value::String(truncated);
-    // Strip the surrounding quotes from the JSON string
     let s = json_val.to_string();
     s[1..s.len() - 1].to_string()
 }
@@ -362,9 +354,8 @@ mod tests {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Unix env vars are case-sensitive: TIRITH_api_key != TIRITH_API_KEY
-        // The blocklist is exact-match, so a case variant is a DIFFERENT var.
-        // This is correct — TIRITH_api_key is not a real sensitive var.
+        // Env vars are case-sensitive and the blocklist is exact-match, so a
+        // case variant is a different (non-sensitive) var.
         unsafe { std::env::set_var("TIRITH_api_key", "not-sensitive") };
         assert_eq!(
             expand_env_value("$TIRITH_api_key"),
@@ -391,9 +382,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
-        // $$TIRITH_API_KEY: first $ sees second $ which is not '{' or alnum,
-        // so it becomes a literal '$', then the second $ starts a new expansion
-        // which hits the blocklist.
+        // First $ is literal (next char isn't '{'/alnum); the second $ starts an
+        // expansion that hits the blocklist.
         let result = expand_env_value("$$TIRITH_API_KEY");
         assert!(
             !result.contains("leaked"),
@@ -408,9 +398,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("TIRITH_API_KEY", "leaked") };
-        // ${TIRITH_${NESTED}} — the inner ${...} is consumed as the var name
-        // "TIRITH_${NESTED" (take_while stops at '}'), which doesn't start
-        // with TIRITH_ in any meaningful way that resolves.
+        // The inner ${...} is consumed as the var name (take_while stops at the
+        // first '}'), which does not resolve.
         let result = expand_env_value("${TIRITH_${NESTED}}");
         assert!(
             !result.contains("leaked"),

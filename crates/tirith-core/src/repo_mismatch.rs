@@ -1,24 +1,14 @@
-//! M6 ch6 — registry-claimed repository URL verification.
+//! M6 ch6 — registry-claimed repository URL verification (`--online` only).
 //!
-//! Under `--online` only: for a package whose registry response carries a
-//! `repository_url`, GET the URL and verify:
-//!
-//!  1. The URL parses as a known git-hosting URL (GitHub, GitLab, Bitbucket).
-//!  2. The host is reachable (HTTP 200 on the URL or a derived raw-manifest
-//!     URL).
-//!  3. The hosted manifest (e.g. `package.json` for GitHub) mentions this
-//!     package name.
-//!
-//! Returns a [`RepoMismatchVerdict`]:
+//! For a package whose registry response carries a `repository_url`, fetch it
+//! and verify: (1) parses as a known git host (GitHub/GitLab/Bitbucket),
+//! (2) host reachable, (3) hosted manifest names this package. Returns a
+//! [`RepoMismatchVerdict`]:
 //!  * `Match` — all three checks passed.
-//!  * `Mismatch` — host reachable but the hosted manifest names a different
-//!    package, or the URL parses as non-git.
+//!  * `Mismatch` — host reachable but manifest names a different package, or
+//!    the URL parses as non-git.
 //!  * `Unverifiable` — no URL, dead host, or transport failure. Emits no
 //!    finding by design.
-//!
-//! The check is capped via the planned `policy.package_policy.repo_mismatch_check_max_packages`
-//! (default 50; sort by score, check top-N). For M6 ch6 the cap is a const
-//! exported here; ch7 wires it through policy.
 
 use std::time::Duration;
 
@@ -38,10 +28,8 @@ const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Verify a registry-claimed repository URL against `(eco, name)`.
 ///
-/// `repository_url` should be the URL as the registry reported it; we trim
-/// leading `git+` prefixes and `.git` suffixes before parsing. On any error
-/// the verdict defaults to `Unverifiable` with the reason recorded — the
-/// rule never fires unless the verdict is positively `Mismatch`.
+/// On any error the verdict defaults to `Unverifiable` with the reason
+/// recorded — the rule never fires unless the verdict is positively `Mismatch`.
 pub fn verify(repository_url: &str, eco: Ecosystem, name: &str) -> RepoMismatchVerdict {
     let trimmed = sanitize_repo_url(repository_url);
     let host = match parse_known_git_host(&trimmed) {
@@ -55,7 +43,6 @@ pub fn verify(repository_url: &str, eco: Ecosystem, name: &str) -> RepoMismatchV
         }
     };
 
-    // Resolve to a raw-manifest URL we can fetch and parse.
     let raw_url = match host.raw_manifest_url(eco) {
         Some(u) => u,
         None => {
@@ -187,9 +174,8 @@ impl KnownGitHost {
 
     fn raw_manifest_url(&self, eco: Ecosystem) -> Option<String> {
         let manifest = manifest_filename(eco)?;
-        // We try `main` then `master` only on GitHub; we fall back to a single
-        // candidate here to keep network usage minimal. The caller treats a
-        // 404 on the first candidate as `Unverifiable`, not `Mismatch`.
+        // Single candidate to keep network usage minimal; a 404 is treated as
+        // `Unverifiable`, not `Mismatch`.
         match self.kind {
             HostKind::GitHub => Some(format!(
                 "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{manifest}",
@@ -216,8 +202,7 @@ fn manifest_filename(eco: Ecosystem) -> Option<&'static str> {
         Ecosystem::Crates => Some("Cargo.toml"),
         Ecosystem::PyPI => Some("pyproject.toml"),
         Ecosystem::RubyGems => Some("Gemfile"),
-        // Other ecosystems have no single conventional repo-root manifest
-        // file; we skip the check rather than guess.
+        // Other ecosystems have no single conventional repo-root manifest; skip rather than guess.
         _ => None,
     }
 }
@@ -227,23 +212,20 @@ fn manifest_filename(eco: Ecosystem) -> Option<&'static str> {
 fn manifest_names_package(manifest: &str, name: &str, eco: Ecosystem) -> bool {
     match eco {
         Ecosystem::Npm => {
-            // Match `"name": "foo"` with optional whitespace.
             let needle = format!("\"name\": \"{name}\"");
             let needle_no_space = format!("\"name\":\"{name}\"");
             manifest.contains(&needle) || manifest.contains(&needle_no_space)
         }
         Ecosystem::Crates => {
-            // Cargo.toml: `name = "foo"` under `[package]`.
             let needle = format!("name = \"{name}\"");
             manifest.contains(&needle)
         }
         Ecosystem::PyPI => {
-            // pyproject.toml: `name = "foo"` under `[project]`.
             let needle = format!("name = \"{name}\"");
             manifest.contains(&needle)
         }
         Ecosystem::RubyGems => {
-            // Gemfile: this is the most heuristic case; just check substring.
+            // Gemfile: heuristic substring check.
             manifest.contains(name)
         }
         _ => false,
@@ -338,7 +320,7 @@ mod tests {
 
     #[test]
     fn verify_returns_unverifiable_for_non_known_host() {
-        // Doesn't issue a network request — the host parse fails first.
+        // No network request — the host parse fails first.
         let v = verify("https://example.com/owner/repo", Ecosystem::Npm, "p");
         assert!(matches!(v.state, RepoMismatchState::Unverifiable));
         assert!(v.reason.contains("does not parse"));

@@ -4,17 +4,13 @@ use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 
-/// Thread-safe cache: URL -> (resolved destination, insertion time).
 static CACHE: Lazy<Mutex<HashMap<String, (String, Instant)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Cache entries expire after 5 minutes.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Maximum redirect hops before giving up.
 const MAX_REDIRECTS: usize = 10;
 
-/// Per-hop HTTP timeout.
 const HOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Known URL shortener domains (lowercase).
@@ -41,19 +37,13 @@ pub fn is_shortened_url(url: &str) -> bool {
 }
 
 /// Follow redirects from a shortened URL and return the final destination.
-///
-/// Returns `None` when:
-/// - The URL is not a known shortener
-/// - Network errors prevent resolution
-/// - The redirect chain exceeds [`MAX_REDIRECTS`]
-///
-/// Results are cached for [`CACHE_TTL`] to avoid redundant requests.
+/// `None` for a non-shortener, network failure, or chains over [`MAX_REDIRECTS`].
+/// Results are cached for [`CACHE_TTL`].
 pub fn resolve_shortened_url(url: &str) -> Option<String> {
     if !is_shortened_url(url) {
         return None;
     }
 
-    // Check cache first.
     if let Some(cached) = cache_get(url) {
         return Some(cached);
     }
@@ -100,7 +90,6 @@ fn follow_redirects(start_url: &str) -> Option<String> {
         let resp = client.get(&current).send().ok()?;
 
         if !resp.status().is_redirection() {
-            // Reached the final destination.
             return Some(current);
         }
 
@@ -110,7 +99,6 @@ fn follow_redirects(start_url: &str) -> Option<String> {
             .to_str()
             .ok()?;
 
-        // Handle relative redirects.
         current = if location.starts_with("http://") || location.starts_with("https://") {
             location.to_string()
         } else if location.starts_with('/') {
@@ -129,7 +117,7 @@ fn follow_redirects(start_url: &str) -> Option<String> {
     Some(current)
 }
 
-/// Return "https://host" or "http://host:port" portion of a URL.
+/// Return the `scheme://host[:port]` origin portion of a URL.
 fn extract_origin(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let after = &url[scheme_end + 3..];
@@ -149,7 +137,6 @@ fn cache_get(url: &str) -> Option<String> {
 
 fn cache_put(url: &str, resolved: &str) {
     if let Ok(mut cache) = CACHE.lock() {
-        // Evict expired entries when the cache grows large.
         if cache.len() > 1024 {
             cache.retain(|_, (_, ts)| ts.elapsed() < CACHE_TTL);
         }

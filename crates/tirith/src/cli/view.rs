@@ -1,21 +1,13 @@
 //! `tirith view <file>` — render a file with terminal-deception sequences
 //! neutralized and a sidecar finding list.
 //!
-//! Streams the file via [`std::io::BufReader`] in 64 KiB chunks, feeding each
-//! chunk into [`tirith_core::engine::analyze_output_chunk`] so the underlying
-//! byte-scanner state machine carries across chunk boundaries (an escape
-//! sequence split on byte 65 535 → 65 536 is still detected).
+//! Streams the file in 64 KiB chunks through [`tirith_core::engine::analyze_output_chunk`]
+//! so the byte-scanner state machine carries across chunk boundaries (an escape
+//! sequence split on a 64 KiB boundary is still detected). Output is neutralized by
+//! stripping ANSI escapes (CSI/OSC/APC/DCS) and zero-width chars — plain text only.
 //!
-//! Output is "neutralized" by stripping all ANSI escape sequences (CSI / OSC
-//! / APC / DCS) and zero-width characters before printing. Sanitization is
-//! intentionally simple — we render plain text — because the goal is for a
-//! human to be able to see the file's textual content without their terminal
-//! being tricked. Programs that wanted color/format must be re-run live.
-//!
-//! Exit codes follow the standard tirith convention: 0 on Allow (no
-//! findings), 1 on Block (a High-severity finding fired), 2 on Warn.
-//! `Action::WarnAck` (hook-context-only) maps to exit 3; in `tirith view`
-//! it is folded back to 2 because no interactive ack channel exists here.
+//! Exit codes: 0 Allow, 1 Block (High finding), 2 Warn. `Action::WarnAck` folds
+//! back to 2 here (no interactive ack channel in `tirith view`).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -55,8 +47,7 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
             // `max_bytes`. When the remaining budget is 0, stop.
             let remaining = max_bytes.saturating_sub(total_bytes);
             if remaining == 0 {
-                // Probe one extra byte to know whether we truncated content
-                // vs. just hit EOF cleanly.
+                // Probe one extra byte to distinguish truncation from a clean EOF.
                 let mut probe = [0u8; 1];
                 let n = reader.read(&mut probe)?;
                 if n > 0 {
@@ -71,13 +62,9 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
             }
             total_bytes += n as u64;
 
-            // The scanner uses raw bytes; the analyzer's text mirror is what
-            // drives the prompt-shape detector at EOF. We decode lossily.
             let chunk_str = String::from_utf8_lossy(&buf[..n]).into_owned();
-            // Side-effect: scanner advances byte_offset; findings accumulate.
             let _ = engine::analyze_output_chunk(&chunk_str, &mut state);
 
-            // Build the sanitized copy of this chunk for human display.
             sanitize_into(&buf[..n], &mut sanitized);
         }
         Ok(())
@@ -92,9 +79,6 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
         return 1;
     }
 
-    // Use the `_mut` variant so the byte-scanner's truncated-escape check
-    // can finalize state in place (clones are wasteful on hot path). The
-    // immutable wrapper is kept for `analyze_output`'s legacy one-shot use.
     let verdict = engine::analyze_output_finalize_mut(&mut state);
 
     if json {

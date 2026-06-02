@@ -66,33 +66,24 @@ pub fn run(
         .map(|v| v == "0")
         .unwrap_or(false);
 
-    // Must run before any early return (--approval-check, daemon path, etc.)
-    // so hooks calling `tirith check --approval-check` still trigger updates.
-    // `--offline` (or TIRITH_OFFLINE) makes this a guaranteed no-op — analysis
-    // then stays purely local with zero network attempts.
+    // Must run before any early return so hooks calling `--approval-check` still
+    // trigger updates. `--offline`/`TIRITH_OFFLINE` makes this a guaranteed no-op.
     crate::cli::threatdb_cmd::maybe_background_update(offline);
 
     let session_id = tirith_core::session::resolve_session_id();
 
-    // M4 item 8: best-effort origin attribution. Computed once from the
-    // current process env + the interactive flag tirith already derived,
-    // and stamped on the verdict so post-processing and the audit entry
-    // both see the same value. `post_process_verdict` consults this via
-    // `escalation::apply_agent_rules` against the active policy's
-    // `agent_rules.deny` (note: the `TIRITH=0` bypass branch below skips
-    // `post_process_verdict`, so `agent_rules.deny` does not currently
-    // enforce under bypass — to be addressed separately).
+    // M4 item 8: best-effort origin attribution, stamped on the verdict so
+    // post-processing and audit agree. Consulted via `apply_agent_rules` against
+    // `agent_rules.deny`. NOTE: the `TIRITH=0` bypass branch below skips
+    // `post_process_verdict`, so `agent_rules.deny` does not enforce under bypass.
     let origin = tirith_core::agent_origin::resolve_cli_origin(interactive);
 
-    // M11 ch1 — a `--card <path>` sidecar must be honored by the LOCAL engine
-    // (the daemon protocol carries no card field in v1), so a card forces the
-    // local analysis path just like `--no-daemon`.
+    // M11 ch1 — a `--card <path>` sidecar is daemon-unsupported (v1), so it forces
+    // the local analysis path just like `--no-daemon`.
     let use_daemon = !approval_check && !no_daemon && card.is_none();
 
-    // Daemon delegation skipped for --approval-check (needs local policy +
-    // approval file writes), --no-daemon, and --card. Local paths return the
-    // policy from the engine to avoid a redundant Policy::discover() call;
-    // daemon path returns None because analysis happened server-side.
+    // Local paths return the engine's policy to avoid a redundant
+    // Policy::discover(); the daemon path returns None (analysis was server-side).
     let (mut raw_verdict, engine_policy) = if use_daemon {
         if let Some(resp) =
             crate::cli::daemon::try_daemon_check(cmd, shell, cwd.as_deref(), interactive)
@@ -122,12 +113,9 @@ pub fn run(
                         approval_description: None,
                         escalation_reason: None,
                         agent_origin: None,
-                        // M11 ch2 — the daemon evaluates the full manifest
-                        // (`engine::analyze`) and now carries the matched
-                        // `allowed[]` entry name across the boundary, so the
-                        // audit-context annotation survives the daemon path.
-                        // (A pre-upgrade daemon omits the field; serde defaults
-                        // it to None.)
+                        // M11 ch2 — matched `allowed[]` name carried across the
+                        // daemon boundary so the audit annotation survives. A
+                        // pre-upgrade daemon omits it; serde defaults to None.
                         manifest_allowed_match: resp.manifest_allowed_match.clone(),
                     },
                     None,
@@ -191,9 +179,8 @@ pub fn run(
         (v, Some(p))
     };
 
-    // Stamp the resolved origin on the raw verdict so every later step
-    // (post-processing → effective → audit) sees it. `engine::analyze` does
-    // not know the caller's identity by design; the CLI does.
+    // Stamp the resolved origin so every later step sees it; `engine::analyze`
+    // does not know the caller's identity by design, the CLI does.
     raw_verdict.agent_origin = Some(origin);
 
     // Bypass path audits and returns without post-processing.
@@ -201,8 +188,7 @@ pub fn run(
         let policy =
             engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
         let event_id = uuid::Uuid::new_v4().to_string();
-        // Best-effort audit on the `check` hot path — a write failure must not
-        // change the exit code, so the Result is intentionally dropped.
+        // Best-effort audit: a write failure must not change the exit code.
         let _ = tirith_core::audit::log_verdict(
             &raw_verdict,
             cmd,
@@ -249,8 +235,7 @@ pub fn run(
     );
 
     let event_id = uuid::Uuid::new_v4().to_string();
-    // Best-effort audit on the `check` hot path — a write failure must not
-    // change the exit code, so the Result is intentionally dropped.
+    // Best-effort audit: a write failure must not change the exit code.
     let _ = tirith_core::audit::log_verdict_with_raw(
         &effective,
         cmd,
@@ -261,9 +246,9 @@ pub fn run(
         Some(raw_rule_ids),
     );
 
-    // Reconstruct ApprovalMetadata from verdict fields set by apply_approval —
-    // do NOT re-call check_approval on the filtered findings, as paranoia
-    // filtering may have removed the causal finding.
+    // Reconstruct ApprovalMetadata from verdict fields set by apply_approval — do
+    // NOT re-call check_approval on filtered findings (paranoia filtering may have
+    // removed the causal finding).
     if approval_check {
         if effective.requires_approval == Some(true) {
             let meta = tirith_core::approval::ApprovalMetadata {
@@ -301,9 +286,8 @@ pub fn run(
         }
     }
 
-    // Skip auto-checkpoint in non-interactive mode: hooks and scripts need
-    // fast responses, and checkpoint::create() synchronously traverses the
-    // entire cwd which can take seconds on large directories.
+    // Skip auto-checkpoint when non-interactive: checkpoint::create() synchronously
+    // traverses the whole cwd (seconds on large dirs) and hooks need fast responses.
     if interactive
         && effective.action != Action::Block
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
@@ -348,8 +332,7 @@ pub fn run(
         }
 
         // Mode B (hook-driven strict_warn): write warn-ack temp file and exit 3.
-        // Old hooks without warn-ack support treat rc=3 as "unexpected" and
-        // fail open, so this is backward-compatible.
+        // Old hooks without warn-ack support treat rc=3 as "unexpected" → fail open.
         if effective.action == Action::Warn && (strict_warn || policy.strict_warn) {
             let max_sev = effective
                 .findings
@@ -374,9 +357,8 @@ pub fn run(
         return effective.action.exit_code();
     }
 
-    // Safe-command suggestions are advisory only — computed solely when the
-    // user opted in AND the verdict actually flagged something (Allow needs no
-    // alternative). They never influence `effective.action` or the exit code.
+    // Safe-command suggestions are advisory only: computed when opted-in AND the
+    // verdict flagged something; they never influence the action or exit code.
     let safe_suggestions: Vec<tirith_core::safe_command::SafeSuggestion> =
         if suggest_safe_command && effective.action != Action::Allow {
             tirith_core::safe_command::suggest(cmd, shell_type, &effective)

@@ -1,7 +1,5 @@
-//! Per-tool setup implementations.
-//!
-//! Each function configures tirith protection for a specific AI coding tool:
-//! hook scripts, JSON config merges, MCP registration, and zshenv guard.
+//! Per-tool setup: hook scripts, JSON config merges, MCP registration, and
+//! zshenv guard for each AI coding tool.
 
 use super::fs_helpers;
 use super::merge;
@@ -99,9 +97,8 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
                 )?;
             }
             Scope::User => {
-                // Merge directly into ~/.claude/settings.json mcpServers.
-                // We avoid `claude mcp add` because it hangs when called from
-                // within an active Claude Code session (subprocess deadlock).
+                // Merge directly into ~/.claude/settings.json mcpServers — avoid
+                // `claude mcp add`, which deadlocks inside an active CC session.
                 merge::merge_claude_mcp_server(
                     &settings_path,
                     "tirith",
@@ -668,9 +665,8 @@ pub fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
 }
 
 pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
-    // Copilot CLI loads .github/hooks/*.json from the *current working
-    // directory*, with no walk-up. Tirith requires a git repo so doctor
-    // detection has a stable root to look at.
+    // Copilot CLI loads .github/hooks/*.json from the cwd with no walk-up;
+    // require a git repo so doctor detection has a stable root.
     let repo_root = tirith_core::policy::find_repo_root(None).ok_or_else(|| {
         "tirith setup copilot-cli requires being run inside a git repository — \
          Copilot CLI loads hooks from the repo root"
@@ -738,9 +734,8 @@ pub fn setup_copilot_cli(opts: &SetupOpts) -> Result<(), String> {
 pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
-    // Resolve the .kiro root according to scope. For project, walk up from
-    // cwd looking for an existing .kiro/ — if found, honor it. Otherwise
-    // create a new .kiro at cwd. For user, always ~/.kiro.
+    // Project scope: walk up for an existing .kiro/ and honor it, else create
+    // one at cwd. User scope: always ~/.kiro.
     let (kiro_root, scope_root, created_new_workspace) = match opts.scope {
         Scope::Project => {
             let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
@@ -771,10 +766,9 @@ pub fn setup_kiro(opts: &SetupOpts) -> Result<(), String> {
         opts.dry_run,
     )?;
 
-    // Both scopes use absolute hook paths since Kiro does not document
-    // hook-command path resolution relative to the agent file. tools=["*"]
-    // preserves default tool access; includeMcpJson=true preserves the
-    // user's MCP servers.
+    // Absolute hook paths in both scopes (Kiro doesn't document agent-relative
+    // resolution). tools=["*"] keeps default tool access; includeMcpJson keeps
+    // the user's MCP servers.
     let agent_path = agents_dir.join("tirith-security.json");
     let quoted = super::shell_profile::shell_quote(&hook_path.display().to_string(), "bash");
     let command = format!("python3 {quoted}");
@@ -970,10 +964,8 @@ mod tests {
     #[test]
     fn setup_codex_registers_when_current_cli_reports_missing_server() {
         with_fake_env(false, |home, _cwd| {
-            // Pin XDG_CONFIG_HOME so etcetera::config_dir() resolves to
-            // <tempdir>/.config regardless of the developer's exported env.
-            // copy_gateway_config writes to <XDG>/tirith/gateway.yaml; the
-            // assertion below depends on that path being deterministic.
+            // Pin XDG_CONFIG_HOME so the gateway path (<XDG>/tirith/gateway.yaml)
+            // the assertion below checks is deterministic.
             let xdg = home.join(".config");
             let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
 
@@ -985,10 +977,8 @@ mod tests {
 
             write_fake_codex(
                 bin_dir.path(),
-                // Note: this script uses bare $* logging and a plain `cat`-style
-                // shebang. Stays as a literal r#"..."# string because Rust raw
-                // strings can't interpolate; do not "simplify" into a heredoc
-                // expecting Rust-side variable substitution.
+                // Literal r#"..."# — Rust raw strings can't interpolate; don't
+                // "simplify" into a heredoc expecting Rust-side substitution.
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CODEX_LOG"
 if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "tirith-gateway" ]; then
@@ -1043,11 +1033,9 @@ exit 64
             let _log = EnvGuard::set("CODEX_LOG", &log_path);
             let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/zsh"));
 
-            // The fake script splices $XDG_CONFIG_HOME at shell-execution time
-            // via printf '%s%s%s'. The three single-quoted literals can't be
-            // a heredoc — Rust raw strings don't interpolate, and the test
-            // intentionally relies on the spawned shell's $XDG_CONFIG_HOME
-            // (set above) matching what etcetera computes inside setup_codex.
+            // The fake script splices $XDG_CONFIG_HOME at shell-execution time;
+            // it must stay a raw string (the test relies on the spawned shell's
+            // $XDG_CONFIG_HOME matching what etcetera computes in setup_codex).
             write_fake_codex(
                 bin_dir.path(),
                 r#"#!/bin/sh
@@ -1261,11 +1249,8 @@ exit 64
         with_fake_env(false, |home, _cwd| {
             setup_kiro(&opts_for(Scope::User)).unwrap();
 
-            // Build paths via chained `.join` (single component each) so the
-            // separator on Windows matches what production code emits.
-            // `home.join(".kiro/hooks/kiro-hook.py")` would produce mixed
-            // separators on Windows (`\\` from home, `/` from the embedded
-            // slashes) and break the strict-equality assertion below.
+            // Chained single-component `.join`s so Windows separators match
+            // production; an embedded-slash path would mix `\` and `/`.
             let hook = home.join(".kiro").join("hooks").join("kiro-hook.py");
             let agent = home
                 .join(".kiro")

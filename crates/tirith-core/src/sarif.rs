@@ -3,13 +3,9 @@ use crate::rule_explanations;
 use crate::verdict::{Finding, Severity};
 use std::collections::HashMap;
 
-/// Convert scan findings to SARIF 2.1.0 JSON.
-///
-/// Each finding becomes a SARIF result, with unique rules collected into the
-/// `tool.driver.rules` array. Severity mapping:
-///   CRITICAL/HIGH -> "error", MEDIUM -> "warning", LOW/INFO -> "note"
+/// Convert scan findings to SARIF 2.1.0 JSON. Severity maps as
+/// CRITICAL/HIGH -> "error", MEDIUM -> "warning", LOW/INFO -> "note".
 pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Value {
-    // Collect unique rules by rule_id display string
     let mut rule_map: HashMap<String, usize> = HashMap::new();
     let mut rules = Vec::new();
 
@@ -26,13 +22,11 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
                 }
             });
 
-            // Enrich with explanation metadata when available
             if let Some(explanation) = rule_explanations::explain(&rule_str) {
                 rule["fullDescription"] = serde_json::json!({
                     "text": explanation.description
                 });
 
-                // Add MITRE ATT&CK tag if present
                 let mut tags: Vec<&str> = Vec::new();
                 if let Some(mitre) = explanation.mitre_id {
                     tags.push(mitre);
@@ -43,7 +37,6 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
                     });
                 }
 
-                // Use first reference as helpUri
                 if let Some(uri) = explanation.references.first() {
                     rule["helpUri"] = serde_json::json!(uri);
                 }

@@ -204,21 +204,15 @@ fn format_bytes(bytes: u64) -> String {
 
 /// `tirith watch -- <cmd>` — snapshot → run → snapshot → diff (M10 ch2).
 ///
-/// Snapshots the working directory (plus any `--paths`) and the runtime state
-/// (env-var names, `$PATH`, shell-rc hashes) BEFORE running the command, runs
-/// it, then re-snapshots and reports: new files, modified files, `$PATH`
-/// additions, and shell-rc modifications. A shell-rc file changed during the run
-/// fires the High `PostRunShellRcModified` finding.
+/// Snapshots files (cwd + `--paths`) and runtime state (env names, `$PATH`,
+/// shell-rc hashes), runs the command, re-snapshots, and reports new/modified
+/// files, `$PATH` additions, and shell-rc changes (a changed rc fires High
+/// `PostRunShellRcModified`). Observability AFTER the fact — it does NOT sandbox
+/// or gate; the command runs with full privileges. Exit code is the CHILD's
+/// (usage/spawn errors are 2); findings never override it — `watch` is a lens.
 ///
-/// This is observability AFTER the fact — it does NOT sandbox, isolate, or gate
-/// the command, which runs with the user's full privileges. The exit code is the
-/// CHILD command's exit code (so `tirith watch -- false` exits 1), except for a
-/// usage error (2) or a spawn failure (2). Findings are reported but do NOT
-/// override the child's exit code — `watch` is a lens, not a gate.
-///
-/// `with_net_hints` opts into an EXPERIMENTAL, best-effort domain-hint heuristic
-/// (resolver-cache mtime delta). It may miss QUIC/UDP/direct-IP entirely and is
-/// not a network monitor or a security boundary.
+/// `with_net_hints` opts into an EXPERIMENTAL resolver-cache mtime heuristic; it
+/// misses QUIC/UDP/direct-IP and is not a network monitor or security boundary.
 pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: bool) -> i32 {
     let command_str = command.join(" ");
     if command_str.trim().is_empty() {
@@ -238,8 +232,8 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
         }
     };
 
-    // The set of file-content roots to snapshot: cwd plus any user-given paths.
-    // We deliberately cap to these — never walk all of $HOME (perf + privacy).
+    // Snapshot roots: cwd + user paths. Capped to these — never all of $HOME
+    // (perf + privacy).
     let mut snapshot_paths: Vec<String> = vec![cwd.to_string_lossy().into_owned()];
     snapshot_paths.extend(paths.iter().cloned());
 
@@ -252,8 +246,8 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
         None
     };
 
-    // F1: keep tirith alive across a Ctrl-C so the AFTER snapshot + diff always
-    // run (the child is in its own process group, see `run_command`).
+    // F1: keep tirith alive across Ctrl-C so the AFTER snapshot + diff always run
+    // (child is in its own process group, see `run_command`).
     install_watch_sigint_handler();
 
     // --- RUN the command with the user's full privileges (no isolation) ---
@@ -327,13 +321,12 @@ pub fn watch(command: &[String], paths: &[String], with_net_hints: bool, json: b
         );
     }
 
-    // `watch` reports; it does not gate. Surface the child's exit code so the
-    // command's success/failure is preserved for scripts.
+    // `watch` reports, never gates: surface the child's exit code for scripts.
     exit_code
 }
 
-/// Resolve the user's home directory without mutating env. Mirrors the
-/// resolution `tirith_core::policy` uses; falls back to `$HOME` / `%USERPROFILE%`.
+/// Resolve home without mutating env (`$HOME` / `%USERPROFILE%`); mirrors
+/// `tirith_core::policy`.
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -347,23 +340,15 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// Run the watched command through the platform shell so pipelines / redirects
-/// behave as the user typed them. Returns the child's exit code (128 if killed
-/// by a signal with no code). The command runs with tirith's full privileges —
-/// this is NOT isolation.
+/// Run the watched command through the platform shell (pipelines/redirects
+/// behave as typed). Returns the child's exit code (128 if signal-killed). NOT
+/// isolation — runs with full privileges.
 ///
-/// F1: on Unix the child is placed in its OWN process group (`setpgid(0,0)` via
-/// `pre_exec`). Without this the child shares tirith's process group, so a
-/// terminal `Ctrl-C` (SIGINT) is delivered to the WHOLE group — killing tirith
-/// before it can run the AFTER snapshot + diff. A half-finished installer that
-/// wrote a `.zshrc` persistence line then got interrupted would produce NO
-/// `PostRunShellRcModified` finding. With the child in its own group, SIGINT
-/// goes to the child only; tirith's installed SIGINT handler (see
-/// [`install_watch_sigint_handler`]) merely notes the interrupt, and the caller
-/// ALWAYS runs the after-snapshot + diff once `status()` returns. The child
-/// still observes the interrupt (the terminal also signals the foreground group,
-/// and an interactive child reads it), so this does not swallow the user's
-/// Ctrl-C — it only keeps tirith alive long enough to report.
+/// F1: on Unix the child gets its OWN process group (`setpgid(0,0)` via
+/// `pre_exec`) so a terminal SIGINT hits only the child, not tirith — otherwise
+/// Ctrl-C would kill tirith before the AFTER snapshot + diff (and a half-finished
+/// installer's `.zshrc` persistence line would go unreported). The child still
+/// observes the interrupt; this only keeps tirith alive long enough to report.
 fn run_command(command_str: &str) -> std::io::Result<i32> {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
@@ -379,9 +364,8 @@ fn run_command(command_str: &str) -> std::io::Result<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setpgid` is async-signal-safe and the only call made in the
-        // forked child before exec. Placing the child in its own process group
-        // (pgid = its own pid) keeps a terminal SIGINT from also killing tirith.
+        // SAFETY: `setpgid` is async-signal-safe and the only call in the forked
+        // child before exec; it puts the child in its own process group.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
@@ -402,32 +386,26 @@ fn run_command(command_str: &str) -> std::io::Result<i32> {
 static WATCH_INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Install a SIGINT handler that flips [`WATCH_INTERRUPTED`] instead of letting
-/// the default action terminate tirith. The child runs in its own process group
-/// (see [`run_command`]), so the child still takes the terminal's SIGINT; this
-/// handler only keeps the PARENT (tirith) alive so it can run the after-snapshot
-/// and diff. Uses `libc::signal` directly (the handler does one atomic store,
-/// which is async-signal-safe).
+/// the default action kill tirith. The child takes the terminal's SIGINT (own
+/// process group, see [`run_command`]); this only keeps the parent alive to run
+/// the after-snapshot + diff. The handler does one async-signal-safe atomic store.
 #[cfg(unix)]
 fn install_watch_sigint_handler() {
     extern "C" fn handle(_sig: libc::c_int) {
         WATCH_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    // SAFETY: `handle` only performs an atomic store, which is
-    // async-signal-safe. Registering a SIGINT handler is sound.
+    // SAFETY: `handle` only does an async-signal-safe atomic store.
     unsafe {
         libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
     }
 }
 
-/// On non-Unix, Ctrl-C uses the default behavior. `watch` still runs the diff
-/// on a normal child exit; the process-group nuance is Unix-only.
+/// Non-Unix: Ctrl-C uses default behavior (the process-group nuance is Unix-only).
 #[cfg(not(unix))]
 fn install_watch_sigint_handler() {}
 
-/// Inventory files under the given roots as a `path -> mtime` map, capped to
-/// keep the before/after snapshot cheap. Symlinks are recorded by their own
-/// metadata (not followed). Hidden dirs (`.git`, …) are skipped, matching the
-/// shipping checkpoint walker's behavior.
+/// Inventory files under `roots` as a `path -> mtime` map (capped). Symlinks are
+/// recorded by their own metadata (not followed); hidden dirs (`.git`, …) skipped.
 fn inventory_files(roots: &[String]) -> std::collections::BTreeMap<String, SystemTime> {
     const MAX_FILES: usize = 100_000;
     let mut out = std::collections::BTreeMap::new();
@@ -466,7 +444,7 @@ fn inventory_dir(
             Err(_) => continue,
         };
         if meta.file_type().is_symlink() {
-            // Record the link itself; do not follow (avoids escaping the tree).
+            // Record the link itself; don't follow (avoids escaping the tree).
             if let Ok(mt) = meta.modified() {
                 out.insert(p.to_string_lossy().into_owned(), mt);
             }
@@ -477,8 +455,7 @@ fn inventory_dir(
                 out.insert(p.to_string_lossy().into_owned(), mt);
             }
         } else if meta.is_dir() {
-            // Skip dotdirs (e.g. .git) — they dominate the count and are rarely
-            // the point of a watch.
+            // Skip dotdirs (.git, …): they dominate the count, rarely the point.
             let is_dot = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -495,10 +472,9 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().ok().and_then(|m| m.modified().ok())
 }
 
-/// EXPERIMENTAL best-effort network-hint sources: resolver-cache / log files
-/// whose mtime changing across the run *might* indicate DNS activity. This is
-/// the candidate-source list; [`net_hints_changed`] re-stats them after the run.
-/// This is NOT a network monitor and misses QUIC/UDP/direct-IP entirely.
+/// EXPERIMENTAL candidate network-hint sources (resolver-cache/log files whose
+/// mtime delta *might* indicate DNS activity); [`net_hints_changed`] re-stats them.
+/// NOT a network monitor — misses QUIC/UDP/direct-IP.
 fn net_hint_sources(home: &Path) -> std::collections::BTreeMap<String, Option<SystemTime>> {
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/var/log/system.log"),
@@ -513,10 +489,9 @@ fn net_hint_sources(home: &Path) -> std::collections::BTreeMap<String, Option<Sy
     out
 }
 
-/// Re-stat the candidate sources and return the human-readable hint list for any
-/// whose mtime advanced during the run. Each entry is prefixed so the consumer
-/// cannot mistake it for an authoritative domain — these are mtime-delta hints,
-/// not resolved hostnames.
+/// Re-stat the candidate sources, returning a hint per source whose mtime
+/// advanced. Each is prefixed (`activity-near:`) so it can't be mistaken for a
+/// resolved hostname.
 fn net_hints_changed(
     before: &std::collections::BTreeMap<String, Option<SystemTime>>,
     home: &Path,
@@ -620,9 +595,8 @@ fn emit_watch_json(
     action: Action,
     interrupted: bool,
 ) {
-    // `net_hints` is only meaningful (and present) when the experimental flag is
-    // set; otherwise null so a consumer never reads an empty array as "no
-    // network activity".
+    // `net_hints` is null unless the experimental flag is set, so a consumer
+    // never reads an empty array as "no network activity".
     let net_hints = if with_net_hints {
         serde_json::json!({
             "experimental": true,
@@ -639,9 +613,8 @@ fn emit_watch_json(
     let json_val = serde_json::json!({
         "command": command,
         "exit_code": exit_code,
-        // True when tirith caught a SIGINT during the run. The after-snapshot
-        // still ran, but the command may not have finished — a consumer should
-        // treat the diff as a lower bound, not a clean result.
+        // True if tirith caught a SIGINT: the after-snapshot ran but the command
+        // may not have finished — treat the diff as a lower bound.
         "interrupted": interrupted,
         "new_files": new_files,
         "modified_files": modified_files,

@@ -1,27 +1,19 @@
 use crate::license::Tier;
 use crate::verdict::{Finding, RuleId, Severity};
 
-/// Metadata for time-boxed early access gating (ADR-14).
-///
-/// New detection rules may ship to Pro/Team first, then become universally
-/// free after a defined date. Critical findings always bypass the gate.
+/// Metadata for time-boxed early access gating (ADR-14): a rule may ship to
+/// Pro/Team first, then become free after a date. Critical findings always
+/// bypass the gate.
 pub struct RuleMeta {
     pub rule_id: RuleId,
     /// Minimum tier required during early access window.
     pub min_tier: Option<Tier>,
-    /// ISO 8601 date (exclusive) — rule becomes free at the start of this date.
-    /// `None` means no early access gate (always free).
+    /// ISO 8601 date (exclusive) the rule becomes free; `None` = always free.
     pub early_access_until: Option<&'static str>,
 }
 
-/// Early access metadata table.
-///
-/// When a rule is in early-access, findings for tiers below `min_tier` are
-/// suppressed — UNLESS the finding severity is Critical (security-critical
-/// detection is always free immediately).
-///
-/// After `early_access_until` passes, the entry is ignored at runtime and
-/// removed in the next release.
+/// Early access metadata table: while a rule is in early-access, sub-`min_tier`
+/// findings are suppressed unless Critical. Expired entries are ignored.
 pub const RULE_META: &[RuleMeta] = &[
     // No rules are currently in early access.
     // Example entry (commented out):
@@ -32,13 +24,8 @@ pub const RULE_META: &[RuleMeta] = &[
     // },
 ];
 
-/// Check if an early access gate is active for a given rule on a given date.
-///
-/// Returns `true` if the gate is still active (i.e., the rule should be
-/// suppressed for tiers below `min_tier`).
-///
-/// The `early_access_until` date is exclusive — the gate expires at the
-/// start of that date (UTC midnight).
+/// Whether the early-access gate is active for `meta` on `now` (rule suppressed
+/// for sub-`min_tier`). `early_access_until` is exclusive (expires at UTC midnight).
 pub fn is_early_access_active(meta: &RuleMeta, now: chrono::NaiveDate) -> bool {
     let Some(date_str) = meta.early_access_until else {
         return false;
@@ -57,11 +44,8 @@ pub fn is_early_access_active(meta: &RuleMeta, now: chrono::NaiveDate) -> bool {
     }
 }
 
-/// Filter findings based on early access gates and current tier.
-///
-/// Removes findings for rules that are in an active early-access window
-/// when the user's tier is below the required minimum. Critical findings
-/// always pass through regardless of gating.
+/// Remove findings whose rule is in an active early-access window below `tier`;
+/// Critical findings always pass through.
 pub fn filter_early_access(findings: &mut Vec<Finding>, tier: Tier) {
     let today = chrono::Utc::now().date_naive();
     filter_early_access_at(findings, tier, today);
@@ -125,8 +109,7 @@ mod tests {
         }
     }
 
-    // Use a rule that exists in the enum for testing.
-    // We test the metadata lookup logic; actual RULE_META is empty in prod.
+    // A real RuleId for testing the lookup logic; prod RULE_META is empty.
     const TEST_RULE: RuleId = RuleId::ShortenedUrl;
 
     fn test_meta(until: Option<&'static str>) -> RuleMeta {

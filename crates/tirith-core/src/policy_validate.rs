@@ -78,7 +78,6 @@ fn validate_paranoia(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssu
 
 fn validate_severity_overrides(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
     for key in policy.severity_overrides.keys() {
-        // Check if the key is a valid RuleId
         let parsed: Result<RuleId, _> =
             serde_json::from_value(serde_json::Value::String(key.clone()));
         if parsed.is_err() {
@@ -132,10 +131,9 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             });
         }
 
-        // Validate contexts (shared by both rule shapes). Run BEFORE the regex
-        // checks so `has_invalid_context` is set and the regex empty-context
-        // check below can skip a list that only had bogus tokens (already
-        // reported here) — same double-report discipline `rule validate` uses.
+        // Validate contexts BEFORE the regex checks so `has_invalid_context` is
+        // set and the empty-context check can skip a bogus-only list (avoids
+        // double-reporting — same discipline as `rule validate`).
         let valid_contexts = ["exec", "paste", "file"];
         let mut has_invalid_context = false;
         for ctx in &rule.context {
@@ -152,21 +150,13 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             }
         }
 
-        // Validate a REGEX rule by mirroring `rules::custom::compile_rules`
-        // EXACTLY, in the SAME ORDER, so `policy validate` never green-lights a
-        // regex rule the engine silently DROPS at runtime (CodeRabbit M13). The
-        // engine drops a regex rule for, in order: (1) no valid contexts after
-        // filtering, (2) pattern over the 1024-CHAR cap, (3) invalid regex
-        // syntax. The earlier "validate the regex compiles" block ran first and
-        // checked only (3); (1) and (2) were missing, so a rule with an empty
-        // context set or an over-cap pattern validated as "valid" yet never ran.
+        // Validate a REGEX rule by mirroring `compile_rules` EXACTLY in the SAME
+        // ORDER, so `policy validate` never green-lights a rule the engine
+        // silently DROPS (CodeRabbit M13). Drop order: (1) no valid contexts,
+        // (2) pattern over the 1024-CHAR cap, (3) invalid regex.
         if let Some(pattern) = &rule.pattern {
-            // (1) No valid contexts. A regex rule has no required-trigger notion
-            //     to synthesize an executable set from, so an empty filtered
-            //     context set is a dead rule that `compile_rules` drops. Skip
-            //     when a token was INVALID (already reported above; a bogus-only
-            //     list would otherwise double-report — same discipline as the
-            //     DSL coverage check and `rule validate`).
+            // (1) No valid contexts ⇒ dead rule. Skip when a token was invalid
+            //     (reported above; avoids double-report).
             let parsed = parse_declared_contexts(&rule.context);
             if parsed.is_empty() {
                 if !has_invalid_context {
@@ -179,23 +169,15 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                         field: Some(format!("custom_rules.{}.context", rule.id)),
                     });
                 }
-                // No runnable contexts ⇒ `compile_rules` drops this rule, so skip
-                // the pattern-length + regex checks below: they would emit a
-                // redundant error for a rule that can never run. Mirrors
-                // `compile_rules` (and the round-28 overlong-pattern short-circuit).
+                // No runnable contexts ⇒ engine drops the rule; skip the length +
+                // regex checks (they'd redundantly error a rule that can't run).
                 continue;
             }
-            // (2) Pattern length cap. Measure in CHARACTERS, not UTF-8 BYTES, to
-            //     mirror `compile_rules` / `check_regex` (CodeRabbit M13
-            //     round-26): a multibyte pattern must not trip the cap early or
-            //     report a misleading byte count.
-            //
-            //     SHORT-CIRCUIT (CodeRabbit M13 round-28): when the cap fails,
-            //     SKIP regex compilation for this rule — `compile_rules` drops
-            //     the rule at the cap and never compiles either, so compiling
-            //     here would be wasted work (and a perf risk on a pathological
-            //     pattern) AND could push a redundant second issue. The `else if`
-            //     guarantees `Regex::new` runs only for an under-cap pattern.
+            // (2) Length cap in CHARACTERS not BYTES (round-26: a multibyte
+            //     pattern must not trip early). Round-28: the `else if`
+            //     short-circuits `Regex::new` on cap failure — `compile_rules`
+            //     also never compiles past the cap (avoids wasted work + a
+            //     redundant second issue).
             let pattern_chars = pattern.chars().count();
             if pattern_chars > 1024 {
                 issues.push(PolicyIssue {
@@ -207,8 +189,7 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.pattern", rule.id)),
                 });
             } else if let Err(e) = regex::Regex::new(pattern) {
-                // (3) Regex must compile. Done LAST (after the cap) so the same
-                //     ordering as `compile_rules` is preserved.
+                // (3) Regex must compile. LAST (after the cap), matching `compile_rules`.
                 issues.push(PolicyIssue {
                     level: IssueLevel::Error,
                     message: format!("custom_rules.{}: invalid regex '{}': {e}", rule.id, pattern),
@@ -217,9 +198,9 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
             }
         }
 
-        // Validate the `when:` clause (M13 ch4 DSL): inner regexes must compile
-        // and the declared context must cover the clause's required trigger
-        // groups (the tier-1 invariant — predicates need their data extracted).
+        // Validate the `when:` clause (DSL): inner regexes compile and the
+        // declared context covers the clause's required trigger groups (tier-1
+        // invariant — predicates need their data extracted).
         if let Some(when) = &rule.when {
             if let Err(e) = crate::custom_rule_dsl::validate_regexes(when) {
                 issues.push(PolicyIssue {
@@ -228,13 +209,10 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             }
-            // Reject a clause that uses a predicate no scan context can satisfy
-            // (`mcp.tool` and `agent.kind` — neither signal is wired into the
-            // scan context, so the rule would validate+load yet never match).
-            // CodeRabbit M13 round-3 R3-3 (`mcp.tool`) + round-8 R8-1
-            // (`agent.kind`; use `agent_rules` for per-agent control instead).
-            // Done FIRST so an `agent.kind`/`mcp.tool` clause never reaches the
-            // satisfiable-context check below (its set would be empty).
+            // Reject predicates no scan context can satisfy — `mcp.tool` (round-3
+            // R3-3) and `agent.kind` (round-8 R8-1; use `agent_rules` instead);
+            // neither signal is wired in. Done FIRST so such a clause never
+            // reaches the (empty-set) satisfiable check below.
             let unsupported = crate::custom_rule_dsl::clause_uses_unsupported_predicate(when);
             if let Some(reason) = unsupported {
                 issues.push(PolicyIssue {
@@ -243,23 +221,15 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             }
-            // Per-clause satisfiability + coverage (CodeRabbit M13 round-9 R9-1).
-            // `satisfiable_contexts` computes the scan contexts in which the WHOLE
-            // clause can be evaluated — `all` intersects children, `any` unions,
-            // `not` is the child's set — so combinators keep their semantics. Two
-            // independent failures:
-            //   (1) An EMPTY satisfiable set means the clause needs facts from
-            //       contexts that never co-occur in a single scan (e.g. command +
-            //       file via `all`) — it can NEVER match. Reject as unsatisfiable,
-            //       independent of the declared context. Skip only when the clause
-            //       used an unsupported predicate (already reported just above;
-            //       that predicate's empty set would otherwise double-report).
-            //   (2) Otherwise the declared context must intersect the satisfiable
-            //       set (`declared ∩ satisfiable ≠ ∅`) — at least one declared
-            //       context can evaluate the clause. An empty `context: []` here
-            //       has no intersection and is rejected (CodeRabbit M13 finding D).
-            //       Skipped when a context token was INVALID (reported above; the
-            //       dropped token would otherwise look like an uncovered context).
+            // Per-clause satisfiability + coverage (round-9 R9-1).
+            // `satisfiable_contexts` = contexts where the WHOLE clause evaluates
+            // (`all` intersects, `any` unions, `not` passes through). Two failures:
+            //   (1) Empty satisfiable set ⇒ needs facts from contexts that never
+            //       co-occur (e.g. command + file via `all`) — can never match.
+            //       Skip when an unsupported predicate was used (reported above).
+            //   (2) Else the declared context must intersect the satisfiable set;
+            //       an empty `context: []` has no intersection (finding D). Skip
+            //       when a context token was invalid (reported above).
             let satisfiable = crate::custom_rule_dsl::satisfiable_contexts(when);
             if unsupported.is_none() && satisfiable.is_empty() {
                 issues.push(PolicyIssue {
@@ -272,17 +242,13 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
                     field: Some(format!("custom_rules.{}.when", rule.id)),
                 });
             } else if unsupported.is_none() && !has_invalid_context {
-                // Route through the SAME shared resolver `compile_rules` and
-                // `rule validate` use (`resolve_runtime_contexts` = `declared ∩
-                // satisfiable`) so the engine and both validators classify a rule
-                // IDENTICALLY (CodeRabbit M13 round-15). `parse_declared_contexts`
-                // already carries serde's empty-→-`[exec, paste]` default for an
-                // OMITTED `context:`, so a no-context `command.*` rule is ACCEPTED
-                // (resolves to a non-empty `{exec, paste}`) while a no-context
-                // `file.path_matches` rule is REJECTED (resolves to the empty
-                // `{exec, paste} ∩ {file}`). An explicit `context: []` (which
-                // serde does NOT default) likewise resolves empty and is rejected
-                // (finding D).
+                // Route through the SAME `resolve_runtime_contexts` (= `declared ∩
+                // satisfiable`) the engine and `rule validate` use, so all three
+                // classify identically (round-15). An OMITTED `context:` carries
+                // serde's `[exec, paste]` default, so a no-context `command.*`
+                // rule is ACCEPTED but a no-context `file.*` rule is REJECTED
+                // (`{exec,paste} ∩ {file}` = ∅); an explicit `context: []` also
+                // resolves empty and is rejected (finding D).
                 let declared = parse_declared_contexts(&rule.context);
                 if crate::custom_rule_dsl::resolve_runtime_contexts(&declared, when).is_empty() {
                     issues.push(PolicyIssue {
@@ -386,8 +352,7 @@ fn validate_package_policy(policy: &crate::policy::Policy, issues: &mut Vec<Poli
         }
     }
 
-    // Block must not be greater than Warn — if both are set, Block requires
-    // a stricter (smaller) age window than Warn.
+    // If both set, the Block age window must be stricter (smaller) than Warn.
     if let (Some(b), Some(w)) = (pp.block_newer_than_days, pp.warn_newer_than_days) {
         if b > w {
             issues.push(PolicyIssue {
@@ -436,8 +401,7 @@ fn validate_package_policy(policy: &crate::policy::Policy, issues: &mut Vec<Poli
         }
     }
 
-    // Typosquat distance: 1..=10 is the practical range; anything else is
-    // either useless (0) or matches every package (>10).
+    // Typosquat distance: 1..=10 is practical; 0 is useless, >10 matches all.
     if let Some(d) = pp.block_typosquat_distance {
         if d == 0 {
             issues.push(PolicyIssue {
@@ -540,7 +504,7 @@ fn validate_network_entries(policy: &crate::policy::Policy, issues: &mut Vec<Pol
 
 /// Check if a string is a valid hostname, IP, or CIDR notation.
 fn is_valid_cidr_or_host(s: &str) -> bool {
-    // Allow hostnames (domain-like strings)
+    // Hostnames (domain-like strings).
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '*')
         && !s.is_empty()
@@ -548,24 +512,21 @@ fn is_valid_cidr_or_host(s: &str) -> bool {
         return true;
     }
 
-    // Allow IP/CIDR: split on '/' for CIDR prefix
+    // CIDR: split on '/' for the prefix length.
     if let Some((ip_part, prefix)) = s.split_once('/') {
-        // Validate prefix length
         let Ok(prefix_len) = prefix.parse::<u32>() else {
             return false;
         };
-        // IPv4 CIDR
         if ip_part.contains('.') {
             return prefix_len <= 32 && parse_ipv4(ip_part);
         }
-        // IPv6 CIDR
         if ip_part.contains(':') {
             return prefix_len <= 128 && parse_ipv6(ip_part);
         }
         return false;
     }
 
-    // Plain IP
+    // Plain IP.
     if s.contains(':') {
         return parse_ipv6(s);
     }
@@ -604,7 +565,6 @@ fn parse_ipv6(s: &str) -> bool {
 
 fn validate_action_overrides(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
     for (key, value) in &policy.action_overrides {
-        // Validate value: only "block" is allowed
         if value != "block" {
             let hint = match value.as_str() {
                 "allow" | "warn" | "warn_ack" => {
@@ -622,7 +582,6 @@ fn validate_action_overrides(policy: &crate::policy::Policy, issues: &mut Vec<Po
             });
         }
 
-        // Validate key is a known RuleId
         let parsed: Result<RuleId, _> =
             serde_json::from_value(serde_json::Value::String(key.clone()));
         if parsed.is_err() {
@@ -678,21 +637,11 @@ fn validate_escalation_rules(policy: &crate::policy::Policy, issues: &mut Vec<Po
     }
 }
 
-/// Sanity-check the agent governance block (M4 item 8). This is
-/// **schema validation only** — the engine consumes `agent_rules` at
-/// runtime via [`crate::escalation::apply_agent_rules`], but the
-/// validator's job is limited to flagging matchers shaped wrong
-/// (e.g. a `name` filter on a payloadless kind), not predicting whether
-/// a matcher will ever fire in practice.
-///
-/// Diagnostics:
-/// * A `name` filter on a payloadless kind (`human`, `gateway`) is a
-///   warning — it matches nothing by construction. The decision helper
-///   in `policy.rs` is deterministic about that, but the operator most
-///   likely meant a different `kind` or no `name` filter at all.
-/// * An empty `name` string (`name: ""`) is a warning — a zero-length
-///   match accepts only a payload that itself sanitized to empty, which
-///   the `AgentOrigin` constructors reject up-front.
+/// Schema validation only for the agent governance block — flags matchers
+/// shaped wrong, not whether one ever fires (the engine enforces at runtime via
+/// [`crate::escalation::apply_agent_rules`]). Warns on: a `name` filter on a
+/// payloadless kind (`human`/`gateway`) which matches nothing; and an empty
+/// `name: ""` which the `AgentOrigin` constructors reject up-front.
 fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
     for (list_name, list) in [
         ("agent_rules.allow", &policy.agent_rules.allow),
@@ -729,17 +678,11 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
                 });
             }
 
-            // Unenforced semantic predicates (CodeRabbit M13 round-15
-            // policy_validate.rs:744). `filesystem_write` / `network` /
-            // `secrets_access` are accepted as known matcher keys and load fine,
-            // but `policy.rs::matcher_matches` decides on `kind` + `name` ONLY —
-            // it never reads these. So a hand-written entry like
-            // `agent_rules: { deny: [{ kind: agent, network: block }] }` LOOKS
-            // conditional, yet the `network: block` predicate is silently dropped
-            // at runtime (matching is still constrained by `kind` and any `name`).
-            // Warn (not error: the field is legal advisory metadata an operator may
-            // declare in policy YAML, and the round-12 `agent block` CLI gate is the
-            // enforced path). Emit one warning per present predicate.
+            // Unenforced semantic predicates (round-15). `filesystem_write` /
+            // `network` / `secrets_access` load fine but `matcher_matches` keys
+            // on `kind` + `name` ONLY, so such a predicate is silently dropped at
+            // runtime — a conditional-LOOKING matcher that isn't. Warn (not
+            // error: legal advisory metadata), one per present predicate.
             for (field, present) in [
                 ("filesystem_write", matcher.filesystem_write.is_some()),
                 ("network", matcher.network.is_some()),
@@ -790,13 +733,11 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "enforce_fail_mode",
         "threat_intel",
         "agent_rules",
-        // M6 ch7 — package-policy section
         "package_policy",
     ];
 
-    // Known fields under package_policy (M6 ch7). A typo at this level is
-    // load-bearing — a misspelled `block_newr_than_days` silently disables
-    // the operator's intent — so flag unknown keys.
+    // A typo here is load-bearing — a misspelled `block_newr_than_days` silently
+    // disables the operator's intent — so flag unknown keys.
     let known_package_policy_fields = [
         "block_not_found",
         "block_newer_than_days",
@@ -815,7 +756,6 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
     ];
     let known_internal_package_spec_fields = ["ecosystem", "name"];
 
-    // Known fields for nested objects
     let known_scan_fields = [
         "additional_config_files",
         "trusted_mcp_servers",
@@ -825,13 +765,11 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "profiles",
     ];
     let known_checkpoint_fields = ["max_count", "max_age_hours", "max_storage_bytes"];
-    // PR #121 fix-list item 10 — `agent_rules` is in `known_top_level` but
-    // its children (`allow`/`deny`) were never validated. A typo like
-    // `agent_rules: { denyy: [...] }` then passed silently and the
-    // operator's intended block never fired. The lists below mirror
-    // `policy.rs::AgentRules` and `policy.rs::AgentMatcher`.
+    // PR #121 fix-list item 10 — the `allow`/`deny` children were never
+    // validated, so `agent_rules: { denyy: [...] }` passed silently and the
+    // intended block never fired. Lists mirror `policy.rs` AgentRules/AgentMatcher.
     let known_agent_rules_fields = ["allow", "deny"];
-    // `kind` + `name` (pre-M13) plus the M13 ch5 optional semantic predicates.
+    // `kind` + `name` plus the optional semantic predicates.
     let known_agent_matcher_fields = [
         "kind",
         "name",
@@ -840,7 +778,6 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "secrets_access",
     ];
 
-    // Parse as generic YAML value to check top-level keys
     if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) {
         for (key, value) in &map {
             if let serde_yaml::Value::String(k) = key {
@@ -852,7 +789,6 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                     });
                 }
 
-                // Check nested fields for known sub-objects
                 if k == "scan" {
                     if let serde_yaml::Value::Mapping(sub_map) = value {
                         let known_profile_fields = ["include", "exclude", "fail_on", "ignore"];
@@ -865,7 +801,6 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                         field: Some(format!("scan.{sk}")),
                                     });
                                 }
-                                // Validate scan.profiles.<name>.* keys
                                 if sk == "profiles" {
                                     if let serde_yaml::Value::Mapping(profiles) = sub_val {
                                         for (pname, pval) in profiles {
@@ -930,9 +865,8 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                 });
                                 continue;
                             }
-                            // Recurse into internal_package_names entries —
-                            // each is an `InternalPackageSpec { ecosystem, name }`
-                            // map. A typo silently drops the entry, so flag.
+                            // Recurse into internal_package_names entries
+                            // ({ecosystem, name}); a typo silently drops the entry.
                             if sk == "internal_package_names" {
                                 if let serde_yaml::Value::Sequence(seq) = sub_val {
                                     for (i, item) in seq.iter().enumerate() {
@@ -965,14 +899,8 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                 }
 
                 // PR #121 fix-list item 10 — validate the nested
-                // `agent_rules.{allow,deny}` keys and each matcher object's
-                // (`kind`, `name`) keys. A typo at either level was
-                // silently dropped pre-fix, e.g.
-                //   agent_rules: { denyy: [...] }                  (top key)
-                //   agent_rules: { deny: [{ kind: agent, namee: x }] }  (matcher key)
-                // both used to pass `validate`; the policy then loaded
-                // with the typo'd field discarded and the operator never
-                // knew their rule was a no-op.
+                // `agent_rules.{allow,deny}` keys and each matcher's keys; a typo
+                // at either level used to be dropped silently (a no-op rule).
                 if k == "agent_rules" {
                     if let serde_yaml::Value::Mapping(sub_map) = value {
                         for (sub_key, sub_val) in sub_map {
@@ -987,10 +915,7 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                 });
                                 continue;
                             }
-                            // For known `allow` / `deny` lists, recurse
-                            // into each matcher object and flag unknown
-                            // matcher fields. The fields on
-                            // `policy::AgentMatcher` are `kind` and `name`.
+                            // Recurse into each matcher and flag unknown fields.
                             if let serde_yaml::Value::Sequence(seq) = sub_val {
                                 for (i, item) in seq.iter().enumerate() {
                                     let serde_yaml::Value::Mapping(matcher) = item else {
@@ -1084,14 +1009,10 @@ custom_rules:
 
     #[test]
     fn test_custom_regex_rule_empty_context_rejected() {
-        // CodeRabbit M13 round-27 (outside-diff): `policy validate` must mirror
-        // `compile_rules`, which DROPS a regex rule whose filtered context set is
-        // empty. An explicit `context: []` (serde does NOT default it) filters to
-        // the empty set, so the engine never runs the rule — `policy validate`
-        // must report this as an Error instead of green-lighting it. (An OMITTED
-        // `context:` defaults to [exec, paste] and is NOT affected — see
-        // `test_custom_rule_bad_regex`, which omits context and only flags the
-        // regex.)
+        // round-27: mirror `compile_rules`, which DROPS a regex rule with an
+        // empty filtered context. An explicit `context: []` filters empty and
+        // must be an Error (an OMITTED `context:` defaults to [exec,paste] and is
+        // unaffected — see `test_custom_rule_bad_regex`).
         let yaml = r#"
 custom_rules:
   - id: regex-empty-ctx
@@ -1118,13 +1039,9 @@ custom_rules:
 
     #[test]
     fn test_empty_context_regex_rule_short_circuits_regex_validation() {
-        // CodeRabbit M13 (post-finalization): a regex rule with no runnable
-        // contexts is DROPPED by `compile_rules`, so `policy validate` must NOT
-        // also emit an "invalid regex" error for it — the empty-context check
-        // short-circuits before the pattern-length + regex-compile checks. The
-        // pattern below is a deliberately INVALID regex AND the context is empty;
-        // validate must report ONLY the "no valid contexts" error, not a
-        // redundant regex error for a rule that can never run.
+        // A no-context rule is dropped by `compile_rules`, so the empty-context
+        // check short-circuits before the regex checks: an empty-context AND
+        // invalid-regex rule must report ONLY "no valid contexts".
         let yaml = r#"
 custom_rules:
   - id: empty-ctx-bad-regex
@@ -1154,19 +1071,10 @@ custom_rules:
 
     #[test]
     fn test_custom_regex_rule_pattern_too_long_rejected() {
-        // CodeRabbit M13 round-27: `compile_rules` drops a regex `pattern` over
-        // the 1024-CHAR cap, so `policy validate` must flag it as an Error
-        // (the engine uses `pattern.chars().count()`, not byte length — round-26).
-        //
-        // Round-28: the cap must ALSO short-circuit regex compilation. A plain
-        // `"a".repeat(1025)` is itself a PERFECTLY VALID regex (a 1025-char
-        // literal), so a fall-through to `Regex::new` would SUCCEED and add no
-        // second issue — making the short-circuit bug invisible. To make the
-        // short-circuit OBSERVABLE we use a pattern that is both over the cap AND
-        // would FAIL to compile: an unterminated group `(` repeated. With the
-        // round-28 fix the cap check short-circuits, so `Regex::new` is never
-        // called and the ONLY issue for this rule is the length error — never
-        // "invalid regex".
+        // round-27: a pattern over the 1024-CHAR cap (chars, not bytes — round-26)
+        // is an Error. round-28: the cap also short-circuits compilation. Using a
+        // pattern that's over-cap AND invalid (`(` repeated) makes the short-
+        // circuit observable: the ONLY issue must be the length error.
         let pattern = "(".repeat(1025);
         assert_eq!(pattern.chars().count(), 1025, "1025 chars (over the cap)");
         assert!(
@@ -1194,9 +1102,8 @@ custom_rules:
             Some("custom_rules.too-long.pattern"),
             "field must point at the rule's pattern: {issues:?}"
         );
-        // Round-28: the cap short-circuits regex compilation, so the over-cap
-        // (and otherwise invalid) pattern must NOT also yield an "invalid regex"
-        // issue. Exactly ONE issue for this rule proves `Regex::new` was skipped.
+        // The over-cap (and invalid) pattern must NOT also yield "invalid regex"
+        // — exactly one issue proves `Regex::new` was skipped.
         assert!(
             !issues
                 .iter()
@@ -1216,13 +1123,9 @@ custom_rules:
 
     #[test]
     fn test_custom_regex_rule_multibyte_pattern_under_char_cap_accepted() {
-        // CodeRabbit M13 round-26 + round-27: the 1024 cap counts CHARACTERS, not
-        // UTF-8 BYTES. A multibyte pattern that is <=1024 CHARS but >1024 BYTES
-        // must be ACCEPTED (it would be wrongly dropped by a byte-length cap),
-        // proving `policy validate` uses `pattern.chars().count()` like the
-        // engine. 'é' (U+00E9) is 2 bytes; 600 of them is 600 chars / 1200 bytes
-        // — under the 1024-CHAR cap, over a 1024-BYTE one. A repeated literal is
-        // a cheap, valid regex (no pathological backtracking in debug).
+        // round-26/27: the cap counts CHARS not BYTES. 600×'é' = 600 chars /
+        // 1200 bytes — under the char cap, over a byte cap — must be ACCEPTED,
+        // proving `pattern.chars().count()` is used like the engine.
         let pattern = "é".repeat(600);
         assert_eq!(pattern.chars().count(), 600, "600 chars");
         assert!(pattern.len() > 1024, "but >1024 bytes");
@@ -1266,10 +1169,9 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_empty_context_rejected() {
-        // Regression (CodeRabbit M13 finding D): a DSL rule with an explicitly
-        // empty `context: []` and a `command.*` predicate is a silent no-op —
-        // its predicates can never see the data they reference — and must be
-        // rejected. The previous `!declared.is_empty()` guard let it pass.
+        // Finding D: an explicit `context: []` with a `command.*` predicate is a
+        // silent no-op and must be rejected (the old `!declared.is_empty()` guard
+        // let it pass).
         let yaml = r#"
 custom_rules:
   - id: empty-context-noop
@@ -1289,8 +1191,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_empty_context_file_predicate_rejected() {
-        // The always-on coverage check must also reject an empty context for a
-        // file-family predicate (a different required group than command/url).
+        // The coverage check must also reject an empty context for a file-family
+        // predicate.
         let yaml = r#"
 custom_rules:
   - id: empty-context-file
@@ -1310,10 +1212,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_omitted_context_defaults_and_is_accepted() {
-        // When `context:` is OMITTED it defaults to [exec, paste] (NOT empty),
-        // so a url-family rule is covered and accepted. This is the
-        // counterpoint to the explicit `context: []` no-op above — finding D is
-        // about the EXPLICIT empty list, not the defaulted one.
+        // An OMITTED `context:` defaults to [exec, paste], so a url-family rule
+        // is covered and accepted (finding D is about the EXPLICIT empty list).
         let yaml = r#"
 custom_rules:
   - id: defaulted-context
@@ -1333,14 +1233,10 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_no_context_command_accepted_file_rejected() {
-        // CodeRabbit M13 round-15 rule.rs:338 + policy_validate consistency: an
-        // OMITTED `context:` defaults (via serde) to [exec, paste], so it must be
-        // resolved THROUGH that default — not treated as raw-empty. A no-context
-        // `command.*` rule therefore RESOLVES to {exec, paste} and is ACCEPTED
-        // (the engine compiles+runs it), while a no-context `file.path_matches`
-        // rule resolves to {exec, paste} ∩ {file} = ∅ and is correctly REJECTED
-        // (it can never fire). Validity is computed the SAME way compile_rules
-        // resolves+clamps, so all three agree.
+        // round-15: an OMITTED `context:` resolves THROUGH the [exec,paste]
+        // default, so a no-context `command.*` rule resolves to {exec,paste} and
+        // is ACCEPTED while a no-context `file.*` rule resolves to ∅ and is
+        // REJECTED — computed the same way `compile_rules` does.
         let cmd_yaml = r#"
 custom_rules:
   - id: no-ctx-cmd
@@ -1394,12 +1290,9 @@ custom_rules:
 
     #[test]
     fn test_agent_matcher_unenforced_predicate_warns() {
-        // CodeRabbit M13 round-15 policy_validate.rs:744: `filesystem_write` /
-        // `network` / `secrets_access` are recognized matcher keys but
-        // `matcher_matches` ignores them (matching is kind+name only). A
-        // conditional-LOOKING matcher carrying one of them is an unconditional
-        // allow/deny at runtime, so `policy validate` must emit a WARNING (not an
-        // error, not silence).
+        // round-15: `filesystem_write` / `network` / `secrets_access` are
+        // recognized but `matcher_matches` ignores them (kind+name only), so a
+        // matcher carrying one must emit a WARNING (not error, not silence).
         let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      network: block\n";
         let issues = validate(yaml);
         let warn = issues.iter().find(|i| {
@@ -1441,8 +1334,7 @@ custom_rules:
 
     #[test]
     fn test_agent_matcher_no_predicates_no_unenforced_warning() {
-        // A plain kind+name matcher carries no advisory predicates, so it must
-        // NOT trigger the unenforced-predicate warning.
+        // A plain kind+name matcher must NOT trigger the unenforced-predicate warning.
         let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      name: claude-code\n";
         let issues = validate(yaml);
         assert!(
@@ -1455,10 +1347,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_invalid_context_not_double_reported() {
-        // An invalid context value is reported as its own issue; we must NOT
-        // also emit a trigger-coverage error for the same typo (the unknown
-        // token is dropped, which would otherwise look like an unmet
-        // requirement). Exactly one error mentions the rule, and it is the
+        // An invalid context value is its own issue; we must NOT also emit a
+        // coverage error for the dropped token. Exactly one error, the
         // invalid-context one.
         let yaml = r#"
 custom_rules:
@@ -1508,12 +1398,9 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_agent_kind_rejected_as_unsupported() {
-        // CodeRabbit M13 round-8 R8-1: an `agent.kind` clause reads a
-        // `DslEvalContext` field the engine hard-codes to `None`, so it can never
-        // match — `policy validate` must REJECT it (like `mcp.tool`), with a
-        // clear message that points at `agent_rules`. (Round-3 R3-9 had kept it
-        // valid; that is reversed here.) Cover both a bare clause and one nested
-        // in an `all:`.
+        // round-8 R8-1: an `agent.kind` clause reads a field the engine hard-codes
+        // to `None`, so it can never match and must be REJECTED (like `mcp.tool`)
+        // with a message pointing at `agent_rules`. Covers bare + nested-in-`all`.
         for (id, when_block) in [
             ("agent-bare", "      agent.kind: claude-code"),
             (
@@ -1538,9 +1425,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_mcp_tool_rejected() {
-        // CodeRabbit M13 round-3 R3-3: a `when:` clause using `mcp.tool` must be
-        // REJECTED — no scan context wires up an MCP-tool signal, so the rule
-        // would validate+load yet never match. The error must be clear.
+        // round-3 R3-3: `mcp.tool` must be REJECTED — no scan context wires up an
+        // MCP-tool signal, so the rule would load yet never match.
         let yaml = r#"
 custom_rules:
   - id: mcp-tool-rule
@@ -1561,9 +1447,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_paste_command_predicate_accepted() {
-        // CodeRabbit M13 round-3 R3-1: a `command.*` predicate under `paste`
-        // context is now VALID (build_dsl_backing fills command facts for paste),
-        // so it must NOT produce a coverage error. Agrees with `rule validate`.
+        // round-3 R3-1: a `command.*` predicate under `paste` is VALID (paste
+        // fills command facts), so no coverage error.
         let yaml = r#"
 custom_rules:
   - id: paste-cmd
@@ -1582,13 +1467,10 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_all_command_and_file_is_unsatisfiable() {
-        // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` mixes facts from
-        // contexts that never co-occur in a single scan (command -> exec/paste,
-        // file -> FileScan), so its satisfiable set is the EMPTY intersection. It
-        // can never match and must be rejected with the dedicated
-        // "never co-occur" message -- NOT the generic coverage message -- even
-        // though the rule declares BOTH contexts. The old leaf-flatten accepted
-        // both-contexts here.
+        // round-9 R9-1: `all(command.*, file.*)` mixes contexts that never
+        // co-occur, so its satisfiable set is ∅ — rejected with the dedicated
+        // "never co-occur" message (not the generic coverage one), even with both
+        // contexts declared.
         let yaml = r#"
 custom_rules:
   - id: impossible-and
@@ -1616,10 +1498,8 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_any_command_or_file_accepted_under_single_context() {
-        // CodeRabbit M13 round-9 R9-1: `any(command.*, file.*)` is evaluable
-        // wherever EITHER branch is (the UNION), so a single-context rule is
-        // covered by whichever branch is live there and must be ACCEPTED. The old
-        // leaf-flatten rejected it. Cover the command-branch context.
+        // round-9 R9-1: `any(command.*, file.*)` is evaluable wherever EITHER
+        // branch is (the union), so a single-context rule is covered and ACCEPTED.
         let yaml = r#"
 custom_rules:
   - id: either-or
@@ -1737,17 +1617,12 @@ custom_rules:
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 fix-list item 10 — nested `agent_rules.*` unknown-field
-    // validation. Pre-fix a typo on the `allow`/`deny` slot or on a matcher
-    // field (`kind`/`name`) was silently dropped; the operator's intended
-    // rule then never fired but no warning surfaced.
-    // -----------------------------------------------------------------------
+    // PR #121 fix-list item 10 — nested `agent_rules.*` unknown-field validation
+    // (a typo on `allow`/`deny` or a matcher field used to be dropped silently).
 
     #[test]
     fn test_agent_rules_unknown_sub_key_warns() {
-        // `denyy` instead of `deny` — pre-fix this passed silently, the
-        // matcher list was dropped, and the policy looked "valid".
+        // `denyy` instead of `deny` used to pass silently with the list dropped.
         let yaml = "agent_rules:\n  denyy:\n    - kind: agent\n      name: claude-code\n";
         let issues = validate(yaml);
         assert!(
@@ -1760,12 +1635,8 @@ custom_rules:
 
     #[test]
     fn test_agent_rules_unknown_matcher_field_warns() {
-        // A typo on the matcher object itself (`namee` instead of `name`)
-        // — the matcher then deserialized as `{kind: agent, name: None}`,
-        // matched every Agent caller, and the operator's intent was lost.
-        // Note: a matcher with `name: None` does NOT trigger
-        // "matches nothing" (that's only fired on Human/Gateway), so the
-        // pre-fix path emitted zero warnings.
+        // `namee` instead of `name` deserialized as `name: None` (matching every
+        // Agent caller) and emitted zero warnings pre-fix.
         let yaml = "agent_rules:\n  deny:\n    - kind: agent\n      namee: claude-code\n";
         let issues = validate(yaml);
         assert!(

@@ -1,56 +1,18 @@
-//! CI / repo supply-chain scan rules — file-content detection for
-//! repository infrastructure files.
+//! CI / repo supply-chain scan rules — file-content detection for GitHub
+//! Actions workflows, Dockerfiles, Terraform configs, Helm chart files, and
+//! `package.json` lifecycle scripts. Only dangerous shapes fire; pinned/local
+//! configs stay clean.
 //!
-//! Where `install.rs` inspects a *command line*, this module inspects the
-//! *files* a repository checks in to describe its own build and deploy
-//! pipeline: GitHub Actions workflows, Dockerfiles, Terraform configs, Helm
-//! chart files, and `package.json` lifecycle scripts. It runs only on the
-//! `tirith scan` FileScan path (it is never on the exec hot path), so a tier-1
-//! PATTERN_TABLE entry is not required for reachability — `tier1_scan` always
-//! returns `true` for FileScan.
+//! Runs only on the `tirith scan` FileScan path (never the exec hot path), so
+//! a tier-1 PATTERN_TABLE entry is not required for reachability — `tier1_scan`
+//! always returns `true` for FileScan.
 //!
-//! These rules detect *dangerous patterns*, not the tools themselves. A
-//! SHA-pinned action, a digest-pinned base image, a local Terraform module, a
-//! benign workflow, and a normal `package.json` all stay clean — only the
-//! high-risk shapes fire:
+//! The Terraform-module and Helm-chart-repo checks reuse the `install.rs`
+//! command-line `RuleId`s: a remote module/chart is the same risk class whether
+//! named on a command line or declared in a checked-in file.
 //!
-//!  - **`workflow_unpinned_action`** — a GitHub Actions `uses:` reference
-//!    pinned to a *mutable* ref (a branch like `@main`, or a tag like `@v3`)
-//!    instead of an immutable 40-hex commit SHA. A mutable ref means the
-//!    action's code can change under you between runs.
-//!  - **`workflow_dangerous_trigger`** — the `pull_request_target` trigger,
-//!    which runs the workflow with repository secrets in the context of a
-//!    fork's pull request.
-//!  - **`workflow_curl_pipe_shell`** — a `curl …| bash` / `wget …| sh`
-//!    pipe-to-shell inside a workflow `run:` step.
-//!  - **`workflow_untrusted_input`** — attacker-controllable
-//!    `${{ github.event.* }}` (issue title, PR body, …) interpolated directly
-//!    into a `run:` shell step — the classic GitHub Actions script-injection
-//!    sink.
-//!  - **`dockerfile_unpinned_image`** — a Dockerfile `FROM` on a mutable tag
-//!    (`:latest`, or no tag at all) with no `@sha256:` digest pin.
-//!  - **`package_script_dangerous`** — an npm `package.json`
-//!    `preinstall` / `install` / `postinstall` lifecycle hook that runs a
-//!    dangerous command (pipe-to-shell, obfuscated payload, …).
-//!    A lifecycle hook runs automatically on `npm install`.
-//!
-//! This module also scans two more repo-infrastructure file shapes. Both reuse
-//! the `RuleId`s the `install.rs` command-line rules already define — a remote
-//! module / chart is the same risk class whether it is named on a command line
-//! or declared in a checked-in file:
-//!
-//!  - **Terraform `module` blocks** — a `module "<name>" { source = … }` whose
-//!    `source` is a remote / untrusted location (a `git::` / `http(s)://`
-//!    address, a `github.com/…` shorthand, a cloud bucket) rather than a local
-//!    path or the Terraform Registry. Fires `RuleId::TerraformRemoteModule`.
-//!  - **Helm chart dependency repos** — a `Chart.yaml` / `requirements.yaml`
-//!    dependency whose `repository:` points at an http(s) / `oci://` chart
-//!    repository that is not a recognised, trusted host. Fires
-//!    `RuleId::HelmUntrustedRepo`.
-//!
-//! Detection is pure pattern matching — no network, no registry lookups.
-//! Every function here is total: a malformed file yields no findings, never a
-//! panic.
+//! Detection is pure pattern matching — no network. Every function is total: a
+//! malformed file yields no findings, never a panic.
 
 use std::path::Path;
 
@@ -72,42 +34,35 @@ pub enum CiFileKind {
     PackageJson,
 }
 
-/// Classify a file path as a CI/repo file `cifile` rules should scan, if it is
-/// one. Returns `None` for any other file so the scan stays narrowly scoped.
-///
-/// Matching is by basename / extension / path shape only — content is never
-/// read here. A workflow is recognised only inside a `.github/workflows/`
-/// directory (the location GitHub itself requires), so a stray `ci.yml`
-/// elsewhere is not misclassified.
+/// Classify a file path as a CI/repo file `cifile` rules should scan, by
+/// basename / extension / path shape only (content is never read). A workflow
+/// is recognised only inside a `.github/workflows/` directory so a stray
+/// `ci.yml` elsewhere is not misclassified. `None` keeps the scan narrow.
 pub fn classify(path: Option<&Path>) -> Option<CiFileKind> {
     let path = path?;
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower = basename.to_ascii_lowercase();
 
-    // package.json — exact basename.
     if lower == "package.json" {
         return Some(CiFileKind::PackageJson);
     }
 
-    // Dockerfile — `Dockerfile`, `Dockerfile.prod`, `prod.dockerfile`.
+    // `Dockerfile`, `Dockerfile.prod`, `prod.dockerfile`.
     if lower == "dockerfile" || lower.starts_with("dockerfile.") || lower.ends_with(".dockerfile") {
         return Some(CiFileKind::Dockerfile);
     }
 
-    // Terraform / OpenTofu — `*.tf` (but not `*.tfvars`, which holds values,
-    // not module sources, and not `*.tf.json` which is rare and structured).
+    // `*.tf` only — not `*.tfvars` (values, not module sources).
     if lower.ends_with(".tf") {
         return Some(CiFileKind::Terraform);
     }
 
-    // Helm chart — `Chart.yaml` / `Chart.yml`, or a `requirements.yaml`
-    // (the legacy Helm-2 dependency file).
+    // `Chart.yaml` / `Chart.yml`, or the legacy Helm-2 `requirements.yaml`.
     if lower == "chart.yaml" || lower == "chart.yml" || lower == "requirements.yaml" {
         return Some(CiFileKind::HelmChart);
     }
 
-    // GitHub Actions workflow — a `.yml` / `.yaml` file whose parent directory
-    // is `workflows` and whose grandparent is `.github`.
+    // A `.yml`/`.yaml` whose parent dir is `workflows` and grandparent `.github`.
     if lower.ends_with(".yml") || lower.ends_with(".yaml") {
         if let Some(parent) = path.parent() {
             let parent_name = parent
@@ -159,9 +114,7 @@ pub fn check(input: &str, file_path: Option<&Path>) -> Vec<Finding> {
     findings
 }
 
-// ===========================================================================
 // shared helpers
-// ===========================================================================
 
 /// Truncate `s` to at most `max` chars (char-boundary safe), appending `…`
 /// when truncation happened. Keeps evidence lines short.
@@ -193,9 +146,7 @@ fn is_commit_sha(r: &str) -> bool {
     r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// ===========================================================================
 // GitHub Actions workflow checks
-// ===========================================================================
 
 /// Run every workflow check over a workflow file's text.
 fn check_workflow(input: &str, findings: &mut Vec<Finding>) {
@@ -224,18 +175,15 @@ fn parse_uses(value: &str) -> Option<UsesRef<'_>> {
     if v.is_empty() {
         return None;
     }
-    // A local action reference is checked out with the repo — not pinnable and
-    // not a third-party supply-chain risk.
+    // A local `./` action is checked out with the repo — not a pin target.
     if v.starts_with("./") || v.starts_with("../") {
         return None;
     }
-    // A `docker://image` action is an image reference, not a git action ref;
-    // image pinning is the Dockerfile rule's concern.
+    // A `docker://image` action is image pinning — the Dockerfile rule's concern.
     if v.starts_with("docker://") {
         return None;
     }
-    // The pin is whatever follows the LAST `@` (an owner/repo never contains
-    // `@`, so this is unambiguous).
+    // The pin follows the LAST `@` (an owner/repo never contains `@`).
     let (repo, git_ref) = v.rsplit_once('@')?;
     if repo.is_empty() || git_ref.is_empty() {
         return None;
@@ -265,7 +213,6 @@ fn check_workflow_unpinned_actions(input: &str, findings: &mut Vec<Finding>) {
         let Some(value) = after else {
             continue;
         };
-        // Drop a trailing `# comment`.
         let value = match value.split_once(" #") {
             Some((before, _)) => before,
             None => value,
@@ -488,11 +435,9 @@ fn line_has_curl_pipe_shell(line: &str) -> bool {
 /// itself, or an indented continuation line).
 fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     let mut in_run_block = false;
-    // The column at which the `run` *key* itself starts — the content after a
-    // `- ` list marker, not the dash. For `      - run: |` this is 8, not 6;
-    // the block body must be indented strictly deeper than this, and a sibling
-    // `env:` of the same step (indented to the key column or shallower) ends
-    // the block.
+    // The column where the `run` *key* starts (content after a `- ` marker, not
+    // the dash; `      - run: |` → 8). The body must be indented strictly
+    // deeper; a sibling `env:` at the key column or shallower ends the block.
     let mut run_key_col = 0usize;
     let mut curl_pipe_evidence: Option<String> = None;
     let mut untrusted_evidence: Option<(String, String)> = None;
@@ -501,13 +446,11 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
         let indent = raw_line.len() - raw_line.trim_start().len();
         let trimmed = raw_line.trim();
 
-        // Detect the start of a `run:` step. A `run:`-prefixed line indented
-        // *inside* an active block body is body content (e.g. a shell command
-        // invoking a binary named `run`), not a new step — treat it as a step
-        // start only when not currently in a block, or when it sits at/above
-        // the current block's run-key column. Without this guard such a body
-        // line would terminate the block scan early and a later `curl`-into-a-
-        // shell body line would go undetected.
+        // A `run:`-prefixed line indented *inside* an active block body is body
+        // content (e.g. a command invoking a binary named `run`), not a new
+        // step — treat it as a step start only when not in a block, or when it
+        // sits at/above the run-key column. Without this guard such a body line
+        // ends the scan early and a later `curl`-into-shell line goes undetected.
         let run_inline = trimmed
             .strip_prefix("- run:")
             .or_else(|| trimmed.strip_prefix("run:"))
@@ -516,19 +459,15 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
 
         if let Some(inline) = run_inline {
             let inline = inline.trim();
-            // The column of the `run` key: when the step is written
-            // `- run: …`, the `run` key sits two columns past the dash.
+            // For `- run: …` the `run` key sits two columns past the dash.
             let key_col = if trimmed.starts_with("- ") {
                 indent + 2
             } else {
                 indent
             };
-            // A block scalar (`run: |` / `run: >`) — the body is the following
-            // more-indented lines. Strip a trailing YAML comment first:
-            // `run: | # deploy step` is valid YAML, and without stripping the
-            // `# …` the indicator check below fails, the line is treated as a
-            // single-line `run:`, and the block body is never scanned — a
-            // detection-evasion gap.
+            // Strip a trailing YAML comment before the indicator check:
+            // `run: | # deploy step` is valid YAML; without this the line is
+            // mistaken for single-line `run:` and the body is never scanned.
             let inline_code = match inline.find('#') {
                 Some(pos) => inline[..pos].trim_end(),
                 None => inline,
@@ -545,12 +484,9 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
         }
 
         if in_run_block {
-            // The block ends at the first non-blank line indented at or below
-            // the `run` *key* column — the YAML block-scalar rule (the body is
-            // every line indented strictly deeper than the key). A sibling step
-            // key (`env:` / `with:` / `name:` / `if:` / `id:` / `uses:`) of the
-            // same step sits *at* the key column, so this catches it too; a
-            // blank line stays inside the block.
+            // The block ends at the first non-blank line indented at or below the
+            // `run` key column (a sibling key like `env:`/`with:`/`name:` sits
+            // there); blank lines stay inside the block.
             if !trimmed.is_empty() && indent <= run_key_col {
                 in_run_block = false;
             } else if !trimmed.is_empty() {
@@ -607,31 +543,20 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Return true if `code` is a YAML block-scalar header — either the plain
-/// indicator (`|` / `>`) or the indicator followed by an explicit
-/// indentation indicator (`|2`, `>1+`, `|+3`, …) per YAML 1.2 §8.1.1.1.
+/// Return true if `code` is a YAML block-scalar header — the indicator (`|` /
+/// `>`) optionally followed by a chomping indicator (`-`/`+`) and/or an
+/// indentation digit (`1`–`9`), in either order, per YAML 1.2 §8.1.1.1.
 ///
-/// Pre-fix (PR #121 fix-list item 13) the check accepted only `|`, `>`,
-/// `|-`, `|+`, `>-`, `>+`. Workflows using explicit indentation indicators
-/// like `run: |2` were silently treated as a single-line `run:`, the
-/// block body never entered `in_run_block` mode, and an injection or
-/// `curl | sh` in the body went undetected.
-///
-/// YAML 1.2 §8.1.1.1 grammar:
-///   c-b-block-scalar-indicator ::= '|' | '>'
-///   c-b-chomping-indicator     ::= '-' | '+'
-///   c-b-indentation-indicator  ::= ns-dec-digit (1..9)
-/// Either order — `|2-` and `|-2` are both valid. We accept both.
+/// PR #121 fix-list item 13: the pre-fix check accepted only `|`/`>`/`|-`/`|+`/
+/// `>-`/`>+`, so `run: |2` was treated as single-line `run:`, the body never
+/// entered block-scan mode, and a `curl | sh` / injection inside it went undetected.
 fn is_yaml_block_scalar_header(code: &str) -> bool {
     let mut chars = code.chars();
-    // The first char must be the literal block indicator.
     if !matches!(chars.next(), Some('|') | Some('>')) {
         return false;
     }
 
-    // The remainder is an optional chomping indicator (`-` / `+`) and an
-    // optional indentation digit (`1`–`9`), in either order. Zero or one
-    // of each. Each of the remaining chars must satisfy this grammar —
+    // Optional chomp (`-`/`+`) and optional digit (`1`–`9`), zero or one each;
     // anything else (a second `|`, a quote, text) disqualifies the line.
     let mut saw_chomp = false;
     let mut saw_indent = false;
@@ -665,9 +590,7 @@ fn scan_run_line(
     }
 }
 
-// ===========================================================================
 // Dockerfile checks
-// ===========================================================================
 
 /// Scan a Dockerfile for a `FROM` on a mutable / un-pinned base image.
 fn check_dockerfile(input: &str, findings: &mut Vec<Finding>) {
@@ -706,8 +629,7 @@ fn check_dockerfile(input: &str, findings: &mut Vec<Finding>) {
 
         // A reference to an earlier build stage is internal — never flagged.
         let is_stage_ref = stage_names.contains(&image_lower);
-        // A build-arg-templated image (`FROM ${BASE_IMAGE}`) cannot be
-        // statically resolved — skip rather than guess.
+        // A build-arg-templated image (`FROM ${BASE}`) can't be resolved — skip.
         let is_templated = image.contains('$');
 
         if !is_stage_ref && !is_templated {
@@ -753,15 +675,10 @@ fn check_dockerfile(input: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-/// If `image` is a mutable / un-pinned base-image reference, return a
-/// plain-language reason; otherwise `None` (the image is digest-pinned and
-/// safe).
-///
-/// An image is considered pinned when it carries an `@sha256:<digest>` (any
-/// `@<algo>:<digest>`) — that is immutable. A `:latest` tag, or no tag at all,
-/// is mutable. A specific version tag (`:1.2.3`) without a digest is *also*
-/// mutable (a tag can be re-pointed) but is a much weaker signal, so this rule
-/// flags only the clear cases: `:latest` and no-tag.
+/// If `image` is a mutable / un-pinned base-image reference, return a reason;
+/// otherwise `None`. An `@sha256:<digest>` is immutable (pinned). Only the
+/// clear cases are flagged — `:latest` and no-tag; a specific version tag
+/// without a digest is mutable but a much weaker signal, so it is not flagged.
 fn unpinned_image_reason(image: &str) -> Option<String> {
     // A digest pin (`name@sha256:…` / `name:tag@sha256:…`) is immutable.
     if let Some((_, after_at)) = image.split_once('@') {
@@ -770,9 +687,8 @@ fn unpinned_image_reason(image: &str) -> Option<String> {
         }
     }
 
-    // Determine the tag. The `:` that introduces a tag is the one AFTER the
-    // last `/` (so a registry-port `registry:5000/img` is not mistaken for a
-    // tag). Strip any `@digest` suffix first.
+    // The tag-introducing `:` is the one AFTER the last `/`, so a registry port
+    // (`registry:5000/img`) is not mistaken for a tag. Strip `@digest` first.
     let without_digest = image.split('@').next().unwrap_or(image);
     let last_segment = without_digest.rsplit('/').next().unwrap_or(without_digest);
     let tag = last_segment.rsplit_once(':').map(|(_, t)| t);
@@ -795,16 +711,10 @@ fn strip_keyword_ci<'a>(code: &'a str, keyword: &str) -> Option<&'a str> {
     if code.len() < keyword.len() + 1 {
         return None;
     }
-    // PR #121 fix-list item 4 (second site, missed by the initial pass):
-    // `code.split_at(keyword.len())` panics on a `&str` when `keyword.len()`
-    // lands inside a multi-byte UTF-8 character (e.g. `modulé` with keyword
-    // `module` — `split_at(6)` lands inside the `é` codepoint at bytes 5..7).
-    //
-    // Switch to a byte-level prefix check first. `eq_ignore_ascii_case` on
-    // `[u8]` matches keyword bytes against the leading bytes of `code` without
-    // demanding a char boundary; only ASCII bytes can compare-equal to the
-    // (always-ASCII) keyword, so a matching head guarantees `keyword.len()`
-    // sits on a char boundary, and `&code[keyword.len()..]` is then sound.
+    // PR #121 fix-list item 4: byte-level prefix check, not `split_at`, which
+    // panics when `keyword.len()` lands inside a multi-byte char (e.g. `modulé`).
+    // `keyword` is ASCII, so a matching head guarantees a char boundary and the
+    // `&code[keyword.len()..]` slice below is sound.
     let head_bytes = &code.as_bytes()[..keyword.len()];
     if !head_bytes.eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
@@ -817,9 +727,7 @@ fn strip_keyword_ci<'a>(code: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
-// ===========================================================================
 // Terraform checks
-// ===========================================================================
 
 /// Scan a Terraform config for a `module` block whose `source` is a remote /
 /// untrusted location.
@@ -838,10 +746,6 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
 
     for raw_line in input.lines() {
         let line = raw_line.trim();
-        // Strip a `#` or `//` comment (HCL supports both). Conservative: this
-        // does not handle `#`/`//` inside a string, but a source URL with a
-        // literal `#` is rare and erring toward "no comment" only risks a
-        // missed finding, never a false positive.
         let code = strip_hcl_comment(line);
         let code = code.trim();
         if code.is_empty() {
@@ -851,16 +755,11 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
         // A `module "<name>" {` block header (the `{` may be on this line).
         let opens_module = is_module_block_header(code);
         if opens_module {
-            // The block opens at depth `brace_depth + 1`; remember it *before*
-            // inspecting this line so a one-line module — `module "x" { source
-            // = "…" }` — has its `source` inspected on the same line, not only
-            // on a later line once the depth was already set.
+            // Remember the open depth *before* inspecting this line so a
+            // one-line module (`module "x" { source = "…" }`) is inspected here.
             module_block_depth = Some(brace_depth + 1);
         }
 
-        // Inside a module block, inspect `source = "<value>"`. With the
-        // header handled above, `module_block_depth` is set for a one-line
-        // block too, so `parse_hcl_source` runs against the rest of that line.
         if let Some(open_depth) = module_block_depth {
             if brace_depth + 1 >= open_depth {
                 if let Some(source) = parse_hcl_source(code) {
@@ -874,9 +773,6 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
             }
         }
 
-        // Update brace depth for this line. Braces inside a double-quoted
-        // string (`source = "git::https://…/{var}"`, a heredoc-ish value) are
-        // not block delimiters — count only the structural ones.
         let (opens, closes) = count_structural_braces(code);
         brace_depth += opens - closes;
         if brace_depth < 0 {
@@ -904,9 +800,7 @@ fn check_terraform(input: &str, findings: &mut Vec<Finding>) {
             ));
         }
         findings.push(Finding {
-            // Reuses the install-rule RuleId — a remote Terraform module is
-            // the same risk class whether named on a command line or in a
-            // `.tf` file.
+            // Reuses the install-rule RuleId (same risk class as a CLI module).
             rule_id: RuleId::TerraformRemoteModule,
             severity: Severity::Medium,
             title: "Terraform module sourced from an untrusted remote location".to_string(),
@@ -977,13 +871,9 @@ fn is_module_block_header(code: &str) -> bool {
 }
 
 /// Parse a `source = "<value>"` HCL assignment, returning the unquoted value.
-///
-/// The `source` token may appear at the start of the line or, for a one-line
-/// module block (`module "x" { source = "…" }`), after the opening brace — so
-/// the scan looks for a `source` *token* anywhere in `code` rather than only
-/// as a prefix. To avoid matching `source` inside a string literal or as a
-/// substring of a longer identifier (`data_source`, `mysource`), the match
-/// must be at an HCL token boundary and outside any double-quoted string.
+/// The `source` token is matched anywhere in `code` (one-line blocks put it
+/// after the brace), but only at an HCL token boundary and outside any
+/// double-quoted string, so `data_source` / a quoted `source` is not matched.
 fn parse_hcl_source(code: &str) -> Option<String> {
     const KEY: &str = "source";
     let bytes = code.as_bytes();
@@ -1001,18 +891,10 @@ fn parse_hcl_source(code: &str) -> Option<String> {
             i += 1;
             continue;
         }
-        // A `source` token: preceded by a non-identifier byte (or line start)
-        // and followed by a non-identifier byte (or line end).
-        //
-        // PR #121 fix-list item 4: the suspect-byte comparison must operate
-        // on `&[u8]`, NOT on `code[i..]` (a `&str` slice). When `i` lands on
-        // a UTF-8 continuation byte — anywhere a non-ASCII rune appears in
-        // an attacker-controlled `.tf` file (e.g. `modulé "x" { source = … }`)
-        // — `code[i..]` panics with "start byte index N is not a char
-        // boundary". Byte-level matching is sound: `KEY` is pure ASCII, so a
-        // byte-for-byte match on `bytes[i..i+KEY.len()]` is equivalent to
-        // matching the substring; any continuation byte at `i` makes the
-        // first byte comparison fail naturally.
+        // A `source` token at an identifier boundary. PR #121 fix-list item 4:
+        // match on `&[u8]`, not `code[i..]` — a continuation byte at `i` (e.g.
+        // `modulé` in a `.tf` file) would panic a `&str` slice. `KEY` is ASCII,
+        // so the byte match is equivalent and a matching head is a char boundary.
         let matches_key = bytes
             .get(i..i + KEY.len())
             .is_some_and(|b| b == KEY.as_bytes());
@@ -1023,10 +905,7 @@ fn parse_hcl_source(code: &str) -> Option<String> {
                 .map(|b| !is_ident(*b))
                 .unwrap_or(true)
         {
-            // Both `i + KEY.len()` and the bytes that follow are guaranteed
-            // to be char boundaries here because `KEY` is ASCII and we just
-            // confirmed a byte-for-byte match starting at `i`. The remainder
-            // of the function may therefore continue to use `&str` slicing.
+            // `&str` slicing is sound here (matching ASCII head ⇒ char boundary).
             let after = code[i + KEY.len()..].trim_start();
             if let Some(rest) = after.strip_prefix('=') {
                 let value = rest.trim();
@@ -1076,9 +955,7 @@ fn is_untrusted_tf_source(source: &str) -> bool {
     true
 }
 
-// ===========================================================================
 // Helm chart checks
-// ===========================================================================
 
 /// Recognised Helm chart-repository hosts. Mirrors `install.rs`'s
 /// `TRUSTED_HELM_HOSTS` so a chart-file finding and a `helm` command-line
@@ -1167,8 +1044,7 @@ fn check_helm_chart(input: &str, findings: &mut Vec<Finding>) {
             ));
         }
         findings.push(Finding {
-            // Reuses the install-rule RuleId — same risk class as a `helm`
-            // command pointed at an untrusted repo.
+            // Reuses the install-rule RuleId (same risk class as a `helm` cmd).
             rule_id: RuleId::HelmUntrustedRepo,
             severity: Severity::Medium,
             title: "Helm chart dependency from an untrusted repository".to_string(),
@@ -1207,9 +1083,7 @@ fn helm_url_host(url: &str) -> Option<String> {
     }
 }
 
-// ===========================================================================
 // package.json lifecycle-script checks
-// ===========================================================================
 
 /// Scan a `package.json` for a lifecycle install hook (`preinstall`,
 /// `install`, `postinstall`) whose command is dangerous.
@@ -1280,11 +1154,9 @@ fn dangerous_script_reason(cmd: &str) -> Option<String> {
         );
     }
 
-    // 2 — base64 decode then execute. `echo <b64> | base64 -d | sh`, or a
-    // node `Buffer.from(...,'base64')` feeding an interpreter.
-    // `js_decode` / `js_eval` are the JS base64-decode / dynamic-eval call
-    // names, assembled at runtime so this detector's source does not itself
-    // contain a literal `<name>(` substring.
+    // 2 — base64 decode then execute. `js_decode` / `js_eval` are the JS
+    // base64-decode / eval call names, assembled at runtime so this detector's
+    // source does not itself contain the literal `<name>(` substring.
     let js_decode = format!("a{}", "tob(");
     let js_eval = format!("ev{}", "al(");
     let has_base64_decode = lower.contains("base64 -d")
@@ -1606,16 +1478,9 @@ mod tests {
 
     #[test]
     fn workflow_run_block_scalar_explicit_indentation_indicator_flagged() {
-        // PR #121 fix-list item 13 — YAML 1.2 §8.1.1.1 allows an explicit
-        // indentation indicator (a digit 1..9) on a block-scalar header:
-        // `run: |2`, `>+3`, `|-1`. Pre-fix the recognized-prefix check
-        // only covered `|`, `>`, `|-`, `|+`, `>-`, `>+`; a `|2` workflow
-        // was silently treated as a single-line `run:` and the block
-        // body was never scanned for curl-pipe-shell or untrusted
-        // interpolations.
-        //
-        // We test multiple forms: bare digit, chomp+digit, digit+chomp.
-        // All three are legal YAML; all three must enter block-scan mode.
+        // PR #121 fix-list item 13 — explicit indentation indicators (`|2`,
+        // `>+3`, `|-1`) are legal YAML block-scalar headers; pre-fix they were
+        // treated as single-line `run:` and the body never scanned.
         for header in &["|2", "|2-", "|-2", ">+1", "|+3"] {
             let wf = format!(
                 "jobs:\n  build:\n    steps:\n      - run: {header}\n          echo start\n          \
@@ -2005,18 +1870,9 @@ mod tests {
 
     #[test]
     fn terraform_non_ascii_in_hcl_does_not_panic() {
-        // PR #121 fix-list item 4: `parse_hcl_source` iterated by raw byte
-        // index but sliced `&str`; a non-ASCII byte in a `.tf` line (e.g. a
-        // typo like `modulé`, or a unicode identifier the operator left in
-        // a comment) lands `i` on a UTF-8 continuation byte, and the old
-        // `code[i..].starts_with(KEY)` slice panicked with
-        // "start byte index N is not a char boundary". The byte-safe match
-        // now skips through continuation bytes naturally.
-        //
-        // The fixture mixes a `modulé` typo, a non-ASCII description, and a
-        // legitimate `module` block with a remote source — the rule must
-        // (a) not panic on the non-ASCII bytes and (b) still flag the
-        // genuine remote module.
+        // PR #121 fix-list item 4: a non-ASCII byte in a `.tf` line (e.g. a
+        // `modulé` typo) once panicked the `&str`-slicing scan. The fixture must
+        // (a) not panic and (b) still flag the genuine remote module below.
         let tf = "modulé \"x\" { source = \"evil\" }\n\
                   module \"vpc\" {\n  \
                     description = \"délivré par exemple.com\"\n  \

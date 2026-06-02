@@ -61,12 +61,7 @@ static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
     include_bytes!("../assets/keys/threatdb-verify.pub");
 
 /// Package ecosystem identifiers, encoded as a single byte in the DB.
-///
-/// **Discriminants are part of the on-disk threat-DB binary format and must
-/// stay stable.** Variants `Npm..=Packagist` (0..=7) ship in every signed DB.
-/// `Apt..=Docker` (8..=14) were added in M6 ch1 for the distro/docker/go
-/// `tirith install` backends; no signed DB currently emits these byte values,
-/// but the decoder accepts them so a future feed wiring is a one-line change.
+/// Discriminants are part of the on-disk binary format and must stay stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Ecosystem {
@@ -78,9 +73,8 @@ pub enum Ecosystem {
     Maven = 5,
     NuGet = 6,
     Packagist = 7,
-    // M6 ch1 — distro / docker backends for `tirith install`. These ship
-    // command-complete but signal-weak: no registry adapter, so threat-DB
-    // lookups for them are empty until feed wiring extends.
+    // M6 ch1 — distro/docker backends for `tirith install`; threat-DB lookups
+    // are empty until feed wiring extends.
     Apt = 8,
     Brew = 9,
     Dnf = 10,
@@ -134,8 +128,7 @@ impl Ecosystem {
         }
     }
 
-    /// Parse an ecosystem from its string name (case-insensitive).
-    /// Accepts common aliases like "crates.io", "cargo" for `Crates`.
+    /// Parse an ecosystem from its string name (case-insensitive, with aliases).
     pub fn from_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "npm" => Some(Self::Npm),
@@ -164,8 +157,7 @@ impl Ecosystem {
 pub enum SourceTier {
     /// Compiled and Ed25519-signed by CI; verified on download and load.
     Primary,
-    /// Compiled on the user's own machine from optional opt-in feeds; an
-    /// unsigned user-local overlay.
+    /// Unsigned user-local overlay compiled from optional opt-in feeds.
     Supplemental,
 }
 
@@ -213,8 +205,7 @@ impl ThreatSource {
         }
     }
 
-    /// Every threat source variant, in stable declaration order. Used by the
-    /// `threat-db sources` transparency command and the snapshot history.
+    /// Every threat source variant, in stable declaration order.
     pub const ALL: [ThreatSource; 11] = [
         Self::OssfMalicious,
         Self::DatadogMalicious,
@@ -229,10 +220,8 @@ impl ThreatSource {
         Self::TorExit,
     ];
 
-    /// Stable machine-readable identifier (snake_case). Distinct from
-    /// [`label`](Self::label), which is a human display string that may change.
-    /// This is the key used in `--format json` output and the snapshot history,
-    /// so it must remain stable across releases.
+    /// Stable machine-readable identifier (snake_case). Used as the key in
+    /// `--format json` and the snapshot history, so it must stay stable.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OssfMalicious => "ossf_malicious",
@@ -251,11 +240,6 @@ impl ThreatSource {
 
     /// Whether this source is carried in the signed CI-built primary DB or in
     /// the optional user-local supplemental overlay.
-    ///
-    /// The two-way split mirrors how the DB is actually built: the primary
-    /// `.dat` is compiled and Ed25519-signed by CI from a fixed set of feeds;
-    /// the supplemental `.dat` is compiled on the user's own machine from
-    /// optional keyed/opt-in feeds during `tirith threat-db update`.
     pub fn tier(&self) -> SourceTier {
         match self {
             Self::OssfMalicious
@@ -272,8 +256,7 @@ impl ThreatSource {
         }
     }
 
-    /// Upstream project / homepage for the feed, for attribution in
-    /// `threat-db sources`.
+    /// Upstream project / homepage for the feed (attribution).
     pub fn upstream_url(&self) -> &'static str {
         match self {
             Self::OssfMalicious => "https://github.com/ossf/malicious-packages",
@@ -310,7 +293,6 @@ impl ThreatSource {
     }
 
     /// Default confidence level for network-indicator sources (hostnames, IPs).
-    /// Package-level matches carry their own per-record confidence from the DB.
     pub fn default_confidence(self) -> Confidence {
         match self {
             Self::TorExit => Confidence::Medium,
@@ -350,9 +332,7 @@ impl Confidence {
         }
     }
 
-    /// Stable machine-readable identifier (lowercase). Matches the
-    /// `#[serde(rename_all = "lowercase")]` representation, so the human
-    /// label and the JSON form never drift apart.
+    /// Stable machine-readable identifier (lowercase), matching the serde form.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -364,9 +344,8 @@ impl Confidence {
 
 /// Result of a package, hostname, or IP lookup in the threat DB.
 ///
-/// `ecosystem` is `Some` for package matches and `None` for hostname/IP matches
-/// (where the concept of ecosystem does not apply).
-/// `all_versions_malicious` is only meaningful for package matches.
+/// `ecosystem` / `all_versions_malicious` are only meaningful for package
+/// matches; hostname/IP matches leave `ecosystem` as `None`.
 #[derive(Debug, Clone)]
 pub struct ThreatMatch {
     pub ecosystem: Option<Ecosystem>,
@@ -401,15 +380,8 @@ pub struct ThreatDbStats {
 
 /// Per-source record counts derived by walking a loaded DB's sections.
 ///
-/// `per_source` covers package, hostname, and IP records (the record types
-/// that carry a `ThreatSource` byte on disk) plus the typosquat index, whose
-/// records are all from `EcosystemsTyposquat`. `typosquat_count` and
-/// `popular_count` are also reported separately as categories.
-///
-/// `per_source` is private: `count_for` and `merge` rely on the invariant
-/// that it holds at most one entry per source. The [`per_source`](Self::per_source)
-/// accessor exposes the slice read-only so that invariant cannot be broken
-/// from outside.
+/// `per_source` is private and holds at most one entry per source (an
+/// invariant `count_for`/`merge` rely on); the accessor exposes it read-only.
 #[derive(Debug, Clone, Default)]
 pub struct SourceBreakdown {
     per_source: Vec<(ThreatSource, u64)>,
@@ -423,8 +395,7 @@ impl SourceBreakdown {
         &self.per_source
     }
 
-    /// Add another breakdown's counts into this one (used to fold a
-    /// supplemental overlay's counts into the primary's).
+    /// Fold another breakdown's counts into this one (overlay into primary).
     fn merge(&mut self, other: SourceBreakdown) {
         for (src, count) in other.per_source {
             if let Some((_, existing)) = self.per_source.iter_mut().find(|(s, _)| *s == src) {
@@ -471,25 +442,11 @@ pub enum ThreatDbError {
     StringOutOfBounds(u32),
 }
 
-/// Package record size:
-///   ecosystem(1) + name_len(2) + name(variable, capped at 256) + NOT fixed-size.
-/// We use a length-prefixed variable-size format within a contiguous buffer,
-/// with a separate index of offsets for binary search.
-///
-/// Index entry (8 bytes each):
-///   offset_into_data(u32 LE)
-///   key_hash(u32 LE) — FNV-1a of (ecosystem, name) for fast comparison
-///
-/// Data record (variable):
-///   ecosystem(u8)
-///   name_len(u16 LE)
-///   name(name_len bytes)
-///   source(u8)
-///   confidence(u8)
-///   flags(u8) — bit 0 = all_versions_malicious
-///   version_count(u16 LE)
-///   [version strings: len(u16 LE) + bytes] * version_count
-///   reference_offset(u32 LE) — into string table (0xFFFFFFFF = none)
+/// Package index entry (8 bytes): offset_into_data(u32 LE) + key_hash(u32 LE,
+/// FNV-1a of (ecosystem, name)). Records are variable-size, length-prefixed:
+/// ecosystem(u8), name_len(u16)+name, source(u8), confidence(u8), flags(u8;
+/// bit0=all_versions_malicious), version_count(u16) + [len(u16)+bytes]*,
+/// reference_offset(u32 into string table; 0xFFFFFFFF = none).
 const PKG_INDEX_ENTRY_SIZE: usize = 8;
 
 /// IP record: u32 LE (IPv4) + source(u8) = 5 bytes.
@@ -541,11 +498,10 @@ fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
 pub struct ThreatDb {
     data: Vec<u8>,
     supplemental: Option<Box<ThreatDb>>,
-    // Parsed header fields cached for fast access
+    // Parsed header fields cached for fast access.
     format_version: u32,
     build_timestamp: u64,
     build_sequence: u64,
-    // Section metadata
     pkg_index_offset: u32,
     pkg_index_count: u32,
     hostname_index_offset: u32,
@@ -564,18 +520,16 @@ impl ThreatDb {
     /// Load and verify a threat DB from raw bytes.
     ///
     /// `min_sequence` enforces rollback protection — the DB is rejected if its
-    /// build sequence is <= this value.  Pass 0 to skip.
+    /// build sequence is <= this value. Pass 0 to skip.
     pub fn from_bytes(data: Vec<u8>, min_sequence: u64) -> Result<Self, ThreatDbError> {
         if data.len() < HEADER_SIZE {
             return Err(ThreatDbError::FileTooSmall(data.len()));
         }
 
-        // Magic
         if &data[0..8] != MAGIC {
             return Err(ThreatDbError::InvalidMagic);
         }
 
-        // Format version
         let err = || ThreatDbError::InvalidRecord(0);
         let version = read_u32_le(&data, 8).ok_or_else(err)?;
         if version != FORMAT_VERSION {
@@ -585,7 +539,7 @@ impl ThreatDb {
         let build_timestamp = read_u64_le(&data, 12).ok_or_else(err)?;
         let build_sequence = read_u64_le(&data, 20).ok_or_else(err)?;
 
-        // Rollback protection
+        // Rollback protection.
         if min_sequence > 0 && build_sequence <= min_sequence {
             return Err(ThreatDbError::RollbackDetected {
                 got: build_sequence,
@@ -593,7 +547,7 @@ impl ThreatDb {
             });
         }
 
-        // Section offsets/counts (all within bounds-checked HEADER_SIZE)
+        // Section offsets/counts (all within bounds-checked HEADER_SIZE).
         let pkg_index_offset = read_u32_le(&data, 28).ok_or_else(err)?;
         let pkg_index_count = read_u32_le(&data, 32).ok_or_else(err)?;
         let hostname_index_offset = read_u32_le(&data, 36).ok_or_else(err)?;
@@ -607,22 +561,19 @@ impl ThreatDb {
         let string_table_offset = read_u32_le(&data, 68).ok_or_else(err)?;
         let string_table_size = read_u32_le(&data, 72).ok_or_else(err)?;
 
-        // Bounds checks on sections
+        // Bounds checks on sections.
         let len = data.len() as u64;
         let check_section = |off: u32, count: u32, entry_size: usize| -> bool {
             let end = off as u64 + count as u64 * entry_size as u64;
             end <= len
         };
 
-        // IP section is fixed-size records
         if !check_section(ip_offset, ip_count, IP_RECORD_SIZE) {
             return Err(ThreatDbError::SectionOutOfBounds);
         }
 
-        // Index sections — their entries are fixed size, but they point into
-        // variable-size data regions that live between sections.  We just
-        // validate the index extent here; individual records are validated
-        // lazily on access.
+        // Index extents are validated here; individual variable-size records
+        // are validated lazily on access.
         if !check_section(pkg_index_offset, pkg_index_count, PKG_INDEX_ENTRY_SIZE) {
             return Err(ThreatDbError::SectionOutOfBounds);
         }
@@ -648,7 +599,6 @@ impl ThreatDb {
             return Err(ThreatDbError::SectionOutOfBounds);
         }
 
-        // String table
         if (string_table_offset as u64 + string_table_size as u64) > len {
             return Err(ThreatDbError::SectionOutOfBounds);
         }
@@ -691,10 +641,8 @@ impl ThreatDb {
         Self::from_bytes(data, min_sequence)
     }
 
-    /// Default filesystem path for the threat DB file.
-    ///
-    /// Checks `TIRITH_THREATDB_PATH` env var first (useful for testing with
-    /// fixture DBs), then falls back to `~/.local/share/tirith/tirith-threatdb.dat`.
+    /// Default filesystem path for the threat DB file. Checks
+    /// `TIRITH_THREATDB_PATH` first, then `~/.local/share/tirith/...`.
     pub fn default_path() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("TIRITH_THREATDB_PATH") {
             if !p.is_empty() {
@@ -720,29 +668,23 @@ impl ThreatDb {
         self
     }
 
-    /// Verify the Ed25519 signature and signer fingerprint.
-    ///
-    /// Returns `Ok(())` if the signature is valid and the signer fingerprint
-    /// matches the embedded public key.  Returns `Err(reason)` on any error
-    /// (invalid key, corrupt data, wrong signer).
+    /// Verify the Ed25519 signature and signer fingerprint against the embedded
+    /// public key. Returns `Err(reason)` on any failure.
     pub fn verify_signature(&self) -> Result<(), String> {
-        // Check signer fingerprint
         let key_fingerprint = Sha256::digest(VERIFY_KEY_BYTES);
         let stored_fp = &self.data[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + FINGERPRINT_LEN];
         if key_fingerprint.as_slice() != stored_fp {
             return Err("signer fingerprint does not match embedded public key".to_string());
         }
 
-        // Parse the verification key
         let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
             .map_err(|e| format!("invalid embedded public key: {e}"))?;
 
-        // Parse signature from header
         let sig_bytes = &self.data[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
         let signature = Signature::from_slice(sig_bytes)
             .map_err(|e| format!("invalid signature in header: {e}"))?;
 
-        // Signed message = header before sig ++ all data after header
+        // Signed message = header before sig ++ all data after header.
         let mut signed_data = Vec::with_capacity(SIG_OFFSET + (self.data.len() - HEADER_SIZE));
         signed_data.extend_from_slice(&self.data[..SIG_OFFSET]);
         signed_data.extend_from_slice(&self.data[HEADER_SIZE..]);
@@ -781,12 +723,8 @@ impl ThreatDb {
     }
 
     /// Count how many records each [`ThreatSource`] contributes, across this DB
-    /// and any supplemental overlay.
-    ///
-    /// The DB header does not store a per-source manifest, so this walks every
-    /// section's records. Malformed records are skipped (best-effort, never
-    /// panics) — a malformed record will not be counted, mirroring how lookups
-    /// already treat unparseable records as a miss.
+    /// and any supplemental overlay. Walks every section (no per-source
+    /// manifest on disk); malformed records are skipped best-effort.
     pub fn source_breakdown(&self) -> SourceBreakdown {
         let mut breakdown = self.source_breakdown_self();
         if let Some(overlay) = self.supplemental.as_deref() {
@@ -811,7 +749,7 @@ impl ThreatDb {
             }
         }
 
-        // Hostnames: record layout is source(u8) + name_len(u16 LE) + name.
+        // Hostnames: record is source(u8) + name_len(u16 LE) + name.
         for i in 0..self.hostname_index_count {
             let base = self.hostname_index_offset as usize + i as usize * HOSTNAME_INDEX_ENTRY_SIZE;
             if let Some(data_off) = read_u32_le(&self.data, base) {
@@ -841,17 +779,9 @@ impl ThreatDb {
             per_source: ThreatSource::ALL
                 .iter()
                 .map(|src| {
-                    // Typosquat records carry no per-record source byte on
-                    // disk, so the section walk above never bumps a count for
-                    // `EcosystemsTyposquat`. Every typosquat record is from
-                    // that one source, so attribute the whole typosquat index
-                    // count to it — otherwise `count_for(EcosystemsTyposquat)`
-                    // would always (and wrongly) return 0.
-                    // Start from the section-walk count, then add the
-                    // typosquat index for `EcosystemsTyposquat`. The walk never
-                    // bumps that source (typosquat records carry no source
-                    // byte), so the base is 0 today — but adding rather than
-                    // replacing stays correct if that ever changes.
+                    // Typosquat records carry no source byte, so the walk never
+                    // bumps `EcosystemsTyposquat`; attribute the whole typosquat
+                    // index to it (adding, not replacing, stays correct).
                     let mut count = counts.get(&(*src as u8)).copied().unwrap_or(0);
                     if *src == ThreatSource::EcosystemsTyposquat {
                         count += self.typosquat_index_count as u64;
@@ -859,10 +789,8 @@ impl ThreatDb {
                     (*src, count)
                 })
                 .collect(),
-            // Typosquats are also surfaced in `typosquat_count` as their own
-            // category (for callers that report categories, not sources).
-            // Popular packages carry no source byte and have no single source,
-            // so they remain a category only.
+            // Typosquat and popular counts are also reported as their own
+            // categories (popular has no single source).
             typosquat_count: self.typosquat_index_count as u64,
             popular_count: self.popular_index_count as u64,
         }
@@ -882,7 +810,7 @@ impl ThreatDb {
         std::str::from_utf8(&self.data[start..end]).ok()
     }
 
-    /// Look up index entry: returns (data_offset, key_hash).
+    /// Returns (data_offset, key_hash) for a package index entry.
     fn pkg_index_entry(&self, idx: u32) -> Option<(u32, u32)> {
         let base = self.pkg_index_offset as usize + idx as usize * PKG_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)?;
@@ -956,7 +884,6 @@ impl ThreatDb {
             let (data_off, _) = self.pkg_index_entry(idx)?;
             let rec = self.parse_pkg_record(data_off as usize)?;
 
-            // Version-aware matching
             match version {
                 Some(v) => {
                     if !rec.all_versions_malicious && !rec.versions.iter().any(|rv| rv == &v) {
@@ -1005,12 +932,11 @@ impl ThreatDb {
             let mid = lo + (hi - lo) / 2;
             let (data_off, hash) = self.pkg_index_entry(mid)?;
 
-            // Compare by hash first (fast path), then verify by parsing
+            // Compare by hash first (fast path), then verify the actual key.
             match hash.cmp(&target_hash) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    // Hash match — verify actual key
                     let rec = self.parse_pkg_record(data_off as usize)?;
                     match (rec.ecosystem as u8, rec.name).cmp(&(eco as u8, name)) {
                         std::cmp::Ordering::Equal => return Some(mid),
@@ -1043,7 +969,7 @@ impl ThreatDb {
         let base = self.hostname_index_offset as usize + idx as usize * HOSTNAME_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
 
-        // Hostname data record: source(u8) + name_len(u16 LE) + name(bytes)
+        // Hostname record: source(u8) + name_len(u16 LE) + name(bytes).
         let source = ThreatSource::from_u8(*self.data.get(data_off)?)?;
         let name_len = read_u16_le(&self.data, data_off + 1)? as usize;
         let name_start = data_off + 3;
@@ -1078,7 +1004,6 @@ impl ThreatDb {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    // Verify: parse the actual hostname
                     let data_off = _data_off as usize;
                     let name_len = read_u16_le(&self.data, data_off + 1)? as usize;
                     let name_start = data_off + 3;
@@ -1154,8 +1079,7 @@ impl ThreatDb {
         let base = self.typosquat_index_offset as usize + idx as usize * TYPOSQUAT_INDEX_ENTRY_SIZE;
         let data_off = read_u32_le(&self.data, base)? as usize;
 
-        // Typosquat data record:
-        //   ecosystem(u8) + mal_len(u16 LE) + mal(bytes) + tgt_len(u16 LE) + tgt(bytes)
+        // Typosquat record: ecosystem(u8) + mal_len(u16)+mal + tgt_len(u16)+tgt.
         let _eco = Ecosystem::from_u8(*self.data.get(data_off)?)?;
         let mut cursor = data_off + 1;
         let mal_len = read_u16_le(&self.data, cursor)? as usize;
@@ -1200,7 +1124,6 @@ impl ThreatDb {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    // Verify actual key
                     let data_off = _data_off as usize;
                     let rec_eco = Ecosystem::from_u8(*self.data.get(data_off)?)?;
                     let mal_len = read_u16_le(&self.data, data_off + 1)? as usize;
@@ -1221,19 +1144,13 @@ impl ThreatDb {
         None
     }
 
-    /// Whether `name` is itself a known-popular package in `eco`.
-    ///
-    /// This is the exact-match companion to [`check_popular_distance`], which
-    /// deliberately *skips* exact matches (it answers "what popular package is
-    /// this a near-miss of?"). Provenance scoring needs both: the exact check
-    /// recognizes a name as a well-known, widely-installed package, while the
-    /// distance check flags a name that merely *resembles* one.
+    /// Whether `name` is itself a known-popular package in `eco`. Exact-match
+    /// companion to [`check_popular_distance`], which instead flags near-misses.
     ///
     /// [`check_popular_distance`]: Self::check_popular_distance
     pub fn is_popular_package(&self, eco: Ecosystem, name: &str) -> bool {
-        // Linear scan, same as `check_popular_distance` — the popular index is
-        // sorted by (ecosystem, name) on disk but not by hash, so a hash-keyed
-        // binary search would not be sound here.
+        // Linear scan: the popular index is sorted by (ecosystem, name), not by
+        // hash, so a hash-keyed binary search would be unsound.
         for i in 0..self.popular_index_count {
             let base = self.popular_index_offset as usize + i as usize * POPULAR_INDEX_ENTRY_SIZE;
             let data_off = match read_u32_le(&self.data, base) {
@@ -1282,7 +1199,7 @@ impl ThreatDb {
                 None => continue,
             };
 
-            // Popular data record: ecosystem(u8) + name_len(u16 LE) + name(bytes)
+            // Popular record: ecosystem(u8) + name_len(u16 LE) + name(bytes).
             let rec_eco = match self.data.get(data_off).and_then(|&b| Ecosystem::from_u8(b)) {
                 Some(e) => e,
                 None => continue,
@@ -1305,7 +1222,7 @@ impl ThreatDb {
                 Err(_) => continue,
             };
 
-            // Skip exact matches (the package itself is popular — not suspicious)
+            // Skip exact matches — the package itself is popular, not suspicious.
             if popular_name == name {
                 continue;
             }
@@ -1338,22 +1255,14 @@ impl ThreatDb {
     }
 
     /// Get the cached threat DB instance, loading/reloading as needed.
-    ///
-    /// Re-checks file mtime every 60 seconds.  If the file changed, reloads
-    /// into a new `Arc`; readers holding the old `Arc` finish safely.
-    ///
-    /// Returns `None` if no DB file exists or loading fails (fail-open).
+    /// Re-checks file mtime every 60s; returns `None` on miss/failure (fail-open).
     pub fn cached() -> Option<Arc<ThreatDb>> {
         let cache = CACHE.get_or_init(ThreatDbCache::new);
         cache.get()
     }
 
-    /// Force-refresh the cached DB from the current configured source.
-    ///
-    /// Explicit refreshes honor source/overlay changes even when the primary
-    /// DB build sequence does not increase. This matters for tests and for
-    /// supplemental overlay rebuilds, both of which intentionally reuse the
-    /// same signed primary DB.
+    /// Force-refresh the cached DB. Honors source/overlay changes even when the
+    /// primary build sequence is unchanged (tests, supplemental rebuilds).
     pub fn refresh_cache() {
         if let Some(cache) = CACHE.get() {
             cache.force_reload();
@@ -1442,10 +1351,9 @@ impl ThreatDbCache {
                     );
                     return;
                 }
-                // Supplemental DBs are user-local overlays built from optional keyed feeds.
-                // They are intentionally not verified against the pinned release signing key:
-                // `load_from_path()` still validates the binary structure/header/version, but
-                // authenticity is anchored to the local machine policy and filesystem, not CI.
+                // Supplemental overlays are intentionally NOT signature-verified
+                // (authenticity is anchored to local machine policy, not CI);
+                // `load_from_path` still validates binary structure/header/version.
                 let supplemental_db =
                     source.supplemental_path.as_ref().and_then(
                         |path| match ThreatDb::load_from_path(path, 0) {
@@ -1609,7 +1517,7 @@ impl StringTable {
         }
     }
 
-    /// Intern a string, returning its offset within the table.
+    /// Intern a string, returning its offset.
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(&off) = self.index.get(s) {
             return off;
@@ -1717,7 +1625,7 @@ impl ThreatDbWriter {
         &mut self,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<Vec<u8>, ThreatDbError> {
-        // Sort and deduplicate
+        // Sort and deduplicate each section.
         self.packages
             .sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
         self.packages
@@ -1744,7 +1652,7 @@ impl ThreatDbWriter {
         let mut pkg_index: Vec<(u32, u32)> = Vec::new(); // (data_offset, key_hash)
 
         for pkg in &self.packages {
-            let data_offset = (HEADER_SIZE + pkg_data.len()) as u32; // absolute offset placeholder
+            let data_offset = (HEADER_SIZE + pkg_data.len()) as u32;
             let key_hash = pkg_key_hash(pkg.ecosystem, pkg.name.as_bytes());
 
             pkg_data.push(pkg.ecosystem as u8);
@@ -1859,14 +1767,10 @@ impl ThreatDbWriter {
         offset += popular_data.len();
 
         let string_table_offset = offset as u32;
-        // offset += self.string_table.len() as usize; // not needed further
 
-        // Fix up data offsets to be absolute
+        // Fix up data offsets to be absolute. pkg_index was built as
+        // HEADER_SIZE + local; rebase onto the real pkg_data_offset.
         for (data_off, _) in &mut pkg_index {
-            // pkg_index was built with absolute offsets assuming data starts right after header.
-            // Now data starts at pkg_data_offset. Adjust.
-            // The original data_offset was HEADER_SIZE + local_offset.
-            // We need pkg_data_offset + local_offset.
             let local_off = *data_off as usize - HEADER_SIZE;
             *data_off = (pkg_data_offset + local_off) as u32;
         }
@@ -1883,10 +1787,8 @@ impl ThreatDbWriter {
             *data_off = (popular_data_offset + *data_off as usize) as u32;
         }
 
-        // Sort index vectors by hash so binary search works correctly.
-        // (The input data was sorted by (ecosystem, name), but lookups
-        // use FNV hash ordering.)  popular_index uses linear scan, but
-        // sort it too for consistency.
+        // Sort index vectors by hash so binary search works (data was sorted by
+        // (ecosystem, name), but lookups use FNV hash ordering).
         pkg_index.sort_by_key(|&(_, hash)| hash);
         hostname_index.sort_by_key(|&(_, hash)| hash);
         typo_index.sort_by_key(|&(_, hash)| hash);
@@ -1905,7 +1807,7 @@ impl ThreatDbWriter {
 
         let mut buf = vec![0u8; total_size];
 
-        // Header (will fill signature + fingerprint after writing data)
+        // Header (signature + fingerprint filled in after the data is written).
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf[12..20].copy_from_slice(&self.build_timestamp.to_le_bytes());
@@ -1923,62 +1825,51 @@ impl ThreatDbWriter {
         buf[68..72].copy_from_slice(&string_table_offset.to_le_bytes());
         buf[72..76].copy_from_slice(&self.string_table.len().to_le_bytes());
 
-        // Signer fingerprint
         let fingerprint = Sha256::digest(signing_key.verifying_key().as_bytes());
         buf[FINGERPRINT_OFFSET..FINGERPRINT_OFFSET + FINGERPRINT_LEN].copy_from_slice(&fingerprint);
 
-        // Write sections
+        // Write sections in layout order.
         let mut pos = HEADER_SIZE;
 
-        // Package index
         for (data_off, hash) in &pkg_index {
             buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
             buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += PKG_INDEX_ENTRY_SIZE;
         }
-        // Package data
         buf[pos..pos + pkg_data.len()].copy_from_slice(&pkg_data);
         pos += pkg_data.len();
 
-        // Hostname index
         for (data_off, hash) in &hostname_index {
             buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
             buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += HOSTNAME_INDEX_ENTRY_SIZE;
         }
-        // Hostname data
         buf[pos..pos + hostname_data.len()].copy_from_slice(&hostname_data);
         pos += hostname_data.len();
 
-        // IP data
         buf[pos..pos + ip_data.len()].copy_from_slice(&ip_data);
         pos += ip_data.len();
 
-        // Typosquat index
         for (data_off, hash) in &typo_index {
             buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
             buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += TYPOSQUAT_INDEX_ENTRY_SIZE;
         }
-        // Typosquat data
         buf[pos..pos + typo_data.len()].copy_from_slice(&typo_data);
         pos += typo_data.len();
 
-        // Popular index
         for (data_off, hash) in &popular_index {
             buf[pos..pos + 4].copy_from_slice(&data_off.to_le_bytes());
             buf[pos + 4..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += POPULAR_INDEX_ENTRY_SIZE;
         }
-        // Popular data
         buf[pos..pos + popular_data.len()].copy_from_slice(&popular_data);
         pos += popular_data.len();
 
-        // String table
         let st = self.string_table.bytes();
         buf[pos..pos + st.len()].copy_from_slice(st);
 
-        // Sign: header before sig ++ all data after header
+        // Sign: header before sig ++ all data after header.
         let mut signed_data = Vec::with_capacity(SIG_OFFSET + (buf.len() - HEADER_SIZE));
         signed_data.extend_from_slice(&buf[..SIG_OFFSET]);
         signed_data.extend_from_slice(&buf[HEADER_SIZE..]);
@@ -2305,14 +2196,10 @@ mod tests {
         let mut writer = ThreatDbWriter::new(1700000000, 1);
         writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
 
-        // Override the embedded key for this test by checking against
-        // the key that actually signed the data. Since VERIFY_KEY_BYTES
-        // is the placeholder all-zeros key, we verify manually.
         let bytes = writer.build(&key).expect("build");
         let db = ThreatDb::from_bytes(bytes, 0).expect("load");
 
-        // verify_signature() will fail because the embedded key doesn't match.
-        // This tests the negative path for the placeholder key.
+        // Negative path: the embedded placeholder key won't match the signer.
         assert!(
             db.verify_signature().is_err(),
             "placeholder key should not verify real signature"
@@ -2327,7 +2214,6 @@ mod tests {
 
         let mut bytes = writer.build(&key).expect("build");
 
-        // Corrupt a data byte
         if bytes.len() > HEADER_SIZE + 1 {
             bytes[HEADER_SIZE + 1] ^= 0xFF;
         }
@@ -2341,16 +2227,14 @@ mod tests {
 
     #[test]
     fn test_signature_with_matching_key() {
-        // Test that verification works when we construct data signed with a
-        // known key and then check against that same key (simulating what
-        // happens when the real key replaces the placeholder).
+        // Verification works when checked against the key that actually signed
+        // (simulating the real key replacing the placeholder).
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1700000000, 1);
         writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
 
         let bytes = writer.build(&key).expect("build");
 
-        // Manually verify: reconstruct signed data and check
         let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
         let signature = Signature::from_slice(sig_bytes).expect("parse sig");
 
@@ -2426,7 +2310,7 @@ mod tests {
     fn test_unsupported_version() {
         let mut data = vec![0u8; HEADER_SIZE + 10];
         data[0..8].copy_from_slice(MAGIC);
-        data[8..12].copy_from_slice(&99u32.to_le_bytes()); // bad version
+        data[8..12].copy_from_slice(&99u32.to_le_bytes());
         assert!(matches!(
             ThreatDb::from_bytes(data, 0),
             Err(ThreatDbError::UnsupportedVersion(99))
@@ -2479,15 +2363,9 @@ mod tests {
 
     #[test]
     fn test_cache_returns_none_when_no_file() {
-        // ThreatDb::cached() should return None when no DB file exists.
-        // This is the normal case on first install.
-        // We can't easily test the full cache lifecycle without filesystem
-        // setup, but we verify the fail-open behavior.
-        // Note: The OnceLock means this test might interact with other tests
-        // that use cached(). In practice, the default_path() won't exist
-        // in test environments.
+        // Fail-open smoke test: cached() must not panic regardless of whether a
+        // DB file happens to exist in the test environment.
         let result = ThreatDb::cached();
-        // May be None or Some depending on test environment; just ensure no panic.
         let _ = result;
     }
 
@@ -2496,7 +2374,7 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1700000000, 1);
 
-        // Add same package twice
+        // Same package twice.
         writer.add_package(
             Ecosystem::Npm,
             "dupe-pkg",
@@ -2516,7 +2394,7 @@ mod tests {
             None,
         );
 
-        // Add same IP twice
+        // Same IP twice.
         writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
         writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
 
@@ -2791,9 +2669,8 @@ mod tests {
 
     #[test]
     fn threat_source_all_covers_every_variant() {
-        // Every u8 discriminant 0..N must round-trip through ALL, and ALL must
-        // have no duplicates. This guards `threat-db sources` against silently
-        // dropping a source if a new variant is added without updating ALL.
+        // Guards `threat-db sources` against silently dropping a source: every
+        // variant must round-trip through ALL, with no duplicates.
         for src in ThreatSource::ALL {
             assert_eq!(
                 ThreatSource::from_u8(src as u8),
@@ -2805,7 +2682,6 @@ mod tests {
         for src in ThreatSource::ALL {
             assert!(seen.insert(src as u8), "ALL has a duplicate: {src:?}");
         }
-        // The discriminants are 0..=10 contiguous; ALL must cover all 11.
         assert_eq!(ThreatSource::ALL.len(), 11);
         assert!(
             ThreatSource::from_u8(11).is_none(),
@@ -2828,7 +2704,7 @@ mod tests {
 
     #[test]
     fn threat_source_tier_split_matches_feed_origin() {
-        // Primary feeds are the five compiled into the signed CI DB.
+        // The five feeds compiled into the signed CI DB are Primary.
         for src in [
             ThreatSource::OssfMalicious,
             ThreatSource::DatadogMalicious,
@@ -2838,7 +2714,7 @@ mod tests {
         ] {
             assert_eq!(src.tier(), SourceTier::Primary, "{src:?} should be primary");
         }
-        // The rest are opt-in supplemental feeds.
+        // The rest are opt-in supplemental.
         for src in [
             ThreatSource::Urlhaus,
             ThreatSource::PhishingArmy,
@@ -2903,15 +2779,12 @@ mod tests {
         assert_eq!(bd.count_for(ThreatSource::FeodoTracker), 1);
         assert_eq!(bd.count_for(ThreatSource::TorExit), 1);
         assert_eq!(bd.count_for(ThreatSource::CisaKev), 0);
-        // Typosquat records are all from EcosystemsTyposquat — count_for must
-        // attribute the typosquat index count to that source, not return 0.
+        // Typosquats are attributed to EcosystemsTyposquat (not 0).
         assert_eq!(bd.count_for(ThreatSource::EcosystemsTyposquat), 1);
         assert_eq!(bd.typosquat_count, 1);
         assert_eq!(bd.popular_count, 1);
 
-        // Per-source counts cover pkg+host+ip records (3 packages + 2 hostnames
-        // + 2 IPs = 7) plus the 1 typosquat attributed to EcosystemsTyposquat,
-        // for a total of 8; popular packages remain a separate category.
+        // 3 packages + 2 hostnames + 2 IPs + 1 typosquat = 8; popular is separate.
         let total: u64 = bd.per_source().iter().map(|(_, c)| c).sum();
         assert_eq!(total, 8);
     }
@@ -2952,14 +2825,8 @@ mod tests {
         assert_eq!(bd.popular_count, 0);
     }
 
-    /// M6 ch1 — the `Ecosystem` discriminants are part of the on-disk threat-DB
-    /// binary format. A renumber would silently misread every signed DB shipped
-    /// to date (a record with byte `4` would round-trip to a different variant
-    /// than the one CI wrote). Pin them contiguously at the values they ship at.
-    ///
-    /// `Apt..=Docker` (8..=14) were added in M6 ch1 — they extend the sequence
-    /// rather than reusing earlier values, which is what keeps existing DBs
-    /// readable.
+    /// `Ecosystem` discriminants are part of the on-disk binary format — a
+    /// renumber would misread every signed DB shipped to date. Pin them.
     #[test]
     fn test_ecosystem_discriminants_are_contiguous() {
         // Existing (must NEVER change — they are written by signed DBs).
@@ -2979,9 +2846,7 @@ mod tests {
         assert_eq!(Ecosystem::Pacman as u8, 12);
         assert_eq!(Ecosystem::Scoop as u8, 13);
         assert_eq!(Ecosystem::Docker as u8, 14);
-        // `from_u8` decodes every value back to its variant, and unknown
-        // bytes return `None` (so a future DB with a higher byte value is
-        // tolerated as "ignored" rather than mis-decoded).
+        // from_u8 round-trips every value; unknown bytes return None.
         for v in 0u8..=14 {
             let eco = Ecosystem::from_u8(v).expect("must decode");
             assert_eq!(eco as u8, v, "round-trip failed for byte {v}");
@@ -2989,10 +2854,8 @@ mod tests {
         assert!(Ecosystem::from_u8(255).is_none());
     }
 
-    /// M6 ch1 — threat-DB lookups for the new ecosystems (no feed wiring yet)
-    /// must return empty without panicking. Pins the graceful-no-data path so
-    /// `tirith install apt nginx` does not crash on a populated DB that simply
-    /// carries no `apt` records.
+    /// M6 ch1 — lookups for the new ecosystems (no feed wiring yet) must return
+    /// empty without panicking on a populated DB.
     #[test]
     fn test_new_ecosystem_lookups_are_empty_no_panic() {
         let key = SigningKey::generate(&mut OsRng);

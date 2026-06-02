@@ -1,143 +1,94 @@
 //! Agent origin — *who* invoked tirith.
 //!
-//! This module is the **identity layer** for Milestone 4 item 8 ("Agent
-//! governance — per-agent identity + policy"). It defines a single data
-//! type, [`AgentOrigin`], that records the best-effort answer to *"what
-//! kind of caller produced this verdict?"* and threads it through
-//! [`crate::verdict::Verdict`] and [`crate::audit::AuditEntry`].
+//! The identity layer for M4 item 8 (agent governance): [`AgentOrigin`] records
+//! the best-effort "what kind of caller produced this verdict?" and threads it
+//! through [`crate::verdict::Verdict`] and [`crate::audit::AuditEntry`].
 //!
-//! It does **NOT** enforce anything on its own — enforcement lives in
-//! [`crate::escalation::apply_agent_rules`], which consults
-//! [`crate::policy::agent_decision`] against the stored origin and, on a
-//! `deny` match, forces [`Verdict::action`] to
-//! [`crate::verdict::Action::Block`] and appends a
-//! [`crate::verdict::RuleId::AgentDeniedByPolicy`] finding. Populating
-//! [`Verdict::agent_origin`] is what makes that enforcement reachable;
-//! engine paths that do not stamp an origin are treated as
+//! It does NOT enforce anything itself — enforcement lives in
+//! [`crate::escalation::apply_agent_rules`]. Populating [`Verdict::agent_origin`]
+//! makes that reachable; unstamped paths are treated as
 //! [`crate::policy::AgentDecision::Unspecified`] (no behavior change).
 //!
-//! [`RuleId`]: crate::verdict::RuleId
-//! [`Verdict::action`]: crate::verdict::Verdict#structfield.action
 //! [`Verdict::agent_origin`]: crate::verdict::Verdict#structfield.agent_origin
 //!
 //! # Trust model
 //!
-//! Every signal that feeds [`AgentOrigin`] is **caller-controlled**: an
-//! environment variable an attacker on the same machine can set, an MCP
-//! `initialize` parameter the attacker's client can lie about, an
-//! `is_terminal()` result an attacker can fake by allocating a PTY. The
-//! origin is therefore **operator-trust**, not adversary-resistant: useful
-//! for explaining what an honest caller looked like, never sufficient on its
-//! own to attribute an action to a determined adversary controlling the
-//! environment. Subsequent chunks that gate behavior on origin must layer
-//! their threat model on top of that honesty, not assume it.
+//! Every signal is caller-controlled (env var, MCP `initialize` param,
+//! fakeable `is_terminal()`), so the origin is **operator-trust**, not
+//! adversary-resistant. Code that gates behavior on origin must layer its own
+//! threat model on top of that honesty.
 //!
-//! # Surface
-//!
-//! The enum is intentionally **closed** — adding a new variant requires a
-//! source change, so a third party cannot smuggle a fabricated category
-//! through `TIRITH_INTEGRATION`. The free-form `tool` / `client_name` /
-//! `name` strings *inside* the variants are caller-controlled, capped, and
-//! safe to debug-escape on render (see [`sanitize_caller_label`] and
-//! [`sanitize_caller_version`]).
+//! The enum is intentionally **closed** so a third party cannot smuggle a
+//! fabricated category through `TIRITH_INTEGRATION`; the free-form strings
+//! inside variants are caller-controlled, capped, and debug-escaped on render.
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum length of a free-form caller-supplied label (`tool`, `client_name`,
-/// `name`, `provider`) before truncation. The cap is generous (256 bytes) —
-/// real values are short (`claude-code`, `cursor`) — but bounded so a hostile
-/// `TIRITH_INTEGRATION` of a million bytes cannot bloat every audit entry.
+/// Cap on a free-form caller-supplied label (`tool`, `client_name`, `name`,
+/// `provider`), bounded so a hostile million-byte `TIRITH_INTEGRATION` cannot
+/// bloat every audit entry.
 pub const MAX_LABEL_LEN: usize = 256;
 
 /// Maximum length of a free-form caller-supplied version string before
 /// truncation. SemVer is short; we cap to a forgiving 64 bytes.
 pub const MAX_VERSION_LEN: usize = 64;
 
-/// Who invoked tirith — the best-effort origin signal recorded alongside the
-/// verdict and the audit entry.
+/// Who invoked tirith — the best-effort origin recorded with the verdict and
+/// audit entry.
 ///
-/// **Closed enum.** A third party cannot extend this set without a source
-/// change. Free-form strings appear only as variant *payloads* (`tool`,
-/// `client_name`, `name`, `provider`), are caller-controlled, and are
-/// length-capped + content-sanitized at construction time via
+/// **Closed enum, operator-trust only.** A third party cannot add a variant;
+/// every signal is caller-controlled (informative, not adversary-resistant).
+/// Free-form payloads are length-capped + sanitized at construction via
 /// [`sanitize_caller_label`] / [`sanitize_caller_version`].
 ///
-/// **Operator-trust only.** Every signal that produces a variant is
-/// caller-controlled — `TIRITH_INTEGRATION`, `CI`, `GITHUB_ACTIONS`, MCP
-/// `initialize.client_info`, `is_terminal()`. The origin is informative, not
-/// adversary-resistant.
-///
-/// # Serialization
-///
-/// Tagged union (`#[serde(tag = "kind", rename_all = "snake_case")]`) — the
-/// JSON representation is, e.g., `{"kind":"agent","tool":"claude-code"}`. An
-/// older log file with no `agent_origin` field still parses (the parent
-/// struct serde-defaults the field to `None`).
+/// Serialized as a tagged union (`tag = "kind"`, snake_case), e.g.
+/// `{"kind":"agent","tool":"claude-code"}`. An older log with no `agent_origin`
+/// still parses (the field serde-defaults to `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentOrigin {
-    /// A human at a terminal — the default when nothing else identifies the
-    /// caller. `interactive` carries the same flag tirith already records on
-    /// [`Verdict::interactive_detected`], duplicated here so a downstream
-    /// audit consumer that only reads `agent_origin` does not need to know
-    /// the verdict-level field.
+    /// A human at a terminal — the default. `interactive` duplicates
+    /// [`Verdict::interactive_detected`] so an audit consumer reading only
+    /// `agent_origin` need not know the verdict-level field.
     ///
     /// [`Verdict::interactive_detected`]: crate::verdict::Verdict#structfield.interactive_detected
     Human {
-        /// Best-effort: whether stderr looked like a TTY or `TIRITH_INTERACTIVE=1`
-        /// was set. Caller-controllable; not load-bearing for any decision.
+        /// Whether stderr looked like a TTY or `TIRITH_INTERACTIVE=1` was set.
+        /// Caller-controllable; not load-bearing.
         interactive: bool,
     },
-    /// An AI coding agent (Claude Code, Cursor, Windsurf, …) self-reporting
-    /// via `TIRITH_INTEGRATION`.
-    ///
-    /// `tool` is the raw, sanitized value of `TIRITH_INTEGRATION` (or an
-    /// equivalent integration name passed by a daemon caller). Treat this as
-    /// **caller-claimed**, not verified — any process running as the user can
-    /// set `TIRITH_INTEGRATION` to anything.
+    /// An AI coding agent self-reporting via `TIRITH_INTEGRATION`.
     Agent {
-        /// Sanitized integration name. Length-capped at [`MAX_LABEL_LEN`];
-        /// control bytes replaced. See [`sanitize_caller_label`].
+        /// Sanitized integration name (caller-claimed, not verified). See
+        /// [`sanitize_caller_label`].
         tool: String,
-        /// Sanitized integration version, when the caller supplied one.
-        /// Length-capped at [`MAX_VERSION_LEN`].
+        /// Sanitized integration version, when supplied.
         #[serde(skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
-    /// An MCP client connected to `tirith mcp-server`, identifying itself via
-    /// the JSON-RPC `initialize.clientInfo` payload.
-    ///
-    /// `client_name` is the raw, sanitized value of `clientInfo.name` and is
-    /// caller-claimed — an MCP client may report anything. We do not normalize
-    /// across vendors (no "Claude Code" → "claude-code"); the operator sees
-    /// the string the client sent, debug-escaped for terminal safety.
+    /// An MCP client identifying itself via the JSON-RPC `initialize.clientInfo`
+    /// payload (caller-claimed; not normalized across vendors).
     Mcp {
-        /// Sanitized `clientInfo.name`. Length-capped at [`MAX_LABEL_LEN`].
+        /// Sanitized `clientInfo.name`.
         client_name: String,
-        /// Sanitized `clientInfo.version`. Length-capped at [`MAX_VERSION_LEN`].
+        /// Sanitized `clientInfo.version`.
         #[serde(skip_serializing_if = "Option::is_none")]
         client_version: Option<String>,
     },
-    /// The gateway path — `tirith gateway` is acting as a policy enforcement
-    /// point in front of another consumer (a chat UI, an LLM proxy). No
-    /// payload yet; chunk 2+ may extend this with the upstream consumer name.
+    /// `tirith gateway` acting as a policy enforcement point in front of another
+    /// consumer. No payload yet.
     Gateway,
-    /// A CI runner identified by environment heuristics (`GITHUB_ACTIONS`,
-    /// `BUILDKITE`, etc.). The provider name is the env-key shape (e.g.
-    /// `"github-actions"`); `None` means CI was inferred from a generic `CI`
-    /// signal without a specific provider.
+    /// A CI runner identified by env heuristics; `provider` is the env-key shape
+    /// (e.g. `"github-actions"`), `None` for a generic `CI` signal.
     Ci {
-        /// Sanitized provider name. `None` when only the generic `CI` env was
-        /// observed.
+        /// Sanitized provider name; `None` when only generic `CI` was observed.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
-    /// IDE-driven invocation when not otherwise classifiable. Today this is
-    /// unused — IDE integrations set `TIRITH_INTEGRATION` and land in
-    /// [`AgentOrigin::Agent`]. Reserved for a future signal an IDE can provide
-    /// that tirith trusts more strongly than `TIRITH_INTEGRATION`.
+    /// IDE-driven invocation. Unused today (IDEs set `TIRITH_INTEGRATION` and
+    /// land in [`AgentOrigin::Agent`]); reserved for a more-trusted IDE signal.
     Ide {
-        /// Sanitized IDE name. Length-capped at [`MAX_LABEL_LEN`].
+        /// Sanitized IDE name.
         name: String,
     },
 }
@@ -148,9 +99,8 @@ impl AgentOrigin {
         Self::Human { interactive }
     }
 
-    /// Build a [`AgentOrigin::Agent`] from a caller-supplied tool name and
-    /// optional version. Both are sanitized; if the sanitized tool is empty,
-    /// returns `None` so the caller can fall back to a safer default.
+    /// Build an [`AgentOrigin::Agent`]; both fields are sanitized, and an empty
+    /// sanitized tool yields `None` so the caller can fall back.
     pub fn agent(tool: &str, version: Option<&str>) -> Option<Self> {
         let tool = sanitize_caller_label(tool);
         if tool.is_empty() {
@@ -162,9 +112,8 @@ impl AgentOrigin {
         })
     }
 
-    /// Build a [`AgentOrigin::Mcp`] from a caller-supplied `clientInfo.name`
-    /// and optional `clientInfo.version`. Both are sanitized; if the
-    /// sanitized name is empty, returns `None`.
+    /// Build an [`AgentOrigin::Mcp`] from `clientInfo.name`/`.version`; both are
+    /// sanitized, and an empty sanitized name yields `None`.
     pub fn mcp(client_name: &str, client_version: Option<&str>) -> Option<Self> {
         let client_name = sanitize_caller_label(client_name);
         if client_name.is_empty() {
@@ -210,28 +159,16 @@ impl AgentOrigin {
     }
 }
 
-/// Resolve an [`AgentOrigin`] for the **CLI path** from the current process
-/// environment.
+/// Resolve an [`AgentOrigin`] for the CLI path from the process environment.
+/// First match wins: `TIRITH_INTEGRATION` → [`AgentOrigin::Agent`]; CI heuristics
+/// → [`AgentOrigin::Ci`]; else [`AgentOrigin::Human`] with the caller's
+/// `interactive` flag (pass the same value tirith computed for the verdict).
 ///
-/// Priority order — first match wins:
-/// 1. `TIRITH_INTEGRATION` is set and sanitizes to non-empty →
-///    [`AgentOrigin::Agent`].
-/// 2. CI heuristics fire ([`detect_ci_provider`] returns `Some(_)` or the
-///    generic `CI` env signal is set) → [`AgentOrigin::Ci`].
-/// 3. Otherwise → [`AgentOrigin::Human`] with the caller-supplied
-///    `interactive` flag.
-///
-/// Caller is responsible for passing the same `interactive` value tirith
-/// computed for the verdict — see [`crate::verdict::Verdict::interactive_detected`].
-///
-/// **Caller-trust only.** Every signal here is settable by any process running
-/// as the user. The output identifies an honest caller's category; it is
-/// never a sole defense against a hostile environment.
+/// Caller-trust only — every signal is settable by any process running as the
+/// user; never a sole defense against a hostile environment.
 pub fn resolve_cli_origin(interactive: bool) -> AgentOrigin {
-    // 1. Explicit self-identification wins. We accept "TIRITH_INTEGRATION_VERSION"
-    //    as an optional companion variable so an integration can report its
-    //    version without us having to invent a separate channel; today no
-    //    integration sets it, but the slot is documented.
+    // 1. Explicit self-identification wins. `TIRITH_INTEGRATION_VERSION` is an
+    //    optional companion version slot (documented; unused today).
     if let Ok(raw) = std::env::var("TIRITH_INTEGRATION") {
         let version = std::env::var("TIRITH_INTEGRATION_VERSION").ok();
         if let Some(origin) = AgentOrigin::agent(&raw, version.as_deref()) {
@@ -251,17 +188,11 @@ pub fn resolve_cli_origin(interactive: bool) -> AgentOrigin {
     AgentOrigin::human(interactive)
 }
 
-/// Detect a specific CI provider by walking a small, audited set of well-known
-/// environment variables. Returns the sanitized provider tag the first match
-/// produces, or `None` when no named provider is observed.
-///
-/// The list is deliberately small — every entry has to come back through here
-/// in a future chunk if the operator wants to gate on a specific provider,
-/// and an attacker controlling the env can already set any of these. We
-/// surface what the provider sets natively; we do not invent new identifiers.
+/// Detect a CI provider from a small audited set of env vars, returning the
+/// first match's sanitized provider tag (or `None`). The tag is fixed in source,
+/// not derived from env values.
 pub fn detect_ci_provider() -> Option<String> {
-    // (env_var_name, canonical_provider_tag) — env shape, lowercase-kebab tag.
-    // The tag is fixed in source; it never includes attacker bytes.
+    // (env_var_name, canonical lowercase-kebab provider tag).
     const PROVIDERS: &[(&str, &str)] = &[
         ("GITHUB_ACTIONS", "github-actions"),
         ("GITLAB_CI", "gitlab-ci"),
@@ -284,10 +215,9 @@ pub fn detect_ci_provider() -> Option<String> {
     None
 }
 
-/// True when the given env var exists and is not literally `"0"`, `""`, or
-/// `"false"` (case-insensitive). CI env vars are set to varied values by
-/// providers — sometimes `"true"`, sometimes a URL, sometimes the build ID —
-/// so "present and not explicitly disabled" is the honest test.
+/// True when the env var exists and is not `"0"`/`""`/`"false"`
+/// (case-insensitive) — CI vars take varied values, so "present and not
+/// explicitly disabled" is the honest test.
 fn env_is_truthy(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => {
@@ -298,45 +228,29 @@ fn env_is_truthy(var: &str) -> bool {
     }
 }
 
-/// Sanitize a caller-supplied free-form label (`TIRITH_INTEGRATION`,
-/// `clientInfo.name`, IDE name, CI provider tag).
-///
-/// Rules — applied in order:
-/// 1. Trim leading/trailing ASCII whitespace.
-/// 2. Replace any non-printable / control byte (ASCII < 0x20 or == 0x7F, and
-///    any byte that's part of a non-ASCII control codepoint) with `?`. This
-///    prevents a hostile `TIRITH_INTEGRATION` from injecting newlines into an
-///    audit log line, ANSI escapes into a terminal, or NUL bytes into a JSON
-///    string the parser later rejects.
-/// 3. Cap at [`MAX_LABEL_LEN`] bytes by **truncating to a char boundary** —
-///    naive `&s[..N]` could panic on multibyte UTF-8.
-///
-/// Empty result is preserved (the caller decides whether empty → fall back).
+/// Sanitize a caller-supplied free-form label: trim, replace control/format/
+/// invisible chars with `?` (so a hostile value can't inject newlines/ANSI/NUL
+/// into an audit line or JSON), and cap at [`MAX_LABEL_LEN`] bytes truncating on
+/// a char boundary. Empty result is preserved (caller decides the fallback).
 pub fn sanitize_caller_label(raw: &str) -> String {
     let trimmed = raw.trim();
     let mut out = String::with_capacity(trimmed.len().min(MAX_LABEL_LEN));
     for ch in trimmed.chars() {
-        // Hold to printable ASCII + printable Unicode. Drop ASCII control
-        // (incl. CR/LF/NUL/ESC), DEL, and any non-character / format
-        // codepoint. Non-ASCII printable codepoints are kept — an integration
-        // name could legitimately contain a non-ASCII letter — but the byte
-        // cap below stops the output from blowing past MAX_LABEL_LEN.
+        // Keep printable ASCII + printable Unicode; drop C0 control, DEL, and
+        // invisible/format/surrogate codepoints (the byte classes the byte-scan
+        // rules flag in command input).
         let keep = if (ch as u32) < 0x20 || ch == '\u{7f}' {
             false
         } else {
-            // Reject Unicode general categories that are invisible / format /
-            // surrogate — these are the same byte-classes the byte-scan rules
-            // already treat as suspicious in command/paste input.
             !is_invisible_or_format(ch)
         };
         if keep {
-            // Byte-budget check: a 4-byte char must still fit.
+            // A 4-byte char must still fit the byte budget.
             if out.len() + ch.len_utf8() > MAX_LABEL_LEN {
                 break;
             }
             out.push(ch);
         } else {
-            // Substitute a visible placeholder, but only when we have room.
             if out.len() + 1 > MAX_LABEL_LEN {
                 break;
             }
@@ -368,25 +282,16 @@ pub fn sanitize_caller_version(raw: &str) -> String {
     out
 }
 
-/// True for codepoints we never want to round-trip through the agent-origin
-/// payload: bidi controls, zero-width characters, Unicode tags, variation
-/// selectors, surrogates, C1 controls (CSI/OSC/APC/DCS), and other
-/// format-class characters. Mirrors the byte classes tirith already flags
-/// in command input — re-emitting them via the origin label would be
-/// self-defeating.
-///
-/// **C1 controls (U+0080..U+009F)** are included because the C0 control
-/// drop in [`sanitize_caller_label`] catches `< 0x20` only — a hostile
-/// caller could otherwise route an ANSI control sequence introducer
-/// (U+009B = CSI) or operating-system-command introducer (U+009D = OSC)
-/// past sanitization and into the operator's terminal at
-/// `tirith agent explain` time.
+/// True for codepoints we never round-trip through the origin payload: bidi
+/// controls, zero-width, Unicode tags, variation selectors, surrogates, C1
+/// controls, and other format-class chars — the byte classes tirith already
+/// flags in command input. C1 controls (U+0080..U+009F) are included because the
+/// C0 drop in [`sanitize_caller_label`] catches `< 0x20` only, so an 8-bit CSI
+/// (U+009B) / OSC (U+009D) could otherwise reach the terminal.
 fn is_invisible_or_format(ch: char) -> bool {
     matches!(
         ch as u32,
-        // C1 controls (U+0080..U+009F) — includes CSI (0x9B), OSC (0x9D),
-        // DCS (0x90), APC (0x9F), and the rest of the C1 family. Not
-        // covered by the C0 (`< 0x20`) check in `sanitize_caller_label`.
+        // C1 controls (CSI/OSC/DCS/APC) — not covered by the C0 `< 0x20` check.
         0x80..=0x9F
         // Bidirectional controls (U+202A..U+202E, U+2066..U+2069)
         | 0x202A..=0x202E
@@ -458,9 +363,8 @@ mod tests {
 
     #[test]
     fn sanitize_label_strips_control_and_caps_length() {
-        // ANSI escape + newline + NUL — all must be replaced with `?` and
-        // the result must NOT contain a literal CR/LF/ESC/NUL byte that could
-        // splice into a JSONL audit line.
+        // ANSI escape + newline + NUL must be replaced with `?` — no literal
+        // CR/LF/ESC/NUL that could splice into a JSONL audit line.
         let hostile = "claude\x1b[31mcode\n\x00";
         let clean = sanitize_caller_label(hostile);
         assert!(!clean.contains('\n'));
@@ -478,8 +382,7 @@ mod tests {
 
     #[test]
     fn sanitize_label_drops_invisible_unicode() {
-        // Bidi RLO + zero-width joiner + Unicode tag — all must NOT survive
-        // (they're exactly the classes the byte-scan rules flag in commands).
+        // Bidi RLO + zero-width joiner + Unicode tag must NOT survive.
         let hostile = "claude\u{202E}code\u{200B}\u{E0041}";
         let clean = sanitize_caller_label(hostile);
         assert!(!clean.contains('\u{202E}'));
@@ -491,14 +394,8 @@ mod tests {
 
     #[test]
     fn sanitize_label_drops_c1_controls() {
-        // C1 controls (U+0080..U+009F) include CSI (U+009B), OSC (U+009D),
-        // DCS (U+0090), APC (U+009F) — these are *not* `< 0x20` so the C0
-        // drop in sanitize_caller_label doesn't catch them. They have to
-        // be filtered via is_invisible_or_format, otherwise a hostile
-        // caller could ship an 8-bit CSI past sanitization and into the
-        // operator's terminal at `tirith agent explain` time. This is the
-        // ingest-side belt-and-braces; the human-output path also uses
-        // `{:?}` (Finding G part 1).
+        // C1 controls (CSI/OSC/DCS/APC) are not `< 0x20`, so they must be filtered
+        // via is_invisible_or_format — else an 8-bit CSI could reach the terminal.
         let hostile = "cur\u{009B}sor\u{009D}name\u{0090}\u{009F}";
         let clean = sanitize_caller_label(hostile);
         for c1 in ['\u{0080}', '\u{0090}', '\u{009B}', '\u{009D}', '\u{009F}'] {
@@ -516,8 +413,7 @@ mod tests {
 
     #[test]
     fn sanitize_label_truncates_on_char_boundary_without_panic() {
-        // 4-byte UTF-8 char ('🦀' = U+1F980, 4 bytes in UTF-8) repeated past
-        // the cap. We must never slice mid-codepoint.
+        // A 4-byte char ('🦀') repeated past the cap — never slice mid-codepoint.
         let crab = "🦀".repeat(MAX_LABEL_LEN);
         let clean = sanitize_caller_label(&crab);
         assert!(clean.len() <= MAX_LABEL_LEN);
@@ -529,8 +425,8 @@ mod tests {
     fn agent_returns_none_for_blank_label() {
         assert!(AgentOrigin::agent("", None).is_none());
         assert!(AgentOrigin::agent("   \t  ", None).is_none());
-        // Pure-control input sanitizes to "???" — non-empty, so we keep it.
-        // (We don't want a hostile env to slip through as "human" silently.)
+        // Pure-control input sanitizes to "???" — non-empty, so kept (a hostile
+        // env must not slip through as "human" silently).
         assert!(AgentOrigin::agent("\x00\x01\x02", None).is_some());
     }
 
@@ -566,8 +462,7 @@ mod tests {
         }
     }
 
-    // --- env-driven resolver ---
-    // These hold the global env lock because they mutate process env.
+    // env-driven resolver tests; hold the global env lock (they mutate env).
 
     #[test]
     fn resolve_cli_origin_prefers_tirith_integration() {
@@ -575,7 +470,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        // Pin the env to a known shape: TIRITH_INTEGRATION wins over CI signals.
+        // TIRITH_INTEGRATION wins over CI signals.
         unsafe {
             std::env::set_var("TIRITH_INTEGRATION", "claude-code");
             std::env::set_var("TIRITH_INTEGRATION_VERSION", "1.2.3");
@@ -748,9 +643,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        // A million-byte hostile value with embedded control bytes must
-        // (a) not crash, (b) not produce a multi-line audit-poisoning label,
-        // (c) cap at MAX_LABEL_LEN.
+        // A million-byte hostile value with control bytes must not crash, not
+        // produce a multi-line audit-poisoning label, and cap at MAX_LABEL_LEN.
         let hostile = format!(
             "{}\n\x1b[31m{}",
             "x".repeat(1_000_000),

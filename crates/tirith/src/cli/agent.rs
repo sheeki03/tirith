@@ -1,44 +1,29 @@
-//! `tirith agent sessions / explain / policy init / allow` — agent governance
-//! observability surface.
+//! `tirith agent sessions / explain / policy init / allow / block / current` —
+//! agent-governance observability surface.
 //!
-//! This is the CLI surface for Milestone 4 item 8 (Agent Governance).
-//! The [`AgentOrigin`] type and its plumbing through every verdict and
-//! audit entry record *who* invoked tirith; this module makes that signal
-//! **inspectable** and surfaces the `agent_rules` policy schema that the
-//! engine consults via `tirith_core::escalation::apply_agent_rules` inside
-//! `tirith_core::escalation::post_process_verdict`.
+//! [`AgentOrigin`] records *who* invoked tirith through every verdict/audit
+//! entry; this module makes that signal inspectable and surfaces the
+//! `agent_rules` policy schema the engine enforces in `escalation.rs`. Every
+//! command here is a local file operation (no network, off the detection hot
+//! path); runtime enforcement lives in `escalation.rs`, not here.
 //!
-//! `tirith agent allow` validates a matcher and prints the YAML snippet
-//! the operator should paste — it intentionally does NOT mutate
-//! `.tirith/policy.yaml`. The operator integrates the snippet themselves
-//! the same way they integrate `tirith mcp policy init`'s example output,
+//! `tirith agent allow` only validates a matcher and prints a YAML snippet — it
+//! does NOT mutate `.tirith/policy.yaml`; the operator integrates it themselves
 //! so an honest review precedes any widening of trust.
-//!
-//! Like every other observability surface, every command in this module is
-//! a **local file operation**: it touches no network and is off the
-//! tier-1/2/3 detection hot path. The runtime enforcement of `agent_rules`
-//! lives in `escalation.rs`, not here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tirith_core::agent_origin::AgentOrigin;
 use tirith_core::audit_aggregator;
-// NOTE: `FilesystemWriteScope` / `NetworkPredicate` / `SecretsAccessPredicate`
-// are intentionally NOT imported here. `agent block` no longer mints those
-// predicates (R12-2: agent_rules matching is kind+name only, so emitting them is
-// a footgun); the flags are gated and rejected. The `AgentMatcher` struct still
-// carries the fields and `Policy::load` still parses them in `tirith_core` for
-// forward-compat, so hand-written policies round-trip unchanged.
+// `FilesystemWriteScope` / `NetworkPredicate` / `SecretsAccessPredicate` are
+// intentionally NOT imported: `agent block` no longer mints them (R12-2:
+// matching is kind+name only, so emitting them is a footgun). The struct still
+// carries the fields and `Policy::load` still parses them for forward-compat.
 use tirith_core::policy::{self, AgentMatcher, AgentOriginKind};
 
-// ===========================================================================
-// shared helpers
-// ===========================================================================
-
-/// Resolve the audit log path. Mirrors the default in
-/// `audit::default_log_path` (which is private in tirith-core) so the CLI
-/// can be driven against a temp file by tests without exporting that helper.
+/// Resolve the audit log path. Mirrors the private `audit::default_log_path` so
+/// tests can drive the CLI against a temp file without exporting that helper.
 fn resolve_log_path(override_path: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = override_path {
         if p.trim().is_empty() {
@@ -49,13 +34,9 @@ fn resolve_log_path(override_path: Option<&str>) -> Option<PathBuf> {
     policy::data_dir().map(|d| d.join("log.jsonl"))
 }
 
-/// Best-effort label for an [`AgentOrigin`] — a single line, ASCII-safe,
-/// debug-escaped at every caller-claimed string so a hostile name cannot
-/// inject control sequences into the operator's terminal.
-///
-/// Mirrors the convention `mcp.rs::escape_name` already applies: print
-/// caller-claimed bytes through `{:?}` so ANSI escapes / newlines / control
-/// bytes become `\u{1b}` / `\n` etc. rather than reaching the terminal raw.
+/// Best-effort one-line label for an [`AgentOrigin`]. Every caller-claimed
+/// string is `{:?}`-escaped so a hostile name cannot inject control sequences
+/// into the operator's terminal (same convention as `mcp.rs::escape_name`).
 fn label_origin(origin: &AgentOrigin) -> String {
     match origin {
         AgentOrigin::Human { interactive } => {
@@ -85,15 +66,14 @@ fn label_origin(origin: &AgentOrigin) -> String {
     }
 }
 
-/// A stable group key — `kind` plus optional caller-claimed payload —
-/// usable as a `BTreeMap` key for deterministic ordering. Two origins
-/// with the same kind and payload (but different versions) group
-/// together; version is observability detail, not group identity.
+/// Stable `BTreeMap` group key (`kind` + optional caller payload) for
+/// deterministic ordering. Same kind+payload but different versions group
+/// together — version is observability detail, not identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OriginGroupKey {
     kind: String,
     payload: Option<String>,
-    // Discriminate interactive-vs-not for `human` — operators want to see them split.
+    // Split interactive-vs-not for `human`.
     interactive_flag: Option<bool>,
 }
 
@@ -158,29 +138,24 @@ impl OriginGroupKey {
     }
 }
 
-// ===========================================================================
 // `tirith agent sessions`
-// ===========================================================================
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct SessionGroup {
-    /// Stable kind tag — `"human"`, `"agent"`, `"mcp"`, `"gateway"`, `"ci"`,
-    /// `"ide"`, or `"unknown"`. Matches [`AgentOrigin::kind`] plus the
-    /// explicit `"unknown"` bucket for unattributed entries.
+    /// Kind tag (`"human"`/`"agent"`/`"mcp"`/`"gateway"`/`"ci"`/`"ide"`/`"unknown"`).
     kind: String,
-    /// Caller-claimed payload (tool / client_name / provider / ide name).
-    /// `None` for `human`, `gateway`, `unknown`, or a generic CI entry.
+    /// Caller-claimed payload (tool / client_name / provider / ide name);
+    /// `None` for human/gateway/unknown/generic-CI.
     #[serde(skip_serializing_if = "Option::is_none")]
     payload: Option<String>,
-    /// Best-effort interactivity flag for `human`. `None` for every other kind.
+    /// Interactivity flag for `human`; `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     interactive: Option<bool>,
     count: usize,
     /// Last-seen ISO 8601 timestamp.
     last_seen: String,
-    /// Per-action histogram — only `Allow` / `Warn` / `Block` are guaranteed
-    /// keys; other engine-emitted action strings (e.g. `WarnAck`) flow
-    /// through verbatim under their own key.
+    /// Per-action histogram; `Allow`/`Warn`/`Block` guaranteed, others (e.g.
+    /// `WarnAck`) flow through under their own key.
     actions: BTreeMap<String, usize>,
 }
 
@@ -221,9 +196,8 @@ pub fn sessions(log_override: Option<&str>, json: bool) -> i32 {
         }
     };
 
-    // Group only `verdict` entries — hook_telemetry / trust_change are not
-    // verdicts and carry `agent_origin = None` by design (chunk 1). Pulling
-    // them in would conflate categories.
+    // Group only `verdict` entries — hook_telemetry / trust_change carry
+    // `agent_origin = None` and would conflate categories.
     let mut groups: BTreeMap<OriginGroupKey, SessionGroup> = BTreeMap::new();
     for record in read
         .records
@@ -241,9 +215,7 @@ pub fn sessions(log_override: Option<&str>, json: bool) -> i32 {
         });
         entry.count += 1;
         *entry.actions.entry(record.action.clone()).or_insert(0) += 1;
-        // Last-seen is the maximum timestamp by lexicographic comparison
-        // — RFC 3339 timestamps sort correctly under that ordering (within
-        // the same time zone offset), and our writer always emits UTC.
+        // Max by lexicographic compare — UTC RFC 3339 sorts correctly.
         if record.timestamp > entry.last_seen {
             entry.last_seen.clone_from(&record.timestamp);
         }
@@ -310,15 +282,11 @@ fn print_sessions_human(log_path: &Path, groups: &[SessionGroup], skipped: usize
     }
 }
 
-/// Render a single `SessionGroup` as the human-output row.
-/// Split out from [`print_sessions_human`] so the formatter is
-/// unit-testable without redirecting stderr. `key.label()` already
-/// debug-escapes its caller-claimed payload via `{:?}` (see
-/// [`OriginGroupKey::label`]); `last_seen` is operator-trust input
-/// (loaded from the audit log JSONL) and is also debug-printed at this
-/// site so a stray control byte from a tampered or older-tirith log row
-/// renders as `\u{...}` rather than reaching the terminal raw.
-/// (Finding G — defense-in-depth.)
+/// Render a `SessionGroup` row. Split out so it's unit-testable without
+/// redirecting stderr. `last_seen` (operator-trust input from the JSONL log) is
+/// `{:?}`-escaped here so a stray control byte renders as `\u{...}` rather than
+/// reaching the terminal raw (Finding G defense-in-depth); `key.label()`
+/// already escapes its payload.
 fn format_session_group(g: &SessionGroup) -> String {
     let key = OriginGroupKey {
         kind: g.kind.clone(),
@@ -337,9 +305,7 @@ fn format_session_group(g: &SessionGroup) -> String {
     )
 }
 
-// ===========================================================================
 // `tirith agent explain`
-// ===========================================================================
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct ExplainMatch {
@@ -356,9 +322,7 @@ struct ExplainMatch {
     policy_path: Option<String>,
 }
 
-/// Cap on the number of matching entries surfaced; chosen to keep `tirith
-/// agent explain` output readable on a terminal while still being useful
-/// for a "show me what this caller has been doing" query.
+/// Cap on matching entries surfaced, to keep output terminal-readable.
 const EXPLAIN_MAX_MATCHES: usize = 20;
 
 pub fn explain(query: &str, log_override: Option<&str>, json: bool) -> i32 {
@@ -411,9 +375,8 @@ pub fn explain(query: &str, log_override: Option<&str>, json: bool) -> i32 {
         .into_iter()
         .filter(|r| r.entry_type.is_empty() || r.entry_type == "verdict")
         .filter(|r| {
-            // Exact session-id match wins, then case-insensitive substring on
-            // the redacted command, then a substring on the rendered origin
-            // label so an operator can search for "claude-code" etc.
+            // Exact session-id, then command substring, then origin-label
+            // substring (so an operator can search "claude-code" etc.).
             if r.session_id == query {
                 return true;
             }
@@ -514,19 +477,12 @@ fn print_explain_human(log_path: &Path, query: &str, matches: &[ExplainMatch], t
     }
 }
 
-/// Render a single `ExplainMatch` as the multi-line human-output block.
-/// Split out from [`print_explain_human`] so the formatter is unit-testable
-/// without redirecting stderr. **Every caller-controlled string is
-/// debug-printed (`{:?}`)** — `timestamp`, `session_id`, `action`,
-/// `rule_ids`, `command_redacted`, and `policy_path` are all loaded from
-/// the JSONL audit log and are operator-trust input. Sanitization at
-/// ingest drops the worst bytes (C0 + C1 controls + Unicode
-/// invisible/format), but an operator reading a log file written by an
-/// older tirith may still encounter a row a previous sanitizer let
-/// through. Debug-printing at this site is belt-and-braces so a surviving
-/// control byte renders as `\u{...}` rather than reaching the terminal
-/// raw. (Finding G — silent-failure-hunter H1.) `label_origin` already
-/// applies the same discipline to the embedded caller-claimed payload.
+/// Render an `ExplainMatch` block. Split out so it's unit-testable without
+/// redirecting stderr. Every caller-controlled string (timestamp, session_id,
+/// action, rule_ids, command_redacted, policy_path — all operator-trust input
+/// from the JSONL log) is `{:?}`-escaped here so a control byte a previous
+/// sanitizer let through renders as `\u{...}` not raw (Finding G H1);
+/// `label_origin` applies the same to the payload.
 fn format_explain_match(m: &ExplainMatch) -> String {
     let origin = m
         .agent_origin
@@ -560,14 +516,11 @@ fn format_explain_match(m: &ExplainMatch) -> String {
     s
 }
 
-// ===========================================================================
 // `tirith agent policy init`
-// ===========================================================================
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct AgentPolicyScaffold {
-    /// `true` when the audit log was readable. A missing log yields a
-    /// header-only scaffold and `audit_present: false`.
+    /// `true` when the log was readable (a missing log yields a header-only scaffold).
     audit_present: bool,
     /// The path the log was loaded from.
     log_path: String,
@@ -596,8 +549,8 @@ pub fn policy_init(log_override: Option<&str>, force: bool, json: bool) -> i32 {
     policy_init_for_root(&repo_root, log_override, force, json)
 }
 
-/// `policy init` against an explicit repo root. Split out so tests can drive
-/// the command against a tempdir without mutating process-wide env vars.
+/// `policy init` against an explicit repo root (so tests drive a tempdir
+/// without mutating process-wide env vars).
 pub(crate) fn policy_init_for_root(
     repo_root: &Path,
     log_override: Option<&str>,
@@ -694,10 +647,9 @@ pub(crate) fn policy_init_for_root(
     0
 }
 
-/// Render the scaffold to YAML. Every entry is commented out by design —
-/// mirrors `tirith mcp policy init`. Two runs against the same audit log
-/// produce a byte-identical scaffold (origins are sorted, header is fixed,
-/// no embedded timestamps).
+/// Render the scaffold to YAML, every entry commented out by design (mirrors
+/// `tirith mcp policy init`). Deterministic: byte-identical across runs against
+/// the same log (sorted origins, fixed header, no embedded timestamps).
 fn render_agent_policy_scaffold_yaml(scaffold: &AgentPolicyScaffold) -> String {
     let mut s = String::new();
     s.push_str("# Tirith agent governance policy scaffold (example)\n");
@@ -854,9 +806,7 @@ fn write_policy_init_json(
     )
 }
 
-// ===========================================================================
 // `tirith agent allow`
-// ===========================================================================
 
 pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
     let Some(kind) = AgentOriginKind::parse(kind_str) else {
@@ -884,14 +834,10 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
         return 1;
     }
 
-    // M4 PR #120 fix-6 (CodeRabbit Minor): the `--tool` payload must be
-    // run through the same `sanitize_caller_label` pipeline that
-    // stored agent origins are ingested with — otherwise a matcher
-    // emitted from `tirith agent allow --tool "  claude-code  "`
-    // never matches the stored origin (which had its whitespace
-    // stripped at ingest). The empty-check below is moved AFTER
-    // sanitization for the same reason: `--tool "   "` sanitizes to
-    // "" and must fall into the empty-string rejection arm.
+    // PR #120 fix-6: sanitize `--tool` through the same `sanitize_caller_label`
+    // pipeline stored origins use, else `--tool "  claude-code  "` never matches
+    // the (whitespace-stripped) stored origin. Empty-check is AFTER sanitization
+    // so `--tool "   "` falls into the empty-string rejection arm.
     let name = tool.map(tirith_core::agent_origin::sanitize_caller_label);
     if matches!(name.as_deref(), Some("")) {
         report_error(
@@ -934,9 +880,8 @@ pub fn allow(kind_str: &str, tool: Option<&str>, json: bool) -> i32 {
     0
 }
 
-/// Render the matcher as the YAML list-item snippet an operator pastes
-/// under `agent_rules.allow`. Always uses two-space indentation under
-/// `allow:` so it merges cleanly into a `tirith policy init` template.
+/// Render the matcher as a YAML list-item for `agent_rules.allow`, two-space
+/// indented to merge cleanly into a `tirith policy init` template.
 fn render_allow_snippet(m: &AgentMatcher) -> String {
     let mut s = String::new();
     s.push_str(&format!("    - kind: {}\n", m.kind.as_str()));
@@ -946,42 +891,20 @@ fn render_allow_snippet(m: &AgentMatcher) -> String {
     s
 }
 
-// ===========================================================================
 // `tirith agent block` — emit a deny-list YAML snippet
-// ===========================================================================
 
-/// `tirith agent block --kind <k> [--tool <t>] <pattern>`
+/// `tirith agent block --kind <k> [--tool <t>] <pattern>`. Validates the matcher
+/// like [`allow`], then prints the snippet for `agent_rules.deny:`. Deny is
+/// purely structural — any deny matcher forces a `Block` (beating allow) and the
+/// engine keys on `(kind, name)` ONLY.
 ///
-/// Validates the matcher exactly like [`allow`] does, then prints the YAML
-/// snippet the operator pastes under `agent_rules.deny:` in their policy.
-/// The `command_pattern` positional is captured but NOT folded into the
-/// emitted matcher — the engine schema today matches on `(kind, name)`
-/// only; the pattern is rendered as a YAML comment beside the snippet so
-/// the operator has a record of what the deny rule is meant to cover when
-/// the schema is later extended.
-///
-/// Schema honesty: the codebase's [`AgentMatcher`] carries `kind`, `name`, and
-/// (M13 ch5) the optional semantic predicates `filesystem_write` / `network` /
-/// `secrets_access`. The deny semantic is purely structural — any matcher listed
-/// under `agent_rules.deny` forces a `Block`, beating any allow entry, and the
-/// engine matcher keys on `(kind, name)` ONLY.
-///
-/// Because the engine ignores the semantic predicates when matching, a snippet
-/// carrying them would LOOK conditional ("deny only when it writes the
-/// filesystem") but actually deny EVERY command for that origin — a silent
-/// footgun. The `--filesystem-write` / `--network` / `--secrets-access` flags
-/// were therefore REMOVED from `tirith agent block` entirely (M13 PR #132
-/// round-28): they were parse-but-always-reject dead CLI surface. The
-/// `AgentMatcher` struct still carries the fields and `Policy::load` still parses
-/// them in `tirith_core`, so hand-written policies round-trip for forward-compat
-/// (and `policy_validate` still emits its advisory "this predicate has no effect"
-/// warning) — only `agent block` stops accepting them.
-///
-/// What IS emitted: the `kind` (+ `name` when supplied) matcher, plus the
-/// `command_pattern` positional rendered as a leading YAML comment
-/// (`# command pattern: <pattern>`). The pattern is captured but NOT folded into
-/// the matcher — the engine does not match per-command yet — so the comment is
-/// purely operator documentation.
+/// The `command_pattern` positional is NOT folded into the matcher (no
+/// per-command matching yet); it is rendered as a leading YAML comment for
+/// operator documentation. The `--filesystem-write` / `--network` /
+/// `--secrets-access` flags were REMOVED (M13 PR #132 round-28): since the engine
+/// ignores those predicates, a snippet carrying one would LOOK conditional but
+/// deny EVERY command — a silent footgun. The struct still carries the fields
+/// and `Policy::load` parses them for forward-compat; only `agent block` rejects them.
 pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json: bool) -> i32 {
     let Some(kind) = AgentOriginKind::parse(kind_str) else {
         report_error(
@@ -1007,9 +930,8 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
         return 1;
     }
 
-    // Same caller-label sanitization the `allow` path applies — keeps the
-    // matcher byte-comparable against stored origins, which were also
-    // ingested through `sanitize_caller_label`.
+    // Same `sanitize_caller_label` as `allow`, keeping the matcher
+    // byte-comparable against stored origins.
     let name = payload.map(tirith_core::agent_origin::sanitize_caller_label);
     if matches!(name.as_deref(), Some("")) {
         report_error(
@@ -1037,15 +959,11 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
         struct Out<'a> {
             schema_version: u32,
             matcher: &'a AgentMatcher,
-            /// The pattern the operator typed. Echoed back so a machine
-            /// consumer can correlate the snippet with the operator's
-            /// intent. Not yet honored by the engine matcher — see the
-            /// `command_pattern_supported` field.
+            /// The pattern the operator typed, echoed back for correlation. Not
+            /// yet honored by the engine — see `command_pattern_supported`.
             command_pattern: &'a str,
-            /// Whether `command_pattern` is enforced by the engine's
-            /// `apply_agent_rules` today. Always `false` in this release —
-            /// the engine matches on `(kind, name)` only; the pattern is
-            /// captured for documentation and forward compatibility.
+            /// Whether the engine enforces `command_pattern`. Always `false`
+            /// (matching is `(kind, name)` only); captured for forward compat.
             command_pattern_supported: bool,
             snippet: &'a str,
             /// Honest reminder: this command does NOT mutate any policy file.
@@ -1073,15 +991,10 @@ pub fn block(kind_str: &str, payload: Option<&str>, command_pattern: &str, json:
     0
 }
 
-/// Render the matcher as the YAML list-item snippet an operator pastes
-/// under `agent_rules.deny`. Two-space indentation matches the
-/// `tirith policy init` template's `deny:` block.
-///
-/// The `pattern` is rendered as a YAML comment immediately above the
-/// matcher (`# command pattern: <pattern>`) so it is preserved in version
-/// control without changing the engine-consumed structure. The comment
-/// runs through `yaml_safe_scalar` so a hostile pattern carrying ANSI
-/// escapes or newlines cannot inject into adjacent YAML lines.
+/// Render the matcher as a YAML list-item for `agent_rules.deny` (two-space
+/// indented). The `pattern` is a leading `# command pattern:` comment, run
+/// through `yaml_safe_scalar` so a hostile pattern with ANSI/newlines can't
+/// inject into adjacent YAML lines.
 fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -1092,36 +1005,22 @@ fn render_block_snippet(m: &AgentMatcher, pattern: &str) -> String {
     if let Some(t) = m.name.as_deref() {
         s.push_str(&format!("      name: {}\n", yaml_safe_scalar(t)));
     }
-    // `agent block` does not emit the M13 ch5 semantic predicates
-    // (`filesystem_write` / `network` / `secrets_access`). The engine matcher is
-    // `(kind, name)` only, so emitting a predicate would silently widen the deny
-    // to ALL commands for the origin. The `--filesystem-write` / `--network` /
-    // `--secrets-access` flags were removed from the CLI surface entirely
-    // (M13 PR #132 round-28), so the matcher reaching here never carries one.
+    // No semantic predicates emitted — the engine keys on `(kind, name)` only,
+    // so a predicate would silently widen the deny to ALL commands (the flags
+    // were removed in M13 PR #132 round-28).
     s
 }
 
-// ===========================================================================
 // `tirith agent current` — print the running process's claimed origin
-// ===========================================================================
 
-/// `tirith agent current` — report the [`AgentOrigin`] the engine would
-/// attribute to this process if it ran a verdict right now.
-///
-/// Uses the same resolver `tirith check` uses (`resolve_cli_origin`),
-/// fed with the same interactive detection logic
-/// (`TIRITH_INTERACTIVE=1` overrides, otherwise `stderr.is_terminal()`).
-///
-/// This is observability, not enforcement: every signal is
-/// caller-claimed and settable by any process running as the user. Use
-/// it to debug agent-rules / hook integration ("what is tirith
-/// attributing me as?") not as authentication.
+/// Report the [`AgentOrigin`] the engine would attribute to this process now,
+/// via the same `resolve_cli_origin` / interactive detection `tirith check`
+/// uses. Observability, not enforcement: every signal is caller-claimed and
+/// settable by any process running as the user — use it to debug agent-rules /
+/// hook integration, never as authentication.
 pub fn current(json: bool) -> i32 {
-    // Mirror `cli::check`'s interactive detection — env var override
-    // first, otherwise the stderr-TTY heuristic. We have no
-    // `--interactive` / `--non-interactive` flag here; this command
-    // does not run analysis, so the env var is the operator's only
-    // override channel.
+    // Mirror `cli::check`'s interactive detection — env override, else the
+    // stderr-TTY heuristic (no flag here; this command runs no analysis).
     let interactive = if let Ok(val) = std::env::var("TIRITH_INTERACTIVE") {
         val == "1"
     } else {
@@ -1154,9 +1053,8 @@ pub fn current(json: bool) -> i32 {
     0
 }
 
-/// Gather the per-signal snapshot used by `current --format json`.
-/// Pulled into its own helper so the JSON path stays narrow and the
-/// stringly-typed env-var lookups live in one place.
+/// Per-signal snapshot for `current --format json`, in one helper so the
+/// stringly-typed env lookups live in one place.
 fn current_signals(interactive: bool) -> CurrentSignalsOwned {
     let tirith_integration = std::env::var("TIRITH_INTEGRATION").ok().and_then(|raw| {
         let s = tirith_core::agent_origin::sanitize_caller_label(&raw);
@@ -1173,10 +1071,8 @@ fn current_signals(interactive: bool) -> CurrentSignalsOwned {
     let ci_generic = std::env::var("CI")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    // The raw value of `TIRITH_INTERACTIVE` is reported verbatim (rather
-    // than the resolved bool) so the operator can see exactly what they
-    // set. Bounded to a tiny fixed set ("0" / "1" / other) — anything
-    // longer is debug-escaped.
+    // Report the raw `TIRITH_INTERACTIVE` value (not the resolved bool) so the
+    // operator sees what they set; anything other than "0"/"1" is debug-escaped.
     let tirith_interactive_env = std::env::var("TIRITH_INTERACTIVE").ok().map(|v| {
         if v == "0" || v == "1" {
             v
@@ -1272,13 +1168,10 @@ it never authenticates a hostile one."
     );
 }
 
-// ===========================================================================
 // helpers — repo root, error reporting, YAML escaping
-// ===========================================================================
 
-/// Resolve the repository root the same way `tirith policy init` does:
-/// `.git`-boundary walk-up from cwd, falling back to cwd itself when no
-/// repo is found.
+/// Resolve the repo root like `tirith policy init`: `.git`-boundary walk-up from
+/// cwd, falling back to cwd.
 fn find_repo_root_or_cwd() -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
@@ -1286,10 +1179,8 @@ fn find_repo_root_or_cwd() -> Result<PathBuf, String> {
     Ok(policy::find_repo_root(Some(&cwd_str)).unwrap_or(cwd))
 }
 
-// `yaml_safe_scalar` is the YAML-scalar safety helper formerly duplicated
-// here and in `cli/mcp.rs`. M4 item 8 chunk 3 consolidates both copies into
-// `crate::cli::yaml::safe_scalar`. The thin local alias preserves the
-// original name so the existing call sites and tests stay terse.
+// Local alias for the shared YAML-scalar safety helper (consolidated from a copy
+// formerly duplicated here and in `cli/mcp.rs`), keeping call sites terse.
 use crate::cli::yaml::safe_scalar as yaml_safe_scalar;
 
 fn report_error(json: bool, command: &str, message: &str) {
@@ -1319,13 +1210,9 @@ mod tests {
     use tempfile::tempdir;
     use tirith_core::agent_origin::AgentOrigin;
 
-    /// Write a verdict-shape audit-log line directly to `log_path`. We craft
-    /// the JSONL by hand rather than calling `log_verdict` so the test
-    /// (a) doesn't need to touch process env vars (no XDG/APPDATA mutation),
-    /// (b) doesn't need the lock on the engine, and (c) controls the
-    /// timestamp ordering deterministically.
-    ///
-    /// The line matches the `AuditEntry` shape produced by `audit::log_verdict`.
+    /// Write a verdict-shape audit line (matching `audit::log_verdict`'s
+    /// `AuditEntry`) by hand rather than via `log_verdict`, so the test touches
+    /// no process env vars / engine lock and controls timestamp ordering.
     fn plant_audit_line(
         log_path: &Path,
         timestamp: &str,
@@ -1396,13 +1283,10 @@ mod tests {
     // `agent block` — happy path
     // -----------------------------------------------------------------------
 
-    /// A well-formed `(kind, name, pattern)` matcher is accepted and returns 0.
-    /// Calling `block` directly (rather than spawning the binary) pins the
-    /// happy-path contract at the unit boundary. The M13 ch5 semantic predicate
-    /// flags (`--filesystem-write` / `--network` / `--secrets-access`) were
-    /// removed from this command entirely (M13 PR #132 round-28), so there is no
-    /// longer a predicate-rejection path to cover here — the `cli_integration`
-    /// regression test confirms those flags are now unknown clap arguments.
+    /// A well-formed `(kind, name, pattern)` matcher is accepted (exit 0). The
+    /// semantic-predicate flags were removed (M13 PR #132 round-28), so there is
+    /// no predicate-rejection path here (the `cli_integration` test confirms
+    /// they're now unknown clap args).
     #[test]
     fn block_with_valid_matcher_succeeds() {
         let rc = block("agent", Some("codex"), "sudo *", /* json = */ false);
@@ -1411,24 +1295,19 @@ mod tests {
             "a block with a valid (kind, name, pattern) must succeed (exit 0)"
         );
 
-        // `block` writes its snippet to stdout and returns only an exit code, so
-        // it isn't directly capturable here. Round-trip the snippet `block`
-        // would emit by rendering it with the SAME matcher and pattern, mirroring
-        // how `allow_snippet_round_trips_through_yaml` parses the allow snippet.
+        // `block` only writes to stdout + returns a code, so round-trip the
+        // snippet it would emit (as `allow_snippet_round_trips_through_yaml` does).
         let matcher = AgentMatcher::new(AgentOriginKind::Agent, Some("codex".to_string()));
         let snippet = render_block_snippet(&matcher, "sudo *");
 
-        // The pattern comment marker is still emitted (round-28 only removed the
-        // semantic-predicate flags, not the `# command pattern:` documentation).
+        // The pattern comment marker survives (round-28 removed only the flags).
         assert!(
             snippet.contains("# command pattern:"),
             "block snippet must still carry the pattern comment marker"
         );
 
-        // Parse the snippet under an `agent_rules.deny:` block and assert the
-        // emitted matcher mapping carries EXACTLY `kind` + `name` — no
-        // semantic-predicate keys (`filesystem_write` / `network` /
-        // `secrets_access`), confirming the round-28 flag removal holds.
+        // The emitted matcher must carry EXACTLY kind + name (no predicate keys),
+        // confirming the round-28 removal holds.
         let yaml = format!("agent_rules:\n  deny:\n{snippet}");
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("snippet parses");
         let entry = parsed
@@ -1577,9 +1456,8 @@ mod tests {
 
     #[test]
     fn sessions_json_format_outputs_structured_payload() {
-        // Smoke-test the JSON branch — we just verify the exit code, not stdout
-        // capture (that needs a subprocess test, which the integration suite
-        // already covers for similar commands).
+        // Smoke the JSON branch via exit code (stdout capture is a subprocess
+        // test the integration suite covers).
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let human = AgentOrigin::human(true);
@@ -1715,34 +1593,17 @@ mod tests {
         assert_eq!(code, 1);
     }
 
-    // -----------------------------------------------------------------------
-    // human-output ANSI/CSI defense (Finding G)
-    // -----------------------------------------------------------------------
-    //
-    // `print_explain_human` / `print_sessions_human` render strings loaded
-    // from the JSONL audit log. Sanitization at ingest drops the worst
-    // bytes (`agent_origin::sanitize_caller_label` now drops C0 + C1
-    // controls + Unicode invisible/format), but an operator reading a log
-    // file written by an older tirith may still encounter a row a previous
-    // sanitizer let through. The formatter helpers route every
-    // caller-controlled string through `{:?}` (Debug) as defense-in-depth.
-    // These tests construct hostile-looking inputs and assert the rendered
-    // bytes are printable-only — every escape sequence introducer / NUL /
-    // newline must appear as `\u{...}` or `\n`, never as the raw byte.
+    // human-output ANSI/CSI defense (Finding G): the formatters render
+    // operator-trust JSONL-log strings through `{:?}` as defense-in-depth. These
+    // tests feed hostile inputs and assert the output is printable-only (every
+    // ESC/NUL/newline appears escaped, never raw).
 
-    /// Returns `true` if every byte is printable ASCII, a tab, or part of a
-    /// well-formed UTF-8 sequence. We disallow ESC (0x1B), CSI (0x9B-as-byte
-    /// is part of UTF-8 lead, so it cannot appear bare in &str), NUL, and
-    /// any bare C0 / C1 byte that would reach the terminal as-is. The
-    /// formatter helpers use `{:?}` so all these arrive escaped; this
-    /// helper makes the assertion explicit at the bytes level.
+    /// `true` if every byte is printable ASCII, tab, newline, or a UTF-8
+    /// high byte — i.e. no bare ESC/NUL/C0/C1 the `{:?}` formatting should escape.
     fn is_printable_only(bytes: &[u8]) -> bool {
         for &b in bytes {
-            // Allowed: printable ASCII (0x20..=0x7E), tab (0x09), newline
-            // (0x0A — emitted intentionally by the formatter between
-            // entries), or any byte >= 0x80 (UTF-8 continuation/lead — the
-            // string we received is &str so high bytes are well-formed and
-            // the Debug-printed escape already neutralized any C1 controls).
+            // Allowed: printable ASCII, tab, formatter-emitted newline, or any
+            // >= 0x80 (well-formed UTF-8 in a &str; `{:?}` neutralized C1).
             let ok = (0x20..=0x7E).contains(&b) || b == b'\t' || b == b'\n' || b >= 0x80;
             if !ok {
                 return false;
@@ -1753,16 +1614,11 @@ mod tests {
 
     #[test]
     fn format_explain_match_debug_escapes_hostile_caller_strings() {
-        // Construct an ExplainMatch with hostile bytes in EVERY
-        // caller-controlled string slot. These would never survive
-        // `sanitize_caller_label` at ingest today (after the C1 extension
-        // in this commit), but an older tirith may have logged them. The
-        // formatter is the defense-in-depth layer.
+        // Hostile bytes in EVERY caller-controlled slot — simulating a row an
+        // older tirith logged; the formatter is the defense-in-depth layer.
         let hostile_origin = AgentOrigin::Mcp {
-            // `Mcp` constructor sanitizes its inputs, so we build the
-            // variant directly to skip that path and simulate "a log file
-            // written by older tirith". The literal here is well-formed
-            // UTF-8; `{:?}` will escape it as `\u{1b}` etc.
+            // Built directly (the `Mcp` constructor sanitizes) to simulate an
+            // older-tirith log row; `{:?}` escapes it as `\u{1b}` etc.
             client_name: "evil\x1b[31mtool".to_string(),
             client_version: None,
         };
@@ -1805,8 +1661,7 @@ mod tests {
         actions.insert("Allow".to_string(), 1);
         let g = SessionGroup {
             kind: "mcp".to_string(),
-            // The label embeds this payload through `{:?}` already
-            // (`OriginGroupKey::label`); the test still confirms the
+            // `label()` already `{:?}`-embeds this; the test confirms the
             // assembled bytes are clean.
             payload: Some("ev\x1b[31mil".to_string()),
             interactive: None,
@@ -1992,9 +1847,8 @@ mod tests {
 
     #[test]
     fn policy_init_scaffold_yaml_survives_hostile_payload() {
-        // A hostile tool name (with ANSI escapes, newlines) is quoted-and-escaped
-        // by yaml_safe_scalar so the generated YAML stays parseable AND no raw
-        // control byte reaches the operator's terminal.
+        // A hostile tool name is escaped by yaml_safe_scalar: the YAML stays
+        // parseable and no raw control byte reaches the terminal.
         let scaffold = AgentPolicyScaffold {
             audit_present: true,
             log_path: "/tmp/audit.jsonl".to_string(),
@@ -2016,10 +1870,8 @@ mod tests {
         );
     }
 
-    /// CodeRabbit M13 PR #132 round-23 F2: the user-facing scaffold header must
-    /// use EVERGREEN wording for the `TIRITH=0`-bypass caveat — no stale milestone
-    /// reference ("revisit in M5") should ship in the generated example file. The
-    /// header block is emitted unconditionally, so any scaffold exercises it.
+    /// M13 PR #132 round-23 F2: the scaffold header's `TIRITH=0`-bypass caveat
+    /// must use EVERGREEN wording — no stale "revisit in M5" milestone reference.
     #[test]
     fn policy_init_scaffold_header_uses_evergreen_wording() {
         let scaffold = AgentPolicyScaffold {
@@ -2102,30 +1954,18 @@ mod tests {
         assert_eq!(code, 1);
     }
 
-    /// M4 PR #120 fix-6 (CodeRabbit Minor) — pin that
-    /// `tirith agent allow --tool "  claude-code  "` sanitizes the
-    /// payload through `sanitize_caller_label` (the same pipeline that
-    /// stored origins go through at ingest) so the emitted matcher
-    /// actually matches the stored origin "claude-code". Before fix-6,
-    /// the whitespace slipped through into the matcher payload and the
-    /// matcher would never match any real-world origin.
+    /// PR #120 fix-6 — `--tool "  claude-code  "` must sanitize through
+    /// `sanitize_caller_label` so the emitted matcher matches the stored origin.
     #[test]
     fn tirith_agent_allow_normalizes_whitespace_payload() {
-        // The CLI top-level `allow` function only prints + returns an
-        // exit code, so to pin the actual matcher we exercise the same
-        // sanitize_caller_label call on a whitespace-padded input and
-        // assert the result is the trimmed form. That is the
-        // sanitization pin; the wiring into `allow` is covered by the
-        // `..._accepts_whitespace_padded_tool` exit-code test below.
+        // `allow` only returns an exit code, so pin the sanitizer directly; the
+        // wiring is covered by `allow_accepts_whitespace_padded_tool`.
         let sanitized = tirith_core::agent_origin::sanitize_caller_label("  claude-code  ");
         assert_eq!(sanitized, "claude-code");
     }
 
-    /// M4 PR #120 fix-6 (CodeRabbit Minor) — paired with
-    /// `tirith_agent_allow_normalizes_whitespace_payload`. The CLI top-
-    /// level `allow` must accept a whitespace-padded tool (sanitizing it
-    /// down to "claude-code") and exit 0, NOT reject it as an empty
-    /// payload after sanitization (because "claude-code" is non-empty).
+    /// PR #120 fix-6 — a whitespace-padded tool sanitizes to "claude-code" and
+    /// must exit 0, not be rejected as empty.
     #[test]
     fn allow_accepts_whitespace_padded_tool() {
         let code = allow("agent", Some("  claude-code  "), false);
@@ -2135,9 +1975,8 @@ mod tests {
         );
     }
 
-    /// M4 PR #120 fix-6 (CodeRabbit Minor) — a whitespace-only tool
-    /// sanitizes to "" and must fall into the empty-string rejection
-    /// arm (same exit code as `Some("")` directly).
+    /// PR #120 fix-6 — a whitespace-only tool sanitizes to "" and must hit the
+    /// empty-string rejection arm.
     #[test]
     fn allow_rejects_whitespace_only_tool() {
         let code = allow("agent", Some("   "), false);
@@ -2150,8 +1989,7 @@ mod tests {
     #[test]
     fn allow_snippet_round_trips_through_yaml() {
         // The emitted snippet must parse cleanly inside an agent_rules.allow
-        // block — `tirith policy validate` is what the operator will run after
-        // pasting, and a broken render would break that.
+        // block (what the operator runs `tirith policy validate` against).
         let snippet = render_allow_snippet(&AgentMatcher {
             kind: AgentOriginKind::Agent,
             name: Some("claude-code".to_string()),

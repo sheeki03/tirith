@@ -1,64 +1,40 @@
 //! Prompt-injection seed detection (M7 ch5).
 //!
-//! Scans text — agent output, error log, build log, paste content — for
-//! well-known prompt-injection markers like "ignore previous instructions",
-//! "you are now", "DAN mode". When found, emits a [`Finding`] tagged with
-//! one of two rule IDs:
-//!
-//! - [`RuleId::IgnorePreviousInstructions`] — phrases that explicitly try
-//!   to wipe / override the agent's prior context ("ignore previous
-//!   instructions", "disregard above", "override your instructions",
-//!   "new instructions:", "ignore your training").
-//! - [`RuleId::PromptInjectionInOutput`] — broader injection / role-override
-//!   markers ("act as <role>", "you are now", "system:", "do anything now",
-//!   "DAN mode"). The bucket of last resort for the catalog.
-//!
-//! Both rules are **High severity**. The list of seeds lives in
-//! `crates/tirith-core/assets/data/prompt_injection_seeds.txt` so it can
-//! grow over time without touching this file.
+//! Scans text (agent output, logs, paste content) for well-known injection
+//! markers and emits a [`Finding`] tagged with one of two rule IDs:
+//! [`RuleId::IgnorePreviousInstructions`] for explicit context-override phrases,
+//! and [`RuleId::PromptInjectionInOutput`] for broader role-override / jailbreak
+//! markers ("act as <role>", "you are now", "DAN mode"). Both are High severity.
+//! Seeds live in `assets/data/prompt_injection_seeds.txt`.
 //!
 //! # Honest scope
 //!
-//! This rule catches **well-known seed phrases**. It is not a complete
-//! prompt-injection defense. Treat all agent output as untrusted regardless
-//! of whether this rule fires. Sophisticated injections (encoded payloads,
-//! cross-language phrasing, polite paraphrases) will slip past — this is a
-//! "did the cheap version of the attack appear verbatim?" smoke alarm.
-//!
-//! The two-tier ID split lets policy authors differentiate the highest-
-//! confidence override phrases (`IgnorePreviousInstructions`) from the
-//! looser role-override / jailbreak family (`PromptInjectionInOutput`)
-//! when tuning severity overrides in `.tirith/policy.yaml`.
+//! This catches **well-known seed phrases only** — not a complete defense.
+//! Treat all agent output as untrusted regardless of whether this fires;
+//! encoded / paraphrased injections will slip past. The two-tier ID split lets
+//! policy authors tune severity for the two families separately.
 //!
 //! # Pipelines
 //!
-//! [`check`] is called from:
-//! - [`crate::engine::analyze_output`] (and its streaming sibling
-//!   `analyze_output_finalize`) — the M7 ch1 output-direction pipeline.
-//! - [`crate::engine::analyze`] for `ScanContext::Paste` only — so a
-//!   `tirith paste` of agent output catches the same patterns. The
-//!   PATTERN_TABLE entry `prompt_injection_seed` keeps the rule
-//!   reachable from tier-1 in that context; the output pipeline bypasses
-//!   PATTERN_TABLE entirely (output is never gated by tier-1).
-//! - `tirith logs scan` calls [`check`] **directly** from
-//!   `cli::logs.rs` for the file-scan audit target — the engine's
-//!   FileScan path deliberately does NOT wire this rule to avoid
-//!   false-flagging documentation that quotes injection seeds.
+//! [`check`] is called from [`crate::engine::analyze_output`] (and
+//! `analyze_output_finalize`), from [`crate::engine::analyze`] for
+//! `ScanContext::Paste` only (the PATTERN_TABLE entry `prompt_injection_seed`
+//! keeps it tier-1-reachable there; the output pipeline bypasses PATTERN_TABLE),
+//! and **directly** from `cli::logs.rs` for `tirith logs scan`. The engine's
+//! FileScan path deliberately does NOT wire this rule, to avoid false-flagging
+//! documentation that quotes injection seeds.
 //!
 //! # Asset format
 //!
-//! See `assets/data/prompt_injection_seeds.txt` — one regex per line,
-//! lines starting with `#` are comments, blank lines are ignored.
-//! `<placeholder>` tokens inside a seed are rewritten to `\S+` so the seed
-//! `act as <role>` matches `act as DAN` or `act as administrator`.
+//! One regex per line; `#` lines are comments, blanks ignored. `<placeholder>`
+//! tokens are rewritten to `\S+` so `act as <role>` matches `act as DAN`.
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// The raw seed file is embedded at compile time so the rule has no
-/// I/O dependency at runtime.
+/// The seed file, embedded at compile time (no runtime I/O dependency).
 const SEEDS_ASSET: &str = include_str!("../../assets/data/prompt_injection_seeds.txt");
 
 /// One compiled seed entry — the regex plus the rule it routes to.
@@ -69,9 +45,7 @@ struct Seed {
     raw: String,
 }
 
-/// Decide which RuleId a seed line routes to. We use a small, explicit
-/// keyword table so a future maintainer can grep for the classification
-/// without rerunning the rule against a corpus.
+/// Decide which RuleId a seed line routes to, via a small explicit keyword table.
 fn classify(seed_lc: &str) -> RuleId {
     const IGNORE_PHRASES: &[&str] = &[
         "ignore",
@@ -87,19 +61,16 @@ fn classify(seed_lc: &str) -> RuleId {
     }
 }
 
-/// Rewrite `<placeholder>` tokens inside a seed line to `\S+` so the seed
-/// `act as <role>` matches arbitrary role names. Only `<word>` style
-/// placeholders are rewritten; `<` / `>` appearing in real text (e.g.
-/// inside an HTML fragment) is escaped normally by [`build_regex`].
+/// Rewrite `<placeholder>` tokens in a seed to `\S+` so `act as <role>` matches
+/// arbitrary role names. Only `<word>`-style tokens are rewritten.
 fn substitute_placeholders(seed: &str) -> String {
     static PLACEHOLDER_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"<[a-zA-Z][a-zA-Z0-9_-]*>").unwrap());
     PLACEHOLDER_RE.replace_all(seed, r"\S+").into_owned()
 }
 
-/// Compile one seed line into a case-insensitive regex. Returns `None` and
-/// logs a warning when the seed is itself an invalid regex — the rule's
-/// other seeds still load, so a typo in the data file degrades gracefully.
+/// Compile one seed into a case-insensitive regex. Returns `None` + a warning on
+/// an invalid-regex seed so a typo degrades gracefully (other seeds still load).
 fn build_regex(seed: &str) -> Option<Regex> {
     let pattern = substitute_placeholders(seed);
     match RegexBuilder::new(&pattern).case_insensitive(true).build() {
@@ -130,9 +101,8 @@ static SEEDS: Lazy<Vec<Seed>> = Lazy::new(|| {
     out
 });
 
-/// Scan `input` for prompt-injection seed phrases and return one [`Finding`]
-/// per distinct seed that fires. A single seed only emits once even if it
-/// matches several times — duplicate evidence would only inflate noise.
+/// Scan `input` for seed phrases, one [`Finding`] per distinct seed that fires
+/// (a seed emits once even if it matches several times).
 pub fn check(input: &str) -> Vec<Finding> {
     if input.is_empty() {
         return Vec::new();

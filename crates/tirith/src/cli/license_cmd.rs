@@ -254,8 +254,7 @@ fn print_license_json(info: &license::LicenseInfo) {
     println!();
 }
 
-/// Format an expiry string for display.
-/// Handles both Unix timestamps and ISO 8601 date strings.
+/// Format an expiry string (Unix timestamp or ISO 8601) for display.
 fn format_expiry(exp: &str) -> String {
     if let Ok(ts) = exp.parse::<i64>() {
         if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {

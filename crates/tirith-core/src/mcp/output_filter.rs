@@ -1,34 +1,21 @@
-//! MCP tool-result output filter (M7 ch4).
+//! MCP tool-result output filter (M7 ch4). Routes a [`ToolCallResult`]'s
+//! `content[].text` through [`crate::engine::analyze_output`] and rewrites by
+//! verdict [`Action`]:
 //!
-//! Routes a returning [`ToolCallResult`]'s `content[].text` through
-//! [`crate::engine::analyze_output`] and rewrites the result based on the
-//! verdict's [`Action`]:
-//!
-//! * `Block` — replace `content` with a single placeholder text item and set
-//!   `isError: true`. The placeholder cites the `event_id` so an operator
-//!   reading the audit log can correlate.
-//! * `Warn` — preserve `isError`; prepend a `[tirith: WARNING …]` text item;
-//!   sanitize the existing text items in place (strip ANSI / OSC /
-//!   zero-width — bytes are scrubbed, structure preserved).
+//! * `Block` — replace `content` with one placeholder text item citing the
+//!   `event_id` (for audit-log correlation) and set `isError: true`.
+//! * `Warn` — keep `isError`; prepend a `[tirith: WARNING …]` item and sanitize
+//!   existing text in place (strip ANSI/OSC/zero-width, structure preserved).
 //! * `Allow` — pass through unchanged.
 //!
-//! The single chosen protocol behavior is **MCP `isError: true` with sanitized
-//! placeholder content** for blocks. A JSON-RPC error envelope would signal
-//! transport/protocol failure, not content policy — see
+//! Blocks use MCP `isError: true` + placeholder, NOT a JSON-RPC error envelope
+//! (that signals transport failure, not content policy). See
 //! [`docs/mcp-output-filter.md`](../../../docs/mcp-output-filter.md).
 //!
-//! ## Risks handled
-//!
-//! 1. **Latency cap** — scanned payload per call is capped at
-//!    [`MAX_SCAN_BYTES`]. Beyond cap we mark the result with a truncation
-//!    notice but never drop content silently.
-//! 2. **False positive on benign agent output** — the output ruleset (M7 ch1)
-//!    intentionally flags only the dangerous subset (OSC52 clipboard write,
-//!    OSC0/OSC2 title rewrite, screen clear, hyperlink mismatch, hidden-text,
-//!    fake-prompt). Plain SGR color is allowed.
-//! 3. **Fail-mode** — `fail_mode_closed=true` callers (default for
-//!    `mcp-server --sanitize-tool-output`) must DENY on analysis error
-//!    rather than passing content through.
+//! Risks handled: per-call scan capped at [`MAX_SCAN_BYTES`] (truncation noted,
+//! content never silently dropped); the M7 ch1 ruleset flags only the dangerous
+//! subset (plain SGR colour passes); and `fail_mode_closed=true` callers DENY on
+//! analysis error rather than passing content through.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,38 +24,27 @@ use crate::verdict::{Action, Finding, Severity};
 
 use super::types::{ContentItem, ToolCallResult};
 
-/// Per-call scan cap. `analyze_output` is sub-ms on payloads of this size;
-/// beyond it we mark the result with a truncation notice and only scan the
-/// first `MAX_SCAN_BYTES` of concatenated text. Never drop content silently.
+/// Per-call scan cap. Beyond it the result is marked truncated and only the first
+/// `MAX_SCAN_BYTES` of concatenated text is scanned. Never drop content silently.
 pub const MAX_SCAN_BYTES: usize = 1_048_576;
 
-/// Outcome of one filter pass — used by callers to write an audit line and
-/// surface user-visible context (the event_id is the join key against the
-/// audit log).
+/// Outcome of one filter pass (the `event_id` is the join key against the audit log).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterOutcome {
-    /// Effective action after the filter ran. `Action::WarnAck` is folded
-    /// into `Warn` for transport purposes (the protocol surface is just
-    /// block/warn/allow).
+    /// Effective action after the filter ran (`WarnAck` is folded into `Warn`).
     pub action: Action,
-    /// Stable identifier persisted to the placeholder text on block so an
-    /// operator can correlate the agent-facing message with the audit line.
+    /// Stable id persisted to the block placeholder for audit correlation.
     pub event_id: String,
     /// Rule IDs that fired, in scan order.
     pub rule_ids: Vec<String>,
     /// Highest severity that fired (None if no findings).
     pub max_severity: Option<Severity>,
-    /// Wall time spent in `analyze_output` (sub-ms in practice).
+    /// Wall time spent in `analyze_output`.
     pub elapsed_ms: f64,
-    /// `true` when the scanned slice was truncated to `MAX_SCAN_BYTES`. The
-    /// caller may want to surface this to the user; the in-result placeholder
-    /// (block path) cites it implicitly via the audit cross-reference.
+    /// `true` when the scanned slice was truncated to `MAX_SCAN_BYTES`.
     pub truncated: bool,
-    /// `true` when the wrapping response was force-blocked because the scan
-    /// could not be completed within budget under `fail_mode_closed`. v1
-    /// currently sets this only on the truncation-degrades-to-block path
-    /// (`MAX_SCAN_BYTES` exceeded with closed fail-mode); future analysis-
-    /// error rules may set it as well.
+    /// `true` when the response was force-blocked because the scan couldn't
+    /// complete in budget under `fail_mode_closed` (v1: the truncation path only).
     pub fail_mode_triggered: bool,
 }
 
@@ -79,20 +55,15 @@ impl FilterOutcome {
     }
 }
 
-/// Run the output filter on `result` in place. Returns the [`FilterOutcome`]
-/// so the caller can write an audit entry and decide on further routing.
-///
-/// `fail_mode_closed` — when `true`, an analysis error degrades to BLOCK
-/// (the default for `mcp-server --sanitize-tool-output`). Under `false`
-/// (the gateway default) an analysis error degrades to ALLOW (pass through).
+/// Run the output filter on `result` in place, returning a [`FilterOutcome`] for
+/// audit + routing. `fail_mode_closed`: `true` degrades an analysis error to
+/// BLOCK (default for `mcp-server --sanitize-tool-output`); `false` (gateway
+/// default) degrades to ALLOW.
 pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -> FilterOutcome {
     let event_id = uuid::Uuid::new_v4().to_string();
 
-    // Concatenate `content[].text` for analysis. We only inspect text items;
-    // structured/non-text items pass through untouched. A NUL byte separates
-    // items so a multi-item OSC payload split across items is not joined
-    // back into a single sequence — that's a real corner case and the
-    // separator keeps the scanner honest.
+    // Concatenate `content[].text` (text items only; others pass through). A NUL
+    // separates items so an OSC payload split across items isn't rejoined.
     let mut joined = String::new();
     let mut total_bytes: usize = 0;
     let mut truncated = false;
@@ -151,13 +122,11 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
         }
         Action::Warn | Action::WarnAck => {
             apply_warn(result, &event_id, &verdict.findings);
-            // Normalize WarnAck → Warn for transport purposes.
-            outcome.action = Action::Warn;
+            outcome.action = Action::Warn; // normalize WarnAck → Warn for transport
         }
         Action::Allow => {
             if truncated && fail_mode_closed {
-                // We never finished scanning — under closed fail-mode, we
-                // refuse to forward content we did not analyze in full.
+                // Closed fail-mode: refuse to forward content not analyzed in full.
                 apply_block(result, &event_id);
                 outcome.action = Action::Block;
                 outcome.fail_mode_triggered = true;
@@ -168,9 +137,8 @@ pub fn filter_tool_result(result: &mut ToolCallResult, fail_mode_closed: bool) -
     outcome
 }
 
-/// Block path: replace `content` with a single placeholder text item and set
-/// `isError: true`. Structure preserved (a `content` array with one
-/// well-formed text item) so MCP clients render the message uniformly.
+/// Block path: replace `content` with one placeholder text item and set
+/// `isError: true` (structure preserved so MCP clients render uniformly).
 fn apply_block(result: &mut ToolCallResult, event_id: &str) {
     result.content = vec![ContentItem {
         content_type: "text".to_string(),
@@ -181,8 +149,8 @@ fn apply_block(result: &mut ToolCallResult, event_id: &str) {
     result.is_error = true;
 }
 
-/// Warn path: prepend a `[tirith: WARNING …]` notice and sanitize each
-/// existing text item in place. Non-text items pass through.
+/// Warn path: prepend a `[tirith: WARNING …]` notice and sanitize each existing
+/// text item in place (non-text items pass through).
 fn apply_warn(result: &mut ToolCallResult, event_id: &str, findings: &[Finding]) {
     let n = findings.len();
     let warning = ContentItem {
@@ -199,20 +167,16 @@ fn apply_warn(result: &mut ToolCallResult, event_id: &str, findings: &[Finding])
         }
         let mut out = Vec::with_capacity(item.text.len());
         sanitize_text_into(item.text.as_bytes(), &mut out);
-        // Bytes scrubbed of escape sequences/zero-width are valid UTF-8 if the
-        // input was — we only drop chars, never split a char mid-byte.
+        // Scrubbed output stays valid UTF-8 (we drop whole chars, never split one).
         item.text = String::from_utf8(out).unwrap_or_else(|_| item.text.clone());
     }
 
     result.content.insert(0, warning);
 }
 
-/// Strip ANSI / OSC / APC / DCS escape sequences and zero-width characters
-/// from `chunk` into `out`. Mirrors the helper in `tirith view` so the two
-/// surfaces sanitize identically.
-///
-/// Keeps tabs and newlines. Drops bare CR (display-overwriting); keeps CRLF
-/// pairs. Drops C0 controls (except `\t` / `\n`) and DEL (0x7F).
+/// Strip ANSI/OSC/APC/DCS escapes and zero-width chars from `chunk` into `out`.
+/// Mirrors `tirith view` so both surfaces sanitize identically. Keeps `\t`/`\n`
+/// and CRLF; drops bare CR (display-overwriting), other C0 controls, and DEL.
 pub fn sanitize_text_into(chunk: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     let n = chunk.len();
@@ -237,7 +201,7 @@ pub fn sanitize_text_into(chunk: &[u8], out: &mut Vec<u8>) {
                         continue;
                     }
                     b']' | b'_' | b'P' => {
-                        // OSC / APC / DCS: terminated by BEL (0x07) or ST (\e\\).
+                        // OSC/APC/DCS: terminated by BEL (0x07) or ST (ESC \).
                         let mut j = i + 2;
                         while j < n {
                             if chunk[j] == 0x07 {
@@ -320,11 +284,8 @@ fn is_strippable_zero_width(ch: char) -> bool {
         | '\u{2060}' // WORD JOINER
         | '\u{FEFF}' // BYTE ORDER MARK / ZERO WIDTH NO-BREAK SPACE
     ) || ('\u{E0000}'..='\u{E007F}').contains(&ch)
-    // Unicode Tags block — invisible to display, used in steganographic
-    // attacks. Kept in sync with `cli::view::is_strippable_zero_width` and
-    // `cli::logs::is_strippable_zero_width`. Greptile P2: dropping this
-    // range would let an attacker smuggle hidden text through the MCP
-    // filter that `tirith view` would correctly strip.
+    // Unicode Tags block — invisible, steganographic-attack vector (Greptile P2).
+    // Keep in sync with `cli::view`/`cli::logs::is_strippable_zero_width`.
 }
 
 #[cfg(test)]
@@ -339,7 +300,7 @@ mod tests {
     }
 
     fn osc52_text() -> String {
-        // \e]52;c;aGVsbG8=\a — a complete OSC 52 sequence.
+        // A complete OSC 52 (clipboard-write) sequence.
         "before-payload-\x1B]52;c;aGVsbG8=\x07-after-payload".to_string()
     }
 
@@ -400,10 +361,8 @@ mod tests {
 
     #[test]
     fn warn_prepends_notice_and_sanitizes() {
-        // OSC 2 title-set is Info severity per output ruleset which lands
-        // as Allow at the verdict level. Construct a warn-shaped scenario
-        // by injecting hidden text (zero-width run > 8 chars) which is
-        // Medium → Warn.
+        // Force a Warn-shaped scenario via a hidden-text run (>8 zero-width
+        // chars → Medium → Warn).
         let mut zw_block = String::new();
         for _ in 0..16 {
             zw_block.push('\u{200B}');
@@ -486,10 +445,8 @@ mod tests {
         };
         let outcome = filter_tool_result(&mut result, false);
         assert_eq!(outcome.action, Action::Block);
-        // Block path replaces content entirely with the placeholder — that's
-        // the safe behavior. The image was sibling to a malicious payload and
-        // we do not preserve it (it could be a steg vector). The placeholder
-        // is the only item left.
+        // Block replaces all content with the placeholder — the sibling image
+        // (a possible steg vector) is not preserved.
         assert_eq!(result.content.len(), 1);
         assert_eq!(result.content[0].content_type, "text");
     }

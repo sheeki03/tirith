@@ -3,9 +3,8 @@ use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-/// Default TTL applied to a `trust add` when the caller passes neither
-/// `--ttl` nor `--permanent`. Trust is meant to expire by default so a stale
-/// allow does not linger forever; permanent trust must be chosen explicitly.
+/// Default TTL for a `trust add` with neither `--ttl` nor `--permanent`. Trust
+/// expires by default; permanent trust must be chosen explicitly.
 const DEFAULT_TTL: &str = "30d";
 
 /// A single entry in trust.json.
@@ -39,11 +38,8 @@ impl Default for TrustStore {
     }
 }
 
-/// How broad a trust pattern is. Ordered narrowest → broadest; a broader
-/// classification means the entry trusts more and is riskier.
-///
-/// The variants are declared narrowest-first, so the derived `PartialOrd`/`Ord`
-/// agree with that prose contract: `ScopeKind::Exact < ScopeKind::BareTld`.
+/// How broad a trust pattern is, declared narrowest-first so the derived `Ord`
+/// agrees: `ScopeKind::Exact < ScopeKind::BareTld` (broader = riskier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
@@ -100,10 +96,9 @@ impl ScopeKind {
     }
 }
 
-/// A small, conservative set of public suffixes used only to recognise a
-/// pattern that is a *bare* TLD (`com`) versus a registrable domain
-/// (`example.com`). Not a full public-suffix list — it just needs to catch the
-/// common foot-guns so `trust add com` is rejected by default.
+/// Small set of public suffixes to distinguish a *bare* TLD (`com`) from a
+/// registrable domain (`example.com`). Not a full PSL — just enough to reject
+/// `trust add com` by default.
 const KNOWN_TLDS: &[&str] = &[
     "com", "net", "org", "io", "dev", "sh", "co", "ai", "app", "xyz", "info", "biz", "me", "us",
     "uk", "de", "fr", "ru", "cn", "jp", "in", "br", "ca", "au", "eu", "gov", "edu", "mil", "tv",
@@ -114,7 +109,6 @@ const KNOWN_TLDS: &[&str] = &[
 pub fn classify_scope(pattern: &str) -> ScopeKind {
     let p = pattern.trim().to_lowercase();
 
-    // Wildcard domains are explicit.
     if let Some(rest) = p.strip_prefix("*.") {
         // `*.com` is a bare-TLD wildcard — still the worst case.
         if !rest.contains('.') && KNOWN_TLDS.contains(&rest) {
@@ -123,14 +117,12 @@ pub fn classify_scope(pattern: &str) -> ScopeKind {
         return ScopeKind::Wildcard;
     }
 
-    // Anything with a scheme, path, query, or fragment is treated as an exact
-    // literal — it pins a specific URL/resource rather than a whole host.
+    // A scheme, path, query, or fragment pins a specific URL/resource → Exact.
     if p.contains("://") || p.contains('/') || p.contains('?') || p.contains('#') {
         return ScopeKind::Exact;
     }
 
-    // A bare token with no dot: either a bare TLD or just a non-domain
-    // substring fragment.
+    // Bare token, no dot: a bare TLD or a non-domain substring fragment.
     if !p.contains('.') {
         if KNOWN_TLDS.contains(&p.as_str()) {
             return ScopeKind::BareTld;
@@ -138,14 +130,12 @@ pub fn classify_scope(pattern: &str) -> ScopeKind {
         return ScopeKind::Substring;
     }
 
-    // Has at least one dot and no path: a `host.tld`-shaped domain pattern.
-    // A two-label form whose last label is a known TLD is a registrable
-    // domain; the policy matcher treats it as "domain + all subdomains".
+    // At least one dot, no path: a `host.tld`-shaped registrable domain.
     let labels: Vec<&str> = p.split('.').filter(|l| !l.is_empty()).collect();
     if labels.len() >= 2 {
         ScopeKind::Domain
     } else {
-        // e.g. a trailing-dot oddity — fall back to substring.
+        // Trailing-dot oddity → substring.
         ScopeKind::Substring
     }
 }
@@ -180,10 +170,9 @@ fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
     }
 }
 
-/// Serialize `value` as pretty JSON to stdout. Returns `0` on success and `1`
-/// on a serialization failure. A JSON consumer must be able to tell that the
-/// output is incomplete, so a failure surfaces as a non-zero exit rather than
-/// a misleading exit-0 with a literal `{}`/`[]` printed in place of real data.
+/// Serialize `value` as pretty JSON to stdout. Returns `0` on success, `1` on a
+/// serialization failure — surfaced as a non-zero exit so a consumer can tell
+/// the output is incomplete rather than a misleading exit-0.
 #[must_use]
 fn print_json(value: &impl Serialize) -> i32 {
     match serde_json::to_string_pretty(value) {
@@ -284,12 +273,9 @@ fn parse_ttl(ttl: &str) -> Result<String, String> {
     Ok(expires.to_rfc3339())
 }
 
-/// Check if an entry is expired.
-///
-/// Backward-compatible: an entry with no `ttl_expires` (every entry written by
-/// an older tirith, and every `--permanent` entry) never expires. An entry
-/// whose `ttl_expires` cannot be parsed is treated as **not** expired so a
-/// malformed timestamp never silently revokes a user's trust.
+/// Check if an entry is expired. No `ttl_expires` (older/`--permanent` entries)
+/// never expires; an unparseable `ttl_expires` is treated as NOT expired so a
+/// malformed timestamp never silently revokes trust.
 fn is_expired(entry: &TrustEntry) -> bool {
     if let Some(ref exp) = entry.ttl_expires {
         if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(exp) {
@@ -327,8 +313,7 @@ fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Resu
     if pattern.is_empty() {
         return Err("pattern must not be empty".to_string());
     }
-    // Reject control characters (bytes < 0x20) except tab to stop users from
-    // smuggling ANSI escapes or NULs into trust-store entries.
+    // Reject control chars (< 0x20, except tab) to stop ANSI escapes / NULs in entries.
     for (i, b) in pattern.bytes().enumerate() {
         if b < 0x20 && b != b'\t' {
             return Err(format!(
@@ -366,16 +351,15 @@ pub fn add(
         return 1;
     }
 
-    // --ttl and --permanent are mutually exclusive (clap also enforces this,
-    // but guard here too for the library-call path).
+    // --ttl and --permanent are mutually exclusive (clap enforces it too; guard
+    // here for the library-call path).
     if permanent && ttl.is_some() {
         eprintln!("tirith: trust add: --permanent cannot be combined with --ttl");
         return 1;
     }
 
-    // Narrow-trust-by-default: a broad pattern (whole domain / wildcard / bare
-    // TLD) requires an explicit `--broad` opt-in. This nudges users toward the
-    // narrowest scope that works (a specific URL, path, or rule-scoped entry).
+    // Narrow-trust-by-default: a broad pattern (domain/wildcard/bare-TLD) requires
+    // an explicit `--broad` opt-in.
     let scope_kind = classify_scope(pattern);
     if scope_kind.is_broad() && !broad {
         eprintln!(
@@ -934,9 +918,8 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
             }
         };
         let before = store.entries.len();
-        // Capture the entries we are about to remove so each one lands in
-        // the audit log under the right `trust_action` (M6 ch3). Without
-        // this, gc/prune sweeps were invisible in `tirith trust audit`.
+        // Capture removed entries so each lands in the audit log under the right
+        // `trust_action` (M6 ch3) — otherwise gc/prune sweeps are invisible there.
         let expired_entries: Vec<TrustEntry> = store
             .entries
             .iter()
@@ -1231,13 +1214,10 @@ fn current_trust_snapshot() -> TrustSnapshot {
     }
 }
 
-/// Load all retained trust snapshots, oldest first. Unparseable lines skipped.
-///
-/// Returns `(snapshots, read_error)`. A missing history file is legitimate
-/// (no snapshots yet) and yields an empty list with no error. A history file
-/// that *exists* but cannot be read (permissions, I/O fault) yields an empty
-/// list **and** a `Some(message)` so `diff` can say "could not read history"
-/// rather than falsely reporting "first observation".
+/// Load all retained trust snapshots, oldest first (unparseable lines skipped).
+/// Returns `(snapshots, read_error)`: a missing file → empty + `None`; a file
+/// that exists but can't be read → empty + `Some(msg)` so `diff` can say "could
+/// not read history" instead of falsely reporting "first observation".
 fn load_trust_history() -> (Vec<TrustSnapshot>, Option<String>) {
     let Some(path) = trust_history_path() else {
         return (Vec::new(), None);
@@ -1264,9 +1244,8 @@ fn load_trust_history() -> (Vec<TrustSnapshot>, Option<String>) {
     (snapshots, None)
 }
 
-/// Atomic write: write to a temp file in the same directory, then rename, so a
-/// torn write can never leave a partial snapshot history behind. Mirrors
-/// `threatdb_cmd::record_snapshot`'s atomic write of its sibling history file.
+/// Atomic write (temp file + rename) so a torn write can never leave a partial
+/// snapshot history. Mirrors `threatdb_cmd::record_snapshot`.
 fn atomic_write(dest: &std::path::Path, data: &[u8]) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -1291,11 +1270,9 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
     let Some(path) = trust_history_path() else {
         return;
     };
-    // The read-error note is irrelevant here: recording is best-effort and
-    // rewrites the whole file regardless.
+    // Read-error note is irrelevant: recording rewrites the whole file regardless.
     let (mut history, _) = load_trust_history();
-    // Dedup on entry set: re-running `trust list` against an unchanged trust
-    // set must not append a near-identical line every invocation.
+    // Dedup on entry set so an unchanged trust set doesn't append a line every call.
     if history
         .last()
         .map(|s| s.entries == snapshot.entries)
@@ -1315,7 +1292,6 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
             body.push('\n');
         }
     }
-    // Atomic write so a torn write can never lose the snapshot history.
     let _ = atomic_write(&path, body.as_bytes());
 }
 
@@ -1383,11 +1359,8 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
 
     if !log_path.exists() {
         if json {
-            // Emit the same envelope shape as the normal path so consumers
-            // never have to special-case "no log yet": `entries` is always
-            // an array and `skipped_lines` is always present (0 here, since
-            // there were no lines to skip). Matches the `result.skipped_lines`
-            // (`usize`) emission below — both serialize as a JSON integer.
+            // Same envelope shape as the normal path so consumers never special-case
+            // "no log yet": `entries` always an array, `skipped_lines` always present.
             let _ = print_json(&serde_json::json!({"entries": [], "skipped_lines": 0_usize}));
         } else {
             eprintln!(
@@ -1398,8 +1371,7 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         return 0;
     }
 
-    // Reuse the shipping superset reader so missing fields on older entries
-    // (no agent_origin, no trust_action, etc.) parse cleanly.
+    // Reuse the superset reader so missing fields on older entries parse cleanly.
     let result = match tirith_core::audit_aggregator::read_log(&log_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1411,10 +1383,8 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
         }
     };
 
-    // Surface malformed-line skips: a partial write or a corrupted log
-    // silently dropped rows would otherwise be invisible to an operator
-    // running `trust audit` to chase a missing entry. Human shape prints
-    // to stderr; JSON shape includes it in the envelope below.
+    // Surface malformed-line skips so a corrupted log isn't invisible to an
+    // operator chasing a missing entry. JSON shape includes it in the envelope below.
     if result.skipped_lines > 0 && !json {
         eprintln!(
             "tirith: trust audit: skipped {} malformed audit log line(s) at {}",
@@ -1458,8 +1428,7 @@ pub fn audit(since: Option<&str>, json: bool) -> i32 {
     }
 
     if json {
-        // Include the skipped-line count so a JSON consumer can detect a
-        // partial / corrupted audit log without having to parse stderr.
+        // Skipped-line count lets a JSON consumer detect a corrupted log without parsing stderr.
         return print_json(&serde_json::json!({
             "entries": rows,
             "skipped_lines": result.skipped_lines,
@@ -1519,11 +1488,8 @@ pub fn diff(json: bool) -> i32 {
     let (history, history_read_error) = load_trust_history();
     let current = current_trust_snapshot();
 
-    // The baseline is simply the most recent recorded snapshot. If it equals
-    // the current set the diff is empty; otherwise it shows the delta. Using
-    // the literal last snapshot (not "last that differs") keeps repeated
-    // `trust diff` calls idempotent — once the post-change state is recorded,
-    // a later diff against an unchanged set reports "no changes".
+    // Baseline = the literal last recorded snapshot (not "last that differs"),
+    // which keeps repeated `trust diff` calls idempotent.
     let baseline = history.last();
 
     let report = match baseline {

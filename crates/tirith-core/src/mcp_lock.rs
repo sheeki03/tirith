@@ -1,160 +1,81 @@
 //! MCP server inventory and `.tirith/mcp.lock` lockfile generation.
 //!
-//! This module is the data layer behind `tirith mcp lock` (Milestone 4, Agent
-//! & MCP governance). It does two things, both **local file operations off the
-//! tier-1/2/3 detection hot path**:
+//! The data layer behind `tirith mcp lock` (M4), all local file ops off the
+//! detection hot path. [`build_inventory`] discovers the repo-local MCP config
+//! files and parses each into an [`McpInventory`]; [`McpLockfile::from_inventory`]
+//! / [`render`](McpLockfile::render) serialize it into a deterministic JSON
+//! lockfile (per-server transport + tools + content hash, plus a format version
+//! and an inventory hash). Servers are sorted by `(name, source_config)` BEFORE
+//! hashing, so the lockfile and its `inventory_hash` are stable regardless of
+//! discovery order — a clean baseline for `mcp verify` / `mcp diff`.
 //!
-//! 1. **Inventory** ([`build_inventory`]) — given a repository root, discover
-//!    the **repo-local** MCP configuration files (`mcp.json`, `.mcp.json`,
-//!    `mcp_settings.json`, and the IDE variants under `.vscode/`, `.cursor/`,
-//!    `.windsurf/`, `.cline/`, `.amazonq/`, `.continue/`, `.kiro/`) and parse
-//!    each into a structured [`McpInventory`]: one [`McpServerEntry`] per
-//!    declared MCP server, recording its name, transport descriptor, and the
-//!    tool list it declares.
+//! **Repo-local only.** Discovery never enters `~/.claude/` or any user-level
+//! dir; the guarantee is enforced, not structural: a symlinked config path (or
+//! one under a symlinked dir), or one whose canonical path escapes the repo
+//! root, is rejected.
 //!
-//! 2. **Lockfile** ([`McpLockfile::from_inventory`] / [`McpLockfile::render`])
-//!    — serialize that inventory into a deterministic JSON lockfile
-//!    (`<repo_root>/.tirith/mcp.lock`): per server a canonical transport
-//!    descriptor, the tool list, and a content hash; plus a format version and
-//!    a hash over the whole inventory. [`McpLockfile::from_inventory`] sorts
-//!    servers by `(name, source_config)` **before** hashing, so the lockfile
-//!    and its `inventory_hash` are stable regardless of config-discovery
-//!    order — a future `mcp verify` / `mcp diff` (chunk 2) can diff two
-//!    lockfiles cleanly.
-//!
-//! **Repo-local only.** Discovery never walks into `~/.claude/` or any other
-//! user-level configuration directory — only files inside the given repo root
-//! are inventoried. This is the same scoping decision the policy system makes
-//! with org-level lists. The guarantee is enforced, not merely structural: a
-//! config path that is a symlink (or sits under a symlinked directory), or
-//! whose canonicalized path escapes the repo root, is **rejected** — a
-//! symlinked `.mcp.json` pointing at a user-level config is not read.
-//!
-//! **Malformed input is never fatal.** A configuration file that is not valid
-//! JSON, or that does not carry an MCP-server object, contributes **no
-//! entries** and never panics — the same "malformed → empty, no panic"
-//! convention the rest of the codebase follows (see `configfile::check_mcp_*`).
+//! **Malformed input is never fatal:** a non-JSON / non-MCP file contributes no
+//! entries and never panics (the codebase's "malformed → empty, no panic"
+//! convention).
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Lockfile format version. Bump only on a breaking schema change so a future
-/// `mcp verify` can refuse — or migrate — an older lockfile deliberately.
+/// Lockfile format version. Bump only on a breaking schema change.
 ///
-/// **Enforced at load.** [`parse_lockfile`] rejects any lockfile whose
-/// `format_version` is not equal to this constant with a dedicated
-/// [`McpLockLoadError::UnsupportedVersion`] variant — so a v999 lockfile
-/// written by a future tirith does not parse silently, and a legacy-shape
-/// lockfile (v3 or earlier, before `userinfo_hash` and the env redaction)
-/// is also rejected. The CLI and `mcpdrift` rule both distinguish this from
-/// "the JSON is corrupt", so the operator sees "this lockfile was written by
-/// tirith schema vN, re-run `tirith mcp lock` to refresh / upgrade tirith"
-/// rather than a generic parse-error message.
+/// **Enforced at load:** [`parse_lockfile`] rejects a `format_version` other
+/// than this (or v4, the migration carve-out) with a dedicated
+/// [`McpLockLoadError::UnsupportedVersion`], distinct from "the JSON is corrupt"
+/// so the operator gets a precise re-lock / upgrade message.
 ///
-/// Version history:
-/// * `1` — initial schema: per-server name, transport (`url`, or stdio
-///   `command` + `args`), tools, source config, and content hash.
-/// * `2` — a stdio transport now also captures the server's `env` (the
-///   environment variables the config injects into the subprocess); `env` is
-///   part of the per-server content hash, so an `env` change registers as
-///   drift. A v1 lockfile is therefore not byte-comparable to a v2 one.
-/// * `3` — env entries no longer serialize a raw value: each entry is
-///   `{ name, value_hash }`, where `value_hash` is the lowercase-hex SHA-256
-///   of `name || ':' || value`. An env value is commonly a credential
-///   (`API_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `OPENAI_API_KEY`, …), and
-///   the lockfile is designed to be committed — persisting the value would
-///   leak it. Hashing with the name as a salt still makes any value change
-///   register as drift (the hash flips), so drift detection is unchanged in
-///   spirit; only the *value* leaves the process, the hash does, and even a
-///   low-entropy value (`1`, `true`) is not brute-forceable across servers
-///   because the per-key salt makes the digest unique to (name, value). A v2
-///   lockfile is therefore not byte-comparable to a v3 one.
-/// * `4` — the same `name`+salted-SHA-256 redaction scheme is applied to the
-///   `url` transport's userinfo. A URL declared as `https://user:token@host/`
-///   is now stored as `https://host/` and the captured userinfo (the literal
-///   `user[:password]` substring) is hashed into a `userinfo_hash` of
-///   `sha256(server_name || ':' || userinfo)`, salted by the MCP server's
-///   name. The hash is folded into the per-server content hash, so a userinfo
-///   change registers as drift exactly like an env-value change does; a URL
-///   that carried no userinfo serializes with `userinfo_hash` **omitted** (not
-///   set to a sentinel value), so "no credential present" is structurally
-///   distinct on the wire from "credential present". HTTP Basic Auth tokens
-///   in a URL are credentials in exactly the same threat model that motivated
-///   v3, and `.tirith/mcp.lock` is designed to be committed — so the raw
-///   userinfo never lands in the file. A v3 lockfile is not byte-comparable
-///   to a v4 one.
-/// * `5` — the per-server `tools_declared` flag is now folded into the
-///   per-server `content_hash`. Pre-v5, `tools_declared` was deliberately
-///   excluded from the hash: a server flipping `"tools": []` to omitted
-///   (or vice-versa) silently passed drift detection because both shapes
-///   collapsed into the same canonical `tools: []` list and the
-///   `tools_declared` distinction was carried but not hashed. v5 folds the
-///   serialized form of the declaration state into the content hash so
-///   that flip now registers as drift. The on-disk shape is otherwise
-///   unchanged from v4 — every field still serializes the same way — but
-///   the recomputed `content_hash` / `inventory_hash` values differ, so a
-///   v4 lockfile is not byte-comparable to a v5 one. A v4 lockfile loaded
-///   in a v5 build is tagged with a migration marker (see
-///   [`LockfileSchema`]); [`compute_drift`] skips the normal per-server
-///   comparison for migration-tagged lockfiles and returns a single
-///   [`McpDrift::SchemaUpgradeRequired`] entry instructing the operator
-///   to run `tirith mcp lock --force` once to regenerate. This avoids the
-///   phantom-drift storm that would otherwise fire on the first v5 run
-///   against an existing v4 baseline.
+/// Version history (each bump makes prior lockfiles not byte-comparable):
+/// * `1` — initial: name, transport, tools, source config, content hash.
+/// * `2` — stdio transport captures `env`, folded into the content hash.
+/// * `3` — env entries store `{ name, value_hash }` (salted SHA-256), never the
+///   raw value: env values are commonly credentials and the lockfile is
+///   committed. The name salt makes even a low-entropy value unforgeable across
+///   servers; a value change still flips the hash (drift unchanged).
+/// * `4` — the same name-salted redaction applied to a `url` transport's
+///   userinfo: `https://user:token@host/` stores as `https://host/` plus a
+///   `userinfo_hash`, omitted entirely when no userinfo was present.
+/// * `5` — `tools_declared` folded into `content_hash`. Pre-v5 it was excluded,
+///   so a `"tools": []` ↔ omitted flip silently passed drift detection. A v4
+///   lockfile loaded under v5 is tagged [`LockfileSchema::LegacyV4Migration`]
+///   and [`compute_drift`] returns a single [`McpDrift::SchemaUpgradeRequired`]
+///   (re-lock once) instead of phantom-drifting every server.
 pub const MCP_LOCK_FORMAT_VERSION: u32 = 5;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
 
-/// One environment variable a stdio MCP server is launched with, as captured
-/// in the lockfile.
+/// One environment variable a stdio MCP server is launched with, as captured in
+/// the lockfile.
 ///
-/// **The raw value is never stored.** An env value is commonly a credential
-/// (`API_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `OPENAI_API_KEY`, …) and the
-/// lockfile is designed to be committed — persisting plaintext values would
-/// leak secrets into version control. Instead, we record a fixed-output hash:
-/// `value_hash = sha256(name || ':' || value)`. The name is the per-entry salt
-/// — a low-entropy value (`1`, `true`, `production`) hashes differently under
-/// each name, so a digest cannot be brute-forced once and reused across
-/// servers / configs. Drift detection is unchanged in spirit: a swapped value
-/// still flips `value_hash`, which still flips the per-server content hash.
-///
-/// Computed exactly once in [`parse_env`]; the raw value never leaves that
-/// function.
+/// **The raw value is never stored** (env values are commonly credentials and
+/// the lockfile is committed). Instead `value_hash = sha256(name || ':' ||
+/// value)`: the name salt makes a low-entropy value hash differently per name,
+/// so a digest can't be brute-forced once and reused across servers. A swapped
+/// value still flips the hash, so drift detection is unchanged. Computed once in
+/// [`parse_env`]; the raw value never leaves that function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpEnvEntry {
-    /// The environment variable's name (the key in the config's `env` object).
+    /// The env var's name (the key in the config's `env` object).
     pub name: String,
-    /// Lowercase-hex SHA-256 of `name || ':' || value`. The `:` delimiter is
-    /// per-entry **entropy**, not the load-bearing collision protection: the
-    /// unambiguity of an `McpEnvEntry` inside the per-server content hash is
-    /// established by the **outer length-prefixed framing** in
-    /// [`McpServerEntry::content_hash`] (each `name` and `value_hash` is fed
-    /// through [`hash_field`], which writes the length first). POSIX env-var
-    /// names may legally contain `:` (only `=` is forbidden by `execve(2)`),
-    /// so the inner `:` itself is not a guaranteed boundary marker — but
-    /// outer length-prefixing makes the framing total over any byte content,
-    /// regardless. The inner `name`-salted hash still defends against a
-    /// cross-server precomputed-rainbow-table attack: a low-entropy value
-    /// (`1`, `true`, `production`) hashes differently under each `name`, so
-    /// a digest cannot be brute-forced once and reused across servers /
-    /// configs.
+    /// Lowercase-hex SHA-256 of `name || ':' || value`. The inner `:` is
+    /// per-entry entropy, not the boundary marker (POSIX names may contain `:`);
+    /// the load-bearing collision protection is the outer length-prefixed framing
+    /// in [`McpServerEntry::content_hash`] via [`hash_field`].
     pub value_hash: String,
 }
 
 impl McpEnvEntry {
-    /// Build an entry from a `(name, raw_value)` pair, hashing the value
-    /// immediately. This is the **only** legitimate way to construct an entry
-    /// from a real value, and the raw value is consumed and dropped before the
-    /// function returns — it never reaches a struct field, the serializer, or
-    /// the rest of the process.
+    /// Build an entry from `(name, raw_value)`, hashing the value immediately.
+    /// The only legitimate way to construct one from a real value; the raw value
+    /// is consumed and dropped before returning — it never reaches a struct
+    /// field, the serializer, or the rest of the process.
     pub fn from_raw(name: &str, raw_value: &str) -> Self {
-        // `:`-salted SHA-256 — see [`salted_sha256_hex`] for the shape and
-        // [`McpEnvEntry::value_hash`] for why the outer length-prefixed
-        // framing is the load-bearing collision protection (the inner `:`
-        // is for cross-server entropy, not boundary unambiguity).
         let value_hash = salted_sha256_hex(name, raw_value);
         McpEnvEntry {
             name: name.to_string(),
@@ -163,50 +84,25 @@ impl McpEnvEntry {
     }
 }
 
-/// How an MCP server is reached. A server declares **either** a remote URL
-/// (`url` transport) **or** a local subprocess (`command` + `args`); the two
-/// are mutually exclusive in every known config shape, so this is an enum.
+/// How an MCP server is reached — either a remote URL or a local subprocess
+/// (mutually exclusive in every known config shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpTransport {
     /// A network-reachable MCP server (HTTP / SSE / streamable-HTTP).
     ///
-    /// **The URL is stored with any userinfo stripped.** A URL declared as
-    /// `https://user:token@host:port/path` is recorded here as
-    /// `https://host:port/path`; the `user:token` substring is HTTP Basic
-    /// Auth and is a credential. `.tirith/mcp.lock` is designed to be
-    /// committed, so persisting the raw userinfo would leak the credential
-    /// into version control — the same threat model that motivated the v3
-    /// env-value redaction.
-    ///
-    /// When the source URL carried a userinfo component, `userinfo_hash` is
-    /// `Some(sha256(server_name || ':' || userinfo))` — the same name-salted
-    /// SHA-256 scheme `McpEnvEntry` uses, with the **MCP server's name** as
-    /// the per-entry salt. Folded into the per-server content hash, so a
-    /// userinfo change registers as drift exactly like an env-value change
-    /// does. When the source URL had no userinfo, `userinfo_hash` is `None`
-    /// and is **omitted** from the serialized lockfile (not written as
-    /// `null`), so "no credential" is structurally distinct on the wire from
-    /// "credential present".
-    ///
-    /// **The stored `url` is the canonical `url::Url::as_str()` form**
-    /// regardless of whether userinfo was present in the source — both
-    /// branches round-trip through the parser, so removing or adding a
-    /// credential from the source config does not surface as a spurious
-    /// `UrlChanged` drift alongside `UserinfoAdded` / `UserinfoRemoved`
-    /// (`url::Url` defaults a missing path to `/`, so a bare-host URL has
-    /// two textual shapes — only the canonical one ends up in the lockfile).
-    ///
-    /// A URL that does not parse cleanly has its userinfo
-    /// best-effort-stripped (replaced with `***@` when the scheme +
-    /// authority + userinfo shape is recognizable) and a salted hash
-    /// of the original userinfo bytes is stored, so credential
-    /// add/remove drift still surfaces for malformed URLs. A
-    /// malformed URL that does not look authority-shaped is preserved
-    /// as-is with `userinfo_hash = None` — stripping bytes from a
-    /// string whose structure we cannot parse could itself mangle
-    /// diagnostic context. See [`redact_url_userinfo`] for the full
-    /// stripping logic.
+    /// **The URL is stored with any userinfo (HTTP Basic Auth) stripped** —
+    /// `.tirith/mcp.lock` is committed, so persisting it would leak a credential
+    /// (the v3 threat model). When userinfo was present, `userinfo_hash` is
+    /// `Some(sha256(server_name || ':' || userinfo))` (name-salted, folded into
+    /// the content hash so a change is drift); when absent it is `None` and
+    /// **omitted** from the wire, so absence is structurally distinct from
+    /// presence. The stored `url` is always the canonical `url::Url::as_str()`
+    /// form (both branches round-trip the parser), so adding/removing a
+    /// credential doesn't surface as a spurious `UrlChanged` alongside
+    /// `Userinfo*`. An unparseable URL is best-effort-stripped (`***@`) with a
+    /// hash of the original userinfo bytes; a non-authority-shaped one is kept
+    /// verbatim with `None`. See [`redact_url_userinfo`].
     Url {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,67 +112,49 @@ pub enum McpTransport {
     Stdio {
         /// The executable to run.
         command: String,
-        /// Arguments passed to the executable, in declared order.
+        /// Arguments, in declared order.
         #[serde(default)]
         args: Vec<String>,
-        /// Environment variables the config injects into the subprocess, as
-        /// `(name, value_hash)` entries sorted by name. Security-relevant: a
-        /// change to a server's `env` (a swapped credential, an added variable
-        /// that alters what the server does) must register as drift, so it is
-        /// part of the inventory, the lockfile schema, and the per-server
-        /// hash. **Raw values are never stored** — each entry carries only a
-        /// salted hash; see [`McpEnvEntry`]. An empty vec means the config
-        /// declared no `env` object.
+        /// Env vars the config injects, as `(name, value_hash)` entries sorted by
+        /// name. Security-relevant (a swapped credential / added variable must
+        /// drift), so part of the per-server hash; raw values are never stored
+        /// (see [`McpEnvEntry`]). Empty vec = no `env` object declared.
         #[serde(default)]
         env: Vec<McpEnvEntry>,
     },
-    /// The server object declared neither a `url` nor a `command`. Captured
-    /// rather than dropped: an MCP entry with no transport is itself a
-    /// finding-worthy oddity that a later `mcp verify` should be able to see.
+    /// The server declared neither `url` nor `command`. Captured (not dropped):
+    /// a transport-less MCP entry is itself a finding-worthy oddity.
     Unknown,
 }
 
-/// How a server's `tools` key appeared in the source config. The lockfile's
-/// per-server `tools: Vec<String>` collapses these three on-disk shapes
-/// into one list — but the distinction is still useful for audits / future
-/// reporting (an `Omitted` server is treated by MCP clients as "all
-/// tools"; an `EmptyDeclared` server is treated as "no tools at all"; an
-/// `Invalid` server has a malformed `tools` value that this parser
-/// dropped). For backward compatibility, [`McpServerEntry`] and
-/// [`McpLockServer`] track the distinction in a sibling
-/// `tools_declared: bool` field rather than carrying this enum directly;
-/// see [`parse_tools`]'s return shape for the raw three-way distinction.
+/// How a server's `tools` key appeared in the source config. The lockfile
+/// collapses these into one `tools: Vec<String>`, but the distinction is useful
+/// for audits (`Omitted` → MCP clients treat as "all tools"; `EmptyDeclared` →
+/// "no tools"; `Invalid` → a malformed value this parser dropped). For backward
+/// compat, [`McpServerEntry`] / [`McpLockServer`] track it in a sibling
+/// `tools_declared: bool` rather than carrying this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredTools {
-    /// The source config did not carry a `tools` key for this server.
-    /// MCP semantics: "the client may call any tool the server runtime
-    /// exposes" (runtime negotiation, invisible to a static config
-    /// inventory).
+    /// No `tools` key. MCP semantics: any tool the runtime exposes.
     Omitted,
-    /// The source config carried a `tools` key but its value was not a
-    /// JSON array of strings (an object, a number, a non-string array
-    /// element, …). The values that *did* parse as strings are still
-    /// captured in the inner vec; entries that failed are dropped.
+    /// A `tools` key whose value was not a string array; values that parsed as
+    /// strings are still captured, the rest dropped.
     Invalid(Vec<String>),
-    /// The source config carried `"tools": []` — an explicit declaration
-    /// that the server exposes no tools.
+    /// `"tools": []` — an explicit "no tools" declaration.
     EmptyDeclared,
-    /// The source config carried a non-empty list of tool name strings.
+    /// A non-empty list of tool-name strings.
     Declared(Vec<String>),
 }
 
 impl DeclaredTools {
-    /// Whether the source config carried a `tools` key at all — true for
-    /// `Invalid`, `EmptyDeclared`, and `Declared`; false for `Omitted`.
+    /// Whether the source config carried a `tools` key (false only for `Omitted`).
     pub fn was_declared(&self) -> bool {
         !matches!(self, DeclaredTools::Omitted)
     }
 
-    /// Flatten into the canonical (deduplicated, sorted) tool list that
-    /// the lockfile stores. `Omitted` and `EmptyDeclared` flatten to an
-    /// empty vec — the lockfile's `tools: Vec<String>` was a Vec already,
-    /// and the distinction between these two is tracked in
-    /// `tools_declared`.
+    /// Flatten into the canonical (deduplicated, sorted) tool list the lockfile
+    /// stores. `Omitted`/`EmptyDeclared` → empty vec (distinguished via
+    /// `tools_declared`).
     pub fn into_canonical(self) -> Vec<String> {
         match self {
             DeclaredTools::Omitted | DeclaredTools::EmptyDeclared => Vec::new(),
@@ -285,12 +163,8 @@ impl DeclaredTools {
     }
 }
 
-/// `serde(default = ...)` helper for the new `tools_declared` field. An
-/// older lockfile that predates this field is treated as if the operator
-/// had declared a tools list — preserving the pre-change behavior of
-/// "an empty `tools` list could mean either omitted or declared empty"
-/// while still letting freshly-written lockfiles record the true source
-/// shape going forward.
+/// `serde(default)` for `tools_declared`: a legacy lockfile predating the field
+/// deserializes as `true`, preserving the pre-change semantics.
 fn default_tools_declared() -> bool {
     true
 }
@@ -303,39 +177,19 @@ pub struct McpServerEntry {
     pub name: String,
     /// How the server is reached.
     pub transport: McpTransport,
-    /// The tools the server declares, sorted and de-duplicated for a stable
-    /// hash. An empty vec means the config declared no explicit tool list
-    /// (which an MCP client treats as "all tools"), OR the config declared
-    /// `"tools": []` — distinguish the two via [`Self::tools_declared`].
+    /// The declared tools, sorted and de-duplicated for a stable hash. Empty =
+    /// either no `tools` key (MCP "all tools") or `"tools": []` — distinguish via
+    /// [`Self::tools_declared`].
     pub tools: Vec<String>,
-    /// Whether the source config carried a `tools` key. `true` for any
-    /// shape where the operator wrote a `tools` key — including
-    /// [`DeclaredTools::Invalid`] (a malformed `tools` value is still a
-    /// declaration *attempt*, just shaped wrong), [`DeclaredTools::EmptyDeclared`]
-    /// (`"tools": []`), and [`DeclaredTools::Declared`] (`"tools": [...]`).
-    /// `false` only when the source config omitted the `tools` key
-    /// entirely ([`DeclaredTools::Omitted`]). See
-    /// [`DeclaredTools::was_declared`] for the canonical predicate.
+    /// Whether the source config carried a `tools` key (`false` only for
+    /// [`DeclaredTools::Omitted`]; see [`DeclaredTools::was_declared`]).
     ///
-    /// **Folded into [`Self::content_hash`] from `format_version: 5` onward.**
-    /// Pre-v5 this field rode on entries with
-    /// `#[serde(default = "default_tools_declared")]` but was deliberately
-    /// **excluded** from `content_hash`, so a server flipping
-    /// `"tools": []` to omitted (or vice-versa) silently passed drift
-    /// detection (both shapes flatten to the canonical empty `tools:
-    /// Vec<String>`). v5 folds the serialized form of the field into the
-    /// hash so the flip now registers as drift. A v4 lockfile loaded in
-    /// a v5 build is tagged with [`LockfileSchema::LegacyV4Migration`]
-    /// rather than rejected outright (see [`parse_lockfile`]), and
-    /// [`compute_drift`] short-circuits to a migration prompt so the
-    /// first v5 run against an existing v4 baseline doesn't fire phantom
-    /// drift.
-    ///
-    /// Backward compatibility: older lockfiles without this field still
-    /// deserialize with `tools_declared: true` (the
-    /// `default_tools_declared` helper), preserving the pre-change
-    /// semantics that an empty `tools` list could come from either
-    /// omitted or explicit empty.
+    /// **Folded into [`Self::content_hash`] from v5 onward.** Pre-v5 it was
+    /// excluded, so a `"tools": []` ↔ omitted flip silently passed drift
+    /// detection. A v4 lockfile under v5 is tagged
+    /// [`LockfileSchema::LegacyV4Migration`] and [`compute_drift`] short-circuits
+    /// to a migration prompt rather than phantom-drifting. Legacy lockfiles
+    /// without the field deserialize as `true`.
     #[serde(default = "default_tools_declared")]
     pub tools_declared: bool,
     /// Repo-relative path of the config file this entry was parsed from.
@@ -343,36 +197,21 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
-    /// A stable per-server content hash over name + transport (including a
-    /// stdio server's `env`) + tools. Two entries hash identically iff they
-    /// declare the same server the same way, so a future `mcp diff` can detect
-    /// a changed server by hash alone.
+    /// A stable per-server content hash over name + transport (incl. a stdio
+    /// server's `env`) + tools, so `mcp diff` can detect a changed server by hash
+    /// alone. `source_config` is excluded — moving an unchanged server between
+    /// configs must not drift.
     ///
-    /// `source_config` is deliberately **excluded**: moving an unchanged server
-    /// definition between two config files must not register as drift.
-    ///
-    /// **Collision-free framing.** Every variable-length component (each arg,
-    /// each tool, each `env` name/value) is *length-prefixed* — its byte length
-    /// is written before its bytes via [`hash_field`] — rather than joined by a
-    /// `\0` separator. A separator-only scheme is ambiguous: `["a", "b"]` and
-    /// `["ab"]` would feed the hasher the same bytes, and a value that itself
-    /// contains a `\0` could forge a boundary. Length-prefixing makes the byte
-    /// stream an unambiguous encoding of the structure.
+    /// **Collision-free framing:** every variable-length component is
+    /// length-prefixed via [`hash_field`], not `\0`-joined — so `["a","b"]` and
+    /// `["ab"]` (or a value containing `\0`) cannot collide.
     pub fn content_hash(&self) -> String {
         let mut hasher = Sha256::new();
         self.feed_content_hash_common(&mut hasher);
-        // `tools_declared` joined the per-server hash in `format_version: 5`.
-        // Pre-v5, a server flipping `"tools": []` to omitted (or vice-versa)
-        // collapsed to an identical canonical `tools: Vec<String>` and hashed
-        // identically, so the flip went undetected. Folding the byte `\x01`
-        // (declared) / `\x00` (omitted) into the hasher makes that flip
-        // register as drift. The length-prefixed framing established for
-        // every preceding field keeps the encoding unambiguous over any
-        // byte content — a 1-byte declaration tag at the end never collides
-        // with anything earlier in the stream. See [`MCP_LOCK_FORMAT_VERSION`]
-        // history note for v5 for the migration path (legacy v4 lockfiles
-        // are tagged with [`LockfileSchema::LegacyV4Migration`] so the first
-        // v5 run against an existing baseline does not fire phantom drift).
+        // `tools_declared` joined the hash in v5: folding `\x01` (declared) /
+        // `\x00` (omitted) makes the `"tools": []` ↔ omitted flip register as
+        // drift. (Legacy v4 lockfiles are tagged for a one-time migration prompt
+        // — see [`MCP_LOCK_FORMAT_VERSION`].)
         if self.tools_declared {
             hasher.update(b"\x01");
         } else {
@@ -381,39 +220,24 @@ impl McpServerEntry {
         hex_lower(&hasher.finalize())
     }
 
-    /// v4-compatible per-server content hash — the same byte stream the
-    /// v4 release computed, before `tools_declared` was folded into the
-    /// hash. Used by [`compute_drift`] when the parsed lockfile is tagged
-    /// [`LockfileSchema::LegacyV4Migration`] so the drift comparison runs
-    /// under v4 semantics on BOTH sides (current inventory and stored
-    /// lockfile) — that way real drift in a v4 lockfile (URL changed,
-    /// command changed, env changed, tools added/removed, server
-    /// added/removed) is still surfaced alongside the
-    /// [`McpDrift::SchemaUpgradeRequired`] migration prompt. Without this
-    /// method, the v5 short-circuit would silently absorb any real drift
-    /// that happened during the v4→v5 migration window — exactly the
-    /// signal a malicious config change would exploit.
-    ///
-    /// Concretely: every component a v5 hash includes EXCEPT the trailing
-    /// `tools_declared` byte. The v4 `"tools": []` ↔ omitted flip remains
-    /// undetected here (that is precisely the v4 semantic — the
-    /// regression is intentional for this migration-window comparison;
-    /// once the operator re-locks under v5 the regular `content_hash`
-    /// path catches the flip).
+    /// v4-compatible per-server hash — the same byte stream v4 computed, before
+    /// `tools_declared` was folded in. Used by [`compute_drift`] for a
+    /// [`LockfileSchema::LegacyV4Migration`] lockfile so the comparison runs under
+    /// v4 semantics on BOTH sides: real drift (URL/command/env/tools/server
+    /// changes) still surfaces alongside the migration prompt, instead of the v5
+    /// short-circuit silently absorbing drift made during the migration window.
+    /// The v4 `"tools": []` ↔ omitted flip stays undetected here (intentional —
+    /// re-locking under v5 catches it).
     pub fn content_hash_v4(&self) -> String {
         let mut hasher = Sha256::new();
         self.feed_content_hash_common(&mut hasher);
         hex_lower(&hasher.finalize())
     }
 
-    /// Feed every per-server hash component into `hasher` EXCEPT the
-    /// trailing `tools_declared` byte. Shared by [`Self::content_hash`]
-    /// (v5: appends the declaration byte after this returns) and
-    /// [`Self::content_hash_v4`] (v4: omits the declaration byte
-    /// entirely). Keeping the common body in one place guarantees the
-    /// two hash functions never diverge on the shared prefix —
-    /// transport, env, tools list — only on the v5-introduced trailing
-    /// byte.
+    /// Feed every per-server hash component into `hasher` EXCEPT the trailing
+    /// `tools_declared` byte. Shared by [`Self::content_hash`] (v5, appends the
+    /// byte) and [`Self::content_hash_v4`] (v4, omits it) so the two never diverge
+    /// on the shared prefix.
     fn feed_content_hash_common(&self, hasher: &mut Sha256) {
         hasher.update(b"mcp-server-v2\0");
         hash_field(hasher, self.name.as_bytes());
@@ -421,15 +245,9 @@ impl McpServerEntry {
             McpTransport::Url { url, userinfo_hash } => {
                 hasher.update(b"url\0");
                 hash_field(hasher, url.as_bytes());
-                // Fold `userinfo_hash` in so a userinfo change registers as
-                // drift (just like an env-value change does for stdio). The
-                // presence/absence of the hash is itself framed: a leading
-                // 0/1 byte distinguishes `None` from `Some("")`, so a future
-                // empty-hash sentinel cannot collide with a no-userinfo URL.
-                // The hash itself is already deterministically derived from
-                // (server_name, raw userinfo), so any userinfo change flips
-                // the per-server content hash even though no raw value is
-                // stored or hashed at this layer.
+                // Fold `userinfo_hash` in so a userinfo change drifts. A leading
+                // 0/1 byte frames presence/absence so a future empty-hash
+                // sentinel can't collide with a no-userinfo URL.
                 match userinfo_hash {
                     Some(h) => {
                         hasher.update(b"\x01");
@@ -449,12 +267,8 @@ impl McpServerEntry {
                 }
                 hash_field(hasher, &(env.len() as u64).to_le_bytes());
                 for entry in env {
-                    // Each env entry feeds its name AND its value_hash into the
-                    // per-server hash. The `value_hash` already deterministically
-                    // depends on the raw value (via `name + ':' + value`), so any
-                    // value change still flips the per-server content hash —
-                    // drift detection is unchanged even though no raw value is
-                    // stored or hashed here.
+                    // Feed name + value_hash; the hash already depends on the raw
+                    // value, so a value change still drifts (no raw value here).
                     hash_field(hasher, entry.name.as_bytes());
                     hash_field(hasher, entry.value_hash.as_bytes());
                 }
@@ -470,30 +284,20 @@ impl McpServerEntry {
     }
 }
 
-/// Feed one length-prefixed field into a hasher: the value's byte length as a
-/// little-endian `u64`, then the value's bytes. Length-prefixing every
-/// variable-length component makes the hash input an unambiguous encoding —
-/// no list of values can collide with a different list, and a `\0` (or any
-/// byte) inside a value can never be mistaken for a field boundary.
+/// Feed one length-prefixed field into a hasher: the byte length as a LE `u64`,
+/// then the bytes. Makes the hash input an unambiguous encoding — no list can
+/// collide with a different list, and an embedded `\0` can't forge a boundary.
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
 
-/// Lowercase-hex SHA-256 of `salt || ':' || value` — the redaction primitive
-/// used by both [`McpEnvEntry::from_raw`] (where `salt` is the env var's
-/// `name` and `value` is the raw env value) and [`redact_url_userinfo`]
-/// (where `salt` is the MCP server's `name` and `value` is the raw URL
-/// userinfo substring).
-///
-/// **The `:` is per-entry entropy, not the load-bearing collision protection.**
-/// In both callers the resulting hash is fed into a length-prefixed outer
-/// framing (`hash_field` in [`McpServerEntry::content_hash`]), and it's that
-/// outer framing that makes the encoding unambiguous over any byte content.
-/// The inner `salt`-salted hash exists so a low-entropy `value` (`1`,
-/// `true`, `production`, a stock auth token) hashes differently under each
-/// `salt` — a precomputed rainbow table built against one server's hashes
-/// cannot be reused against another's.
+/// Lowercase-hex SHA-256 of `salt || ':' || value` — the redaction primitive for
+/// both [`McpEnvEntry::from_raw`] (salt = env name) and [`redact_url_userinfo`]
+/// (salt = server name). The `:` is per-entry entropy, not the collision
+/// protection (the outer length-prefixed framing in
+/// [`McpServerEntry::content_hash`] is); the salt makes a low-entropy value hash
+/// differently per entry, defeating a cross-server rainbow table.
 pub(crate) fn salted_sha256_hex(salt: &str, value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(salt.as_bytes());
@@ -502,58 +306,36 @@ pub(crate) fn salted_sha256_hex(salt: &str, value: &str) -> String {
     hex_lower(&hasher.finalize())
 }
 
-/// Why a physically-present MCP config path was skipped during
-/// discovery / inventory build, instead of contributing servers.
+/// Why a physically-present MCP config path was skipped during discovery rather
+/// than contributing servers. Surfacing it in
+/// [`McpInventory::rejected_configs`] turns a silent skip — which would let an
+/// attacker swap a real `.mcp.json` for a symlink-out-of-repo and lose every
+/// server it contributed — into a visible diagnostic.
 ///
-/// Every reason here corresponds to a path that the discovery walk
-/// found on disk but deliberately refused — a silent skip would let
-/// an attacker (or a careless misconfiguration) replace a real
-/// `.mcp.json` with a symlink-out-of-repo, an oversized file, or an
-/// unreadable file, and the lockfile would silently lose every
-/// server that file used to contribute. Surfacing the rejection in
-/// [`McpInventory::rejected_configs`] turns the silent skip into a
-/// visible diagnostic the CLI and any consumer can show.
-///
-/// Wire shape (when serialized in CLI JSON output): the `kind`
-/// field names the variant in `snake_case`. Variants that carry
-/// additional context (`Oversize`, `Unreadable`) include extra
-/// fields after the `kind`. Field values are `usize`/`u64`/`bool`
-/// only — no file content or arbitrary error strings — so the
-/// diagnostic surface cannot echo a redacted-but-still-sensitive
-/// lockfile body.
+/// Wire shape: `kind` names the variant in `snake_case`; extra fields are
+/// `usize`/`u64`/`bool` only (no content / error strings), so the diagnostic
+/// can't echo a sensitive lockfile body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RejectedReason {
-    /// The path itself, or some directory between `repo_root` and it,
-    /// is a symbolic link. Discovery is repo-local by design; a symlink
-    /// could point at a user-level config (`~/.claude/`) or any
-    /// arbitrary path, so we refuse to follow it.
+    /// The path, or a directory between `repo_root` and it, is a symlink —
+    /// refused since discovery is repo-local and a symlink could point anywhere.
     Symlink,
-    /// The path exists but is not a regular file (it is a directory,
-    /// a FIFO, a socket, a block device, …). Only regular files
-    /// contribute to the inventory.
+    /// The path exists but is not a regular file (dir/FIFO/socket/device).
     NotRegularFile,
-    /// The path's canonical (fully symlink-resolved) form does not
-    /// stay inside the canonicalized repository root — a defense-in-
-    /// depth backstop on top of the per-component symlink check.
+    /// The canonical (symlink-resolved) form escapes the repo root — a
+    /// defense-in-depth backstop over the per-component symlink check.
     OutsideRepo,
-    /// The path is a regular file but its size exceeds the
-    /// per-config limit (`MCP_CONFIG_MAX_SIZE`). Reading an
-    /// unbounded JSON document would let a hostile or careless config
-    /// turn `tirith mcp lock` into a memory-pressure / DoS surface.
+    /// A regular file whose size exceeds `MCP_CONFIG_MAX_SIZE`; reading an
+    /// unbounded JSON doc would be a DoS surface.
     Oversize {
-        /// The file's size in bytes, as returned by `fs::metadata().len()`.
+        /// The file's size in bytes (`fs::metadata().len()`).
         size_bytes: u64,
     },
-    /// The path is a regular file under the size cap but could not be
-    /// read.
+    /// A regular file under the cap that could not be read.
     Unreadable {
-        /// `true` when the underlying io error was
-        /// `std::io::ErrorKind::PermissionDenied` — the most common
-        /// operator-actionable cause (a config file mode-locked by the
-        /// IDE). Other io errors fold into `false` (the inner error
-        /// string is deliberately not surfaced; see the
-        /// `unreadable file` rationale in `mcpdrift.rs`).
+        /// `true` for `PermissionDenied` (the operator-actionable case); other
+        /// io errors fold into `false` (the inner string is not surfaced).
         permission_denied: bool,
     },
 }
@@ -561,8 +343,7 @@ pub enum RejectedReason {
 /// One rejected config path with the reason it was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectedConfig {
-    /// Repo-relative path of the rejected config file (the same shape
-    /// `configs` / `malformed_configs` carry).
+    /// Repo-relative path of the rejected config file.
     pub path: String,
     /// Why the path was rejected.
     pub reason: RejectedReason,
@@ -577,35 +358,22 @@ pub struct McpInventory {
     /// file checked, including ones that yielded no server — so the caller can
     /// honestly report "N configs, M servers").
     pub configs: Vec<String>,
-    /// Repo-relative paths of config files that were discovered but could not
-    /// be parsed (not valid JSON, or no MCP-server object). Informational —
-    /// these are NOT an error; they simply contribute no entries.
+    /// Repo-relative paths discovered but unparseable (non-JSON, or no MCP-server
+    /// object). Informational, not an error — they contribute no entries.
     pub malformed_configs: Vec<String>,
-    /// Physically-present MCP config paths that the discovery walk
-    /// **refused** (symlinked, not a regular file, escaped the repo root
-    /// by canonicalization, oversized, or unreadable). Each entry carries
-    /// the repo-relative path and the structured reason. Distinct from
-    /// `malformed_configs`: a "malformed" config was read but did not
-    /// parse; a "rejected" config was discovered but never read at all.
-    ///
-    /// **Additive field, not a lockfile schema bump.** This field rides
-    /// on `McpInventory`, which is the in-process discovery structure —
-    /// it is NOT part of the on-disk `McpLockfile` shape, so its
-    /// introduction did not require a `MCP_LOCK_FORMAT_VERSION` bump.
-    /// Consumers that want to surface the rejections (the `mcp lock`
-    /// CLI summary, an integration ingesting the JSON output) read it
-    /// directly from `McpInventory::rejected_configs`.
+    /// Physically-present config paths the discovery walk REFUSED (symlinked, not
+    /// regular, escaped the repo, oversized, or unreadable), each with a
+    /// structured reason. Distinct from `malformed_configs` (read but didn't
+    /// parse): a rejected config was never read. In-process discovery field only,
+    /// not part of the on-disk lockfile shape (no schema bump).
     pub rejected_configs: Vec<RejectedConfig>,
 }
 
 impl McpInventory {
-    /// `true` when no MCP configuration was found at all. Distinct from "found
-    /// configs but they declared zero servers" — the caller words its honest
-    /// output differently for the two. `rejected_configs` does NOT count
-    /// against emptiness: a repo whose only config was rejected (symlinked,
-    /// oversized, …) still counts as "no configs found" because no servers
-    /// could be inventoried — but the rejection list is the operator-visible
-    /// signal that the apparent emptiness has a cause.
+    /// `true` when no MCP config was found at all (distinct from "found configs
+    /// with zero servers"). `rejected_configs` doesn't count — a repo whose only
+    /// config was rejected still reads as "no configs found", with the rejection
+    /// list as the operator-visible cause.
     pub fn is_empty(&self) -> bool {
         self.configs.is_empty()
     }
@@ -618,23 +386,14 @@ pub struct McpLockServer {
     pub name: String,
     /// Canonical transport descriptor.
     pub transport: McpTransport,
-    /// Declared tool list (sorted, de-duplicated). Empty when the source
-    /// config either omitted the `tools` key entirely OR declared
-    /// `"tools": []` — distinguish via [`Self::tools_declared`].
+    /// Declared tool list (sorted, de-duplicated). Empty when the config omitted
+    /// `tools` OR declared `"tools": []` — distinguish via [`Self::tools_declared`].
     pub tools: Vec<String>,
-    /// Whether the source config carried a `tools` key. See
-    /// [`McpServerEntry::tools_declared`] for the rationale. Serialized
-    /// with `#[serde(default = "default_tools_declared")]` so a legacy
-    /// lockfile (no field) deserializes with the value `true`.
-    ///
-    /// **Folded into [`Self::hash`] from `format_version: 5` onward.**
-    /// Pre-v5, this field was excluded from the per-server hash so a
-    /// `"tools": []` ↔ omitted flip silently passed drift detection. v5
-    /// folds it into [`McpServerEntry::content_hash`]; a v4 lockfile
-    /// loaded in a v5 build is tagged via
-    /// [`LockfileSchema::LegacyV4Migration`] so
-    /// [`compute_drift`] surfaces a one-time migration prompt instead of
-    /// phantom drift.
+    /// Whether the source config carried a `tools` key (see
+    /// [`McpServerEntry::tools_declared`]). Legacy lockfiles without the field
+    /// deserialize as `true`. Folded into [`Self::hash`] from v5 onward; a v4
+    /// lockfile is tagged [`LockfileSchema::LegacyV4Migration`] for a one-time
+    /// migration prompt.
     #[serde(default = "default_tools_declared")]
     pub tools_declared: bool,
     /// Repo-relative path of the config file the server was declared in.
@@ -643,75 +402,49 @@ pub struct McpLockServer {
     pub hash: String,
 }
 
-/// In-memory schema-state tag attached to a parsed lockfile.
-///
-/// Not part of the on-disk lockfile shape — never serialized, never
-/// deserialized — but carried alongside an [`McpLockfile`] value so
-/// downstream consumers (notably [`compute_drift`]) can short-circuit the
-/// drift comparison for a legacy lockfile that needs a one-time
-/// regeneration.
-///
-/// The variant is set inside [`parse_lockfile`] based on the file's
-/// declared `format_version`. A lockfile built freshly via
-/// [`McpLockfile::from_inventory`] is always `Current`.
+/// In-memory schema-state tag on a parsed lockfile. Never serialized; carried
+/// alongside an [`McpLockfile`] so [`compute_drift`] can short-circuit a legacy
+/// lockfile that needs a one-time regeneration. Set in [`parse_lockfile`] from
+/// the file's `format_version`; a freshly-built lockfile is always `Current`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockfileSchema {
-    /// The lockfile's `format_version` matches [`MCP_LOCK_FORMAT_VERSION`];
-    /// drift detection runs normally.
+    /// `format_version` matches [`MCP_LOCK_FORMAT_VERSION`]; drift runs normally.
     #[default]
     Current,
-    /// The lockfile was written with `format_version: 4`. The on-disk
-    /// shape is identical to v5, but the hashes inside were computed
-    /// without folding `tools_declared` into [`McpServerEntry::content_hash`]
-    /// — so a v5 build's recomputed hashes will differ from the stored
-    /// ones for every server, even when nothing about the MCP inventory
-    /// changed. [`compute_drift`] sees this tag and returns a single
-    /// [`McpDrift::SchemaUpgradeRequired`] entry instructing the operator
-    /// to run `tirith mcp lock --force` once, rather than firing phantom
-    /// drift on every existing server.
+    /// `format_version: 4`: same on-disk shape as v5, but hashes were computed
+    /// without `tools_declared`, so every v5-recomputed hash differs even with an
+    /// unchanged inventory. [`compute_drift`] returns a single
+    /// [`McpDrift::SchemaUpgradeRequired`] (re-lock once) instead of phantom drift.
     LegacyV4Migration,
 }
 
-/// The `.tirith/mcp.lock` document.
-///
-/// JSON, deterministically ordered (servers sorted by `(name, source_config)`),
-/// so re-running `tirith mcp lock` on an unchanged repository produces a
-/// byte-identical file and a `git diff` of the lockfile shows exactly what
-/// changed in the MCP surface.
+/// The `.tirith/mcp.lock` document. JSON, deterministically ordered (servers by
+/// `(name, source_config)`), so re-running `tirith mcp lock` on an unchanged repo
+/// produces a byte-identical file and a clean `git diff`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpLockfile {
     /// Lockfile schema version.
     pub format_version: u32,
-    /// Hash over the whole inventory — the ordered concatenation of every
-    /// server's content hash. Changes iff any server is added, removed, or
-    /// altered. The cheap top-level "did anything change?" check for `mcp
-    /// verify`.
+    /// Hash over the ordered concatenation of every server's content hash —
+    /// changes iff any server is added/removed/altered. The cheap "did anything
+    /// change?" check for `mcp verify`.
     pub inventory_hash: String,
     /// Repo-relative paths of the MCP config files captured, sorted.
     pub configs: Vec<String>,
     /// Every locked MCP server, sorted by `(name, source_config)`.
     pub servers: Vec<McpLockServer>,
-    /// In-memory schema-state tag — `LegacyV4Migration` when the lockfile
-    /// was parsed from a v4 file, `Current` otherwise. Never serialized;
-    /// `#[serde(skip)]` with a `Default` impl returning `Current` so a
-    /// freshly-constructed `McpLockfile` (and any future
-    /// [`Serialize`]/[`Deserialize`] round-trip) lands in the `Current`
-    /// state.
+    /// In-memory schema-state tag (`LegacyV4Migration` for a v4 file, else
+    /// `Current`). Never serialized; `#[serde(skip)]` so any round-trip lands in
+    /// `Current`.
     #[serde(skip)]
     pub schema_state: LockfileSchema,
 }
 
 impl McpLockfile {
-    /// Build a lockfile from an inventory. Pure and deterministic: the same
-    /// inventory always yields the same lockfile — **regardless of the order
-    /// the inventory's servers happen to be in**.
-    ///
-    /// `build_inventory` already sorts, but `from_inventory` is a public entry
-    /// point that may be handed an inventory assembled by any means (a test, a
-    /// future caller, a different discovery order), so the sort is repeated
-    /// here and is the load-bearing one: servers are sorted by
-    /// `(name, source_config)` **before** the inventory hash is computed, so
-    /// both the lockfile and its `inventory_hash` are stable.
+    /// Build a lockfile from an inventory. Pure and deterministic regardless of
+    /// the inventory's server order: the sort by `(name, source_config)` here —
+    /// the load-bearing one, since this is a public entry point — happens BEFORE
+    /// the inventory hash, so both the lockfile and `inventory_hash` are stable.
     pub fn from_inventory(inventory: &McpInventory) -> Self {
         let mut servers: Vec<McpLockServer> = inventory
             .servers
@@ -726,9 +459,8 @@ impl McpLockfile {
             })
             .collect();
 
-        // Deterministic ordering — independent of config-discovery order — so
-        // the lockfile and the inventory hash below are both stable. Must
-        // happen before `compute_inventory_hash`, which hashes server order.
+        // Sort before `compute_inventory_hash` (which hashes server order), so
+        // both the lockfile and the hash are discovery-order-independent.
         servers.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
@@ -750,13 +482,11 @@ impl McpLockfile {
         }
     }
 
-    /// Render the lockfile to its on-disk string form: pretty JSON with a
-    /// trailing newline. Deterministic — the input ordering is already fixed
-    /// by [`from_inventory`].
+    /// Render to the on-disk form: pretty JSON with a trailing newline.
+    /// Deterministic (ordering already fixed by [`from_inventory`]).
     pub fn render(&self) -> String {
-        // serde_json::to_string_pretty cannot fail for this fully-owned,
-        // string-keyed structure, but handle the Result rather than unwrap so
-        // a future schema change can never panic the `mcp lock` command.
+        // Handle the Result (rather than unwrap) so a future schema change can
+        // never panic `mcp lock`; this serialize cannot actually fail today.
         match serde_json::to_string_pretty(self) {
             Ok(mut s) => {
                 s.push('\n');
@@ -778,13 +508,11 @@ fn compute_inventory_hash(servers: &[McpLockServer]) -> String {
     hex_lower(&hasher.finalize())
 }
 
-/// Lowercase hex encoding of a byte slice. Local helper — avoids pulling in the
-/// `hex` crate for one call site.
+/// Lowercase hex encoding of a byte slice (local — avoids the `hex` crate).
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        // Writing to a String never fails.
         let _ = write!(s, "{b:02x}");
     }
     s
@@ -796,28 +524,13 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Repo-root-relative MCP config locations to probe.
 ///
-/// **Intentionally broader than `configfile::is_mcp_config_file`'s `mcp_dirs`.**
-/// The configfile rule that flags an `.mcp.json` as a known MCP config file
-/// in the general file-scan path checks the bare-root names
-/// (`mcp.json` / `.mcp.json` / `mcp_settings.json`) plus a four-entry
-/// `mcp_dirs` list of IDE host directories: `.vscode`, `.cursor`, `.windsurf`,
-/// `.cline`. This discovery list deliberately also covers `.amazonq/`,
-/// `.continue/`, and `.kiro/settings/` — three additional IDE / agent surfaces
-/// the lockfile pipeline must inventory even though the general file-scan
-/// rule does not classify them as MCP config files (yet). The asymmetry is
-/// intentional: the lockfile is the gating baseline for the MCP surface and
-/// must capture every host directory tirith knows about; the file-scan
-/// classifier is a separate detection-tier concern with its own cadence for
-/// expanding the list.
-///
-/// **Maintainer note.** A maintainer adding a new IDE host directory must
-/// decide independently whether to extend this list (the lockfile inventory),
-/// `configfile::is_mcp_config_file`'s `mcp_dirs` (the file-scan classifier),
-/// or both — the two lists are deliberately decoupled rather than mirrors of
-/// each other.
-///
-/// Kept as an explicit list (rather than a filesystem walk) so discovery is
-/// bounded, fast, and never strays outside the known MCP config surface.
+/// **Intentionally broader than `configfile::is_mcp_config_file`'s `mcp_dirs`**:
+/// this list also covers `.amazonq/`, `.continue/`, and `.kiro/settings/`. The
+/// asymmetry is deliberate — the lockfile is the gating baseline and must capture
+/// every host dir tirith knows; the file-scan classifier expands on its own
+/// cadence. A maintainer adding a host dir decides independently whether to
+/// extend this list, the classifier, or both. Kept explicit (not a walk) so
+/// discovery is bounded and never strays outside the known surface.
 pub(crate) const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
     // Bare repo-root MCP configs.
     "mcp.json",
@@ -833,53 +546,27 @@ pub(crate) const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
     ".kiro/settings/mcp.json",
 ];
 
-/// Discover the repo-local MCP config files that exist under `repo_root`.
-///
-/// Returns `(absolute_path, repo_relative_path)` pairs, sorted by the relative
-/// path for determinism. Only **regular files reachable without crossing a
-/// symlink, and resolving to a location inside `repo_root`**, are returned.
-///
-/// Discovery is strictly repo-local. Every probed path is a fixed relative
-/// path joined onto `repo_root`, so the *probed* path can never escape the
-/// repository — but a probed path could itself **be** a symlink (or sit under
-/// a symlinked parent directory) pointing outside the repo. Following that
-/// would break the "repo-local only" guarantee — a malicious or careless
-/// `.mcp.json -> ~/.claude/mcp.json` symlink would pull a user-level config
-/// into the inventory. So a config path is rejected when:
-///
-/// * it (or any ancestor up to `repo_root`) is itself a symlink — checked with
-///   `symlink_metadata`, which does **not** follow the final component, so the
-///   check is not subject to the TOCTOU window an `is_file()` probe has; or
-/// * its canonicalized (fully symlink-resolved) path does not stay inside the
-///   canonicalized `repo_root` — a defense-in-depth backstop.
-///
-/// **Discovery-time rejections are dropped on this signature.** Callers that
-/// want the structured list of rejected paths use
-/// [`discover_mcp_configs_full`]. This thin wrapper drops the rejection list
-/// for callers that only need the accepted pairs (existing tests, programmatic
-/// consumers of the simpler shape).
+/// Discover the repo-local MCP config files under `repo_root`, returning
+/// `(absolute, repo_relative)` pairs sorted by the relative path. Only regular
+/// files reachable without crossing a symlink and resolving inside `repo_root`
+/// are returned — a probed path that is itself a symlink (or under a symlinked
+/// parent), or whose canonical form escapes the root, is rejected, so a
+/// `.mcp.json -> ~/.claude/mcp.json` can't pull a user config in. The symlink
+/// check uses `symlink_metadata` (no TOCTOU). Drops the rejection list — use
+/// [`discover_mcp_configs_full`] for it.
 pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
     discover_mcp_configs_full(repo_root).0
 }
 
-/// Like [`discover_mcp_configs`] but also returns the structured rejection
-/// list. Each rejected path carries the repo-relative path and a
-/// [`RejectedReason`] describing why it was refused. Used by
-/// [`build_inventory`] so the rejection list flows through to
-/// [`McpInventory::rejected_configs`] and into the CLI's `mcp lock`
-/// human / JSON summary.
-///
-/// Pure path-level rejections only — file-content rejections (oversize,
-/// permission denied) happen in [`build_inventory`] when the file is
-/// actually read.
+/// Like [`discover_mcp_configs`] but also returns the structured rejection list
+/// (used by [`build_inventory`] to populate [`McpInventory::rejected_configs`]).
+/// Path-level rejections only — content rejections (oversize, permission) happen
+/// in [`build_inventory`] when the file is read.
 pub(crate) fn discover_mcp_configs_full(
     repo_root: &Path,
 ) -> (Vec<(PathBuf, String)>, Vec<RejectedConfig>) {
-    // Canonicalize the repo root once for the containment check. If the root
-    // itself cannot be canonicalized (it does not exist), no config under it
-    // can be discovered anyway — return empty rather than guess. There's
-    // nothing to "reject" in that case because no candidate is physically
-    // present either.
+    // Canonicalize the root once for the containment check; if it doesn't exist,
+    // no config under it can be discovered — return empty (nothing to reject).
     let canonical_root = match repo_root.canonicalize() {
         Ok(r) => r,
         Err(_) => return (Vec::new(), Vec::new()),
@@ -891,13 +578,8 @@ pub(crate) fn discover_mcp_configs_full(
     for rel in MCP_CONFIG_RELATIVE_PATHS {
         let abs = repo_root.join(rel);
 
-        // Reject if the final component, or any directory component between
-        // `repo_root` and it, is a symlink. `symlink_metadata` does not follow
-        // the path it is given, so each component is inspected as-is.
-        //
-        // Only record the rejection when the path is *physically present*
-        // (a non-existent path under a normal repo is not "rejected", it
-        // just isn't there).
+        // Reject if any component between `repo_root` and the leaf is a symlink.
+        // (A non-existent path isn't "rejected", it just isn't there.)
         if path_crosses_symlink(repo_root, rel) {
             rejected.push(RejectedConfig {
                 path: (*rel).to_string(),
@@ -906,16 +588,12 @@ pub(crate) fn discover_mcp_configs_full(
             continue;
         }
 
-        // The file must be a regular file (not a directory, FIFO, …). Use
-        // `symlink_metadata` so a symlink that slipped past the component walk
-        // is still not silently followed.
+        // Must be a regular file; `symlink_metadata` so a leaf symlink is still
+        // not followed.
         match std::fs::symlink_metadata(&abs) {
             Ok(meta) if meta.file_type().is_file() => {}
             Ok(meta) if meta.file_type().is_symlink() => {
-                // A leaf-position symlink that the per-component walk did not
-                // observe (the parent components were all not-symlinks; the
-                // probed leaf itself is). Same rejection class as a directory
-                // symlink on the path — record it explicitly.
+                // A leaf-position symlink the per-component walk didn't observe.
                 rejected.push(RejectedConfig {
                     path: (*rel).to_string(),
                     reason: RejectedReason::Symlink,
@@ -923,8 +601,7 @@ pub(crate) fn discover_mcp_configs_full(
                 continue;
             }
             Ok(_) => {
-                // The path exists but isn't a regular file — directory,
-                // FIFO, socket, …. Surface it so an operator notices.
+                // Exists but not a regular file (dir/FIFO/socket/…) — surface it.
                 rejected.push(RejectedConfig {
                     path: (*rel).to_string(),
                     reason: RejectedReason::NotRegularFile,
@@ -932,16 +609,13 @@ pub(crate) fn discover_mcp_configs_full(
                 continue;
             }
             Err(_) => {
-                // The path doesn't exist; this is the common case for any
-                // probe that doesn't apply to this repo. Not "rejected"
-                // — there's nothing here.
+                // Doesn't exist — the common case; not "rejected", nothing here.
                 continue;
             }
         }
 
-        // Defense in depth: the fully-resolved path must stay inside the
-        // resolved repo root. (With the symlink-component check above this is
-        // belt-and-braces, but it also catches an exotic mount/junction case.)
+        // Defense in depth: the resolved path must stay inside the resolved root
+        // (also catches exotic mount/junction cases).
         match abs.canonicalize() {
             Ok(canonical) if canonical.starts_with(&canonical_root) => {}
             _ => {
@@ -960,14 +634,10 @@ pub(crate) fn discover_mcp_configs_full(
     (found, rejected)
 }
 
-/// `true` if any component of `rel` — joined onto `repo_root` — is a symlink.
-///
-/// Walks from `repo_root` outward one component at a time, calling
-/// `symlink_metadata` (which never follows the inspected path's last
-/// component) on each prefix. `repo_root` itself is intentionally **not**
-/// inspected: the caller chose it, and a repo legitimately reached through a
-/// symlinked checkout directory must still be scannable — only symlinks
-/// *inside* the repo, on the way to a config file, are rejected.
+/// `true` if any component of `rel` (joined onto `repo_root`) is a symlink.
+/// Walks outward one component at a time via `symlink_metadata`. `repo_root`
+/// itself is NOT inspected — a repo reached through a symlinked checkout must
+/// still be scannable; only symlinks INSIDE the repo are rejected.
 fn path_crosses_symlink(repo_root: &Path, rel: &str) -> bool {
     let mut current = repo_root.to_path_buf();
     for component in Path::new(rel).components() {
@@ -978,55 +648,29 @@ fn path_crosses_symlink(repo_root: &Path, rel: &str) -> bool {
                     return true;
                 }
             }
-            // A component that does not exist cannot be a symlink; let the
-            // caller's `symlink_metadata` on the full path handle "missing".
+            // A missing component can't be a symlink; the caller handles "missing".
             Err(_) => return false,
         }
     }
     false
 }
 
-/// Per-file size cap for an MCP config. A `.mcp.json` realistically lives in
-/// the tens of KiB at most (a few servers, a handful of args / env / tool
-/// entries each); 1 MiB is roughly 1000× that. Above the cap the file is
-/// rejected without reading — `tirith mcp lock` should not be a memory-
-/// pressure / DoS surface against a hostile or careless config.
-///
-/// Distinct from `scan_single_file`'s 10 MiB cap on the tier-1/2/3 hot path:
-/// MCP configs are a much narrower file class with a much smaller realistic
-/// size envelope, so a tighter cap is appropriate here.
+/// Per-file size cap for an MCP config (1 MiB ≫ the realistic tens-of-KiB).
+/// Above it the file is rejected without reading, so `tirith mcp lock` isn't a
+/// DoS surface. Tighter than `scan_single_file`'s 10 MiB hot-path cap — a much
+/// narrower file class.
 pub const MCP_CONFIG_MAX_SIZE: u64 = 1_048_576;
 
-/// Build the MCP inventory for a repository.
+/// Build the MCP inventory for a repository: discover every repo-local config
+/// under `repo_root`, parse each, and return the [`McpInventory`]. An unparseable
+/// config lands in [`McpInventory::malformed_configs`] (never an error/panic).
 ///
-/// Discovers every repo-local MCP config under `repo_root`, parses each, and
-/// returns the structured [`McpInventory`]. A config that cannot be parsed is
-/// recorded in [`McpInventory::malformed_configs`] and contributes no servers —
-/// it is never an error and never a panic.
-///
-/// **Path-level rejections** (symlinks, non-regular files, paths whose
-/// canonical form escapes the repo) flow through from
-/// [`discover_mcp_configs_full`] into [`McpInventory::rejected_configs`].
-/// **File-level rejections** (oversize, permission denied) are detected
-/// here and recorded in the same list — the goal is one operator-visible
-/// list of "physically present but skipped" paths regardless of which
-/// gate the path tripped.
-///
-/// **Size cap.** Each config's `fs::metadata().len()` is checked against
-/// [`MCP_CONFIG_MAX_SIZE`] before any read. An oversized file contributes
-/// no servers and appears in `rejected_configs` with reason
-/// [`RejectedReason::Oversize`]. This is the file-class-specific cap; the
-/// tier-1/2/3 hot-path 10 MiB cap is unrelated and applies to a different
-/// surface.
-///
-/// **IO-error categorization.** A read failure is no longer collapsed into
-/// the malformed-config bucket: `std::io::ErrorKind::PermissionDenied`
-/// becomes [`RejectedReason::Unreadable`] with `permission_denied: true`;
-/// `NotFound` is silent (the path was probed but vanished between the
-/// discovery `symlink_metadata` and the read, which is normal during a
-/// concurrent edit); `InvalidData` (non-UTF-8 content) keeps the legacy
-/// "malformed" path; anything else folds into `Unreadable` with
-/// `permission_denied: false`.
+/// Path-level rejections (from [`discover_mcp_configs_full`]) and file-level ones
+/// (oversize, permission) both flow into [`McpInventory::rejected_configs`] — one
+/// "present but skipped" list regardless of which gate tripped. Size is checked
+/// against [`MCP_CONFIG_MAX_SIZE`] before any read. IO errors are categorized:
+/// `PermissionDenied`→`Unreadable{true}`; `NotFound`→silent (vanished mid-edit);
+/// `InvalidData`→malformed; else `Unreadable{false}`.
 pub fn build_inventory(repo_root: &Path) -> McpInventory {
     let (configs, rejected_from_discovery) = discover_mcp_configs_full(repo_root);
 
@@ -1036,11 +680,8 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
     };
 
     for (abs_path, rel_path) in configs {
-        // Size pre-check. Use `fs::metadata` (which follows symlinks); the
-        // discovery walk already rejected symlinked candidates, so the
-        // probed file is a real regular file at this point. A metadata
-        // failure here folds into the unreadable category (rare: the file
-        // was present a moment ago).
+        // Size pre-check. Discovery already rejected symlinks, so this is a real
+        // regular file; a metadata failure here folds into the unreadable bucket.
         let size_bytes = match std::fs::metadata(&abs_path) {
             Ok(m) => m.len(),
             Err(e) => {
@@ -1059,32 +700,22 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
                 path: rel_path.clone(),
                 reason: RejectedReason::Oversize { size_bytes },
             });
-            // Oversized files do NOT count as a discovered config (they
-            // are rejected at the gate, never reach the parser, and
-            // contribute no servers).
+            // Oversized: rejected at the gate, never a discovered config.
             continue;
         }
 
-        // The file is admitted: it counts as a discovered config from
-        // here on, even if it later fails to read or parse.
+        // Admitted: counts as a discovered config from here on, even if it later
+        // fails to read or parse.
         inventory.configs.push(rel_path.clone());
 
         let content = match std::fs::read_to_string(&abs_path) {
             Ok(c) => c,
             Err(e) => {
-                // Categorize the io error so the operator can tell
-                // "I can't read this file" from "this file is not UTF-8".
+                // Categorize so the operator can tell "can't read" from "not UTF-8".
                 match e.kind() {
                     std::io::ErrorKind::NotFound => {
-                        // The file vanished between the discovery
-                        // `symlink_metadata` and this read — a concurrent
-                        // edit, a temp file being swapped, etc. Drop the
-                        // candidate silently: this is operationally
-                        // normal and there's nothing here to surface.
-                        // Pop the rel_path off `configs` since we have
-                        // no real file to attribute servers to (and the
-                        // policy summary should not claim a config
-                        // exists that does not).
+                        // Vanished between discovery and read (concurrent edit) —
+                        // pop it off `configs`, nothing to surface.
                         inventory.configs.pop();
                     }
                     std::io::ErrorKind::PermissionDenied => {
@@ -1094,15 +725,13 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
                                 permission_denied: true,
                             },
                         });
-                        // Pop: the file was "discovered" structurally but
-                        // we couldn't actually read it. The rejection list
-                        // is the place that names it now.
+                        // Pop: discovered structurally, but unreadable; the
+                        // rejection list names it now.
                         inventory.configs.pop();
                     }
                     std::io::ErrorKind::InvalidData => {
-                        // Non-UTF-8 content. Keep the legacy "malformed"
-                        // path: the file is present, attributable, and
-                        // the right shape — its bytes just aren't text.
+                        // Non-UTF-8: present and attributable, just not text —
+                        // keep the legacy "malformed" path.
                         inventory.malformed_configs.push(rel_path.clone());
                     }
                     _ => {
@@ -1122,21 +751,19 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
         match parse_mcp_config(&content, &rel_path) {
             Some(mut servers) => {
                 if servers.is_empty() {
-                    // Valid JSON, valid MCP shape, but zero servers declared.
-                    // Not malformed — just an empty config; it still counts as
-                    // a discovered config.
+                    // Valid but empty config — not malformed, still a discovered config.
                 } else {
                     inventory.servers.append(&mut servers);
                 }
             }
             None => {
-                // Not valid JSON, or no MCP-server object at all.
+                // Not valid JSON, or no MCP-server object.
                 inventory.malformed_configs.push(rel_path);
             }
         }
     }
 
-    // Deterministic ordering: sort the merged server list by (name, source).
+    // Deterministic ordering by (name, source).
     inventory.servers.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
@@ -1154,23 +781,16 @@ pub fn build_inventory(repo_root: &Path) -> McpInventory {
     inventory
 }
 
-/// Parse one MCP config file's contents into a list of server entries.
-///
-/// Returns:
-/// * `Some(vec)` — the file is valid JSON **and** carries a recognized
-///   MCP-server object (`mcpServers` or its `servers` alias). The vec may be
-///   empty if that object declared no servers.
-/// * `None` — the file is not valid JSON, or has no MCP-server object at all.
-///   The caller records this as a malformed/non-MCP config.
-///
-/// Every malformed individual server object (a server whose value is not a
-/// JSON object) is skipped silently rather than failing the whole file — one
-/// bad entry must not discard the others.
+/// Parse one MCP config file into server entries. `Some(vec)` if it's valid JSON
+/// with a recognized MCP-server object (`mcpServers` or `servers` alias; vec may
+/// be empty); `None` otherwise (caller records it as malformed). A single
+/// non-object server value is skipped silently — one bad entry must not discard
+/// the rest.
 pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpServerEntry>> {
     let json: serde_json::Value = serde_json::from_str(content).ok()?;
 
-    // Both shape variants: the canonical `mcpServers` and the `servers` alias.
-    // `configfile::check_mcp_config` accepts exactly this pair.
+    // Canonical `mcpServers` and the `servers` alias — the pair
+    // `configfile::check_mcp_config` accepts.
     let servers_obj = json
         .get("mcpServers")
         .or_else(|| json.get("servers"))
@@ -1178,8 +798,7 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
 
     let mut entries = Vec::with_capacity(servers_obj.len());
     for (name, config) in servers_obj {
-        // A server whose value is not a JSON object is malformed — skip it,
-        // keep the rest.
+        // Skip a non-object server value, keep the rest.
         let obj = match config.as_object() {
             Some(o) => o,
             None => continue,
@@ -1202,14 +821,9 @@ pub fn parse_mcp_config(content: &str, source_config: &str) -> Option<Vec<McpSer
     Some(entries)
 }
 
-/// Derive the transport descriptor from a single server object.
-///
-/// `url` wins over `command` if a (malformed) config declares both — a remote
-/// URL is the higher-risk surface, so it is the one recorded.
-///
-/// `server_name` is the MCP server's declared name (the key in the config's
-/// `mcpServers` / `servers` object). It is used as the per-entry salt for the
-/// URL transport's `userinfo_hash` (see [`redact_url_userinfo`]).
+/// Derive the transport descriptor from a server object. `url` wins over
+/// `command` if both are declared (the higher-risk surface). `server_name` is the
+/// per-entry salt for the URL `userinfo_hash` (see [`redact_url_userinfo`]).
 fn parse_transport(
     server_name: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -1243,139 +857,62 @@ fn parse_transport(
     McpTransport::Unknown
 }
 
-/// Strip any HTTP Basic Auth userinfo (`user[:password]`) from a URL declared
-/// in an MCP config, returning the redacted URL and a salted hash of the
-/// captured userinfo.
+/// Strip any HTTP Basic Auth userinfo from a URL, returning the redacted URL and
+/// a salted hash of the captured userinfo.
 ///
-/// **Security invariant.** A URL declared as `https://user:token@host:port/`
-/// in `.mcp.json` is recorded as `https://host:port/` in the lockfile, and
-/// the captured `user:token` substring is hashed with the MCP server's name
-/// as the salt (the shared [`salted_sha256_hex`] helper, the same scheme
-/// [`McpEnvEntry::from_raw`] uses for env values; see that helper's docs for
-/// why the inner `:` is per-entry entropy rather than the load-bearing
-/// collision protection — the outer length-prefixed framing in
-/// [`McpServerEntry::content_hash`] is what makes the encoding unambiguous).
-/// The raw userinfo is consumed inside this function and dropped before the
-/// function returns; it never reaches a struct field, the serializer, or
-/// the rest of the process. This is the load-bearing security invariant of
-/// the v4 lockfile format for the URL transport: a committed
-/// `.tirith/mcp.lock` never contains a Basic Auth credential that was in
-/// the source `.mcp.json`.
+/// **Security invariant (v4):** `https://user:token@host/` is stored as
+/// `https://host/`; the `user:token` substring is hashed via
+/// [`salted_sha256_hex`] (server name as salt) and dropped before return — a
+/// committed `.tirith/mcp.lock` never contains a credential from the source.
 ///
-/// **Behavior.**
-/// * The URL parses cleanly with a non-empty userinfo → return the URL with
-///   `set_username("")` and `set_password(None)`, then re-serialize via
-///   `url::Url::as_str()`, plus `Some(sha256(server_name || ':' || userinfo))`.
-///   `userinfo` is the exact `username[:password]` substring as parsed —
-///   percent-encoded bytes are hashed as-is, because that is what the
-///   original config declared and any byte-level difference must register
-///   as drift.
-/// * The URL parses cleanly with no userinfo (the common case) → return the
-///   **canonical** `url::Url::as_str()` form and `None`. The URL is
-///   round-tripped through the parser even though there is nothing to
-///   redact, so the stored bytes have the same shape whether the source URL
-///   carried userinfo or not. Without this symmetry, removing a credential
-///   from the source config would surface as a spurious `UrlChanged` drift
-///   alongside `UserinfoRemoved` (e.g. `https://host` locks as
-///   `https://host/` when userinfo was present, then a later verify against
-///   a stripped `https://host` source would diff `https://host/` vs
-///   `https://host` and flag two changes when semantically only one
-///   happened). An "all-zero userinfo" form like `https://:@host/` or
-///   `https://@host/` is normalized by `url::Url` to the no-userinfo form
-///   during parsing, so it is treated as the no-userinfo case — the user
-///   supplied nothing.
-/// * The URL does not parse → best-effort-strip the userinfo (the
-///   `***@` form when the scheme + authority + userinfo shape is
-///   recognizable) and store a salted hash of the original userinfo
-///   bytes — see [`strip_userinfo_best_effort`]. Credential add/remove
-///   drift still surfaces for malformed URLs because the hash flips.
-///   A malformed URL that does not look authority-shaped is preserved
-///   as-is with `userinfo_hash = None` (a malformed URL is captured
-///   anyway: it is itself a finding-worthy oddity a later `mcp verify`
-///   should see).
-///
-/// Returns `(redacted_url, userinfo_hash)`. The raw userinfo lives only as
-/// the local `userinfo` String for the duration of the hash computation and
-/// is dropped on function exit; it is never returned.
+/// Behavior: a clean parse with userinfo returns the stripped URL
+/// (`set_username("")`/`set_password(None)`, re-serialized) plus `Some(hash)`. A
+/// clean parse with no userinfo returns the CANONICAL `as_str()` form and `None`
+/// — round-tripped even with nothing to redact, so the stored bytes have the same
+/// shape either way and credential removal doesn't surface as a spurious
+/// `UrlChanged` alongside `UserinfoRemoved`. (`https://:@host/` etc. normalize to
+/// no-userinfo.) An unparseable URL is best-effort-stripped with a hash of its
+/// userinfo bytes (see [`strip_userinfo_best_effort`]); a non-authority-shaped
+/// one is kept verbatim with `None`.
 fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>) {
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
-        // Unparseable URL: we can't structurally identify the userinfo
-        // boundary the way `url::Url` would, but the raw string still
-        // frequently carries a `user:token@host` authority — and
-        // `.tirith/mcp.lock` is designed to be committed. A previous
-        // implementation stored the verbatim string, which leaked any
-        // credential the malformed URL happened to carry. Run a best-
-        // effort byte-scan strip pass instead: replace anything between
-        // `scheme://` and the first `@` (before the next path/query/
-        // fragment boundary) with `***`. The strip is deliberately
-        // conservative — it only fires when the input clearly carries a
-        // scheme + authority + userinfo shape — so a malformed URL that
-        // does not look authority-shaped is preserved as-is for
-        // diagnostic context.
-        //
-        // **Credential-drift signal is preserved.** When the byte-scan
-        // strip identifies userinfo bytes, we hash THOSE bytes (with the
-        // server-name salt, matching the parsed-URL path) and return
-        // `Some(hash)`. Without this, two consecutive locks of a config
-        // that lost its credentials would both carry `userinfo_hash:
-        // None` and look identical — drift detection would silently fail
-        // on credential add/remove for malformed URLs. The actual
-        // credential is never stored; only the salted hash, which is the
-        // same shape `redact_url_userinfo`'s parsed path returns.
+        // Unparseable: best-effort byte-scan strip (replace `scheme://...@` with
+        // `***`) so a credential in a malformed-but-authority-shaped URL doesn't
+        // leak into the committed lockfile; the userinfo bytes are still hashed
+        // so credential add/remove drift survives. See `strip_userinfo_best_effort`.
         Err(_) => return strip_userinfo_best_effort(server_name, url),
     };
 
     let username = parsed.username();
     let password = parsed.password();
 
-    // Reconstruct the literal userinfo substring as it appears between the
-    // scheme separator and the host: `user`, `user:password`, or `:password`.
-    // The `url` crate normalizes the all-empty `:@` and `@` forms (no user,
-    // no password) away during parsing, so `None`/`""` here genuinely means
-    // the source URL declared no userinfo and there is nothing to redact.
+    // Reconstruct the literal userinfo substring (`user`, `user:password`, or
+    // `:password`). `url` normalizes the all-empty `:@`/`@` forms away, so
+    // `None`/`""` here means no userinfo and nothing to redact.
     let userinfo: Option<String> = match (username, password) {
         ("", None) => None,
         (u, None) => Some(u.to_string()),
         (u, Some(p)) => Some(format!("{u}:{p}")),
     };
 
-    // No userinfo: round-trip through `url::Url::as_str()` anyway, so the
-    // stored URL has the same canonical shape whether the source URL declared
-    // a userinfo or not. The userinfo-strip path below also emits
-    // `parsed.as_str()`, so going through the same canonicalization here is
-    // what keeps `compute_drift` from reporting a spurious `UrlChanged`
-    // alongside `UserinfoRemoved`. Concretely: `https://user:token@host`
-    // would lock as `https://host/` (url::Url appends a missing path
-    // default), and if we kept the no-userinfo case byte-verbatim, a later
-    // verify against a stripped `https://host` source would diff
-    // `https://host/` vs `https://host` and flag two changes when the
-    // endpoint did not actually change.
+    // No userinfo: still round-trip through `as_str()` so the stored URL has the
+    // same canonical shape as the userinfo-stripped path — without this,
+    // `compute_drift` would report a spurious `UrlChanged` alongside
+    // `UserinfoRemoved` (e.g. `https://host` vs the locked `https://host/`).
     let Some(raw_userinfo) = userinfo else {
         return (parsed.as_str().to_string(), None);
     };
 
-    // Same name-salted SHA-256 scheme as `McpEnvEntry::from_raw`: the server
-    // name is the per-entry salt so the same Basic Auth token under two
-    // different servers hashes to two different digests. As documented on
-    // `salted_sha256_hex`, the inner `:` provides cross-server entropy
-    // rather than boundary unambiguity — the load-bearing collision
-    // protection at the parent level is the length-prefixed outer framing
-    // in `McpServerEntry::content_hash`, which feeds this hash through
-    // `hash_field` along with every other variable-length component.
+    // Name-salted SHA-256 (same scheme as `McpEnvEntry::from_raw`): the same
+    // token under two servers hashes differently.
     let userinfo_hash = Some(salted_sha256_hex(server_name, &raw_userinfo));
 
-    // Strip userinfo from the URL we will store. `set_username("")` /
-    // `set_password(None)` only fail for URLs that cannot have an authority
-    // (e.g. `data:`, `mailto:`), and a URL of that shape cannot carry
-    // userinfo in the first place — so since we just observed a userinfo
-    // present, both `set_*` calls must succeed. Panic if `url::Url` ever
-    // violates this invariant: a silent fallback (rebuilding the URL from
-    // `parsed`'s components) silently drops `parsed.query()` and
-    // `parsed.fragment()`, which would produce a permanent spurious
-    // `UrlChanged` drift every time `mcp verify` runs on this lockfile.
-    // The cost of a panic here is a clear bug report; the cost of silent
-    // data loss is years of mysterious drift on a working baseline.
+    // Strip userinfo from the stored URL. `set_username`/`set_password` only fail
+    // for authority-less schemes (which can't carry userinfo), so since we just
+    // saw userinfo, both must succeed — assert rather than silently rebuild from
+    // components (which would drop query/fragment and cause permanent spurious
+    // `UrlChanged` drift).
     let mut parsed = parsed;
     let strip_ok = parsed.set_password(None).is_ok() && parsed.set_username("").is_ok();
     assert!(
@@ -1390,43 +927,18 @@ fn redact_url_userinfo(server_name: &str, url: &str) -> (String, Option<String>)
     (parsed.as_str().to_string(), userinfo_hash)
 }
 
-/// Best-effort userinfo strip for a URL string that `url::Url::parse` could
-/// not parse. Locates the `scheme://` prefix and the first `@` before the
-/// next `/`, `?`, `#`, or end-of-string, and replaces the segment between
-/// them with `***`. Preserves the rest of the string for diagnostic
-/// context.
+/// Best-effort userinfo strip for a URL `url::Url::parse` rejected. Replaces the
+/// segment between `scheme://` and the first `@` (before the next `/`/`?`/`#`/end)
+/// with `***`, preserving the rest for diagnostics. A string not matching the
+/// `scheme://...@` shape is returned verbatim — nothing to strip.
 ///
-/// This runs only when [`redact_url_userinfo`]'s parser fallback fires —
-/// the parsed-fine path uses `url::Url::set_username` / `set_password` for
-/// a structurally-sound strip. The byte-scan version is a safety net for
-/// malformed inputs that nevertheless look like they carry an authority
-/// with credentials. A URL that does not match the `scheme://...@`
-/// shape is returned verbatim: a relative URL, a non-authority scheme
-/// (`mailto:`, `data:`), or a string that just isn't URL-shaped at all
-/// can't be carrying URL userinfo, so there is nothing to strip.
-///
-/// **Why the manual scan?** Pulling in a regex for one call site here
-/// would import a transitively large dependency. The byte-scan is small
-/// (~25 lines), allocation-free until the strip fires, and unambiguous
-/// over any byte content.
-///
-/// **Returns `(stripped_url, Option<userinfo_hash>)`.** When the strip
-/// fires, the userinfo bytes (between `://` and `@`) are fed into the
-/// same `salted_sha256_hex(server_name, ...)` shape that the parsed-URL
-/// path uses, so a subsequent `mcp verify` notices when credentials are
-/// added or removed — even for malformed URLs. The hash captures the
-/// presence-of-credentials signal without storing the credential itself.
-/// When the strip does NOT fire (no scheme, no `@` in authority, etc.),
-/// the hash is `None` because there were no userinfo bytes to fingerprint.
-///
-/// If the userinfo substring is non-UTF-8 (technically impossible because
-/// the input is `&str`, but the byte-scan operates on `.as_bytes()` for
-/// regularity), the bytes are still fed verbatim into the SHA-256 hasher —
-/// the salted-hash construction is byte-defined, not string-defined.
+/// Manual byte-scan (not regex) to avoid a heavy dependency for one call site.
+/// Returns `(stripped_url, Option<hash>)`: when the strip fires, the userinfo
+/// bytes are hashed via the same `salted_sha256_hex(server_name, ...)` shape so
+/// credential add/remove drift survives even for malformed URLs; otherwise `None`.
 fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<String>) {
     let bytes = raw.as_bytes();
-    // Find a scheme: at least one ASCII letter, then any of letter/digit/`+`/`-`/`.`,
-    // terminated by `://`. RFC 3986 §3.1.
+    // Scheme (RFC 3986 §3.1): a letter, then letter/digit/`+`/`-`/`.`, then `://`.
     let mut scheme_end = 0usize;
     if bytes.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
         return (raw.to_string(), None);
@@ -1439,13 +951,12 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
             break;
         }
     }
-    // After scheme: must be exactly `://`.
+    // Must be exactly `://`.
     if scheme_end + 3 > bytes.len() || &bytes[scheme_end..scheme_end + 3] != b"://" {
         return (raw.to_string(), None);
     }
     let auth_start = scheme_end + 3;
-    // Authority terminates at `/`, `?`, `#`, or end. Find the first `@`
-    // before that boundary.
+    // Authority ends at `/`/`?`/`#`/end; find the first `@` before that.
     let mut i = auth_start;
     let mut at_pos: Option<usize> = None;
     while i < bytes.len() {
@@ -1459,19 +970,12 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
         }
     }
     let Some(at) = at_pos else {
-        // No `@` before the path/query/fragment boundary — nothing to
-        // strip and no userinfo signal to record.
+        // No `@` before the boundary — nothing to strip, no signal to record.
         return (raw.to_string(), None);
     };
-    // Compute the salted hash from the userinfo BYTES before we drop
-    // them. Mirrors `redact_url_userinfo`'s salted_sha256_hex call:
-    // the server name is the per-entry salt so the same credential
-    // under two different servers hashes to two different digests.
-    // The bytes between `auth_start` and `at` are the userinfo
-    // substring; when the substring is empty (the `://@host` form),
-    // we record `None` because there are no credential bytes to
-    // fingerprint — only the strip rewrites the shape to `***` for
-    // consistency.
+    // Hash the userinfo bytes (between `auth_start` and `at`) before dropping
+    // them — server name as salt, mirroring `redact_url_userinfo`. An empty
+    // substring (`://@host`) records `None`.
     let userinfo_bytes = &bytes[auth_start..at];
     let userinfo_hash = if userinfo_bytes.is_empty() {
         None
@@ -1482,10 +986,7 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
         hasher.update(userinfo_bytes);
         Some(hex_lower(&hasher.finalize()))
     };
-    // If there's nothing between `://` and `@`, the input has no
-    // userinfo content to redact — still rewrite to `***` so the
-    // output shape is consistent with the strip-fired path, but the
-    // input has no secret to leak.
+    // Rewrite to `***` for shape consistency even when the substring is empty.
     let mut out = String::with_capacity(raw.len());
     out.push_str(&raw[..auth_start]);
     out.push_str("***");
@@ -1493,23 +994,14 @@ fn strip_userinfo_best_effort(server_name: &str, raw: &str) -> (String, Option<S
     (out, userinfo_hash)
 }
 
-/// Extract a stdio server's `env` object as `(name, value_hash)` entries,
-/// sorted by name so the hash is stable regardless of JSON key order. A
-/// non-string env value is hashed by its compact JSON rendering (so a numeric
-/// or boolean env value — unusual but seen in real configs — is not silently
-/// dropped); a missing or non-object `env` field yields an empty vec.
+/// Extract a stdio server's `env` as `(name, value_hash)` entries, sorted by name
+/// for a stable hash. A non-string value is hashed by its compact JSON form (not
+/// dropped); a missing/non-object `env` yields an empty vec.
 ///
-/// `env` is **security-relevant**: it is what a config injects into the MCP
-/// subprocess. Capturing it means a swapped credential or an added variable
-/// shows up as drift in `mcp verify` / `mcp diff` rather than passing silently.
-///
-/// **The raw value never leaves this function.** It is read out of the JSON
-/// map into a local `String`, immediately consumed by [`McpEnvEntry::from_raw`]
-/// to compute `sha256(name || ':' || value)`, and then dropped at the end of
-/// the iteration step. No struct field, log line, return value, or serialized
-/// output ever carries the plaintext value. This is the load-bearing security
-/// invariant of the v3 lockfile format: a committed `.tirith/mcp.lock` never
-/// contains a secret that was in the source `.mcp.json`.
+/// `env` is security-relevant (what the config injects into the subprocess), so
+/// capturing it surfaces a swapped credential as drift. **The raw value never
+/// leaves this function** (v3 invariant): consumed by [`McpEnvEntry::from_raw`]
+/// and dropped, never reaching a struct/serializer/log.
 fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntry> {
     let mut env: Vec<McpEnvEntry> = obj
         .get("env")
@@ -1517,12 +1009,9 @@ fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntr
         .map(|map| {
             map.iter()
                 .map(|(k, v)| {
-                    // A string value is hashed verbatim; any other JSON value
-                    // is hashed by its compact JSON form so it still contributes
-                    // a deterministic per-value digest. The raw value sits in a
-                    // local `String` only long enough for `from_raw` to consume
-                    // it — it never reaches a struct, the serializer, the
-                    // hasher's transport-level frame, or stdout.
+                    // String value hashed verbatim; any other JSON value by its
+                    // compact form. The raw value lives only long enough for
+                    // `from_raw` to consume it.
                     let raw_value: String = match v.as_str() {
                         Some(s) => s.to_string(),
                         None => v.to_string(),
@@ -1532,42 +1021,20 @@ fn parse_env(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<McpEnvEntr
                 .collect()
         })
         .unwrap_or_default();
-    // Sort by name for a stable hash regardless of JSON key order.
     env.sort_by(|a, b| a.name.cmp(&b.name));
     env
 }
 
-/// Extract the declared tool list from a server object, distinguishing
-/// the three on-wire states the JSON can present:
-///
-/// * **Omitted** — no `tools` key on the server object. MCP semantics
-///   treat this as runtime-negotiated ("any tool the server runtime
-///   exposes"), invisible to static-config inventory.
-/// * **EmptyDeclared** — `"tools": []`. The operator explicitly declared
-///   that this server exposes no tools.
-/// * **Declared(Vec)** — `"tools": ["read", "write", ...]`. The vec is
-///   sorted and de-duplicated for a stable per-server content hash;
-///   non-string entries in the array are dropped.
-/// * **Invalid(Vec)** — the `tools` key is present but its value is not
-///   a JSON array (e.g. a string, an object). Any nested string values
-///   that did parse are still captured for downstream visibility, but
-///   the operator's declaration is malformed.
-///
-/// The lockfile schema currently collapses Omitted and EmptyDeclared
-/// (both yield `tools: []`); a sibling `tools_declared: bool` field on
-/// [`McpServerEntry`] / [`McpLockServer`] preserves the distinction
-/// without breaking the existing on-disk shape. See item 7 in
-/// `PR121_FIX_LIST_TRIAGE.md` for the bounded-improvement contract this
-/// implements.
+/// Extract the declared tool list, distinguishing the four on-wire states:
+/// `Omitted` (no key), `EmptyDeclared` (`"tools": []`), `Declared` (a string
+/// array, sorted/de-duplicated, non-strings dropped), and `Invalid` (a `tools`
+/// value that isn't an array). The lockfile collapses Omitted/EmptyDeclared,
+/// preserving the distinction via `tools_declared` (PR121_FIX_LIST_TRIAGE item 7).
 fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> DeclaredTools {
     let Some(value) = obj.get("tools") else {
         return DeclaredTools::Omitted;
     };
     let Some(arr) = value.as_array() else {
-        // Present but not an array. We still try to extract any string
-        // values nested inside (e.g. an object whose values happen to be
-        // strings) so a malformed-but-recoverable case is recorded;
-        // otherwise the resulting Invalid carries an empty list.
         return DeclaredTools::Invalid(Vec::new());
     };
     let mut tools: Vec<String> = arr
@@ -1577,11 +1044,8 @@ fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> DeclaredTool
     tools.sort();
     tools.dedup();
     if tools.is_empty() {
-        // Either the JSON array was empty, or every element was a
-        // non-string that we dropped. We treat them the same:
-        // `"tools": []` is the structural case the operator can express,
-        // and a non-string-element-only array is structurally equivalent
-        // to having no declarable tools.
+        // Empty array, or all elements non-string — both equivalent to "no
+        // declarable tools".
         DeclaredTools::EmptyDeclared
     } else {
         DeclaredTools::Declared(tools)
@@ -1592,14 +1056,10 @@ fn parse_tools(obj: &serde_json::Map<String, serde_json::Value>) -> DeclaredTool
 // Drift detection
 // ---------------------------------------------------------------------------
 
-/// How a stdio server's `env` differs from what the lockfile recorded.
-///
-/// Each variant carries only the variable's **name** — the lockfile carries
-/// only a salted hash of the value (see [`McpEnvEntry`]), and a drift report is
-/// printed to a human and to `--format json`, so a raw value (which could be a
-/// credential) must never leave drift detection. The hash is folded into the
-/// per-server content hash, so a value swap surfaces as `ValueHashChanged` here
-/// without ever being decoded.
+/// How a stdio server's `env` differs from the lockfile. Each variant carries
+/// only the variable's NAME — the lockfile holds only a salted hash, and drift
+/// reports are printed, so a raw (possibly-credential) value must never leak. A
+/// value swap surfaces as `ValueHashChanged` without being decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpEnvChange {
@@ -1612,44 +1072,32 @@ pub enum McpEnvChange {
     ValueHashChanged { name: String },
 }
 
-/// How a server's transport differs from what the lockfile recorded.
-///
-/// The transport descriptor is the most security-relevant part of a server's
-/// definition: a swapped URL is a redirection, a swapped command is a rebound
-/// subprocess. Each variant captures *only* what is needed for a readable
-/// drift report — `KindChanged` records the two kinds plainly, the more
-/// specific variants record the structural shape of the change without
-/// repeating the raw URL / command (those flow through the higher-level
-/// server-changed entry).
+/// How a server's transport differs from the lockfile — the most
+/// security-relevant change (a swapped URL is a redirection, a swapped command a
+/// rebound subprocess). Variants record the structural shape without repeating
+/// the raw URL/command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpTransportChange {
-    /// The transport's *kind* changed (e.g. `stdio` → `url`).
+    /// The transport *kind* changed (e.g. `stdio` → `url`).
     KindChanged {
-        /// The previous kind, lowercase: `"url"` / `"stdio"` / `"unknown"`.
+        /// Previous kind, lowercase: `"url"` / `"stdio"` / `"unknown"`.
         previous: String,
-        /// The current kind.
+        /// Current kind.
         current: String,
     },
-    /// Both sides are `url` and the stored URL bytes differ — the redacted
-    /// (userinfo-stripped) URL bytes the lockfile carries are not equal to
-    /// the current redacted URL.
+    /// Both `url`, stored (redacted) URL bytes differ.
     UrlChanged,
-    /// Both sides are `url` and the `userinfo_hash` differs: a credential was
-    /// added, removed, or swapped. `added` / `removed` carry the literal
-    /// transition; a swap surfaces as both `Removed` and `Added` would mask
-    /// the diff, so the swap case is `Swapped`.
+    /// Both `url`, `userinfo_hash` differs — credential added / removed / swapped.
     UserinfoAdded,
     UserinfoRemoved,
     UserinfoSwapped,
-    /// Both sides are `stdio` and the command bytes differ.
+    /// Both `stdio`, command bytes differ.
     CommandChanged,
-    /// Both sides are `stdio` and the arg list differs (added / removed /
-    /// reordered).
+    /// Both `stdio`, arg list differs.
     ArgsChanged,
-    /// Both sides are `stdio` and one or more env variables added / removed /
-    /// changed value-hash. The per-variable detail rides in
-    /// [`McpServerDrift::env_changes`] for readability.
+    /// Both `stdio`, env changed; per-variable detail in
+    /// [`McpServerDrift::env_changes`].
     EnvChanged,
 }
 
@@ -1657,10 +1105,8 @@ pub enum McpTransportChange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpToolsChangeKind {
-    /// The set of tool names is the same but the recorded order differs.
-    /// (Tool lists are sorted on parse, so this fires only when two sides
-    /// were sorted differently — a defensive variant; in practice `Set` is
-    /// what fires when the *declared* tools change.)
+    /// Same tool set, different recorded order (defensive — lists are sorted on
+    /// parse, so in practice `Set` fires when declared tools change).
     Reordered,
     /// One or more tools were added.
     Added,
@@ -1698,9 +1144,8 @@ pub struct McpServerDriftEntry {
 }
 
 impl McpServerDriftEntry {
-    /// `true` when the entry records no per-field changes — used internally to
-    /// reject an empty `Changed` drift (a defensive check; in normal use a
-    /// `Changed` drift only exists when at least one field actually changed).
+    /// `true` when the entry records no per-field changes — used to reject an
+    /// empty `Changed` drift (defensive).
     fn is_empty(&self) -> bool {
         self.transport_changes.is_empty()
             && self.env_changes.is_empty()
@@ -1710,16 +1155,10 @@ impl McpServerDriftEntry {
     }
 }
 
-/// One drift between the current inventory and the loaded lockfile.
-///
-/// A `Vec<McpDrift>` is the structured shape both `tirith mcp verify` and
-/// `tirith mcp diff` consume. Sort order: `SchemaUpgradeRequired` first
-/// (there is at most one and it short-circuits the comparison), then
-/// `Removed` (by name), then `Added` (by name), then `Changed` (by name)
-/// — `Removed` first among real-drift kinds because it is the most
-/// surprising / security-relevant case (a server that the lockfile
-/// expected is gone), and grouping `Added` and `Changed` by name makes
-/// the human output read top-to-bottom by server.
+/// One drift between the current inventory and the loaded lockfile. A
+/// `Vec<McpDrift>` is what `mcp verify` / `mcp diff` consume, sorted
+/// `SchemaUpgradeRequired` (at most one) → `Removed` → `Added` → `Changed`, each
+/// by name — `Removed` first as the most security-relevant case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpDrift {
@@ -1736,36 +1175,20 @@ pub enum McpDrift {
         name: String,
         /// Repo-relative source config the current inventory found.
         source_config: String,
-        /// The tools the new server declares, sorted and de-duplicated (the
-        /// same canonical form `McpServerEntry::tools` carries). Surfaced so
-        /// a policy gate — for example `scan.mcp_allowed_tools` — can
-        /// inspect the brand-new server's tool surface, mirroring the
-        /// `tools_added` field on `Changed`. An empty vec means the
-        /// newly-added server declared no tools (an MCP client treats that
-        /// as "all tools"); a non-empty vec lists each declared tool.
-        ///
-        /// **Privacy.** Like `tools_added` on `Changed`, this carries only
-        /// tool *names* — no values, no hashes — so a drift report can be
-        /// printed and serialized safely.
-        ///
-        /// **Wire shape.** Skipped on serialization when empty so an older
-        /// drift document (without the field) round-trips into a current
-        /// `Added` with `tools: vec![]`. This is a structural extension,
-        /// **not** a lockfile schema change.
+        /// The new server's declared tools (sorted, de-duplicated), so a policy
+        /// gate (`scan.mcp_allowed_tools`) can inspect its surface — mirroring
+        /// `tools_added` on `Changed`. Names only (printable/serializable).
+        /// Skipped on serialization when empty (a structural extension, not a
+        /// schema change), so an older drift doc round-trips with `tools: []`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
     },
-    /// A server present on both sides has changed — its per-server `hash`
-    /// differs. The entry holds the per-field detail.
+    /// A server present on both sides changed (per-server `hash` differs); the
+    /// entry holds the per-field detail.
     Changed(McpServerDriftEntry),
-    /// The lockfile parses cleanly but was written with an older
-    /// `format_version` whose hashing rules differ from the current
-    /// build's. [`compute_drift`] emits this as a single entry instead
-    /// of comparing per-server hashes — every recomputed hash would
-    /// differ from the stored one and produce a phantom-drift storm
-    /// even when the MCP inventory is unchanged. The operator runs
-    /// `tirith mcp lock --force` once to regenerate; subsequent runs
-    /// take the normal drift path.
+    /// The lockfile parses but was written with an older `format_version` whose
+    /// hashing rules differ. Emitted as a single entry (re-lock once) instead of
+    /// phantom-drifting every server. See [`compute_drift`].
     SchemaUpgradeRequired {
         /// The `format_version` value the lockfile carried.
         from_version: u32,
@@ -1776,14 +1199,9 @@ pub enum McpDrift {
 }
 
 impl McpDrift {
-    /// Sort key for deterministic ordering: kind-bucket first
-    /// (SchemaUpgradeRequired = 0, Removed = 1, Added = 2, Changed = 3),
-    /// then by `(name, source_config)` inside each bucket. This is what
-    /// makes a `Vec<McpDrift>` byte-stable. `SchemaUpgradeRequired`
-    /// carries no server name, so its name/source_config sort fields
-    /// are empty strings — there is at most one such entry in a drift
-    /// vec (it short-circuits the per-server comparison), so a tie-
-    /// break against another `SchemaUpgradeRequired` cannot happen.
+    /// Deterministic sort key: kind-bucket (SchemaUpgradeRequired=0, Removed=1,
+    /// Added=2, Changed=3), then `(name, source_config)`. SchemaUpgradeRequired
+    /// has empty name fields but there is at most one, so it can't tie.
     fn sort_key(&self) -> (u8, String, String) {
         match self {
             McpDrift::SchemaUpgradeRequired { .. } => (0, String::new(), String::new()),
@@ -1800,22 +1218,10 @@ impl McpDrift {
         }
     }
 
-    /// The server name this drift refers to, or `None` for the schema-
-    /// wide [`McpDrift::SchemaUpgradeRequired`] signal which has no
-    /// per-server identity.
-    ///
-    /// **Why `Option<&str>` rather than `&str` with an empty-string
-    /// sentinel.** [`parse_mcp_config`] does accept an empty JSON object
-    /// key as a (degenerate) server name — `{"": {...}}` parses to a
-    /// server with `name == ""`. If the schema-wide signal also returned
-    /// `""`, name-based filtering / grouping / de-duplication would
-    /// shadow that legitimate empty-name server with the schema sentinel.
-    /// Returning `None` for the schema-wide variant keeps the two
-    /// structurally distinct: callers explicitly handle the schema case
-    /// or skip it, instead of unwittingly matching `""` against a real
-    /// empty-name server. Per-server variants (`Added`, `Removed`,
-    /// `Changed`) return `Some(&name)` — the real server name, including
-    /// an empty string when the source config used `""` as a key.
+    /// The server name this drift refers to, or `None` for the schema-wide
+    /// [`McpDrift::SchemaUpgradeRequired`]. `Option` rather than an empty-string
+    /// sentinel because `{"": {...}}` is a legitimate empty-name server; returning
+    /// `None` keeps the schema signal from shadowing it in name-based filtering.
     pub fn name(&self) -> Option<&str> {
         match self {
             McpDrift::Removed { name, .. } => Some(name),
@@ -1826,72 +1232,31 @@ impl McpDrift {
     }
 }
 
-/// Compute the structured drift between the current inventory and the
-/// lockfile that was previously written.
+/// Compute the structured drift between the current inventory and the previously
+/// written lockfile.
 ///
-/// **Fast path.** The lockfile carries an `inventory_hash` computed over the
-/// ordered concatenation of every server's content hash; the current
-/// inventory's *would-be* lockfile carries the same kind of hash. If those
-/// two hashes are byte-equal, the inventory is unchanged at every level — no
-/// server added, removed, or altered — so the drift is empty without doing
-/// any per-server work.
+/// Fast path: if the current would-be `inventory_hash` byte-equals the lockfile's,
+/// nothing changed — empty drift, no per-server work. Slow path: a merge walk
+/// over the `(name, source_config)`-sorted sides emits `Added`/`Removed`, and
+/// `Changed` (via `compute_changed_entry`) when a per-server `content_hash`
+/// differs. `content_hash` excludes `source_config`, so moving an unchanged
+/// server between configs is a non-event.
 ///
-/// **Slow path.** When the two inventory hashes differ, every server is
-/// compared by `(name, source_config)` (deterministic, since both sides are
-/// sorted by that pair in `from_inventory`). A server on one side and not
-/// the other is `Added` / `Removed`; a server on both sides whose per-server
-/// `content_hash` differs is `Changed`, with `compute_changed_entry` filling
-/// in the per-field detail.
-///
-/// **A note on the `source_config` interaction.** `content_hash`
-/// deliberately excludes `source_config` — moving an unchanged server
-/// definition from `.mcp.json` to `.vscode/mcp.json` is a *non-event* in
-/// the chunk-1 schema. Since `inventory_hash` aggregates `content_hash`es,
-/// such a move leaves the inventory hash unchanged and the fast path
-/// returns empty drift. A repo that legitimately declares **two** distinct
-/// servers with the same name in different configs still works: each is a
-/// separate `(name, source_config)` entry in the lockfile, and changes are
-/// attributed to the entry that actually changed.
-///
-/// The returned `Vec<McpDrift>` is sorted deterministically — see
-/// [`McpDrift::sort_key`].
-///
-/// **Privacy.** Drift entries carry only **names**: server names, env
-/// variable names, tool names. The lockfile already strips env raw values
-/// and URL userinfos (replacing each with a salted hash); drift detection
-/// observes that the *hash* changed, never the underlying secret. A drift
-/// report is therefore safe to print to a terminal and to serialize as JSON.
+/// The result is sorted ([`McpDrift::sort_key`]). Privacy: entries carry only
+/// names (server / env-var / tool) — the lockfile already salted-hashes env
+/// values and URL userinfos, so drift sees only that a hash changed.
 pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
-    // Legacy v4 migration path. A lockfile parsed from a legacy
-    // `format_version: 4` carries [`LockfileSchema::LegacyV4Migration`]
-    // because its stored hashes were computed under the pre-v5 rules
-    // (tools_declared excluded). The straightforward "compare v5 hashes
-    // directly" walk would phantom-drift on every existing server
-    // because every recomputed v5 hash differs from every v4 baseline
-    // when `tools_declared` happens to differ between the two sides.
-    //
-    // We resolve this by comparing under **v4-compatible semantics** on
-    // both sides — see [`McpServerEntry::content_hash_v4`]. That keeps
-    // real drift (URL changed, command changed, env added/removed,
-    // tools added/removed, server added/removed) visible across the
-    // schema boundary, while suppressing the `tools_declared`-only
-    // phantom drift. The lockfile-wide `SchemaUpgradeRequired` migration
-    // prompt rides on top so the operator knows to re-lock and pick up
-    // v5's `tools_declared` drift detection on the next run.
-    //
-    // Why both signals matter. A malicious config change made during the
-    // v4→v5 migration window would, under a "migration-only" short-
-    // circuit, slip silently into the operator's `tirith mcp lock
-    // --force` regeneration. Computing v4-compatible drift in parallel
-    // closes that window: real drift is reported alongside the
-    // migration prompt, so no signal is absorbed by the upgrade.
+    // Legacy v4 migration path. A v4 lockfile's stored hashes were computed
+    // without `tools_declared`, so a direct v5 comparison would phantom-drift
+    // every server. We compare under v4-compatible semantics on both sides (see
+    // [`McpServerEntry::content_hash_v4`]) so REAL drift stays visible across the
+    // boundary — closing the window where a malicious change could otherwise slip
+    // silently into the operator's `--force` regeneration — with the
+    // `SchemaUpgradeRequired` prompt riding on top to re-lock once.
     if matches!(lock.schema_state, LockfileSchema::LegacyV4Migration) {
         let mut drifts = compute_drift_v4(current, lock);
-        // Migration prompt always rides on top. Its sort key is `(0, "",
-        // "")` so the final sort_by_key call below places it first; emit
-        // it unconditionally — even when the v4 comparison is clean —
-        // since the schema-state itself is the signal that the operator
-        // needs to re-lock once.
+        // Always emit the migration prompt (sort key `(0, "", "")` → first),
+        // even when the v4 comparison is clean.
         drifts.push(McpDrift::SchemaUpgradeRequired {
             from_version: lock.format_version,
             to_version: MCP_LOCK_FORMAT_VERSION,
@@ -1900,18 +1265,13 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
         return drifts;
     }
 
-    // Compute the current inventory's would-be inventory hash. If it equals
-    // the lockfile's recorded one, nothing changed; skip the per-server
-    // comparison entirely.
+    // Fast path: equal inventory hashes → nothing changed.
     let current_lock = McpLockfile::from_inventory(current);
     if current_lock.inventory_hash == lock.inventory_hash {
         return Vec::new();
     }
 
-    // Walk both sides by sorted name. Both `current_lock.servers` and
-    // `lock.servers` are sorted by `(name, source_config)` — that is the
-    // invariant `from_inventory` establishes — so a merge walk yields the
-    // diff in O(n + m).
+    // Merge walk over the `(name, source_config)`-sorted sides, O(n + m).
     let mut drifts: Vec<McpDrift> = Vec::new();
     let mut i = 0usize; // index into current_lock.servers
     let mut j = 0usize; // index into lock.servers
@@ -1925,11 +1285,8 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
 
         match key_cur.cmp(&key_prev) {
             std::cmp::Ordering::Less => {
-                // Current side has a server before the lockfile's next one —
-                // the lockfile doesn't have it. Added. The new server's
-                // tool list rides along so a policy gate
-                // (`scan.mcp_allowed_tools`) can see what the brand-new
-                // server is exposing — mirroring `tools_added` on Changed.
+                // Only on the current side → Added (tools ride along for a
+                // policy gate, mirroring `tools_added` on Changed).
                 drifts.push(McpDrift::Added {
                     name: cur.name.clone(),
                     source_config: cur.source_config.clone(),
@@ -1938,8 +1295,7 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                // Lockfile has a server before the current side's next one —
-                // current side doesn't have it. Removed.
+                // Only in the lockfile → Removed.
                 drifts.push(McpDrift::Removed {
                     name: prev.name.clone(),
                     source_config: prev.source_config.clone(),
@@ -1947,9 +1303,7 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                // Same (name, source_config). If the per-server content hash
-                // matches, the server is byte-identical — no drift. If the
-                // hashes differ, classify the per-field change.
+                // Same key: differing hashes → classify the per-field change.
                 if cur.hash != prev.hash {
                     if let Some(entry) = compute_changed_entry(cur, prev) {
                         drifts.push(McpDrift::Changed(entry));
@@ -1982,36 +1336,20 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
     drifts
 }
 
-/// Compute per-server drift between `current` and `lock` under **v4
-/// hashing semantics** — every per-server hash on both sides is the
-/// v4-style hash (see [`McpServerEntry::content_hash_v4`]), which
-/// excludes `tools_declared` from the hash input.
-///
-/// Used exclusively by [`compute_drift`] when the parsed lockfile is
-/// tagged [`LockfileSchema::LegacyV4Migration`]. The returned drift
-/// vector is **unsorted** — the caller (`compute_drift`) appends the
-/// migration prompt and then calls [`McpDrift::sort_key`] once to
-/// deterministically order the combined output.
-///
-/// The walk logic is structurally identical to the v5 slow path in
-/// `compute_drift`: a merge walk over `(name, source_config)`-sorted
-/// sides emitting Added / Removed / Changed entries. The only
-/// difference is which hash function feeds the equality check.
+/// Per-server drift under v4 hashing semantics (each hash via
+/// [`McpServerEntry::content_hash_v4`], which excludes `tools_declared`). Used by
+/// [`compute_drift`] for a [`LockfileSchema::LegacyV4Migration`] lockfile. Returns
+/// an UNSORTED vector — the caller appends the migration prompt and sorts once.
+/// Walk logic is identical to the v5 slow path; only the hash function differs.
 fn compute_drift_v4(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
-    // Mirror the v5 fast path: build the would-be locked form of the
-    // current inventory, but use v4 hashes. The `from_inventory` call
-    // gives us a sorted `Vec<McpLockServer>`; we recompute hashes onto
-    // a side-table indexed by position so the merge walk below can
-    // compare v4 hashes without mutating the v5 hashes in
-    // `current_lock.servers` (those are still useful elsewhere).
+    // Recompute v4 hashes onto a position-indexed side-table so the walk can
+    // compare them without mutating the v5 hashes in `current_lock.servers`.
     let current_lock = McpLockfile::from_inventory(current);
     let current_hashes_v4: Vec<String> = current_lock.servers.iter().map(server_v4_hash).collect();
     let lock_hashes_v4: Vec<String> = lock.servers.iter().map(server_v4_hash).collect();
 
-    // Fast path: if every v4 hash on the current side matches every v4
-    // hash on the lock side (and the server lists align), no real drift
-    // exists under v4 semantics — return empty so only the migration
-    // prompt fires. Cheap to skip when populations differ in length.
+    // Fast path: aligned server lists with all v4 hashes equal → no real drift,
+    // only the migration prompt fires.
     if current_lock.servers.len() == lock.servers.len()
         && current_hashes_v4 == lock_hashes_v4
         && current_lock
@@ -2051,14 +1389,10 @@ fn compute_drift_v4(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift>
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                // Compare v4-style hashes only. `compute_changed_entry`
-                // diffs the per-field detail (transport changes, env
-                // changes, tools changes) directly from the structured
-                // fields, NOT from any hash — so the function works
-                // identically under v4 and v5 semantics. The only thing
-                // v4 hides is the `tools_declared` flip, which has no
-                // dedicated `McpServerDriftEntry` field to surface
-                // anyway.
+                // Compare v4 hashes; `compute_changed_entry` diffs the per-field
+                // detail from the structured fields (not a hash), so it works
+                // identically under v4/v5 — v4 only hides the `tools_declared`
+                // flip, which has no dedicated drift field anyway.
                 if current_hashes_v4[i] != lock_hashes_v4[j] {
                     if let Some(entry) = compute_changed_entry(cur, prev) {
                         drifts.push(McpDrift::Changed(entry));
@@ -2090,13 +1424,8 @@ fn compute_drift_v4(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift>
     drifts
 }
 
-/// Re-derive a v4-compatible per-server hash from an [`McpLockServer`].
-/// [`McpServerEntry::content_hash_v4`] is the canonical implementation;
-/// this helper bridges the two record types (the structurally-identical
-/// fields are copied into a transient `McpServerEntry` and hashed). The
-/// allocation cost is one `clone()` per server per `compute_drift`
-/// call under the v4 migration path — negligible (lockfiles typically
-/// hold tens of servers at most).
+/// Re-derive a v4-compatible per-server hash from an [`McpLockServer`] by copying
+/// its fields into a transient [`McpServerEntry`] and calling `content_hash_v4`.
 fn server_v4_hash(server: &McpLockServer) -> String {
     McpServerEntry {
         name: server.name.clone(),
@@ -2108,14 +1437,10 @@ fn server_v4_hash(server: &McpLockServer) -> String {
     .content_hash_v4()
 }
 
-/// Classify the field-level change between two servers that share a
-/// `(name, source_config)` but have different per-server `hash` values.
-///
-/// Returns `Some(entry)` when at least one field-level change is detected.
-/// Returns `None` only in the defensive case where the hashes differ but no
-/// field-level cause is identified — that should not happen for well-formed
-/// inputs (`content_hash` is total over every field), and an empty `Changed`
-/// entry would be noise.
+/// Classify the field-level change between two servers sharing a
+/// `(name, source_config)` but differing in `hash`. `Some(entry)` when a change
+/// is found; `None` only in the defensive no-cause case (an empty `Changed` would
+/// be noise).
 fn compute_changed_entry(
     current: &McpLockServer,
     previous: &McpLockServer,
@@ -2175,9 +1500,7 @@ fn compute_changed_entry(
             }
         }
         (cur, prev) => {
-            // Kind changed (stdio ↔ url, or either ↔ unknown). Encode the
-            // before/after kind directly so the human and JSON forms can
-            // render "stdio → url".
+            // Kind changed — encode before/after so reports can render "stdio → url".
             transport_changes.push(McpTransportChange::KindChanged {
                 previous: transport_kind_name(prev).to_string(),
                 current: transport_kind_name(cur).to_string(),
@@ -2187,9 +1510,8 @@ fn compute_changed_entry(
 
     let (tools_change, tools_added, tools_removed) = diff_tools(&current.tools, &previous.tools);
 
-    // Transport changes are sorted so equal drifts compare equal regardless of
-    // detection order. The sort discriminates by serialized form so it is
-    // stable across enum variant additions.
+    // Sort transport changes (by serialized form, stable across variant
+    // additions) so equal drifts compare equal regardless of detection order.
     transport_changes
         .sort_by_key(|c| serde_json::to_string(c).unwrap_or_else(|_| format!("{c:?}")));
 
@@ -2219,9 +1541,8 @@ fn transport_kind_name(t: &McpTransport) -> &'static str {
     }
 }
 
-/// Diff two env lists. Both are sorted by name (the invariant `parse_env`
-/// establishes), so a merge walk yields per-variable changes in O(n + m).
-/// Returned entries are themselves sorted by `name` for determinism.
+/// Diff two name-sorted env lists via a merge walk (O(n + m)); returned entries
+/// are sorted by `name`.
 fn diff_env(current: &[McpEnvEntry], previous: &[McpEnvEntry]) -> Vec<McpEnvChange> {
     let mut out: Vec<McpEnvChange> = Vec::new();
     let mut i = 0usize;
@@ -2268,10 +1589,9 @@ fn diff_env(current: &[McpEnvEntry], previous: &[McpEnvEntry]) -> Vec<McpEnvChan
     out
 }
 
-/// Diff two tool lists, returning the kind of change, the added tools, and
-/// the removed tools. Tool lists are sorted on parse, so a same-set / different
-/// order case can only arise from a hand-built inventory; the `Reordered`
-/// variant is recorded for completeness.
+/// Diff two tool lists into (kind, added, removed). Lists are sorted on parse, so
+/// a same-set/different-order case only arises from a hand-built inventory
+/// (`Reordered`, recorded for completeness).
 fn diff_tools(
     current: &[String],
     previous: &[String],
@@ -2308,22 +1628,9 @@ fn diff_tools(
     (Some(kind), added, removed)
 }
 
-/// Load a lockfile from disk and parse it.
-///
-/// Returns the parsed `McpLockfile` on success.
-///
-/// `Err` cases — surfaced via [`McpLockLoadError`] so a caller (`mcp verify`,
-/// `mcp diff`, a `tirith scan` FileScan dispatcher) can present each
-/// differently:
-///
-/// * [`McpLockLoadError::NotFound`] — the file does not exist. For `mcp
-///   verify` this is "no baseline yet, run `tirith mcp lock`", which is a
-///   usage error (exit 2). For a `scan` of `mcp.lock` it is "nothing to
-///   check" (the scan target was something else).
-/// * [`McpLockLoadError::Io`] — the file exists but could not be read
-///   (permission denied, etc.).
-/// * [`McpLockLoadError::Parse`] — the file is not valid JSON or does not
-///   match the [`McpLockfile`] schema.
+/// Load and parse a lockfile from disk. `Err` cases via [`McpLockLoadError`] so a
+/// caller can present each differently: `NotFound` (no file), `Io` (present but
+/// unreadable), `Parse` (invalid JSON / schema).
 pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -2331,9 +1638,8 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
             return Err(McpLockLoadError::NotFound);
         }
         Err(e) => {
-            // Suppress the inner `io::Error`'s `Display` and capture only
-            // the category-level kind. See the doc on
-            // [`McpLockLoadError::Io`] for the privacy rationale.
+            // Capture only the category kind, not the io-error Display (privacy —
+            // see [`McpLockLoadError::Io`]).
             return Err(McpLockLoadError::Io {
                 kind: McpLockIoKind::from_io_kind(e.kind()),
             });
@@ -2342,114 +1648,49 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
     parse_lockfile(&content)
 }
 
-/// Parse a lockfile from its on-disk JSON form.
+/// Parse a lockfile from its on-disk JSON.
 ///
-/// **Privacy.** A failed parse intentionally **does not** carry the
-/// `serde_json::Error`'s message string forward. `serde_json::Error`'s
-/// `Display` impl can include the offending JSON value (e.g.
-/// `invalid type: string "...", expected ...`), and `.tirith/mcp.lock`
-/// frequently carries secret-shaped data (env-value hashes, a userinfo
-/// hash, a malformed-but-committed credential the lockfile redaction is
-/// meant to protect). Echoing that error string into the parse-error
-/// variant would surface it through `Display`, the `mcp verify` /
-/// `mcp diff` CLI output, AND the `McpServerDrift` finding's
-/// description — a privacy leak via diagnostic. Instead we capture
-/// only the structurally-safe `line` and `column` from
-/// [`serde_json::Error`] (both are `usize`, neither can echo content)
-/// and discard the message itself. Drift detection is unaffected: the
-/// lockfile is still recognized as unparseable, the same
-/// `McpServerDrift` finding still fires; only the diagnostic tightens.
+/// **Privacy:** a failed parse captures only `serde_json::Error`'s `line`/`column`
+/// (both `usize`), not its `Display` message — that can echo the offending JSON
+/// value, and `.tirith/mcp.lock` carries secret-shaped data (hashes, a
+/// committed credential the redaction protects). Drift detection is unaffected.
 ///
-/// **Schema version validation.** After the JSON parses, the
-/// `format_version` field is checked against [`MCP_LOCK_FORMAT_VERSION`].
-/// A mismatch — either an older lockfile produced by a previous tirith
-/// release, or a newer lockfile produced by a future one — yields
-/// [`McpLockLoadError::UnsupportedVersion`], distinct from
-/// [`McpLockLoadError::Parse`] so the CLI and `mcpdrift` rule can offer
-/// the operator a precise message ("this lockfile was written by tirith
-/// schema vN, re-run `tirith mcp lock` to refresh / upgrade tirith")
-/// rather than a generic parse-error. This is the schema-evolution gate
-/// the [`MCP_LOCK_FORMAT_VERSION`] doc-comment promises: a legacy v3-shape
-/// lockfile (no `userinfo_hash`, raw env values) deserializes into a v4+
-/// `McpLockfile` shape because the missing fields default — but the
-/// `format_version: 3` field is preserved and the check fires here, so
-/// the operator is never silently confused by a half-migrated baseline.
+/// **Schema version:** `format_version` is checked against
+/// [`MCP_LOCK_FORMAT_VERSION`]; a mismatch yields
+/// [`McpLockLoadError::UnsupportedVersion`] (distinct from `Parse`) so the CLI can
+/// offer a precise re-lock/upgrade message. A legacy v3-shape file (missing
+/// fields default) is still caught here via its preserved `format_version: 3`.
 ///
-/// **v4 → v5 migration.** A `format_version: 4` lockfile is the one
-/// exception to the strict-equality gate: its on-disk shape is
-/// identical to v5 (no new fields), only the stored hashes were
-/// computed without folding `tools_declared` in. Rejecting it with
-/// `UnsupportedVersion` would force every existing v4 baseline into an
-/// `mcp lock --force` regeneration through an "incompatible schema"
-/// finding — louder than necessary for a hash-semantics-only bump. The
-/// parser instead **accepts** a v4 lockfile but tags the in-memory
-/// [`McpLockfile`] with [`LockfileSchema::LegacyV4Migration`]. The
-/// recompute-on-parse pass below still recomputes every hash from the
-/// lockfile's data (using the v5 hashing rules) — so the lockfile's
-/// hashes are coherent for v5 internally — but [`compute_drift`] sees
-/// the migration tag and returns a single
-/// [`McpDrift::SchemaUpgradeRequired`] entry pointing the operator at
-/// `tirith mcp lock --force`. After one regeneration, the lockfile is
-/// `format_version: 5` and subsequent runs use the normal drift path.
+/// **v4 → v5 migration:** a `format_version: 4` lockfile (same on-disk shape, only
+/// the hashes differ) is ACCEPTED and tagged
+/// [`LockfileSchema::LegacyV4Migration`]; the recompute-on-parse pass below makes
+/// it v5-coherent internally, and [`compute_drift`] returns a single
+/// [`McpDrift::SchemaUpgradeRequired`] (re-lock once).
 ///
-/// **Server ordering.** A parsed lockfile's `servers` list is sorted by
-/// `(name, source_config)` here — the same ordering
-/// [`McpLockfile::from_inventory`] establishes — so every
-/// `McpLockfile` consumer sees a consistent view regardless of
-/// on-disk order. A hand-edited or merge-conflict-resolved lockfile
-/// whose servers landed out of order would otherwise make
-/// [`compute_drift`]'s slow-path merge walk emit spurious
-/// `Added`/`Removed` pairs and miss `Changed` entries: the merge
-/// walk assumes both sides are sorted, and the fast-path
-/// `inventory_hash` short-circuit cannot save it once a single server
-/// genuinely differs. Sorting here keeps the invariant load-bearing
-/// for every caller (the rule, `mcp verify`, `mcp diff`, future
-/// programmatic consumers) without re-sorting at each call site.
+/// **Server ordering:** `servers` is sorted by `(name, source_config)` here (the
+/// `from_inventory` invariant) so [`compute_drift`]'s merge walk — which assumes
+/// sorted sides — works for every caller, even a hand-edited lockfile that landed
+/// out of order.
 pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
-    // Two-pass parse. The first pass extracts ONLY `format_version` via a
-    // minimal helper struct, so a legacy-shape lockfile (e.g. a v3 file
-    // whose `env` entries carry a raw `value` instead of the v4-shape
-    // `value_hash`) is surfaced as `UnsupportedVersion` rather than the
-    // misleading `Parse` it would otherwise produce — serde's full
-    // deserializer would fail on the missing field before it ever
-    // observed `format_version`. The two-pass cost is one extra
-    // `serde_json::from_str` over a tiny shape; cheap and necessary
-    // for the schema-version-mismatch error to be precise.
+    // Two-pass parse. First pass probes ONLY `format_version` via a minimal
+    // struct, so a legacy-shape file (e.g. v3 raw `value` env entries) surfaces as
+    // `UnsupportedVersion`, not the misleading `Parse` a full deserialize would
+    // produce by failing on the missing field first.
     #[derive(serde::Deserialize)]
     struct FormatProbe {
         format_version: u32,
     }
 
-    // First pass: probe the version. If this fails, the JSON is either
-    // not valid JSON at all, or it is JSON but does not even carry a
-    // `format_version` field — both are real `Parse` failures.
-    let probe: FormatProbe = serde_json::from_str(content).map_err(|e| {
-        // Capture only the safe structural metadata. The error's
-        // Display message is deliberately dropped — it can contain
-        // the offending JSON content.
-        McpLockLoadError::Parse {
+    // First pass: a failure here is invalid JSON or no `format_version` — real
+    // `Parse` failures (line/column only; the Display can echo content).
+    let probe: FormatProbe =
+        serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
             line: e.line(),
             column: e.column(),
-        }
-    })?;
+        })?;
 
-    // Schema-version gate. A mismatched `format_version` — either an
-    // older lockfile (pre-redaction shape) or a newer one (future
-    // schema we cannot model) — is surfaced as a distinct variant so
-    // the CLI and rule can name the failure precisely. See the
-    // function-level docs for the contract this enforces. We do this
-    // BEFORE the full deserialize so that a legacy-shape file (v3
-    // raw env values, missing `value_hash`) does not produce a
-    // misleading `Parse` failure when its underlying issue is a
-    // schema-version mismatch.
-    //
-    // `format_version: 4` is the carve-out: its on-disk shape is
-    // identical to v5 (no new fields), so it deserializes cleanly into
-    // an `McpLockfile`. We accept it here and tag the result with
-    // `LockfileSchema::LegacyV4Migration` so `compute_drift` can short-
-    // circuit to a migration prompt rather than fire phantom drift on
-    // every existing server. See the function-level docs for the full
-    // contract.
+    // Schema-version gate, BEFORE the full deserialize. v4 is the carve-out
+    // (identical on-disk shape) — accepted and tagged for migration; see the docs.
     let schema_state = match probe.format_version {
         v if v == MCP_LOCK_FORMAT_VERSION => LockfileSchema::Current,
         4 => LockfileSchema::LegacyV4Migration,
@@ -2461,53 +1702,32 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         }
     };
 
-    // Second pass: full deserialize. This time the version is the
-    // current one (or v4, whose on-disk shape is identical), so any
-    // failure here is a genuine corruption / schema-mismatch within
-    // the v5 schema (a malformed entry, a non-string where a string
-    // was required, …) — `Parse`.
+    // Second pass: full deserialize. The version is current (or v4, identical
+    // shape), so any failure here is genuine corruption within the v5 schema.
     let mut lock: McpLockfile =
         serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
             line: e.line(),
             column: e.column(),
         })?;
     lock.schema_state = schema_state;
-    // Defensive sort: `compute_drift`'s slow-path merge walk requires
-    // `lock.servers` to be sorted by `(name, source_config)`. The
-    // lockfile we wrote is always sorted (see `from_inventory`), but a
-    // hand-edited or merge-resolved lockfile could land here out of
-    // order. Sorting at the parse boundary makes the invariant total
-    // over every `McpLockfile` value that exists in the program, so
-    // no downstream caller has to re-sort.
+    // Defensive sort at the parse boundary (a hand-edited lockfile could land out
+    // of order) so `compute_drift`'s merge walk holds for every caller.
     lock.servers.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
             .then_with(|| a.source_config.cmp(&b.source_config))
     });
 
-    // Recompute every hash from the lockfile's *data* — the deserialized
-    // `hash` / `inventory_hash` values are discarded entirely. A
-    // hand-edited lockfile that forges consistent hashes (so the
-    // tampered-with state still looks coherent at the JSON layer) would
-    // otherwise silence drift in `compute_drift`'s fast path: the path
-    // short-circuits when `current.inventory_hash == lock.inventory_hash`,
-    // and the slow path's per-server comparison consults each
-    // `lock.servers[*].hash`. Both readings must come from the parsed
-    // body, not from a string an attacker could plant. The cost of
-    // recomputing every hash on parse is one extra SHA-256 over every
-    // server plus one over the concatenated digests — cheap relative to
-    // the file IO that just happened, and dwarfed by the lockfile
-    // typically having tens of servers at most.
+    // Recompute every hash from the lockfile's DATA — the deserialized
+    // `hash`/`inventory_hash` are discarded, so a hand-edited lockfile that
+    // forged consistent hashes can't silence drift (both `compute_drift`'s
+    // fast-path short-circuit and its per-server comparison read these). Cheap
+    // relative to the file IO just done.
     for server in &mut lock.servers {
         let recomputed = McpServerEntry {
             name: server.name.clone(),
             transport: server.transport.clone(),
             tools: server.tools.clone(),
-            // `tools_declared` IS folded into `content_hash` from v5
-            // onward (see [`McpServerEntry::tools_declared`]'s
-            // docstring), so the deserialized field value
-            // (`default_tools_declared = true` for legacy entries
-            // missing the field) flows through to the recompute.
             tools_declared: server.tools_declared,
             source_config: server.source_config.clone(),
         }
@@ -2519,23 +1739,14 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
     Ok(lock)
 }
 
-/// Coarse-grained category of a lockfile io failure. Carrying the
-/// `std::io::ErrorKind` directly here would couple this public enum to a
-/// non-exhaustive upstream type, so the cases tirith needs to distinguish
-/// are encoded explicitly. The `Display` impl on
-/// [`McpLockLoadError::Io`] uses these to produce a category-only message,
-/// never the inner io-error string — same privacy invariant as the
-/// `serde_json::Error` suppression in [`McpLockLoadError::Parse`].
+/// Coarse category of a lockfile io failure — encoded explicitly rather than
+/// carrying the non-exhaustive `std::io::ErrorKind`. Drives a category-only
+/// `Display` (never the inner io string), same privacy invariant as `Parse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpLockIoKind {
-    /// Underlying `std::io::ErrorKind::PermissionDenied` — the file mode
-    /// did not permit a read. The most operator-actionable case (a mode
-    /// bit on the lockfile, or a containing-directory permission).
+    /// `PermissionDenied` — the most operator-actionable case (a mode bit).
     PermissionDenied,
-    /// Any other io-error category (e.g. an OS-level transient failure).
-    /// Folded in here rather than spelled out individually so adding a new
-    /// io-error variant in std is not a backwards-incompatible break for
-    /// downstream consumers.
+    /// Any other io-error category (folded in so a new std variant isn't a break).
     Other,
 }
 
@@ -2554,38 +1765,16 @@ impl McpLockIoKind {
 pub enum McpLockLoadError {
     /// The file does not exist (caller decides whether this is fatal).
     NotFound,
-    /// The file exists but cannot be read.
-    ///
-    /// **Carries only a kind.** The original `std::io::Error`'s message
-    /// string is intentionally **not** captured — exactly the same
-    /// privacy invariant `Parse` enforces for `serde_json::Error`.
-    /// `std::io::Error`'s `Display` typically does not echo file
-    /// contents, but it CAN include user-visible path fragments (e.g.
-    /// `permission denied (os error 13): /home/.../lockfile`), and the
-    /// CLI's existing interpolation patterns would surface those.
-    /// Folding the inner string out at the boundary removes the class
-    /// of future diagnostic-leak regressions and matches the symmetric
-    /// pattern already applied to `mcpdrift`'s finding rendering.
+    /// The file exists but cannot be read. Carries only a kind — the inner
+    /// `io::Error` string can include path fragments (`os error 13: /home/...`),
+    /// so it's folded out at the boundary (same privacy invariant as `Parse`).
     Io { kind: McpLockIoKind },
-    /// The file exists and was read but does not parse as a lockfile.
-    ///
-    /// **Carries only line/column.** The original `serde_json::Error`
-    /// message is intentionally **not** captured — see
-    /// [`parse_lockfile`] for why. Both fields are `usize`, neither
-    /// can carry the offending JSON value, so this variant is safe to
-    /// `Display` into a CLI message and into a `McpServerDrift`
-    /// finding's description.
+    /// Read but doesn't parse. Carries only line/column (both `usize`, can't echo
+    /// the JSON value) — see [`parse_lockfile`]. Safe to `Display`.
     Parse { line: usize, column: usize },
-    /// The file parsed as JSON and matched the lockfile schema shape,
-    /// but its `format_version` is not [`MCP_LOCK_FORMAT_VERSION`].
-    ///
-    /// Distinct from [`Self::Parse`] so the CLI and the `mcpdrift`
-    /// rule can offer a precise message ("this lockfile was written
-    /// by tirith schema v{found}, re-run `tirith mcp lock` to refresh
-    /// or upgrade tirith") rather than a generic parse error. Both
-    /// fields are `u32`, neither can echo file content, so this
-    /// variant is safe to `Display` and to interpolate into a
-    /// finding's description.
+    /// Parsed and schema-shaped, but `format_version` ≠ [`MCP_LOCK_FORMAT_VERSION`].
+    /// Distinct from `Parse` for a precise re-lock/upgrade message; both fields
+    /// are `u32`, safe to `Display`.
     UnsupportedVersion {
         /// The `format_version` value the lockfile carried.
         found: u32,
@@ -2599,19 +1788,14 @@ impl std::fmt::Display for McpLockLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McpLockLoadError::NotFound => write!(f, "lockfile not found"),
-            // Category-only — the inner `io::Error`'s message is
-            // deliberately not surfaced (see the `McpLockLoadError::Io`
-            // doc for the privacy rationale). Two cases the operator
-            // can act on: PermissionDenied (the most common; file mode /
-            // directory mode wrong) and Other.
+            // Category-only — the inner io message is not surfaced (privacy).
             McpLockLoadError::Io { kind } => match kind {
                 McpLockIoKind::PermissionDenied => {
                     write!(f, "could not read lockfile (permission denied)")
                 }
                 McpLockIoKind::Other => write!(f, "could not read lockfile (other io error)"),
             },
-            // Line/column only — never the parser's message string.
-            // See `parse_lockfile` for the privacy rationale.
+            // Line/column only — never the parser's message string (privacy).
             McpLockLoadError::Parse { line, column } => {
                 write!(f, "could not parse lockfile (line {line}, column {column})")
             }
@@ -3020,11 +2204,8 @@ mod tests {
         assert!(!inventory.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Finding A — `from_inventory` sorts servers before hashing, so a lockfile
-    // (and its inventory hash) is identical no matter what order discovery
-    // happened to produce.
-    // -----------------------------------------------------------------------
+    // Finding A — `from_inventory` sorts before hashing, so the lockfile (and its
+    // inventory hash) is identical regardless of discovery order.
 
     #[test]
     fn from_inventory_sorts_servers_regardless_of_input_order() {
@@ -3110,10 +2291,8 @@ mod tests {
         assert_eq!(lock_f, lock_b);
     }
 
-    // -----------------------------------------------------------------------
-    // Finding B — a symlinked config file (or one under a symlinked directory)
-    // is rejected: discovery is repo-local, and a symlink can point anywhere.
-    // -----------------------------------------------------------------------
+    // Finding B — a symlinked config (or one under a symlinked dir) is rejected:
+    // discovery is repo-local, and a symlink can point anywhere.
 
     #[cfg(unix)]
     #[test]
@@ -3194,10 +2373,8 @@ mod tests {
         assert_eq!(found[0].1, ".mcp.json");
     }
 
-    // -----------------------------------------------------------------------
-    // Finding C — a stdio server's `env` is captured and an `env` change
-    // registers as drift (it is part of the per-server content hash).
-    // -----------------------------------------------------------------------
+    // Finding C — a stdio server's `env` is captured and an `env` change drifts
+    // (it is part of the per-server content hash).
 
     #[test]
     fn parse_captures_stdio_env() {
@@ -3358,11 +2535,8 @@ mod tests {
         assert_eq!(parsed, lock);
     }
 
-    // -----------------------------------------------------------------------
-    // Finding E — env raw values must not be persisted in the lockfile. They
-    // are commonly secrets (API tokens, credentials), and `.tirith/mcp.lock`
-    // is designed to be committed. The lockfile carries a salted hash only.
-    // -----------------------------------------------------------------------
+    // Finding E — env raw values must not be persisted (they're commonly secrets
+    // and the lockfile is committed); only a salted hash is stored.
 
     /// A bag of credential-shaped (high-entropy, unique) env values we render
     /// into the lockfile in the test below; **none** of these byte sequences
@@ -3529,11 +2703,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Finding D — the per-server hash is collision-free: a separator-delimited
-    // list scheme cannot distinguish `["a","b"]` from `["ab"]` or `["a\0b"]`;
-    // length-prefixing every component makes the hash input unambiguous.
-    // -----------------------------------------------------------------------
+    // Finding D — the per-server hash is collision-free: length-prefixing every
+    // component distinguishes `["a","b"]` from `["ab"]` / `["a\0b"]`.
 
     #[test]
     fn content_hash_distinguishes_ambiguous_arg_lists() {
@@ -3649,15 +2820,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Finding G — a URL transport's userinfo (HTTP Basic Auth) must not be
-    // persisted in the lockfile. A URL declared as `https://user:token@host/`
-    // is recorded as `https://host/` plus a salted `userinfo_hash` (same
-    // scheme as `McpEnvEntry`). A URL with no userinfo serializes with
-    // `userinfo_hash` omitted, so absence is structurally distinct from
-    // presence. Folded into the per-server content hash, so a userinfo
-    // change registers as drift.
-    // -----------------------------------------------------------------------
+    // Finding G — a URL transport's userinfo must not be persisted:
+    // `https://user:token@host/` is stored as `https://host/` plus a salted
+    // `userinfo_hash` (omitted when absent), folded into the content hash so a
+    // change drifts.
 
     /// Credential-shaped (high-entropy, unique) URL userinfo probes. None of
     /// these byte sequences may appear in the rendered lockfile. They are
@@ -4110,16 +3276,8 @@ mod tests {
         assert_eq!(parsed, lock);
     }
 
-    // -----------------------------------------------------------------------
-    // Chunk 2 — drift detection.
-    //
-    // The drift core is what `tirith mcp verify` and `tirith mcp diff`
-    // consume, and what the new `RuleId::McpServerDrift` rule fires on. The
-    // tests below cover every category from the chunk-2 brief: added,
-    // removed, transport-change, env added/removed/value-change,
-    // tools-change, userinfo-change. Plus the fast-path: an unchanged
-    // inventory has empty drift.
-    // -----------------------------------------------------------------------
+    // Chunk 2 — drift detection. Covers every category (added, removed,
+    // transport / env / tools / userinfo change) plus the empty-drift fast path.
 
     fn mk_inventory(servers: Vec<McpServerEntry>) -> McpInventory {
         McpInventory {
@@ -4339,17 +3497,10 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F24 (PRT II-10) — when a transport flips kind
-    // (stdio ↔ url, or either ↔ unknown), `compute_changed_entry` records
-    // ONLY a `KindChanged` entry and intentionally drops the per-variable
-    // env detail (the diff doesn't make sense across the kind boundary —
-    // a URL server doesn't HAVE env vars). Tools diff, however, still runs
-    // unconditionally across the kind boundary. Pin both behaviours
-    // explicitly so a future refactor doesn't silently start emitting
-    // misleading `EnvChanged` / per-variable `Removed` entries across the
-    // boundary, or silently stop diff'ing tools.
-    // -----------------------------------------------------------------------
+    // F24 (PRT II-10) — on a transport kind flip, `compute_changed_entry` records
+    // ONLY `KindChanged` and drops per-variable env detail (a URL server has no
+    // env), but still diffs tools across the boundary. Pinned so a refactor can't
+    // silently emit misleading `EnvChanged` entries or stop diffing tools.
 
     #[test]
     fn drift_kind_change_stdio_to_url_drops_env_detail_but_keeps_tools_diff() {
@@ -4665,16 +3816,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F21 (PRT II-1) — `McpToolsChangeKind::Reordered` is
-    // documented as a "defensive variant" that fires when the two tool
-    // lists carry the same set in a different order. `parse_mcp_config`
-    // sorts tools on parse, so a same-set-different-order case can only
-    // arise from a hand-built inventory (e.g. a future caller, a test
-    // fixture). Without a test, both the variant and its `"reordered"`
-    // serde tag are dead — a future refactor could silently drop them.
-    // Pin both.
-    // -----------------------------------------------------------------------
+    // F21 (PRT II-1) — pin `McpToolsChangeKind::Reordered` (and its `"reordered"`
+    // tag): a same-set-different-order case only arises from a hand-built
+    // inventory, so without a test both the variant and tag could be dropped.
 
     #[test]
     fn drift_tools_change_kind_reordered_fires_when_tool_lists_differ_only_in_order() {
@@ -5122,15 +4266,9 @@ mod tests {
         assert_eq!(loaded, lock);
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F1 — `format_version` is validated on load. A lockfile
-    // whose `format_version` is not `MCP_LOCK_FORMAT_VERSION` (a future
-    // schema like v999, or a legacy v3-shape pre-redaction file that still
-    // happens to deserialize because its v4-only fields are optional) is
-    // rejected with `McpLockLoadError::UnsupportedVersion { found, supported }`
-    // — distinct from `Parse` so the CLI / `mcpdrift` rule can offer a
-    // precise diagnostic instead of "the JSON is corrupt".
-    // -----------------------------------------------------------------------
+    // F1 — `format_version` is validated on load. A non-current version (future
+    // v999, or a legacy v3-shape file) is rejected with `UnsupportedVersion`,
+    // distinct from `Parse` for a precise diagnostic.
 
     #[test]
     fn parse_lockfile_rejects_future_version_999_distinctly() {
@@ -5268,13 +4406,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // v5 — `tools_declared` is folded into the per-server `content_hash`,
-    // and a `format_version: 4` lockfile is accepted at parse time with a
-    // `LockfileSchema::LegacyV4Migration` tag so `compute_drift` surfaces
-    // a one-time migration prompt instead of phantom drift on every
-    // server.
-    // -----------------------------------------------------------------------
+    // v5 — `tools_declared` is folded into `content_hash`, and a v4 lockfile is
+    // accepted with a `LegacyV4Migration` tag for a one-time migration prompt.
 
     #[test]
     fn content_hash_includes_tools_declared() {
@@ -5596,13 +4729,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F3 / F4 — `build_inventory` surfaces the structured
-    // rejection list on `McpInventory::rejected_configs`. Discovery-time
-    // rejections (symlinked, non-regular, canonical-not-under-root) and
-    // file-content rejections (oversize, permission denied) both flow into
-    // the same list.
-    // -----------------------------------------------------------------------
+    // F3 / F4 — `build_inventory` surfaces the rejection list on
+    // `rejected_configs`; discovery-time and file-content rejections both flow in.
 
     #[cfg(unix)]
     #[test]
@@ -5729,13 +4857,8 @@ mod tests {
         assert!(inventory.configs.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F8 — `redact_url_userinfo` preserves query string and
-    // fragment through the redaction. The previous defensive-fallback path
-    // would drop them; the documented-unreachable branch now panics with a
-    // clear message, but the normal redaction must already round-trip every
-    // structural URL component.
-    // -----------------------------------------------------------------------
+    // F8 — `redact_url_userinfo` round-trips every structural URL component
+    // (query, fragment) through the redaction; the old fallback dropped them.
 
     #[test]
     fn redact_url_userinfo_preserves_query_and_fragment() {
@@ -5769,12 +4892,8 @@ mod tests {
         assert_eq!(hash, None);
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 5 — `parse_lockfile` recomputes every hash from the
-    // lockfile's data; deserialized `inventory_hash` and per-server `hash`
-    // values are discarded. A hand-edited lockfile that forges consistent
-    // hashes must NOT silence drift.
-    // -----------------------------------------------------------------------
+    // PR #121 item 5 — `parse_lockfile` recomputes every hash from the data and
+    // discards the deserialized ones, so a forged-hash lockfile can't silence drift.
 
     #[test]
     fn parse_lockfile_recomputes_hashes_and_ignores_forged_inventory_hash() {
@@ -5836,12 +4955,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 6 — `redact_url_userinfo`'s parse-failure fallback no
-    // longer stores the raw URL string verbatim. The `user:token@host`
-    // userinfo must be stripped (replaced with `***`) even when the URL
-    // doesn't successfully parse.
-    // -----------------------------------------------------------------------
+    // PR #121 item 6 — the parse-failure fallback strips userinfo (→ `***`)
+    // rather than storing the raw URL verbatim, even for an unparseable URL.
 
     #[test]
     fn redact_url_userinfo_strips_userinfo_on_parse_failure() {
@@ -5919,15 +5034,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 CR follow-up — the malformed-URL strip path must preserve the
-    // credential-drift signal. Without a hash on the strip-fired path, two
-    // consecutive locks of a config that lost its credential would both
-    // carry `userinfo_hash: None` and look identical — drift detection
-    // would silently fail. The strip now hashes the userinfo bytes with
-    // the same `salted_sha256_hex(server_name, ...)` scheme the parsed
-    // path uses, so add/remove is visible at the inventory-hash level.
-    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — the malformed-URL strip path hashes the userinfo
+    // bytes (same `salted_sha256_hex` scheme) so credential add/remove drift stays
+    // visible; otherwise two locks losing the credential would look identical.
 
     #[test]
     fn strip_userinfo_best_effort_records_hash_for_malformed_url_with_credentials() {
@@ -6000,11 +5109,8 @@ mod tests {
         assert_ne!(h1, h3, "removing credentials must flip the userinfo hash");
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 7 (partial) — `parse_tools` distinguishes the three
-    // on-wire shapes via the `DeclaredTools` enum, and the per-entry
-    // `tools_declared` flag captures the omitted-vs-declared distinction.
-    // -----------------------------------------------------------------------
+    // PR #121 item 7 — `parse_tools` distinguishes the on-wire shapes via
+    // `DeclaredTools`, and `tools_declared` captures omitted-vs-declared.
 
     #[test]
     fn parse_tools_distinguishes_omitted_empty_and_declared() {

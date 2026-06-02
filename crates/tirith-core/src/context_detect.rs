@@ -1,52 +1,33 @@
 //! Operational-context detection — M8 ch1.
 //!
-//! Reads the *currently-selected* context for each supported cloud / k8s
-//! provider so the `rules::context` module can decide whether the parsed
-//! command's target context is labeled production. The four readers:
+//! Reads the currently-selected context for each supported cloud / k8s provider
+//! so `rules::context` can decide whether a command's target is labeled
+//! production. Four readers: **kube** (`~/.kube/config` `current-context`,
+//! honoring the first `$KUBECONFIG` entry); **aws** (`$AWS_PROFILE` then
+//! `$AWS_DEFAULT_PROFILE`, falling back to `~/.aws` `default` — only the profile
+//! *name*, never credentials); **gcloud** (`gcloud config list --format=json`,
+//! context `<account>@<project>`); **az** (`az account show -o json`,
+//! subscription `name`). The gcloud/az shell-outs have a hard 1.5s timeout.
 //!
-//! 1. **kube** — `~/.kube/config` `current-context` field, honoring
-//!    `$KUBECONFIG` (which may list multiple files; the first wins for the
-//!    purpose of `current-context`, mirroring kubectl 1.28+ behavior).
-//! 2. **aws** — `$AWS_PROFILE` env (then `$AWS_DEFAULT_PROFILE`), falling back
-//!    to the `[default]` section of `~/.aws/config`. We never *parse* the
-//!    profile's contents — only resolve the profile *name*; that name is
-//!    what operators label with `tirith context label aws:<profile> …`.
-//! 3. **gcloud** — shells out to `gcloud config list --format=json` with a
-//!    hard 1.5s timeout. Extracts `core.account` and `core.project` for
-//!    labels; the canonical context string is `<account>@<project>` (or
-//!    just `<project>` when the account is unknown).
-//! 4. **az** — shells out to `az account show -o json` with a hard 1.5s
-//!    timeout. Extracts the active subscription `name` (operator-facing
-//!    string that matches `az account list -o table`).
-//!
-//! Every external command goes through [`run_with_timeout`] which spawns
-//! `std::process::Command` and polls `try_wait()` against a deadline on
-//! the main thread; stdout is drained in a helper thread to avoid
-//! pipe-buffer deadlock. On timeout we `kill()` the child and return
-//! [`ContextDetectFailure::Timeout`]; on non-zero exit we return
-//! [`ContextDetectFailure::Exited`]. The hot path NEVER blocks on a
-//! shell-out — callers gate detection on the parsed leader being a cloud
-//! CLI (see `engine.rs`) and a 5-second per-process cache keeps repeat
-//! invocations cheap.
+//! Every external command goes through [`run_with_timeout`], which drains stdout
+//! on a helper thread (no pipe-buffer deadlock) and `kill()`s on timeout. The hot
+//! path never blocks: callers gate detection on the parsed leader being a cloud
+//! CLI, and a 5s per-process cache keeps repeats cheap.
 //!
 //! ## Cache semantics
 //!
-//! [`detect_all`] is what the engine calls. Results are cached in a
-//! process-global `OnceLock`-backed `Mutex` for [`CACHE_TTL_SECS`] (5s).
-//! Within that window every call returns the same map. After expiry the
-//! next call refreshes; failures are cached too (negative caching prevents
-//! a permanently-broken `gcloud` from being re-invoked every second).
+//! [`detect_all`] caches results in a process-global `OnceLock`/`Mutex` for
+//! [`CACHE_TTL_SECS`] (5s). Failures are cached too (negative caching keeps a
+//! permanently-broken `gcloud` from being re-invoked every second).
 //!
 //! ## Honest scope
 //!
-//! These signals are operator-trust, not adversary-resistant. The strings
-//! we read are caller-controlled (`~/.kube/config` is a user-writable file,
-//! `gcloud config` is settable by anyone with shell access). The labels
-//! file (`~/.config/tirith/context-labels.yaml`) is the security boundary
-//! — an attacker who can mutate it can already run anything. We trust the
-//! labels file to declare which contexts are critical, then we lift the
-//! provider's current-context string into a finding when a destructive
-//! command targets a labeled context.
+//! These signals are operator-trust, not adversary-resistant: the strings read
+//! are caller-controlled (user-writable config files). The labels file
+//! (`~/.config/tirith/context-labels.yaml`) is the security boundary — an
+//! attacker who can mutate it can already run anything. We trust it to declare
+//! which contexts are critical, then lift the current-context string into a
+//! finding when a destructive command targets a labeled context.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,17 +35,15 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Hard per-call wall-clock cap for any shell-out. The watchdog thread
-/// `kill`s the child if the call hasn't finished by this deadline.
+/// Hard per-call wall-clock cap for any shell-out; the child is killed past it.
 const SHELL_OUT_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Per-process cache TTL. Mirrors the documented design — keeps the hot
-/// path responsive when the operator runs a burst of `kubectl` / `aws`
-/// commands in quick succession.
+/// Per-process cache TTL — keeps the hot path responsive during a burst of
+/// cloud-CLI commands.
 pub const CACHE_TTL_SECS: u64 = 5;
 
-/// Provider identifier. The string form matches the `provider:context`
-/// label keys (e.g. `kube:prod-us-east`).
+/// Provider identifier. The string form matches the `provider:context` label
+/// keys (e.g. `kube:prod-us-east`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum Provider {
     Kube,
@@ -95,9 +74,8 @@ impl Provider {
         }
     }
 
-    /// Map a parsed command leader (lowercased basename) to the provider
-    /// it targets, if any. `kubectl`/`kustomize`/`helm`/`argocd` → Kube;
-    /// `aws`/`aws-vault` → AWS; `gcloud` → GCP; `az` → Azure.
+    /// Map a parsed command leader (lowercased basename) to the provider it
+    /// targets, if any.
     pub fn from_leader(leader: &str) -> Option<Self> {
         match leader {
             "kubectl" | "kustomize" | "helm" | "argocd" => Some(Self::Kube),
@@ -109,27 +87,19 @@ impl Provider {
     }
 }
 
-/// Failure reason returned by a single-provider reader.
-///
-/// `NotConfigured` means "no kubeconfig found / no AWS profile / no gcloud
-/// CLI on PATH" — the provider simply isn't configured on this machine, so
-/// the rule should not fire for that provider.
-///
-/// `Timeout` / `Exited` / `Io` are operational failures that get logged and
-/// negative-cached for [`CACHE_TTL_SECS`] so a permanently-broken provider
-/// doesn't slow down every cloud-CLI check.
+/// Failure reason returned by a single-provider reader. `NotConfigured` is
+/// absence of signal (no config / no CLI on PATH), not an error; the others are
+/// operational failures that get logged and negative-cached for
+/// [`CACHE_TTL_SECS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextDetectFailure {
-    /// The provider isn't configured on this machine (no config file, no
-    /// CLI on PATH). Not an error — just absence of signal.
+    /// The provider isn't configured on this machine — absence of signal.
     NotConfigured,
     /// The shell-out exceeded [`SHELL_OUT_TIMEOUT`]. The child was killed.
     Timeout,
     /// The shell-out exited with a non-zero status code.
     Exited(i32),
-    /// The shell-out failed for an I/O reason (couldn't spawn, couldn't
-    /// read stdout, couldn't parse JSON, etc.). Carries a short reason
-    /// string for the audit log.
+    /// An I/O failure (spawn / read / JSON parse). Carries a short reason string.
     Io(String),
 }
 
@@ -148,10 +118,8 @@ impl std::fmt::Display for ContextDetectFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContext {
     pub provider: Provider,
-    /// The operator-facing context name. For kube this is
-    /// `current-context`; for aws it's the profile name; for gcp it's
-    /// `<account>@<project>` (or `<project>` when the account is unknown
-    /// or empty); for azure it's the subscription name.
+    /// The operator-facing context name (kube `current-context`, aws profile
+    /// name, gcp `<account>@<project>`, azure subscription name).
     pub context: String,
 }
 
@@ -162,8 +130,8 @@ impl ProviderContext {
     }
 }
 
-/// Combined result of detecting every provider. The hot path consumes the
-/// `BTreeMap` directly; failures are exposed for the audit log.
+/// Combined result of detecting every provider; failures are exposed for the
+/// audit log.
 #[derive(Debug, Clone, Default)]
 pub struct DetectionResult {
     pub contexts: BTreeMap<Provider, ProviderContext>,
@@ -176,9 +144,7 @@ impl DetectionResult {
     }
 }
 
-/// Process-global cache. `OnceLock` defers initialization until the first
-/// call; the inner `Mutex` is fine-grained — readers are infrequent
-/// (parsed-leader gated).
+/// Process-global cache (`OnceLock`-deferred init, fine-grained inner `Mutex`).
 static CACHE: OnceLock<Mutex<CacheEntry>> = OnceLock::new();
 
 #[derive(Default)]
@@ -191,15 +157,13 @@ fn cache() -> &'static Mutex<CacheEntry> {
     CACHE.get_or_init(|| Mutex::new(CacheEntry::default()))
 }
 
-/// Detect the active context for every configured provider, with a
-/// per-process cache. Safe to call from the hot path — never blocks longer
-/// than [`SHELL_OUT_TIMEOUT`] per provider on the cache-cold path, and
-/// returns instantly on a cache hit.
+/// Detect the active context for every configured provider, with a per-process
+/// cache. Hot-path-safe: never blocks longer than [`SHELL_OUT_TIMEOUT`] per
+/// provider when cold, instant on a cache hit.
 ///
-/// Test-only override: when `TIRITH_CONTEXT_DETECT_DISABLE=1` is set, this
-/// returns an empty result without touching the filesystem or running any
-/// shell-outs. Used by the engine integration tests so they don't pick up
-/// the developer's real `kubeconfig` / `aws config`.
+/// Test-only: `TIRITH_CONTEXT_DETECT_DISABLE=1` returns an empty result with no
+/// filesystem / shell-out access, so integration tests don't pick up the
+/// developer's real cloud config.
 pub fn detect_all() -> DetectionResult {
     if std::env::var("TIRITH_CONTEXT_DETECT_DISABLE")
         .ok()
@@ -227,10 +191,8 @@ pub fn detect_all() -> DetectionResult {
     fresh
 }
 
-/// Detect the active context for a single provider. Used by the
-/// `tirith context status` CLI which wants per-provider failure detail.
-/// The result is NOT cached at the per-provider level — `detect_all`
-/// already coalesces.
+/// Detect the active context for a single provider (used by `tirith context
+/// status` for per-provider failure detail). Not cached — `detect_all` coalesces.
 pub fn detect_single(provider: Provider) -> Result<ProviderContext, ContextDetectFailure> {
     match provider {
         Provider::Kube => detect_kube(),
@@ -240,8 +202,7 @@ pub fn detect_single(provider: Provider) -> Result<ProviderContext, ContextDetec
     }
 }
 
-/// Clear the per-process cache. Tests call this between scenarios; the
-/// hot path never needs it (the TTL handles staleness).
+/// Clear the per-process cache. Tests call this between scenarios.
 pub fn clear_cache_for_tests() {
     if let Some(lock) = CACHE.get() {
         if let Ok(mut guard) = lock.lock() {
@@ -304,10 +265,8 @@ fn detect_kube() -> Result<ProviderContext, ContextDetectFailure> {
     })
 }
 
-/// Resolve the active kubeconfig path. Honors `$KUBECONFIG` (uses the
-/// FIRST path when the env var is a `:`-separated list, mirroring how
-/// kubectl resolves `current-context` from the first file) and falls
-/// back to `~/.kube/config`.
+/// Resolve the active kubeconfig path: the first `$KUBECONFIG` entry (mirroring
+/// kubectl's `current-context` resolution), falling back to `~/.kube/config`.
 fn resolve_kubeconfig_path() -> Option<PathBuf> {
     if let Ok(env_val) = std::env::var("KUBECONFIG") {
         let env_val = env_val.trim();
@@ -347,9 +306,8 @@ fn detect_aws() -> Result<ProviderContext, ContextDetectFailure> {
         }
     }
 
-    // Fall back to a file under `~/.aws/` so we have *some* signal when
-    // the operator hasn't set `AWS_PROFILE`. We only need to know the
-    // profile NAME — never the credential value.
+    // Fall back to a file under `~/.aws/` for *some* signal when `AWS_PROFILE`
+    // is unset. We only need the profile NAME, never the credential value.
     let home = home::home_dir().ok_or(ContextDetectFailure::NotConfigured)?;
     let config_path = home.join(".aws").join("config");
     let credentials_path = home.join(".aws").join("credentials");
@@ -358,9 +316,7 @@ fn detect_aws() -> Result<ProviderContext, ContextDetectFailure> {
         return Err(ContextDetectFailure::NotConfigured);
     }
 
-    // Use the default profile if either file declares one. `aws` does not
-    // distinguish "missing default" from "no aws config at all" — we
-    // return `default` because that is what `aws` itself would use.
+    // Return `default` (what `aws` itself would use) when either file exists.
     Ok(ProviderContext {
         provider: Provider::Aws,
         context: "default".to_string(),
@@ -409,9 +365,8 @@ fn detect_azure() -> Result<ProviderContext, ContextDetectFailure> {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| ContextDetectFailure::Io(format!("json parse: {e}")))?;
 
-    // `az account show` returns `{"name": "...", "id": "...", ...}`. The
-    // operator-facing label is `name` (matches what `az account list -o
-    // table` prints); fall back to `id` (subscription UUID) if missing.
+    // Prefer the operator-facing `name` (what `az account list -o table` prints),
+    // falling back to the subscription `id` UUID.
     let context = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -437,29 +392,10 @@ struct ShellOutOutput {
     pub stdout: Vec<u8>,
 }
 
-/// Run a binary with a hard wall-clock timeout.
-///
-/// The implementation polls `child.try_wait()` in 25ms ticks. If the child
-/// is still running past [`SHELL_OUT_TIMEOUT`], we send a kill and return
-/// [`ContextDetectFailure::Timeout`]. This is simpler than a watchdog
-/// thread (which has a take-ownership race with `wait_with_output`) and
-/// equally precise for our 1.5s deadline.
-///
-/// Stdout is read on a helper thread so the pipe doesn't fill up while
-/// we poll. The main thread owns the `Child` for the entire call.
-///
-/// Returns:
-/// - `Ok(out)` on success (exit 0) with the child's stdout captured.
-/// - `Err(ContextDetectFailure::NotConfigured)` when the binary isn't on
-///   PATH (`spawn()` returns `NotFound`). Distinct from a real I/O error
-///   so missing-CLI is treated as "no signal" rather than "broken
-///   provider".
-/// - `Err(ContextDetectFailure::Timeout)` when the deadline elapses.
-/// - `Err(ContextDetectFailure::Exited(code))` on non-zero exit.
-/// - `Err(ContextDetectFailure::Io(reason))` on other spawn / read errors.
+/// Run a binary with a hard wall-clock timeout, mapping the shared helper's
+/// outcome onto [`ContextDetectFailure`]. A missing binary (`spawn` `NotFound`)
+/// becomes `NotConfigured` ("no signal"), distinct from a real I/O error.
 fn run_with_timeout(program: &str, args: &[&str]) -> Result<ShellOutOutput, ContextDetectFailure> {
-    // Delegate to the shared shell-timeout helper in `crate::util`; map
-    // its outcome onto our typed failure enum.
     use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
     let outcome = run_shell_with_timeout(
         program,
@@ -577,16 +513,14 @@ mod tests {
             std::env::remove_var("AWS_PROFILE");
             std::env::remove_var("AWS_DEFAULT_PROFILE");
         }
-        // We can't assert the result deterministically (depends on whether
-        // ~/.aws exists on the test box). Just check it doesn't panic and
-        // returns *some* shape.
+        // Result is non-deterministic (depends on whether ~/.aws exists); just
+        // check it doesn't panic.
         let _ = detect_aws();
     }
 
     #[test]
     fn timeout_triggers_on_slow_binary() {
-        // Use `sleep` (POSIX) — present on macOS / Linux test runners.
-        // Skip on Windows; the watchdog path is the same anyway.
+        // `sleep` is POSIX-only; skip on Windows (same watchdog path anyway).
         if cfg!(windows) {
             return;
         }

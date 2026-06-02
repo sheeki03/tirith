@@ -1,58 +1,33 @@
 //! Sudo-session helpers (M8 ch4).
 //!
-//! The session-file lives at `state_dir()/sudo-session.json` and stores
-//! `{started_at, ttl, reason}` for the operator's currently-claimed sudo
-//! window. The M8 ch4 rule module consults this file when
-//! `policy.sudo_require_reason` is on so a tagged session can suppress an
+//! A session file at `state_dir()/sudo-session.json` stores `{started_at, ttl,
+//! reason}` for the operator's claimed sudo window. The M8 ch4 rule consults it
+//! (when `policy.sudo_require_reason` is on) so a tagged session can suppress an
 //! otherwise-blocking finding.
 //!
-//! ## Clock-skew tolerance
+//! Clock-skew tolerance: TTL checks compare `now()` to `started_at`, tolerating
+//! ≤60s skew (NTP/container drift); a wildly-future timestamp expires the session
+//! and never panics. The on-disk `mtime` is NEVER used to rewrite `started_at` —
+//! a `touch`/`cp -p` must not reactivate an expired session.
 //!
-//! TTL freshness checks compare against `SystemTime::now()` and the
-//! recorded `started_at`. Two cases are tolerated:
+//! Lifecycle: `start` writes the file `0o600` (overwriting any prior); `end`
+//! removes it; `status` computes `remaining_secs`. Failures are non-fatal — an
+//! unreadable file means "no session", which the rules treat as a hard Block.
 //!
-//! 1. Operator clock-skew (NTP drift, container time-warp) — if
-//!    `now()` and the recorded `started_at` differ by ≤ 60 seconds we
-//!    still treat the session as active.
-//! 2. Stale-fail safety — when the system clock is wrong by hours, the
-//!    `started_at` field can read as wildly in the future. We reject
-//!    expired sessions but never panic on an unparseable timestamp.
-//!
-//! The on-disk `mtime` is **never** used to rewrite `started_at` —
-//! `touch(1)`, `cp -p`, or a backup tool refreshing the timestamp must
-//! not silently reactivate an expired session.
-//!
-//! ## Lifecycle
-//!
-//! `start` — creates the file with `0o600` and overwrites any prior
-//! session. `end` — removes the file. `status` — reads the file and
-//! computes `remaining_secs` from `now() - started_at`.
-//!
-//! Failures are deliberately non-fatal. A session file that can't be
-//! read just means "no session active"; the rules treat that as a hard
-//! Block (the rules ship the safer-default).
-//!
-//! ## Honest scope
-//!
-//! The session file is user-writable. An attacker who already has shell
-//! access can simply touch the file. This is operator-trust, not
-//! adversary-resistant — the goal is to catch operational footguns
-//! ("I forgot I had a sudo window open"), not to stop a determined
-//! attacker. The M8 ch1/ch2/ch3 labels-file model is the same shape.
+//! Honest scope: the file is user-writable, so this is operator-trust (catch "I
+//! forgot a sudo window is open"), not adversary-resistant. Same shape as the M8
+//! ch1-3 labels-file model.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum clock skew we tolerate when comparing the recorded
-/// `started_at` against `SystemTime::now()`. Sixty seconds is wider
-/// than typical NTP drift but tight enough that a clock that's
-/// pathologically wrong still expires sessions.
+/// Max tolerated clock skew between `started_at` and `now()`. Wider than typical
+/// NTP drift, tight enough that a pathologically-wrong clock still expires.
 pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
 
-/// Default TTL when the operator runs `tirith sudo session start`
-/// without `--ttl`.
+/// Default TTL for `tirith sudo session start` without `--ttl`.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 60;
 
 /// Path the session file lives at, when `state_dir()` is resolvable.
@@ -82,22 +57,18 @@ impl SudoSession {
         }
     }
 
-    /// `true` when the session is still within its TTL window. The check
-    /// is forgiving in two directions: clock-skew within
-    /// [`CLOCK_SKEW_TOLERANCE_SECS`] is treated as "still valid", and a
-    /// missing-but-recent file `mtime` is treated as a fallback anchor.
+    /// `true` when still within the TTL window. Tolerates clock-skew within
+    /// [`CLOCK_SKEW_TOLERANCE_SECS`].
     pub fn is_active(&self) -> bool {
         let now = unix_now();
         let started = self.started_at;
-        // Clock-skew tolerance: `started_at` may legitimately be slightly
-        // in the future after a clock-correction. Don't reject those.
+        // `started_at` may be slightly future after a clock-correction; don't
+        // reject those, but a wildly-past clock fails closed (safer default).
         let effective_now = if now >= started {
             now
         } else if started - now <= CLOCK_SKEW_TOLERANCE_SECS {
             started
         } else {
-            // Clock is wildly off in the past direction. Treat as
-            // expired — fail-closed for sessions is the safer default.
             return false;
         };
         let age = effective_now.saturating_sub(started);
@@ -108,23 +79,17 @@ impl SudoSession {
     pub fn remaining_secs(&self) -> u64 {
         let now = unix_now();
         if now < self.started_at {
-            // Negative age — treat as full TTL.
-            return self.ttl_secs;
+            return self.ttl_secs; // negative age → full TTL
         }
         let age = now - self.started_at;
         self.ttl_secs.saturating_sub(age)
     }
 }
 
-/// Read the current session, if any. Returns `None` when the file is
-/// missing OR the parsed session has expired. Caller never needs to
-/// re-check the TTL.
-///
-/// We *never* overwrite a parsed `started_at` from disk mtime. A prior
-/// implementation did so when the JSON timestamp drifted >1y from mtime,
-/// intending to recover from on-disk schema changes; in practice
-/// `touch(1)` or backup tools could refresh mtime on a long-expired
-/// session and silently reactivate it for another TTL window.
+/// Read the current session, or `None` when the file is missing OR expired
+/// (caller needn't re-check the TTL). NEVER overwrites `started_at` from disk
+/// mtime — a `touch`/backup-tool mtime refresh must not reactivate an expired
+/// session.
 pub fn read_active_session() -> Option<SudoSession> {
     let path = sudo_session_path()?;
     let bytes = std::fs::read(&path).ok()?;
@@ -184,12 +149,9 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse a `--ttl` string like `30m` / `2h` / `90s` / bare seconds.
-/// Returns the duration in seconds. Empty string → `None`.
-///
-/// The trailing suffix must be a single ASCII character. Multi-byte
-/// suffixes (e.g. `5m€`) are rejected; previously the implementation
-/// called `s.split_at(s.len() - 1)` which can panic mid-codepoint.
+/// Parse a `--ttl` string (`30m` / `2h` / `90s` / bare seconds) to seconds.
+/// Empty → `None`. The suffix must be a single ASCII byte; a multi-byte suffix
+/// (e.g. `5m€`) is rejected so the `split_at` below can't panic mid-codepoint.
 pub fn parse_ttl(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -199,9 +161,7 @@ pub fn parse_ttl(s: &str) -> Option<u64> {
     if let Ok(n) = s.parse::<u64>() {
         return Some(n);
     }
-    // The unit suffix must be a single ASCII byte. Reject anything else
-    // (including multi-byte unicode) up-front so the boundary split below
-    // is always safe.
+    // Suffix must be a single ASCII byte (rejected up-front so the split is safe).
     let last_byte = s.as_bytes().last().copied()?;
     if !last_byte.is_ascii() {
         return None;
@@ -256,10 +216,8 @@ mod tests {
 
     #[test]
     fn parse_ttl_does_not_panic_on_multibyte_suffix() {
-        // Regression: parse_ttl previously called s.split_at(s.len() - 1)
-        // which panics mid-codepoint when the last char is multi-byte
-        // (e.g. €, 中, 😀). The CLI passes this string straight from the
-        // operator's --ttl arg.
+        // Regression: `split_at(len - 1)` panicked mid-codepoint on a multi-byte
+        // last char (the CLI passes the raw `--ttl` arg here).
         assert_eq!(parse_ttl("5m€"), None);
         assert_eq!(parse_ttl("30s😀"), None);
         assert_eq!(parse_ttl("€"), None);

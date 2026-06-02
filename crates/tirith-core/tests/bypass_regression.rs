@@ -1,8 +1,6 @@
 //! Adversarial bypass regression tests for the allowlist and blocklist paths.
-//!
-//! Each test attempts to circumvent a security fix rather than confirm the
-//! happy path — if one starts passing when it should fail (or vice versa), a
-//! bypass has been reintroduced.
+//! Each test attempts to circumvent a security fix; a flip signals a
+//! reintroduced bypass.
 
 use std::fs;
 

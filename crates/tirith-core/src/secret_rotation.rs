@@ -1,62 +1,32 @@
 //! M11 ch4 — secret-rotation ASSISTANT (guidance only).
 //!
-//! This module is a **presenter over existing audit data plus a static provider
-//! table**. It tells the user *where* and *how* to rotate a leaked credential —
-//! it does NOT rotate or revoke anything, and it makes **zero network calls**.
-//! There is no HTTP client constructed anywhere in this module or in the
-//! `tirith secret` CLI front-end (which lives in the `tirith` binary crate, not
-//! here); the only "URLs" here are inert string literals printed for the human
-//! to open in their own browser.
+//! A presenter over existing audit data plus a static provider table: it tells
+//! the user where and how to rotate a leaked credential but does NOT rotate or
+//! revoke anything, and makes ZERO network calls — the "URLs" here are inert
+//! string literals for the human to open. This honesty contract is stated in
+//! `--help` and the command output (see [`HONESTY_BANNER`]).
 //!
-//! # Honesty contract
-//!
-//! tirith does NOT perform rotation or revocation. It shows you the provider's
-//! revocation page and a manual checklist; **you** do the rotation. This is
-//! stated loudly in `--help` and in the command output (see
-//! [`HONESTY_BANNER`]).
-//!
-//! # No new RuleIds
-//!
-//! `tirith secret triage` reads RECENT credential-type findings already recorded
-//! in the local audit log (written by the engine's existing rules — see
-//! [`CREDENTIAL_RULE_IDS`]) and, for each, matches the finding against a
-//! provider in [`PROVIDERS`] to print a one-line next-step. No detection logic,
-//! no new [`crate::verdict::RuleId`] — the rules that produced those findings
-//! already exist.
-//!
-//! # Guidance staleness
-//!
-//! Provider revocation URLs and checklists drift over time. Every [`Provider`]
-//! entry carries a [`Provider::last_verified`] date (surfaced under `--verbose`)
-//! so a stale entry is visible rather than silently trusted.
+//! No new RuleIds: `tirith secret triage` reads existing credential-type
+//! findings from the audit log (see [`CREDENTIAL_RULE_IDS`]) and matches each
+//! against a provider in [`PROVIDERS`]. Each [`Provider`] carries a
+//! [`Provider::last_verified`] date so a stale entry is visible.
 
-/// The date every provider entry in [`PROVIDERS`] was last hand-verified.
-/// Surfaced under `tirith secret rotate <p> --verbose`. Bump this (and
-/// re-check each URL) whenever the table is revised.
+/// The date every [`PROVIDERS`] entry was last hand-verified (surfaced under
+/// `--verbose`). Bump this and re-check each URL whenever the table is revised.
 pub const LAST_VERIFIED: &str = "2026-05-28";
 
-/// The loud honesty banner. tirith is an assistant, not an actor: it never
-/// rotates or revokes a credential — it shows the user where and how, and the
-/// user does the rotation. Printed by every `tirith secret` subcommand and
-/// echoed in `--help`.
+/// The honesty banner: tirith shows where and how, the user does the rotation.
+/// Printed by every `tirith secret` subcommand and echoed in `--help`.
 pub const HONESTY_BANNER: &str =
     "tirith does NOT perform rotation or revocation; it shows you where and how. You do the rotation.";
 
 /// The credential-EXPOSURE audit rule IDs `tirith secret triage` scans for, as
-/// the `snake_case` strings they serialize to in the audit log's `rule_ids`
-/// array (serde `rename_all = "snake_case"` on [`crate::verdict::RuleId`]).
+/// their `snake_case` serialized forms.
 ///
-/// SCOPE: only rules that signal an ACTUAL leaked / exposed secret — for which
-/// "rotate this credential" is the correct playbook. That is the three direct
-/// credential rules (`credential_in_text`, `high_entropy_secret`,
-/// `private_key_exposed`) plus the M11 ch3 `canary_token_touched` rule (a touched
-/// bait token IS a planted secret being read — a strong "rotate now" signal).
-///
-/// Deliberately EXCLUDES the `threat_*package*` reputation rules (malicious /
-/// typosquat / similar-name / suspicious package). Those fire on a package's
-/// NAME / reputation, not on a leaked credential — emitting a "rotate this
-/// credential" next-step for them would be the wrong playbook (there is no secret
-/// to rotate).
+/// SCOPE: only rules signalling an ACTUAL leaked secret (for which "rotate this
+/// credential" is correct) — the three direct credential rules plus
+/// `canary_token_touched`. Deliberately EXCLUDES the `threat_*package*`
+/// reputation rules, which fire on a package name, not a leaked credential.
 pub const CREDENTIAL_RULE_IDS: &[&str] = &[
     "credential_in_text",
     "high_entropy_secret",
@@ -70,14 +40,13 @@ pub fn is_credential_rule(rule_id: &str) -> bool {
     CREDENTIAL_RULE_IDS.contains(&rule_id)
 }
 
-/// The audit `rule_id` for a touched canary (tirith's own synthetic honeytoken).
-/// Kept as a named constant so the triage attribution-suppression and the
-/// canary-specific advice in [`TriageItem::next_step`] stay in lockstep.
+/// The audit `rule_id` for a touched canary (tirith's own honeytoken). A named
+/// constant so the triage suppression and [`TriageItem::next_step`] advice stay
+/// in lockstep.
 pub const CANARY_RULE_ID: &str = "canary_token_touched";
 
 /// `true` when `rule_id` is the canary-touched rule. A canary is tirith's OWN
-/// bait token, not a leaked third-party credential, so triage must not attribute
-/// it to a provider — it gets its own "investigate the bait" next-step instead.
+/// bait token, so triage must not attribute it to a provider.
 pub fn is_canary_rule(rule_id: &str) -> bool {
     rule_id == CANARY_RULE_ID
 }
@@ -87,41 +56,26 @@ pub fn is_canary_rule(rule_id: &str) -> bool {
 pub struct Provider {
     /// The canonical CLI token (`aws`, `github`, …). Lowercase, no spaces.
     pub provider: &'static str,
-    /// The page where the user revokes / regenerates the credential. Printed
-    /// for the user to open themselves — tirith never fetches it.
+    /// The page where the user revokes the credential. Printed, never fetched.
     pub revocation_url: &'static str,
     /// The provider's authoritative rotation / key-management documentation.
     pub doc_url: &'static str,
-    /// Step-by-step manual checklist the user performs. tirith performs NONE of
-    /// these — it only prints them.
+    /// Manual checklist the user performs; tirith only prints these.
     pub manual_checklist: &'static [&'static str],
-    /// Literal key-prefix / shape fragments used by `triage` to attribute a
-    /// leaked-secret finding to this provider (substring match against the
-    /// redacted finding text). Best-effort: a redacted finding may not retain
-    /// enough of the prefix to match, in which case triage falls back to
-    /// generic guidance.
-    ///
-    /// These are VALUE shapes — fragments of the credential itself (`AKIA…`,
-    /// `sk-ant-api…`). They are TIER-1 in [`match_provider`]: a value-shape
-    /// match always beats an [`Provider::env_name_markers`] match (CodeRabbit
-    /// R15 #2), so `OPENAI_API_KEY=[REDACTED] sk-ant-api03-…` routes to
-    /// anthropic on the real prefix, not to openai on the env-var name.
+    /// VALUE-shape fragments of the credential (`AKIA…`, `sk-ant-api…`) used by
+    /// `triage` to attribute a finding. TIER-1 in [`match_provider`]: a value
+    /// shape always beats an [`Provider::env_name_markers`] match (CodeRabbit
+    /// R15 #2), so a real `sk-ant-api` outranks the longer `OPENAI_API_KEY`.
     pub key_prefix_shapes: &'static [&'static str],
-    /// Env-var / config-key NAME markers (e.g. `OPENAI_API_KEY`,
-    /// `aws_secret_access_key`). Substring-matched only as a TIER-2 FALLBACK
-    /// when NO provider's [`Provider::key_prefix_shapes`] matched: a redacted
-    /// record masks the secret VALUE (`OPENAI_API_KEY=[REDACTED]`) but keeps
-    /// the var name, which is enough to attribute when no real shape survives.
-    /// A name marker must never outrank another provider's real value shape
-    /// (these names are longer than `sk-ant-`, so a single-tier longest-match
-    /// would mis-route — hence the separate tier).
+    /// Env-var / config-key NAME markers, matched only as a TIER-2 FALLBACK when
+    /// no value shape matched (a redacted record masks the value but keeps the
+    /// var name). A separate tier so a long name can't outrank a real value shape.
     pub env_name_markers: &'static [&'static str],
     /// The date this entry was last hand-verified (see [`LAST_VERIFIED`]).
     pub last_verified: &'static str,
 }
 
-/// The 11-provider rotation table. Order is the canonical display order used by
-/// `tirith secret rotate <bogus>` when listing valid providers.
+/// The 11-provider rotation table, in canonical display order.
 pub static PROVIDERS: &[Provider] = &[
     Provider {
         provider: "aws",
@@ -136,10 +90,8 @@ pub static PROVIDERS: &[Provider] = &[
             "Review CloudTrail for unauthorized use of the leaked key.",
         ],
         key_prefix_shapes: &["AKIA", "ASIA"],
-        // Config-key NAME markers (the `~/.aws/credentials` INI keys): TIER-2
-        // fallback only, so a redacted `aws_secret_access_key=[REDACTED]` still
-        // routes to aws when no `AKIA…` value survives, without outranking
-        // another provider's real value shape.
+        // `~/.aws/credentials` INI keys: TIER-2 fallback, so a redacted record
+        // still routes to aws when no `AKIA…` value survives.
         env_name_markers: &["aws_access_key_id", "aws_secret_access_key"],
         last_verified: LAST_VERIFIED,
     },
@@ -170,10 +122,9 @@ pub static PROVIDERS: &[Provider] = &[
             "Update ~/.npmrc, CI publish secrets, and any automation.",
             "Audit recently published package versions for unexpected releases.",
         ],
-        // `npm_` is a real token VALUE prefix (tier 1). The `.npmrc` line
-        // `//registry.npmjs.org/:_authToken=` is a config-KEY name, not a value
-        // shape, so it belongs in tier 2 (CodeRabbit R13b) — otherwise it could
-        // out-rank another provider's real prefix in a mixed redacted command.
+        // `npm_` is a real value prefix (tier 1); the `.npmrc` `:_authToken=`
+        // line is a config-KEY name → tier 2 (CodeRabbit R13b), so it can't
+        // out-rank another provider's real prefix.
         key_prefix_shapes: &["npm_"],
         env_name_markers: &["//registry.npmjs.org/:_authToken"],
         last_verified: LAST_VERIFIED,
@@ -204,12 +155,9 @@ pub static PROVIDERS: &[Provider] = &[
             "Update CI publish secrets and ~/.cargo/credentials.toml.",
             "Check your crates' version history for unexpected publishes.",
         ],
-        // NB: crates.io tokens are `cio…`, but the bare 3-char substring "cio"
-        // false-matches common words ("suspicious", "precious", …) and would
-        // mis-route an unrelated leak to crates.io — so there is no value-shape
-        // prefix. cargo is matched only via the explicit `cargo-registry-token`
-        // config KEY, which is a NAME marker → tier 2 (CodeRabbit R13b), not a
-        // value shape, so a real prefix elsewhere in a mixed command wins.
+        // crates.io tokens are `cio…`, but the bare "cio" substring false-matches
+        // common words, so there is no value shape. cargo is matched only via the
+        // `cargo-registry-token` config KEY (NAME marker, tier 2 — CodeRabbit R13b).
         key_prefix_shapes: &[],
         env_name_markers: &["cargo-registry-token"],
         last_verified: LAST_VERIFIED,
@@ -257,13 +205,9 @@ pub static PROVIDERS: &[Provider] = &[
             "Review usage in the dashboard for unexpected spend.",
         ],
         key_prefix_shapes: &["sk-proj-", "sk-svcacct-", "sk-"],
-        // Env-var NAME marker (CodeRabbit R9 #I): a redacted audit record masks
-        // the `sk-…` value (`OPENAI_API_KEY=[REDACTED]` / `[REDACTED:OpenAI API
-        // Key]`), so the `sk-` shape is gone post-mask — but the var name
-        // survives and attributes as a TIER-2 fallback. It is intentionally NOT
-        // a value shape: as a 14-byte fragment it would otherwise longest-match
-        // over anthropic's `sk-ant-api` and steal a real Anthropic key
-        // (CodeRabbit R15 #2). Mirrors aws's `aws_secret_access_key` marker.
+        // TIER-2 NAME marker (CodeRabbit R9 #I, R15 #2): once the `sk-…` value is
+        // masked the var name still attributes. NOT a value shape — at 14 bytes it
+        // would longest-match over anthropic's `sk-ant-api` and steal a real key.
         env_name_markers: &["OPENAI_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
@@ -279,11 +223,8 @@ pub static PROVIDERS: &[Provider] = &[
             "Review usage for unexpected activity.",
         ],
         key_prefix_shapes: &["sk-ant-api", "sk-ant-"],
-        // Env-var NAME marker (CodeRabbit R9 #I): same rationale as openai — the
-        // masked record keeps `ANTHROPIC_API_KEY` even after the `sk-ant-…`
-        // value is redacted. A TIER-2 fallback so it never outranks a real
-        // value shape; the two var-name markers share no substring, so a record
-        // carrying only one routes to exactly the right provider.
+        // TIER-2 NAME marker (CodeRabbit R9 #I): same rationale as openai. The two
+        // var-name markers share no substring, so neither cross-attributes.
         env_name_markers: &["ANTHROPIC_API_KEY"],
         last_verified: LAST_VERIFIED,
     },
@@ -298,22 +239,12 @@ pub static PROVIDERS: &[Provider] = &[
             "Roll the new credential out to every workload before deleting the old.",
             "Review Cloud Audit Logs for use of the leaked credential.",
         ],
-        // NOTE: the generic `-----BEGIN PRIVATE KEY-----` PEM header is
-        // deliberately NOT listed here. It is not GCP-specific (any RSA/EC
-        // service key, SSH key, or unrelated PEM uses it) and would misroute
-        // every bare private key to GCP. We keep only GCP-distinctive shapes:
-        // the `AIza` API-key prefix and the service-account JSON `type` field.
-        //
-        // BOTH the spaced and MINIFIED `type` shapes are listed (CodeRabbit R11
-        // #8): a service-account key file is commonly stored minified (no spaces
-        // after the colon), and the substring scan is literal on spacing — without
-        // the minified form a `{"type":"service_account",...}` record would not
-        // attribute. These are listed in their REAL lowercase form: tier-1 is now
-        // matched case-sensitively (CodeRabbit R13d), and a genuine GCP key file
-        // always uses lowercase JSON keys, so case-sensitive matching catches every
-        // real key while avoiding word-false-matches on short prefixes elsewhere.
-        // The minified shape is longer, so when both match it wins the
-        // longest-match tie-break, still routing to gcp.
+        // The generic PEM private-key header is NOT listed — it is not
+        // GCP-specific and would misroute every bare private key here. Only
+        // GCP-distinctive shapes: the `AIza` prefix and the service-account JSON
+        // `type` field. BOTH spaced and MINIFIED `type` forms are listed
+        // (CodeRabbit R11 #8) since the substring scan is literal on spacing, in
+        // their real lowercase form (tier-1 is case-sensitive — CodeRabbit R13d).
         key_prefix_shapes: &[
             "AIza",
             "\"type\": \"service_account\"",
@@ -339,71 +270,47 @@ pub static PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// Look up a provider by its canonical token (case-insensitive, trimmed).
-/// Returns `None` for an unknown provider so the CLI can print the valid list.
+/// Look up a provider by canonical token (case-insensitive, trimmed); `None`
+/// for an unknown provider.
 pub fn lookup(provider: &str) -> Option<&'static Provider> {
     let needle = provider.trim().to_ascii_lowercase();
     PROVIDERS.iter().find(|p| p.provider == needle)
 }
 
-/// The canonical list of valid provider tokens, in display order. Used by the
-/// CLI's "unknown provider" error and `--help`.
+/// The valid provider tokens, in display order (for the unknown-provider error).
 pub fn provider_names() -> Vec<&'static str> {
     PROVIDERS.iter().map(|p| p.provider).collect()
 }
 
-/// Attribute a leaked-secret `finding_text` (typically the redacted command
-/// from an audit record) to a provider by substring-matching the provider's
-/// shapes. Returns the provider owning the LONGEST matching shape; ties (same
-/// shape length) are broken by [`PROVIDERS`] order. `None` when nothing matches
-/// (the caller then prints generic guidance).
+/// Attribute a leaked-secret `finding_text` to a provider by substring-matching
+/// its shapes. Returns the provider owning the LONGEST matching shape (ties
+/// broken by [`PROVIDERS`] order); `None` when nothing matches.
 ///
-/// **Two tiers (CodeRabbit R15 #2).** A real value-shape match always beats an
-/// env-var-NAME marker:
-///   1. TIER-1 — [`Provider::key_prefix_shapes`] (fragments of the credential
-///      value itself). Longest-match, table-order tie-break.
-///   2. TIER-2 — [`Provider::env_name_markers`] (var/config-key NAMES), tried
-///      ONLY when no tier-1 shape matched anywhere.
+/// Two tiers (CodeRabbit R15 #2): a real value shape always beats an env-var
+/// NAME marker. TIER-1 is [`Provider::key_prefix_shapes`]; TIER-2 is
+/// [`Provider::env_name_markers`], tried only when no tier-1 shape matched.
+/// Without the split, the 14-byte `OPENAI_API_KEY` would longest-match over a
+/// real 10-byte `sk-ant-api` and mis-route. Longest-match (not first) also lets
+/// the specific `sk-ant-api` win over the shared `sk-` family prefix.
 ///
-/// Without the split, the env-var name `OPENAI_API_KEY` (14 bytes) would
-/// longest-match over anthropic's real `sk-ant-api` (10 bytes), so
-/// `OPENAI_API_KEY=[REDACTED] sk-ant-api03-…` would mis-route to openai even
-/// though a real Anthropic prefix is present. Tiering routes that to anthropic
-/// while a LONE `OPENAI_API_KEY=[REDACTED]` (no value shape survives) still
-/// falls through to openai via the marker.
-///
-/// **Longest-match, not first-match (within a tier).** Several providers share
-/// an `sk-` family prefix (OpenAI `sk-`, Anthropic `sk-ant-…`, Stripe
-/// `sk_live_…`). Preferring the longest shape means the more specific
-/// `sk-ant-api` wins over `sk-`, so a key is routed to the right provider.
-///
-/// This is intentionally a cheap substring scan, not a parser: redacted audit
-/// text often keeps a credential's leading prefix (`AKIA…`, `ghp_…`) even after
-/// the body is masked, which is enough to route the user to the right provider.
+/// A cheap substring scan, not a parser: redacted text usually keeps a leading
+/// prefix (`AKIA…`, `ghp_…`), enough to route.
 pub fn match_provider(finding_text: &str) -> Option<&'static Provider> {
-    // Case-insensitive: redacted audit text may upper/lower-case an env-var name
-    // (`AWS_SECRET_ACCESS_KEY=` vs the table's `aws_secret_access_key`), so we
-    // lowercase BOTH the haystack and each shape before comparing. The
-    // longest-match (then table-order) tie-break is preserved — lengths are
-    // unchanged by ASCII-lowercasing, so `sk-ant-api` still beats `sk-`.
     let lower = finding_text.to_ascii_lowercase();
-    // TIER-1: real value shapes, matched CASE-SENSITIVELY against the ORIGINAL
-    // text. A match here wins outright over any marker.
+    // TIER-1: value shapes, case-sensitive against the original text — wins
+    // outright over any marker.
     match_longest(finding_text, |p| p.key_prefix_shapes, true)
-        // TIER-2: env-var/config-key NAME markers, CASE-INSENSITIVE (pre-lowered
-        // haystack + lowered shapes), only when no value shape hit anywhere.
+        // TIER-2: NAME markers, case-insensitive, only when no value shape hit.
         .or_else(|| match_longest(&lower, |p| p.env_name_markers, false))
 }
 
-/// Longest-match (table-order tie-break) of `haystack` against the shape set
-/// `shapes_of(p)` for each provider. Shared by both tiers of [`match_provider`].
+/// Longest-match (table-order tie-break) of `haystack` against `shapes_of(p)`
+/// per provider. Shared by both tiers of [`match_provider`].
 ///
-/// `case_sensitive` (CodeRabbit R13d): TIER-1 value shapes pass `true` and the
-/// ORIGINAL text, so a fixed-case credential prefix (`AKIA`/`ASIA` upper,
-/// `ghp_`/`sk-…`/`"type": "service_account"` lower) cannot be matched by an
-/// ordinary word in the wrong case (e.g. "asia" → AWS `ASIA`). TIER-2 NAME markers
-/// pass `false` AND a pre-lowercased haystack; the shapes are lowered here so an
-/// env-var name in any case (`AWS_SECRET_ACCESS_KEY=`) still attributes.
+/// `case_sensitive` (CodeRabbit R13d): TIER-1 value shapes pass `true` so a
+/// fixed-case prefix can't be matched by an ordinary word in the wrong case
+/// (e.g. "asia" → `ASIA`). TIER-2 markers pass `false` (and a pre-lowered
+/// haystack) so an env-var name in any case still attributes.
 fn match_longest(
     haystack: &str,
     shapes_of: impl Fn(&'static Provider) -> &'static [&'static str],
@@ -426,40 +333,32 @@ fn match_longest(
                 .max()
                 .map(|best| (p, best))
         })
-        // `max_by_key` returns the LAST maximal element; iterating in reverse
-        // makes that the FIRST provider in table order among equal-length ties.
+        // `max_by_key` returns the LAST maximal element; reverse so a tie
+        // resolves to the FIRST provider in table order.
         .rev()
         .max_by_key(|(_, len)| *len)
         .map(|(p, _)| p)
 }
 
-/// One triage line: a credential finding paired with its (optional) attributed
-/// provider and the redacted text that produced it. Pure value — the CLI turns
-/// this into a one-line next-step.
+/// One triage line: a credential finding with its optional attributed provider
+/// and the redacted text that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriageItem {
     /// The audit `rule_id` that fired (e.g. `credential_in_text`).
     pub rule_id: String,
     /// The record's RFC-3339 timestamp, for ordering / display.
     pub timestamp: String,
-    /// The redacted command text from the audit record (already redacted by the
-    /// engine at write time — triage never sees raw secrets).
+    /// The redacted command text (the engine redacts at write time).
     pub redacted: String,
     /// The provider this finding was attributed to, if any shape matched.
     pub provider: Option<&'static Provider>,
 }
 
 impl TriageItem {
-    /// The one-line next-step shown by `tirith secret triage`.
-    ///
-    /// * A touched canary (tirith's own bait token) gets its OWN investigate-the-
-    ///   bait advice — NOT third-party-provider rotation (CodeRabbit R12 #E).
-    ///   Its `provider` is always `None` (suppressed in [`triage_records`]), but
-    ///   we branch on the rule id so a canary never falls through to the generic
-    ///   "name a provider to rotate" line either.
-    /// * Otherwise, when a provider was attributed, point at its revocation URL;
-    ///   else give generic guidance (the user names the provider for
-    ///   `tirith secret rotate <p>`).
+    /// The one-line next-step shown by `tirith secret triage`. A touched canary
+    /// gets its own investigate-the-bait advice, never provider rotation
+    /// (CodeRabbit R12 #E); otherwise point at the attributed revocation URL, or
+    /// generic guidance when none matched.
     pub fn next_step(&self) -> String {
         if is_canary_rule(&self.rule_id) {
             return format!(
@@ -485,42 +384,29 @@ impl TriageItem {
     }
 }
 
-/// Build the triage list from already-loaded audit records.
+/// Build the triage list from already-loaded audit records. Pure and I/O-free
+/// (the CLI reads the audit log and hands records here).
 ///
-/// Pure and I/O-free so it is unit-testable without touching the filesystem:
-/// the CLI is responsible for reading the audit log (via
-/// [`crate::audit::audit_log_path`] + [`crate::audit_aggregator::read_log`])
-/// and handing the records here.
-///
-/// * Keeps only `verdict` entries whose `rule_ids` include at least one
-///   credential-type rule (see [`CREDENTIAL_RULE_IDS`]).
-/// * Emits one [`TriageItem`] per matching `(record, credential-rule)` pair, so
-///   a single command that tripped two credential rules yields two lines.
-/// * `recent` caps the result to the most recent N items (by input order —
-///   callers pass records newest-last or sort beforehand). `0` means no cap.
+/// Keeps only `verdict` entries whose `rule_ids` include a credential-type rule
+/// (see [`CREDENTIAL_RULE_IDS`]), emitting one [`TriageItem`] per matching
+/// `(record, rule)` pair. `recent` caps to the most recent N (input order; `0`
+/// means no cap).
 pub fn triage_records(
     records: &[crate::audit_aggregator::AuditRecord],
     recent: usize,
 ) -> Vec<TriageItem> {
     let mut items: Vec<TriageItem> = Vec::new();
     for r in records {
-        // Only verdict entries carry credential rule_ids; telemetry / trust
-        // entries are skipped (empty entry_type is a legacy "verdict").
+        // Only verdict entries carry credential rule_ids (empty = legacy verdict).
         if !(r.entry_type.is_empty() || r.entry_type == "verdict") {
             continue;
         }
         for rid in &r.rule_ids {
             if is_credential_rule(rid) {
-                // A touched canary is tirith's OWN synthetic honeytoken, not a
-                // real leaked third-party credential — so it must NEVER be
-                // attributed to a provider (CodeRabbit R12 #E). Routing it to
-                // "rotate your AWS/GitHub token at <url>" is the wrong playbook:
-                // there is no third-party secret to rotate. The redacted command
-                // text around a canary touch can coincidentally contain a
-                // provider key-shape, so we suppress attribution explicitly
-                // rather than relying on `match_provider` returning `None`. A
-                // canary item carries its own "investigate the bait" next-step
-                // (see [`TriageItem::next_step`]).
+                // Suppress provider attribution for a canary explicitly
+                // (CodeRabbit R12 #E): the redacted text can coincidentally carry
+                // a provider key-shape, so we don't rely on `match_provider`
+                // returning `None`.
                 let provider = if is_canary_rule(rid) {
                     None
                 } else {
@@ -661,10 +547,8 @@ mod tests {
 
     #[test]
     fn redacted_env_var_names_still_attribute_openai_and_anthropic() {
-        // CodeRabbit R9 #I: triage matches the POST-mask `command_redacted`. Once
-        // the engine masks the value, the `sk-…` shape is gone — but the env-var
-        // NAME survives and must still attribute. (Mirrors aws's
-        // `aws_secret_access_key` marker.)
+        // CodeRabbit R9 #I: triage matches the POST-mask text — the value shape
+        // is gone but the env-var NAME survives and must still attribute.
         assert_eq!(
             match_provider("OPENAI_API_KEY=[REDACTED]").map(|p| p.provider),
             Some("openai"),
@@ -695,14 +579,9 @@ mod tests {
 
     #[test]
     fn real_prefix_outranks_env_var_name_marker() {
-        // CodeRabbit R15 #2 — regression pinning BOTH properties of the two-tier
-        // matcher at once.
-        //
-        // (1) NEW FIX: when a record carries BOTH an env-var NAME marker AND a
-        // real credential prefix, the REAL prefix wins — even though the marker
-        // (`OPENAI_API_KEY`, 14 bytes) is LONGER than the real prefix
-        // (`sk-ant-api`, 10 bytes). A single-tier longest-match would mis-route
-        // this to openai; the value-shape tier must take precedence.
+        // CodeRabbit R15 #2 — pin both two-tier properties.
+        // (1) With BOTH a NAME marker and a real prefix, the real prefix wins
+        // even though the 14-byte marker is longer than the 10-byte `sk-ant-api`.
         assert_eq!(
             match_provider("OPENAI_API_KEY=[REDACTED] sk-ant-api03-xxxx").map(|p| p.provider),
             Some("anthropic"),
@@ -723,9 +602,7 @@ mod tests {
             "a real ghp_ value shape must outrank the aws_secret_access_key marker"
         );
 
-        // (2) PRIOR-ROUND PROPERTY PRESERVED: a LONE env-var-name marker (no
-        // real prefix survives the redaction) still attributes via the tier-2
-        // fallback. This is the round-9/12 behavior the new tiering must keep.
+        // (2) A LONE env-var-name marker still attributes via the tier-2 fallback.
         assert_eq!(
             match_provider("OPENAI_API_KEY=[REDACTED]").map(|p| p.provider),
             Some("openai"),
@@ -745,9 +622,7 @@ mod tests {
 
     #[test]
     fn triage_attributes_masked_openai_env_record() {
-        // End-to-end through `triage_records`: a verdict record whose
-        // `command_redacted` is a MASKED `OPENAI_API_KEY=…` assignment triages to
-        // openai (the rotation next-step points at OpenAI's revocation URL).
+        // End-to-end: a masked `OPENAI_API_KEY=…` verdict triages to openai.
         let rec = verdict(
             "2026-05-01T00:00:00Z",
             &["credential_in_text"],
@@ -764,13 +639,9 @@ mod tests {
 
     #[test]
     fn bare_pem_header_does_not_attribute_to_gcp() {
-        // F4 (Minor): the generic PEM private-key header is not GCP-specific and
-        // must NOT misroute an unrelated private key to gcp.
-        //
-        // CodeRabbit R7 #8: assemble the `-----BEGIN ... PRIVATE KEY-----` header
-        // from fragments at runtime so a contiguous private-key header LITERAL is
-        // not committed (it trips private-key scanners). The reconstructed string
-        // is byte-identical to the header `match_provider` sees in real input.
+        // F4: the generic PEM private-key header must not misroute to gcp.
+        // CodeRabbit R7 #8: assemble the header from fragments at runtime so no
+        // contiguous private-key literal is committed (it trips secret scanners).
         let dashes = "-".repeat(5);
         let pem_header = format!("{dashes}BEGIN PRIVATE KEY{dashes}");
         assert!(
@@ -796,20 +667,16 @@ mod tests {
 
     #[test]
     fn minified_service_account_json_attributes_to_gcp() {
-        // CodeRabbit R11 #8: a MINIFIED service-account record (no spaces after
-        // the colon — the common on-disk shape) must attribute to gcp. The substr
-        // scan is literal on spacing, so the minified shape has to be listed too.
+        // CodeRabbit R11 #8: a MINIFIED service-account record must attribute to
+        // gcp (the substr scan is literal on spacing, so list the minified shape).
         assert_eq!(
             match_provider("{\"type\":\"service_account\",\"project_id\":\"x\"}")
                 .map(|p| p.provider),
             Some("gcp"),
             "a minified service-account JSON must attribute to gcp"
         );
-        // A real GCP key file always uses lowercase JSON keys; tier-1 value shapes
-        // are matched case-sensitively (CodeRabbit R13d), so an artificially
-        // UPPERCASED structural variant (never a real key) does NOT attribute to
-        // gcp via the value shape. GCP has no env-name marker, so it falls through
-        // to None — acceptable, since this is not a real credential.
+        // Tier-1 is case-sensitive (CodeRabbit R13d), so an UPPERCASED variant
+        // (never a real key) does not attribute — gcp has no marker, so None.
         assert_eq!(
             match_provider("{\"TYPE\":\"SERVICE_ACCOUNT\"}").map(|p| p.provider),
             None
@@ -818,9 +685,8 @@ mod tests {
 
     #[test]
     fn env_name_markers_are_case_insensitive() {
-        // F5 (Minor): redacted audit text may upper-case an env-var NAME. An
-        // UPPERCASE `AWS_SECRET_ACCESS_KEY=` (no value shape survives) must still
-        // attribute to aws via the case-insensitive TIER-2 name marker.
+        // F5: an UPPERCASE env-var name (no value shape) still attributes via the
+        // case-insensitive tier-2 marker.
         assert_eq!(
             match_provider("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIexample").map(|p| p.provider),
             Some("aws"),
@@ -831,9 +697,8 @@ mod tests {
             match_provider("NPM_TOKEN env: npm_AbCdEf").map(|p| p.provider),
             Some("npm")
         );
-        // An uppercased `SK-ANT-API03` is NOT a real Anthropic value (those are
-        // lowercase), so tier-1 misses — but the `ANTHROPIC_API_KEY` name marker
-        // (tier-2, case-insensitive) still routes it correctly to anthropic.
+        // An uppercased value misses tier-1, but the `ANTHROPIC_API_KEY` name
+        // marker (tier-2) still routes it to anthropic.
         assert_eq!(
             match_provider("ANTHROPIC_API_KEY=SK-ANT-API03-REDACTED").map(|p| p.provider),
             Some("anthropic"),
@@ -843,10 +708,8 @@ mod tests {
 
     #[test]
     fn tier1_value_shapes_are_case_sensitive_no_word_false_match() {
-        // CodeRabbit R13d: AWS's short alpha prefix `ASIA` (STS) must NOT match the
-        // ordinary word "asia" in unrelated text. Tier-1 is case-sensitive, so a
-        // real `ASIA…`/`AKIA…` (uppercase) attributes while a lowercase word does
-        // not misroute to AWS.
+        // CodeRabbit R13d: case-sensitive tier-1 means the word "asia" must not
+        // match AWS's `ASIA` prefix, while a real uppercase `ASIA…` does.
         assert!(
             match_provider("deploy the service to the asia-pacific region").is_none(),
             "the word 'asia' must not match AWS's `ASIA` value prefix"
@@ -865,10 +728,8 @@ mod tests {
 
     #[test]
     fn match_provider_equal_length_tie_breaks_to_earlier_table_entry() {
-        // The longest-match rule documents that an EQUAL-byte-length shape tie
-        // resolves to the FIRST provider in PROVIDERS order. Pin an actual tie:
-        // aws's `AKIA` and github's `ghp_` are BOTH 4 bytes, and aws precedes
-        // github in the table, so an input matching both must route to aws.
+        // Pin an equal-length tie: aws's `AKIA` and github's `ghp_` are both 4
+        // bytes and aws precedes github, so an input matching both routes to aws.
         assert_eq!("AKIA".len(), "ghp_".len(), "shapes must be equal length");
         let aws_idx = PROVIDERS.iter().position(|p| p.provider == "aws").unwrap();
         let github_idx = PROVIDERS
@@ -880,8 +741,7 @@ mod tests {
             "test assumes aws precedes github in PROVIDERS"
         );
 
-        // Input contains both 4-byte shapes; neither provider has a LONGER shape
-        // matching here, so the best length is 4 for both — a genuine tie.
+        // Both 4-byte shapes match and neither has a longer one — a genuine tie.
         let both = "AKIA0000example ghp_0000example";
         assert_eq!(
             match_provider(both).map(|p| p.provider),
@@ -899,9 +759,8 @@ mod tests {
 
     #[test]
     fn cargo_cio_substring_does_not_false_match() {
-        // Regression (code-reviewer #1): the dropped 3-char "cio" shape matched
-        // inside common words. A benign command containing "suspicious" /
-        // "precious" must NOT route to cargo (crates.io).
+        // Regression (code-reviewer #1): a benign command containing "suspicious"
+        // / "precious" must NOT route to cargo via a "cio" substring.
         assert!(
             match_provider("npm install suspicious-pkg").is_none(),
             "'suspicious' must not route to cargo via a 'cio' substring"
@@ -916,11 +775,8 @@ mod tests {
 
     #[test]
     fn real_value_prefix_outranks_npm_cargo_config_markers() {
-        // CodeRabbit R13b: `//registry.npmjs.org/:_authToken` (npm) and
-        // `cargo-registry-token` (cargo) are config-KEY NAME markers, now in tier 2.
-        // In a mixed redacted command that ALSO carries another provider's real
-        // value prefix, the real prefix (tier 1) must win — previously the long
-        // npm/cargo name marker sat in tier 1 and out-ranked it by length.
+        // CodeRabbit R13b: the npm/cargo config-KEY markers are now tier 2, so in
+        // a mixed command another provider's real value prefix (tier 1) wins.
         assert_eq!(
             match_provider("npmrc //registry.npmjs.org/:_authToken=x and ghp_realleakedtoken")
                 .map(|p| p.provider),
@@ -942,9 +798,8 @@ mod tests {
 
     #[test]
     fn benign_non_credential_command_yields_no_provider() {
-        // pr-test-analyzer #9: a benign command that merely mentions a
-        // credential-shaped WORD (not an actual token) must not attribute a
-        // provider — no false triage routing.
+        // pr-test-analyzer #9: a credential-shaped WORD (not a real token) must
+        // not attribute a provider.
         assert!(match_provider("echo sk_live is my variable name").is_none());
         assert!(match_provider("git commit -m 'add aws docs'").is_none());
     }
@@ -1010,17 +865,14 @@ mod tests {
 
     #[test]
     fn canary_touch_is_not_attributed_to_a_third_party_provider() {
-        // CodeRabbit R12 #E: a touched canary is tirith's OWN bait token, not a
-        // leaked third-party credential. Even when the redacted command text
-        // contains a real provider key-shape (here an AWS `AKIA…` id AND a
-        // GitHub `ghp_…` token), triage must NOT attribute the canary to a
-        // provider, and its next-step must point at canary investigation — never
-        // "rotate your AWS/GitHub credential".
+        // CodeRabbit R12 #E: even when the redacted text carries real provider
+        // key-shapes, a touched canary must NOT attribute to a provider and its
+        // next-step must point at canary investigation.
         let items = triage_records(
             &[verdict(
                 "2026-05-28T10:00:00Z",
                 &["canary_token_touched"],
-                // Deliberately laden with provider shapes match_provider WOULD hit.
+                // Laden with provider shapes match_provider would otherwise hit.
                 "cat ~/.aws/credentials # AKIA... ghp_xxx",
             )],
             0,
@@ -1045,9 +897,8 @@ mod tests {
             "canary next-step must NOT offer third-party-provider rotation, got: {step}"
         );
 
-        // Contrast: a REAL credential rule carrying the same AWS shape IS
-        // attributed to aws (proves the suppression is canary-specific, not a
-        // blanket disable of attribution).
+        // Contrast: a REAL credential rule with the same AWS shape IS attributed
+        // to aws (the suppression is canary-specific, not a blanket disable).
         let real = triage_records(
             &[verdict(
                 "2026-05-28T10:01:00Z",
@@ -1067,9 +918,7 @@ mod tests {
     #[test]
     fn package_risk_findings_are_not_credential_exposure() {
         // CodeRabbit R5 #2: the `threat_*package*` reputation rules fire on a
-        // package NAME / reputation, NOT on a leaked credential. They must be
-        // OUT of the triage (credential-rotation) scope — "rotate this
-        // credential" is the wrong playbook when there is no secret to rotate.
+        // package name, not a leaked credential, so they're out of triage scope.
         for rid in [
             "threat_malicious_package",
             "threat_package_typosquat",

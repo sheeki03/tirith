@@ -1,32 +1,19 @@
 //! `tirith iac guard|check-plan|require-plan-before-apply` (M8 ch3).
 //!
-//! Three actions:
-//!
-//! 1. **`guard on|off|status`** — flips `policy.context_guard_enabled`. M8
-//!    ch3 re-uses the shared M8 ch1 operator switch so the prod-context
-//!    IaC rules (auto-approve-in-prod, destroy-in-prod) silence uniformly
-//!    when the operator turns the guard off. The non-prod rules
-//!    (auto-approve outside prod, apply-without-plan, hash-mismatch) still
-//!    fire — they are tool-only, not context-dependent.
-//!
-//! 2. **`check-plan <tfplan>`** — read a saved Terraform / Pulumi / OpenTofu
-//!    plan file, parse it via `terraform show -json` (for Terraform binary
-//!    plans) or `serde_json::from_slice` (for Pulumi JSON plans), record
-//!    its SHA-256 in `state_dir()/iac_plans/`, and report
-//!    create / update / destroy counts plus IAM / SG / public-bucket flags.
-//!
-//! 3. **`require-plan-before-apply on|off|status`** — flips
-//!    `policy.iac_require_plan_before_apply`. When on, the engine's
-//!    `IacApplyWithoutPlan` and `IacPlanHashMismatch` rules enforce the
-//!    plan-before-apply gate.
+//! * `guard on|off|status` — flips `policy.context_guard_enabled` (the shared
+//!   M8 ch1 operator switch). The non-prod IaC rules stay tool-only.
+//! * `check-plan <tfplan>` — parse a saved Terraform/Pulumi/OpenTofu plan,
+//!   record its SHA-256 in `state_dir()/iac_plans/`, and report change counts
+//!   plus IAM/SG/public-bucket flags.
+//! * `require-plan-before-apply on|off|status` — flips
+//!   `policy.iac_require_plan_before_apply` (drives `IacApplyWithoutPlan` /
+//!   `IacPlanHashMismatch`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tirith_core::iac_plan::{self, PlanSummary, PlanTool};
 use tirith_core::policy::{self as policy_mod, Policy};
-
-// ─── guard ─────────────────────────────────────────────────────────────────
 
 /// `tirith iac guard on|off|status` — flip the shared operational-context
 /// switch.
@@ -98,8 +85,6 @@ fn guard_status(json: bool) -> i32 {
     }
     0
 }
-
-// ─── require-plan-before-apply ─────────────────────────────────────────────
 
 /// `tirith iac require-plan-before-apply on|off|status`.
 pub fn require_plan_before_apply(action: &str, json: bool) -> i32 {
@@ -177,19 +162,14 @@ fn require_plan_status(json: bool) -> i32 {
     0
 }
 
-// ─── check-plan ────────────────────────────────────────────────────────────
-
 /// `tirith iac check-plan <tfplan> [--tool terraform|pulumi|tofu]` —
 /// parse a saved plan, record its SHA-256 in `state_dir()/iac_plans/`,
 /// and print the change summary.
 pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i32 {
-    // Purge old plans best-effort. Failures are silent.
     let purged = iac_plan::purge_old_plans();
 
-    // Cap the read at `MAX_PLAN_SIZE_BYTES` (32 MiB). A plan file
-    // symlinked to /dev/zero or a maliciously oversized JSON would
-    // otherwise OOM the CLI before the parse step's own timeout fires
-    // (PR-127 review #10).
+    // Cap the read at MAX_PLAN_SIZE_BYTES (32 MiB) so a symlink-to-/dev/zero or
+    // oversized JSON can't OOM the CLI before parsing (PR-127 review #10).
     match std::fs::metadata(plan_path) {
         Ok(md) if md.len() > iac_plan::MAX_PLAN_SIZE_BYTES => {
             eprintln!(
@@ -214,8 +194,7 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
         }
     };
     if bytes.len() as u64 > iac_plan::MAX_PLAN_SIZE_BYTES {
-        // metadata() may have lied (symlink, /dev/zero, fifo) — double
-        // check after the read and refuse to parse.
+        // metadata() may have lied (symlink, /dev/zero, fifo) — re-check post-read.
         eprintln!(
             "tirith iac check-plan: read {} bytes from {}; cap is {} bytes ({} MiB). Refusing to parse.",
             bytes.len(),
@@ -242,8 +221,8 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
         iac_plan::detect_plan_tool(plan_path)
     };
 
-    // Decide JSON vs binary: pulumi plans are already JSON, terraform's
-    // binary plan needs a shell-out to `terraform show -json <plan>`.
+    // Pulumi plans are already JSON; terraform's binary plan needs a shell-out
+    // to `terraform show -json <plan>`.
     let plan_json: Vec<u8> = if iac_plan::looks_like_json(&bytes) {
         bytes.clone()
     } else {
@@ -273,9 +252,8 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
         }
     };
 
-    // Record the hash from the ORIGINAL plan-file bytes (what the engine
-    // will hash at apply-time), not the JSON rendering — those are not
-    // byte-identical for terraform binary plans.
+    // Hash the ORIGINAL plan-file bytes (what the engine hashes at apply-time),
+    // not the JSON rendering — they differ for terraform binary plans.
     let sha = match iac_plan::record_plan_hash(&bytes, plan_path, &summary) {
         Ok(h) => h,
         Err(e) => {
@@ -347,8 +325,6 @@ fn emit_check_plan_json(plan_path: &Path, sha: &str, summary: &PlanSummary, purg
     }
     0
 }
-
-// ─── shared helpers ────────────────────────────────────────────────────────
 
 fn resolve_policy_path() -> Result<PathBuf, i32> {
     if let Some(existing) = policy_mod::discover_local_policy_path(None) {
@@ -437,7 +413,7 @@ mod tests {
 
     #[test]
     fn update_policy_key_distinct_keys_dont_collide() {
-        // Verify prefix-matching uses `key:` not just `key`.
+        // Prefix-matching must use `key:`, not just `key`.
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(

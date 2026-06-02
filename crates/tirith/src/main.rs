@@ -420,12 +420,8 @@ Examples:
   tirith explain --rule curl_pipe_shell --fix
   tirith explain --finding evt-abc:0
   tirith explain --list --category terminal",
-        // `--rule`, `--list`, and `--finding` are three mutually exclusive
-        // selectors. `--fix` needs at least one of `--rule`/`--finding`
-        // (set as `requires` on the flag) and conflicts with `--list`. The
-        // ArgGroup carries the exact-one-of semantics for `--rule` /
-        // `--finding` so a stale `--rule X --finding Y` invocation surfaces
-        // a clear usage error rather than silently picking one.
+        // ArgGroup gives `--rule`/`--finding` exact-one-of semantics; `--fix`
+        // requires one of them and conflicts with `--list`.
         group = clap::ArgGroup::new("explain_target")
             .args(["rule", "finding"])
             .multiple(false)
@@ -537,12 +533,8 @@ Examples:
   tirith onboard --json
   tirith onboard --ai-agent-heavy
   tirith onboard --apply",
-        // `--repo`, `--team`, and `--ai-agent-heavy` are three mutually
-        // exclusive mode biases, modeled the way `Explain` models its
-        // mutually-exclusive selectors: separate bool flags carried by an
-        // ArgGroup (multiple=false) so a stale `--repo --team` invocation
-        // surfaces a clear usage error. They collapse to one `mode` string
-        // before reaching `cli::onboard::run`.
+        // ArgGroup (multiple=false) makes --repo/--team/--ai-agent-heavy
+        // mutually exclusive; they collapse to one `mode` string downstream.
         group = clap::ArgGroup::new("onboard_mode")
             .args(["repo", "team", "ai_agent_heavy"])
             .multiple(false)
@@ -2328,10 +2320,8 @@ Examples:
     },
 
     /// Create, sign, and verify signed command cards (M11 ch1)
-    // The help text is platform-split: `command-card fetch` is `#[cfg(unix)]`
-    // (it reuses the unix-only hardened downloader), so the Windows help must
-    // NOT advertise a `fetch` subcommand that does not exist there — it instead
-    // tells the user to download the card to a local file manually.
+    // Help text is platform-split: `fetch` is `#[cfg(unix)]`, so the Windows
+    // help must not advertise a subcommand that does not exist there.
     #[cfg_attr(
         unix,
         command(after_help = "\
@@ -3348,10 +3338,7 @@ Examples:
   tirith command-card fetch https://example.com/install-card.json
   CARD=$(tirith command-card fetch https://example.com/install-card.json)
   tirith check --card \"$CARD\" -- 'curl -fsSL https://example.com/install.sh | sh'")]
-    // Unix-only: reuses the hardened `runner::download_to_path` (the same path
-    // `tirith run`/`tirith fetch` use), which is `#[cfg(unix)]` in v1. On
-    // Windows `create`/`sign`/`verify` stay available; copy a card to
-    // `~/.cache/tirith/cards/` manually.
+    // Unix-only: reuses the `#[cfg(unix)]` hardened `runner::download_to_path`.
     #[cfg(unix)]
     Fetch {
         /// URL of the card to download.
@@ -6300,9 +6287,7 @@ fn main() {
         .spawn(run)
         .expect("failed to spawn tirith main thread");
     if handle.join().is_err() {
-        // `run` panicked; the panic hook already reported it. Exit with the
-        // conventional panic code rather than re-panicking (which would print
-        // a second, confusing panic message).
+        // `run` panicked (hook already reported it); exit 101 without re-panicking.
         std::process::exit(101);
     }
 }
@@ -6339,9 +6324,8 @@ fn run() {
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            // `shell_join` (not `cmd.join(" ")`): preserve argv word boundaries so a
-            // multi-word arg can't be re-split into separate tokens/commands and
-            // skew the engine verdict (CodeRabbit R13c, sibling of `commands check`).
+            // `shell_join` preserves argv word boundaries so a multi-word arg
+            // can't be re-split and skew the verdict (CodeRabbit R13c).
             cli::check::run(
                 &cli::shell_join(&cmd),
                 &shell,
@@ -6413,10 +6397,8 @@ fn run() {
             json,
         } => {
             let (_, want_json) = HumanJsonFormat::resolve(format, json);
-            // Gate interactivity on BOTH stdout (so we don't write prompts
-            // into a pipe / log file) AND stdin (so we don't block reading
-            // from a closed/redirected stdin and "select interactive then
-            // terminate immediately"). The lab loop reads stdin per scenario.
+            // Gate interactivity on both stdout (don't write prompts into a
+            // pipe) and stdin (don't block on a closed/redirected stdin).
             let interactive = !non_interactive
                 && !want_json
                 && is_terminal::is_terminal(std::io::stdout())
@@ -6910,9 +6892,7 @@ fn run() {
             prompt_status,
         } => cli::init::run(shell.as_deref(), prompt_status),
 
-        // M13 ch1 — onboarding wizard. The three mutually-exclusive mode flags
-        // (enforced as an ArgGroup) collapse to a single `mode` string; `None`
-        // means auto-detect.
+        // The mutually-exclusive mode flags collapse to one `mode` string; `None` = auto-detect.
         Commands::Onboard {
             repo,
             team,
@@ -6932,8 +6912,6 @@ fn run() {
             cli::onboard::run(mode, apply, json)
         }
 
-        // M13 ch3 — local security dashboard. `export` writes a self-contained
-        // HTML report; `serve` runs a loopback-only token-guarded HTTP server.
         Commands::Dashboard { action } => match action {
             DashboardAction::Export { out, json } => cli::dashboard::export(out.as_deref(), json),
             DashboardAction::Serve { port, json } => cli::dashboard::serve(port, json),
@@ -7146,9 +7124,7 @@ fn run() {
             out,
             json,
         } => {
-            // The value_parser already constrained `target` to the
-            // accepted set; parse_audience is infallible here but we
-            // surface a clear error if something slips through.
+            // value_parser already constrained `target`; this is defensive.
             let audience = match cli::share::parse_audience(&target) {
                 Ok(a) => a,
                 Err(msg) => {
@@ -7666,11 +7642,8 @@ fn run() {
             }
         },
 
-        // M11 ch2 — repo command manifest (`tirith commands ...`). The enum
-        // variant is `RepoCmd` (not `RepoCommands` — clippy's
-        // `enum_variant_names` rejects a variant ending in the enum name
-        // `Commands`); the CLI word is `commands` via
-        // `#[command(name = "commands")]`.
+        // Variant is `RepoCmd` (clippy `enum_variant_names` rejects a variant
+        // ending in `Commands`); the CLI word is `commands` via `#[command(name)]`.
         Commands::RepoCmd { action } => match action {
             RepoCommandsAction::Init {
                 force,
@@ -7695,14 +7668,12 @@ fn run() {
                 cmd,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                // `shell_join` (not `cmd.join(" ")`): preserve argv word
-                // boundaries so a multi-word arg cannot be re-split into separate
-                // tokens/commands and skew the engine verdict (CodeRabbit R13b).
+                // `shell_join` preserves argv word boundaries so a multi-word
+                // arg can't be re-split and skew the verdict (CodeRabbit R13b).
                 cli::commands::check(&cli::shell_join(&cmd), &shell, json)
             }
         },
 
-        // M11 ch3 — honeytoken / canary (`tirith canary ...`).
         Commands::Ai { action } => match action {
             AiAction::Scan { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -7769,8 +7740,7 @@ fn run() {
             }
         },
 
-        // M11 ch4 — secret-rotation ASSISTANT (`tirith secret ...`). Guidance
-        // only: 0 network calls, no new RuleIds. tirith does NOT rotate.
+        // Guidance only: 0 network calls, no new RuleIds; tirith does NOT rotate.
         Commands::Secret { action } => match action {
             SecretAction::Triage {
                 verbose,
@@ -7800,7 +7770,6 @@ fn run() {
             }
         },
 
-        // M11 ch5 — incident mode (fail-closed + rule elevation + report).
         Commands::Incident { action } => match action {
             IncidentAction::Start {
                 reason,
@@ -7824,15 +7793,12 @@ fn run() {
             }
         },
 
-        // M12 ch2 — local terminal/font confusability self-audit. CLI-only; no
-        // new RuleId. `--non-interactive --pairs critical` is headless-CI safe.
         Commands::VisualAudit {
             non_interactive,
             pairs,
             json,
         } => cli::visual_audit::run(non_interactive, pairs, json),
 
-        // M12 ch3 — browser companion: native-messaging host + manifest install.
         Commands::Browser { action } => match action {
             BrowserAction::Host => cli::browser_host::run(),
             BrowserAction::InstallExtension {
@@ -7842,9 +7808,7 @@ fn run() {
                 json,
             } => match browser.parse::<cli::browser::Browser>() {
                 Ok(browser) => cli::browser::install_extension(extension_id, browser, apply, json),
-                // An invalid `--browser` value is an argument-validation (usage)
-                // error → exit 2, consistent with the other CLI validation paths
-                // (e.g. `share` / `redact` audience parsing), not a runtime failure.
+                // Invalid `--browser` is a usage error → exit 2 (like share/redact).
                 Err(e) => {
                     eprintln!("tirith browser install-extension: {e}");
                     2

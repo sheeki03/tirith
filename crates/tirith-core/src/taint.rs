@@ -1,52 +1,25 @@
 //! M10 ch3 — tainted-content tracking.
 //!
-//! A *taint* records that a file on disk was written from a risky source (a
-//! download from an untrusted URL, an `install <url>` payload kept on disk). The
-//! mark persists in a JSONL store at `state_dir()/taint.jsonl` so a later
-//! `bash ./install.sh` against the same path can fire
-//! [`crate::verdict::RuleId::ExecOfTaintedFile`], and a `source ./tainted.sh`
-//! can fire [`crate::verdict::RuleId::CommandSourcedFromTaintedFile`].
+//! A *taint* records that a file was written from a risky source (a download
+//! from an untrusted URL, an `install <url>` payload). The mark persists in a
+//! JSONL store at `state_dir()/taint.jsonl` so a later `bash ./install.sh` fires
+//! [`crate::verdict::RuleId::ExecOfTaintedFile`] and `source ./tainted.sh` fires
+//! [`crate::verdict::RuleId::CommandSourcedFromTaintedFile`].
 //!
-//! # Path-key vs inode (documented limitation)
-//!
-//! The store is **path-keyed**, not inode-keyed. The key is the absolute,
-//! lexically-normalized path of the file. This means `mv ./install.sh
-//! ./run.sh` LOSES the mark — the new path has no entry. This is a deliberate
-//! v1 simplification: inode tracking is fragile across filesystems, bind
-//! mounts, and editors that write-rename on save, and the threat model (run a
-//! freshly-downloaded installer) is dominated by the direct
-//! `download → execute-by-the-same-path` flow. A `mv`-then-execute evasion is
-//! out of v1 scope and noted here so a future inode-aware backend is an
-//! informed change, not a surprise.
-//!
-//! # Backend choice (documented)
-//!
-//! JSONL for v1: one `{path, origin, marked_at, source_url, source_repo}`
-//! object per line, appended on `mark`, rewritten on `clear`. This is simple,
-//! human-inspectable, and fast enough while the store holds the handful of
-//! files a workstation downloads-and-keeps. If a future workload makes the
-//! linear scan a bottleneck (thousands of marks), migrate to SQLite — the
-//! public API here (`mark_tainted` / `is_tainted` / `list_taints` /
-//! `clear_taint`) is the migration boundary and would not change.
-//!
-//! # Hot-path cost
-//!
-//! [`is_tainted`] is called once per exec-leader on the `engine::analyze` hot
-//! path. To keep that cheap it is backed by a per-process cache (load once,
-//! 5-second TTL, invalidated on store mtime change). When the store is absent
-//! or empty the lookup is a near-noop: a single `metadata()` stat that resolves
-//! to an empty map, then an `O(1)` map miss. The engine additionally only
-//! forces past its tier-1 fast-exit for the taint check when the store is
-//! non-empty (see `engine::taint_store_nonempty`), so a machine that has never
-//! run `tirith fetch --save` pays nothing.
-//!
-//! # Auto-clear policy (documented)
-//!
-//! A taint is NEVER auto-cleared. Specifically, `chmod +x ./install.sh` and a
-//! `bash -n ./install.sh` (syntax-only parse check) do NOT clear the mark — the
-//! file's provenance does not change because you made it executable or parsed
-//! it. The mark persists until an explicit [`clear_taint`] (the
-//! `tirith taint clear <file>` command).
+//! Limitations / design (v1):
+//! * **Path-keyed, not inode-keyed** — the key is the absolute, lexically-
+//!   normalized path, so `mv ./install.sh ./run.sh` LOSES the mark. Inode
+//!   tracking is fragile across filesystems / write-rename editors and the
+//!   threat model is dominated by `download → execute-by-the-same-path`.
+//! * **JSONL backend** — one object per line; the public API
+//!   (`mark_tainted` / `is_tainted` / `list_taints` / `clear_taint`) is the
+//!   migration boundary if a future workload needs SQLite.
+//! * **Hot-path cost** — [`is_tainted`] runs once per exec-leader, backed by a
+//!   per-process cache (5s TTL, mtime-invalidated). The engine only forces past
+//!   tier-1 for the taint check when the store is non-empty, so a machine that
+//!   never ran `tirith fetch --save` pays nothing.
+//! * **Never auto-cleared** — `chmod +x` / `bash -n` do NOT clear a mark; only
+//!   an explicit [`clear_taint`] (`tirith taint clear <file>`) does.
 
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -80,14 +53,10 @@ pub fn store_path() -> Option<PathBuf> {
     crate::policy::state_dir().map(|d| d.join("taint.jsonl"))
 }
 
-/// Lexically normalize a path to an absolute key WITHOUT touching the
-/// filesystem (no `canonicalize` — the file may not exist yet at `mark` time,
-/// and we must produce the SAME key the exec-leader lookup will compute).
-///
-/// Resolves `.` and `..` components lexically and prefixes a relative path with
-/// `cwd` (falling back to the process cwd). Symlinks are NOT resolved — a
-/// path-keyed store keys on the path the user typed, normalized, which is what
-/// both the `mark` and the `is_tainted` sides see.
+/// Lexically normalize a path to an absolute key WITHOUT touching the filesystem
+/// (no `canonicalize` — the file may not exist yet at `mark` time, and both
+/// `mark` and `is_tainted` must compute the SAME key). Resolves `.`/`..`,
+/// prefixes relative paths with `cwd` (else process cwd); symlinks NOT resolved.
 pub fn normalize_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
     let base: PathBuf = if path.is_absolute() {
         PathBuf::new()
@@ -105,16 +74,13 @@ pub fn normalize_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
                 out.pop();
             }
             Component::Prefix(p) => {
-                // Drive/UNC prefix on Windows is always the first component of
-                // an absolute path; seed `out` with it. (No-op on Unix.)
+                // Windows drive/UNC prefix seeds `out` (no-op on Unix).
                 out = PathBuf::from(p.as_os_str());
             }
             Component::RootDir => {
-                // Append the root anchor to whatever prefix `out` already holds,
-                // rather than replacing it: on Windows `C:` + `\` must stay
-                // `C:\` (replacing it would drop the drive and collide across
-                // drives); on Unix this turns an empty `out` into `/`. This is
-                // cargo's canonical `normalize_path` ordering.
+                // Append (not replace) the root anchor so Windows `C:` + `\`
+                // stays `C:\`; on Unix this turns empty `out` into `/`. Matches
+                // cargo's `normalize_path` ordering.
                 out.push(comp.as_os_str());
             }
             Component::Normal(seg) => out.push(seg),
@@ -127,14 +93,12 @@ pub fn normalize_key(path: &Path, cwd: Option<&Path>) -> PathBuf {
 struct CacheState {
     path: PathBuf,
     entries: Vec<TaintEntry>,
-    /// Whether the underlying store read reached EOF cleanly. `false` means the
-    /// read broke on a persistent mid-file I/O fault (or the store was present
-    /// but unreadable) so `entries` is a PARTIAL prefix — a lookup miss against
-    /// it is NOT a definitive "not tainted" (CodeRabbit R16 #3, fail-safe).
+    /// `false` when the read did not reach EOF (mid-file I/O fault or unreadable
+    /// store), so `entries` is a PARTIAL prefix — a miss is NOT "not tainted"
+    /// (CodeRabbit R16 #3, fail-safe).
     complete: bool,
     loaded_at: Instant,
-    /// `(present, mtime_nanos)` of the store file at load time, for invalidation.
-    /// `present` is tracked separately from `mtime_nanos` so an absent store and a
+    /// `present` is tracked apart from `mtime_nanos` so an absent store and a
     /// present-but-unstattable one are never conflated (see [`stat_signature`]).
     existed: bool,
     mtime_nanos: u128,
@@ -146,15 +110,10 @@ const CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Cache-invalidation stat for the store path: `(present, mtime_nanos)`.
 ///
-/// FAIL-SAFE + symlink-aware (CodeRabbit R13b), mirroring `incident::mtime_nanos`.
-/// Uses `symlink_metadata` (lstat) so a symlink planted at the path is seen as a
-/// present entry rather than followed, and maps ONLY a genuine `NotFound` to
-/// absent `(false, 0)`. Every OTHER stat error (permission, I/O, unstattable
-/// parent) maps to present `(true, 0)` so it cannot be confused with the cached
-/// "absent" snapshot and silently reused: it busts the cache, forcing a re-read
-/// that [`read_store_lines_complete`](crate::util::read_store_lines_complete)
-/// reports as incomplete for a present-but-unreadable file → [`is_tainted_at`]
-/// fails safe (UNKNOWN), per the absent-vs-unreadable contract on `complete`.
+/// FAIL-SAFE + symlink-aware (CodeRabbit R13b): `symlink_metadata` (lstat) so a
+/// planted symlink reads as present, and ONLY a genuine `NotFound` maps to absent
+/// `(false, 0)`. Every other stat error maps to present `(true, 0)` so it busts
+/// the cache and forces a re-read that fails safe via [`is_tainted_at`].
 fn stat_signature(path: &Path) -> (bool, u128) {
     match std::fs::symlink_metadata(path) {
         Ok(m) => {
@@ -171,22 +130,12 @@ fn stat_signature(path: &Path) -> (bool, u128) {
     }
 }
 
-/// Parse the JSONL store, skipping blank and unparseable lines (fail-open: a
-/// corrupt line never aborts the lookup). Returns `(entries, complete)`.
-///
-/// `complete == false` means the underlying read did NOT reach EOF (a persistent
-/// mid-file I/O fault left the tail unread, or the store is present-but-unreadable)
-/// so `entries` is a PARTIAL prefix. A skipped invalid-UTF-8 line is NOT a
-/// truncation — the file is still read to EOF and `complete` stays `true`. A
-/// genuinely-absent store is empty AND complete. The lookup side
-/// ([`is_tainted_at`]) treats an incomplete read as fail-SAFE (CodeRabbit R16 #3):
-/// a miss against a partial prefix is "unknown", not "clean".
+/// Parse the JSONL store, skipping blank/unparseable lines (fail-open). Returns
+/// `(entries, complete)`. `complete == false` means the read did NOT reach EOF
+/// (a partial prefix); a skipped invalid-UTF-8 line is NOT a truncation and keeps
+/// `complete == true`. [`is_tainted_at`] fails safe on an incomplete read
+/// (CodeRabbit R16 #3): a miss against a partial prefix is "unknown", not "clean".
 fn parse_store(path: &Path) -> (Vec<TaintEntry>, bool) {
-    // `read_store_lines_complete` skips blank lines, skips a single recoverable
-    // invalid-UTF-8 line (so a corrupt byte does not abort the lookup), and
-    // BREAKS on any other (persistent) read error — reporting `complete == false`
-    // — so the reader cannot spin forever and a truncated read is observable.
-    // Lines that don't parse as a `TaintEntry` are dropped (fail-open).
     let (lines, complete) = crate::util::read_store_lines_complete(path);
     let entries = lines
         .iter()
@@ -195,10 +144,9 @@ fn parse_store(path: &Path) -> (Vec<TaintEntry>, bool) {
     (entries, complete)
 }
 
-/// Load entries through the per-process cache. Reloads when the cached path
-/// differs, the TTL expired, or the store's mtime changed. Returns
-/// `(entries, complete)` — `complete == false` flags a partial/truncated read so
-/// the lookup can fail safe (CodeRabbit R16 #3).
+/// Load entries through the per-process cache (reloads on path change, TTL
+/// expiry, or mtime change). `complete == false` flags a partial read so the
+/// lookup can fail safe (CodeRabbit R16 #3).
 fn cached_entries(path: &Path) -> (Vec<TaintEntry>, bool) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
@@ -226,19 +174,16 @@ fn cached_entries(path: &Path) -> (Vec<TaintEntry>, bool) {
     (entries, complete)
 }
 
-/// Drop the per-process cache. Tests that write a store directly then assert via
-/// the default-path API call this so a stale earlier load is not reused. The
-/// engine never needs it (mtime + TTL invalidation cover the real flow).
+/// Drop the per-process cache. Tests that write a store directly call this; the
+/// engine relies on mtime + TTL invalidation instead.
 pub fn invalidate_cache() {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
-/// Append `entry` to the JSONL store at `store`, creating parent dirs and the
-/// file (`0600` on Unix) as needed. If a prior entry for the same path exists it
-/// is left in place — `is_tainted` returns the LAST matching entry, so an append
-/// is an effective update. (A periodic compaction is unnecessary for the v1
-/// workload; `clear` rewrites the whole file.)
+/// Append `entry` to the JSONL store (creating parent dirs + the `0600` file).
+/// A prior entry for the same path is left in place — `is_tainted` returns the
+/// LAST match, so an append is an effective update.
 fn append_entry(store: &Path, entry: &TaintEntry) -> std::io::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
@@ -257,10 +202,7 @@ fn append_entry(store: &Path, entry: &TaintEntry) -> std::io::Result<()> {
 }
 
 /// Mark `path` tainted in the store at `store`. `cwd` controls relative-path
-/// normalization (tests pass an explicit cwd; production passes `None` to use
-/// the process cwd). The recorded `path` is the normalized absolute key.
-///
-/// Returns the recorded [`TaintEntry`].
+/// normalization (`None` = process cwd). Returns the recorded [`TaintEntry`].
 pub fn mark_tainted_at(
     store: &Path,
     path: &Path,
@@ -282,9 +224,7 @@ pub fn mark_tainted_at(
     Ok(entry)
 }
 
-/// Production entry point: mark `path` tainted in the default store
-/// (`state_dir()/taint.jsonl`), normalizing relative paths against the process
-/// cwd.
+/// Production entry point: mark `path` tainted in the default store.
 pub fn mark_tainted(
     path: &Path,
     origin: impl Into<String>,
@@ -300,28 +240,21 @@ pub fn mark_tainted(
     mark_tainted_at(&store, path, None, origin, source_url, source_repo)
 }
 
-/// Origin label stamped on the synthetic [`TaintEntry`] returned when the store
-/// could not be read to completion and the queried path was NOT found in the
-/// partial prefix. Makes the fail-safe "treated as tainted because the store is
-/// unreadable" reason obvious in a `tirith why` / finding detail.
+/// Origin label on the synthetic [`TaintEntry`] returned when the store could
+/// not be read completely and the queried path was absent from the prefix.
 pub const UNKNOWN_TAINT_ORIGIN: &str =
     "taint store could not be read completely — treated as tainted (fail-safe)";
 
-/// Look up `path` in the store at `store` (cached). Returns the LAST recorded
-/// entry for the normalized key, or `None` if the path is not tainted. `cwd`
-/// controls relative-path normalization.
+/// Look up `path` in the store (cached). Returns the LAST entry for the
+/// normalized key, or `None` if not tainted. `cwd` controls normalization.
 ///
-/// FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3): the store read can stop on
-/// a persistent mid-file I/O fault and yield only the PREFIX it consumed. A query
-/// for a path in the UNREAD tail would then miss and read as "not tainted"
-/// (fail-OPEN — a security miss). So when the read was INCOMPLETE and the key is
-/// not present in the prefix, we do NOT answer a definitive `None`: we emit a
-/// one-line stderr diagnostic and return a synthetic entry (`origin =
-/// [`UNKNOWN_TAINT_ORIGIN`]`) so the security check errs toward "tainted/unknown".
-/// A definite HIT in the prefix is returned as-is (it is genuinely tainted). A
-/// COMPLETE read (the common path — including one that skipped a recoverable
-/// invalid-UTF-8 line) keeps the exact prior semantics: a miss is a clean `None`.
-/// An InvalidData line skip is NOT a truncation, so it never trips this path.
+/// FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3): an incomplete read yields
+/// only a PREFIX, so a miss for a path in the unread tail would read "not
+/// tainted" (fail-OPEN). When the read was INCOMPLETE and the key is absent we
+/// return a synthetic [`UNKNOWN_TAINT_ORIGIN`] entry (not `None`) plus a stderr
+/// diagnostic, so the check errs toward "tainted". A hit is returned as-is; a
+/// COMPLETE read (incl. one that skipped a recoverable invalid-UTF-8 line) keeps
+/// the prior semantics — a miss is a clean `None`.
 pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<TaintEntry> {
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy();
@@ -330,10 +263,8 @@ pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<Ta
         return Some(found);
     }
     if !complete {
-        // Truncated/unreadable store + a lookup miss → the path's taint state is
-        // UNKNOWN, not proven-clean. Fail safe: surface a synthetic tainted entry
-        // so the rule fires, and warn once (rate-limited per (path, mtime)) so the
-        // operator knows why a never-marked path is being flagged.
+        // Incomplete read + miss → taint state UNKNOWN, not proven-clean: fail
+        // safe with a synthetic entry and warn once (rate-limited).
         warn_incomplete_store_once(store);
         return Some(unknown_taint_entry(&key_str));
     }
@@ -341,8 +272,7 @@ pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<Ta
 }
 
 /// Synthetic [`TaintEntry`] for the fail-safe "store unreadable, taint unknown"
-/// case. Carries the queried `path` and a clearly-labelled origin so the
-/// downstream finding explains itself; no `source_url`/`source_repo`.
+/// case: the queried `path` plus a labelled origin, no source fields.
 fn unknown_taint_entry(path: &str) -> TaintEntry {
     TaintEntry {
         path: path.to_string(),
@@ -353,10 +283,9 @@ fn unknown_taint_entry(path: &str) -> TaintEntry {
     }
 }
 
-/// One-line stderr diagnostic when a taint lookup runs against an INCOMPLETELY
-/// read store, de-duplicated per `(path, mtime)` so the 5s-cache hot path does
-/// not spam. The lookup result is still fail-safe regardless; this just tells the
-/// operator why an unmarked path is being treated as tainted.
+/// Stderr diagnostic when a lookup runs against an INCOMPLETELY read store,
+/// de-duplicated per `(path, mtime)`. The result is fail-safe regardless; this
+/// just tells the operator why an unmarked path is being flagged.
 fn warn_incomplete_store_once(store: &Path) {
     static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
     let mtime = stat_signature(store).1;
@@ -366,8 +295,7 @@ fn warn_incomplete_store_once(store: &Path) {
         return;
     }
     *guard = Some(key);
-    // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
-    // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+    // Write fallibly so a closed stderr cannot panic this helper (CodeRabbit R22 #4).
     let _ = writeln!(
         std::io::stderr(),
         "tirith: warning: taint store {} could not be read completely; \
@@ -376,15 +304,10 @@ fn warn_incomplete_store_once(store: &Path) {
     );
 }
 
-/// One-line stderr diagnostic when `list_taints_at` builds its output from an
-/// INCOMPLETELY read store (CodeRabbit R18 #5), de-duplicated per `(path, mtime)`
-/// so a repeated `tirith taint list` against the same broken store does not spam.
-///
-/// The wording is LIST-specific (the list may be truncated) — distinct from the
-/// lookup path's "treated as tainted (fail-safe)" message, which would be
-/// misleading here (`list` synthesizes nothing; it just shows the partial
-/// prefix). A separate rate-limit static from [`warn_incomplete_store_once`] so a
-/// prior lookup warning never suppresses this display warning (and vice versa).
+/// Stderr diagnostic when `list_taints_at` builds output from an INCOMPLETELY
+/// read store (CodeRabbit R18 #5), de-duplicated per `(path, mtime)`. The wording
+/// is LIST-specific (may be truncated) and uses a SEPARATE rate-limit static from
+/// [`warn_incomplete_store_once`] so neither warning suppresses the other.
 fn warn_incomplete_list_once(store: &Path) {
     static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
     let mtime = stat_signature(store).1;
@@ -394,7 +317,6 @@ fn warn_incomplete_list_once(store: &Path) {
         return;
     }
     *guard = Some(key);
-    // Best-effort diagnostic: write fallibly (see `warn_incomplete_store_once`).
     let _ = writeln!(
         std::io::stderr(),
         "tirith: warning: taint store {} could not be read completely; \
@@ -403,16 +325,14 @@ fn warn_incomplete_list_once(store: &Path) {
     );
 }
 
-/// Production entry point: look up `path` in the default store, normalizing
-/// relative paths against `cwd` (or the process cwd when `cwd` is `None`).
+/// Production entry point: look up `path` in the default store.
 pub fn is_tainted(path: &Path, cwd: Option<&Path>) -> Option<TaintEntry> {
     let store = store_path()?;
     is_tainted_at(&store, path, cwd)
 }
 
-/// `true` when the store at `store` exists and has at least one byte. Used by
-/// the engine to decide whether to force past the tier-1 fast-exit for the
-/// per-leader taint check. A cheap `metadata()` stat — no parse.
+/// `true` when the store exists and is non-empty. The engine uses this (a cheap
+/// stat, no parse) to decide whether to force past the tier-1 fast-exit.
 pub fn store_nonempty_at(store: &Path) -> bool {
     std::fs::metadata(store)
         .map(|m| m.len() > 0)
@@ -424,19 +344,12 @@ pub fn store_nonempty() -> bool {
     store_path().map(|p| store_nonempty_at(&p)).unwrap_or(false)
 }
 
-/// List all taints in the store at `store`, de-duplicated by path (the LAST
-/// recorded entry per path wins, mirroring [`is_tainted_at`]). Order is by
-/// first appearance.
+/// List all taints in the store, de-duplicated by path (LAST entry per path
+/// wins, mirroring [`is_tainted_at`]), ordered by first appearance.
 pub fn list_taints_at(store: &Path) -> Vec<TaintEntry> {
-    // `list` is a display path: an incomplete read yields a partial prefix — we
-    // list what we could read rather than synthesizing entries (the lookup hot
-    // path `is_tainted_at` is the one that fails safe on `complete == false`,
-    // CodeRabbit R16 #3). But a SILENT truncation here would let a mid-file I/O
-    // fault hide taints from the displayed list with no signal to the operator,
-    // so when the read is incomplete we emit the SAME rate-limited one-line stderr
-    // diagnostic the lookup path uses (CodeRabbit R18 #5). The returned list is
-    // still the partial prefix; the warning just tells the operator it may be
-    // truncated.
+    // Display path: an incomplete read yields a partial prefix — we list what we
+    // could read (the lookup path is the one that fails safe). A silent
+    // truncation would hide taints, so warn (CodeRabbit R18 #5).
     let (entries, complete) = parse_store(store);
     if !complete {
         warn_incomplete_list_once(store);
@@ -464,32 +377,21 @@ pub fn list_taints() -> Vec<TaintEntry> {
     }
 }
 
-/// Remove every entry for `path` from the store at `store` by rewriting the file
-/// without the matching lines. `cwd` controls relative-path normalization.
-/// Returns the number of entries removed.
+/// Remove every entry for `path` by rewriting the store without the matching
+/// lines. `cwd` controls normalization. Returns the count removed.
 ///
-/// REWRITE DATA-SAFETY (CodeRabbit R12 #F): the reader (`parse_store`) is
-/// fail-open — it SKIPS lines it cannot parse as a `TaintEntry` so a lookup never
-/// aborts. Reusing that for the rewrite would PERMANENTLY DROP any
-/// valid-but-momentarily-unparseable line (a future schema field, a transient
-/// hiccup) on the next `clear`. So compaction operates on RAW lines here: a line
-/// is removed ONLY when it parses as a `TaintEntry` matching the key; every
-/// other line — including ones the reader would skip — is PRESERVED VERBATIM.
+/// REWRITE DATA-SAFETY (CodeRabbit R12 #F): compaction operates on RAW lines so a
+/// valid-but-unparseable line (a future schema field) is PRESERVED VERBATIM — a
+/// line is dropped ONLY when it parses as a `TaintEntry` matching the key.
 pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
     let key = normalize_key(path, cwd);
     let key_str = key.to_string_lossy().into_owned();
 
-    // PARTIAL-READ GUARD (CodeRabbit R13 #1): `clear` REWRITES the store from the
-    // lines it just read. A read that broke early on a real mid-file I/O fault
-    // (not a recoverable skipped-UTF-8 line) yields a truncated prefix; rewriting
-    // from it would PERMANENTLY DROP the unread tail — including still-live taint
-    // markers for OTHER paths (a security miss: a tainted path silently reads as
-    // clean). When the read is incomplete, ABORT the clear (report it as an I/O
-    // error so the caller knows nothing was removed) rather than truncating.
-    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable/unknown-schema
-    // line is kept verbatim and written back, so it must retain its original
-    // surrounding whitespace. Parseable `TaintEntry` lines are unaffected —
-    // `serde_json` tolerates the whitespace.
+    // PARTIAL-READ GUARD (CodeRabbit R13 #1): rewriting from a truncated prefix
+    // would permanently drop the unread tail — including still-live markers for
+    // OTHER paths (a security miss). On an incomplete read, ABORT rather than
+    // truncate. RAW (untrimmed) read (CodeRabbit R15 #3) keeps unknown lines'
+    // whitespace intact; serde tolerates it for parseable entries.
     let (lines, complete) = crate::util::read_store_lines_raw_complete(store);
     if !complete {
         return Err(std::io::Error::other(
@@ -499,9 +401,7 @@ pub fn clear_taint_at(store: &Path, path: &Path, cwd: Option<&Path>) -> std::io:
     let mut removed = 0usize;
     let mut kept_lines: Vec<String> = Vec::new();
     for line in lines {
-        // Drop ONLY a line that parses as a TaintEntry whose path matches the
-        // key. A line that does not parse (unknown/future schema) is kept
-        // verbatim so the rewrite never loses it.
+        // Drop only a TaintEntry matching the key; keep unparseable lines verbatim.
         match serde_json::from_str::<TaintEntry>(&line) {
             Ok(entry) if entry.path == key_str => removed += 1,
             _ => kept_lines.push(line),
@@ -528,15 +428,13 @@ pub fn clear_taint(path: &Path, cwd: Option<&Path>) -> std::io::Result<usize> {
     clear_taint_at(&store, path, cwd)
 }
 
-/// Atomically rewrite the store to exactly the given pre-serialized JSONL
-/// `lines` (one entry per line, no trailing newlines in the elements). Writes a
-/// sibling temp file then renames over the target so a crash mid-write never
-/// truncates the store. This is the line-preserving primitive `clear_taint_at`
-/// uses so it can write back RAW lines (parseable entries + verbatim unknown
-/// lines) without round-tripping every line through `serde` (CodeRabbit R12 #F).
+/// Atomically rewrite the store to exactly the given pre-serialized JSONL `lines`
+/// (temp file + rename, so a crash mid-write never truncates). The line-preserving
+/// primitive `clear_taint_at` uses to write back RAW lines without round-tripping
+/// through serde (CodeRabbit R12 #F).
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
-    // Resolve a symlinked store to its real target so the rewrite writes THROUGH
-    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    // Resolve a symlinked store so the rewrite writes THROUGH the link rather
+    // than replacing it with a regular file (CodeRabbit R13b).
     let dest = crate::util::resolve_symlink_target(store);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -552,11 +450,9 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     for line in lines {
         writeln!(tmp, "{line}")?;
     }
-    // Durability (CodeRabbit R9 #B): fsync the rewritten body to stable storage
-    // BEFORE the rename, then fsync the parent dir so the rename's directory
-    // entry is durable too. A lost rewrite could drop a still-live taint marker
-    // (a security miss) or resurrect a cleared one. Best-effort parent fsync
-    // (unix-only).
+    // Durability (CodeRabbit R9 #B): fsync the body before the rename, then the
+    // parent dir, so a lost rewrite can't drop a live marker or resurrect a
+    // cleared one. Best-effort parent fsync (unix-only).
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(&dest).map_err(|e| e.error)?;
@@ -576,11 +472,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stat_signature_distinguishes_absent_from_present_unreadable() {
-        // CodeRabbit R13b: the cache must not conflate "absent" with "present but
-        // unstattable". A genuinely missing path is the only `(false, _)`; a
-        // dangling symlink (and any non-NotFound stat error) is present, so a store
-        // that was absent when cached and becomes one of those busts the cache and
-        // forces a re-read that fails safe instead of reusing a stale clean snapshot.
+        // CodeRabbit R13b: only a genuinely-missing path is `(false, _)`; a dangling
+        // symlink is present, so it busts the cache and forces a fail-safe re-read.
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope.jsonl");
@@ -598,13 +491,9 @@ mod tests {
         assert!(stat_signature(&real).0, "a real store reads as present");
     }
 
-    /// CodeRabbit R13 #1: `clear_taint_at` REWRITES the store from the lines it
-    /// reads, so it must NOT do so when the read is incomplete (a real I/O fault
-    /// leaves the tail unread). A FIFO store is reported incomplete by
-    /// `read_store_lines_complete` (not a readable regular file), so the clear
-    /// aborts with an error and leaves the FIFO intact — never replaced by a
-    /// truncated regular file that would drop still-live taint markers. Unix-only
-    /// (needs mkfifo); cannot hang (O_NONBLOCK open returns immediately).
+    /// CodeRabbit R13 #1: `clear` must NOT rewrite from an incomplete read. A FIFO
+    /// store reads as incomplete, so clear aborts and leaves the FIFO intact —
+    /// never a truncated regular file. Unix-only; cannot hang (O_NONBLOCK).
     #[cfg(unix)]
     #[test]
     fn clear_aborts_on_incomplete_read_no_truncation() {
@@ -631,15 +520,10 @@ mod tests {
         );
     }
 
-    // The Unix-path-shape assertions below are gated `#[cfg(unix)]` because
-    // `/work/repo` is NOT an absolute path on Windows (no drive prefix), so
-    // `normalize_key` would take the cwd-prefix branch and the expected key
-    // would be `<cwd>/work/repo/...`, not `/work/repo/...`. The `normalize_key`
-    // LOGIC itself is portable — it routes every component through
-    // `std::path::Component` (RootDir / Prefix / ParentDir / Normal) rather
-    // than splitting on a hard-coded `/`, so drive letters and `\` separators
-    // are handled by `std::path` on Windows. The `#[cfg(windows)]` twins below
-    // exercise the same code with drive-letter absolute paths.
+    // The Unix-path-shape assertions below are `#[cfg(unix)]` because `/work/repo`
+    // is not absolute on Windows. The `normalize_key` LOGIC is portable (routes
+    // every component through `std::path::Component`); the `#[cfg(windows)]` twins
+    // exercise it with drive-letter paths.
     #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd() {
@@ -663,13 +547,9 @@ mod tests {
         assert_eq!(key, PathBuf::from("/tmp/x/y"));
     }
 
-    // Windows twins: drive-letter absolute paths exercise the `Component::Prefix`
-    // and `Component::RootDir` arms of `normalize_key`. Rather than pin the exact
-    // string form of the normalized key (which depends on Windows path display
-    // details), these assert the load-bearing INVARIANT directly: a relative
-    // path resolved against a cwd produces the SAME key as the equivalent
-    // absolute path. That's the property taint-keying actually relies on, and
-    // comparing two `normalize_key` outputs to each other is correct on any host.
+    // Windows twins exercise the `Component::Prefix` / `RootDir` arms. They assert
+    // the load-bearing INVARIANT (relative-against-cwd == equivalent absolute)
+    // rather than the exact key string, which depends on Windows display details.
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd_windows() {
@@ -770,14 +650,9 @@ mod tests {
         assert_eq!(found.path, entry.path);
     }
 
-    /// CodeRabbit R16 #3: `is_tainted_at` must NOT report a path as clean when the
-    /// store read was INCOMPLETE — a persistent mid-file fault leaves the tail
-    /// unread, so a queried path in that tail would falsely read "not tainted"
-    /// (fail-OPEN). A FIFO store is reported incomplete by
-    /// `read_store_lines_complete` (not a readable regular file), so a lookup miss
-    /// against it must fail SAFE: a synthetic `UNKNOWN_TAINT_ORIGIN` entry, never
-    /// `None`. Unix-only (needs mkfifo); cannot hang (O_NONBLOCK open returns
-    /// immediately).
+    /// CodeRabbit R16 #3: a lookup miss against an INCOMPLETE read must fail SAFE
+    /// (synthetic `UNKNOWN_TAINT_ORIGIN` entry, never `None`), else a path in the
+    /// unread tail reads "not tainted" (fail-OPEN). FIFO store; Unix-only, no hang.
     #[cfg(unix)]
     #[test]
     fn lookup_fails_safe_on_incomplete_read_not_clean() {
@@ -861,20 +736,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clear_preserves_unparseable_lines_on_rewrite() {
-        // CodeRabbit R12 #F: the lenient reader SKIPS a line it can't parse as a
-        // TaintEntry (correct for a hot-path lookup), but the `clear` REWRITE must
-        // NOT permanently drop it. Hand-write a store with a real entry + a
-        // valid-but-unparseable line (a future-schema JSON object), clear the real
-        // entry, and assert the unknown line SURVIVES on disk.
+        // CodeRabbit R12 #F: the lenient reader skips an unparseable line, but the
+        // `clear` rewrite must NOT drop it. Real entry + a future-schema line,
+        // clear the real entry, assert the unknown line survives.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let cwd = Path::new("/work/repo");
 
-        // One real entry we will clear.
         mark_tainted_at(&store, Path::new("./a.sh"), Some(cwd), "x", None, None).unwrap();
-        // Append a line the reader cannot parse as a TaintEntry but that we must
-        // not lose (e.g. an entry from a newer tirith with an extra required
-        // field, here modeled as an object with an unknown shape).
+        // A line the reader cannot parse as a TaintEntry but must not lose.
         let unknown = r#"{"schema":"v2","path":"/work/repo/future.sh","kind":"something-new"}"#;
         {
             use std::io::Write as _;
@@ -886,8 +756,7 @@ mod tests {
         }
         invalidate_cache();
 
-        // Sanity: the lenient reader skips the unknown line (only the real entry
-        // is visible), proving it is genuinely unparseable-as-TaintEntry.
+        // Sanity: the reader skips the unknown line (only the real entry visible).
         let (parsed, complete) = parse_store(&store);
         assert!(complete, "a clean read of a regular file is complete");
         assert_eq!(parsed.len(), 1, "reader skips the unknown line");

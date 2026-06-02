@@ -1,22 +1,14 @@
 //! `tirith ecosystem scan` — supply-chain risk scan of a project's dependency
-//! manifests.
+//! manifests; the directory-level companion to `tirith package risk`.
 //!
-//! This is the directory-level companion to `tirith package risk`: it walks a
-//! project, parses every dependency manifest it understands (npm / Python /
-//! Rust / Go / Ruby), and scores **every declared dependency** with the same
-//! deterministic [`tirith_core::package_risk`] factor engine — folding in a
-//! *slopsquat* (AI-hallucinated package name) heuristic on top.
-//!
-//! **Offline by default.** Name and typosquat signals come from the local
-//! threat DB; no network is touched. `--online` additionally consults each
-//! package's registry API (npm / PyPI / crates.io) for provenance signals,
-//! gated and degraded exactly as `tirith package risk --online` is — that is
-//! the *only* path on which `ecosystem scan` reaches the network.
-//!
-//! Findings flow through tirith's normal [`Verdict`] / `Finding` model: the
-//! result is explainable, audit-logged, and policy-aware (an allowlisted
-//! package is suppressed). `--format json` emits the full machine-readable
-//! report.
+//! Walks a project, parses each dependency manifest (npm / Python / Rust / Go /
+//! Ruby), and scores every declared dependency with the deterministic
+//! [`tirith_core::package_risk`] engine plus a slopsquat (AI-hallucinated name)
+//! heuristic. Offline by default (local threat DB, no network); `--online` is
+//! the only path that touches the network, consulting each registry API for
+//! provenance exactly as `tirith package risk --online` does. Findings flow
+//! through the normal [`Verdict`] / `Finding` model (explainable, audit-logged,
+//! allowlist-aware); `--format json` emits the full report.
 
 use std::path::{Path, PathBuf};
 
@@ -44,28 +36,16 @@ pub const MAX_INSTALLED_ENTRIES: usize = 200_000;
 /// against a tiny installed tree is not enough to surprise an operator.
 pub const ONLINE_PROMPT_THRESHOLD: usize = 100;
 
-/// Run `tirith ecosystem scan [path]`.
+/// Run `tirith ecosystem scan [path]` (defaults to cwd; `path` may be a single
+/// manifest). `offline` (or `TIRITH_OFFLINE`) forces offline even with
+/// `online`. `installed` walks `node_modules`/`site-packages`/`vendor`/
+/// `Cargo.lock` instead of manifests; `max_installed_entries` caps that walk
+/// (`0` = unbounded). `non_interactive` suppresses the `--installed --online`
+/// prompt (CI).
 ///
-/// `path` is the project directory (or a single manifest file) to scan;
-/// it defaults to the current directory. `online` opts into the registry-API
-/// provenance signals; `offline` (or `TIRITH_OFFLINE`) forces offline scoring
-/// even when `online` is set. `installed` switches to installed-tree mode —
-/// walking `node_modules/`, `site-packages/`, `vendor/`, and `Cargo.lock`
-/// instead of declared-dependency manifests.
-///
-/// `max_installed_entries` caps the installed-tree walk (default
-/// [`DEFAULT_MAX_INSTALLED_ENTRIES`]; pass `0` to disable the cap).
-///
-/// `non_interactive` suppresses the `--installed --online` confirmation
-/// prompt — useful in CI where stdin/stderr are not a TTY.
-///
-/// Exit codes mirror `tirith scan`:
-/// * `0` — no findings (or every finding allowlisted);
-/// * `1` — at least one finding at or above the BLOCK threshold (a
-///   confirmed-malicious / typosquat dependency);
-/// * `2` — only advisory (WARN-level) findings, **or** a usage error (the
-///   given path does not exist). Exit `2` keeps a usage error distinct from a
-///   `1` BLOCK finding, exactly as `tirith install` does.
+/// Exit codes mirror `tirith scan`: `0` clean/allowlisted; `1` a BLOCK-level
+/// finding; `2` only WARN findings OR a usage error (keeps usage errors distinct
+/// from a `1` BLOCK, like `tirith install`).
 #[allow(clippy::too_many_arguments)]
 pub fn scan(
     path: Option<&str>,
@@ -86,13 +66,11 @@ pub fn scan(
             scan_root.display()
         );
         eprintln!("  try: tirith ecosystem scan ./  (scan the current directory)");
-        // A usage error, not a finding — exit 2 so it never collides with
-        // exit 1 (= a BLOCK-level finding).
+        // Usage error → exit 2, never colliding with exit 1 (a BLOCK finding).
         return 2;
     }
 
-    // Validate the entries cap. `0` is the explicit unbounded sentinel; any
-    // other value must sit within the documented range.
+    // `0` is the unbounded sentinel; any other value must be in range.
     if max_installed_entries != 0
         && !(MIN_INSTALLED_ENTRIES..=MAX_INSTALLED_ENTRIES).contains(&max_installed_entries)
     {
@@ -106,46 +84,31 @@ pub fn scan(
 
     let installed_effective = installed || force_installed_for_tests();
 
-    // Pick the engine mode from the CLI surface. `installed` wins over a
-    // manifest-only walk. When `path` points at a single file and that file
-    // is recognized as a lockfile, we keep the shipping behavior (path-arg
-    // form treats it as a specific lockfile) — but only when the operator has
-    // NOT asked for `--installed`.
+    // `installed` wins; otherwise a single-file lockfile path-arg is treated as
+    // a specific lockfile (shipping behavior).
     let mode = pick_mode(&scan_root, installed_effective);
 
-    // Threat DB — offline name / typosquat signals. `None` is not an error:
-    // the scan still runs (weaker), and a note records the missing DB.
+    // Threat DB — offline name/typosquat signals. `None` is not an error: the
+    // scan still runs (weaker) and a note records the missing DB.
     let db = ThreatDb::cached();
 
-    // Policy — drives the allowlist (suppress findings for trusted packages).
-    //
-    // PR #121 fix-list item 14 — discover policy from the SCAN TARGET, not the
-    // operator's cwd. Previously `Policy::discover(None)` fell back to
-    // `std::env::current_dir()`, so `tirith ecosystem scan /path/to/repo` from
-    // `~/elsewhere` ignored the repo's `.tirith/policy.yaml` (allowlist,
-    // severity overrides) entirely. The scan target IS the project whose
-    // policy must apply — passing `scan_root` is the same shape the per-file
-    // analysis paths already use (`engine::analyze` discovers policy from the
-    // analyzed file's directory, not the caller's cwd).
+    // PR #121 fix-list item 14 — discover policy from the SCAN TARGET, not cwd,
+    // so `tirith ecosystem scan /repo` from elsewhere honors the repo's
+    // `.tirith/policy.yaml` (matches the per-file analysis paths).
     let policy = Policy::discover(scan_root.to_str());
 
-    // Build the allowlist predicate. A policy allowlist entry suppresses a
-    // dependency when it matches the bare package name or the `ecosystem:name`
-    // form — exact, predictable matching (a substring match would let `react`
-    // silence `react-dom`). Both the global `allowlist` and the rule-scoped
-    // `allowlist_rules` for the package supply-chain rules are honored.
+    // Allowlist predicate: exact match on the bare name or `ecosystem:name` (a
+    // substring match would let `react` silence `react-dom`). Honors both the
+    // global allowlist and the supply-chain rule-scoped `allowlist_rules`.
     let is_allowlisted = |eco: Ecosystem, name: &str| package_allowlisted(&policy, eco, name);
 
-    // Registry-API resolver — only when `--online` and offline mode is not in
-    // force. The closure is offline-safe: it degrades any registry failure to
-    // `ApiSignals::Unavailable` (the package-risk score then falls back to
-    // offline signals). It is memoized inside `ecosystem_scan::scan`, so a
-    // package declared in two manifests is fetched at most once.
+    // Registry-API resolver — only when `--online` and not forced offline.
+    // Offline-safe (degrades any failure to `ApiSignals::Unavailable`) and
+    // memoized inside `ecosystem_scan::scan`, so a package is fetched at most once.
     let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
-    // M6 ch6 — `gather_api_signals` now returns `(ApiSignals, PackageExistence)`;
-    // fold existence into the provenance the way `tirith install` does so the
-    // policy gate (`PackageNotFoundInRegistry`) can read it.
+    // Fold `gather_api_signals`'s existence result into provenance (as `tirith
+    // install` does) so the `PackageNotFoundInRegistry` gate can read it.
     let resolver = |eco: Ecosystem, name: &str| -> ApiSignals {
         let (mut signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
         use tirith_core::package_risk::{ApiProvenance, PackageExistence};
@@ -174,10 +137,9 @@ pub fn scan(
         signals
     };
 
-    // `--installed --online` against a large tree could fire thousands of API
-    // calls. Estimate the call count from a quick count of installed entries
-    // and prompt the operator when it exceeds the threshold. The prompt is
-    // skipped under `--non-interactive` (CI) and when stderr is not a TTY.
+    // `--installed --online` on a large tree can fire thousands of API calls —
+    // estimate and prompt above the threshold (skipped under `--non-interactive`
+    // / non-TTY stderr).
     if use_online && matches!(mode, ScanMode::Installed) && !non_interactive {
         let estimate = estimate_installed_entries(&scan_root, max_installed_entries);
         if estimate > ONLINE_PROMPT_THRESHOLD
@@ -211,40 +173,24 @@ pub fn scan(
     };
     let mut report = ecosystem_scan::scan(&request);
 
-    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
-    // scan's verdict BEFORE the audit-log write below. The scan engine does
-    // not know the caller's identity by design; the CLI does. Without this
-    // stamp, `tirith ecosystem scan` audit lines would land in the
+    // Stamp the resolved caller origin BEFORE the audit write — the scan engine
+    // doesn't know the caller's identity, and unstamped lines land in the
     // `tirith agent sessions` "unknown" bucket.
     let interactive = is_terminal::is_terminal(std::io::stderr());
     report.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
-    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the
-    // ecosystem-scan path. `tirith ecosystem scan` does not route through
-    // `post_process_verdict`, so without this call deny would stamp but
-    // not enforce on the directory-level supply-chain surface. The
-    // helper is a no-op on `Allowed`/`Unspecified`.
-    //
-    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
-    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
-    // verdict already wins and `apply_agent_rules` must NOT silently
-    // re-Block. The CLI-side guard is defensive future-proofing for
-    // ecosystem-scan (the engine bypass branch does NOT fire on this
-    // path today; ecosystem-scan never routes through `engine::analyze`),
-    // pinned by `ecosystem_tirith_bypass_not_wired_so_deny_enforces_today`
-    // (renamed in fix-7 from `..._deny_skipped_under_tirith_bypass_today`
-    // to match the assertions — bypass-skip never fires today, so deny
-    // enforces).
+    // Enforce `agent_rules.deny` here: ecosystem-scan never routes through
+    // `post_process_verdict`, so deny would stamp but not enforce. The
+    // bypass-skip guard mirrors `check`/`gateway` (under `TIRITH=0` the raw
+    // verdict wins) — defensive, since the engine bypass branch can't fire on
+    // this path; pinned by
+    // `ecosystem_tirith_bypass_not_wired_so_deny_enforces_today`.
     if !report.verdict.bypass_honored {
         tirith_core::escalation::apply_agent_rules(&mut report.verdict, &policy);
     }
 
-    // Audit-log the verdict, exactly as the other analysis commands do. The
-    // "command" string identifies this as an ecosystem scan of the root, with
-    // the resolved mode appended so an audit reader can tell the
-    // manifests / installed / specific-lockfile passes apart at a glance. A
-    // failed audit write does not abort the scan, but it must not be silent —
-    // surface it as a non-fatal notice.
+    // Audit-log the verdict (mode appended so a reader can tell the passes
+    // apart). A failed write is non-fatal but surfaced, not silent.
     if let Err(e) = tirith_core::audit::log_verdict(
         &report.verdict,
         &format!("ecosystem scan ({}) {}", report.mode, report.scan_root),
@@ -258,11 +204,9 @@ pub fn scan(
     }
 
     if json {
-        // A JSON-write failure is the command's own I/O failure. If the report
-        // would otherwise exit 0 (a clean scan), surface exit 1 so a piped
-        // consumer does not treat truncated JSON as a clean pass. A non-zero
-        // finding-driven code (1 BLOCK / 2 WARN) already propagates and is
-        // kept.
+        // On a JSON-write failure, surface exit 1 if the scan was otherwise
+        // clean so a piped consumer never reads truncated JSON as a pass; a
+        // finding-driven code (1/2) already propagates.
         if !print_json(&report) {
             let code = exit_code(report.action());
             return if code == 0 { 1 } else { code };
@@ -274,8 +218,7 @@ pub fn scan(
     exit_code(report.action())
 }
 
-/// Exit code for a scan's resolved [`Action`]. Mirrors `tirith scan`:
-/// BLOCK → 1, WARN → 2, ALLOW → 0.
+/// Exit code for a resolved [`Action`]: BLOCK → 1, WARN → 2, ALLOW → 0.
 fn exit_code(action: Action) -> i32 {
     match action {
         Action::Block => 1,
@@ -284,14 +227,10 @@ fn exit_code(action: Action) -> i32 {
     }
 }
 
-/// Decide whether a `(ecosystem, name)` dependency is allowlisted by `policy`.
-///
-/// A dependency is allowlisted when a policy allowlist entry — global or
-/// scoped to one of the package supply-chain rules — matches it. Matching is
-/// exact against either the bare package name (`react`) or the qualified
-/// `ecosystem:name` form (`npm:react`), case-insensitively. Exact matching is
-/// deliberate: a package allowlist must not let a short name silence every
-/// longer name that contains it.
+/// Whether `(eco, name)` is allowlisted: an exact, case-insensitive match (bare
+/// `react` or qualified `npm:react`) against the global allowlist or a
+/// supply-chain rule-scoped one. Exact (not substring) so a short name can't
+/// silence every longer name containing it.
 fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
     let bare = name.to_lowercase();
     let qualified = format!("{}:{}", eco, bare);
@@ -301,7 +240,6 @@ fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
         e == bare || e == qualified
     };
 
-    // Global allowlist.
     if policy.allowlist.iter().any(|e| matches_entry(e)) {
         return true;
     }
@@ -321,14 +259,9 @@ fn package_allowlisted(policy: &Policy, eco: Ecosystem, name: &str) -> bool {
     false
 }
 
-// --- output ----------------------------------------------------------------
-
-/// Emit the full machine-readable report. The structure is a thin wrapper over
-/// [`EcosystemScanReport`] (which already derives `Serialize`), with a
-/// `schema_version` for forward compatibility.
-///
-/// Returns `false` on a JSON-write failure so the caller can exit non-zero — a
-/// piped consumer must not see truncated JSON paired with a success code.
+/// Emit the full report (a `schema_version`-tagged wrapper over
+/// [`EcosystemScanReport`]). `false` on a JSON-write failure so the caller exits
+/// non-zero — a piped consumer must not see truncated JSON with a success code.
 fn print_json(report: &EcosystemScanReport) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOut<'a> {
@@ -343,12 +276,11 @@ fn print_json(report: &EcosystemScanReport) -> bool {
     super::write_json_stdout(&out, "tirith ecosystem scan: failed to write JSON output")
 }
 
-/// Render the human-readable report to stderr (the summary) and stdout (the
-/// findings), following the `tirith scan` convention of a stderr summary line.
+/// Render the report: summary to stderr, findings to stdout (the `tirith scan`
+/// convention).
 fn print_human(report: &EcosystemScanReport) {
     let finding_count = report.verdict.findings.len();
 
-    // Summary line.
     if report.manifests.is_empty() {
         eprintln!(
             "tirith ecosystem scan: {} — no dependency manifests found",
@@ -364,7 +296,6 @@ fn print_human(report: &EcosystemScanReport) {
         );
     }
 
-    // Manifests scanned.
     if !report.manifests.is_empty() {
         eprintln!();
         eprintln!("  manifests:");
@@ -373,7 +304,6 @@ fn print_human(report: &EcosystemScanReport) {
         }
     }
 
-    // Notes about coverage (missing DB, unreadable manifest, truncation).
     if !report.notes.is_empty() {
         eprintln!();
         eprintln!("  notes:");
@@ -385,7 +315,7 @@ fn print_human(report: &EcosystemScanReport) {
         }
     }
 
-    // Findings — printed to stdout so they can be captured / piped.
+    // Findings go to stdout so they can be captured / piped.
     if finding_count == 0 {
         eprintln!();
         if report.dependency_count == 0 {
@@ -409,14 +339,12 @@ fn print_human(report: &EcosystemScanReport) {
         }
     }
 
-    // The allowlist note: how many dependencies were suppressed.
     let allowlisted = report.allowlisted_count();
     if allowlisted > 0 {
         eprintln!();
         eprintln!("  {allowlisted} dependency/dependencies suppressed by policy allowlist.");
     }
 
-    // A pointer to per-package inspection.
     if report.dependency_count > 0 {
         eprintln!();
         let highest = highest_risk_dependency(report);
@@ -450,14 +378,9 @@ fn highest_risk_dependency(report: &EcosystemScanReport) -> Option<&DependencyAs
         .filter(|a| a.risk.score > 0)
 }
 
-/// Resolve the effective [`ScanMode`] from the CLI surface.
-///
-/// Precedence:
-///  1. `--installed` (or the debug-only `TIRITH_FORCE_INSTALLED` env var
-///     in test builds) → [`ScanMode::Installed`].
-///  2. `path` points at a single file recognized as a manifest →
-///     [`ScanMode::SpecificLockfile`] (the path-arg form of `--lockfile`).
-///  3. Otherwise → [`ScanMode::Manifests`] (the shipping default).
+/// Resolve the effective [`ScanMode`]. Precedence: `--installed` (or debug-only
+/// `TIRITH_FORCE_INSTALLED`) → `Installed`; a single recognized manifest file →
+/// `SpecificLockfile`; otherwise `Manifests` (default).
 pub(crate) fn pick_mode(scan_root: &Path, installed: bool) -> ScanMode {
     if installed {
         return ScanMode::Installed;
@@ -472,12 +395,9 @@ pub(crate) fn pick_mode(scan_root: &Path, installed: bool) -> ScanMode {
     ScanMode::Manifests
 }
 
-/// `true` when the `TIRITH_FORCE_INSTALLED` env var is set — used only by
-/// tests to drive the installed-tree mode without re-shimming `Args`. The
-/// env override is GATED to debug builds (`cfg!(debug_assertions)`) so a
-/// release binary never honors `TIRITH_FORCE_INSTALLED` from an inherited
-/// environment — production behavior depends only on `--installed`, never
-/// on undocumented env vars.
+/// `true` when `TIRITH_FORCE_INSTALLED` is set (tests only). GATED to debug
+/// builds so a release binary never honors it from an inherited environment —
+/// production depends only on `--installed`.
 fn force_installed_for_tests() -> bool {
     if !cfg!(debug_assertions) {
         return false;
@@ -488,12 +408,11 @@ fn force_installed_for_tests() -> bool {
         .unwrap_or(false)
 }
 
-/// Cheap upper-bound estimate of how many installed packages the engine would
-/// score in [`ScanMode::Installed`]. Used only to size the `--online`
-/// confirmation prompt — it does not need to be exact.
+/// Cheap upper-bound estimate of installed-package count, only to size the
+/// `--online` prompt — need not be exact.
 pub(crate) fn estimate_installed_entries(root: &Path, cap: usize) -> usize {
     let mut count = 0usize;
-    // Fast: just count immediate children of node_modules + site-packages.
+    // Count immediate children of node_modules + site-packages.
     let nm = root.join("node_modules");
     if let Ok(rd) = std::fs::read_dir(&nm) {
         for e in rd.flatten() {
@@ -708,27 +627,15 @@ mod tests {
 
     #[test]
     fn scan_discovers_policy_from_scan_target_not_cwd() {
-        // PR #121 fix-list item 14 regression pin — `Policy::discover` must be
-        // anchored at the SCAN TARGET, not the operator's cwd. We write a
-        // `.tirith/policy.yaml` to the scan target that allowlists the only
-        // declared dependency; if discovery is anchored at the scan target the
-        // allowlist suppresses findings (verdict ALLOW, exit 0). If discovery
-        // falls back to cwd (the old bug), the allowlist never loads and the
-        // dependency goes unsuppressed.
-        //
-        // This is a discovery-anchoring test, not an end-to-end finding test —
-        // the temp project's only dep is unknown to the (absent) threat DB, so
-        // a clean baseline scan would already exit 0. We exercise discovery
-        // through `Policy::discover(scan_root.to_str())` directly to assert
-        // the resolved policy carries the allowlist entry.
+        // PR #121 fix-list item 14 regression pin — `Policy::discover` must
+        // anchor at the SCAN TARGET, not cwd. Discovery-anchoring test (not
+        // end-to-end): we assert the resolved policy carries the target's
+        // allowlist entry, and cwd's does not.
         let target = tempdir().unwrap();
         let cwd = tempdir().unwrap();
 
-        // Mark both temp dirs as repo roots so policy-discovery's walk-up does
-        // not climb out of the tempdir into a parent project. Without this
-        // marker, `discover_policy_path` walks past the temp dir looking for
-        // an ancestor with `.tirith/`; on a developer box the workspace root's
-        // `.tirith/` could win.
+        // Mark both as repo roots so discovery's walk-up does not climb out of
+        // the tempdir into the workspace root's `.tirith/` on a dev box.
         fs::create_dir_all(target.path().join(".git")).unwrap();
         fs::create_dir_all(cwd.path().join(".git")).unwrap();
 
@@ -761,11 +668,7 @@ mod tests {
             from_cwd.allowlist,
         );
 
-        // The exported `scan` entry point is what wires discovery — invoke it
-        // and assert no panic and a clean ALLOW (the scan finds the dep,
-        // allowlist suppresses it). The threat DB is absent here so a clean
-        // baseline already exits 0 regardless; this is a smoke that the new
-        // wiring does not regress the happy path.
+        // Smoke: the exported `scan` entry wires discovery — exit 0, no panic.
         let code = scan(
             target.path().to_str(),
             false,

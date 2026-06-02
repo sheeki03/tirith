@@ -15,8 +15,7 @@ fn powershell_single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "''"))
 }
 
-/// Check if another `tirith` binary shadows us on PATH.
-/// Returns a warning message if a shadow is detected.
+/// Warn if another `tirith` binary shadows us on PATH.
 fn check_path_shadow() -> Option<String> {
     let shadows = super::find_shadow_binaries();
     if shadows.is_empty() {
@@ -118,10 +117,8 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                 return 1;
             }
             if prompt_status {
-                // Nushell prompts use closures with PROMPT_COMMAND. The shipped
-                // hook does the wiring (see shell/lib/nushell-hook.nu); we
-                // emit a no-op marker so `--prompt-status` is at least
-                // signaled, with a note for manual install.
+                // Nushell can't be wired via eval; emit a manual-install pointer
+                // (the shipped hook does the real wiring).
                 println!("{}", prompt_status_snippet("nushell"));
             }
             0
@@ -135,16 +132,10 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
     }
 }
 
-/// Render the opt-in `--prompt-status` snippet for `shell`.
-///
-/// Each snippet is wrapped in a guard so eval-ing it twice (once per shell
-/// startup, again after `source ~/.zshrc`) does not double-wrap the
-/// operator's PS1 / PROMPT / `prompt` function.
-///
-/// We use **single quotes** around `$(tirith prompt-status --short)` so the
-/// command substitution is deferred to *prompt render time*, not the moment
-/// `eval` runs. That's the documented PS1 quoting pattern and the only one
-/// that produces a live status.
+/// Render the opt-in `--prompt-status` snippet for `shell`. Each snippet is
+/// guarded against double-eval (so PS1/PROMPT isn't double-wrapped) and uses
+/// single quotes around the command substitution so it defers to prompt-render
+/// time (the only quoting that produces a live status).
 pub(crate) fn prompt_status_snippet(shell: &str) -> String {
     match shell {
         "zsh" => [
@@ -203,11 +194,8 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
         .join("\n"),
-        // Nushell wiring requires `$env.PROMPT_COMMAND` / `prompt-string`
-        // configuration which lives in the user's config.nu — we can't
-        // safely splice a closure via `eval`. Print a pointer instead so
-        // `--prompt-status` always produces *something*, but document the
-        // manual install path.
+        // Nushell wiring lives in config.nu and can't be spliced via `eval`;
+        // print a manual-install pointer instead.
         "nushell" | "nu" => [
             "# >>> tirith prompt-status (M8 ch6) >>>",
             "# Nushell does not support eval-style prompt wiring; add this to",
@@ -272,8 +260,8 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
 fn detect_shell_from_parent() -> Option<&'static str> {
     let mut pid = unsafe { libc::getppid() };
 
-    // Walk ancestors because the immediate parent may be a wrapper process
-    // (e.g., timeout/env) or a shell that exec'd into another program.
+    // Walk ancestors: the immediate parent may be a wrapper (timeout/env) or a
+    // shell that exec'd into another program.
     for _ in 0..8 {
         if pid <= 1 {
             return None;
@@ -405,8 +393,7 @@ pub fn find_hook_dir_readonly() -> Option<PathBuf> {
     None
 }
 
-/// Write embedded hook files to the user data directory.
-/// Returns the shell directory path if successful.
+/// Write embedded hook files to the user data dir, returning the shell dir.
 fn materialize_hooks() -> Option<PathBuf> {
     let data_dir = tirith_core::policy::data_dir()?;
     let shell_dir = data_dir.join("shell");
@@ -414,7 +401,7 @@ fn materialize_hooks() -> Option<PathBuf> {
     let version_path = shell_dir.join(".hooks-version");
     let current_version = env!("CARGO_PKG_VERSION");
 
-    // Re-materialize if required files are missing or embedded hook version changed.
+    // Re-materialize if required files are missing or the version changed.
     let required_files = [
         shell_dir.join("tirith.sh"),
         lib_dir.join("zsh-hook.zsh"),
@@ -488,12 +475,9 @@ mod tests {
 
     #[test]
     fn normalize_shell_name_distinguishes_pwsh_and_windows_powershell() {
-        // PowerShell 7+ (pwsh) — preserved as a distinct label so the displayed
-        // runtime matches `tirith doctor --compat`. The hook script
-        // (powershell-hook.ps1) is the same for both runtimes, so the install
-        // path still works; only the label differs.
+        // pwsh (PowerShell 7+) is a distinct label from legacy powershell 5.1;
+        // the hook script is the same, only the label differs.
         assert_eq!(normalize_shell_name("/usr/local/bin/pwsh"), Some("pwsh"));
-        // Windows PowerShell 5.1 — the legacy runtime, distinct from pwsh.
         assert_eq!(
             normalize_shell_name("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
             Some("powershell")
@@ -539,16 +523,9 @@ mod tests {
         );
     }
 
-    /// Each per-shell snippet must:
-    ///   1. Carry the BEGIN/END marker comments so idempotency can be
-    ///      detected by an external dedupe layer (rc-file editor).
-    ///   2. Reference `tirith prompt-status --short` so the command
-    ///      substitution actually exists.
-    ///   3. Guard against double-evaluation in-process (the
-    ///      `_TIRITH_PROMPT_STATUS_LOADED` variable or equivalent).
-    ///   4. Use SINGLE quotes around `$(tirith …)` so the substitution is
-    ///      deferred to prompt render — printf-evaluating it at eval time
-    ///      would freeze the status.
+    /// Each per-shell snippet must carry the BEGIN/END markers (for external
+    /// dedupe), reference `tirith prompt-status --short`, guard against double-eval,
+    /// and single-quote the substitution so it defers to prompt render.
     #[test]
     fn prompt_status_snippet_zsh_is_marker_wrapped_and_deferred() {
         let s = prompt_status_snippet("zsh");
@@ -556,8 +533,7 @@ mod tests {
         assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
         assert!(s.contains("setopt PROMPT_SUBST"));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
-        // The substitution must be inside SINGLE quotes so PROMPT is
-        // re-rendered each redraw.
+        // Single-quoted so PROMPT re-renders each redraw.
         assert!(s.contains("'$(tirith prompt-status --short) '"));
     }
 
@@ -591,7 +567,7 @@ mod tests {
     #[test]
     fn prompt_status_snippet_nushell_emits_manual_install_pointer() {
         let s = prompt_status_snippet("nushell");
-        // Nushell can't `eval` a closure, so the snippet is a doc pointer.
+        // Nushell snippet is a doc pointer (no eval-able closure).
         assert!(s.contains("docs/prompt-integration.md"));
         assert!(s.contains("tirith prompt-status --short"));
     }

@@ -1,22 +1,11 @@
-//! `tirith mcp lock` / `tirith mcp verify` / `tirith mcp diff` — capture and
-//! govern the MCP servers a repository declares.
+//! `tirith mcp lock` / `verify` / `diff` — capture and govern the MCP servers
+//! a repository declares. Local file ops only (no network, off the detection
+//! hot path); discovery is repo-local (user-level configs never inventoried).
 //!
-//! These are the Milestone 4 (Agent & MCP governance) `mcp` subcommand group:
-//! `lock` writes the deterministic inventory baseline to
-//! `<repo_root>/.tirith/mcp.lock`; `verify` gates on drift (exit 1 when the
-//! committed lockfile no longer matches the current inventory); `diff` shows
-//! that drift informationally.
-//!
-//! Every command is a **local file operation**: it touches no network and is
-//! entirely off the tier-1/2/3 detection hot path. `lock` writes one file
-//! (`mcp.lock`); `verify` and `diff` read it. Discovery is repo-local only —
-//! user-level configs (`~/.claude/`, …) are never inventoried.
-//!
-//! **Privacy invariant.** Env values and URL userinfos are never persisted
-//! in `mcp.lock` (each is replaced with a salted hash; see `mcp_lock.rs`)
-//! and they are never **printed** by `verify` / `diff` either — the human
-//! and `--format json` outputs only ever name the variable / credential
-//! that changed, never its value or hash.
+//! Privacy invariant: env values and URL userinfos are never persisted in
+//! `mcp.lock` (replaced with a salted hash; see `mcp_lock.rs`) and never
+//! printed by `verify`/`diff` — outputs only name the variable/credential that
+//! changed, never its value or hash.
 
 use std::path::{Path, PathBuf};
 
@@ -26,20 +15,13 @@ use tirith_core::mcp_lock::{
 };
 use tirith_core::policy;
 
-/// Run `tirith mcp lock`.
+/// Run `tirith mcp lock`. Builds the MCP inventory and writes
+/// `<repo_root>/.tirith/mcp.lock`.
 ///
-/// Resolves the repository root (the `.git`-boundary walk, same as the policy
-/// system), builds the MCP inventory, writes `<repo_root>/.tirith/mcp.lock`,
-/// and reports honestly how many configs / servers were captured.
-///
-/// Exit codes:
-/// * `0` — the lockfile was written (including the "no MCP configs found" case:
-///   finding nothing to lock is **not** an error — an empty but valid lockfile
-///   is still written so `mcp verify` has a baseline).
-/// * `1` — an operational failure: the repo root could not be determined, the
-///   `.tirith/` directory could not be created, or the lockfile could not be
-///   written. A JSON-write failure on an otherwise-successful run also maps
-///   here so a piped consumer never sees truncated JSON with a success code.
+/// Exit codes: `0` written (including "no configs found" — an empty but valid
+/// lockfile is still written so `verify` has a baseline); `1` operational
+/// failure (no repo root, dir create/write failed, or JSON-write failure so a
+/// piped consumer never sees truncated JSON with a success code).
 pub fn lock(json: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -67,8 +49,7 @@ pub fn lock(json: bool) -> i32 {
 
     if json {
         if !print_json(&repo_root, &lock_path, &inventory, &lockfile) {
-            // JSON serialization/write failed: the lockfile is on disk, but the
-            // caller's output is broken — exit non-zero so a pipeline notices.
+            // Lockfile is on disk, but the caller's JSON output is broken.
             return 1;
         }
     } else {
@@ -78,36 +59,16 @@ pub fn lock(json: bool) -> i32 {
     0
 }
 
-/// Resolve the repository root for `mcp lock`.
+/// Resolve the repository root for `mcp lock`: `TIRITH_POLICY_ROOT` (treated as
+/// the repo root directly), then the `.git`-boundary walk via
+/// `policy::find_repo_root`.
 ///
-/// Honors `TIRITH_POLICY_ROOT` first (treated as the repo root directly — so
-/// a test or deliberate override can pin the root without needing a `.git/`
-/// at the override path), then falls back to the `.git`-boundary walk-up from
-/// the current directory via `policy::find_repo_root`.
-///
-/// **Not identical to the other two resolvers in the codebase — three
-/// different mechanisms exist, deliberately.** A maintainer who needs to
-/// touch one of these should read all three before assuming they share a
-/// helper:
-///
-/// * `policy::find_repo_root` (used by `.tirith/trust.json` via
-///   `Policy::load_trust_entries`) — raw `.git`-walk only; ignores
-///   `TIRITH_POLICY_ROOT` entirely.
-/// * `policy::discover_local_policy_path` (used by `tirith policy`) —
-///   joins `.tirith/` onto `TIRITH_POLICY_ROOT` (so the env var points
-///   at a *repo root*, and the policy file is located inside the
-///   `.tirith/` subdirectory of it), then falls through to a walk-up.
-/// * This function — takes `TIRITH_POLICY_ROOT` as the repo root
-///   directly (so the `.tirith/` subpath is appended later when the
-///   lockfile path is built); falls through to a walk-up.
-///
-/// The shapes line up *in the common case* — `TIRITH_POLICY_ROOT=/repo`
-/// puts `mcp.lock` at `/repo/.tirith/mcp.lock` and the policy at
-/// `/repo/.tirith/policy.yaml`, so the lockfile and policy land beside each
-/// other in practice. They diverge under the trust resolver (which never
-/// sees the env var), so a maintainer expecting strict equivalence will be
-/// wrong. Unifying the three resolvers behind a single helper is a worthwhile
-/// follow-up but a behavior change requiring its own PR.
+/// Deliberately NOT identical to the codebase's two other resolvers — read all
+/// three before assuming a shared helper: `policy::find_repo_root` (trust
+/// entries) ignores the env var; `policy::discover_local_policy_path` (`tirith
+/// policy`) joins `.tirith/` onto it. They line up in the common case but
+/// diverge under the trust resolver. Unifying them is a behavior change for its
+/// own PR.
 fn resolve_repo_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         if !root.trim().is_empty() {
@@ -137,24 +98,16 @@ fn print_json(
 ) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOut<'a> {
-        /// Result-envelope schema version (independent of the lockfile's own
-        /// `format_version`).
+        /// Result-envelope schema version (independent of the lockfile's own).
         schema_version: u32,
         repo_root: String,
         lock_path: String,
         configs_found: usize,
         malformed_configs: &'a [String],
-        /// Physically-present MCP config paths that were skipped during
-        /// discovery / inventory build, with the reason for each. A
-        /// silent skip would hide a misconfigured `.mcp.json` (symlinked,
-        /// oversized, unreadable, …) behind an "empty lockfile" result;
-        /// surfacing this list makes the skip visible.
-        ///
-        /// Additive on the result envelope only — its presence does not
-        /// require a lockfile schema bump.
+        /// Present-but-skipped config paths + reason — surfacing this avoids
+        /// hiding a misconfigured `.mcp.json` behind an "empty lockfile".
         rejected_configs: &'a [mcp_lock::RejectedConfig],
         servers_locked: usize,
-        /// The lockfile document that was written.
         lockfile: &'a McpLockfile,
     }
 
@@ -172,14 +125,11 @@ fn print_json(
     super::write_json_stdout(&out, "tirith mcp lock: failed to write JSON output")
 }
 
-/// Render the human-readable summary.
-///
-/// The summary goes to stderr (consistent with `tirith scan` / `ecosystem
-/// scan`); the written path goes to stdout so it can be captured.
+/// Render the human-readable summary. Summary → stderr; the written path →
+/// stdout so it can be captured.
 fn print_human(lock_path: &Path, inventory: &McpInventory) {
     if inventory.is_empty() {
-        // Honest "nothing to lock" — not an error. An empty lockfile is still
-        // written so a later `mcp verify` has a baseline to diff against.
+        // Not an error — an empty lockfile is still written as a baseline.
         eprintln!("tirith mcp lock: no MCP configuration files found in this repository.");
         eprintln!(
             "  Looked for .mcp.json / mcp.json / mcp_settings.json and the IDE variants \
@@ -187,14 +137,8 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
         );
         eprintln!("  Wrote an empty lockfile so `tirith mcp verify` has a baseline.");
 
-        // PR #121 item 16 — show rejected configs even when the
-        // inventory is empty. [`McpInventory::is_empty`] explicitly
-        // notes that `rejected_configs` does NOT count toward
-        // emptiness: a repo whose only `.mcp.json` is a symlink-out /
-        // oversized / unreadable would otherwise see "no configs found"
-        // with no signal that a config was actually present but blocked.
-        // Surface the rejection list here so the operator can see the
-        // cause.
+        // PR #121 item 16 — `rejected_configs` does NOT count toward emptiness,
+        // so surface it here or a present-but-blocked config goes unsignalled.
         if !inventory.rejected_configs.is_empty() {
             eprintln!();
             eprintln!(
@@ -269,28 +213,14 @@ fn print_human(lock_path: &Path, inventory: &McpInventory) {
     println!("{}", lock_path.display());
 }
 
-/// Render each [`mcp_lock::RejectedConfig`] as the human-summary line printed
-/// under `tirith mcp lock`'s `note:` block.
+/// Render each [`mcp_lock::RejectedConfig`] as a human-summary line for `mcp
+/// lock`'s `note:` block.
 ///
-/// **The `path` is debug-escaped (`{:?}`).** The `rejected.path` carries a
-/// repo-relative filename that — although today's source is the static
-/// [`mcp_lock::MCP_CONFIG_RELATIVE_PATHS`] table — must be treated as
-/// potentially attacker-shaped at every print site. The same convention
-/// the env-name / server-name / tool-name printers (`escape_name`,
-/// `describe_transport`) already apply: a name carrying `\x1b` / `\r` /
-/// `\n` / any control byte would otherwise reach the operator's terminal
-/// raw and could rewrite the rendering (colour injection, line erasure,
-/// cursor repositioning). Debug formatting renders every control byte as
-/// `\u{NN}` / `\n` / `\r` / etc. and quotes the value — costless for
-/// today's static paths (they Debug back to themselves with quotes) and
-/// the principled default for any future code path that introduces an
-/// attacker-controlled rejection source.
-///
-/// The JSON surface (`print_json` and the structured `RejectedConfig`
-/// serialization that flows through it) does **not** need this escape:
-/// `serde_json` natively escapes every C0 control byte as a `\u00NN`
-/// JSON-string escape, so a hostile path cannot inject through the JSON
-/// envelope. This helper is the human-stderr render only.
+/// The `path` is debug-escaped (`{:?}`): treat it as potentially
+/// attacker-shaped so a control byte (`\x1b`/`\r`/`\n`) can't rewrite the
+/// operator's terminal — same convention as `escape_name`/`describe_transport`.
+/// The JSON surface doesn't need this (serde_json escapes C0 bytes natively);
+/// this is the human-stderr render only.
 fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<String> {
     rejected
         .iter()
@@ -304,33 +234,14 @@ fn format_rejected_config_lines(rejected: &[mcp_lock::RejectedConfig]) -> Vec<St
         .collect()
 }
 
-/// Render one inventory server entry as it appears under the `servers:`
-/// block of `tirith mcp lock`'s human summary.
-///
-/// **Both `server.name` and `server.source_config` are debug-escaped.**
-/// Both originate from a `.mcp.json` checked into the repo and must be
-/// treated as attacker-controllable at every print site (PR #121 item
-/// 17). The codebase's stated discipline — see the comments at the top
-/// of [`format_rejected_config_lines`], at [`escape_name`], and at the
-/// drift / env-name printers (`describe_changed_entry`,
-/// `describe_transport`) — is "every printer escapes attacker-
-/// controllable strings". This site was missed before PR #121 fixed
-/// it; the helper is factored out so the contract can be unit-tested
-/// without driving the whole `print_human` function.
+/// Render one inventory server entry under the `servers:` block of `mcp lock`'s
+/// human summary. Both `name` and `source_config` are debug-escaped — they come
+/// from a repo `.mcp.json` and are attacker-controllable (PR #121 item 17).
 fn format_inventory_server_line(server: &mcp_lock::McpServerEntry) -> String {
     let transport = describe_transport(&server.transport);
-    // Branch on `tools_declared` so the operator can distinguish three states:
-    //   1. tools omitted in the source config — MCP clients treat this as
-    //      "any tool the server exposes at runtime". The lockfile captures no
-    //      tool list because none was declared.
-    //   2. tools declared as `"tools": []` — an explicit empty allowlist. The
-    //      source config intentionally allows no tools.
-    //   3. tools declared with one or more entries — the normal case.
-    // Without this distinction (the pre-fix code rendered cases 1 and 2 with
-    // the same "all tools (none declared)" string), an operator could not
-    // tell whether a server was deliberately scoped to zero tools or whether
-    // the runtime would surface every tool the server exposes — a real
-    // policy ambiguity that the lockfile is supposed to resolve.
+    // Branch on `tools_declared` to distinguish three states (a real policy
+    // ambiguity the lockfile resolves): omitted (runtime exposes any tool) vs
+    // `"tools": []` (explicit zero-tool allowlist) vs N declared tools.
     let tools = if !server.tools_declared {
         "tools omitted — server may expose runtime tools".to_string()
     } else if server.tools.is_empty() {
@@ -347,13 +258,8 @@ fn format_inventory_server_line(server: &mcp_lock::McpServerEntry) -> String {
     )
 }
 
-/// One-line human description of a [`mcp_lock::RejectedReason`].
-///
-/// Used only by [`print_human`]; the structured variant is what the JSON
-/// surface and any programmatic consumer reads. The description names the
-/// failure category plainly without echoing arbitrary bytes (the
-/// `size_bytes`/`permission_denied` fields are integers/booleans, safe to
-/// interpolate).
+/// One-line human description of a [`mcp_lock::RejectedReason`] (used only by
+/// [`print_human`]). Names the failure category without echoing arbitrary bytes.
 fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
     match reason {
         mcp_lock::RejectedReason::Symlink => {
@@ -384,41 +290,17 @@ fn describe_rejection_reason(reason: &mcp_lock::RejectedReason) -> String {
 
 /// One-line description of a transport for the human summary.
 ///
-/// A stdio server's `env` is named (the variable names only — raw values are
-/// never stored anywhere, much less printed; the lockfile carries only a
-/// salted hash) so a reader of `mcp lock` output can see that the server runs
-/// with injected environment.
-///
-/// **Env names are debug-escaped before printing.** A config can declare an
-/// env name containing ANSI escape sequences, newlines, or other terminal
-/// control bytes (a malicious or careless config, or one round-tripped from a
-/// hostile source). Printing the name verbatim would let those control bytes
-/// reach the user's terminal and inject color, repositioning, or
-/// line-erasure. Rust's `Debug` formatting on `&str` (`"{:?}"`) escapes every
-/// control byte as a `\u{NN}` / `\n` / `\r` / etc. and quotes the value (the
-/// dedicated test `describe_transport_escapes_control_bytes_in_env_names`
-/// probes for the `\u{1b}` escape form to pin this contract) — the simplest
-/// correct fix, applied at *every* env-name print site.
-///
-/// **A URL's userinfo is never printed.** The stored URL is already the
-/// redacted form (`https://host/...` — the `user:token@` segment has been
-/// stripped during parsing). When the source config declared a userinfo, the
-/// summary prints a separate `(credentials in source URL)` annotation so the
-/// reader can see that the redaction fired without revealing the credential
-/// itself.
+/// Every attacker-controllable field (URL, command, args, env names — all from
+/// a repo `.mcp.json`) is debug-escaped so control bytes (ANSI/CR/BEL) can't
+/// rewrite the operator's terminal. Env values are never stored or printed (the
+/// lockfile carries only a salted hash); a URL's userinfo is already stripped at
+/// parse time — a `(credentials in source URL)` annotation shows the redaction
+/// fired without revealing the credential.
 fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
     match transport {
         mcp_lock::McpTransport::Url { url, userinfo_hash } => {
-            // The stored `url` is already userinfo-stripped (a credential, if
-            // any, has been replaced with a salted hash). The URL still came
-            // from a `.mcp.json` checked into the repo and must be treated as
-            // attacker-controllable — debug-escape the bytes so control chars
-            // (ANSI, CR, BEL, …) cannot rewrite the operator's terminal
-            // (PR #121 follow-up: every printer escapes attacker-controllable
-            // strings, transport fields are no exception).
-            // When `userinfo_hash` is Some, append a fixed phrase so the
-            // operator can see that the source declared a credential —
-            // never the credential itself.
+            // `url` is already userinfo-stripped; annotate (never echo) the
+            // credential when one was declared.
             if userinfo_hash.is_some() {
                 format!("url {} (credentials in source URL)", escape_name(url))
             } else {
@@ -426,10 +308,6 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
             }
         }
         mcp_lock::McpTransport::Stdio { command, args, env } => {
-            // Both `command` and every `args` element originated from the
-            // `.mcp.json` and are hostile-by-default. Debug-format each so a
-            // command/arg containing ESC / CR / BEL renders as `\u{NN}` rather
-            // than reaching the terminal raw.
             let mut desc = if args.is_empty() {
                 format!("stdio {}", escape_name(command))
             } else {
@@ -437,11 +315,6 @@ fn describe_transport(transport: &mcp_lock::McpTransport) -> String {
                 format!("stdio {} {}", escape_name(command), escaped_args.join(" "))
             };
             if !env.is_empty() {
-                // Debug-format each name so control bytes (ANSI escapes,
-                // newlines, …) are rendered as `\u{NN}` literals (e.g. ESC →
-                // `\u{1b}`) rather than reaching the terminal. Names appear
-                // quoted, which is fine for the human summary and the test
-                // snapshot.
                 let names: Vec<String> = env.iter().map(|e| format!("{:?}", e.name)).collect();
                 desc.push_str(&format!(" (env: {})", names.join(", ")));
             }
@@ -466,8 +339,7 @@ fn report_error_for(json: bool, command: &str, message: &str) {
             schema_version: u32,
             error: &'a str,
         }
-        // A best-effort error envelope; the exit code is the source of truth,
-        // so a failure to even print this is not separately handled.
+        // Best-effort error envelope; the exit code is the source of truth.
         let ctx = format!("{command}: failed to write JSON output");
         let _ = super::write_json_stdout(
             &ErrOut {
@@ -481,24 +353,14 @@ fn report_error_for(json: bool, command: &str, message: &str) {
     }
 }
 
-// ===========================================================================
 // `tirith mcp verify` — gating drift check
-// ===========================================================================
 
-/// Run `tirith mcp verify`.
+/// Run `tirith mcp verify`. Loads `.tirith/mcp.lock`, rebuilds the inventory,
+/// computes drift, and reports it.
 ///
-/// Loads the committed `.tirith/mcp.lock`, rebuilds the current MCP inventory,
-/// computes the structured drift, and reports it. Exit codes are the contract
-/// a CI integration depends on:
-///
-/// * `0` — no drift. The lockfile and the current inventory are identical at
-///   the inventory-hash level.
-/// * `1` — drift detected. The lockfile and the current inventory differ;
-///   the human / JSON output names the affected servers.
-/// * `2` — a *usage* error: no lockfile to verify against, the lockfile
-///   cannot be read or parsed, or the repository root could not be
-///   determined. Distinct from drift so a CI caller can distinguish "the
-///   lockfile is stale" (1) from "there is no lockfile to verify" (2).
+/// Exit codes (the CI contract): `0` no drift; `1` drift detected (output names
+/// the affected servers); `2` usage error (no/unreadable lockfile or no repo
+/// root) — distinct from drift so CI can tell "stale" from "nothing to verify".
 pub fn verify(json: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -515,11 +377,8 @@ pub fn verify(json: bool) -> i32 {
     verify_for_root(&repo_root, json)
 }
 
-/// Verify against an explicit repo root.
-///
-/// Split out so tests can drive a verify against a tempdir without mutating
-/// process-wide environment variables. Production `verify(...)` resolves the
-/// root the same way `lock` does, then calls this.
+/// Verify against an explicit repo root. Split out so tests can drive a verify
+/// against a tempdir without mutating process-wide environment variables.
 pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
     let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
     let lockfile = match mcp_lock::load_lockfile(&lock_path) {
@@ -562,24 +421,13 @@ pub(crate) fn verify_for_root(repo_root: &Path, json: bool) -> i32 {
     verify_exit_code(drifts.is_empty(), true)
 }
 
-/// Decide `tirith mcp verify`'s exit code from `(in_sync, json_write_ok)`.
+/// Decide `tirith mcp verify`'s exit code from `(in_sync, json_write_ok)`. Pure
+/// so the F2 contract is unit-testable without a broken stdout pipe.
 ///
-/// Pure function so the F2 contract — a JSON-write failure must NOT
-/// collapse "drift was detected, exit 1" into "usage error, exit 2" — can
-/// be pinned by a unit test without simulating a broken stdout pipe.
-///
-/// Contract:
-/// * `in_sync == true, json_write_ok == true` → 0 (no drift).
-/// * `in_sync == true, json_write_ok == false` → 2: there's no drift to
-///   preserve, and the consumer's only signal (the JSON payload) is
-///   broken — surface it as a usage-class failure so a pipeline notices.
-/// * `in_sync == false, json_write_ok == true` → 1 (drift detected).
-/// * `in_sync == false, json_write_ok == false` → 1: the JSON write
-///   failed, but drift IS the dominant signal — preserve it. The
-///   privacy / pipe-truncation contract (a consumer never sees
-///   truncated JSON paired with a success code) is satisfied by the
-///   stderr write inside `write_json_stdout`; we don't need exit 2 to
-///   convey it.
+/// F2 contract: a JSON-write failure must NOT collapse "drift, exit 1" into
+/// "usage error, exit 2". So: no-drift+ok → 0; no-drift+write-fail → 2 (the only
+/// signal is broken); drift → 1 regardless of write success (drift dominates;
+/// the truncated-JSON warning is on stderr already).
 pub(crate) fn verify_exit_code(in_sync: bool, json_write_ok: bool) -> i32 {
     match (in_sync, json_write_ok) {
         (true, true) => 0,
@@ -588,11 +436,8 @@ pub(crate) fn verify_exit_code(in_sync: bool, json_write_ok: bool) -> i32 {
     }
 }
 
-/// Human-readable summary for `tirith mcp verify`.
-///
-/// Goes to stderr (the rest of the verdict surface follows that convention),
-/// with one line per drift entry. Env values and URL userinfos never appear
-/// — only the name of the variable / credential that changed.
+/// Human-readable summary for `tirith mcp verify` (stderr, one line per drift).
+/// Env values and URL userinfos never appear — only the name that changed.
 fn print_verify_human(lock_path: &Path, drifts: &[McpDrift]) {
     if drifts.is_empty() {
         eprintln!(
@@ -615,15 +460,11 @@ fn print_verify_human(lock_path: &Path, drifts: &[McpDrift]) {
     eprintln!("  re-run `tirith mcp lock` to refresh the lockfile once the change is intentional.");
 }
 
-// ===========================================================================
 // `tirith mcp diff` — informational drift report
-// ===========================================================================
 
-/// Run `tirith mcp diff`.
-///
-/// Same drift data as `verify`, presented as an informational diff. Always
-/// exits 0 (a usage error still exits 2 so a piped consumer can distinguish
-/// "no drift" from "I could not check").
+/// Run `tirith mcp diff`. Same drift data as `verify`, informational. Always
+/// exits 0 (a usage error still exits 2 so a consumer can tell "no drift" from
+/// "could not check").
 pub fn diff(json: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -640,10 +481,8 @@ pub fn diff(json: bool) -> i32 {
     diff_for_root(&repo_root, json)
 }
 
-/// Diff against an explicit repo root.
-///
-/// Split out so tests can drive a diff against a tempdir without mutating
-/// process-wide environment variables.
+/// Diff against an explicit repo root. Split out so tests can drive a diff
+/// against a tempdir without mutating process-wide environment variables.
 pub(crate) fn diff_for_root(repo_root: &Path, json: bool) -> i32 {
     let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
     let lockfile = match mcp_lock::load_lockfile(&lock_path) {
@@ -704,16 +543,11 @@ fn print_diff_human(lock_path: &Path, drifts: &[McpDrift]) {
     print_drift_body(drifts);
 }
 
-// ===========================================================================
 // shared drift presentation helpers (used by verify and diff)
-// ===========================================================================
 
 /// Count drifts by kind: `(added, removed, changed)`. A
-/// [`McpDrift::SchemaUpgradeRequired`] entry does not contribute to any of
-/// the three buckets — it's a migration prompt, not a per-server drift —
-/// so the call sites that pair these counts with the `drift_count` from
-/// `drifts.len()` correctly show "N drift entries, of which 0 added /
-/// removed / changed" when the only entry is a migration prompt.
+/// [`McpDrift::SchemaUpgradeRequired`] entry is a migration prompt, not a
+/// per-server drift, so it contributes to none of the three buckets.
 fn drift_kind_counts(drifts: &[McpDrift]) -> (usize, usize, usize) {
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -774,11 +608,9 @@ fn print_drift_body(drifts: &[McpDrift]) {
     }
 }
 
-/// Print the per-field detail of a `Changed` drift entry. Every printed name
-/// is **debug-escaped** (`{:?}`), so a maliciously-crafted server / env /
-/// tool name containing ANSI escapes, newlines, or other terminal control
-/// bytes cannot inject control sequences into the operator's terminal —
-/// same treatment as `describe_transport`'s env-name handling in `lock`.
+/// Print the per-field detail of a `Changed` drift entry. Every printed name is
+/// debug-escaped (`{:?}`) so a hostile server/env/tool name cannot inject
+/// terminal control sequences — same treatment as `describe_transport`.
 fn describe_changed_entry(entry: &McpServerDriftEntry) {
     for change in &entry.transport_changes {
         match change {
@@ -786,10 +618,8 @@ fn describe_changed_entry(entry: &McpServerDriftEntry) {
                 eprintln!("      - transport kind: {previous} → {current}");
             }
             McpTransportChange::UrlChanged => {
-                // The stored URL changed bytes; both sides are already
-                // userinfo-stripped in the lockfile, so naming the host
-                // here would only echo the redacted form. The diff is the
-                // structural fact; the lockfile has the bytes.
+                // Both sides are userinfo-stripped; report the structural fact
+                // only (the redacted bytes live in the lockfile).
                 eprintln!("      - URL changed (redacted form recorded in mcp.lock)");
             }
             McpTransportChange::UserinfoAdded => {
@@ -808,8 +638,7 @@ fn describe_changed_entry(entry: &McpServerDriftEntry) {
                 eprintln!("      - stdio args changed");
             }
             McpTransportChange::EnvChanged => {
-                // The per-variable detail is printed below, in `env_changes`.
-                // The transport-level `EnvChanged` marker is the headline.
+                // Per-variable detail is printed below in `env_changes`.
             }
         }
     }
@@ -848,20 +677,14 @@ fn describe_changed_entry(entry: &McpServerDriftEntry) {
     }
 }
 
-/// Debug-format a name. ANSI escapes / newlines / control bytes inside a
-/// server / env / tool name are rendered as `\u{1b}` / `\n` / … so a hostile
-/// or careless config cannot inject terminal control sequences when a drift
-/// is printed.
+/// Debug-format a name so control bytes in a server/env/tool name render as
+/// `\u{1b}` / `\n` / … and can't inject terminal control sequences.
 fn escape_name(name: &str) -> String {
     format!("{name:?}")
 }
 
-/// Shared JSON output for `verify` / `diff`. The envelope is identical so a
-/// machine consumer can switch between the two with the same parser; only
-/// the exit code distinguishes the gating verb (`verify`) from the
-/// informational verb (`diff`).
-///
-/// Returns `false` on a write failure so the caller can exit non-zero.
+/// Shared JSON output for `verify` / `diff` — identical envelope (only the exit
+/// code distinguishes them). Returns `false` on a write failure.
 fn print_drift_json(
     command: &str,
     repo_root: &Path,
@@ -873,25 +696,19 @@ fn print_drift_json(
 
     #[derive(serde::Serialize)]
     struct JsonOut<'a> {
-        /// Result-envelope schema version (independent of the lockfile's own
-        /// `format_version`).
+        /// Result-envelope schema version (independent of the lockfile's own).
         schema_version: u32,
         repo_root: String,
         lock_path: String,
-        /// `lock` / `verify` / `diff` — so a piped consumer can tell which
-        /// command produced the document.
+        /// `lock` / `verify` / `diff` — which command produced the document.
         command: &'a str,
-        /// The lockfile's recorded `format_version` (so the consumer can
-        /// react to a schema bump independently of the envelope version).
+        /// The lockfile's recorded `format_version`.
         lockfile_format_version: u32,
-        /// Total drift count.
         drift_count: usize,
         added_count: usize,
         removed_count: usize,
         changed_count: usize,
-        /// Whether the inventory matches the lockfile (i.e. `drift_count == 0`).
         in_sync: bool,
-        /// The drift entries themselves, in stable order.
         drifts: &'a [McpDrift],
     }
 
@@ -913,43 +730,20 @@ fn print_drift_json(
     super::write_json_stdout(&out, &ctx)
 }
 
-// ===========================================================================
 // `tirith mcp policy init` — scaffold a starter MCP policy
-// ===========================================================================
 
-/// Run `tirith mcp policy init`.
+/// Run `tirith mcp policy init`. Reads `.tirith/mcp.lock` and writes
+/// `.tirith/mcp-policy.yaml.example`: a (commented-out) scaffold of
+/// `scan.trusted_mcp_servers` / `scan.mcp_allowed_tools` for every locked
+/// server, which the operator merges into `policy.yaml` themselves. A separate
+/// `.example` file lets the operator diff before integrating.
 ///
-/// Reads the committed `.tirith/mcp.lock` and writes
-/// `.tirith/mcp-policy.yaml.example` — a scaffold of `scan.trusted_mcp_servers`
-/// and `scan.mcp_allowed_tools` entries (commented out) listing every server
-/// currently locked and the tools it currently exposes. The operator copies
-/// the file in, uncomments the entries they wish to declare, and merges them
-/// into `.tirith/policy.yaml` themselves.
+/// Deterministic (the lockfile is sorted by `(name, source_config)`).
+/// `--format json` emits the same scaffold as a preview plus the file paths.
 ///
-/// A separate `.example` file is cleaner than mutating the operator's
-/// existing policy: the operator can `diff` it against their working
-/// `policy.yaml` and integrate the bits they want.
-///
-/// Determinism: running `mcp policy init` twice against the same lockfile
-/// produces a byte-identical file. The lockfile is sorted by
-/// `(name, source_config)` (see `mcp_lock::McpLockfile::from_inventory`), so
-/// the policy scaffold's server order is stable.
-///
-/// Exit codes:
-/// * `0` — the example policy was written (including the "no lockfile" case —
-///   a header-only example is still written so the operator has a starting
-///   point; the body lists nothing because there is nothing to list yet).
-/// * `1` — the lockfile is unparseable (the operator must fix or refresh it
-///   before generating policy from it), the repo root cannot be determined,
-///   or the example file cannot be written.
-/// * `2` — usage / argument error (e.g. an unrecognized `--format` value).
-///   Currently unused but reserved so future arg validation has a place to
-///   land without rewriting consumers.
-///
-/// `--format json` emits a planned-policy preview (the same scaffold the
-/// human form writes, plus the example file path and the lockfile path) so
-/// a CI integration can ingest the proposed policy without reading the
-/// example file off disk.
+/// Exit codes: `0` written (incl. the no-lockfile case — a header-only example
+/// is still written); `1` unparseable lockfile / no repo root / write failure;
+/// `2` reserved usage error.
 pub fn policy_init(json: bool, force: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -967,15 +761,13 @@ pub fn policy_init(json: bool, force: bool) -> i32 {
 }
 
 /// `policy init` against an explicit repo root. Split out so tests can drive
-/// the command against a tempdir without mutating process-wide environment
-/// variables.
+/// the command against a tempdir without mutating process-wide env vars.
 pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) -> i32 {
     let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
     let example_path = repo_root.join(".tirith").join("mcp-policy.yaml.example");
 
-    // Reject overwriting an existing example file unless --force is passed,
-    // mirroring `tirith policy init`. The operator may have edited the
-    // example to track their working policy.
+    // Refuse to overwrite an existing example without --force (the operator may
+    // have edited it), mirroring `tirith policy init`.
     if example_path.exists() && !force {
         report_error_for(
             json,
@@ -988,10 +780,8 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
         return 1;
     }
 
-    // Load the lockfile if present. A missing lockfile is NOT fatal — we
-    // still generate a header-only example so the operator has a starting
-    // point. A truly unparseable lockfile is fatal because we cannot tell
-    // what to list.
+    // A missing lockfile is NOT fatal (header-only example still written); an
+    // unparseable one IS, because we cannot tell what to list.
     let lockfile_opt: Option<McpLockfile> = match mcp_lock::load_lockfile(&lock_path) {
         Ok(l) => Some(l),
         Err(McpLockLoadError::NotFound) => None,
@@ -1009,11 +799,9 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
         }
     };
 
-    // Build the scaffold. Both forms (human YAML, JSON preview) derive from
-    // this same structured shape, so they cannot drift apart.
+    // Both forms (human YAML, JSON preview) derive from this same shape.
     let scaffold = build_policy_scaffold(lockfile_opt.as_ref());
 
-    // Ensure `.tirith/` exists.
     if let Some(parent) = example_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             report_error_for(
@@ -1046,16 +834,13 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
     0
 }
 
-/// The structured scaffold the human and JSON forms share. Each entry is one
-/// server name + the tool names the lockfile recorded for it.
+/// The structured scaffold the human and JSON forms share.
 #[derive(Debug, Clone, serde::Serialize)]
 struct PolicyScaffold {
-    /// `true` when no lockfile was found — the human and JSON output report
-    /// this distinctly so the operator knows the scaffold is empty by
-    /// construction, not because every server got dropped.
+    /// `true` when a lockfile was found — distinguishes "empty by construction"
+    /// from "every server got dropped".
     lockfile_present: bool,
-    /// Servers in `(name, source_config)` order — the lockfile's own
-    /// canonical order.
+    /// Servers in the lockfile's `(name, source_config)` canonical order.
     servers: Vec<PolicyScaffoldServer>,
 }
 
@@ -1067,20 +852,10 @@ struct PolicyScaffoldServer {
     tools: Vec<String>,
 }
 
-/// Build the policy scaffold from a (possibly absent) lockfile.
-///
-/// A missing lockfile yields an empty `servers` list — the YAML / JSON
-/// scaffold is still emitted, with `lockfile_present: false`, so the
-/// operator sees the structure even before they run `mcp lock`.
-///
-/// **Deduplication.** A lockfile sorts servers by `(name, source_config)`,
-/// so the same name can legitimately appear twice in different configs
-/// (e.g. `.mcp.json` and `.vscode/mcp.json`). The scaffold's
-/// `trusted_mcp_servers` entry is a `name` only — keying off name alone
-/// would emit the same name twice. The body keeps the per-config detail
-/// for `mcp_allowed_tools` (one tools-list per server entry, even when
-/// names repeat), but the trusted-servers commented list deduplicates by
-/// name so the YAML is operator-friendly.
+/// Build the policy scaffold from a (possibly absent) lockfile. A missing
+/// lockfile yields an empty `servers` list with `lockfile_present: false` (the
+/// structure is still emitted). The same name can appear twice (different
+/// configs); `render_policy_scaffold_yaml` dedups the trusted-servers list.
 fn build_policy_scaffold(lockfile: Option<&McpLockfile>) -> PolicyScaffold {
     match lockfile {
         Some(lock) => PolicyScaffold {
@@ -1102,20 +877,11 @@ fn build_policy_scaffold(lockfile: Option<&McpLockfile>) -> PolicyScaffold {
     }
 }
 
-/// Render the scaffold to its YAML on-disk form.
-///
-/// Every server's entry is **commented out** with `#` so importing the
-/// example into a working `policy.yaml` does not silently widen the
-/// operator's trust set — they must uncomment what they intend to trust.
-/// This matches `tirith policy init`'s convention: defaults are
-/// commented; the operator opts in.
-///
-/// Determinism: the lockfile is already sorted, so two invocations against
-/// the same lockfile produce the same bytes. A trailing newline is always
-/// emitted.
+/// Render the scaffold to its YAML on-disk form. Every entry is commented out
+/// with `#` so importing the example doesn't silently widen the trust set (the
+/// operator opts in, matching `tirith policy init`). Deterministic; always emits
+/// a trailing newline.
 fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
-    // Header — explains what the file is, how to use it, and (critically)
-    // that the entries are commented out by design.
     let mut s = String::new();
     s.push_str("# Tirith MCP policy scaffold (example)\n");
     s.push_str("# Generated by `tirith mcp policy init` from .tirith/mcp.lock.\n");
@@ -1152,8 +918,8 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
 
     s.push_str("scan:\n");
 
-    // `trusted_mcp_servers`: deduplicate by name, since the same server
-    // name can legitimately appear in two different source configs.
+    // `trusted_mcp_servers`: dedup by name (the same name can appear in two
+    // different source configs).
     let mut seen_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     s.push_str("  # Server names that are trusted: every per-server MCP config\n");
     s.push_str("  # finding (insecure URL, raw IP, suspicious args, wildcard tools,\n");
@@ -1171,10 +937,8 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
         }
     }
 
-    // `mcp_allowed_tools`: per-server tool allow-list. Emit one entry per
-    // server (keyed by name); when the same name appears twice with
-    // different tool lists, prefer the union for the scaffold so the
-    // operator sees every tool the lockfile records.
+    // `mcp_allowed_tools`: per-server tool allow-list, one entry per name;
+    // when a name repeats with different tool lists, emit the union.
     s.push('\n');
     s.push_str("  # Per-server allowed tools. The keys are MCP server names; the\n");
     s.push_str("  # values are the tools the server may expose. A tool the lockfile\n");
@@ -1220,13 +984,8 @@ fn render_policy_scaffold_yaml(scaffold: &PolicyScaffold) -> String {
     s
 }
 
-// M4 item 8 chunk 3 — the YAML safety helpers (`yaml_safe_scalar`,
-// `yaml_safe_inline_comment`, `YAML_NEEDS_QUOTING_BYTES`) used to live as
-// two byte-identical copies in this file and `cli/agent.rs`. They are now
-// centralized in `crate::cli::yaml`. The thin aliases below preserve the
-// original names so the round-trip tests at the bottom of this module
-// (which form the most thorough round-trip suite in the repo) keep
-// reading naturally without renaming every reference.
+// YAML safety helpers are centralized in `crate::cli::yaml`; these aliases keep
+// the original names so the round-trip tests below read naturally.
 #[cfg(test)]
 use crate::cli::yaml::YAML_NEEDS_QUOTING_BYTES;
 use crate::cli::yaml::{
@@ -1292,26 +1051,14 @@ fn print_policy_init_json(
     super::write_json_stdout(&out, "tirith mcp policy init: failed to write JSON output")
 }
 
-// ===========================================================================
 // `tirith mcp explain` — print one server's lockfile entry
-// ===========================================================================
 
-/// Run `tirith mcp explain <server>`.
+/// Run `tirith mcp explain <server>`. Finds the named server (case-sensitive
+/// exact) and prints its tools, redacted transport, env-variable names (never
+/// values — only hashes are stored), and inferred capabilities.
 ///
-/// Loads `.tirith/mcp.lock`, finds the named server (case-sensitive exact),
-/// and prints its declared tools, redacted transport, env-variable
-/// **names** (never values — the lockfile stores only hashes), and the
-/// inferred capabilities. The same redaction `verify` / `diff` apply to
-/// transports and env values applies here: URL userinfos are absent
-/// (already stripped at lock time) and env values are unreachable from the
-/// lockfile (already replaced with salted hashes at lock time).
-///
-/// Exit codes:
-/// * `0` — the server was found and printed.
-/// * `1` — the lockfile is missing or unreadable, the server name was not
-///   found, or the JSON output could not be written.
-/// * `2` — usage error (none defined today; reserved for symmetry with
-///   `verify` / `diff`).
+/// Exit codes: `0` found and printed; `1` missing/unreadable lockfile, server
+/// not found, or JSON write failure; `2` reserved usage error.
 pub fn explain(server: &str, json: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -1350,8 +1097,8 @@ pub fn explain(server: &str, json: bool) -> i32 {
         }
     };
 
-    // Case-sensitive exact lookup — matches every other byte-equal site
-    // in the lockfile schema (matchers, env names, server identity).
+    // Case-sensitive exact lookup — matches every other byte-equal site in the
+    // lockfile schema.
     let entry = lockfile.servers.iter().find(|s| s.name == server);
     let Some(entry) = entry else {
         let suggestions = suggest_server_names(&lockfile.servers, server);
@@ -1378,9 +1125,8 @@ pub fn explain(server: &str, json: bool) -> i32 {
     0
 }
 
-/// Suggest server names close to `query`. Prefix matches first
-/// (alphabetical), then up to two Levenshtein-near names within distance
-/// 3. Bounded to four total so the error message stays short.
+/// Suggest server names close to `query`: prefix matches first (alphabetical),
+/// then Levenshtein-near names within distance 3. Bounded to four total.
 fn suggest_server_names(servers: &[McpLockServer], query: &str) -> Vec<String> {
     let mut prefix: Vec<&str> = servers
         .iter()
@@ -1394,7 +1140,7 @@ fn suggest_server_names(servers: &[McpLockServer], query: &str) -> Vec<String> {
         return prefix.into_iter().map(escape_name).collect();
     }
 
-    // Fall through to edit-distance suggestions for the remaining slots.
+    // Edit-distance suggestions for the remaining slots.
     let mut distance: Vec<(usize, &str)> = servers
         .iter()
         .filter(|s| !prefix.contains(&s.name.as_str()))
@@ -1414,10 +1160,8 @@ fn suggest_server_names(servers: &[McpLockServer], query: &str) -> Vec<String> {
     out
 }
 
-/// Stable, env-only view of a server's transport — surfaces the
-/// information `tirith mcp explain` exposes (named env vars, sanitized
-/// command/args, redacted URL) without re-exposing the underlying
-/// `McpTransport` enum's value-carrying form.
+/// Stable, env-only view of a server's transport for `tirith mcp explain` —
+/// without re-exposing the underlying `McpTransport`'s value-carrying form.
 #[derive(serde::Serialize)]
 struct TransportView<'a> {
     kind: &'static str,
@@ -1429,8 +1173,7 @@ struct TransportView<'a> {
     command: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     args: Option<&'a [String]>,
-    /// Just the env-variable **names**. The lockfile stores only hashes
-    /// for the values; this view never reaches a raw value.
+    /// Env-variable names only — the lockfile stores only value hashes.
     #[serde(skip_serializing_if = "Option::is_none")]
     env_names: Option<Vec<&'a str>>,
 }
@@ -1558,22 +1301,11 @@ fn print_explain_human(lock_path: &Path, entry: &McpLockServer) {
     }
 }
 
-// ===========================================================================
 // `tirith mcp permissions` — per-capability aggregation across all servers
-// ===========================================================================
 
-/// Capability tags surfaced by `tirith mcp permissions`.
-///
-/// Derived from the lockfile structure rather than parsed from a
-/// permissions key — the MCP lockfile schema does not store an explicit
-/// capability list per server today. Each tag below names both the field
-/// the derivation reads and the security-relevant property the tag
-/// describes.
-///
-/// The list is closed and small on purpose: every tag costs an English
-/// label in the human output and a string in the JSON envelope, so
-/// expanding the surface beyond what the lockfile structurally
-/// distinguishes risks the output drifting from the data.
+/// Capability tags surfaced by `tirith mcp permissions`, derived from the
+/// lockfile structure (the schema has no explicit per-server capability list).
+/// Kept closed and small so the output can't drift from the data.
 const CAP_NETWORK: &str = "network";
 const CAP_PROCESS_SPAWN: &str = "process-spawn";
 const CAP_ENV_SECRET: &str = "env-secret";
@@ -1583,11 +1315,8 @@ const CAP_AWS: &str = "aws";
 const CAP_RUNTIME_TOOL_WILDCARD: &str = "runtime-tool-wildcard";
 const CAP_UNKNOWN_TRANSPORT: &str = "unknown-transport";
 
-/// Derive the capability tag set for one locked server.
-///
-/// Returns an ordered, deduplicated list. The ordering is stable (the
-/// declaration order of the `caps` Vec) so two equal inputs produce a
-/// byte-identical JSON tag list.
+/// Derive the capability tag set for one locked server: ordered (stable) and
+/// deduplicated, so two equal inputs produce a byte-identical tag list.
 fn derive_capabilities(entry: &McpLockServer) -> Vec<&'static str> {
     let mut caps: Vec<&'static str> = Vec::new();
     let mut push = |c: &'static str| {
@@ -1625,9 +1354,8 @@ fn derive_capabilities(entry: &McpLockServer) -> Vec<&'static str> {
     caps
 }
 
-/// `*_TOKEN` / `*_KEY` / `*_SECRET` / `*_PASSWORD` heuristic — broad,
-/// known to over-match, but better than missing the common case. Names
-/// are compared ASCII-case-insensitive.
+/// `*_TOKEN` / `*_KEY` / `*_SECRET` / `*_PASSWORD` heuristic (ASCII
+/// case-insensitive) — broad, over-matches, but catches the common case.
 fn env_name_is_secret_shaped(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.ends_with("_TOKEN")
@@ -1654,24 +1382,13 @@ fn env_name_matches_aws(name: &str) -> bool {
     upper.starts_with("AWS_")
 }
 
-/// Run `tirith mcp permissions`.
+/// Run `tirith mcp permissions`. Aggregates a per-capability view across every
+/// locked server (grouped by network / stdio-process / env-secret / github-api
+/// / …). `wildcards:` lists servers whose `tools` key was omitted (an MCP client
+/// treats that as "any runtime tool").
 ///
-/// Loads `.tirith/mcp.lock` and aggregates a per-capability view across
-/// every locked server. Output groups servers by the capability they
-/// imply (network / stdio-process / env-secret / github-api / …) so an
-/// operator can see "every server that can talk to the network" or
-/// "every server that requires a secret env" at a glance.
-///
-/// `wildcards:` lists servers whose `tools` key was omitted in the
-/// source config — an MCP client treats that as "any tool the server
-/// runtime exposes", which is a wildcard the operator may not have
-/// intended.
-///
-/// Exit codes:
-/// * `0` — the aggregation was printed.
-/// * `1` — the lockfile is missing or unreadable, or the JSON output
-///   could not be written.
-/// * `2` — usage error (none defined today; reserved).
+/// Exit codes: `0` printed; `1` missing/unreadable lockfile or JSON write
+/// failure; `2` reserved usage error.
 pub fn permissions(json: bool) -> i32 {
     let repo_root = match resolve_repo_root() {
         Some(r) => r,
@@ -1723,27 +1440,21 @@ pub fn permissions(json: bool) -> i32 {
     0
 }
 
-/// One capability group in the permissions aggregation — the capability
-/// tag and every server that declared it.
+/// One capability group: the tag and every server that declared it.
 #[derive(Debug, Clone, serde::Serialize)]
 struct PermissionGroup {
     capability: &'static str,
-    /// Servers that declared the capability, sorted by name for
-    /// deterministic output.
+    /// Servers that declared it, sorted by name for deterministic output.
     servers: Vec<String>,
-    /// True when the capability is unbounded — currently only set for
-    /// `runtime-tool-wildcard` (an omitted `tools` key) and
-    /// `unknown-transport`. Surfaces in a separate `wildcards:` block.
+    /// Unbounded capability (`runtime-tool-wildcard` / `unknown-transport`) —
+    /// surfaced in a separate `wildcards:` block.
     wildcard: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PermissionsAggregation {
-    /// Total servers in the lockfile (informational).
     server_count: usize,
-    /// Capability groups sorted by (a) named capability alphabetical,
-    /// (b) wildcard capabilities last. Wildcards are separated in the
-    /// human print but kept in the same list for the JSON consumer.
+    /// Capability groups, named first (alphabetical) then wildcards last.
     groups: Vec<PermissionGroup>,
 }
 
@@ -1852,11 +1563,8 @@ mod tests {
 
     #[test]
     fn describe_transport_renders_each_variant() {
-        // URL / command / args are debug-escaped through `escape_name`, so the
-        // human-summary string is the Debug-quoted form. Costless for well-
-        // formed inputs (they round-trip with surrounding quotes) and the
-        // principled default for any future code path that introduces an
-        // attacker-controllable transport string.
+        // URL / command / args are debug-escaped, so the summary is the
+        // Debug-quoted form (well-formed inputs round-trip with quotes).
         assert_eq!(
             describe_transport(&McpTransport::Url {
                 url: "https://x.example".into(),
@@ -1880,9 +1588,8 @@ mod tests {
             }),
             r#"stdio "npx" "-y" "server""#
         );
-        // A stdio server with env: the variable NAMES are shown (debug-escaped
-        // so a control byte inside a name cannot reach the terminal); raw
-        // values are not stored anywhere, much less printed.
+        // A stdio server with env: variable names shown (debug-escaped); raw
+        // values are never stored or printed.
         assert_eq!(
             describe_transport(&McpTransport::Stdio {
                 command: "node".into(),
@@ -1902,11 +1609,8 @@ mod tests {
 
     #[test]
     fn describe_transport_annotates_url_with_userinfo() {
-        // A redacted URL whose source declared credentials prints with a
-        // fixed `(credentials in source URL)` annotation so the operator
-        // can see the redaction fired — without revealing the credential
-        // itself (which has been stripped from `url` and only a salted
-        // hash remains).
+        // A redacted URL whose source declared credentials prints the
+        // `(credentials in source URL)` annotation, never the credential.
         assert_eq!(
             describe_transport(&McpTransport::Url {
                 url: "https://mcp.example.com/sse".into(),
@@ -1914,8 +1618,7 @@ mod tests {
             }),
             r#"url "https://mcp.example.com/sse" (credentials in source URL)"#
         );
-        // The annotation MUST NOT contain the hash itself — the print
-        // surface is for the human, the hash is a wire-format detail.
+        // The annotation MUST NOT contain the hash itself.
         let printed = describe_transport(&McpTransport::Url {
             url: "https://mcp.example.com/sse".into(),
             userinfo_hash: Some("supersecrethashvalue".into()),
@@ -1932,18 +1635,12 @@ mod tests {
 
     #[test]
     fn describe_transport_escapes_control_bytes_in_env_names() {
-        // Finding F: a maliciously-crafted env name containing ANSI escapes /
-        // newlines / control bytes must NOT inject raw control bytes into the
-        // operator's terminal. Debug formatting renders them as `\u{1b}`,
-        // `\n`, etc.
+        // A hostile env name with ANSI/newline/control bytes must NOT reach the
+        // terminal raw — Debug formatting renders them as `\u{1b}`, `\n`, etc.
         let env = vec![
-            // ANSI red — would colourize subsequent terminal output if printed raw.
             McpEnvEntry::from_raw("\x1b[31mREDNAME", "ignored"),
-            // Multiline name — a raw print would split the summary across lines.
             McpEnvEntry::from_raw("MULTI\nLINE", "ignored"),
-            // Carriage return — terminals would overwrite the current line.
             McpEnvEntry::from_raw("OVERWRITE\rATTACK", "ignored"),
-            // Backspace — would erase preceding characters in the rendering.
             McpEnvEntry::from_raw("ERASE\x08", "ignored"),
         ];
         let out = describe_transport(&McpTransport::Stdio {
@@ -1952,8 +1649,7 @@ mod tests {
             env,
         });
 
-        // No raw control byte may appear in the output. Iterating chars rather
-        // than bytes is fine — every control codepoint is one ASCII byte.
+        // No raw control byte may appear in the output.
         for ch in out.chars() {
             assert!(
                 !ch.is_control(),
@@ -1962,8 +1658,7 @@ mod tests {
                 ch as u32,
             );
         }
-        // And the escaped forms ARE present — proving the names did reach the
-        // formatter, they just went through Debug escaping.
+        // And the escaped forms ARE present.
         for needle in [r"\u{1b}", r"\n", r"\r", r"\u{8}"] {
             assert!(
                 out.contains(needle),
@@ -1974,15 +1669,8 @@ mod tests {
 
     #[test]
     fn describe_transport_escapes_control_bytes_in_transport_fields() {
-        // CodeRabbit follow-up: the URL, command, and args fields all
-        // originate from `.mcp.json` and must be debug-escaped before
-        // reaching the terminal. The pre-fix code emitted them verbatim,
-        // letting ANSI / CR / BEL bytes carried in a hostile config rewrite
-        // the operator's rendering. Every transport-derived string now
-        // goes through `escape_name` (Debug formatting).
-        //
-        // URL variant: ANSI red embedded in the (already userinfo-stripped)
-        // URL would colourize every subsequent terminal byte if printed raw.
+        // URL/command/args all come from `.mcp.json` and must be debug-escaped
+        // before reaching the terminal (CodeRabbit follow-up).
         let url_out = describe_transport(&McpTransport::Url {
             url: "https://evil\x1b[31m.example".into(),
             userinfo_hash: None,
@@ -2000,8 +1688,7 @@ mod tests {
             "expected escaped ESC form in url transport line: {url_out:?}",
         );
 
-        // Stdio command + args: CR in command and BEL/newline in args. None
-        // may reach the terminal raw.
+        // Stdio command + args: CR in command, BEL/newline in args.
         let stdio_out = describe_transport(&McpTransport::Stdio {
             command: "evil\rcmd".into(),
             args: vec!["safe".into(), "bell\x07arg".into(), "multi\nline".into()],
@@ -2025,35 +1712,22 @@ mod tests {
 
     #[test]
     fn format_rejected_config_lines_escapes_control_bytes_in_path() {
-        // CodeRabbit cid 3292118208: a hostile `RejectedConfig::path`
-        // carrying ANSI escapes / newlines / control bytes must NOT inject
-        // raw bytes into the operator's terminal when `tirith mcp lock`
-        // renders the human-readable "rejected configs" note. Same
-        // convention the env-name printer (`describe_transport`) and the
-        // server/tool-name printer (`escape_name`) already apply: Debug
-        // formatting renders every control byte as `\u{NN}` / `\n` / `\r` /
-        // etc. and quotes the value, so no raw byte reaches stderr.
+        // A hostile `RejectedConfig::path` with control bytes must NOT reach the
+        // terminal raw when `mcp lock` renders the "rejected configs" note —
+        // Debug-escaped like the env-name / server-name printers.
         let rejected = vec![
-            // ANSI red — would colourize subsequent terminal output if
-            // printed raw.
             mcp_lock::RejectedConfig {
                 path: "\x1b[31mhostile-red.json".to_string(),
                 reason: mcp_lock::RejectedReason::Symlink,
             },
-            // Multiline path — a raw print would split the summary across
-            // lines and let the second line masquerade as a different
-            // diagnostic.
             mcp_lock::RejectedConfig {
                 path: "multi\nline.json".to_string(),
                 reason: mcp_lock::RejectedReason::NotRegularFile,
             },
-            // Carriage return — terminals would overwrite the current line.
             mcp_lock::RejectedConfig {
                 path: "overwrite\rattack.json".to_string(),
                 reason: mcp_lock::RejectedReason::OutsideRepo,
             },
-            // Backspace — would erase preceding characters in the
-            // rendering.
             mcp_lock::RejectedConfig {
                 path: "erase\x08.json".to_string(),
                 reason: mcp_lock::RejectedReason::Unreadable {
@@ -2070,9 +1744,7 @@ mod tests {
              {lines:?}",
         );
 
-        // No raw control byte may appear in any rendered line. Iterating
-        // chars is fine — every control codepoint is one ASCII byte and a
-        // valid char.
+        // No raw control byte may appear in any rendered line.
         for line in &lines {
             for ch in line.chars() {
                 assert!(
@@ -2085,10 +1757,7 @@ mod tests {
             }
         }
 
-        // And the escaped forms ARE present — proving the path did reach
-        // the formatter, it just went through Debug escaping. (The form
-        // `r"\u{1b}"` is the literal four-char sequence Rust's Debug
-        // produces for `\x1b`; same convention as the env-name test.)
+        // And the escaped forms ARE present.
         let joined = lines.join("\n");
         for needle in [r"\u{1b}", r"\n", r"\r", r"\u{8}"] {
             assert!(
@@ -2110,7 +1779,6 @@ mod tests {
         assert!(lock_path.is_file(), ".tirith/mcp.lock must exist");
 
         let contents = fs::read_to_string(&lock_path).unwrap();
-        // Round-trips back to the same lockfile.
         let parsed: McpLockfile = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed, lockfile);
     }
@@ -2134,14 +1802,9 @@ mod tests {
         assert_eq!(first, second, "re-writing an unchanged lockfile is stable");
     }
 
-    // -----------------------------------------------------------------------
-    // Chunk 2 — `tirith mcp verify` / `tirith mcp diff` integration tests.
-    //
-    // These drive the `*_for_root` helpers against tempdir layouts so each
-    // test is fully isolated and the env-var-mutating production
-    // `resolve_repo_root` is not exercised here (it is covered by the
-    // existing `lock` tests).
-    // -----------------------------------------------------------------------
+    // `tirith mcp verify` / `diff` integration tests drive the `*_for_root`
+    // helpers against tempdirs so each is isolated from env-var-mutating
+    // `resolve_repo_root`.
 
     /// Build a repo with one MCP config and a matching lockfile.
     fn repo_with_locked_mcp() -> tempfile::TempDir {
@@ -2168,7 +1831,7 @@ mod tests {
     #[test]
     fn verify_exits_one_when_server_added() {
         let repo = repo_with_locked_mcp();
-        // Add a new server to the config — now the inventory has drifted.
+        // Add a server — the inventory has now drifted.
         fs::write(
             repo.path().join(".mcp.json"),
             r#"{ "mcpServers": {
@@ -2183,8 +1846,7 @@ mod tests {
 
     #[test]
     fn verify_exits_one_when_env_value_rotated() {
-        // Snapshot one server with an env value, then rotate the value in
-        // the config: the env value-hash flips, drift fires, exit 1.
+        // Rotate an env value: the value-hash flips, drift fires, exit 1.
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2211,7 +1873,7 @@ mod tests {
 
     #[test]
     fn verify_exits_two_when_lockfile_missing() {
-        // No `.tirith/mcp.lock` at all — that is a usage error, not drift.
+        // No lockfile is a usage error, not drift.
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2234,7 +1896,6 @@ mod tests {
 
     #[test]
     fn verify_with_json_exits_zero_when_inventory_matches() {
-        // JSON path must not regress the exit-code contract.
         let repo = repo_with_locked_mcp();
         let code = verify_for_root(repo.path(), true);
         assert_eq!(code, 0);
@@ -2243,7 +1904,6 @@ mod tests {
     #[test]
     fn diff_always_exits_zero_even_when_drift_present() {
         let repo = repo_with_locked_mcp();
-        // Drift the inventory.
         fs::write(
             repo.path().join(".mcp.json"),
             r#"{ "mcpServers": {
@@ -2265,8 +1925,7 @@ mod tests {
 
     #[test]
     fn diff_exits_two_when_lockfile_missing() {
-        // Even for the informational verb, no-lockfile is a usage error so
-        // a piped consumer can distinguish "no drift" from "nothing to diff".
+        // No-lockfile is a usage error even for the informational verb.
         let repo = tempdir().unwrap();
         let code = diff_for_root(repo.path(), false);
         assert_eq!(code, 2);
@@ -2274,17 +1933,13 @@ mod tests {
 
     #[test]
     fn escape_name_renders_control_bytes_safely() {
-        // A server / env / tool name carrying a control byte must NOT
-        // inject raw bytes into the operator's terminal — debug formatting
-        // escapes them.
+        // A name carrying a control byte must NOT reach the terminal raw.
         let escaped = escape_name("\x1b[31mEVIL");
         assert!(!escaped.contains('\x1b'), "raw ESC must not survive");
         assert!(escaped.contains("\\u{1b}"));
     }
 
-    // -----------------------------------------------------------------------
-    // Chunk 3 — `tirith mcp policy init` scaffolding.
-    // -----------------------------------------------------------------------
+    // `tirith mcp policy init` scaffolding.
 
     /// Build a repo with one stdio server declaring two tools, lockfile written.
     fn repo_with_locked_server_and_tools() -> tempfile::TempDir {
@@ -2313,13 +1968,11 @@ mod tests {
             ".tirith/mcp-policy.yaml.example must exist after policy init"
         );
         let body = fs::read_to_string(&example_path).unwrap();
-        // The server name and the tool names appear in the scaffold.
         assert!(body.contains("fs"), "server name must appear: {body}");
         assert!(body.contains("read_file"), "tool name must appear: {body}");
         assert!(body.contains("write_file"), "tool name must appear: {body}");
-        // And every entry is commented out by design.
+        // Every entry must appear only commented out (preceded by `#`).
         for needle in ["- fs", "fs:"] {
-            // Either appears, but only as a commented form (preceded by `#`).
             let lines: Vec<&str> = body
                 .lines()
                 .filter(|l| l.contains(needle) && !l.trim_start().starts_with('#'))
@@ -2329,7 +1982,6 @@ mod tests {
                 "an uncommented `{needle}` slipped into the scaffold: {lines:?}",
             );
         }
-        // Includes the documentation header.
         assert!(body.contains("Tirith MCP policy scaffold"));
         assert!(body.contains("scan:"));
         assert!(body.contains("trusted_mcp_servers"));
@@ -2338,16 +1990,14 @@ mod tests {
 
     #[test]
     fn policy_init_is_deterministic_for_same_lockfile() {
-        // Running policy_init twice against the same lockfile produces a
-        // byte-identical example file. --force lets us regenerate without
-        // pre-deleting.
+        // Two runs against the same lockfile produce a byte-identical file.
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
         let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
         let first = fs::read_to_string(&example_path).unwrap();
 
-        let code = policy_init_for_root(repo.path(), false, true); // force overwrite
+        let code = policy_init_for_root(repo.path(), false, true);
         assert_eq!(code, 0);
         let second = fs::read_to_string(&example_path).unwrap();
 
@@ -2362,13 +2012,12 @@ mod tests {
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
-        // Second run without --force should fail with exit 1.
+        // Second run without --force must refuse (exit 1).
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(
             code, 1,
             "second policy_init without --force must refuse to overwrite",
         );
-        // The example file is still the FIRST one (we didn't overwrite).
         let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
         assert!(example_path.is_file());
     }
@@ -2377,7 +2026,7 @@ mod tests {
     fn policy_init_overwrites_with_force() {
         let repo = repo_with_locked_server_and_tools();
         let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
-        // Pre-create a sentinel that policy_init must overwrite.
+        // Pre-create a sentinel that --force must overwrite.
         fs::create_dir_all(example_path.parent().unwrap()).unwrap();
         fs::write(&example_path, "SENTINEL").unwrap();
 
@@ -2390,8 +2039,7 @@ mod tests {
 
     #[test]
     fn policy_init_handles_missing_lockfile() {
-        // No .tirith/mcp.lock — policy_init still writes a header-only
-        // scaffold (the operator gets a starting point) and exits 0.
+        // No lockfile — still writes a header-only scaffold and exits 0.
         let repo = tempdir().unwrap();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0, "missing lockfile must not be fatal");
@@ -2402,7 +2050,6 @@ mod tests {
             body.contains("No `.tirith/mcp.lock` was found"),
             "header should explain the missing-lockfile case: {body}",
         );
-        // No server entries.
         assert!(!body.contains("- fs"));
     }
 
@@ -2422,10 +2069,7 @@ mod tests {
 
     #[test]
     fn policy_init_handles_lockfile_with_no_servers() {
-        // A lockfile that was generated against a repo with no MCP configs
-        // (or all-empty MCP configs) lists zero servers. The scaffold
-        // emits a template form rather than nothing — the operator still
-        // gets to see what they would fill in.
+        // A lockfile listing zero servers still emits a template form.
         let repo = tempdir().unwrap();
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
@@ -2439,20 +2083,15 @@ mod tests {
             body.contains("The lockfile recorded no MCP servers"),
             "scaffold should explain the empty case and emit a template: {body}",
         );
-        // The template uses an "example-server" name so the operator sees
-        // the shape they should fill in.
         assert!(body.contains("example-server"));
     }
 
     #[test]
     fn policy_init_redacts_hostile_server_name() {
-        // A server name carrying ANSI escape / newline / backspace must
-        // NOT inject raw bytes into the example file (which would in turn
-        // inject when the operator `cat`s the file). yaml_safe_scalar
+        // A hostile server name must NOT inject raw bytes into the example file
+        // (which would inject when the operator `cat`s it) — yaml_safe_scalar
         // quotes-and-escapes them.
         let repo = tempdir().unwrap();
-        // Manually build a lockfile with a hostile name (bypass the
-        // JSON parser, which would also accept escapes).
         let inv = mcp_lock::McpInventory {
             servers: vec![mcp_lock::McpServerEntry {
                 name: "ev\x1b[31mil\nname".into(),
@@ -2477,8 +2116,7 @@ mod tests {
         assert_eq!(code, 0);
         let body = fs::read_to_string(repo.path().join(".tirith").join("mcp-policy.yaml.example"))
             .unwrap();
-        // No raw ESC, BS, or unescaped newline-in-a-token. (Newlines as
-        // line separators are fine — we check character context.)
+        // No raw ESC / BS within any line (newline line separators are fine).
         for line in body.lines() {
             assert!(
                 !line.contains('\x1b'),
@@ -2496,17 +2134,14 @@ mod tests {
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), true, false);
         assert_eq!(code, 0);
-        // The file is still on disk.
         let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
         assert!(example_path.is_file());
     }
 
     #[test]
     fn build_policy_scaffold_dedups_repeated_server_names_in_yaml() {
-        // Two distinct lockfile entries for the same server name (a
-        // legal lockfile state) must not produce two `- name` lines in
-        // the `trusted_mcp_servers` block — that would be confusing
-        // duplication for the operator.
+        // Two lockfile entries for the same name must not produce two `- name`
+        // lines in `trusted_mcp_servers`.
         let scaffold = PolicyScaffold {
             lockfile_present: true,
             servers: vec![
@@ -2523,7 +2158,6 @@ mod tests {
             ],
         };
         let yaml = render_policy_scaffold_yaml(&scaffold);
-        // Count the lines that look like `#   - dup` (a trusted-servers entry).
         let trust_lines: Vec<&str> = yaml
             .lines()
             .filter(|l| l.trim_start().starts_with("#   - dup"))
@@ -2534,20 +2168,17 @@ mod tests {
             "duplicate server name should appear once in trusted_mcp_servers: \
              got {trust_lines:?}",
         );
-        // And the mcp_allowed_tools block lists the UNION of tools across both entries.
+        // mcp_allowed_tools lists the UNION of tools across both entries.
         assert!(yaml.contains("- a"));
         assert!(yaml.contains("- b"));
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F2 — `verify`'s JSON-write failure must NOT collapse
-    // the drift exit code (1) into a usage error (2). Pin the truth table
-    // for `verify_exit_code`.
-    // -----------------------------------------------------------------------
+    // Finding F2 — `verify`'s JSON-write failure must NOT collapse the drift
+    // exit code (1) into a usage error (2). Truth table for `verify_exit_code`.
 
     #[test]
     fn verify_exit_code_drift_with_json_write_failure_preserves_drift() {
-        // The bug fix: drift detected AND json write failed → 1, not 2.
+        // Drift detected AND json write failed → 1, not 2.
         assert_eq!(
             verify_exit_code(false, false),
             1,
@@ -2557,8 +2188,7 @@ mod tests {
 
     #[test]
     fn verify_exit_code_no_drift_with_json_write_failure_is_usage_error() {
-        // Without drift, the only signal the consumer would see is the
-        // JSON payload, which is broken. Surface as usage-class failure.
+        // Without drift, the only consumer signal (the JSON) is broken.
         assert_eq!(
             verify_exit_code(true, false),
             2,
@@ -2572,17 +2202,11 @@ mod tests {
         assert_eq!(verify_exit_code(false, true), 1, "drift, write OK → 1");
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F17 — `yaml_safe_scalar` is byte-identical after
-    // collapsing the indicator-set check into a constant. Spot-check the
-    // boundaries: every indicator byte forces quoting, every safe byte
+    // Finding F17 — every YAML indicator byte forces quoting, every safe byte
     // does not.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn yaml_safe_scalar_quotes_every_indicator_byte() {
-        // Every byte in the centralized indicator list must force quoting
-        // (the scalar comes back as a `"..."` quoted form, not bare).
         for &b in YAML_NEEDS_QUOTING_BYTES {
             let s = format!("a{}b", b as char);
             let out = yaml_safe_scalar(&s);
@@ -2596,7 +2220,6 @@ mod tests {
 
     #[test]
     fn yaml_safe_scalar_does_not_quote_safe_strings() {
-        // Plain ASCII identifiers: must come back unmodified.
         for safe in &["abc", "myserver", "TOOL_NAME", "v1_2_3", "a.b.c", "fooBar"] {
             assert_eq!(
                 yaml_safe_scalar(safe),
@@ -2608,8 +2231,8 @@ mod tests {
 
     #[test]
     fn yaml_safe_scalar_quotes_control_bytes() {
-        // Control bytes are NOT in YAML_NEEDS_QUOTING_BYTES (they're
-        // checked separately) — but they still force quoting.
+        // Control bytes are checked separately from YAML_NEEDS_QUOTING_BYTES but
+        // still force quoting.
         for b in 0u8..0x20 {
             let s = format!("a{}b", b as char);
             let out = yaml_safe_scalar(&s);
@@ -2624,25 +2247,15 @@ mod tests {
         assert!(out.starts_with('"'));
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F13 (PRT CG-2) — the YAML scaffold output is never
-    // parsed back in the existing tests, so a render-side bug that produced
-    // structurally-broken YAML for a hostile name would be invisible. Pin
-    // the contract: a scaffold rendered for a hostile name parses cleanly
-    // through `serde_yaml`, and `yaml_safe_scalar`'s output for every YAML
-    // special character round-trips byte-for-byte through a real YAML parser.
-    // -----------------------------------------------------------------------
+    // Finding F13 (PRT CG-2) — a scaffold rendered for a hostile name must parse
+    // cleanly through `serde_yaml`, and `yaml_safe_scalar`'s output round-trips
+    // byte-for-byte through a real YAML parser.
 
     #[test]
     fn policy_init_scaffold_yaml_parses_after_uncomment() {
-        // A scaffold rendered for a server name carrying ANSI escapes /
-        // newlines / control bytes (a hostile-but-legal name a config might
-        // declare or a round-trip from an attacker-controlled source) must
-        // produce structurally-valid YAML even after the operator uncomments
-        // the `trusted_mcp_servers` block. `yaml_safe_scalar` is what
-        // guarantees this — every special character is quoted-and-escaped —
-        // and this test pins the contract by actually parsing the rendered
-        // bytes back through `serde_yaml`.
+        // A scaffold for a hostile name must produce valid YAML even after the
+        // operator uncomments the `trusted_mcp_servers` block — guaranteed by
+        // `yaml_safe_scalar`. Pin it by parsing the rendered bytes back.
         let hostile = "ev\u{1b}[31mil\nname";
 
         let scaffold = PolicyScaffold {
@@ -2655,21 +2268,10 @@ mod tests {
         };
         let body = render_policy_scaffold_yaml(&scaffold);
 
-        // Programmatically uncomment the `trusted_mcp_servers:` header and
-        // its single list entry. The block looks like:
-        //
-        //   # trusted_mcp_servers:
-        //   #   - "ev\u{1b}[31mil\nname"    # from .mcp.json
-        //
-        // We turn `\n  # trusted_mcp_servers:` into `\n  trusted_mcp_servers:`
-        // (matching the render's two-space indent and the leading newline so
-        // we only ever match the canonical site), then uncomment each list
-        // entry directly underneath.
+        // Programmatically uncomment the `trusted_mcp_servers:` header (only the
+        // canonical two-space-indented site) and each list entry underneath.
         let uncommented_header =
             body.replace("\n  # trusted_mcp_servers:", "\n  trusted_mcp_servers:");
-        // The list-entry lines start with `  #   - ` (two-space indent +
-        // `#   - ` per render). Strip the `#   ` prefix so the entry is
-        // a real list item under the now-uncommented key.
         let uncommented: String = uncommented_header
             .lines()
             .map(|line| {
@@ -2681,16 +2283,14 @@ mod tests {
             })
             .collect();
 
-        // The uncommented YAML must parse.
         let parsed: serde_yaml::Value = serde_yaml::from_str(&uncommented).unwrap_or_else(|e| {
             panic!(
                 "scaffold YAML must parse cleanly after uncommenting:\nerror: {e}\nbody:\n{uncommented}"
             )
         });
 
-        // And the loaded server name must byte-equal the hostile input — no
-        // characters lost, no escapes leaking through as literal `\u{1b}`
-        // text instead of the real ESC byte.
+        // The loaded name must byte-equal the hostile input (no escapes leaking
+        // through as literal text).
         let names = parsed
             .get("scan")
             .and_then(|s| s.get("trusted_mcp_servers"))
@@ -2708,20 +2308,9 @@ mod tests {
 
     #[test]
     fn yaml_safe_scalar_round_trips_through_yaml_parser() {
-        // Table-driven: every YAML special character, every control-byte
-        // class that round-trips through a YAML parser, plus multi-byte
-        // UTF-8 and the empty string. For each input, feed
-        // `yaml_safe_scalar`'s output into a one-key YAML document, parse
-        // it, and assert the parser recovers the exact input byte-for-byte.
-        //
-        // **Known gap (production):** `yaml_safe_scalar` calls
-        // `serde_json::to_string`, which does NOT escape DEL (`\x7f`) —
-        // JSON treats it as printable, but YAML 1.2 §5.7 disallows it
-        // inside a double-quoted scalar. The dedicated
-        // `yaml_safe_scalar_does_not_round_trip_del_documents_known_gap`
-        // test below pins that asymmetry so a future production-code fix
-        // (escape DEL alongside the < 0x20 control bytes) has a regression
-        // test ready to flip green.
+        // Table-driven: for each input, feed `yaml_safe_scalar`'s output into a
+        // one-key YAML doc, parse it, assert byte-for-byte recovery. DEL
+        // (`\x7f`) is the one known gap — pinned by the separate DEL test below.
         let cases: &[&str] = &[
             // YAML reserved indicators (the set centralized in
             // `YAML_NEEDS_QUOTING_BYTES`).
@@ -2767,24 +2356,11 @@ mod tests {
 
     #[test]
     fn yaml_safe_scalar_round_trips_del() {
-        // Documents the production-code gap surfaced while landing F13:
-        // `yaml_safe_scalar` uses `serde_json::to_string`, which (per the
-        // JSON spec) emits DEL (`\x7f`) as the raw byte rather than a
-        // `` escape. YAML 1.2 §5.7 disallows DEL inside a
-        // double-quoted scalar, so the round-trip fails. The output is
-        // still quoted (the `quotes_control_bytes` test pins that) — it
-        // just isn't parseable.
-        //
-        // The fix is a one-line change in `yaml_safe_scalar` (post-process
-        // the JSON output to escape DEL as `` before returning), but
-        // it's behavior outside the scope of batch B (tests-only). When a
-        // future production-code fix lands, this test should flip green
-        // (the parse should succeed and recover DEL) — `assert!(parsed.is_err())`
-        // is what makes that pivot explicit.
+        // `yaml_safe_scalar` escapes DEL (`\x7f`) as `\u007F` so it
+        // round-trips: raw DEL (what serde_json emits) is disallowed inside a
+        // YAML 1.2 §5.7 double-quoted scalar.
         let scalar = yaml_safe_scalar("\x7f");
-        // The output is still quoted (forces quoting via the control-byte
-        // check), proving the safety-quoting rule fires — the gap is only
-        // about the escape, not the quoting.
+        // Still quoted (the control-byte check fires); the gap was the escape.
         assert!(
             scalar.starts_with('"') && scalar.ends_with('"'),
             "DEL must still be quoted (forces quoting): {scalar:?}",
@@ -2804,19 +2380,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 17 — `format_inventory_server_line` debug-escapes
-    // both the server name and the source_config path so a hostile
-    // `.mcp.json` cannot smuggle ANSI / CR / BEL / control bytes through
-    // the inventory printer. Adjacent printers in this file already
-    // followed this discipline; this site was missed.
-    // -----------------------------------------------------------------------
+    // PR #121 item 17 — `format_inventory_server_line` debug-escapes both the
+    // server name and source_config so a hostile `.mcp.json` can't smuggle
+    // ANSI/CR/BEL through the inventory printer (this site was missed).
 
     #[test]
     fn format_inventory_server_line_escapes_ansi_in_name_and_source() {
-        // Server name carries an ANSI red-foreground sequence. A raw
-        // print would recolour every subsequent terminal byte until the
-        // next ANSI reset.
         let server = mcp_lock::McpServerEntry {
             name: "evil\x1b[31m".into(),
             transport: mcp_lock::McpTransport::Stdio {
@@ -2826,17 +2395,14 @@ mod tests {
             },
             tools: vec!["read".into()],
             tools_declared: true,
-            // Source config path with a CR + BEL — a raw print would
-            // overwrite the line and beep at the operator.
             source_config: "hostile\rpath\x07.mcp.json".into(),
         };
         let line = format_inventory_server_line(&server);
-        // No raw ESC byte must reach the printer's output.
+        // No raw ESC / CR / BEL byte may reach the printer's output.
         assert!(
             !line.chars().any(|c| c == '\x1b'),
             "raw ESC byte must NOT appear in formatted line: {line:?}",
         );
-        // No raw CR or BEL either.
         assert!(
             !line.chars().any(|c| c == '\r'),
             "raw CR byte must NOT appear in formatted line: {line:?}",
@@ -2845,9 +2411,7 @@ mod tests {
             !line.chars().any(|c| c == '\x07'),
             "raw BEL byte must NOT appear in formatted line: {line:?}",
         );
-        // The escaped form should be visible — `escape_name` and
-        // Debug-format both render control bytes as `\u{NN}` / `\x...`
-        // escapes.
+        // The escaped (legible) form should still be visible.
         assert!(
             line.contains("evil"),
             "the legible portion of the name should still appear: {line}",
@@ -2858,16 +2422,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 CR follow-up — `format_inventory_server_line` distinguishes
-    // the three tools states (omitted / declared empty / declared with N
-    // entries). The pre-fix renderer collapsed "omitted" and "explicit
-    // empty" into the same string, which hid a real policy ambiguity:
-    // "tools omitted" means the runtime may surface any tool the server
-    // exposes, while `"tools": []` is an explicit zero-tool allowlist.
-    // The lockfile already captures the distinction via the
-    // `tools_declared` bool; the printer now branches on it.
-    // -----------------------------------------------------------------------
+    // PR #121 CR follow-up — `format_inventory_server_line` distinguishes the
+    // three tools states (omitted / declared empty / N entries) via
+    // `tools_declared`; the pre-fix renderer collapsed omitted and explicit-empty.
 
     #[test]
     fn format_inventory_server_line_distinguishes_tools_states() {
@@ -2876,8 +2433,7 @@ mod tests {
             args: vec![],
             env: vec![],
         };
-        // State 1: tools omitted in the source config — runtime may expose
-        // any tool the server defines.
+        // State 1: tools omitted — runtime may expose any tool.
         let omitted = mcp_lock::McpServerEntry {
             name: "srv-omitted".into(),
             transport: base_transport.clone(),
@@ -2895,7 +2451,7 @@ mod tests {
             "omitted-tools state must mention runtime tools: {line_omitted}",
         );
 
-        // State 2: tools explicitly declared as `[]` — zero-tool allowlist.
+        // State 2: tools declared as `[]` — zero-tool allowlist.
         let empty_declared = mcp_lock::McpServerEntry {
             name: "srv-empty".into(),
             transport: base_transport.clone(),
@@ -2913,7 +2469,7 @@ mod tests {
             "explicit-empty state must mention 'explicit empty': {line_empty}",
         );
 
-        // State 3: tools declared with N entries — normal case, count is shown.
+        // State 3: N declared tools — count is shown.
         let with_tools = mcp_lock::McpServerEntry {
             name: "srv-tools".into(),
             transport: base_transport,
@@ -2928,16 +2484,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 16 — `format_rejected_config_lines` is reachable
-    // (and rendered) even when the inventory is otherwise empty. The
-    // helper is already covered by `format_rejected_config_lines_*`
-    // tests above; this test asserts that an inventory carrying ONLY
-    // rejected_configs (no servers, no parseable configs) still
-    // produces a non-empty rejected-config render — pinning the
-    // contract that the early-return branch of `print_human` is no
-    // longer the only consumer.
-    // -----------------------------------------------------------------------
+    // PR #121 item 16 — an inventory carrying ONLY rejected_configs (no servers,
+    // no parseable configs) still produces a non-empty rejected-config render.
 
     #[test]
     fn rejected_configs_render_even_when_inventory_is_empty() {

@@ -1,79 +1,28 @@
 //! Deterministic, fully explainable package provenance / maintainer-risk
 //! scoring.
 //!
-//! `tirith package risk <ecosystem> <name>` produces a risk score for a
-//! package the same way [`crate::scoring`] scores a URL: as a fixed sum of
-//! named, inspectable factors. There is **no model, no learned weight, no
-//! statistical classifier** — every score is reproducible by hand from the
-//! signals below.
+//! `tirith package risk <ecosystem> <name>` scores a package as a fixed sum of
+//! named, inspectable factors (like [`crate::scoring`] for URLs). There is **no
+//! model, no learned weight, no classifier** — every score is reproducible by
+//! hand. The final score is `min(100, sum)`; the clamp is reported as an
+//! explicit factor so the breakdown always sums exactly to the score.
 //!
-//! ## Offline signals (always computed)
+//! Offline signals (always computed, **no network**): name-vs-popular (local
+//! threat-DB), known-malicious typosquat, and — only when package content is
+//! locally available (tirith never downloads it) — install/lifecycle-hook and
+//! binary-blob presence.
 //!
-//! These are computed **without any network or registry-API call**:
+//! Registry-API provenance signals (`--online` only; see [`ApiProvenance`] /
+//! [`api_factors`]) are a deterministic addition of named fixed-weight factors.
+//! The [`ApiSignals`] enum is the seam: offline reports
+//! [`ApiSignals::NotComputed`], an online run [`ApiSignals::Available`], and a
+//! network/API failure degrades gracefully to [`ApiSignals::Unavailable`].
+//! tirith NEVER reaches the network from `tirith check` or any hot path —
+//! `--online` on `package risk` is the only entry point.
 //!
-//! 1. **Name-vs-popular** — is the name a known-popular package, an unknown
-//!    name, or a one-edit near-miss of a popular one? Sourced from the local
-//!    threat-DB `popular` section ([`ThreatDb::is_popular_package`] and
-//!    [`ThreatDb::check_popular_distance`]).
-//! 2. **Known-malicious typosquat** — is the name in the threat-DB's
-//!    `typosquat` index, i.e. a *confirmed* malicious typosquat
-//!    ([`ThreatDb::check_typosquat`])? This is a stronger signal than a mere
-//!    name resemblance.
-//! 3. **Install-script / lifecycle-hook presence** — only when the package
-//!    content is locally available (a `node_modules` / `site-packages`
-//!    directory, or a path the caller supplies). tirith never downloads the
-//!    package to obtain this.
-//! 4. **Binary-blob presence** — compiled / native artifacts bundled inside
-//!    the locally-available package content.
-//!
-//! ## Registry-API-backed signals (opt-in, off the hot path)
-//!
-//! `tirith package risk --online` additionally consults the package's
-//! registry API (the npm registry, the PyPI JSON API, or the crates.io API,
-//! selected by ecosystem) for *provenance* signals — see [`ApiProvenance`].
-//! These are an explicit, deterministic **addition** to the same factor-sum
-//! model: each one is a named factor with a fixed weight. They are reached
-//! ONLY behind `--online`; the default is offline, and a network or API
-//! failure degrades gracefully to the offline score with an honest
-//! [`ApiSignals::Unavailable`]. tirith never reaches the network from
-//! `tirith check` or any hot path — `--online` on `package risk` is the only
-//! entry point.
-//!
-//! The seam is the [`ApiSignals`] enum: the offline path always reports
-//! [`ApiSignals::NotComputed`]; an online run reports [`ApiSignals::Available`]
-//! (or [`ApiSignals::Unavailable`] on degradation).
-//!
-//! ## The factor model
-//!
-//! The score is the sum of:
-//!
-//! - **Name vs. popular packages** — the dominant term. A name one edit from a
-//!   known-popular package is the classic typosquat/slopsquat shape and scores
-//!   high; a name that *is* a known-popular package scores 0; an unknown name
-//!   gets a small baseline (unknown is not the same as malicious).
-//! - **Known-malicious typosquat** — additive: the threat-DB independently
-//!   lists this exact name as a malicious typosquat.
-//! - **Install / lifecycle scripts** — additive, only when local content was
-//!   inspected: an `install` / `postinstall` / `preinstall` hook (npm) or a
-//!   `setup.py` with executable install logic (PyPI) is a common malware
-//!   delivery vector.
-//! - **Bundled binary blobs** — additive, only when local content was
-//!   inspected.
-//! - **Registry-API provenance** — additive, only on an `--online` run: a
-//!   very new package or latest version, an established package the registry
-//!   lists with no owners, an abnormal version jump, very low downloads, a
-//!   missing/inconsistent source-repo URL, and a yanked / deprecated latest
-//!   version. Each is a separate named factor; see [`api_factors`].
-//!
-//! The final score is `min(100, sum)`. The clamp is reported as an explicit
-//! factor when it bites, so the breakdown always sums exactly to the score.
-//!
-//! ## Relationship to the verdict
-//!
-//! This score is **advisory and standalone**. It is not a detection rule, it
-//! does not produce a [`Verdict`](crate::verdict::Verdict), and it changes no
-//! `Action`, exit code, or audit log. `tirith package risk` is an inspection
-//! command.
+//! This score is **advisory and standalone**: not a detection rule, produces no
+//! [`Verdict`](crate::verdict::Verdict), changes no `Action`, exit code, or
+//! audit log.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,11 +31,10 @@ use crate::threatdb::{Ecosystem, ThreatDb};
 /// The maximum possible score. Scores are clamped here.
 pub const MAX_SCORE: u32 = 100;
 
-// M6 ch6 — weights for the seven new signal-driven factors. These are
-// deliberately moderate; per-signal policy-driven points come in ch7.
+// M6 ch6 — weights for the seven new signal-driven factors (moderate).
 
 /// The registry positively reports the package does not exist (HTTP 404).
-/// Honestly distinct from `ApiSignals::Unavailable` (unknown).
+/// Distinct from `ApiSignals::Unavailable` (unknown).
 const PACKAGE_NOT_FOUND_WEIGHT: u32 = 18;
 /// Snapshot-vs-snapshot diff shows maintainers were added or removed within
 /// the recency window.
@@ -103,9 +51,8 @@ const INSTALL_SCRIPT_NETWORK_WEIGHT: u32 = 12;
 /// Registry-claimed repo URL did not verify (`Mismatch`).
 const REPO_MISMATCH_WEIGHT: u32 = 18;
 
-/// M6 ch6 — recency window for the maintainer-change-recent signal. A
-/// snapshot diff is "recent" when the two snapshots were taken less than
-/// this many days apart. Plain const for v1; policy-configurable in ch7.
+/// M6 ch6 — recency window: a snapshot diff is "recent" when the two snapshots
+/// are less than this many days apart.
 pub const MAINTAINER_CHANGE_RECENT_DAYS: u32 = 30;
 
 // --- factor weights (all fixed, all inspectable) ---------------------------
@@ -113,12 +60,11 @@ pub const MAINTAINER_CHANGE_RECENT_DAYS: u32 = 30;
 /// A name one Levenshtein edit from a known-popular package — the classic
 /// typosquat / slopsquat shape.
 const NAME_NEAR_POPULAR_WEIGHT: u32 = 60;
-/// A name that does not resemble any known-popular package and is not itself
-/// known-popular. Unknown is not malicious — this baseline is deliberately
-/// small.
+/// A name that neither is nor resembles a known-popular package. Unknown is not
+/// malicious — a deliberately small baseline.
 const NAME_UNKNOWN_WEIGHT: u32 = 10;
 /// The name is in the threat-DB's malicious-typosquat index — a confirmed bad
-/// name, not a mere resemblance. Additive on top of the near-popular term.
+/// name. Additive on top of the near-popular term.
 const KNOWN_MALICIOUS_TYPOSQUAT_WEIGHT: u32 = 30;
 /// An install / lifecycle hook is present in locally-inspected package content.
 const INSTALL_SCRIPT_WEIGHT: u32 = 15;
@@ -126,30 +72,25 @@ const INSTALL_SCRIPT_WEIGHT: u32 = 15;
 const BINARY_BLOB_WEIGHT: u32 = 10;
 
 // --- registry-API provenance factor weights (only on an `--online` run) ----
-//
-// These are deliberately moderate: the offline name signal stays the dominant
-// term. A provenance signal corroborates — it rarely stands alone as proof.
+// Moderate: the offline name signal stays dominant; provenance corroborates.
 
-/// The package itself is very new (first published within
-/// [`VERY_NEW_PACKAGE_DAYS`]). A brand-new package is the textbook shape of a
-/// freshly-uploaded typosquat / slopsquat.
+/// Package itself very new (within [`VERY_NEW_PACKAGE_DAYS`]) — the textbook
+/// freshly-uploaded typosquat shape.
 const PACKAGE_VERY_NEW_WEIGHT: u32 = 25;
-/// The package's *latest version* is very new (published within
-/// [`VERY_NEW_VERSION_DAYS`]) even though the package itself is older — a
-/// fresh release of an established package is a weaker, smaller signal.
+/// The *latest version* is very new (within [`VERY_NEW_VERSION_DAYS`]) on an
+/// otherwise-older package — a weaker, smaller signal.
 const LATEST_VERSION_VERY_NEW_WEIGHT: u32 = 8;
-/// The registry lists an established package with zero maintainers / owners —
-/// abandoned ownership, a classic account-takeover / hijack precursor.
+/// The registry lists an established package with zero maintainers — abandoned
+/// ownership, a classic account-takeover precursor.
 const OWNERSHIP_TRANSFER_WEIGHT: u32 = 20;
-/// The latest version number is an abnormal jump from the previous version
-/// (e.g. `1.2.3` → `9.0.0`) — a hijacked release is often shipped with an
-/// inflated version to win a semver range.
+/// An abnormal version jump (e.g. `1.2.3` → `9.0.0`) — a hijacked release often
+/// inflates the version to win a semver range.
 const VERSION_SPIKE_WEIGHT: u32 = 15;
-/// The package has very few downloads ([`LOW_DOWNLOAD_THRESHOLD`] or fewer over
-/// the reported window) — near-zero adoption is itself a (weak) signal.
+/// Very few downloads ([`LOW_DOWNLOAD_THRESHOLD`] or fewer) — near-zero
+/// adoption is a weak signal.
 const LOW_DOWNLOADS_WEIGHT: u32 = 10;
-/// The registry lists no source-repository URL, or one inconsistent with the
-/// package — provenance cannot be traced back to reviewable source.
+/// No source-repository URL, or one inconsistent with the package — provenance
+/// cannot be traced to reviewable source.
 const REPO_URL_MISSING_WEIGHT: u32 = 12;
 /// The latest version is yanked / deprecated by the registry itself.
 const YANKED_OR_DEPRECATED_WEIGHT: u32 = 18;
@@ -289,22 +230,15 @@ impl MaintainerChangeHistory {
     /// `true` when every previous maintainer is gone and the new set is
     /// non-empty — a true ownership transfer (not just a co-maintainer add).
     ///
-    /// Because `MaintainerChangeHistory` only carries the diff (`added` /
-    /// `removed`), the only way to know "every previous maintainer is gone"
-    /// from the diff alone is for the diff sets to be fully disjoint by id:
-    /// any maintainer appearing in `added.id` ∩ `removed.id` would mean the
-    /// same person sits in both snapshots' maintainer sets, which the
-    /// snapshot diff would never have written. The stricter "all original
-    /// maintainers retired" check lives in
-    /// [`crate::registry_history::synthesize_transfer`], which has access to
-    /// the full older/newer snapshots and compares them directly.
+    /// From the diff alone this requires the `added`/`removed` sets to be fully
+    /// disjoint by id. The stricter "all original maintainers retired" check
+    /// lives in [`crate::registry_history::synthesize_transfer`], which sees the
+    /// full snapshots.
     pub fn is_full_ownership_transfer(&self) -> bool {
         if self.removed.is_empty() || self.added.is_empty() {
             return false;
         }
-        // The added and removed sets must be fully disjoint — any shared id
-        // means the same maintainer appears in both snapshots, so the old
-        // set was not fully cleared.
+        // Any shared id means a maintainer is in both snapshots — not cleared.
         self.added
             .iter()
             .all(|a| !self.removed.iter().any(|r| r.id == a.id))
@@ -434,18 +368,13 @@ pub struct ApiProvenance {
     pub package_age_days: Option<u64>,
     /// Age of the *latest version*'s publication, in whole days, when known.
     pub latest_version_age_days: Option<u64>,
-    /// `true` when the registry lists this — an established (not brand-new)
-    /// package — with **zero** maintainers / owners: an established package
-    /// that has lost every listed owner, the detectable red flag a single
-    /// registry document can actually show (one document carries the *current*
-    /// owner set, not its history, so a literal transfer cannot be proven from
-    /// it). `None` when the registry's API carries no maintainer field at all,
-    /// so ownership is honestly unknown.
+    /// `true` when the registry lists an established package with **zero**
+    /// maintainers — the only ownership red flag a single registry document can
+    /// show (one doc carries the current owner set, not its history). `None`
+    /// when the API carries no maintainer field, so ownership is unknown.
     ///
-    /// **M6 ch6 deprecation note:** the real `ownership_transfer` field below
-    /// supersedes this inferred-from-one-response flag with a snapshot-vs-
-    /// snapshot diff. Kept for backward-compat in this chunk; removed in a
-    /// future cycle. Direct readers should migrate to `ownership_transfer`.
+    /// M6 ch6: superseded by the snapshot-diff `ownership_transfer` field below;
+    /// kept for backward-compat, removed in a future cycle.
     #[deprecated(
         since = "0.4.0",
         note = "M6 ch6 — use the snapshot-vs-snapshot `ownership_transfer` field; \
@@ -471,18 +400,13 @@ pub struct ApiProvenance {
     /// registry resolves this to `Exists` or `NotFound`.
     #[serde(default)]
     pub package_existence: PackageExistence,
-    /// M6 ch6 — snapshot-vs-snapshot maintainer-set diff. `None` when only
-    /// one (or zero) snapshots exist. The first `--online` run after this
-    /// feature lands records a snapshot only — the diff cannot fire until a
-    /// second snapshot exists. Documented explicitly in the rule's
-    /// `false_positive_guidance`.
+    /// M6 ch6 — snapshot-vs-snapshot maintainer-set diff. `None` when fewer than
+    /// two snapshots exist (the diff cannot fire until a second `--online` run).
     #[serde(default)]
     pub maintainer_change_history: Option<MaintainerChangeHistory>,
     /// M6 ch6 — was the OSV lookup verified, unavailable, or not attempted?
-    /// Distinguishes a verified-empty result (`Verified` + empty
-    /// `osv_advisories`) from a failed-lookup empty result (`Unavailable` +
-    /// empty `osv_advisories`) — both look identical to the score otherwise.
-    /// Default `NotChecked` for non-`--online` runs.
+    /// Distinguishes a verified-empty from a failed-lookup-empty result (both
+    /// look identical to the score otherwise). Default `NotChecked` offline.
     #[serde(default)]
     pub osv_state: crate::osv_correlation::OsvLookupState,
     /// M6 ch6 — OSV advisories matching `(eco, name, version)`. Sourced from
@@ -502,53 +426,37 @@ pub struct ApiProvenance {
     /// diff above. Supersedes the inferred `ownership_transferred` flag.
     #[serde(default)]
     pub ownership_transfer: Option<OwnershipTransfer>,
-    /// M6 ch6 — the registry-claimed repository URL, when one is present in
-    /// the underlying response and looks usable (an https/ssh git host URL).
-    /// Threaded through here so [`Self::repository_url_for_check`] can return
-    /// it without re-fetching, and so the `PackageRepoMismatch` rule actually
-    /// has data to consult through the `--online` package-risk path.
-    /// `None` when the registry API does not carry a repository field, or
-    /// the value present is empty / not a recognized URL shape.
+    /// M6 ch6 — the registry-claimed repository URL when present and usable
+    /// (https/ssh git host), so [`Self::repository_url_for_check`] / the
+    /// `PackageRepoMismatch` rule have data without re-fetching. `None` when the
+    /// API has no repository field or the value is empty / not a URL shape.
     #[serde(default)]
     pub repository_url: Option<String>,
 }
 
 impl ApiProvenance {
-    /// The registry-claimed repository URL when one is present in the
-    /// underlying response. Carried on `ApiProvenance::repository_url`
-    /// (populated by `provenance_from_metadata`) so the `PackageRepoMismatch`
-    /// rule has data to consult through the `--online` package-risk path.
-    ///
-    /// Returns `None` when the registry API does not carry a repository
-    /// field, or when the value present is empty / not a recognized URL
-    /// shape (per [`crate::registry_api::is_usable_repo_url`]).
+    /// The registry-claimed repository URL (from `repository_url`), or `None`
+    /// when absent / not a recognized URL shape (per
+    /// [`crate::registry_api::is_usable_repo_url`]).
     pub fn repository_url_for_check(&self) -> Option<String> {
         self.repository_url.clone()
     }
 }
 
-/// State of the registry-API-backed signals.
+/// State of the registry-API-backed signals — the seam between always-on
+/// offline signals and the opt-in `--online` registry signals.
 ///
-/// This enum is the seam between the always-on offline signals and the opt-in
-/// `--online` registry signals:
-///
-/// * [`ApiSignals::NotComputed`] — the default. No `--online` was requested
-///   (or `--offline` / `TIRITH_OFFLINE` forced offline), so no API call was
-///   made. This is what every offline run reports.
-/// * [`ApiSignals::Available`] — an `--online` run reached the registry and
-///   gathered provenance. The carried [`ApiProvenance`] drives the API
-///   factors.
-/// * [`ApiSignals::Unavailable`] — an `--online` run was requested but the
-///   registry call failed (offline, timeout, HTTP error, unparseable
-///   response, unsupported ecosystem). The score degrades gracefully to the
-///   offline signals; `reason` is an honest, human-readable explanation.
+/// * [`ApiSignals::NotComputed`] — the default; no `--online` (or forced
+///   offline), so no API call was made.
+/// * [`ApiSignals::Available`] — an `--online` run reached the registry; the
+///   carried [`ApiProvenance`] drives the API factors.
+/// * [`ApiSignals::Unavailable`] — `--online` requested but the call failed;
+///   the score degrades to offline signals with an honest `reason`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
-// M6 ch6 — `ApiProvenance` grew to ~340 bytes once the seven new signal
-// fields landed. Boxing `provenance` would change the public API and ripple
-// through every site that pattern-matches `Available { provenance }`. The
-// enum is held one-per-package on rare paths (offline by default), so the
-// per-instance cost is bounded and acceptable.
+// M6 ch6 — boxing the ~340-byte `provenance` would ripple through every
+// `Available { provenance }` match site; the enum is one-per-package on rare
+// (offline-by-default) paths, so the cost is bounded.
 #[allow(clippy::large_enum_variant)]
 pub enum ApiSignals {
     /// Registry-API signals were not computed — offline run (the default).
@@ -633,20 +541,15 @@ impl RiskBreakdown {
     }
 }
 
-/// Inputs to [`score_package`] — the raw signals, already gathered.
-///
-/// Keeping signal gathering (which touches the threat DB, the filesystem, and
-/// — for `api` — the network) out of the scoring function lets
-/// `score_package` be a pure, total function of its inputs, so tests can
-/// drive every factor combination directly without any I/O.
+/// Inputs to [`score_package`] — the raw signals, already gathered. Keeping
+/// gathering (threat DB, filesystem, network) out of scoring lets
+/// `score_package` be a pure, total function tests can drive without I/O.
 #[derive(Debug, Clone)]
 pub struct PackageSignals {
     pub ecosystem: Ecosystem,
     pub name: String,
-    /// M6 ch6 — optional version string parsed from `<name>[@<version>]` CLI
-    /// inputs. Threaded through to OSV correlation so a version-pinned
-    /// advisory can match. `None` means "no version specified" (the OSV
-    /// correlation falls back to the registry's default version or skips).
+    /// M6 ch6 — optional version from `<name>[@<version>]` CLI inputs, threaded
+    /// to OSV correlation. `None` means no version specified.
     pub version: Option<String>,
     pub threat_db_missing: bool,
     pub name_vs_popular: NameVsPopular,
@@ -654,40 +557,20 @@ pub struct PackageSignals {
     /// known malicious typosquat.
     pub malicious_typosquat_of: Option<String>,
     pub content_signals: ContentSignals,
-    /// The registry-API state to fold into the score:
-    ///
-    /// * [`ApiSignals::NotComputed`] — offline run; no API factors.
-    /// * [`ApiSignals::Available`] — `--online` run; the carried
-    ///   [`ApiProvenance`] adds API factors.
-    /// * [`ApiSignals::Unavailable`] — `--online` requested but the call
-    ///   failed; no API factors, the breakdown records the honest reason.
-    ///
-    /// Defaults to [`ApiSignals::offline`] so an offline caller is unchanged.
+    /// The registry-API state to fold in; only [`ApiSignals::Available`] adds
+    /// API factors. Defaults to [`ApiSignals::offline`].
     pub api: ApiSignals,
 }
 
-/// M6 ch6 — parse `<name>[@<version>]` into `(name, Option<version>)`.
+/// M6 ch6 — parse `<name>[@<version>]` into `(name, Option<version>)`. The
+/// single source of truth for version-aware CLI parsing; a bare `<name>`
+/// returns `(name, None)`.
 ///
-/// The single source of truth for version-aware CLI parsing on
-/// `tirith package risk|explain|scan|install`. Backward compatible: a bare
-/// `<name>` returns `(name, None)`.
-///
-/// **Edge case for npm scoped packages.** `@org/name` already uses `@` as the
-/// scope sigil; `@org/name@1.2.3` has TWO `@`s — the first is the scope, the
-/// second is the version separator. The parser splits on the LAST `@` only,
-/// and only when followed by a version-shaped token. So:
-///
-///  * `react`         → (`react`, None)
-///  * `react@18.2.0`  → (`react`, Some(`18.2.0`))
-///  * `@org/util`     → (`@org/util`, None)        — only one `@`, scope sigil
-///  * `@org/util@1.0` → (`@org/util`, Some(`1.0`)) — last `@` is the separator
-///  * `@org`          → (`@org`, None)             — `@` at position 0, ignore
-///  * `pkg@`          → (`pkg@`, None)             — empty version is not a version
-///  * `pkg@@1.0`      → (`pkg@`, Some(`1.0`))      — only the LAST `@` splits
-///
-/// A version-shaped token is non-empty and starts with a digit, `v`, `~`, or
-/// `^` (the npm/PyPI/crates.io range syntaxes). A token shaped like a path
-/// segment is rejected to keep `@scope/name` cases unambiguous.
+/// Splits on the LAST `@` only, and only when followed by a version-shaped
+/// token — so npm scoped packages disambiguate (`@org/util` → no version;
+/// `@org/util@1.0` → `Some("1.0")`; `@org` → no version; `pkg@` → no version).
+/// A version-shaped token starts with a digit / `v` / `~` / `^`; a path-segment
+/// shape is rejected.
 pub fn parse_name_and_version(input: &str) -> (String, Option<String>) {
     let s = input.trim();
     if s.is_empty() {
@@ -728,15 +611,11 @@ fn is_version_shaped(s: &str) -> bool {
 }
 
 /// Compute the deterministic risk score and full factor breakdown from
-/// already-gathered signals.
+/// already-gathered signals (offline factors always; API factors only when
+/// [`PackageSignals::api`] is [`ApiSignals::Available`]).
 ///
-/// Folds in the always-on offline signals (name vs. popular, known typosquat,
-/// inspected local content) and, when the [`PackageSignals::api`] state is
-/// [`ApiSignals::Available`], the registry-API provenance factors.
-///
-/// This is a pure, total function — the single source of truth for the
-/// `package risk` number. The breakdown it returns always satisfies
-/// `breakdown.verify()`.
+/// A pure, total function — the single source of truth for the `package risk`
+/// number. The returned breakdown always satisfies `breakdown.verify()`.
 pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
     let mut factors: Vec<RiskFactor> = Vec::new();
 
@@ -806,9 +685,7 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
     // Factors 3 & 4 — content signals, only when local content was inspected.
     match &signals.content_signals {
         ContentSignals::NotInspected => {
-            // No local content — no content factors. Recorded in the breakdown
-            // via `content_signals`, not as a zero factor, to keep the factor
-            // list to the signals that actually applied.
+            // No content factors; recorded via `content_signals`, not a zero factor.
         }
         ContentSignals::Inspected {
             has_install_script,
@@ -849,10 +726,9 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         }
     }
 
-    // Factors 5+ — registry-API provenance, only on an `--online` run that
-    // actually reached the registry. An offline run, or an `--online` run that
-    // degraded, contributes no API factors (its state is still recorded in
-    // `api_signals`, so the breakdown is honest about why).
+    // Factors 5+ — registry-API provenance, only when the run reached the
+    // registry. Offline / degraded runs add no API factors (state still
+    // recorded in `api_signals`).
     if let ApiSignals::Available { provenance } = &signals.api {
         factors.extend(api_factors(provenance));
     }
@@ -887,11 +763,9 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
         factors,
     };
 
-    // The breakdown's public contract is that every factor sums exactly to the
-    // final score (the "reproducible by hand" guarantee). A real `assert!` —
-    // not a `debug_assert!` — so a future factor that violates the invariant
-    // is caught in release builds too. `score_package` is a non-hot-path
-    // inspection helper, so the one integer compare costs nothing.
+    // Contract: factors sum exactly to the score ("reproducible by hand"). A
+    // real `assert!` (not `debug_assert!`) so a violation is caught in release
+    // too — `score_package` is off the hot path, so the compare is free.
     assert!(
         breakdown.verify(),
         "package-risk breakdown factors ({}) must sum to the final score ({})",
@@ -903,22 +777,14 @@ pub fn score_package(signals: &PackageSignals) -> RiskBreakdown {
 }
 
 /// Derive the registry-API provenance factors from gathered [`ApiProvenance`].
-///
-/// Each factor is named, fixed-weight, and explained so the reader can verify
-/// it by hand — exactly like the offline factors. Only signals the registry
-/// *actually reported* (a `Some`, or a `true`) produce a factor; a datum the
-/// registry did not expose contributes nothing (absence is not a signal).
-///
-/// This is a pure function of its input — no I/O — so it is exhaustively
-/// unit-tested below.
+/// Only signals the registry actually reported (a `Some` / `true`) produce a
+/// factor; absence is not a signal. Pure function, exhaustively unit-tested.
 #[allow(deprecated)] // legacy `ownership_transferred` read intentionally during M6 ch6 grace
 pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
     let mut factors: Vec<RiskFactor> = Vec::new();
 
-    // Package age — a brand-new package is the textbook fresh-typosquat shape.
-    // The package-level signal and the latest-version-level signal are
-    // mutually exclusive: a very new *package* already covers a very new
-    // latest version, so the smaller version-level factor is only added when
+    // Package age. The package-level and latest-version-level signals are
+    // mutually exclusive: the smaller version-level factor is added only when
     // the package itself is NOT very new.
     match p.package_age_days {
         Some(days) if days <= VERY_NEW_PACKAGE_DAYS => {
@@ -954,8 +820,7 @@ pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
         }
     }
 
-    // Abandoned ownership — an established package the registry lists with no
-    // owners at all, an account-takeover / hijack precursor.
+    // Abandoned ownership — established package with no listed owners.
     if p.ownership_transferred == Some(true) {
         factors.push(RiskFactor {
             id: "api_ownership_transfer",
@@ -1033,8 +898,7 @@ pub fn api_factors(p: &ApiProvenance) -> Vec<RiskFactor> {
         });
     }
 
-    // M6 ch6 — package-existence: a registry-confirmed 404. Distinct from
-    // `Unknown` (the call did not resolve), which adds nothing.
+    // M6 ch6 — a registry-confirmed 404 (distinct from `Unknown`).
     if matches!(p.package_existence, PackageExistence::NotFound) {
         factors.push(RiskFactor {
             id: "api_package_not_found",
@@ -1199,8 +1063,7 @@ mod tests {
         }
     }
 
-    /// An `ApiProvenance` with every signal "clean" (no factor fires). Tests
-    /// flip exactly the field under test so each factor is isolated.
+    /// An `ApiProvenance` with every signal clean; tests flip one field each.
     fn clean_provenance() -> ApiProvenance {
         #[allow(deprecated)] // legacy `ownership_transferred` set here intentionally
         ApiProvenance {

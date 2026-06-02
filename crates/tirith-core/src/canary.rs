@@ -1,69 +1,40 @@
 //! M11 ch3 — honeytoken / canary tokens (design-decision D3).
 //!
-//! A *canary* is a deliberately-synthetic secret-shaped token you plant
-//! somewhere you expect NOT to be read — a fake `~/.aws/credentials`, a decoy
-//! `.env`, a bait line in a private repo. tirith records the token in a
-//! local-first store at `state_dir()/canaries.jsonl`. When that exact token
-//! later shows up in a command you run or a tool output tirith inspects, the
-//! engine fires [`crate::verdict::RuleId::CanaryTokenTouched`] (High) — a strong
-//! "someone touched the bait" signal.
+//! A *canary* is a synthetic secret-shaped token you plant where you expect it
+//! NOT to be read (a fake `~/.aws/credentials`, a decoy `.env`). tirith records
+//! it local-first at `state_dir()/canaries.jsonl`; when that exact token later
+//! appears in a command or tool output, the engine fires
+//! [`crate::verdict::RuleId::CanaryTokenTouched`] (High).
 //!
 //! # D3 — local-first, no phone-home
 //!
-//! By DEFAULT a canary is **local-only**: detection raises a finding and writes
-//! to the local audit log. tirith never operates a callback endpoint and never
-//! transmits anything off the machine on the default path — consistent with the
-//! "no telemetry / no phone-home" stance in `docs/security.md`.
-//!
-//! A canary MAY be created with an OPT-IN, USER-SELF-HOSTED `callback_url`. On
-//! detection (and ONLY on detection) tirith sends one best-effort POST to that
-//! URL with `{kind, detected_at, context}` — **never the token value**. The
-//! callback is the single exception to tirith's no-network rule, and it is
-//! gated entirely behind an explicit user-supplied `--callback-url`. A callback
-//! failure is non-blocking: it is logged to the audit log and never changes the
-//! verdict. See [`fire_callback`].
+//! By DEFAULT a canary is local-only (finding + audit log, no network). It MAY
+//! be created with an OPT-IN, user-self-hosted `--callback-url`: on detection
+//! ONLY, tirith sends one best-effort POST of `{kind, detected_at, context}` —
+//! NEVER the token value. This is the single exception to the no-network rule;
+//! a callback failure is logged and never changes the verdict. See
+//! [`fire_callback`].
 //!
 //! # Clearly-synthetic token shapes
 //!
-//! Every generated token carries a literal, obviously-fake marker so a flagged
-//! value reads as tirith bait rather than a real third-party credential
-//! (reducing the chance it triggers an external provider's abuse / take-down
-//! workflow), while still matching tirith's own credential-shape detection:
+//! Every token carries an obviously-fake marker (`AKIA00CANARY`, `ghp_canary_`,
+//! `AIzaCANARY`, `TIRITH_CANARY_TOKEN=canary_`, a `TIRITHCANARY` PEM body) so a
+//! flagged value reads as tirith bait, not a real third-party credential, while
+//! still matching tirith's own credential-shape detection. A clearly-labelled
+//! property, not a mathematical impossibility claim — see
+//! `docs/canary-formats.md`.
 //!
-//! | kind                 | shape                                           |
-//! |----------------------|-------------------------------------------------|
-//! | `aws-like`           | `AKIA00CANARY` + 8 base32-ish chars             |
-//! | `github-like`        | `ghp_canary_` + 30 alphanumerics                |
-//! | `gcp-like`           | `AIzaCANARY` + 30 url-safe chars                |
-//! | `env-line`           | `TIRITH_CANARY_TOKEN=canary_` + 24 hex          |
-//! | `private-key-shaped` | a PEM block whose body is `TIRITHCANARY...`     |
-//!
-//! The `AKIA00CANARY` infix keeps the recognizable `AKIA` prefix while the
-//! explicit `00CANARY` marker makes the token clearly synthetic, so it is
-//! unlikely to be mistaken for a genuine key. The `ghp_canary_` / `AIzaCANARY`
-//! / `canary_` markers serve the same clearly-synthetic purpose for the other
-//! kinds. A developer who spots the token can tell it is a tirith canary, not a
-//! real leak. This is a clearly-labelled property, not a mathematical
-//! impossibility claim — see `docs/canary-formats.md`.
-//!
-//! # Token-shape overlap with real creds
-//!
-//! Detection is a STORE lookup, not a shape match: ONLY tokens you registered
-//! fire [`CanaryTokenTouched`](crate::verdict::RuleId::CanaryTokenTouched). An
-//! unrelated, genuine AWS key in a paste still fires the existing
-//! `CredentialInText` / `HighEntropySecret` rules — never the canary rule,
-//! because that key is not in your store.
+//! Detection is a STORE lookup, not a shape match: only registered tokens fire
+//! `CanaryTokenTouched`; an unrelated genuine key fires the existing
+//! `CredentialInText` / `HighEntropySecret` rules instead.
 //!
 //! # Hot-path cost
 //!
-//! [`detect`] is called on the `engine::analyze` (paste + exec) and
-//! `analyze_output` paths. To keep it cheap it is backed by a per-process cache
-//! (load once, 5-second TTL, invalidated on store mtime change), exactly like
-//! [`crate::taint`]. When the store is absent or empty the lookup is a near-noop
-//! and the engine additionally only forces past its tier-1 fast-exit for the
-//! canary scan when the store is non-empty (see `engine::canary` wiring via
-//! [`store_nonempty`]). A machine that has never run `tirith canary create`
-//! pays nothing.
+//! [`detect`] (on the analyze + analyze_output paths) is backed by a per-process
+//! cache (5s TTL, mtime-invalidated), like [`crate::taint`]. An absent/empty
+//! store is a near-noop and the engine only forces past tier-1 when the store is
+//! non-empty (via [`store_nonempty`]), so a machine that never ran
+//! `tirith canary create` pays nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -75,16 +46,15 @@ use serde::{Deserialize, Serialize};
 /// The synthetic token kinds `tirith canary create <kind>` understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanaryKind {
-    /// `AKIA00CANARY` + random — AWS-access-key-shaped, with an explicit
-    /// `00CANARY` marker that keeps the token clearly synthetic.
+    /// `AKIA00CANARY` + random — AWS-access-key-shaped.
     AwsLike,
-    /// `ghp_canary_` + random — GitHub-personal-access-token-shaped.
+    /// `ghp_canary_` + random — GitHub-PAT-shaped.
     GithubLike,
     /// `AIzaCANARY` + random — Google-API-key-shaped.
     GcpLike,
-    /// `TIRITH_CANARY_TOKEN=canary_` + random — a full `.env` assignment line.
+    /// `TIRITH_CANARY_TOKEN=canary_` + random — a full `.env` line.
     EnvLine,
-    /// A PEM block whose body is a `TIRITHCANARY` marker — private-key-shaped.
+    /// A PEM block with a `TIRITHCANARY` body — private-key-shaped.
     PrivateKeyShaped,
 }
 
@@ -100,9 +70,7 @@ impl CanaryKind {
         }
     }
 
-    /// Parse a `<kind>` CLI argument. Accepts the canonical hyphenated form and
-    /// a couple of obvious aliases. Returns `None` on an unknown value so the
-    /// CLI can print the supported list.
+    /// Parse a `<kind>` CLI argument (canonical hyphenated form + aliases).
     pub fn parse(s: &str) -> Option<CanaryKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "aws-like" | "aws" => Some(CanaryKind::AwsLike),
@@ -129,17 +97,15 @@ impl CanaryKind {
 /// One recorded canary: the planted synthetic token plus its metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanaryEntry {
-    /// Stable identifier for `prune`/`rotate` (first 12 hex of a random id).
+    /// Stable identifier for `prune`/`rotate` (12 hex chars).
     pub id: String,
-    /// The synthetic token value. This is what [`detect`] matches against the
-    /// scanned text. It is NEVER transmitted to a callback URL.
+    /// The synthetic token [`detect`] matches against. NEVER transmitted.
     pub token: String,
-    /// The kind the token was generated as (`aws-like`, …). Stored as its CLI
-    /// string for forward-compatible round-tripping.
+    /// The kind's CLI string, stored for forward-compatible round-tripping.
     pub kind: String,
-    /// RFC-3339 UTC timestamp the canary was created.
+    /// RFC-3339 UTC creation timestamp.
     pub created_at: String,
-    /// OPT-IN, user-self-hosted callback URL. `None` = local-only (the default).
+    /// OPT-IN, user-self-hosted callback URL. `None` = local-only (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_url: Option<String>,
 }
@@ -164,20 +130,14 @@ pub fn store_path() -> Option<PathBuf> {
 /// caller decides whether to persist it.
 pub fn generate_token(kind: CanaryKind) -> String {
     match kind {
-        // AWS access keys look like `AKIA` + 16 chars. We keep the recognizable
-        // `AKIA` prefix, then embed an explicit `00CANARY` marker so the token
-        // is clearly synthetic (reducing the chance it's mistaken for a real
-        // key); the suffix uses a base32-style alphabet purely for shape.
+        // Keep the recognizable `AKIA` prefix + an explicit `00CANARY` marker so
+        // the token is clearly synthetic; suffix is base32 purely for shape.
         CanaryKind::AwsLike => format!("AKIA00CANARY{}", random_chars(BASE32, 8)),
-        // `ghp_` is GitHub's PAT prefix; `canary_` makes it obviously fake.
         CanaryKind::GithubLike => format!("ghp_canary_{}", random_chars(ALNUM, 30)),
-        // `AIza` is Google's API-key prefix; `CANARY` marks it synthetic.
         CanaryKind::GcpLike => format!("AIzaCANARY{}", random_chars(URLSAFE, 30)),
-        // A complete `.env` assignment line, value clearly marked.
         CanaryKind::EnvLine => {
             format!("TIRITH_CANARY_TOKEN=canary_{}", random_chars(HEX, 24))
         }
-        // A PEM block whose decoded-looking body is a TIRITHCANARY marker.
         CanaryKind::PrivateKeyShaped => {
             let body = format!("TIRITHCANARY{}", random_chars(BASE64ISH, 52));
             format!("-----BEGIN TIRITH CANARY PRIVATE KEY-----\n{body}\n-----END TIRITH CANARY PRIVATE KEY-----")
@@ -191,33 +151,25 @@ const HEX: &[u8] = b"0123456789abcdef";
 const URLSAFE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const BASE64ISH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// `n` random characters drawn from `alphabet`, seeded by the OS CSPRNG.
+/// `n` random characters from `alphabet`, seeded by the OS CSPRNG.
 ///
-/// Uses `getrandom::fill` (the same OS-entropy source `baseline.rs` uses for
-/// the per-install salt) — `rand` is only a dev-dependency in this crate. To
-/// avoid modulo bias we sample bytes with rejection: only bytes below the
-/// largest multiple of `len` that fits in a `u8` are accepted, so every
-/// alphabet character is equally likely. The token's unguessability comes from
-/// the OS CSPRNG; on the (astronomically unlikely) event `getrandom` fails we
-/// fall back to a per-call-VARYING pseudo-random suffix (see
-/// [`fill_fallback_bytes`]) so token generation never panics AND two calls in
-/// the same process don't collide — a generated token is still clearly
-/// synthetic regardless (CodeRabbit R9 #H).
+/// Uses `getrandom::fill` (`rand` is only a dev-dep). Rejection sampling avoids
+/// modulo bias (only bytes below the largest `u8` multiple of `len` are kept).
+/// If `getrandom` fails (astronomically unlikely) it falls back to a
+/// per-call-VARYING pseudo-random suffix ([`fill_fallback_bytes`]) so generation
+/// never panics and two calls don't collide (CodeRabbit R9 #H).
 fn random_chars(alphabet: &[u8], n: usize) -> String {
     let len = alphabet.len();
     debug_assert!((1..=256).contains(&len), "alphabet must be 1..=256 bytes");
-    // Largest multiple of `len` representable in a u8; bytes >= this are
-    // rejected to keep the distribution uniform.
+    // Largest u8 multiple of `len`; bytes >= this are rejected for uniformity.
     let limit = (256 / len) * len;
 
     let mut out = String::with_capacity(n);
     let mut buf = [0u8; 64];
     while out.len() < n {
         if getrandom::fill(&mut buf).is_err() {
-            // Entropy unavailable — extremely rare. Fill a fresh buffer from a
-            // per-CALL-varying source (process-lifetime counter + time) so the
-            // remaining bytes differ on every call rather than cycling the same
-            // alphabet head deterministically (which made `new_id` repeat IDs).
+            // Entropy unavailable. Fill from a per-call-varying source so the
+            // bytes differ each call (deterministic cycling made `new_id` repeat).
             let mut fb = [0u8; 64];
             fill_fallback_bytes(&mut fb);
             for &b in fb.iter() {
@@ -228,10 +180,8 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
                     out.push(alphabet[(b as usize) % len] as char);
                 }
             }
-            // `fill_fallback_bytes` advances its counter each call, so the loop
-            // makes progress and terminates; but guard against an alphabet whose
-            // `limit` rejects this particular buffer entirely by drawing again on
-            // the next `while` iteration (getrandom will be retried first).
+            // The counter advances each call, so the loop makes progress; redraw
+            // on the next iteration if this buffer was fully rejected.
             continue;
         }
         for &b in buf.iter() {
@@ -247,15 +197,10 @@ fn random_chars(alphabet: &[u8], n: usize) -> String {
 }
 
 /// Fill `buf` with pseudo-random bytes from a per-call-VARYING seed, used ONLY
-/// when the OS CSPRNG (`getrandom`) is unavailable (CodeRabbit R9 #H). The seed
-/// mixes a process-lifetime monotonic counter (so two calls in the same process
-/// differ even at the same instant) with the wall-clock nanos (so it also
-/// differs across processes/restarts), expanded with SplitMix64.
-///
-/// This is NOT a cryptographic RNG and makes no unguessability claim — the
-/// fallback only needs to produce DISTINCT, well-formed synthetic tokens so
-/// repeated `new_id()` calls cannot collide. The CSPRNG path above is the one
-/// that carries the security property; this branch is the panic-free degradation.
+/// when `getrandom` is unavailable (CodeRabbit R9 #H). Mixes a process-lifetime
+/// counter (distinct per call) + wall-clock nanos (distinct across processes),
+/// expanded with SplitMix64. NOT cryptographic — it only needs to produce
+/// DISTINCT tokens so repeated `new_id()` calls cannot collide.
 fn fill_fallback_bytes(buf: &mut [u8; 64]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -265,7 +210,6 @@ fn fill_fallback_bytes(buf: &mut [u8; 64]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    // Distinct per call (counter) and per wall-clock instant (nanos).
     let mut state = counter
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(nanos)
@@ -289,16 +233,14 @@ fn new_id() -> String {
 
 // ---- Store I/O ------------------------------------------------------------
 
-/// Per-process cache of the parsed store, keyed on the resolved store path.
-/// Mirrors [`crate::taint`]'s cache exactly so the hot path stays cheap.
+/// Per-process cache of the parsed store, keyed on the resolved path. Mirrors
+/// [`crate::taint`]'s cache so the hot path stays cheap.
 struct CacheState {
     path: PathBuf,
     entries: Vec<CanaryEntry>,
-    /// Whether the underlying store read reached EOF cleanly. `false` means a
-    /// persistent mid-file I/O fault (or a present-but-unreadable store) left the
-    /// tail unread, so `entries` is a PARTIAL prefix — a touched canary in the
-    /// unread tail would otherwise read as untouched (fail-OPEN). `detect_at`
-    /// surfaces the incompleteness on a miss (CodeRabbit R16 #3).
+    /// `false` = a mid-file I/O fault left the tail unread, so `entries` is a
+    /// PARTIAL prefix (a touched canary in the tail would read as untouched,
+    /// fail-OPEN). `detect_at` surfaces it on a miss (CodeRabbit R16 #3).
     complete: bool,
     loaded_at: Instant,
     mtime_nanos: u128,
@@ -317,24 +259,15 @@ fn mtime_nanos(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
-/// Parse the JSONL store, skipping blank / unparseable lines AND continuing past
-/// reader I/O errors (fail-open: a corrupt line or a transient read error never
-/// aborts the lookup or silently truncates later entries). Empty vec when the
-/// file is absent.
-///
-/// NB: a previous `map_while(Result::ok)` here STOPPED at the first line that
-/// returned `Err` from the reader (e.g. invalid UTF-8 mid-file), silently
-/// dropping every canary AFTER it — a later touched canary would never fire.
-/// We now `continue` on a line error so a single bad line cannot mask the rest
-/// of the store (matching the corrupt-line-skip-but-continue contract).
+/// Parse the JSONL store, skipping blank/unparseable lines and continuing past
+/// recoverable read errors (fail-open: a bad line never masks later entries).
+/// Empty vec when absent. `complete == false` flags a truncated read (a
+/// persistent mid-file fault), which a previous `map_while(Result::ok)` would
+/// have silently dropped the tail on.
 fn parse_store(path: &Path) -> (Vec<CanaryEntry>, bool) {
-    // `read_store_lines_complete` skips blank lines, skips a single recoverable
-    // invalid-UTF-8 line (so a corrupt byte cannot hide later canaries), and
-    // BREAKS on any other (persistent) read error — reporting `complete == false`
-    // — so the reader cannot spin forever and a truncated read is observable.
-    // Lines that don't parse as a `CanaryEntry` are dropped (fail-open). An
-    // InvalidData line skip is NOT a truncation (the file is still read to EOF),
-    // so `complete` stays `true` for it.
+    // `read_store_lines_complete` skips blanks + a single recoverable bad-UTF-8
+    // line, and BREAKS (reporting `complete == false`) on any other read error.
+    // An InvalidData skip is not a truncation, so `complete` stays `true`.
     let (lines, complete) = crate::util::read_store_lines_complete(path);
     let entries = lines
         .iter()
@@ -343,10 +276,9 @@ fn parse_store(path: &Path) -> (Vec<CanaryEntry>, bool) {
     (entries, complete)
 }
 
-/// Load entries through the per-process cache. Reloads when the cached path
-/// differs, the TTL expired, or the store's mtime changed. Returns
-/// `(entries, complete)` — `complete == false` flags a partial/truncated read so
-/// `detect_at` can surface the incompleteness on a miss (CodeRabbit R16 #3).
+/// Load entries through the per-process cache. Reloads on path change, TTL
+/// expiry, or mtime change. `complete == false` flags a truncated read so
+/// `detect_at` surfaces incompleteness on a miss (CodeRabbit R16 #3).
 fn cached_entries(path: &Path) -> (Vec<CanaryEntry>, bool) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
@@ -372,42 +304,30 @@ fn cached_entries(path: &Path) -> (Vec<CanaryEntry>, bool) {
     (entries, complete)
 }
 
-/// Drop the per-process cache. Tests that write a store directly then assert via
-/// the default-path API call this so a stale earlier load is not reused.
+/// Drop the per-process cache (so a stale earlier load is not reused).
 pub fn invalidate_cache() {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
-/// An exclusive cross-process advisory lock on a sibling `<store>.lock` file,
-/// released on drop. All three store mutators (`create_at`, `prune_at`,
-/// `rotate_at`) hold this for the duration of their read-modify-write so two
-/// concurrent commands cannot lose each other's updates: e.g. a `create`
-/// appending while a `prune` rewrites the store from a now-stale snapshot would
-/// otherwise silently drop the freshly-created entry. Reads (`list`/`detect`)
-/// are deliberately NOT locked — they tolerate a torn view because
-/// [`rewrite_store_lines`] swaps the file in atomically (rename), so a reader always
-/// sees a whole prior or whole next file, never a partial one.
+/// Exclusive cross-process advisory lock on a sibling `<store>.lock`, released
+/// on drop. The three mutators (`create_at`/`prune_at`/`rotate_at`) hold it
+/// across their read-modify-write so a concurrent create+prune cannot drop each
+/// other's updates. Reads (`list`/`detect`) are NOT locked — the atomic rename
+/// in [`rewrite_store_lines`] gives them a whole-prior-or-whole-next file.
 ///
-/// Uses the same `fs2::FileExt` advisory locking as `audit.rs` /
-/// `session_warnings.rs`. The `.lock` file is a zero-byte sentinel: never read
-/// or written, only locked, and left in place between calls (creating and
-/// deleting it per-call would itself race).
-///
-/// `pub(crate)` so the generic `<store>.lock` guard is reusable by other
-/// JSONL-store mutators (CodeRabbit R13f — `baseline::record_at` serializes its
-/// append + compaction with it). It locks any `store` path, nothing
-/// canary-specific.
+/// Uses the same `fs2::FileExt` advisory locking as `audit.rs`. The `.lock` is a
+/// zero-byte sentinel, only locked, left in place between calls. `pub(crate)`
+/// and store-agnostic so other JSONL mutators reuse it (CodeRabbit R13f —
+/// `baseline::record_at`).
 pub(crate) struct StoreLock {
     file: std::fs::File,
 }
 
 impl StoreLock {
-    /// Acquire the exclusive lock guarding `store`. Creates parent dirs and the
-    /// sibling lock file as needed, then blocks until the lock is held. If
-    /// advisory locking is unsupported on the platform/filesystem we proceed
-    /// WITHOUT it (best-effort — never worse than the pre-lock behavior, and the
-    /// atomic rename in [`rewrite_store_lines`] still prevents torn files).
+    /// Acquire the exclusive lock guarding `store` (creating parent dirs + the
+    /// lock file), blocking until held. If advisory locking is unsupported here
+    /// we proceed WITHOUT it (the atomic rename still prevents torn files).
     pub(crate) fn acquire(store: &Path) -> std::io::Result<Self> {
         if let Some(parent) = store.parent() {
             std::fs::create_dir_all(parent)?;
@@ -422,23 +342,17 @@ impl StoreLock {
         }
         let file = opts.open(&lock_path)?;
         use fs2::FileExt;
-        // Blocking exclusive lock. Only an `Unsupported` error (advisory locking
-        // not available on this platform/filesystem) is treated as best-effort:
-        // we proceed UNLOCKED, relying on the atomic rename in [`rewrite_store_lines`]
-        // to still prevent torn files. ANY OTHER lock error (EINTR-after-retry,
-        // EDEADLK, ENOLCK, …) must fail loudly so the mutation aborts rather than
-        // racing without the serialization guarantee — mirroring how `audit.rs`
-        // hard-fails on a lock error instead of writing unlocked.
+        // Blocking exclusive lock. Only `Unsupported` is best-effort (proceed
+        // UNLOCKED, atomic rename still prevents torn files); any other lock
+        // error fails loudly so the mutation aborts rather than racing, like
+        // `audit.rs`.
         if let Err(e) = file.lock_exclusive() {
             if e.kind() != std::io::ErrorKind::Unsupported {
                 return Err(e);
             }
-            // Unsupported blocking lock: best-effort. Try once more (non-blocking)
-            // in case the backend supports try-locking — if that SUCCEEDS we hold
-            // the lock (released by `Drop`). A non-`Unsupported` error here is still
-            // a real lock failure and must fail loudly (CodeRabbit R13e), per the
-            // "only Unsupported → unlocked" contract above; only a SECOND
-            // `Unsupported` degrades to running unlocked.
+            // Unsupported blocking lock: try once more non-blocking. A
+            // non-Unsupported error here still fails loudly (CodeRabbit R13e);
+            // only a SECOND Unsupported degrades to unlocked.
             if let Err(e2) = file.try_lock_exclusive() {
                 if e2.kind() != std::io::ErrorKind::Unsupported {
                     return Err(e2);
@@ -480,11 +394,8 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(store)?;
-    // `OpenOptionsExt::mode` above applies ONLY when the file is freshly created.
-    // If `canaries.jsonl` already exists with wider permissions (created under a
-    // looser umask, or by an older build), narrow it to 0600 BEFORE appending the
-    // token + callback data, which are sensitive (CodeRabbit R13b). Best-effort on
-    // the open handle; failure to chmod is surfaced like any other write error.
+    // `mode` only applies on fresh create; narrow an existing wider-perms file
+    // to 0600 before appending sensitive token/callback data (CodeRabbit R13b).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -492,50 +403,32 @@ fn append_entry(store: &Path, entry: &CanaryEntry) -> std::io::Result<()> {
     }
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     writeln!(file, "{line}")?;
-    // Durability: a buffered append that returns Ok before the bytes reach
-    // stable storage can be lost on a crash/power-loss, leaving a registered
-    // canary that never fires. Flush our user-space writer, then fsync the file
-    // so the appended line survives. `flush()` is a no-op for `std::fs::File`
-    // (it has no user-space buffer) but is correct and cheap if the writer type
-    // ever changes; `sync_all()` is the load-bearing barrier.
+    // Durability: fsync so the appended line survives a crash, else a registered
+    // canary could never fire. (`flush` is a no-op for `File`; `sync_all` is the
+    // barrier.) Then fsync the parent dir so a first-time create's link is also
+    // durable.
     file.flush()?;
     file.sync_all()?;
-    // `sync_all` persists the file's contents + inode, but NOT the parent
-    // directory entry that names it. On a FIRST-TIME create a crash could
-    // otherwise lose the link to `canaries.jsonl` even though `create_at`
-    // returned Ok — the same "registered canary that never fires" failure the
-    // content fsync above guards against. Fsync the parent dir too (best-effort,
-    // logged; a no-op-ish cost on the rare subsequent appends). Mirrors the
-    // durable-publish pattern used by the card/incident writers.
     crate::util::fsync_parent_dir_logged(store, "canary store");
     Ok(())
 }
 
-/// One physical line of the canary store: either a successfully-parsed
-/// [`CanaryEntry`] or a raw line that did NOT parse as one.
-///
-/// `prune`/`rotate` read the store through [`read_store_partitioned`] so an
-/// unparseable line (a future schema field, a transient hiccup) is carried
-/// THROUGH the rewrite VERBATIM rather than silently dropped (CodeRabbit R12
-/// #F): the fail-open reader skipping a line for a hot-path lookup is correct,
-/// but dropping it on a compaction rewrite would be permanent data loss.
+/// One physical store line: a parsed [`CanaryEntry`] or a raw unparseable line.
+/// `prune`/`rotate` carry unparseable lines (future schema, transient hiccup)
+/// THROUGH the rewrite VERBATIM rather than dropping them — that would be
+/// permanent data loss (CodeRabbit R12 #F).
 enum StoreLine {
     Parsed(CanaryEntry),
     Unparseable(String),
 }
 
-/// Read the store as an ordered list of [`StoreLine`]s, preserving lines that
-/// do not parse as a [`CanaryEntry`] so a rewrite can write them back verbatim.
-///
-/// Returns `(lines, complete)`. `complete == false` (CodeRabbit R13 #1) means the
-/// underlying read broke early on a real mid-file I/O fault, so `lines` is a
-/// truncated prefix — `prune`/`rotate` must NOT rewrite the store from it (that
-/// would permanently drop the unread tail) and abort instead.
+/// Read the store as ordered [`StoreLine`]s, preserving unparseable lines for
+/// rewrite. `complete == false` (CodeRabbit R13 #1) means the read broke early
+/// on a mid-file fault, so `lines` is truncated — `prune`/`rotate` must abort
+/// rather than rewrite (which would drop the tail).
 fn read_store_partitioned(path: &Path) -> (Vec<StoreLine>, bool) {
-    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable line is kept
-    // verbatim as `StoreLine::Unparseable` and written back as-is on rewrite, so
-    // it must retain its original surrounding whitespace. Parseable entries are
-    // unaffected — `serde_json` tolerates the whitespace.
+    // RAW (untrimmed) read (CodeRabbit R15 #3): an unparseable line is written
+    // back verbatim, so it must retain its surrounding whitespace.
     let (lines, complete) = crate::util::read_store_lines_raw_complete(path);
     let parsed = lines
         .into_iter()
@@ -547,13 +440,11 @@ fn read_store_partitioned(path: &Path) -> (Vec<StoreLine>, bool) {
     (parsed, complete)
 }
 
-/// Atomically rewrite the store to exactly the given pre-serialized JSONL
-/// `lines`. Writes a sibling temp file then renames over the target so a crash
-/// mid-write never truncates the store. This is the line-preserving primitive
-/// `prune`/`rotate` use so unparseable lines survive the rewrite verbatim.
+/// Atomically rewrite the store to the given pre-serialized JSONL `lines`
+/// (temp-file + rename, so a crash mid-write never truncates it).
 fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
-    // Resolve a symlinked store to its real target so the rewrite writes THROUGH
-    // the link rather than replacing it with a regular file (CodeRabbit R13b).
+    // Resolve a symlink so the rewrite writes THROUGH it, not over it
+    // (CodeRabbit R13b).
     let dest = crate::util::resolve_symlink_target(store);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -569,22 +460,13 @@ fn rewrite_store_lines(store: &Path, lines: &[String]) -> std::io::Result<()> {
     for line in lines {
         writeln!(tmp, "{line}")?;
     }
-    // Durability: fsync the temp file's contents to stable storage BEFORE the
-    // atomic rename. Without this, a crash between `persist` (the rename) and
-    // the kernel flushing the temp file's data can leave the store renamed into
-    // place but holding zero/garbage bytes — worse than the pre-rename state.
-    // Flush the user-space writer first (a no-op for the inner `File` today, but
-    // correct regardless), then `sync_all()` the underlying file.
+    // Durability: fsync the temp body BEFORE the rename, else a crash could
+    // leave the store renamed into place holding zero/garbage bytes.
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(&dest).map_err(|e| e.error)?;
-    // Durability of the RENAME itself (CodeRabbit R9 #B): the body is fsync'd
-    // above, but the new directory entry is not crash-durable until the parent
-    // dir is fsync'd. A lost rewrite could resurrect a stale store (e.g. an
-    // un-pruned canary that no longer exists, or drop a still-live one). fsync
-    // the parent so the published store survives a crash. The body+rename already
-    // succeeded, so a dir-fsync failure is LOGGED, not propagated (R13 #5).
-    // Best-effort, unix-only.
+    // Make the rename durable too (CodeRabbit R9 #B): fsync the parent dir.
+    // Body+rename already succeeded, so a dir-fsync failure is logged (R13 #5).
     crate::util::fsync_parent_dir_logged(&dest, "canary store");
     Ok(())
 }
@@ -599,13 +481,9 @@ pub fn create_at(
     kind: CanaryKind,
     callback_url: Option<String>,
 ) -> std::io::Result<CanaryEntry> {
-    // Normalize the callback URL HERE — the single invariant for every caller
-    // (CLI, tests, library). Trim surrounding whitespace and collapse a
-    // blank-after-trim value to `None`. Without this, `Some("   ")` would be
-    // PERSISTED as a configured callback, yet `fire_callback` trims it to empty
-    // and no-ops — the store would claim "callback configured" while runtime
-    // treated the canary as local-only. Storing `None` keeps disk and runtime
-    // semantics identical.
+    // Normalize the callback URL HERE (single point for every caller): trim and
+    // collapse a blank-after-trim value to `None`, so the store can't claim a
+    // callback that `fire_callback` would trim away and no-op.
     let callback_url = callback_url.and_then(|u| {
         let t = u.trim();
         if t.is_empty() {
@@ -621,8 +499,7 @@ pub fn create_at(
         created_at: chrono::Utc::now().to_rfc3339(),
         callback_url,
     };
-    // Hold the store lock across the append so it cannot interleave with a
-    // concurrent prune/rotate read-modify-write (which would drop this entry).
+    // Lock across the append so a concurrent prune/rotate can't drop this entry.
     let _lock = StoreLock::acquire(store)?;
     append_entry(store, &entry)?;
     invalidate_cache();
@@ -640,23 +517,17 @@ pub fn create(kind: CanaryKind, callback_url: Option<String>) -> std::io::Result
     create_at(&store, kind, callback_url)
 }
 
-/// List every recorded canary in the store at `store`, in file order. A display
-/// path: an incomplete read (already diagnosed on stderr by the reader) returns
-/// the partial prefix rather than failing safe — the DETECTION path
-/// ([`detect_at`]) is the one that surfaces incompleteness (CodeRabbit R16 #3).
+/// List every recorded canary in `store`, file order. A display path: returns
+/// the partial prefix on an incomplete read — the DETECTION path ([`detect_at`])
+/// is the one that surfaces incompleteness (CodeRabbit R16 #3).
 pub fn list_at(store: &Path) -> Vec<CanaryEntry> {
     parse_store(store).0
 }
 
-/// Like [`list_at`] but also reports whether the store was read to COMPLETION
-/// (`(entries, complete)`). `complete == false` means the read stopped on a
-/// present-but-unreadable store (FIFO/device/oversized/permission/I/O) or a
-/// mid-file fault, so `entries` is NOT a faithful image and an "empty" result is
-/// NOT proof the store is empty (CodeRabbit R17 #2). The CLI `prune` uses this so
-/// it cannot mistake an UNREADABLE store for "nothing to prune": a lenient
-/// [`list_at`] would degrade such a store to an empty/partial view and report a
-/// false success. An ABSENT store is genuinely empty and returns
-/// `(vec![], true)`.
+/// Like [`list_at`] but also reports `complete`. `false` (unreadable/truncated
+/// store) means an "empty" result is NOT proof the store is empty (CodeRabbit
+/// R17 #2) — CLI `prune` uses this so it can't mistake an unreadable store for
+/// "nothing to prune". An ABSENT store returns `(vec![], true)`.
 pub fn list_at_complete(store: &Path) -> (Vec<CanaryEntry>, bool) {
     parse_store(store)
 }
@@ -669,11 +540,9 @@ pub fn list() -> Vec<CanaryEntry> {
     }
 }
 
-/// Production entry point for [`list_at_complete`] against the default store.
-/// Returns `(entries, complete)`. When the store path cannot be resolved at all
-/// the state dir is unknown — treated as `complete == false` (an unresolved
-/// store is NOT a proven-empty one) so the CLI does not report a false
-/// "nothing to prune".
+/// [`list_at_complete`] against the default store. An unresolvable store path is
+/// `complete == false` (not a proven-empty store) so the CLI doesn't report a
+/// false "nothing to prune".
 pub fn list_complete() -> (Vec<CanaryEntry>, bool) {
     match store_path() {
         Some(p) => list_at_complete(&p),
@@ -684,15 +553,12 @@ pub fn list_complete() -> (Vec<CanaryEntry>, bool) {
 /// Remove the canary with `id` from the store at `store`. Returns the number of
 /// entries removed (0 when the id is unknown).
 pub fn prune_at(store: &Path, id: &str) -> std::io::Result<usize> {
-    // Lock across the whole read-modify-write so a concurrent create/rotate
-    // cannot slip an update in between our snapshot and our rewrite.
+    // Lock across the whole read-modify-write (no concurrent update slips in).
     let _lock = StoreLock::acquire(store)?;
-    // Read RAW lines (CodeRabbit R12 #F): drop ONLY a parsed entry whose id
-    // matches; carry every other line — including ones that don't parse as a
-    // CanaryEntry — through the rewrite VERBATIM so prune never loses data.
-    // PARTIAL-READ GUARD (CodeRabbit R13 #1): if the read broke early on a real
-    // I/O fault the lines are a truncated prefix; rewriting from them would drop
-    // the unread tail (still-live canaries). Abort rather than truncate.
+    // RAW lines (CodeRabbit R12 #F): drop only the matching parsed entry; carry
+    // every other line through verbatim so prune never loses data. Partial-read
+    // guard (R13 #1): a truncated prefix must abort, not drive a rewrite that
+    // drops the tail.
     let (lines, complete) = read_store_partitioned(store);
     if !complete {
         return Err(std::io::Error::other(
@@ -733,14 +599,11 @@ pub fn prune(id: &str) -> std::io::Result<usize> {
 /// of the SAME kind, preserving the id and callback URL. Returns the updated
 /// entry, or `None` when the id is unknown.
 pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>> {
-    // Lock across the whole read-modify-write (see `prune_at`): a concurrent
-    // create appending mid-rotate must not be lost by our rewrite.
+    // Lock across the whole read-modify-write (see `prune_at`).
     let _lock = StoreLock::acquire(store)?;
-    // Read RAW lines (CodeRabbit R12 #F): mutate ONLY the parsed entry whose id
-    // matches; preserve every other line — parsed or not — so rotate never drops
-    // an unparseable (future-schema / transient) line on the rewrite.
-    // PARTIAL-READ GUARD (CodeRabbit R13 #1): a truncated prefix from a broken
-    // read must not drive a rewrite (it would drop the unread tail). Abort first.
+    // RAW lines (CodeRabbit R12 #F): mutate only the matching parsed entry,
+    // preserve every other line verbatim. Partial-read guard (R13 #1): a
+    // truncated prefix must abort before a rewrite that drops the tail.
     let (lines, complete) = read_store_partitioned(store);
     if !complete {
         return Err(std::io::Error::other(
@@ -757,19 +620,13 @@ pub fn rotate_at(store: &Path, id: &str) -> std::io::Result<Option<CanaryEntry>>
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     for sl in lines {
         match sl {
-            // Rotate only the FIRST matching entry; any later id-duplicate is
-            // preserved unchanged (ids are unique in practice — a create rejects
-            // a dup — but never silently drop one if the invariant is violated).
+            // Rotate only the FIRST matching entry; later id-duplicates are
+            // preserved unchanged (ids are unique in practice).
             StoreLine::Parsed(mut entry) if entry.id == id && updated.is_none() => {
-                // FAIL SAFE on an unknown `kind` (CodeRabbit R13 #A). `kind` is
-                // stored as a raw string for forward-compatible round-tripping, so
-                // an entry written by a NEWER binary (a future kind this build does
-                // not know) parses as valid JSON but `CanaryKind::parse` returns
-                // None. Defaulting to AwsLike would mint an AWS-shaped token while
-                // leaving the original `kind` string in place — corrupting the
-                // newer entry. Abort the rotate instead (the store is not rewritten
-                // because we return before `rewrite_store_lines`), mirroring the
-                // forward-compat preservation of `StoreLine::Unparseable`.
+                // FAIL SAFE on an unknown `kind` (CodeRabbit R13 #A): an entry
+                // from a NEWER binary parses as valid JSON but `parse` returns
+                // None. Defaulting would mint a wrong-shaped token over the
+                // original kind string, so abort instead (store not rewritten).
                 let kind = CanaryKind::parse(&entry.kind).ok_or_else(|| {
                     std::io::Error::other(format!(
                         "cannot rotate canary `{}`: unknown kind `{}` (written by a newer tirith?)",
@@ -803,9 +660,8 @@ pub fn rotate(id: &str) -> std::io::Result<Option<CanaryEntry>> {
     rotate_at(&store, id)
 }
 
-/// `true` when the store at `store` exists and has at least one byte. Used by
-/// the engine to decide whether to force past the tier-1 fast-exit for the
-/// canary scan. A cheap `metadata()` stat — no parse.
+/// `true` when `store` exists and is non-empty — the engine's cheap (stat-only)
+/// gate for whether to force past the tier-1 fast-exit for the canary scan.
 pub fn store_nonempty_at(store: &Path) -> bool {
     std::fs::metadata(store)
         .map(|m| m.len() > 0)
@@ -819,14 +675,10 @@ pub fn store_nonempty() -> bool {
 
 // ---- Detection ------------------------------------------------------------
 
-/// Scan `text` against every canary registered in the store at `store`. Returns
-/// one [`CanaryHit`] per matching canary, DEDUPED BY ID: a token appearing twice
-/// in `text` yields one hit (we iterate entries, not text matches), and a
-/// duplicate `id` in the store (the append-only store enforces no uniqueness, so
-/// a hand-edited or rotated-into-collision store could carry one) also yields a
-/// single hit for that id rather than firing the callback twice.
-/// `text.contains(&token)` is a substring match: a canary planted in a larger
-/// blob (e.g. a `cat ~/.aws/credentials` paste) still fires.
+/// Scan `text` against every registered canary, returning one [`CanaryHit`] per
+/// matching canary, DEDUPED BY ID (a token twice, or a duplicate store id, fires
+/// once — never the callback twice). Substring match, so a canary planted in a
+/// larger blob still fires.
 pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
     if text.is_empty() {
         return Vec::new();
@@ -835,14 +687,12 @@ pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
     let mut hits = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in entries {
-        // An empty token would `contains`-match everything; skip defensively
-        // (a well-formed entry never has an empty token).
+        // An empty token would `contains`-match everything; skip defensively.
         if e.token.is_empty() {
             continue;
         }
         if text.contains(&e.token) {
-            // Dedup by id: a duplicate id in the store must not fire twice (one
-            // detection, one callback). First match for an id wins.
+            // Dedup by id (first match wins) so a duplicate id fires once.
             if seen_ids.insert(e.id.clone()) {
                 hits.push(CanaryHit {
                     id: e.id,
@@ -852,27 +702,19 @@ pub fn detect_at(store: &Path, text: &str) -> Vec<CanaryHit> {
             }
         }
     }
-    // FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3, mirroring `taint`): the
-    // store read can stop on a persistent mid-file I/O fault and yield only the
-    // PREFIX it consumed. A canary planted in the UNREAD tail would then never
-    // match — a touched canary reading as untouched (fail-OPEN, a detection miss).
-    // We cannot synthesize a hit (no token/id/callback to attach, and firing a
-    // spurious opt-in callback would be wrong), so the least-disruptive fail-safe
-    // is to SURFACE the incompleteness: a one-line stderr diagnostic (rate-limited
-    // per (path, mtime)) so the operator knows the canary scan was not exhaustive.
-    // A genuine match in the prefix still fires normally; an InvalidData line skip
-    // keeps `complete == true` and never trips this.
+    // FAIL-SAFE ON A TRUNCATED READ (CodeRabbit R16 #3): a canary in the unread
+    // tail would read as untouched (fail-OPEN). We can't synthesize a hit, so
+    // surface the incompleteness via a rate-limited stderr diagnostic. A
+    // prefix match still fires; an InvalidData skip keeps `complete == true`.
     if !complete {
         warn_incomplete_store_once(store);
     }
     hits
 }
 
-/// One-line stderr diagnostic when a canary scan runs against an INCOMPLETELY
-/// read store, de-duplicated per `(path, mtime)` so the 5s-cache hot path does
-/// not spam. Unlike `taint` (whose lookup can fail safe to a synthetic tainted
-/// entry), a canary scan cannot synthesize a hit, so surfacing the incompleteness
-/// is the fail-safe (CodeRabbit R16 #3).
+/// One-line stderr diagnostic for a scan against an incompletely-read store,
+/// deduped per `(path, mtime)` so the 5s-cache hot path doesn't spam. The
+/// canary fail-safe, since a scan can't synthesize a hit (CodeRabbit R16 #3).
 fn warn_incomplete_store_once(store: &Path) {
     static LAST_WARNED: Mutex<Option<(PathBuf, u128)>> = Mutex::new(None);
     let mtime = mtime_nanos(store);
@@ -882,8 +724,8 @@ fn warn_incomplete_store_once(store: &Path) {
         return;
     }
     *guard = Some(key);
-    // Best-effort diagnostic: write fallibly so a closed/broken stderr cannot
-    // panic this helper (CodeRabbit R22 #4). `eprintln!` panics on a write error.
+    // Write fallibly so a closed/broken stderr can't panic this (CodeRabbit
+    // R22 #4 — `eprintln!` panics on a write error).
     let _ = writeln!(
         std::io::stderr(),
         "tirith: warning: canary store {} could not be read completely; \
@@ -900,25 +742,12 @@ pub fn detect(text: &str) -> Vec<CanaryHit> {
     }
 }
 
-/// Fire the OPT-IN, best-effort callback for a detection. Sends ONE POST to
-/// `hit.callback_url` (when set) with a JSON body of `{kind, detected_at,
-/// context}` — **never the token value**. `context` is a short, caller-supplied
-/// label (e.g. `"exec"`, `"paste"`, `"output"`).
-///
-/// This is the SINGLE network path the canary feature can take, and it fires
-/// ONLY on detection of a canary that was created with an explicit
-/// `--callback-url`. It is fully FIRE-AND-FORGET and fail-open:
-///
-/// * No callback URL → no-op (returns immediately; no thread, no network).
-/// * The POST runs on a DETACHED thread, so the engine verdict NEVER waits on
-///   it — a slow or hung endpoint cannot delay (or block) the command. A 1.5s
-///   connect / 3s total timeout caps the detached thread's lifetime.
-/// * Any error (DNS, TLS, timeout, non-2xx) is logged to the audit log via
-///   [`crate::audit::log_hook_event`] and otherwise swallowed — a callback
-///   NEVER blocks or alters the verdict.
-///
-/// The token value is deliberately NOT a parameter so it cannot leak into the
-/// request body.
+/// Fire the OPT-IN, best-effort detection callback: ONE POST to
+/// `hit.callback_url` (when set) of `{kind, detected_at, context}` — NEVER the
+/// token value (it is deliberately not a parameter). The single network path
+/// the feature can take. Fire-and-forget and fail-open: no URL → no-op; the
+/// POST runs on a DETACHED thread (1.5s connect / 3s total) so the verdict
+/// never waits; any error is logged and swallowed.
 pub fn fire_callback(hit: &CanaryHit, context: &str) {
     let Some(url) = hit.callback_url.as_deref() else {
         return;
@@ -935,15 +764,10 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
     let context = context.to_string();
     let detected_at = chrono::Utc::now().to_rfc3339();
 
-    // Keep an `id` copy on this side of the move so a SPAWN failure (the OS
-    // refusing a new thread — e.g. resource limits) can still be audited: the
-    // closure below consumes `id`, so without this clone a failed spawn would
-    // drop the callback with no record, unlike the HTTP-path failures which all
-    // reach `log_callback_failure`.
+    // Keep an `id` copy on this side of the move so a spawn failure can still be
+    // audited (the closure consumes `id`).
     let id_for_spawn_failure = id.clone();
-    // Detached: the engine returns its verdict without waiting on the network.
-    // If the process exits before the POST completes the callback is simply
-    // dropped — best-effort by design. We do not join the handle.
+    // Detached, not joined — the verdict never waits on the network.
     let spawn_result = std::thread::Builder::new()
         .name("tirith-canary-callback".to_string())
         .spawn(move || {
@@ -966,9 +790,6 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
             {
                 Ok(c) => c,
                 Err(_e) => {
-                    // The URL is not given to the builder, so this error cannot
-                    // carry it — but keep the audit reason coarse and URL-free
-                    // for consistency with the send-error path below.
                     log_callback_failure(&id, "client build failed");
                     return;
                 }
@@ -977,35 +798,30 @@ pub fn fire_callback(hit: &CanaryHit, context: &str) {
             match client.post(&url).json(&body).send() {
                 Ok(resp) if resp.status().is_success() => {}
                 Ok(resp) => {
-                    // Only the numeric status — never the URL.
+                    // Numeric status only — never the URL.
                     log_callback_failure(
                         &id,
                         &format!("callback returned HTTP {}", resp.status().as_u16()),
                     );
                 }
                 Err(e) => {
-                    // CRITICAL: a `reqwest::Error`'s Display embeds the request
-                    // URL (e.g. "error sending request for url (https://…)").
-                    // The callback URL is operator-private (a self-hosted
-                    // endpoint), so NEVER interpolate the raw error into the
-                    // audit log — classify it to a coarse, URL-free reason.
+                    // CRITICAL: a `reqwest::Error`'s Display embeds the (operator-
+                    // private) URL, so classify to a coarse, URL-free reason
+                    // instead of logging it raw.
                     log_callback_failure(&id, classify_callback_error(&e));
                 }
             }
         });
 
-    // A spawn failure (the OS refused a new thread) silently dropped the
-    // callback before this — route it through the same audit sink as the
-    // in-thread HTTP failures, with a coarse, URL-free reason.
+    // A spawn failure dropped the callback — route it through the same audit
+    // sink with a coarse, URL-free reason.
     if spawn_result.is_err() {
         log_callback_failure(&id_for_spawn_failure, "callback worker spawn failed");
     }
 }
 
-/// Map a `reqwest` send error to a coarse, NON-sensitive reason string. The raw
-/// `Display` of a `reqwest::Error` embeds the request URL (the operator-private
-/// callback endpoint), so it must never reach the audit log. This returns only
-/// the error *category* — no URL, host, or other request detail.
+/// Map a `reqwest` send error to a coarse, URL-free reason category (the raw
+/// `Display` embeds the operator-private URL and must never reach the log).
 fn classify_callback_error(e: &reqwest::Error) -> &'static str {
     if e.is_timeout() {
         "callback POST failed: timeout"
@@ -1022,9 +838,8 @@ fn classify_callback_error(e: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Log a non-blocking canary-callback failure to the audit log. Reuses the
-/// hook-telemetry entry shape (`integration = "canary"`). The id is recorded;
-/// the token value and the callback URL are NOT (no secret / endpoint leakage).
+/// Log a canary-callback failure to the audit log (hook-telemetry shape,
+/// `integration = "canary"`). Records the id only — never the token or URL.
 fn log_callback_failure(id: &str, reason: &str) {
     crate::audit::log_hook_event(
         "canary",
@@ -1052,13 +867,9 @@ mod tests {
         unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) == 0 }
     }
 
-    /// CodeRabbit R13 #1: a store whose read does NOT complete (here a FIFO, which
-    /// `read_store_lines_complete` reports as incomplete because it is not a
-    /// readable regular file) must ABORT prune/rotate — NOT rewrite the store from
-    /// the empty/partial image, which would truncate it. The mutator returns an
-    /// error and the store path is left exactly as-is (still a FIFO, never
-    /// replaced by a regular file). Unix-only (needs mkfifo); cannot hang (the
-    /// O_NONBLOCK open in `open_regular_capped` returns immediately).
+    /// CodeRabbit R13 #1: a store whose read doesn't complete (here a FIFO) must
+    /// ABORT prune/rotate, not rewrite from the partial image (which would
+    /// truncate). The store is left as-is. Unix-only; can't hang (O_NONBLOCK).
     #[cfg(unix)]
     #[test]
     fn prune_and_rotate_abort_on_incomplete_read_no_truncation() {
@@ -1097,13 +908,10 @@ mod tests {
         );
     }
 
-    /// CodeRabbit R16 #3 (canary analog of the taint fail-safe): a store whose
-    /// read does NOT complete (here a FIFO, reported incomplete by
-    /// `read_store_lines_complete`) must be flagged `complete == false` so
-    /// `detect_at` surfaces the incompleteness rather than treating a planted
-    /// canary as definitively untouched. We assert the load-bearing precondition
-    /// (the read reports incomplete) and that `detect_at` returns promptly without
-    /// hanging or panicking. Unix-only (needs mkfifo); cannot hang (O_NONBLOCK).
+    /// CodeRabbit R16 #3: a store whose read doesn't complete (here a FIFO) must
+    /// be flagged `complete == false` so `detect_at` surfaces it rather than
+    /// treating a planted canary as untouched. Asserts the read reports
+    /// incomplete and `detect_at` returns promptly. Unix-only; can't hang.
     #[cfg(unix)]
     #[test]
     fn detect_surfaces_incomplete_read_not_silent_clean() {
@@ -1134,9 +942,7 @@ mod tests {
     fn aws_like_token_is_clearly_synthetic() {
         let tok = generate_token(CanaryKind::AwsLike);
         assert!(tok.starts_with("AKIA00CANARY"), "got {tok}");
-        // The explicit `00CANARY` marker is what keeps the token clearly
-        // synthetic, so a flagged value reads as tirith bait rather than a real
-        // leaked credential — the load-bearing "clearly-labelled" property.
+        // The `00CANARY` marker is the load-bearing "clearly-synthetic" property.
         assert!(tok.contains("00CANARY"));
         assert_eq!(tok.len(), "AKIA00CANARY".len() + 8);
     }
@@ -1158,10 +964,9 @@ mod tests {
 
     #[test]
     fn getrandom_fallback_bytes_vary_per_call() {
-        // CodeRabbit R9 #H: the getrandom-failure fallback must NOT be
-        // deterministic — the old code cycled the same alphabet head every call,
-        // so `new_id()` could repeat IDs. `fill_fallback_bytes` advances a
-        // process-lifetime counter (+ time), so two consecutive fills differ.
+        // CodeRabbit R9 #H: the fallback must not be deterministic (the old code
+        // cycled the same head, repeating `new_id()`s). The counter advances, so
+        // two consecutive fills differ.
         let mut a = [0u8; 64];
         let mut b = [0u8; 64];
         fill_fallback_bytes(&mut a);
@@ -1225,11 +1030,9 @@ mod tests {
 
     #[test]
     fn create_normalizes_blank_callback_url_to_none() {
-        // CodeRabbit R6 #8: a whitespace-only callback URL must persist as `None`,
-        // not `Some("   ")`. `fire_callback` trims and no-ops on a blank URL, so
-        // storing the raw blank would make the on-disk record claim a callback is
-        // configured while runtime treats the canary as local-only. `create_at`
-        // is the single normalization point for all callers.
+        // CodeRabbit R6 #8: a whitespace-only callback URL persists as `None`, so
+        // the on-disk record can't claim a callback that runtime would no-op.
+        // `create_at` is the single normalization point.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
@@ -1258,17 +1061,11 @@ mod tests {
         );
     }
 
-    /// Durability regression (CodeRabbit/Greptile R4 #1): every store mutator
-    /// must flush + `sync_all()` before returning Ok, so a registered/pruned/
-    /// rotated canary survives a crash. A unit test cannot OBSERVE the fsync
-    /// barrier directly (the kernel would have to crash between the write and
-    /// the flush), so this asserts the necessary precondition: after each
-    /// mutator returns Ok the written content is durably present and readable
-    /// straight from the file on disk (via `parse_store`, NOT the in-process
-    /// cache). If a mutator regressed to dropping the synced write, the bytes
-    /// would not be on disk for `parse_store` to read back. The actual fsync
-    /// calls live in `append_entry` (create) and `rewrite_store_lines`
-    /// (prune/rotate).
+    /// Durability regression (CodeRabbit/Greptile R4 #1): each mutator flushes +
+    /// `sync_all()` before Ok. A unit test can't observe the fsync barrier, so
+    /// this asserts the precondition: after each mutator the content is readable
+    /// straight from disk (via `parse_store`, not the cache). Fsyncs live in
+    /// `append_entry` and `rewrite_store_lines`.
     #[test]
     fn mutators_persist_durably_to_disk() {
         let dir = tempdir().unwrap();
@@ -1328,14 +1125,10 @@ mod tests {
 
     #[test]
     fn detect_dedups_duplicate_id_store_entries() {
-        // P2: the doc promises results are "deduped by id". The append-only
-        // store enforces no id-uniqueness, so two entries can share an id (e.g.
-        // a hand-edited store). Both matching the text must yield ONE hit for
-        // that id — never fire the (opt-in) callback twice for one id.
+        // P2: two store lines can share an id (hand-edited store); both matching
+        // must yield ONE hit, never firing the opt-in callback twice.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
-        // Two store lines with the SAME id but distinct tokens, both present in
-        // the scanned text.
         std::fs::write(
             &store,
             "{\"id\":\"dup\",\"token\":\"ghp_canary_aaa\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n\
@@ -1408,8 +1201,7 @@ mod tests {
         assert!(rotate_at(&store, "nope").unwrap().is_none());
     }
 
-    /// Append a valid-but-unparseable line (a future-schema JSON object) to the
-    /// store so the lenient reader skips it. Returns the literal line.
+    /// Append a future-schema line the lenient reader skips; returns the line.
     fn append_unparseable_line(store: &Path) -> String {
         let unknown = r#"{"schema":"v2","id":"future","token":"x","kind":"brand-new-kind"}"#;
         use std::io::Write as _;
@@ -1424,9 +1216,8 @@ mod tests {
 
     #[test]
     fn prune_preserves_unparseable_lines_on_rewrite() {
-        // CodeRabbit R12 #F: prune's REWRITE must not silently drop a line the
-        // lenient reader skips. Create two canaries + an unknown line, prune one,
-        // and assert the unknown line survives on disk.
+        // CodeRabbit R12 #F: prune's rewrite must not drop a line the reader
+        // skips. Prune one of two canaries; the unknown line survives on disk.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1451,8 +1242,7 @@ mod tests {
 
     #[test]
     fn rotate_preserves_unparseable_lines_on_rewrite() {
-        // CodeRabbit R12 #F: rotate's REWRITE must not silently drop a line the
-        // lenient reader skips.
+        // CodeRabbit R12 #F: rotate's rewrite must not drop a skipped line.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let original = create_at(&store, CanaryKind::GithubLike, None).unwrap();
@@ -1472,11 +1262,9 @@ mod tests {
 
     #[test]
     fn rotate_unknown_kind_fails_safe_without_corrupting() {
-        // CodeRabbit R13 #A: an entry written by a NEWER tirith with a `kind` this
-        // build doesn't know still deserializes as a valid `CanaryEntry`
-        // (StoreLine::Parsed) — it is NOT an unparseable line. Rotating it must
-        // NOT silently mint an AWS-shaped token while leaving the unknown `kind`
-        // in place (corruption). It must fail safe and leave the store untouched.
+        // CodeRabbit R13 #A: a future-`kind` entry parses as a valid CanaryEntry
+        // (not unparseable); rotating it must fail safe and leave the store
+        // untouched, not mint a wrong-shaped token over the unknown kind.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         // A fully-valid CanaryEntry whose `kind` is a future/unknown string.
@@ -1520,10 +1308,8 @@ mod tests {
 
     #[test]
     fn sequential_locked_mutations_each_persist_and_release_lock() {
-        // F2 (Major): the store mutators serialize behind a sibling `.lock`
-        // file. This proves the lock is RELEASED between calls (a still-held
-        // exclusive lock would deadlock the next blocking acquire) and that each
-        // mutation's effect persists — two creates then a prune all take effect.
+        // F2 (Major): proves the lock is RELEASED between calls (a held lock
+        // would deadlock the next acquire) and each mutation persists.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
@@ -1548,23 +1334,15 @@ mod tests {
 
     #[test]
     fn acquire_proceeds_on_supported_lock_and_persists() {
-        // F1 (Major): `StoreLock::acquire` must NOT silently drop the
-        // serialization guarantee on an arbitrary lock error. On a normal
-        // filesystem `lock_exclusive` succeeds, so acquire returns `Ok` and the
-        // guarded mutation persists — proving the happy (supported-lock) path is
-        // preserved by the fix and the lock is actually held across the write.
+        // F1 (Major): the happy (supported-lock) path returns Ok and holds a real
+        // lock across the write — not an unlocked best-effort handle.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         {
             let _g = StoreLock::acquire(&store).expect("supported-lock acquire succeeds");
-            // The sentinel lock file is created as part of acquire.
             assert!(lock_path_for(&store).exists(), "lock sentinel created");
-            // While the lock is held in THIS scope, the file handle is open and
-            // the guard is live; dropping it below releases the lock.
         }
-        // After release the guarded mutator works and its effect persists,
-        // confirming acquire returned a real, releasable lock (not an UNLOCKED
-        // best-effort handle from a swallowed error).
+        // After release the guarded mutator persists, confirming a real lock.
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
         assert!(
             store_nonempty_at(&store),
@@ -1574,25 +1352,18 @@ mod tests {
 
     #[test]
     fn acquire_propagates_non_unsupported_io_errors() {
-        // F1 (Major): only an `Unsupported` lock error is best-effort; any other
-        // I/O failure during acquire must propagate as `Err`, never silently
-        // proceed. We force a deterministic, cross-platform failure: point the
-        // store at a path whose PARENT is an existing regular FILE, so
-        // `create_dir_all(parent)` inside `acquire` fails (NotADirectory /
-        // AlreadyExists) and the error is returned rather than swallowed.
+        // F1 (Major): only `Unsupported` is best-effort; any other I/O failure
+        // must propagate. Force it cross-platform by placing the store under a
+        // regular file, so `create_dir_all(parent)` inside `acquire` fails.
         let dir = tempdir().unwrap();
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
-        // store would live UNDER the regular file `not-a-dir` — its parent can
-        // never be created.
         let store = blocker.join("canaries.jsonl");
         // `StoreLock` is not `Debug`, so match instead of `expect_err`.
         match StoreLock::acquire(&store) {
             Ok(_) => panic!("acquire must fail when the store's parent cannot be created"),
             Err(err) => {
-                // It must surface a real error (the exact kind is OS-dependent),
-                // proving acquire does not return a bogus unlocked guard on a
-                // non-Unsupported failure.
+                // A real error (OS-dependent kind), not a bogus unlocked guard.
                 assert_ne!(
                     err.kind(),
                     std::io::ErrorKind::Unsupported,
@@ -1618,15 +1389,12 @@ mod tests {
 
     #[test]
     fn reader_io_error_line_does_not_truncate_later_entries() {
-        // F3 (Sev-5): a reader I/O error (invalid UTF-8) on one line must skip
-        // only THAT line — entries AFTER it must still load. The previous
-        // `map_while(Result::ok)` stopped at the first Err, silently dropping a
-        // later (possibly TOUCHED) canary.
+        // F3 (Sev-5): a bad-UTF-8 line skips only THAT line; entries after it
+        // still load. The old `map_while(Result::ok)` stopped at the first Err.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
-        // Build: valid entry, then a line with invalid UTF-8 (0xFF), then a
-        // second valid entry. `BufRead::lines()` yields Err on the bad line.
+        // valid entry, then an invalid-UTF-8 line, then a second valid entry.
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(
             b"{\"id\":\"first\",\"token\":\"ghp_canary_first\",\"kind\":\"github-like\",\"created_at\":\"t\"}\n",
@@ -1677,11 +1445,9 @@ mod tests {
 
     #[test]
     fn callback_error_reason_never_contains_the_url_or_host() {
-        // CRITICAL (finding D): a failed callback's audit reason must NOT embed
-        // the operator-private callback URL/host. A raw `reqwest::Error`'s
-        // Display normally includes the request URL, so we provoke a real send
-        // error against a unique, recognizable host and assert the CLASSIFIED
-        // reason carries none of it — only a coarse category.
+        // CRITICAL (finding D): the audit reason must not embed the
+        // operator-private URL/host. Provoke a real send error and assert the
+        // classified reason is a coarse category only.
         let unique_host = "canary-secret-endpoint.invalid";
         let url = format!("http://{unique_host}:9/callback");
         let client = reqwest::blocking::Client::builder()

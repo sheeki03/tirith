@@ -10,18 +10,14 @@ enum UrlValidationMode {
     Fetch,
 }
 
-/// Validate that a server URL is safe for outbound requests.
-///
-/// Requires HTTPS unless `TIRITH_ALLOW_HTTP=1` is set, and blocks private,
-/// loopback, link-local, metadata, documentation, and other non-public targets.
+/// Validate a server URL for outbound requests: HTTPS unless `TIRITH_ALLOW_HTTP=1`,
+/// and block private / loopback / link-local / metadata / non-public targets.
 pub fn validate_server_url(url: &str) -> Result<(), String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Server, &resolve_host).map(|_| ())
 }
 
-/// Validate that a fetch/cloaking URL is safe for outbound requests.
-///
-/// Allows `http` and `https`, but blocks embedded credentials and non-public
-/// network destinations after DNS resolution.
+/// Validate a fetch/cloaking URL: allows http/https but blocks embedded
+/// credentials and non-public destinations (after DNS resolution).
 pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
 }
@@ -394,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_cloud_metadata() {
-        // ::ffff:169.254.169.254 — AWS metadata endpoint via IPv4-mapped.
+        // AWS metadata endpoint via IPv4-mapped IPv6.
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:169.254.169.254]/latest/meta-data/",
             UrlValidationMode::Server,

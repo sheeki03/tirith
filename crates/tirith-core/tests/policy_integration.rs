@@ -1,8 +1,6 @@
-//! Integration tests for the policy system.
-//!
-//! These tests create temporary directory structures with `.git` markers and
-//! `.tirith/` policy dirs to exercise blocklist, allowlist, severity overrides,
-//! and policy discovery through the full engine pipeline.
+//! Integration tests for the policy system: temp dirs with `.git` markers and
+//! `.tirith/` policy dirs exercise blocklist/allowlist/severity overrides and
+//! discovery through the full engine pipeline.
 
 use std::fs;
 
@@ -66,7 +64,6 @@ fn test_blocklist_triggers_policy_blocklisted() {
             .map(|f| &f.rule_id)
             .collect::<Vec<_>>()
     );
-    // Verify it's Critical severity
     let blocklist_finding = verdict
         .findings
         .iter()
@@ -487,8 +484,7 @@ severity_overrides:
 
     let cwd = repo.path().to_str().unwrap();
 
-    // curl | bash would normally BLOCK; learning mode's LOW overrides drop
-    // it to WARN.
+    // curl | bash would normally BLOCK; the LOW overrides drop it to WARN.
     let verdict = analyze_exec("curl https://example.com/install.sh | bash", cwd);
     assert_eq!(
         verdict.action,
@@ -541,13 +537,9 @@ fn test_blocklist_ignores_comments() {
         .any(|f| f.rule_id == RuleId::PolicyBlocklisted));
 }
 
-// ---------------------------------------------------------------------------
-// Chunk 3 — policy-aware MCP suppression.
-//
-// `scan.trusted_mcp_servers` and `scan.mcp_allowed_tools` are exercised
-// through the full engine pipeline: write a policy, drop an MCP config file
-// in the repo, scan the file, and assert which findings did / did not fire.
-// ---------------------------------------------------------------------------
+// Policy-aware MCP suppression: `scan.trusted_mcp_servers` /
+// `scan.mcp_allowed_tools` exercised through the full pipeline — write a policy,
+// drop an MCP config, scan it, assert which findings fired.
 
 /// Scan a config file in the given repo, returning the verdict.
 fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Verdict {
@@ -572,9 +564,8 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
 
 #[test]
 fn test_policy_round_trip_for_mcp_fields() {
-    // A policy.yaml with `trusted_mcp_servers` AND `mcp_allowed_tools` must
-    // load, validate, and be honored — round-trips end-to-end through the
-    // engine and the configfile MCP rules.
+    // A policy with `trusted_mcp_servers` AND `mcp_allowed_tools` must load,
+    // validate, and be honored end-to-end through the engine.
     let policy_yaml = r#"
 fail_mode: open
 scan:
@@ -586,8 +577,8 @@ scan:
 "#;
     let repo = make_repo(policy_yaml);
 
-    // Drop an MCP config that would normally trigger McpInsecureServer
-    // (http://) — the trusted name must suppress the finding.
+    // A config that would normally trigger McpInsecureServer (http://) — the
+    // trusted name must suppress the finding.
     fs::write(
         repo.path().join("mcp.json"),
         r#"{"mcpServers":{"my-trusted-server":{"url":"http://insecure.example.com/mcp"}}}"#,
@@ -611,8 +602,7 @@ scan:
 
 #[test]
 fn test_untrusted_mcp_server_still_fires() {
-    // Same policy, different config: the server is NOT in
-    // `trusted_mcp_servers`, so the finding fires.
+    // Server NOT in `trusted_mcp_servers` → the finding fires.
     let policy_yaml = r#"
 fail_mode: open
 scan:
@@ -643,11 +633,8 @@ scan:
 
 #[test]
 fn test_mcp_allowed_tools_round_trip_through_yaml() {
-    // The policy's `mcp_allowed_tools` HashMap must serialize, deserialize,
-    // and be honored at finding time. We assert the schema-level
-    // round-trip (the policy actually loads and validates) by relying on
-    // the engine — if the field were rejected, the engine would never see
-    // the values and the disallowed-tool finding would not fire.
+    // `mcp_allowed_tools` must load, validate, and be honored — asserted via
+    // the engine (a rejected field would mean no disallowed-tool finding).
     let policy_yaml = r#"
 fail_mode: open
 scan:
@@ -656,13 +643,11 @@ scan:
       - read_file
 "#;
     let repo = make_repo(policy_yaml);
-    // Build a lockfile that records a tool outside the allowed set.
+    // A lockfile recording a tool outside the allowed set.
     let mcp_config =
         r#"{"mcpServers":{"fs":{"command":"node","tools":["read_file","evil_tool"]}}}"#;
     fs::write(repo.path().join(".mcp.json"), mcp_config).unwrap();
 
-    // Build and write the lockfile (we ship the in-process inventory
-    // function via mcp_lock).
     let inv = tirith_core::mcp_lock::build_inventory(repo.path());
     let lock = tirith_core::mcp_lock::McpLockfile::from_inventory(&inv);
     let lock_dir = repo.path().join(".tirith");
@@ -679,7 +664,7 @@ scan:
         !drift_findings.is_empty(),
         "expected a McpServerDrift finding for the disallowed lockfile tool: {verdict:?}"
     );
-    // The disallowed-tool finding is High severity (vs the Medium default).
+    // The disallowed-tool finding is High (vs the Medium default).
     assert!(
         drift_findings.iter().any(|f| f.severity == Severity::High),
         "expected a High-severity drift finding for a disallowed lockfile tool, \

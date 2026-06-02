@@ -1,38 +1,21 @@
 //! IaC plan parsing and hashing — M8 ch3.
 //!
-//! ## Supported tools
+//! Terraform, OpenTofu, and Pulumi only; CDK / CloudFormation / Ansible /
+//! Crossplane are out of scope (their plan shapes need their own dispatch arms).
 //!
-//! Terraform, OpenTofu, and Pulumi only. CDK, CloudFormation, Ansible,
-//! and Crossplane are **out of scope** for M8 — their plan shapes don't
-//! resemble the `terraform show -json` envelope and would need their own
-//! dispatch arms. Operators piping `cdk synth` JSON into `tirith iac
-//! check-plan` will see `unrecognized plan JSON shape` and should treat
-//! that as "not supported yet" rather than "broken".
+//! Two responsibilities, kept off the hot path:
 //!
-//! Two responsibilities, deliberately separated from the hot path:
-//!
-//! 1. **Plan parsing.** `parse_plan_json` accepts a byte buffer holding the
-//!    output of `terraform show -json tfplan` (also produced by
-//!    `tofu show -json`), OR the output of `pulumi preview --json` which
-//!    uses a different `steps`-keyed shape that `parse_plan_json`
-//!    dispatches to separately. Counts create / update / destroy and
-//!    flags IAM / SG / public-bucket / DB / LB changes against a
-//!    curated heuristic table. The heuristic is intentionally narrow —
-//!    false positives here drive operator noise but missing categories
-//!    are easy to add.
-//!
+//! 1. **Plan parsing.** `parse_plan_json` accepts `terraform show -json` /
+//!    `tofu show -json` output, or the `steps`-keyed `pulumi preview --json`
+//!    shape. Counts create/update/destroy and flags IAM/SG/public-bucket/DB/LB
+//!    changes against a deliberately narrow heuristic table.
 //! 2. **Plan hashing + cache.** `record_plan_hash` writes
-//!    `state_dir()/iac_plans/<sha256>.json` with a short metadata blob,
-//!    `plan_hash_recorded` checks for membership, and `purge_old_plans`
-//!    drops files older than the configured TTL (7d by default).
+//!    `state_dir()/iac_plans/<sha256>.json`; `plan_hash_recorded` checks
+//!    membership; `purge_old_plans` drops files older than the TTL.
 //!
-//! Shell-out to `terraform show -json` happens ONLY from the
-//! `tirith iac check-plan` CLI path via [`run_terraform_show_json`].
-//! The engine hot path never calls these helpers — it consults
-//! `plan_hash_recorded` directly with the byte content of the plan file.
-//! `run_terraform_show_json` uses the same hard-timeout watchdog pattern
-//! as `crate::context_detect::run_with_timeout` with a 5s budget (plans
-//! can be large; the 1.5s context-detect cap is too tight here).
+//! Shell-out happens ONLY from the `tirith iac check-plan` CLI path via
+//! [`run_terraform_show_json`] — the engine hot path consults
+//! `plan_hash_recorded` directly with the plan file's bytes.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -40,54 +23,36 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Hard wall-clock cap for the `terraform show -json` / `tofu show -json`
-/// shell-out. Plans can be large; we generously cap at 5s so a real plan
-/// has time to render. The hot path NEVER calls this.
+/// Hard wall-clock cap for the `terraform/tofu show -json` shell-out (plans can
+/// be large). The hot path never calls this.
 pub const TERRAFORM_SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stored plans older than this are dropped by [`purge_old_plans`].
 pub const PLAN_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Maximum size we will read into memory for a plan file or its JSON
-/// rendering. Terraform plan-JSON outputs can be several MiB for large
-/// estates; 32 MiB is a safe upper bound for a CLI-driven flow.
+/// Max bytes read into memory for a plan file or its JSON rendering.
 pub const MAX_PLAN_SIZE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Per-resource change counts plus the curated high-risk flags.
-///
-/// `total_changes` is the sum of `create + update + destroy`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSummary {
-    /// Tool detected by the parser. `terraform` is the default for the
-    /// shared JSON shape; `pulumi` is set when the input has the
-    /// `steps` shape from `pulumi preview --json`.
+    /// Detected tool (`terraform` default; `pulumi` for the `steps` shape).
     #[serde(default)]
     pub tool: PlanTool,
-    /// Number of resources created.
     pub create: usize,
-    /// Number of resources updated.
     pub update: usize,
-    /// Number of resources destroyed.
     pub destroy: usize,
     /// `create + update + destroy`.
     pub total_changes: usize,
-    /// Resource addresses that fall in the IAM category
-    /// (`aws_iam_*`, `google_project_iam_*`, `azurerm_role_*`,
-    /// `kubernetes_cluster_role*`, etc.).
+    /// Addresses in the IAM category (`aws_iam_*`, `azurerm_role_*`, etc.).
     pub iam_changes: Vec<String>,
-    /// Resource addresses that touch security groups
-    /// (`aws_security_group*`, `google_compute_firewall*`, etc.).
+    /// Addresses touching security groups / firewalls.
     pub security_group_changes: Vec<String>,
-    /// Resource addresses that grant public bucket access
-    /// (`aws_s3_bucket_public_access_block`,
-    /// `aws_s3_bucket_acl`, `google_storage_bucket_iam_member` with
-    /// `allUsers`, etc.).
+    /// Addresses granting public bucket access.
     pub public_bucket_changes: Vec<String>,
-    /// Resource addresses that touch DB / cluster instances
-    /// (`aws_db_instance`, `aws_rds_cluster`, `google_sql_database_instance`).
+    /// Addresses touching DB / cluster instances.
     pub db_changes: Vec<String>,
-    /// Resource addresses that touch load balancers
-    /// (`aws_lb`, `aws_alb`, `google_compute_forwarding_rule`).
+    /// Addresses touching load balancers.
     pub lb_changes: Vec<String>,
 }
 
@@ -102,8 +67,7 @@ impl PlanSummary {
     }
 }
 
-/// Which tool emitted the plan JSON. Used in evidence strings and the
-/// recorded metadata blob.
+/// Which tool emitted the plan JSON.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanTool {
@@ -125,15 +89,9 @@ impl PlanTool {
 
 /// Parse a plan-JSON byte buffer into a [`PlanSummary`].
 ///
-/// Supports two shapes:
-///   1. Terraform / OpenTofu — `{ "resource_changes": [...] }`. Each entry
-///      has a `change.actions: [create|update|delete|noop]` array and an
-///      `address` / `type` string.
-///   2. Pulumi — `{ "steps": [...] }`. Each step has `op` (`create`,
-///      `update`, `delete`) and `urn` (`urn:pulumi:stack::project::type::name`).
-///
-/// Any other shape returns `Err`. The caller (`tirith iac check-plan`)
-/// surfaces the error to the operator without panicking.
+/// Supports two shapes: Terraform/OpenTofu (`resource_changes`, each with
+/// `change.actions` + `address`/`type`) and Pulumi (`steps`, each with `op` +
+/// `urn`). Any other shape returns `Err`.
 pub fn parse_plan_json(bytes: &[u8]) -> Result<PlanSummary, String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("json parse error: {e}"))?;
@@ -156,8 +114,6 @@ fn parse_terraform_plan(value: &serde_json::Value) -> Result<PlanSummary, String
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing `resource_changes` array".to_string())?;
 
-    // Heuristic — `terraform_version` ≠ pulumi; pulumi can also emit a
-    // `resource_changes` extension; default to Terraform.
     let mut summary = PlanSummary {
         tool: PlanTool::Terraform,
         ..PlanSummary::default()
@@ -207,8 +163,7 @@ fn parse_pulumi_plan(value: &serde_json::Value) -> Result<PlanSummary, String> {
 
         record_actions(&mut summary, &[op.to_string()]);
 
-        // Pulumi URN format: `urn:pulumi:stack::project::type::name`.
-        // Type is the second-to-last `::` segment.
+        // Type is the second-to-last `::` segment of the URN.
         let resource_type = pulumi_type_from_urn(urn);
         record_high_risk(&mut summary, urn, resource_type);
     }
@@ -228,9 +183,8 @@ fn pulumi_type_from_urn(urn: &str) -> &str {
 }
 
 fn record_actions(summary: &mut PlanSummary, actions: &[String]) {
-    // Terraform plan: actions is an array; a single change can be
-    // `["create"]`, `["update"]`, `["delete"]`, `["delete", "create"]`
-    // (replace), or `["no-op"]`. Pulumi: a single `op` string.
+    // Terraform actions is an array (incl. `["delete", "create"]` replace);
+    // Pulumi passes a single `op`.
     for action in actions {
         match action.as_str() {
             "create" => summary.create += 1,
@@ -241,9 +195,8 @@ fn record_actions(summary: &mut PlanSummary, actions: &[String]) {
     }
 }
 
-/// Resource-type / address heuristics for high-risk changes. The shipped
-/// table is narrow — we surface the highest-signal categories and leave
-/// the rest to operator review.
+/// Resource-type / address heuristics for high-risk changes (narrow table —
+/// highest-signal categories only).
 fn record_high_risk(summary: &mut PlanSummary, address: &str, resource_type: &str) {
     let lower = resource_type.to_lowercase();
     let address = if address.is_empty() {
@@ -252,10 +205,8 @@ fn record_high_risk(summary: &mut PlanSummary, address: &str, resource_type: &st
         address.to_string()
     };
 
-    // IAM mutations. Cover Terraform-style (`aws_iam_role`,
-    // `google_project_iam_member`) plus Pulumi-style URN type names
-    // (`aws:iam/role:Role`, `gcp:projects/iAMMember:IAMMember`,
-    // `azure:authorization/roleAssignment:RoleAssignment`).
+    // IAM mutations — Terraform (`aws_iam_role`) and Pulumi URN type names
+    // (`aws:iam/role:Role`, `...roleAssignment:RoleAssignment`).
     let is_iam = lower.contains("iam_")
         || lower.contains("iam:")
         || lower.contains("iam/")
@@ -314,8 +265,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Metadata stored alongside the recorded plan-hash. Kept small so the
-/// store stays fast to walk; the actual plan body is NOT recorded.
+/// Metadata stored alongside the recorded plan-hash (the plan body is NOT
+/// recorded — kept small so the store stays fast to walk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedPlan {
     pub sha256: String,
@@ -324,12 +275,8 @@ pub struct RecordedPlan {
     pub summary: PlanSummary,
 }
 
-/// Record a plan hash + its summary into the per-process plan store
-/// (`state_dir()/iac_plans/<sha256>.json`).
-///
-/// Returns the hash that was recorded. Idempotent — re-recording the same
-/// hash overwrites the previous entry's metadata (the `plan_path` may
-/// change between runs even if the body is identical).
+/// Record a plan hash + summary into `state_dir()/iac_plans/<sha256>.json` and
+/// return the hash. Idempotent — re-recording overwrites the metadata.
 pub fn record_plan_hash(
     plan_bytes: &[u8],
     plan_path: &Path,
@@ -354,19 +301,16 @@ pub fn record_plan_hash(
     Ok(sha)
 }
 
-/// Status of a plan-hash lookup. PR-127 review #14: previously a bare
-/// `bool` conflated "no state dir resolvable" (operator environment is
-/// broken — `XDG_STATE_HOME` unset on a system that doesn't have one) with
-/// "this hash hasn't been recorded" (mismatch detected). Distinguish.
+/// Status of a plan-hash lookup. PR-127 review #14: a bare `bool` conflated
+/// "state dir unresolvable" with "hash not recorded" — distinguish them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanHashStatus {
-    /// A plan file with the supplied hash exists in the recorded store.
+    /// A plan file with the supplied hash exists in the store.
     Recorded,
-    /// The store exists but the hash isn't in it. This is a real mismatch.
+    /// The store exists but the hash isn't in it — a real mismatch.
     NotRecorded,
-    /// The state directory itself couldn't be resolved (no `$HOME`, no
-    /// `XDG_STATE_HOME`, etc.). The caller should treat this as a
-    /// configuration problem, not a mismatch.
+    /// The state directory couldn't be resolved — a config problem, not a
+    /// mismatch.
     StateDirUnresolved,
 }
 
@@ -384,18 +328,14 @@ pub fn plan_hash_status(sha256: &str) -> PlanHashStatus {
     }
 }
 
-/// `true` when a plan with the supplied hash has been recorded.
-///
-/// Use [`plan_hash_status`] when you need to distinguish "not recorded"
-/// from "state directory unresolvable". This helper folds both into
-/// `false` for legacy callers.
+/// `true` when a plan with the supplied hash has been recorded. Folds both
+/// non-recorded states into `false`; use [`plan_hash_status`] to distinguish.
 pub fn plan_hash_recorded(sha256: &str) -> bool {
     matches!(plan_hash_status(sha256), PlanHashStatus::Recorded)
 }
 
-/// Human-readable form of the iac plan store path (for evidence
-/// strings). Returns the literal `<unresolved>` when `state_dir()` is
-/// not resolvable — we never panic in evidence formatting.
+/// Human-readable iac plan store path for evidence strings; `<unresolved>` when
+/// `state_dir()` can't be resolved (never panics).
 pub fn iac_plans_dir_display() -> String {
     match crate::policy::iac_plans_dir() {
         Some(p) => p.display().to_string(),
@@ -411,15 +351,10 @@ pub fn load_recorded_plan(sha256: &str) -> Option<RecordedPlan> {
     serde_json::from_slice(&content).ok()
 }
 
-/// Purge plans older than [`PLAN_CACHE_TTL`]. Returns the count of
-/// removed files. Errors are swallowed silently — purge is best-effort.
-///
-/// We prefer the `recorded_at_unix` field from the JSON body over the
-/// filesystem mtime (the latter is rewritten by `cp -p`, `rsync
-/// --archive`, backup tools, cloud-sync) and only fall back to mtime when
-/// the JSON can't be read. Forward clock skew (`modified > now`) never
-/// purges — `duration_since` returns `Err` there and we leave the file
-/// alone (PR-127 review #15 + greptile P2 fix).
+/// Purge plans older than [`PLAN_CACHE_TTL`]; returns the removed count.
+/// Best-effort (errors swallowed). Prefers the JSON `recorded_at_unix` over
+/// mtime (rewritten by `cp -p` / backup tools); forward clock skew never purges
+/// (PR-127 review #15 + greptile P2 fix).
 pub fn purge_old_plans() -> usize {
     let dir = match crate::policy::iac_plans_dir() {
         Some(d) => d,
@@ -436,9 +371,7 @@ pub fn purge_old_plans() -> usize {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        // Prefer JSON `recorded_at_unix` over mtime — file copy /
-        // backup tools rewrite mtime and would otherwise purge freshly-
-        // synced plans on the next invocation.
+        // Prefer JSON `recorded_at_unix` over mtime (backup tools rewrite mtime).
         let recorded_at = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<RecordedPlan>(&b).ok())
@@ -447,9 +380,7 @@ pub fn purge_old_plans() -> usize {
         let Some(recorded_at) = recorded_at else {
             continue;
         };
-        // `duration_since` returns `Err` when recorded_at is in the
-        // future (forward clock skew). In that case we leave the file
-        // alone — never delete on `now < recorded_at`.
+        // `duration_since` errs on future recorded_at (clock skew) — leave it.
         if let Ok(age) = now.duration_since(recorded_at) {
             if age > PLAN_CACHE_TTL && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
@@ -479,13 +410,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Shell out to `terraform show -json <plan_path>` (or `tofu show -json
-/// <plan_path>`) with a hard timeout. Stdout buffer is read on a helper
-/// thread to avoid pipe-buffer deadlocks.
+/// Shell out to `terraform/tofu show -json <plan_path>` with a hard timeout.
 ///
-/// **Hot-path warning.** This MUST NOT be called from `engine::analyze`.
-/// The only legitimate caller is `tirith iac check-plan`, where the
-/// operator is interactively requesting plan inspection.
+/// Hot-path warning: MUST NOT be called from `engine::analyze` — the only
+/// caller is the interactive `tirith iac check-plan`.
 pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u8>, String> {
     use crate::util::{run_shell_with_timeout, ShellTimeoutOutcome};
 
@@ -501,10 +429,8 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
     };
 
     let plan_path_string = plan_path.to_string_lossy().into_owned();
-    // Stderr is discarded — previous implementation piped it and never
-    // drained, which could deadlock the child if `terraform show -json`
-    // emitted ≥64KiB of stderr (PR-127 CodeRabbit "Drain stderr or don't
-    // pipe it").
+    // Stderr is discarded, not piped — piping without draining could deadlock
+    // the child on ≥64KiB of stderr (PR-127 CodeRabbit).
     let outcome = run_shell_with_timeout(
         program,
         &["show", "-json", plan_path_string.as_str()],
@@ -541,10 +467,9 @@ pub fn run_terraform_show_json(plan_path: &Path, tool: PlanTool) -> Result<Vec<u
     }
 }
 
-/// Detect the IaC tool from the plan file's parent directory's metadata
-/// (e.g. `.terraform/`, `Pulumi.yaml`). Falls back to Terraform when no
-/// hint is found — `terraform show -json` happens to handle OpenTofu's
-/// plan files too because the wire format is identical for 1.x.
+/// Detect the IaC tool from the plan file's parent directory (e.g.
+/// `Pulumi.yaml`). Falls back to Terraform, which also reads OpenTofu plans (1.x
+/// wire format is identical).
 pub fn detect_plan_tool(plan_path: &Path) -> PlanTool {
     let parent = match plan_path.parent() {
         Some(p) => p,
@@ -556,8 +481,7 @@ pub fn detect_plan_tool(plan_path: &Path) -> PlanTool {
         return PlanTool::Pulumi;
     }
 
-    // Distinguish tofu via the .terraform.lock.hcl path — both terraform
-    // and tofu write this file, but tofu writes a `.tofu` lockfile too.
+    // tofu writes a `.tofu` dir / `tofu.lock.hcl` that terraform does not.
     let tofu_marker = parent.join(".tofu").is_dir() || parent.join("tofu.lock.hcl").is_file();
     if tofu_marker {
         return PlanTool::Tofu;
@@ -566,9 +490,8 @@ pub fn detect_plan_tool(plan_path: &Path) -> PlanTool {
     PlanTool::Terraform
 }
 
-/// Determine if a byte buffer is a JSON plan (for the Pulumi case where
-/// the operator already has JSON in hand) vs a binary terraform plan.
-/// Used by `iac check-plan` so the operator can pass either form.
+/// Whether a byte buffer is a JSON plan (Pulumi) vs a binary terraform plan, so
+/// `iac check-plan` can accept either form.
 pub fn looks_like_json(bytes: &[u8]) -> bool {
     let prefix: Vec<u8> = bytes
         .iter()
@@ -712,16 +635,15 @@ mod tests {
 
     #[test]
     fn looks_like_json_rejects_binary() {
-        // Terraform binary plans have a specific magic header; any non-{
-        // first non-whitespace byte should reject.
+        // Any non-`{`/`[` first non-whitespace byte rejects.
         assert!(!looks_like_json(&[0x50, 0x4b, 0x03, 0x04]));
     }
 
     #[test]
     fn detect_plan_tool_handles_missing_parent_dir() {
+        // Must not panic on a path without a parent.
         let path = std::path::PathBuf::from("");
         let _ = detect_plan_tool(&path);
-        // The function never panics on a path without a parent.
     }
 
     #[test]

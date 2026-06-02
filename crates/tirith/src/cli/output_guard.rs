@@ -1,32 +1,19 @@
 //! `tirith output wrap on|off|status` — manage the opt-in `tirith-out` shell
-//! function that pipes a command's stdout/stderr through the view-style
-//! filter.
+//! function that pipes a command's stdout/stderr through the view-style filter.
 //!
-//! Honesty-of-claim: this is a WRAPPER for individually-invoked commands
-//! (`tirith-out ./myscript`). It does NOT intercept output from anything run
-//! outside the wrapper. The help text and `status` action both say so.
+//! This WRAPS individually-invoked commands (`tirith-out ./myscript`); it does
+//! NOT intercept output from anything run outside the wrapper.
 //!
-//! Implementation:
-//!   * `on`  — appends a BEGIN/END marker block to the user's shell profile
-//!     (`~/.zshrc`, `~/.bashrc`, etc.) that defines the function and a
-//!     shorter `tirith-out` alias. Idempotent: re-running on a profile
-//!     that already has the block is a no-op (we detect by marker match).
-//!   * `off` — removes the marker block. Preserves user content above
-//!     and below.
-//!   * `status` — reports whether the block is present, the resolved
-//!     profile path, and the long-form function name.
-//!
-//! The function name on disk is `tirith-output-guard-wrap` (long form, low
-//! collision risk) with `tirith-out` defined as a short alias. Documented
-//! in the help banner.
+//! `on` appends an idempotent BEGIN/END marker block (function + `tirith-out`
+//! alias) to the user's shell profile; `off` removes it preserving surrounding
+//! content; `status` reports presence, profile path, and function name. The
+//! on-disk function name is `tirith-output-guard-wrap` (low collision risk).
 
 use std::fs;
 use std::path::PathBuf;
 
 /// BEGIN / END markers for the `tirith output wrap` block. Distinct from the
-/// `tirith-hook` markers used by `tirith init` — they manage independent
-/// regions so a user with both enabled gets two separate, individually
-/// removable blocks.
+/// `tirith init` hook markers so the two regions are independently removable.
 const BEGIN_MARKER: &str = "# BEGIN tirith-output-wrap v1";
 const END_MARKER: &str = "# END tirith-output-wrap";
 
@@ -48,7 +35,6 @@ fn enable() -> i32 {
         return 1;
     };
 
-    // Ensure parent dirs exist.
     if let Some(parent) = profile.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             eprintln!(
@@ -77,9 +63,8 @@ fn enable() -> i32 {
         "\n"
     };
     let new_content = format!("{current}{separator}{snippet}");
-    // Write the shell profile ATOMICALLY (temp-in-same-dir → fsync → rename →
-    // parent fsync): this is a read-modify-write of the user's ENTIRE rc file, so
-    // a crash mid-write must never truncate or corrupt their shell config.
+    // Atomic write: a crash mid read-modify-write of the user's rc file must
+    // never truncate or corrupt their shell config.
     if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
@@ -127,8 +112,7 @@ fn disable() -> i32 {
     }
 
     let new_content = strip_block(&current);
-    // Atomic write (see `enable`): removing the tirith block is also a full
-    // rewrite of the user's rc file and must never truncate it on a crash.
+    // Atomic write (see `enable`): removing the block also rewrites the rc file.
     if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
@@ -161,8 +145,7 @@ fn status() -> i32 {
     0
 }
 
-/// Strip the BEGIN…END block (inclusive), preserving newlines around it
-/// so existing user content above / below is untouched.
+/// Strip the BEGIN…END block (inclusive), preserving surrounding user content.
 fn strip_block(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut in_block = false;

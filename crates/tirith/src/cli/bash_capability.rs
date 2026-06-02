@@ -1,50 +1,21 @@
 //! Bash enter-mode delivery capability self-test (issue #111).
 //!
-//! # Why this exists
+//! The bash hook has two modes: **enter** (rebinds Enter via `bind -x`, can
+//! block) and **preexec** (DEBUG-trap, warn-only). Enter is the only blocking
+//! mode, but `bind -x` on `\C-m` in many builds runs the bound function without
+//! accepting the line, so `PROMPT_COMMAND` never fires and the deferred command
+//! is silently eaten (#111). Whether it accepts the line is a property of the
+//! bash/readline BUILD, not the version, so tirith PROVES it empirically: spawn
+//! a disposable bash through a PTY, source the real hook, and check that a typed
+//! command runs and a blocked one is stopped.
 //!
-//! Tirith's bash hook has two modes:
-//!
-//! * **enter** — rebinds Enter (`\C-m`) with `bind -x` to a shell function so it
-//!   can *block* a dangerous command before it runs.
-//! * **preexec** — a `DEBUG`-trap observer; warn-only, cannot block.
-//!
-//! Enter mode is the only bash mode that can truly block. But `bind -x` on
-//! `\C-m` has a fatal quirk in many environments: it runs the bound function
-//! and then **does not accept the line**. Bash stays inside readline's editing
-//! loop, never returns to its command-evaluation loop, so `PROMPT_COMMAND`
-//! never fires and the command the hook deferred into `_TIRITH_PENDING_EVAL`
-//! is never delivered. The typed command is silently eaten — issue #111.
-//!
-//! Whether `bind -x` accepts the line is a *capability* of the specific
-//! bash/readline build, not a function of the bash version number. So tirith
-//! cannot decide enter-vs-preexec by version gate. Instead it **proves** the
-//! capability empirically: spawn a disposable bash through a PTY, source the
-//! real hook in enter mode, and check whether a command typed + Enter actually
-//! runs — and, just as importantly, whether a command that should be *blocked*
-//! is actually stopped.
-//!
-//! # The init-time constraint
-//!
-//! `tirith init` output is `eval`'d on **every** interactive shell startup, so
-//! it must stay fast and side-effect-free. The PTY self-test is far too heavy
-//! to run there. Instead:
-//!
-//! * The self-test runs only at `tirith setup` and `tirith doctor` (and the
-//!   explicit `tirith doctor --simulate-enter`). It is timeout-bound.
-//! * It writes a small `key=value` **cache file** to the tirith state dir,
-//!   recording the verdict keyed by the bash identity (version + path). The
-//!   cache `schema` number is the cross-tirith-version invalidator: enter-mode
-//!   delivery is a bash-build property and does not change across tirith
-//!   releases, so any change to the probe semantics or cache format bumps
-//!   [`CACHE_SCHEMA`] instead of keying on the tirith version.
-//! * `tirith init` is unchanged. The bash hook itself reads the cache at
-//!   startup — a single small-file read, which *is* init-safe — and only
-//!   selects enter mode when the cache proves enter delivery works for the
-//!   running bash. Absent / stale / `broken` cache ⇒ the hook falls back to the
-//!   safe default (preexec, warn-only).
-//!
-//! Failing closed to preexec is the safety floor: a wrong guess never leaves
-//! the user believing they are protected when they are not.
+//! `tirith init` is `eval`'d on every shell startup and must stay fast, so the
+//! heavy PTY probe runs only at `tirith setup`/`doctor` (timeout-bound) and
+//! writes a `key=value` cache keyed by bash identity (version + path).
+//! [`CACHE_SCHEMA`] (not the tirith version) invalidates across releases, since
+//! enter delivery is a bash-build property. The hook reads the cache at startup
+//! (init-safe) and selects enter only when proven; absent/stale/`broken` falls
+//! back to preexec — the fail-closed safety floor.
 
 #![cfg(unix)]
 
@@ -65,13 +36,10 @@ pub const CACHE_FILENAME: &str = "bash-enter-capability";
 
 /// Hard cap on one PTY probe phase settling.
 const PHASE_TIMEOUT: Duration = Duration::from_secs(6);
-/// Hard cap on waiting for a side-effect-only command's marker file to appear
-/// (or to be confirmed absent). A command like `printf >> marker` writes
-/// nothing to the terminal, and when tirith *allows* it the `tirith check`
-/// subprocess prints nothing either — so terminal silence is reached *before*
-/// the command runs. Completion must therefore be read from the filesystem
-/// side effect, not from terminal quiet. Generous for a loaded CI box, yet
-/// bounded so a genuinely swallowed command still fails fast.
+/// Hard cap on waiting for a side-effect-only command's marker file (a
+/// `printf >> marker` + allow-verdict `tirith check` print nothing, so
+/// completion must be read from the filesystem, not terminal quiet). Generous
+/// for CI yet bounded so a swallowed command fails fast.
 const MARKER_TIMEOUT: Duration = Duration::from_secs(8);
 /// Filesystem poll interval while waiting on a marker file.
 const MARKER_POLL: Duration = Duration::from_millis(50);
@@ -148,16 +116,10 @@ pub struct CachedDecision {
     pub reason: String,
 }
 
-/// Locate a bash binary to probe.
-///
-/// The hook the user actually runs is whatever `bash` resolves to for them, so
-/// the probe targets the same: `command -v bash`. The path is returned *as
-/// resolved by `command -v`* — deliberately not canonicalized through
-/// symlinks — because the hook compares the cached value against bash's own
-/// `$BASH`, which is likewise the user-facing invocation path. Comparing
-/// resolved-symlink paths would instead cause a false mismatch for the common
-/// Homebrew layout (`/opt/homebrew/bin/bash` is a symlink into `Cellar`).
-/// Returns `None` when bash is not on `PATH`.
+/// Locate the bash to probe via `command -v bash` (the same bash the user
+/// runs). Returned UNCANONICALIZED — the hook compares the cache against bash's
+/// `$BASH` (also the user-facing path), and resolving symlinks would falsely
+/// mismatch the Homebrew Cellar layout. `None` when bash is not on `PATH`.
 pub fn discover_bash() -> Option<PathBuf> {
     let out = std::process::Command::new("sh")
         .args(["-c", "command -v bash"])
@@ -191,51 +153,25 @@ pub fn bash_version_of(path: &Path) -> Option<String> {
     }
 }
 
-/// Single-quote a path for safe embedding in a POSIX shell command.
-///
-/// The probe types commands like `source <path>` into the disposable shell;
-/// the temp dir comes from `$TMPDIR`, which could contain a `'`. Wrapping in
-/// single quotes and escaping any embedded `'` as `'\''` makes the path a
-/// single shell word regardless of its contents.
+/// Single-quote a path as one POSIX shell word (the temp dir from `$TMPDIR`
+/// could contain a `'`, escaped as `'\''`).
 fn posix_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-/// Absolute path to the embedded bash hook materialised for probing.
-///
-/// The probe must source the *real* hook — the same bytes a user runs — so it
-/// writes the embedded `assets::BASH_HOOK` into the supplied temp dir. (Reading
-/// the on-disk materialised copy would couple the probe to install layout; the
-/// embedded copy is byte-identical and always present.)
+/// Materialise the embedded `assets::BASH_HOOK` into `dir` for probing (the
+/// real hook bytes; reading the installed copy would couple to install layout).
 fn write_probe_hook(dir: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join("bash-hook.bash");
     std::fs::write(&path, crate::assets::BASH_HOOK)?;
     Ok(path)
 }
 
-// ---------------------------------------------------------------------------
-// PTY probe
-// ---------------------------------------------------------------------------
-
-/// `PATH` for the probe's disposable shell, with the *running* tirith binary's
-/// directory prepended to the ambient `PATH`.
-///
-/// The probe sources the real bash hook, and the hook shells out via `command
-/// tirith check`, resolving `tirith` *by name* from the spawned shell's `PATH`.
-/// If the running tirith was invoked by an absolute path or as
-/// `target/debug/tirith` — a directory that is not on `PATH` — the spawned
-/// shell would otherwise resolve `tirith` to whatever stale copy happens to be
-/// installed, or to nothing at all (`command tirith` then exits 127, which the
-/// probe reads as a false `Broken`). Prepending the directory of
-/// [`std::env::current_exe()`] makes the hook's `command tirith` resolve to the
-/// tirith currently running this probe — the binary whose hook is being
-/// validated — and *prepending* (not appending) guarantees it wins over any
-/// stale globally-installed copy. This mirrors `tests/pty_support` exactly.
-///
-/// `std::env::current_exe()` is the right call here — `CARGO_BIN_EXE_tirith` is
-/// a cargo *test*-time variable and is absent from a shipped binary. If
-/// `current_exe()` errors, or it has no parent directory, fall back gracefully
-/// to the ambient `PATH` rather than panicking.
+/// `PATH` for the probe's shell: the running tirith's directory
+/// ([`std::env::current_exe()`]) PREPENDED to the ambient `PATH`, so the hook's
+/// `command tirith check` resolves to the binary under test (not a stale
+/// installed copy, nor exit-127 → false `Broken`). Falls back to ambient `PATH`
+/// if `current_exe()` has no parent. Mirrors `tests/pty_support`.
 fn probe_path() -> String {
     let ambient = std::env::var("PATH").unwrap_or_default();
     let exe_dir = std::env::current_exe()
@@ -336,8 +272,7 @@ impl ProbeSession {
         }
     }
 
-    /// Type `line` followed by a carriage return — the byte a real terminal
-    /// sends when Enter is pressed, and the byte the hook binds.
+    /// Type `line` + carriage return — the byte Enter sends and the hook binds.
     fn send_line(&mut self, line: &str) {
         let mut s = line.to_string();
         s.push('\r');
@@ -362,17 +297,15 @@ impl ProbeSession {
         }
     }
 
-    /// Drain whatever PTY output is currently queued, blocking at most `slice`
-    /// for the first chunk. Used to keep the reader channel from filling while
-    /// the probe waits on a filesystem marker rather than on terminal output.
+    /// Drain queued PTY output (blocking at most `slice`) so the reader channel
+    /// can't fill while the probe waits on a filesystem marker.
     fn drain(&mut self, slice: Duration) {
         self.pump(slice);
     }
 
-    /// Kill the child immediately. Used after a failed probe phase: the readline
-    /// buffer may still hold a stale command, so the session must be torn down
-    /// hard rather than nudged with another Enter (which could let a deferred
-    /// command through and produce a false `works`).
+    /// Kill the child immediately. After a failed phase the readline buffer may
+    /// hold a stale command, so tear down hard rather than nudge with another
+    /// Enter (which could let a deferred command through → a false `works`).
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -399,28 +332,13 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
-/// Poll `marker` until its contents contain `needle`, or `timeout` elapses.
-/// Returns `true` once `needle` is seen, `false` if the deadline passes first.
-/// `sess` is drained each tick so the PTY reader channel cannot fill.
+/// Poll `marker` until it contains `needle` (`true`) or `timeout` elapses
+/// (`false`), draining `sess` each tick so the PTY reader channel can't fill.
 ///
-/// ## Why this exists — the no-output race
-///
-/// The probe types side-effect-only commands (`printf >> marker`,
-/// `printf 'true' | bash && touch marker`) into a disposable shell whose
-/// enter-mode hook shells out to `tirith check`. A `printf >> marker` command
-/// prints nothing to the terminal, and on an *allow* verdict `tirith check`
-/// prints nothing either — so the only terminal output is the keystroke echo.
-/// Keying completion on terminal silence (the old `wait_idle`) therefore
-/// returns *before* the hook has finished shelling out to `tirith` and
-/// delivered the command, and the marker is then read while still empty —
-/// caching a false `Broken` on a working bash, and (worse) letting
-/// `probe_blocking` read a not-yet-run command's absent marker as "blocked".
-/// macOS happens to win that race; a slower Linux CI box does not.
-///
-/// The fix mirrors `tests/pty_support::wait_for_marker` exactly: stop
-/// inferring completion from terminal quiet and poll the filesystem side
-/// effect — the marker file is the ground truth — with a generous bounded
-/// timeout instead of a fixed settle-then-kill.
+/// Polls the filesystem, not terminal quiet: a side-effect-only command and an
+/// allow-verdict `tirith check` print nothing, so `wait_idle` would return
+/// before delivery (caching a false `Broken`, or a false "blocked"). The marker
+/// file is the ground truth. Mirrors `tests/pty_support::wait_for_marker`.
 fn wait_for_marker(
     sess: &mut ProbeSession,
     marker: &Path,
@@ -438,23 +356,19 @@ fn wait_for_marker(
         if Instant::now() >= deadline {
             return false;
         }
-        // Keep the PTY reader channel drained while we wait on the filesystem.
         sess.drain(MARKER_POLL);
     }
 }
 
-/// Wait `timeout` for `marker` to appear, draining the PTY meanwhile, then
-/// report whether it stayed **absent**. The mirror of [`wait_for_marker`] for
-/// an expected-absent side effect: an absence cannot be confirmed early, so it
-/// always waits the full bound to be sure the marker never shows up.
+/// Wait the full `timeout` for `marker`, draining the PTY meanwhile, and report
+/// whether it stayed ABSENT (an absence can't be confirmed early). Mirror of
+/// [`wait_for_marker`] for an expected-absent side effect.
 fn marker_stays_absent(sess: &mut ProbeSession, marker: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if marker.exists() {
             return false;
         }
-        // The check above already established absence for this tick; if the
-        // deadline has now passed, the marker stayed absent for the full bound.
         if Instant::now() >= deadline {
             return true;
         }
@@ -462,8 +376,8 @@ fn marker_stays_absent(sess: &mut ProbeSession, marker: &Path, timeout: Duration
     }
 }
 
-/// Environment for a hermetic probe session, isolated from the developer's real
-/// tirith state. Holds the temp dir alive for the probe's duration.
+/// Hermetic probe-session environment, isolated from the developer's real
+/// tirith state; holds the temp dir alive for the probe's duration.
 struct ProbeEnv {
     _root: tempfile::TempDir,
     work: PathBuf,
@@ -493,7 +407,7 @@ impl ProbeEnv {
             ("TERM".to_string(), "xterm-256color".to_string()),
             // Force enter mode for the probe regardless of the developer's env.
             ("TIRITH_BASH_MODE".to_string(), "enter".to_string()),
-            // Audit log off — the probe asserts on behaviour, not the log.
+            // Audit log off — the probe asserts on behaviour.
             ("TIRITH_LOG".to_string(), "0".to_string()),
         ];
 
@@ -506,18 +420,10 @@ impl ProbeEnv {
     }
 }
 
-/// Probe whether bash enter mode can *deliver* an allowed command exactly once.
-///
-/// Returns `Ok(true)` when the marker file holds exactly one nonce line after
-/// the command + Enter, `Ok(false)` when delivery failed (#111 reproduced),
-/// and `Err` when the probe could not run to a verdict.
-///
-/// Completion is read from the marker *file*, not from terminal quiet: the
-/// probe command is side-effect-only and the hook shells out to `tirith
-/// check`, so terminal silence is reached before the command actually runs
-/// (the no-output race documented on [`wait_for_marker`]). The marker is
-/// polled with a bounded timeout — the same robustness the PTY conformance
-/// harness already adopted.
+/// Probe whether enter mode DELIVERS an allowed command exactly once.
+/// `Ok(true)` when the marker holds exactly one nonce, `Ok(false)` on delivery
+/// failure (#111 reproduced), `Err` when the probe couldn't run. Completion is
+/// read from the marker file (the no-output race on [`wait_for_marker`]).
 fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
     let marker = env.work.join("deliver_marker");
     let nonce = "TIRITH_PROBE_DELIVER_NONCE";
@@ -538,79 +444,40 @@ fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         return Err("sourcing the hook did not return a prompt".into());
     }
 
-    // An allowed, side-effect-only command: append one nonce line to a marker.
-    // Poll the marker file rather than wait for terminal quiet — a
-    // `printf >> marker` command (and `tirith check` on an allow verdict)
-    // print nothing, so terminal silence happens *before* delivery.
+    // Allowed, side-effect-only command (poll the marker, not terminal quiet).
     sess.send_line(&format!("printf '{nonce}\\n' >> {}", posix_quote(&marker)));
     let delivered = wait_for_marker(&mut sess, &marker, nonce, MARKER_TIMEOUT);
-    // Tear the session down hard — never send a second Enter, which (in the
-    // broken case) could flush a stale readline buffer and fake a success.
+    // Tear down hard — a second Enter could flush a stale buffer and fake success.
     sess.kill();
 
     if !delivered {
-        // The marker never gained the nonce within the bound: the command was
-        // not delivered (#111 reproduced).
+        // Marker never gained the nonce: not delivered (#111 reproduced).
         return Ok(false);
     }
-    // Delivered. Re-read once to assert it ran *exactly* once — a hook that
-    // double-delivered would write the nonce twice and is just as broken.
+    // Re-read to assert it ran EXACTLY once (a double-delivery is just as broken).
     let body = std::fs::read_to_string(&marker).unwrap_or_default();
     Ok(count_occurrences(&body, nonce) == 1)
 }
 
-/// Probe whether bash enter mode actually *blocks* a command that tirith would
-/// block.
+/// Probe whether enter mode actually BLOCKS a command tirith would block
+/// (delivery alone is not enough). Types a blocked pipe-to-interpreter whose
+/// payload, if it ran, would create a marker; the marker must stay absent.
 ///
-/// A delivery-only check is not enough: a hook variant that delivers but cannot
-/// block would still be unsafe. This phase types a blocked pipe-to-interpreter
-/// whose payload, if it ran, would create a marker; the marker must stay absent.
+/// The producer is a local `printf`, NOT `curl`: `printf 'true' | bash` hits the
+/// same `pipe_to_interpreter` rule with no network, so an absent marker can't be
+/// confused with "curl missing / network down" → a false `works`.
 ///
-/// The pipe producer is a purely local `printf` — **not** `curl` — on purpose:
-/// `printf 'true' | bash` is blocked by the same `pipe_to_interpreter` rule, but
-/// involves no network. A `curl`-based probe could report "blocked" simply
-/// because `curl` is missing or the network is down, which is indistinguishable
-/// from a correct block and would falsely upgrade a broken hook to `works`.
+/// The empty-policy probe env ([`ProbeEnv::new`]) is correct: detection rules
+/// fire UNCONDITIONALLY (a policy only adds allowlist/overlays — no allow-all
+/// default), so the pipe is a HIGH block (exit 1) here too.
 ///
-/// ## Why an empty-policy probe environment is correct
+/// Anti-vacuous guard: a swallowed command also leaves no marker, so this phase
+/// first delivers an ALLOWED command and polls its marker; only once that proves
+/// delivery does it send the blocked command. If the allowed command never runs,
+/// it returns `Err` (→ `Inconclusive`), never a false `Ok(true)`.
 ///
-/// [`ProbeEnv::new`] points `XDG_CONFIG_HOME` / `XDG_DATA_HOME` /
-/// `XDG_STATE_HOME` at fresh empty temp dirs — no policy file, no threat
-/// database. This is deliberate, not an oversight: tirith's detection rules
-/// (including `pipe_to_interpreter`) fire **unconditionally**, independent of
-/// any policy. A policy file only *adds* allowlist / blocklist / severity
-/// overrides on top of the rule engine — there is no "allow-all when no policy"
-/// default. So `printf 'true' | bash` is a HIGH `pipe_to_interpreter` block
-/// (`tirith check` exit 1) in a zero-policy environment, exactly as it is with
-/// a policy present. Verified empirically: `tirith check` on that command in an
-/// env with an empty `XDG_CONFIG_HOME` exits 1 / `BLOCKED`.
-///
-/// Were tirith ever to gain an allow-by-default-without-policy mode, this probe
-/// would have to seed a minimal blocking policy first — but as built, an empty
-/// probe environment is the correct, network-free way to assert "enter mode can
-/// block".
-///
-/// ## Why this phase has an anti-vacuous guard
-///
-/// A swallowed command trivially produces no marker — so "the blocked
-/// command's marker is absent" proves *blocking* only once it is also proven
-/// that this probe shell delivers commands at all. The old code killed the
-/// shell after terminal quiet and read marker-absent as "blocked": a command
-/// the hook never even ran (the #111 swallow, or a command killed before it
-/// executed) was indistinguishable from a correctly blocked one, and would
-/// falsely upgrade a broken hook to `works`.
-///
-/// This phase therefore first delivers an *allowed* side-effect-only command
-/// and polls its marker. Only if that marker appears — proving the probe shell
-/// is genuinely delivering commands — does it then send the blocked command
-/// and poll *its* marker as absent. If the allowed command never runs, the
-/// probe cannot conclude anything: it returns `Err` (which [`probe`] maps to
-/// [`EnterCapability::Inconclusive`]), never `Ok(true)`.
-///
-/// Returns `Ok(true)` when the allowed command ran *and* the blocked command
-/// did not (marker absent), `Ok(false)` when the blocked command executed
-/// anyway, and `Err` when the probe could not run to a verdict — including the
-/// anti-vacuous case where the allowed command itself was not delivered.
+/// `Ok(true)` = allowed ran AND blocked did not; `Ok(false)` = blocked ran
+/// anyway; `Err` = couldn't conclude (incl. the anti-vacuous case).
 fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
     let allowed_marker = env.work.join("block_allowed_marker");
     let blocked_marker = env.work.join("block_marker");
@@ -631,11 +498,9 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         return Err("sourcing the hook did not return a prompt".into());
     }
 
-    // Anti-vacuous guard: an *allowed* side-effect-only command must actually
-    // run. If its marker never appears, this probe shell is swallowing
-    // commands — a marker-absent verdict on the blocked command below would
-    // then be meaningless, so bail to an inconclusive result rather than
-    // report a false `blocked`.
+    // Anti-vacuous guard: an allowed command must actually run. If its marker
+    // never appears the shell is swallowing commands, so bail to inconclusive
+    // rather than report a false `blocked`.
     sess.send_line(&format!(
         "printf '{allowed_nonce}\\n' >> {}",
         posix_quote(&allowed_marker)
@@ -649,13 +514,9 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         );
     }
 
-    // A purely local pipe-to-interpreter — `printf 'true' | bash` — which
-    // tirith blocks via the `pipe_to_interpreter` rule. The `&& touch` clause
-    // runs only if the pipeline executed; tirith must block before that. Using
-    // a local producer (not `curl`) keeps the verdict independent of network
-    // reachability — see the doc comment above. The marker is *expected to be
-    // absent*: poll for the full timeout to be sure it never appears, draining
-    // the PTY meanwhile.
+    // Local pipe-to-interpreter (blocked by `pipe_to_interpreter`); the
+    // `&& touch` runs only if the pipeline executed. Marker expected absent —
+    // poll the full timeout to be sure.
     sess.send_line(&format!(
         "printf 'true' | bash && touch {}",
         posix_quote(&blocked_marker)
@@ -663,28 +524,15 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
     let blocked = !marker_stays_absent(&mut sess, &blocked_marker, MARKER_TIMEOUT);
     sess.kill();
 
-    // Guard passed (commands are delivered) and the blocked command's marker
-    // stayed absent ⇒ it was genuinely blocked.
+    // Guard passed + blocked marker absent ⇒ genuinely blocked.
     Ok(!blocked)
 }
 
-/// Combine the two probe phases' results into the final verdict and reason.
-///
-/// Pulled out of [`probe`] as a pure function so the verdict logic is unit
-/// testable without spawning a PTY — the PTY phases are environment-dependent
-/// (whether `bind -x` accepts the line is a property of the bash/readline
-/// build), but the composition rule is fixed and must stay regression-safe:
-///
-/// * delivery `Ok(true)` + blocking `Ok(true)` ⇒ [`EnterCapability::Works`].
-/// * delivery `Ok(false)` (the #111 swallow) ⇒ [`EnterCapability::Broken`] —
-///   blocking is not even attempted.
-/// * delivery `Ok(true)` + blocking `Ok(false)` (delivered but did not block)
-///   ⇒ [`EnterCapability::Broken`].
-/// * either phase `Err` ⇒ [`EnterCapability::Inconclusive`] — the probe could
-///   not run to a confident verdict (including `probe_blocking`'s anti-vacuous
-///   guard failing). Fail closed: the hook treats this exactly like `Broken`.
-///
-/// `blocking` is `None` when delivery failed and blocking was skipped.
+/// Combine the two probe phases into the final verdict + reason. Pure (no PTY)
+/// so it is unit-testable: `Ok(true)`+`Ok(true)` ⇒ `Works`; delivery `Ok(false)`
+/// (#111 swallow) or delivered-but-not-blocked ⇒ `Broken`; either phase `Err`
+/// (incl. the anti-vacuous guard) ⇒ `Inconclusive` (fail closed). `blocking` is
+/// `None` when delivery failed and blocking was skipped.
 fn classify_probe_results(
     delivery: &Result<bool, String>,
     blocking: Option<&Result<bool, String>>,
@@ -719,12 +567,9 @@ fn classify_probe_results(
     }
 }
 
-/// Run the full enter-mode self-test against whatever bash is on `PATH`.
-///
-/// Never panics and never blocks unbounded — every phase is timeout-capped. A
-/// missing bash, a PTY failure, or ambiguous output all yield
-/// [`EnterCapability::Inconclusive`], which the hook treats as "do not use
-/// enter mode".
+/// Run the full enter-mode self-test against whatever bash is on `PATH`. Never
+/// panics or blocks unbounded; a missing bash / PTY failure / ambiguous output
+/// all yield [`EnterCapability::Inconclusive`] ("do not use enter mode").
 pub fn probe() -> ProbeOutcome {
     let Some(bash) = discover_bash() else {
         return ProbeOutcome {
@@ -750,11 +595,10 @@ pub fn probe() -> ProbeOutcome {
         }
     };
 
-    // Phase 1 — delivery. If an allowed command is not delivered, this is #111.
+    // Phase 1 — delivery (non-delivery is #111).
     let delivery = probe_delivery(&bash, &env);
-    // Phase 2 — blocking runs only if delivery succeeded: delivery alone is not
-    // enough (enter mode must also stop a dangerous command), and a failed
-    // delivery already settles the verdict as `Broken`.
+    // Phase 2 — blocking, only if delivery succeeded (a failed delivery already
+    // settles the verdict as `Broken`).
     let blocking = matches!(delivery, Ok(true)).then(|| probe_blocking(&bash, &env));
 
     let (capability, reason) = classify_probe_results(&delivery, blocking.as_ref());
@@ -767,22 +611,16 @@ pub fn probe() -> ProbeOutcome {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cache file
-// ---------------------------------------------------------------------------
-
 /// Absolute path of the capability cache file.
 pub fn cache_path() -> Option<PathBuf> {
     tirith_core::policy::state_dir().map(|d| d.join(CACHE_FILENAME))
 }
 
-/// Render the cache file body. A deliberately tiny, strict `key=value` format —
-/// no JSON — so the bash hook can parse it with the same `IFS='='` loop it
-/// already uses for approval files, with no `jq` / `python` / subprocess.
+/// Render the cache body as a strict `key=value` format (no JSON) the bash hook
+/// can parse with its existing `IFS='='` loop — no `jq`/subprocess.
 fn render_cache(outcome: &ProbeOutcome) -> String {
     let bash_version = outcome.bash_version.as_deref().unwrap_or("");
-    // `command -v bash` output is a single path with no newline, so it is safe
-    // in the key=value grammar as-is.
+    // `command -v bash` output is a single newline-free path, safe as-is.
     let bash_path = outcome
         .bash_path
         .as_deref()
@@ -798,19 +636,15 @@ fn render_cache(outcome: &ProbeOutcome) -> String {
         "enter_capability={}\n",
         outcome.capability.as_token()
     ));
-    // Reason is diagnostic only — the hook never parses it. Strip newlines so a
-    // multi-line reason can never break the key=value grammar.
+    // Reason is diagnostic only; strip newlines so it can't break the grammar.
     let reason = outcome.reason.replace(['\n', '\r'], " ");
     body.push_str(&format!("reason={reason}\n"));
     body
 }
 
-/// Write the capability decision to the cache file atomically.
-///
-/// Writes to a uniquely-named temp file in the same directory then renames it
-/// over the target, so a hook reading concurrently sees either the whole old
-/// file or the whole new one — never a half-written one, and two concurrent
-/// writers never share a staging file. Returns the path written on success.
+/// Atomically write the capability decision: a uniquely-named temp file renamed
+/// over the target, so a concurrent reader sees the whole old or whole new file
+/// and two writers never share a staging file. Returns the path on success.
 pub fn write_cache(outcome: &ProbeOutcome) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -822,10 +656,8 @@ pub fn write_cache(outcome: &ProbeOutcome) -> Result<PathBuf, String> {
 
     let body = render_cache(outcome);
 
-    // `NamedTempFile` picks a random, collision-free name in `dir`, so
-    // concurrent `write_cache` calls — even in the same process — never clobber
-    // each other's staging file. It is created mode 0o600; tighten explicitly
-    // in case a restrictive default ever changes.
+    // `NamedTempFile` picks a collision-free name so concurrent writers never
+    // clobber each other's staging file. Created 0o600; tighten explicitly.
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| format!("create temp file in {}: {e}", dir.display()))?;
     tmp.as_file()
@@ -835,8 +667,8 @@ pub fn write_cache(outcome: &ProbeOutcome) -> Result<PathBuf, String> {
         .map_err(|e| format!("write temp cache file: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("flush temp cache file: {e}"))?;
-    // `persist` is the atomic rename onto the same filesystem; on failure it
-    // hands back the temp file, which is dropped (and unlinked) immediately.
+    // `persist` is the atomic same-fs rename; on failure the temp file is
+    // dropped (and unlinked) immediately.
     tmp.persist(&path)
         .map_err(|e| format!("rename into {}: {}", path.display(), e.error))?;
     Ok(path)
@@ -852,11 +684,9 @@ fn parse_capability(token: &str) -> Option<EnterCapability> {
     }
 }
 
-/// Read and validate the capability cache.
-///
-/// Returns `Some` only when the file exists, parses, and its schema matches the
-/// running binary's. The caller decides what to do with a stale tirith /bash
-/// version. Returns `None` on any failure — fail closed.
+/// Read and validate the capability cache. `Some` only when the file exists,
+/// parses, and its schema matches; `None` on any failure (fail closed). The
+/// caller decides what to do with a stale tirith/bash version.
 pub fn read_cache() -> Option<CachedDecision> {
     let path = cache_path()?;
     let body = std::fs::read_to_string(&path).ok()?;
@@ -890,9 +720,8 @@ pub fn read_cache() -> Option<CachedDecision> {
     if schema != Some(CACHE_SCHEMA) {
         return None;
     }
-    // Every field the freshness check needs must be present. A schema-1 cache
-    // is always written with all of them; a missing one means a corrupt or
-    // hand-edited file, so reject it (`?`) and fail closed to preexec.
+    // Every freshness-check field must be present; a missing one means a
+    // corrupt/hand-edited file, so reject (`?`) and fail closed to preexec.
     Some(CachedDecision {
         capability: capability?,
         tirith_version: tirith_version?,
@@ -902,17 +731,11 @@ pub fn read_cache() -> Option<CachedDecision> {
     })
 }
 
-/// Whether a cached decision is fresh for the bash currently on `PATH`.
-///
-/// "Fresh" requires the bash `$BASH_VERSION` and the bash *path* (`command -v
-/// bash`) to match: `bind -x` line-acceptance is a property of the specific
-/// bash/readline build, so a different bash now first on `PATH` must invalidate
-/// the verdict. The tirith version is *not* part of freshness — enter-mode
-/// delivery does not change across tirith releases, and the cache schema
-/// (checked in [`read_cache`]) is the cross-version invalidator for any probe
-/// or format change. This mirrors the bash hook's `_tirith_enter_capability_
-/// proven` exactly, so `doctor` and the hook never disagree about a cache. A
-/// `false` result means the hook ignores the cache and falls back to preexec.
+/// Whether a cached decision is fresh for the bash on `PATH`: both
+/// `$BASH_VERSION` and the bash PATH must match (`bind -x` acceptance is a
+/// build property). The tirith version is NOT part of freshness (schema is the
+/// cross-version invalidator). MUST mirror the bash hook's
+/// `_tirith_enter_capability_proven` so `doctor` and the hook agree.
 pub fn decision_is_fresh(decision: &CachedDecision) -> bool {
     let Some(bash) = discover_bash() else {
         return false;
@@ -926,12 +749,9 @@ pub fn decision_is_fresh(decision: &CachedDecision) -> bool {
     }
 }
 
-/// Run the self-test and persist the result.
-///
-/// This is the entry point for `tirith setup` and `tirith doctor`. It always
-/// returns a [`ProbeOutcome`]; cache-write failure is folded into the outcome's
-/// `cache_path` (left `None`) rather than surfaced as a hard error, because a
-/// failed cache write simply means the hook keeps using its safe default.
+/// Run the self-test and persist the result (entry point for `tirith
+/// setup`/`doctor`). Always returns a [`ProbeOutcome`]; a cache-write failure
+/// just leaves `cache_path` `None` (the hook keeps its safe default).
 pub fn run_and_cache() -> ProbeOutcome {
     let mut outcome = probe();
     match write_cache(&outcome) {
@@ -961,12 +781,9 @@ mod tests {
 
     #[test]
     fn probe_path_prepends_running_exe_directory() {
-        // The probe's spawned shell resolves the hook's `command tirith` by
-        // name from this `PATH`. It MUST therefore lead with the directory of
-        // the *currently-running* tirith binary, so the hook finds the binary
-        // under test rather than a stale installed copy (or nothing). This is
-        // the F1 fix: a missing/wrong `tirith` on the ambient `PATH` would
-        // otherwise make `command tirith` exit 127 → a false `Broken`.
+        // The PATH must lead with the running tirith's directory so the hook's
+        // `command tirith` finds the binary under test, not a stale copy or
+        // nothing (the F1 fix: a missing tirith → exit 127 → false `Broken`).
         let path = probe_path();
         let exe_dir = std::env::current_exe()
             .expect("current_exe must resolve in the test runner")
@@ -1092,10 +909,9 @@ mod tests {
         assert_eq!(tv.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 
-    // `XDG_STATE_HOME` is process-global, and cargo runs unit tests in
-    // parallel. The tests that point it at a temp dir must therefore not
-    // interleave: this mutex serialises them. An RAII guard ([`StateHomeGuard`])
-    // sets and restores the variable so a panicking test still cleans up.
+    // `XDG_STATE_HOME` is process-global and cargo runs tests in parallel, so
+    // this mutex serialises the tests that repoint it; `StateHomeGuard` restores
+    // it (RAII) so a panicking test still cleans up.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct StateHomeGuard {
@@ -1105,8 +921,8 @@ mod tests {
 
     impl StateHomeGuard {
         fn set(dir: &Path) -> Self {
-            // Hold the lock for the whole guard lifetime — recover from a
-            // poisoned mutex so one panicking test does not wedge the rest.
+            // Hold the lock for the guard's lifetime; recover from a poisoned
+            // mutex so one panicking test does not wedge the rest.
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("XDG_STATE_HOME");
             std::env::set_var("XDG_STATE_HOME", dir);
@@ -1217,11 +1033,8 @@ mod tests {
     }
 
     // --- Live probe tests (issue #111 / PR #116 probe-race fix) ------------
-    //
-    // These actually run the PTY self-test. They skip cleanly when the bash
-    // the probe would target (`discover_bash`) is missing or older than 5 —
-    // bash 3.2 (macOS `/bin/bash`) is not a supported enter-mode target, and
-    // `cargo test` must stay green where only an old bash exists.
+    // These run the real PTY self-test; they skip cleanly when the target bash
+    // is missing or < 5 (macOS's bash 3.2 is not a supported enter-mode target).
 
     /// Major version of the bash binary at `path`, parsed from `bash --version`.
     fn bash_major(path: &Path) -> Option<u32> {
@@ -1241,8 +1054,7 @@ mod tests {
         rest.split('.').next()?.trim().parse::<u32>().ok()
     }
 
-    /// The bash the probe will actually target, *only* when it is modern
-    /// (>= 5). `None` ⇒ the caller should skip.
+    /// The probe's target bash, only when modern (>= 5); `None` ⇒ skip.
     fn probe_target_if_modern() -> Option<PathBuf> {
         let bash = discover_bash()?;
         match bash_major(&bash) {
@@ -1251,11 +1063,8 @@ mod tests {
         }
     }
 
-    /// Deterministic, always-runs coverage of the verdict-composition rule —
-    /// the heart of what the PR #116 fix protects. `classify_probe_results` is
-    /// pure, so the `Works` classification is asserted here without depending
-    /// on any host's `bind -x` behaviour. The live-`probe()` test below adds
-    /// the integration angle; this nails the logic regression-safely.
+    /// Deterministic coverage of the pure verdict-composition rule (the PR #116
+    /// heart), asserted without depending on any host's `bind -x` behaviour.
     #[test]
     fn classify_probe_results_maps_phases_to_verdicts() {
         let ok_true: Result<bool, String> = Ok(true);
@@ -1308,28 +1117,11 @@ mod tests {
         );
     }
 
-    /// The integration regression test for the PR #116 probe-race fix: running
-    /// the real self-test against a modern bash must reach a **definite,
-    /// race-free verdict** — `Works` or `Broken`, never `Inconclusive`.
-    ///
-    /// Before the fix, `probe_delivery` / `probe_blocking` keyed completion on
-    /// terminal silence and killed the shell after a quiet gap. For a
-    /// no-terminal-output command whose hook shells out to `tirith check`,
-    /// that silence is reached *before* the command runs — so the probe read
-    /// an empty marker and could not tell "delivery genuinely failed" from
-    /// "delivery had not happened yet". After the fix the probe polls the
-    /// marker file, so the verdict reflects the bash build's *real* enter-mode
-    /// behaviour: a build whose `bind -x` accepts the line ⇒ `Works`, one that
-    /// does not ⇒ `Broken`. Either way it is definite; `Inconclusive` would
-    /// mean the probe could not even run, which must not happen for a healthy
-    /// modern bash.
-    ///
-    /// Whether *this* host's bash delivers in a PTY is build-dependent (the
-    /// `portable-pty` conformance harness documents builds where `bind -x`
-    /// does not accept the line — genuine #111), so the test does not hard-pin
-    /// `Works`. When the host's bash *does* deliver, the verdict is `Works` and
-    /// that is the full end-to-end proof; the deterministic `Works` coverage
-    /// lives in `classify_probe_results_maps_phases_to_verdicts` above.
+    /// PR #116 integration regression: the real self-test against a modern bash
+    /// must reach a DEFINITE verdict (`Works` or `Broken`, never `Inconclusive`,
+    /// which would mean the probe couldn't even run). After the fix the probe
+    /// polls the marker file, so the verdict reflects the build's real `bind -x`
+    /// behaviour. `Works` isn't hard-pinned (delivery is build-dependent).
     #[test]
     fn probe_reaches_definite_verdict_on_modern_bash() {
         let Some(bash) = probe_target_if_modern() else {
@@ -1337,10 +1129,8 @@ mod tests {
             return;
         };
         let outcome = probe();
-        // The verdict must be definite: `Works` or `Broken`, never
-        // `Inconclusive`. An exhaustive match (not an `assert_ne!`) keeps this
-        // future-proof — a new `EnterCapability` variant becomes a compile
-        // error here, forcing a deliberate decision.
+        // Definite verdict only. An exhaustive match (not `assert_ne!`) makes a
+        // future `EnterCapability` variant a compile error, forcing a decision.
         match outcome.capability {
             EnterCapability::Works => assert!(
                 outcome.capability.enables_enter(),
@@ -1373,13 +1163,9 @@ mod tests {
         );
     }
 
-    /// `probe_delivery` against a modern bash must reach a **definite** verdict
-    /// (`Ok(true)` or `Ok(false)`), never `Err`. Before the fix it keyed on
-    /// terminal silence and could not distinguish "delivery had not happened
-    /// yet" from a real result; polling the marker file makes the outcome
-    /// reflect the build's real behaviour regardless of `tirith check`
-    /// latency. When this host's build *does* deliver, the result is
-    /// `Ok(true)` — printed for visibility.
+    /// `probe_delivery` against a modern bash must reach a DEFINITE verdict
+    /// (`Ok(true)`/`Ok(false)`), never `Err` — marker polling makes the outcome
+    /// reflect the build's real behaviour regardless of `tirith check` latency.
     #[test]
     fn probe_delivery_reaches_definite_verdict_on_modern_bash() {
         let Some(bash) = probe_target_if_modern() else {
@@ -1398,13 +1184,9 @@ mod tests {
     }
 
     /// `probe_blocking`'s anti-vacuous guard must never produce a false
-    /// `Ok(true)`: the only way it returns `Ok(true)` ("blocked") is *after*
-    /// an allowed command has been proven to run. So a swallowed-command shell
-    /// yields `Err` (→ `Inconclusive`), and `Ok(true)` is reachable only when
-    /// delivery genuinely works. This test asserts the guard holds — the
-    /// result is `Ok(true)`, `Ok(false)`, or `Err`, and an `Err` here is the
-    /// anti-vacuous guard correctly refusing to vouch for a non-delivering
-    /// shell rather than a crash.
+    /// `Ok(true)`: it only returns `Ok(true)` AFTER an allowed command is proven
+    /// to run, so a swallowing shell yields `Err` (→ `Inconclusive`). An `Err`
+    /// here is the guard refusing to vouch, not a crash.
     #[test]
     fn probe_blocking_anti_vacuous_guard_holds_on_modern_bash() {
         let Some(bash) = probe_target_if_modern() else {
@@ -1423,9 +1205,8 @@ mod tests {
                 bash.display()
             ),
             Err(e) => {
-                // The anti-vacuous guard refusing to conclude is a *correct*
-                // outcome on a build where enter delivery does not work — it
-                // must surface as Err, never a false Ok(true).
+                // The guard refusing to conclude is correct where enter delivery
+                // doesn't work — it must surface as Err, never a false Ok(true).
                 assert!(
                     e.contains("anti-vacuous") || e.contains("probe"),
                     "an Err from probe_blocking must be a probe/guard failure, got: {e}"
@@ -1439,9 +1220,8 @@ mod tests {
         }
     }
 
-    /// `marker_stays_absent` reports `true` only while the file never appears,
-    /// and flips to `false` the moment it does — the absence primitive the
-    /// blocking probe relies on.
+    /// `marker_stays_absent` is `true` only while the file never appears and
+    /// flips `false` the moment it does — the blocking probe's absence primitive.
     #[test]
     fn marker_stays_absent_detects_a_created_marker() {
         let dir = tempfile::tempdir().unwrap();

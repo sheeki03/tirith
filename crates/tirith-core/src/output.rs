@@ -5,14 +5,10 @@ use crate::verdict::{Action, Evidence, Finding, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
 
-/// A [`Finding`] serialized with its per-rule `remediation` appended.
-///
-/// `remediation` is the canonical "what to do instead" advice keyed by
-/// `rule_id` (see [`crate::rule_explanations::remediation`]). It is static,
-/// secret-free text, so it needs no redaction. Serializing through this view
-/// keeps the on-disk [`Finding`] struct (and every other consumer of it —
-/// SARIF, audit, last-trigger) unchanged: remediation appears only in the
-/// `check`/`paste` JSON surface, exactly where it is asked for.
+/// A [`Finding`] serialized with its per-rule `remediation` appended. The
+/// remediation text is static and secret-free (no redaction needed); this view
+/// confines it to the `check`/`paste` JSON surface, leaving every other
+/// `Finding` consumer (SARIF, audit, last-trigger) unchanged.
 #[derive(serde::Serialize)]
 pub struct FindingView<'a> {
     #[serde(flatten)]
@@ -45,10 +41,8 @@ pub struct JsonOutput<'a> {
     pub timings_ms: &'a crate::verdict::Timings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls_extracted_count: Option<usize>,
-    /// Concrete safer-command suggestions. Present (as a JSON array, possibly
-    /// empty) whenever the caller passed `--suggest-safe-command`; omitted
-    /// entirely otherwise. The array is empty when no finding has a safe
-    /// mechanical rewrite — including on an Allow verdict.
+    /// Safer-command suggestions: a (possibly empty) array when the caller
+    /// passed `--suggest-safe-command`, omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_suggestions: Option<&'a [SafeSuggestion]>,
 }
@@ -63,9 +57,7 @@ pub fn write_json(
 }
 
 /// Write verdict as JSON, optionally embedding safe-command suggestions.
-///
-/// `suggestions` is `Some` only when the caller requested
-/// `--suggest-safe-command`; passing `None` is identical to [`write_json`].
+/// `None` is identical to [`write_json`].
 pub fn write_json_with_suggestions(
     verdict: &Verdict,
     custom_patterns: &[String],
@@ -94,11 +86,10 @@ pub fn write_json_with_suggestions(
 
 /// Write human-readable verdict to stderr.
 ///
-/// `warn_only` indicates the caller cannot actually enforce a block (e.g. bash
-/// preexec `DEBUG` trap). In that mode, Block verdicts render as `DETECTED
-/// (shell hook cannot block in preexec mode — command will still run)` instead
-/// of `BLOCKED`, and the bypass hint line is rewritten accordingly. The flag
-/// is human-only — it MUST never reach `write_json`, audit logs, or exit codes.
+/// `warn_only` (caller cannot enforce a block, e.g. bash preexec `DEBUG` trap)
+/// renders Block as `DETECTED (... command will still run)` instead of `BLOCKED`
+/// and rewrites the bypass hint. Human-only — it MUST never reach `write_json`,
+/// audit logs, or exit codes.
 pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std::io::Result<()> {
     if verdict.findings.is_empty() {
         return Ok(());
@@ -126,7 +117,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
         writeln!(w, "  {} {} — {}", sev, finding.rule_id, finding.title)?;
         writeln!(w, "    {}", finding.description)?;
 
-        // Display detailed evidence for homoglyph findings
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
                 raw,
@@ -135,7 +125,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
             } = evidence
             {
                 writeln!(w)?;
-                // Visual line with markers
                 let visual = format_visual_with_markers(raw, suspicious_chars);
                 writeln!(w, "    Visual:  {visual}")?;
                 let esc_styled = if crate::style::use_color_for(crate::style::Stream::Stderr) {
@@ -145,7 +134,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
                 };
                 writeln!(w, "    Escaped: {esc_styled}")?;
 
-                // Suspicious bytes section
                 if !suspicious_chars.is_empty() {
                     writeln!(w)?;
                     let header =
@@ -162,7 +150,6 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
             }
         }
 
-        // Per-rule remediation — concise "what to do instead" line.
         let fix = crate::rule_explanations::remediation(finding.rule_id);
         if !fix.is_empty() {
             let label = crate::style::bold("Fix:", crate::style::Stream::Stderr);
@@ -231,12 +218,9 @@ pub fn write_human_auto(verdict: &Verdict, warn_only: bool) -> std::io::Result<(
     }
 }
 
-/// Write the `--suggest-safe-command` block to the given writer.
-///
-/// For each suggestion, prints a concrete safer command when one exists, or an
-/// honest "no automatic rewrite" line otherwise — always followed by the
-/// per-rule remediation. Does nothing when `suggestions` is empty. Advisory
-/// output only; never affects exit codes.
+/// Write the `--suggest-safe-command` block: a safer command when one exists,
+/// else an honest "no automatic rewrite" line, plus the per-rule remediation.
+/// Advisory output only; never affects exit codes.
 pub fn write_safe_suggestions(
     suggestions: &[SafeSuggestion],
     mut w: impl Write,
@@ -255,8 +239,6 @@ pub fn write_safe_suggestions(
         if let Some(cmd) = &s.safe_command {
             writeln!(w, "    {} {cmd}", crate::style::bold("try:", stream))?;
         }
-        // `rationale` is self-contained: for a rewrite it explains why the
-        // rewrite is safer; with no rewrite it states no safe rewrite exists.
         writeln!(w, "    why: {}", s.rationale)?;
         if !s.remediation.is_empty() {
             writeln!(
@@ -304,7 +286,6 @@ fn write_human_no_color(
         )?;
         writeln!(w, "    {}", finding.description)?;
 
-        // Display detailed evidence for homoglyph findings (no color)
         for evidence in &finding.evidence {
             if let Evidence::HomoglyphAnalysis {
                 raw,
@@ -313,12 +294,10 @@ fn write_human_no_color(
             } = evidence
             {
                 writeln!(w)?;
-                // Visual line with markers (using brackets instead of color)
                 let visual = format_visual_with_brackets(raw, suspicious_chars);
                 writeln!(w, "    Visual:  {visual}")?;
                 writeln!(w, "    Escaped: {escaped}")?;
 
-                // Suspicious bytes section
                 if !suspicious_chars.is_empty() {
                     writeln!(w)?;
                     writeln!(w, "    Suspicious bytes:")?;
@@ -333,7 +312,6 @@ fn write_human_no_color(
             }
         }
 
-        // Per-rule remediation — concise "what to do instead" line.
         let fix = crate::rule_explanations::remediation(finding.rule_id);
         if !fix.is_empty() {
             writeln!(w, "    Fix: {fix}")?;

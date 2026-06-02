@@ -1,38 +1,21 @@
-//! MCP lockfile drift detection — file-content rule that fires when the
-//! committed `.tirith/mcp.lock` no longer matches the repository's current
-//! MCP-server inventory.
+//! MCP lockfile drift detection — fires when the committed `.tirith/mcp.lock` no
+//! longer matches the repo's current MCP-server inventory. The FileScan-path
+//! counterpart to `tirith mcp verify`: on `tirith scan`, parse the lockfile, rebuild
+//! the inventory from the repo's MCP configs, and emit [`RuleId::McpServerDrift`] on a diff.
 //!
-//! This is the FileScan-path counterpart to `tirith mcp verify`. When
-//! `tirith scan` walks the repository and reaches `.tirith/mcp.lock`, this
-//! module parses the lockfile's recorded inventory, rebuilds the current
-//! inventory from the repo's MCP config files, and emits
-//! [`RuleId::McpServerDrift`] when the two differ. A pre-commit hook / CI
-//! integration that runs `tirith scan` therefore catches MCP drift the same
-//! way it catches an un-pinned action or a smuggled instruction.
+//! FileScan-only (never the exec hot path), so no tier-1 PATTERN_TABLE entry is needed
+//! for reachability (`tier1_scan` always returns `true` for FileScan). The module
+//! self-selects by path: only the `.tirith/mcp.lock` target triggers the rebuild, so a
+//! loose `mcp.lock` elsewhere is not misclassified.
 //!
-//! It runs only on the `tirith scan` FileScan path — never the exec hot
-//! path — so a tier-1 PATTERN_TABLE entry is not required for reachability
-//! (`tier1_scan` always returns `true` for FileScan, see `extract.rs`). The
-//! module self-selects by path: only the `.tirith/mcp.lock` *target* of a
-//! file scan ever triggers the inventory rebuild, so an arbitrary file with
-//! the basename `mcp.lock` outside `.tirith/` is not misclassified.
+//! **Privacy.** Findings carry only aggregate counts and server *names* — never an env
+//! value, URL userinfo, or hash (the lockfile already strips those; this observes that a
+//! hash changed, not the secret).
 //!
-//! **Privacy.** The fired finding's description and evidence carry only
-//! aggregate change counts and a server's *name* — never an env value, a URL
-//! userinfo string, or a hash. The lockfile already strips those (see
-//! `mcp_lock.rs`); this module observes the *hash* changed, never the
-//! underlying secret.
-//!
-//! **Malformed lockfile is itself a finding.** A `.tirith/mcp.lock` that
-//! does not parse cannot be diffed against the current inventory, so drift
-//! cannot be verified — exactly the failure mode an attacker would use to
-//! hide an MCP-surface change behind a deliberately broken lockfile. The
-//! rule therefore emits a `McpServerDrift` finding (same severity as a
-//! drift) when the committed lockfile is unparseable, naming the parse
-//! failure without echoing any of the file's bytes. An unreadable repo
-//! root, or an inventory rebuild that fails because of a malformed config
-//! file, still yields zero findings — those are operational conditions, not
-//! a tampered baseline.
+//! **A malformed lockfile is itself a finding** (same `McpServerDrift` rule/severity,
+//! naming the parse failure without echoing bytes): an unparseable baseline can't be
+//! diffed, exactly how an attacker would hide a surface change. An unreadable repo root
+//! or a malformed config still yields zero findings — those are operational, not tampering.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -40,12 +23,8 @@ use std::path::Path;
 use crate::mcp_lock;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// `true` when `path` is the `.tirith/mcp.lock` file this rule scans.
-///
-/// Requires the path's basename to be `mcp.lock` AND its immediate parent
-/// directory to be named `.tirith` — exactly the location
-/// `tirith mcp lock` writes. A loose `mcp.lock` anywhere else in the repo is
-/// not this lockfile.
+/// `true` when `path` is the `.tirith/mcp.lock` this rule scans: basename `mcp.lock`
+/// AND immediate parent `.tirith`. A loose `mcp.lock` elsewhere is not this lockfile.
 pub fn is_mcp_lockfile(path: Option<&Path>) -> bool {
     let Some(path) = path else { return false };
 
@@ -66,61 +45,24 @@ pub fn is_mcp_lockfile(path: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
-/// `true` when `repo_root` looks like a real repository — and therefore
-/// "no MCP configs found under it" is a meaningful signal of "every locked
-/// server has been removed" drift rather than "this isn't a repo, of
-/// course there's nothing here".
+/// `true` when `repo_root` looks like a real repo, so "no MCP configs found" means
+/// "every locked server removed" drift rather than "not a repo". Without this gate, a
+/// stray `.tirith/mcp.lock` (e.g. under `/tmp/random/`) produces a finding-storm of
+/// every-server-removed (finding F9). Cheap (a few `metadata` probes), run only when the
+/// rule is about to fire.
 ///
-/// Without this gate, scanning a bare `.tirith/mcp.lock` outside any
-/// repository (e.g. a copy sitting under `/tmp/random/`) produces a
-/// finding storm: `build_inventory` finds no configs, `compute_drift`
-/// classifies every server in the lockfile as Removed, and the rule
-/// reports drift that does not exist. The check is structurally cheap
-/// (a handful of `metadata` probes) and is run only after we know
-/// `file_path` already looks like `<X>/.tirith/mcp.lock`, so the cost
-/// is paid only when the rule is about to fire anyway.
+/// Admits iff one of:
+/// 1. `repo_root` is empty / `.` — a relative scan path (`.tirith/mcp.lock`) means "scan
+///    against cwd"; honor that. Also the contract the FileScan fixture path relies on.
+/// 2. `.git` is a dir OR file under the root (the file form is how worktrees/submodules mark it).
+/// 3. a known MCP discovery probe ([`mcp_lock::MCP_CONFIG_RELATIVE_PATHS`]) is a regular file.
 ///
-/// The check accepts the root iff at least one of:
-/// 1. **The derived `repo_root` is empty / `.` (a relative path with no
-///    leading components).** When the scan was driven with a relative
-///    file path like `.tirith/mcp.lock`, the derived "repo root" is the
-///    empty path — meaning the caller is implicitly asking us to scan
-///    against the current working directory. We honor that intent
-///    rather than try to re-derive it; the alternative would silently
-///    suppress drift on what the caller plainly meant as "scan THIS
-///    lockfile". This is also the contract the FileScan fixture path
-///    depends on: a fixture's `file_path` is always relative.
-/// 2. `.git` is a directory or a file under the root — the standard
-///    working-tree marker; submodules and `git worktree` checkouts use
-///    a `.git` *file* pointing back at the parent's `.git/` (a regular
-///    file, hence the explicit `is_file()` admit);
-/// 3. at least one of the known MCP discovery probes
-///    ([`mcp_lock::MCP_CONFIG_RELATIVE_PATHS`]) resolves to a regular
-///    file — a working MCP config alone is enough to call this a real
-///    target (a `.mcp.json` outside any other repo marker is still
-///    something the operator deliberately wrote).
-///
-/// **No `.tirith/` admit arm.** A previous version of this gate accepted
-/// the root when `<repo_root>/.tirith/` existed, on the rationale that a
-/// tirith-managed directory was a deliberate operator artifact. But this
-/// rule self-selects on `is_mcp_lockfile(file_path)` — the scanned path
-/// is `<X>/.tirith/mcp.lock`, so on any real scan path (where the scanner
-/// physically read the file off disk), `<X>/.tirith/` is *guaranteed* to
-/// exist. The `.tirith/` arm therefore always passed, defeating the gate's
-/// own purpose: a stray `.tirith/mcp.lock` under `/tmp/random/` would
-/// still produce the very finding-storm F9 was designed to suppress. The
-/// remaining arms ((1) relative-path carve-out, (2) `.git/` marker, (3)
-/// an actual MCP config) are each independent and *not* derivable from
-/// the lockfile's own presence, so they remain meaningful signals.
-///
-/// The case explicitly rejected: an *absolute* path under a directory
-/// that has none of (2)–(3). That's the F9 "stray `/tmp/random/.tirith/
-/// mcp.lock`" failure mode.
+/// No `.tirith/` arm: this rule self-selects on a `<X>/.tirith/mcp.lock` path, so `.tirith/`
+/// always exists on a real scan and that arm was tautological — defeating F9. The remaining
+/// arms aren't derivable from the lockfile's own presence. Rejected: an absolute path with
+/// none of (2)–(3) — the F9 failure mode.
 fn looks_like_repo_root(repo_root: &Path) -> bool {
-    // Admit-by-construction case 1: a relative root with no parent
-    // components (the empty Path produced by `Path("foo").parent()` on a
-    // single-component relative path, or `Path(".")` literal). The caller
-    // pointed at a lockfile by relative path; respect that.
+    // Arm 1: a relative root with no parent components — caller pointed by relative path.
     if repo_root.as_os_str().is_empty() || repo_root == Path::new(".") {
         return true;
     }
@@ -145,37 +87,19 @@ fn looks_like_repo_root(repo_root: &Path) -> bool {
 
 /// Run the MCP-drift rule against a file's contents.
 ///
-/// `file_path` must be the absolute or relative path the scan walked — the
-/// repo root is derived from it (`<repo>/.tirith/mcp.lock` → `<repo>`).
-/// A path that is not the lockfile, or for which the repo root cannot be
-/// derived, yields no findings.
+/// `file_path` is the scanned path; the repo root is derived from it
+/// (`<repo>/.tirith/mcp.lock` → `<repo>`). A non-lockfile path, or one whose root can't
+/// be derived, yields no findings. `content` is the read body (non-UTF8/non-JSON → no
+/// findings).
 ///
-/// `content` is the file's textual contents as the scan read them; the
-/// lockfile is JSON, so a non-UTF8 body simply fails to parse and yields
-/// no findings.
+/// `trusted_mcp_servers` (`policy.scan.trusted_mcp_servers`): drift entries whose server
+/// name is trusted are filtered out before a finding is built; only untrusted drift surfaces.
 ///
-/// `trusted_mcp_servers` is `policy.scan.trusted_mcp_servers`: drift entries
-/// (Added / Removed / Changed) whose server name is in that list are filtered
-/// out of the drift before a finding is built. When **every** drift is for a
-/// trusted server, no finding fires. When some are trusted and others are
-/// not, only the untrusted ones surface.
-///
-/// `mcp_allowed_tools` is `policy.scan.mcp_allowed_tools`: a per-server
-/// allow-list of tool names. Two effects:
-///
-/// * **Lockfile-side**: when the lockfile itself records a tool that is not
-///   in the allowed set for a server listed in `mcp_allowed_tools`, a
-///   `McpServerDrift` finding fires (severity High) naming the disallowed
-///   tools. Fires alongside any other drift; never fires if no policy entry
-///   exists for the server.
-/// * **Drift-side**: when an Added or Changed drift introduces a tool that
-///   is not in the allowed set for a server listed in `mcp_allowed_tools`,
-///   the drift finding is **upgraded to High severity** (the default is
-///   Medium). For `Changed`, the inspected list is `tools_added`. For
-///   `Added`, the inspected list is the brand-new server's declared
-///   `tools` (every tool on a new server is effectively a fresh addition
-///   relative to the previous lockfile state). Drift inside the allowed
-///   set keeps Medium.
+/// `mcp_allowed_tools` (`policy.scan.mcp_allowed_tools`): per-server tool allow-list with
+/// two effects — (a) lockfile-side: a recorded tool outside the allowed set fires a High
+/// `McpServerDrift` finding; (b) drift-side: an Added/Changed drift introducing a
+/// disallowed tool upgrades the drift finding Medium→High (`Changed` inspects `tools_added`,
+/// `Added` inspects the new server's declared `tools`).
 pub fn check(
     content: &str,
     file_path: Option<&Path>,
@@ -186,13 +110,9 @@ pub fn check(
         return Vec::new();
     }
 
-    // Parse the lockfile. A malformed lockfile is itself a security signal:
-    // the committed baseline cannot be diffed against the current inventory,
-    // so drift cannot be verified. An attacker who altered the MCP surface
-    // and then corrupted the lockfile would silently bypass scan-time
-    // governance if we returned no findings. Emit the same `McpServerDrift`
-    // rule as a drift detection — same severity, distinct description — so
-    // the safeguard tests and rule_explanations entry need no schema change.
+    // A malformed lockfile is itself a security signal (an unparseable baseline can't be
+    // diffed, so an attacker could hide a surface change). Emit the same `McpServerDrift`
+    // rule (distinct description) so safeguard tests / rule_explanations need no change.
     let lockfile = match mcp_lock::parse_lockfile(content) {
         Ok(l) => l,
         Err(e) => return vec![finding_for_unparseable_lockfile(&e)],
@@ -203,59 +123,25 @@ pub fn check(
         return Vec::new();
     };
 
-    // Validation: the derived repo root must look like a real repository
-    // before we treat absence-of-configs as drift. Scanning `.tirith/mcp.lock`
-    // outside a repo (e.g. a copy sitting under `/tmp/random/`) would
-    // otherwise produce "every server removed" noise — `build_inventory`
-    // probes a fixed set of MCP config paths under the derived root, finds
-    // none, and `compute_drift` then flags every recorded server as Removed.
-    // Require any one of:
-    //   1. a `.git/` directory or file (the `.git` file form is how
-    //      `git worktree` and submodule checkouts mark a working tree);
-    //   2. at least one of the known MCP discovery probes physically
-    //      present (so a repo without a `.git` but with a real
-    //      `.mcp.json` is still gateable).
-    // The previous version also admitted on a bare `.tirith/` directory,
-    // but that arm was tautological for any real scan path (the lockfile we
-    // are scanning lives *inside* `.tirith/`, so the directory necessarily
-    // exists); see the rationale in `looks_like_repo_root`'s doc-comment.
-    // If none of those are present, the scan target is not a repository in
-    // any sense this rule understands; treat absence as silence, not
-    // a finding storm.
+    // The root must look like a real repo before absence-of-configs counts as drift, else
+    // a stray lockfile produces an every-server-removed storm (F9; see `looks_like_repo_root`).
     if !looks_like_repo_root(repo_root) {
         return Vec::new();
     }
 
-    // Build the current inventory off of the repo root. `build_inventory` is
-    // total (a malformed config contributes no entries) so this cannot panic
-    // or error.
+    // `build_inventory` is total (a malformed config contributes no entries).
     let current = mcp_lock::build_inventory(repo_root);
 
     let drifts = mcp_lock::compute_drift(&current, &lockfile);
 
-    // Policy: drop drift entries whose server NAME is in the trusted list.
-    // The operator has accepted that server's surface as a deliberate
-    // decision — drift on it should not raise a finding. If every drift is
-    // for a trusted server, no drift finding fires at all.
+    // Drop drift on trusted servers (operator accepted that surface). All-trusted → no finding.
     let drifts_after_trust = drift_filter_trusted(drifts, trusted_mcp_servers);
 
     let mut findings: Vec<Finding> = Vec::new();
 
-    // Policy: scan the lockfile's own recorded tool list against
-    // `mcp_allowed_tools`. Tools recorded in the lockfile that are not in
-    // the policy's allowed-set for that server are a policy violation in
-    // their own right — exactly the failure mode of "snuck a tool past
-    // `tirith mcp lock`" the per-tool gate is designed to catch.
-    //
-    // **Trust does NOT apply here.** `trusted_mcp_servers` suppresses
-    // *drift findings* — the operator accepts the server's surface as
-    // observed. `mcp_allowed_tools` is a separate, orthogonal mechanism:
-    // the per-tool allow-list the operator wrote because they want
-    // exactly that list enforced. An older version of this code did
-    // pass `trusted_mcp_servers` through and let trust silently override
-    // the explicit allow-list; PR #121 item 8 fixes that. The trust list
-    // is still passed (for backward signature stability and any future
-    // re-introduction), but is no longer consulted inside the helper.
+    // Lockfile-side: a recorded tool outside `mcp_allowed_tools` is its own violation (a tool
+    // "snuck past `tirith mcp lock`"). Trust does NOT apply here — it suppresses drift only,
+    // not the explicit per-tool allow-list (PR #121 item 8); the param is passed but unused.
     if let Some(finding) =
         finding_for_disallowed_lockfile_tools(&lockfile, mcp_allowed_tools, trusted_mcp_servers)
     {
@@ -263,22 +149,10 @@ pub fn check(
     }
 
     if !drifts_after_trust.is_empty() {
-        // A migration-prompt drift entry is a schema-wide signal, not
-        // per-server drift: it tells the operator the lockfile's
-        // `format_version` predates the current build's hashing rules and
-        // needs `tirith mcp lock --force` once. Emit a distinct finding
-        // (Medium, same `RuleId::McpServerDrift`) so the operator gets a
-        // clear migration instruction.
-        //
-        // **Important:** the migration prompt does NOT short-circuit the
-        // per-server drift finding. `compute_drift` runs v4-compatible
-        // drift detection alongside the migration prompt (see
-        // `mcp_lock::compute_drift`'s v4 branch), so any real drift in a
-        // v4 lockfile — URL changed, command changed, env or tools
-        // added/removed, server added/removed — is still reported as
-        // its own finding. Without this, a malicious config change made
-        // during the v4→v5 migration window would slip silently into the
-        // operator's `tirith mcp lock --force` regeneration.
+        // A SchemaUpgradeRequired entry is a schema-wide signal (lockfile `format_version`
+        // predates this build): emit a distinct Medium finding prompting `mcp lock --force`.
+        // It does NOT short-circuit per-server drift — `compute_drift` still reports real
+        // v4 drift, so a config change made during the v4→v5 window can't slip in silently.
         let migration_entry = drifts_after_trust.iter().find_map(|d| match d {
             mcp_lock::McpDrift::SchemaUpgradeRequired {
                 from_version,
@@ -293,18 +167,14 @@ pub fn check(
             ));
         }
 
-        // Per-server drift (Added / Removed / Changed) is reported in
-        // its own finding, independent of the migration prompt. Filter
-        // out the schema-wide migration entry so it does not contribute
-        // to the per-server change counts or get listed as a "server
-        // name" in the summary.
+        // Per-server drift gets its own finding; filter out the schema-wide entry so it
+        // doesn't pollute the change counts or server-name summary.
         let per_server_drifts: Vec<mcp_lock::McpDrift> = drifts_after_trust
             .into_iter()
             .filter(|d| !matches!(d, mcp_lock::McpDrift::SchemaUpgradeRequired { .. }))
             .collect();
         if !per_server_drifts.is_empty() {
-            // Drift severity ladder: Medium by default, upgraded to High if any
-            // newly-added tool is outside the allowed set for that server.
+            // Severity ladder: Medium default, High if any newly-added tool is disallowed.
             let severity = if any_added_tool_out_of_allowed(&per_server_drifts, mcp_allowed_tools) {
                 Severity::High
             } else {
@@ -329,42 +199,19 @@ fn drift_filter_trusted(
     drifts
         .into_iter()
         .filter(|d| match d.name() {
-            // Per-server drift: drop the entry if its server name is in
-            // the trusted list. An empty server name here would be a
-            // *real* empty-name server (parse_mcp_config accepts `""` as
-            // a JSON object key); it is matched against the trusted list
-            // like any other name.
+            // Per-server drift: drop if the server name is trusted.
             Some(n) => !trusted.iter().any(|t| t == n),
-            // Schema-wide signals (e.g. SchemaUpgradeRequired) have no
-            // per-server identity and cannot be "trusted away" — they
-            // must reach the operator so they can re-lock.
+            // Schema-wide signals have no per-server identity — can't be trusted away.
             None => true,
         })
         .collect()
 }
 
-/// `true` when at least one drift introduces a tool that is NOT in the
-/// `mcp_allowed_tools` set for that server. A server not listed in
-/// `mcp_allowed_tools` is unconstrained (its drift contributes nothing
-/// to the upgrade decision).
-///
-/// Two drift kinds carry "added tools" and both feed the severity ladder:
-///
-/// * **`Changed`** — the per-server `tools_added` field. A pre-existing
-///   server now exposes a tool the previous lockfile state did not.
-/// * **`Added`** — a brand-new server entry, whose declared `tools` list
-///   is treated as a fresh set of additions against the (implicit) empty
-///   previous state. Without surfacing the new server's tools here, an
-///   attacker could smuggle a disallowed tool by introducing a new server
-///   instead of mutating an existing one — exactly the asymmetry CodeRabbit
-///   flagged (`mcp_allowed_tools` ladder must cover both paths).
-///
-/// **Allowed-list semantics** (same on both paths):
-/// * A server unlisted in `mcp_allowed_tools` is unconstrained — its tools
-///   never trigger an upgrade.
-/// * A server listed with `[]` (empty allow-list) forbids *any* tool — every
-///   tool the server declares triggers an upgrade.
-/// * A server listed with a non-empty allow-list permits exactly those tools.
+/// `true` when a drift introduces a tool NOT in `mcp_allowed_tools` for that server. Two
+/// drift kinds feed the ladder: `Changed` (its `tools_added`) and `Added` (the new server's
+/// declared `tools`, treated as fresh additions — else an attacker smuggles a tool via a new
+/// server; CodeRabbit). Semantics: a server unlisted is unconstrained; listed with `[]`
+/// forbids any tool; listed non-empty permits exactly those.
 fn any_added_tool_out_of_allowed(
     drifts: &[mcp_lock::McpDrift],
     mcp_allowed_tools: &HashMap<String, Vec<String>>,
@@ -385,9 +232,7 @@ fn any_added_tool_out_of_allowed(
                 }
             }
             mcp_lock::McpDrift::Added { name, tools, .. } => {
-                // A brand-new server: every declared tool is effectively an
-                // "added" tool relative to the previous lockfile state. The
-                // same policy-set test the `Changed` arm runs applies here.
+                // New server: every declared tool is effectively added; same test as `Changed`.
                 let Some(allowed) = mcp_allowed_tools.get(name) else {
                     continue;
                 };
@@ -398,40 +243,25 @@ fn any_added_tool_out_of_allowed(
                 }
             }
             mcp_lock::McpDrift::Removed { .. } => {
-                // A removed server's tools do not get "added" anywhere; the
-                // upgrade ladder is about NEW exposure, never lost exposure.
+                // The ladder is about NEW exposure, never lost exposure.
             }
             mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => {
-                // The migration prompt has no per-server payload — it is a
-                // single short-circuit entry, not real drift. The allowed-
-                // tools ladder doesn't apply.
+                // No per-server payload — the ladder doesn't apply.
             }
         }
     }
     false
 }
 
-/// Build a finding for lockfile-recorded tools that are not in the
-/// `mcp_allowed_tools` set. Returns `None` if every recorded tool is
-/// allowed (or no policy entry exists for any server).
+/// Build a High finding for lockfile-recorded tools outside `mcp_allowed_tools` (`None`
+/// if all allowed or no policy entry). Lists a few server names + offending tools; full
+/// detail belongs in `tirith mcp verify`. A recorded tool outside policy is a stronger
+/// signal than ordinary drift (the lockfile should have caught it).
 ///
-/// The finding lists at most a few server names and the offending tools
-/// per server; full per-server detail belongs in `tirith mcp verify`. The
-/// rule fires at High severity — a recorded tool outside policy is a
-/// stronger signal than ordinary drift because the lockfile was supposed
-/// to have caught it.
-///
-/// **`trusted` is intentionally not consulted here.** The previous
-/// behavior suppressed lockfile-side findings for trusted servers — but
-/// that conflated two orthogonal mechanisms. `trusted_mcp_servers`
-/// suppresses *drift findings* (the operator declared they accept the
-/// server's surface as-is). `mcp_allowed_tools` is a *per-tool allow-list*
-/// the operator wrote because they want exactly that list enforced. An
-/// operator who configures both means "trust drift, but still hold this
-/// server's tools to [list]"; trust must not silently override the
-/// allow-list. PR #121 item 8 fixes this — the parameter remains in the
-/// signature so callers don't change, but is no longer consulted. See the
-/// block comment inside the loop for the full rationale.
+/// `trusted` is intentionally NOT consulted (PR #121 item 8): trust suppresses *drift*,
+/// while `mcp_allowed_tools` is an orthogonal per-tool allow-list the operator wants
+/// enforced even on a trusted server. Trust still applies to servers with NO allow-list
+/// entry (nothing to enforce). Param kept for signature stability.
 fn finding_for_disallowed_lockfile_tools(
     lockfile: &mcp_lock::McpLockfile,
     mcp_allowed_tools: &HashMap<String, Vec<String>>,
@@ -441,35 +271,13 @@ fn finding_for_disallowed_lockfile_tools(
         return None;
     }
 
-    // Collect (server_name, disallowed_tools) pairs in stable order:
-    // servers in lockfile order (already sorted), tools as recorded.
-    //
-    // **Trust no longer bypasses an explicit allowed-tools entry.**
-    // `trusted_mcp_servers` suppresses drift findings (operator accepted
-    // the *surface* as-is), but `mcp_allowed_tools` is a separate,
-    // orthogonal mechanism — a per-tool allow-list that the operator
-    // wrote because they want exactly that list enforced. An operator
-    // who lists BOTH (trusted: [foo]) AND (mcp_allowed_tools: { foo:
-    // [bar] }) means "trust foo's drift, but still hold its tools to
-    // [bar]". The old behavior conflated the two, silently letting
-    // trust override the explicit policy — PR #121 item 8.
-    //
-    // The trust-bypass is still honored for servers that have NO
-    // `mcp_allowed_tools` entry: trust suppresses the finding the same
-    // way it suppresses drift findings, because there is no explicit
-    // policy to enforce against.
+    // (server, disallowed_tools) in stable lockfile order. An explicit allow-list entry
+    // is enforced regardless of trust (PR #121 item 8); a server with no entry is skipped.
     let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
     for server in &lockfile.servers {
         let Some(allowed) = mcp_allowed_tools.get(&server.name) else {
-            // No explicit allow-list — trust would apply if the server
-            // were here, but with no policy to enforce there is nothing
-            // to flag.
             continue;
         };
-        // An explicit `mcp_allowed_tools` entry exists for this server.
-        // Enforce it regardless of whether the operator also marked the
-        // server trusted — `trusted` is intentionally not consulted on
-        // this branch (see the block comment above).
         let disallowed: Vec<String> = server
             .tools
             .iter()
@@ -485,10 +293,8 @@ fn finding_for_disallowed_lockfile_tools(
         return None;
     }
 
-    // Build a one-line summary plus a structured detail listing of
-    // the offenders. Every name is debug-escaped (`{:?}`) so a control
-    // byte inside a name cannot inject into the operator's terminal —
-    // same convention as `mcp.rs::escape_name`.
+    // Summary + structured detail. Names are debug-escaped (`{:?}`) so a control byte in a
+    // name can't inject into the terminal (same as `mcp.rs::escape_name`).
     let server_count = offenders.len();
     let total_tool_count: usize = offenders.iter().map(|(_, t)| t.len()).sum();
     let summary = format!(
@@ -534,16 +340,9 @@ fn finding_for_disallowed_lockfile_tools(
     })
 }
 
-/// Build the single drift finding from the structured drift list.
-///
-/// Aggregates by drift kind so the description fits in one line: "N added,
-/// M removed, K changed". The first few server names are listed for
-/// orientation; the full structured drift is the domain of
-/// `tirith mcp verify --format json`, not the scan finding.
-///
-/// `severity` is the severity to emit. The default is `Medium`; the caller
-/// passes `High` when policy's `mcp_allowed_tools` ladder applies (a
-/// newly-added tool is outside the allowed set for its server).
+/// Build the single drift finding, aggregated by kind ("N added, M removed, K changed")
+/// with a few server names for orientation (full detail is `tirith mcp verify`'s domain).
+/// `severity` is Medium by default; the caller passes High via the `mcp_allowed_tools` ladder.
 fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Finding {
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -555,19 +354,12 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
             mcp_lock::McpDrift::Removed { .. } => removed += 1,
             mcp_lock::McpDrift::Changed(_) => changed += 1,
             mcp_lock::McpDrift::SchemaUpgradeRequired { .. } => {
-                // Migration prompts are routed to
-                // `finding_for_schema_upgrade_required` by the caller,
-                // never `finding_for_drift`. Skip defensively if one
-                // ever lands here so a future caller refactor cannot
-                // accidentally name an empty server in the summary.
+                // Routed to `finding_for_schema_upgrade_required`; skip defensively here.
                 continue;
             }
         }
         if names.len() < 5 {
-            // Only per-server drifts contribute a server name to the
-            // summary. `SchemaUpgradeRequired` is already routed to its
-            // own finding above and `continue`d past in the match arm —
-            // so any drift that reaches here has a name.
+            // Only per-server drifts contribute a name (SchemaUpgradeRequired was skipped above).
             if let Some(n) = d.name() {
                 names.push(n.to_string());
             }
@@ -608,16 +400,10 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
     }
 }
 
-/// Build the finding fired when the lockfile's `format_version` predates
-/// the current build's hashing rules (a v4 lockfile loaded in a v5 build).
-/// Same `RuleId::McpServerDrift` and Medium severity as a generic drift
-/// finding — the existing rule_explanations / scoring / safeguard
-/// paperwork is unchanged. The distinguishing surface is the title and
-/// description, which name the migration plainly so the operator runs
-/// `tirith mcp lock --force` once and moves on. This avoids the phantom-
-/// drift storm that would otherwise fire when every recomputed v5 hash
-/// differs from every stored v4 hash even though the MCP inventory is
-/// unchanged.
+/// Finding fired when the lockfile `format_version` predates this build (e.g. v4 in a v5
+/// build). Same `McpServerDrift`/Medium as generic drift (paperwork unchanged); the title
+/// names the migration so the operator runs `tirith mcp lock --force` once — avoiding the
+/// phantom-drift storm of every v5 hash differing from every stored v4 hash.
 fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Finding {
     let detail = format!(
         "MCP lockfile is at schema v{from_version}; re-lock with `tirith mcp lock --force` \
@@ -648,62 +434,25 @@ fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Fi
     }
 }
 
-/// Build the finding fired when `.tirith/mcp.lock` cannot be parsed.
+/// Finding fired when `.tirith/mcp.lock` cannot be parsed — an unparseable baseline can't
+/// be diffed, the silent-failure mode an attacker would use. Same `RuleId`/severity as a
+/// drift finding, distinct description.
 ///
-/// The lockfile is the committed baseline a `tirith scan` diffs the current
-/// inventory against. A baseline that doesn't parse cannot be diffed, so
-/// drift cannot be verified — exactly the silent-failure mode that would
-/// let an attacker hide an MCP-surface change behind a corrupted lockfile.
-/// Surface it explicitly: same `RuleId` and severity as a drift finding so
-/// the existing verdict / scoring / explanation paperwork stays unchanged,
-/// distinct description so the operator can tell the two failure modes
-/// apart.
-///
-/// **Privacy.** The description **does not** interpolate the underlying
-/// `serde_json::Error` message. `serde_json::Error`'s `Display` impl can
-/// echo the offending JSON value (`invalid type: string "...", expected
-/// ...`), and `.tirith/mcp.lock` is exactly the file we redact env values
-/// and URL userinfos out of (see `mcp_lock.rs`). A malformed lockfile
-/// containing a secret-shaped value — an unintentionally-committed
-/// credential, a partial config — would then surface that value in the
-/// finding's description: a privacy leak via diagnostic. So we name the
-/// failure category explicitly (`unparseable JSON`, etc.) and, when the
-/// upstream variant carries them, surface only the structurally-safe
-/// line/column numbers from `serde_json::Error` (both `usize`, neither
-/// can echo content). [`mcp_lock::parse_lockfile`] enforces the same
-/// invariant at the source by dropping the parser's message string at
-/// the boundary.
+/// **Privacy.** Does NOT interpolate the `serde_json::Error` message: its `Display` can
+/// echo the offending JSON value, and this is the file we redact secrets out of — so a
+/// malformed lockfile holding a credential would leak it via the diagnostic. We name the
+/// category (`unparseable JSON`, …) and surface only structurally-safe line/column numbers.
 fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding {
-    // Map the lock-load error to a structured (category, optional
-    // location) pair. The category names the failure plainly; the
-    // location, when present, is line/column numbers only — never a
-    // textual error message that could echo the lockfile's bytes.
-    //
-    // The schema-version case is its own arm: a lockfile written by a
-    // different tirith version is a meaningfully different operator
-    // situation from "the JSON is corrupt" (the file is intact and
-    // structured; it just speaks an older or newer schema), so the
-    // human-readable category and the title/description below name
-    // that case distinctly. The two version numbers (`u32`s) are
-    // safe to interpolate — neither can echo lockfile bytes.
+    // Map the error to (category, optional location). The location, when present, is
+    // line/column only — never a message that could echo bytes. The schema-version case is
+    // its own arm (intact file, just an older/newer schema); its `u32`s are safe to print.
     let (category, location): (String, Option<String>) = match err {
         mcp_lock::McpLockLoadError::NotFound => {
-            // `check()` only constructs an unparseable finding from a
-            // `parse_lockfile` result on content the scan already read,
-            // so NotFound is not reachable here in practice. Named
-            // explicitly anyway so a future caller cannot accidentally
-            // surface a path string through the finding description.
+            // Not reachable here in practice; named so no caller leaks a path string.
             ("missing baseline file".to_string(), None)
         }
         mcp_lock::McpLockLoadError::Io { .. } => {
-            // Suppress the inner io-error category — even though
-            // `std::io::Error` typically does not echo file contents,
-            // refusing to interpolate any io detail (even the
-            // structured `kind` exposed by `mcp_lock`) removes a
-            // class of future diagnostic-leak regressions. The
-            // `McpLockLoadError`'s own `Display` exposes the kind
-            // to the CLI surface; this rule's description is
-            // strictly category-only.
+            // Suppress io detail entirely (category-only) to forestall diagnostic-leak regressions.
             ("unreadable file".to_string(), None)
         }
         mcp_lock::McpLockLoadError::Parse { line, column } => (
@@ -722,12 +471,8 @@ fn finding_for_unparseable_lockfile(err: &mcp_lock::McpLockLoadError) -> Finding
         None => String::new(),
     };
 
-    // The version-mismatch case gets its own title and description so the
-    // operator can distinguish "this lockfile speaks an older / newer
-    // schema, refresh it" from "the JSON is corrupt, investigate before
-    // regenerating". Both still emit `RuleId::McpServerDrift` with the
-    // same Medium severity so existing rule_explanations / scoring /
-    // safeguard paperwork is unchanged.
+    // Version-mismatch gets its own title/description ("refresh the schema" vs "JSON is
+    // corrupt"); both still emit Medium `McpServerDrift` so the paperwork is unchanged.
     let (title, description) = match err {
         mcp_lock::McpLockLoadError::UnsupportedVersion { found, supported } => (
             "MCP lockfile schema version is incompatible — drift cannot be verified".to_string(),
@@ -835,8 +580,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_inventory_matches_lockfile() {
-        // A clean repo: the lockfile we wrote matches the inventory the
-        // scan will compute. No drift, no finding.
+        // Clean repo: lockfile matches the computed inventory → no finding.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -854,7 +598,7 @@ mod tests {
 
     #[test]
     fn check_fires_when_server_added_to_config_after_lockfile() {
-        // Step 1: a repo with one MCP server, lockfile committed.
+        // One server, lockfile committed; then add a second server (config drifts).
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -864,8 +608,6 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Step 2: the user adds a second MCP server to .mcp.json (so the
-        // config drifted from the lockfile).
         write_config(
             repo.path(),
             ".mcp.json",
@@ -881,15 +623,12 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::McpServerDrift);
         assert_eq!(findings[0].severity, Severity::Medium);
-        // The aggregated summary mentions the addition.
         assert!(findings[0].description.contains("1 added"));
     }
 
     #[test]
     fn check_fires_when_env_value_rotated() {
-        // Headline integration of the env-value-hash drift signal: a
-        // rotated credential surfaces as a finding when scanning the
-        // (now-stale) lockfile.
+        // A rotated credential surfaces as drift via the env-value-hash signal.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -900,7 +639,7 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // The user rotates the token.
+        // Rotate the token.
         write_config(
             repo.path(),
             ".mcp.json",
@@ -914,7 +653,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].description.contains("1 changed"));
 
-        // And no raw credential bytes appear in the finding.
+        // No raw credential bytes appear in the finding.
         let serialized = serde_json::to_string(&findings).unwrap();
         assert!(!serialized.contains("old-credential"));
         assert!(!serialized.contains("new-credential"));
@@ -922,13 +661,8 @@ mod tests {
 
     #[test]
     fn check_fires_when_lockfile_is_malformed_json() {
-        // A malformed lockfile is itself a security signal: the committed
-        // baseline cannot be diffed against the current inventory, so drift
-        // cannot be verified. Returning no findings here would let an
-        // attacker hide an MCP-surface change behind a deliberately broken
-        // lockfile. The rule fires with the same RuleId (no schema change)
-        // and severity (Medium → Warn) as a drift finding, with a distinct
-        // description naming the parse failure.
+        // A malformed lockfile is itself a finding (same RuleId/severity, distinct
+        // description) — else an attacker could hide a surface change behind a broken lockfile.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -965,8 +699,7 @@ mod tests {
             findings[0].description,
         );
 
-        // The finding must not echo the lockfile's raw bytes — only the
-        // parse-error metadata (line/column) is safe to surface.
+        // The finding must not echo raw lockfile bytes (only line/column metadata is safe).
         let serialized = serde_json::to_string(&findings).unwrap();
         assert!(
             !serialized.contains("{not json"),
@@ -976,24 +709,14 @@ mod tests {
 
     #[test]
     fn unparseable_finding_does_not_echo_serde_json_message() {
-        // Privacy invariant: `serde_json::Error`'s `Display` can include
-        // the offending JSON value (`invalid type: string "...",
-        // expected ...`). A `.tirith/mcp.lock` containing a
-        // secret-shaped value (an accidentally-committed credential, a
-        // partial config) would then surface that value through the
-        // finding description. The finding must NOT carry that error
-        // message — only the failure category and, optionally,
-        // line/column numbers.
+        // Privacy: `serde_json::Error`'s `Display` can echo the offending JSON value, so a
+        // secret-shaped value in the lockfile must NOT reach the finding (category + line/col only).
         let repo = tempdir().unwrap();
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
 
-        // A distinctive credential-shaped value that serde_json would
-        // echo if we naively used `format!("{e}")`. The JSON below is
-        // syntactically valid but the wrong shape for the lockfile
-        // schema — serde_json's message for this failure mode is
-        // exactly the documented `invalid type: string "...",
-        // expected struct ...` form.
+        // A credential-shaped value serde_json would echo via `format!("{e}")`; valid JSON
+        // but the wrong shape (triggers the `invalid type: string "...", expected struct …`).
         let secret = "ghp_LEAK_PROBE_DO_NOT_LET_THIS_INTO_THE_FINDING";
         let body = format!(r#""{secret}""#);
         fs::write(lockdir.join("mcp.lock"), &body).unwrap();
@@ -1004,10 +727,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
 
         let f = &findings[0];
-        // Direct probes on the description: the credential-shaped
-        // value, the literal substrings serde_json typically uses to
-        // frame the offending value, and the offending JSON content
-        // (the raw body bytes) must all be absent.
+        // The secret, serde_json's framing substrings, and the raw body must all be absent.
         assert!(
             !f.description.contains(secret),
             "secret leaked into finding description: {}",
@@ -1018,11 +738,8 @@ mod tests {
             "serde_json's `invalid type:` framing leaked into description: {}",
             f.description,
         );
-        // We can't assert `!description.contains("expected")` outright
-        // because the legitimate prose already contains the word
-        // (e.g. "expected lockfile schema"). Assert the specific
-        // serde_json idiom `expected struct`/`expected one of`/
-        // `expected value` did not leak.
+        // Can't assert `!contains("expected")` (legit prose uses it); assert the specific
+        // serde_json idioms `expected struct`/`one of`/`value` didn't leak.
         assert!(
             !f.description.contains("expected struct"),
             "serde_json's `expected struct ...` framing leaked into description: {}",
@@ -1044,8 +761,7 @@ mod tests {
             f.description,
         );
 
-        // And likewise on the full serialized finding (evidence,
-        // detail, every field).
+        // Likewise on the full serialized finding (every field).
         let serialized = serde_json::to_string(&findings).unwrap();
         assert!(
             !serialized.contains(secret),
@@ -1060,9 +776,7 @@ mod tests {
             "serde_json's `expected struct` framing leaked into serialized finding: {serialized}"
         );
 
-        // Sanity: the description still names the failure category and
-        // (when available) the safe line/column metadata, so the
-        // operator can act on the finding.
+        // Sanity: the description still names the failure category so the operator can act.
         assert!(
             f.description.contains("unparseable JSON") || f.description.contains("schema mismatch"),
             "description must still name the failure category: {}",
@@ -1072,10 +786,7 @@ mod tests {
 
     #[test]
     fn check_fires_on_lockfile_with_unknown_schema_fields() {
-        // A lockfile that is valid JSON but does not match the expected
-        // schema (e.g. produced by a future tirith with an incompatible
-        // shape, or hand-crafted by an attacker) must also surface — same
-        // verification-impossible failure mode.
+        // Valid JSON but wrong schema must also surface — same verification-impossible mode.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1101,20 +812,16 @@ mod tests {
 
     #[test]
     fn check_handles_lockfile_that_describes_url_userinfo_change() {
-        // Lockfile records a URL with userinfo; the config changes to a
-        // different userinfo. Drift fires, and the credential never appears
-        // in the finding text.
+        // Lockfile records a URL userinfo; the config changes it. Drift fires, and the
+        // credential never appears in the finding text.
         let repo = tempdir().unwrap();
-        // Inventory in the lockfile: URL with userinfo "old:secretA".
         let inv = McpInventory {
             servers: vec![McpServerEntry {
                 name: "s".into(),
                 transport: McpTransport::Url {
                     url: "https://host.example/sse".into(),
                     userinfo_hash: Some(
-                        // Doesn't matter that this is a placeholder — the
-                        // current side derives a different hash from the
-                        // config and the two won't compare equal.
+                        // Placeholder; the config-derived hash differs and won't compare equal.
                         "0000000000000000000000000000000000000000000000000000000000000000".into(),
                     ),
                 },
@@ -1127,8 +834,7 @@ mod tests {
             rejected_configs: vec![],
         };
         write_lockfile_for(repo.path(), &inv);
-        // Current config: URL with userinfo "rotated:newcredential" — a
-        // distinctive value we can substring-scan for absence below.
+        // Current config userinfo "rotated:newcredential" — distinctive, substring-scanned below.
         write_config(
             repo.path(),
             ".mcp.json",
@@ -1159,19 +865,12 @@ mod tests {
         assert!(findings.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Chunk 3 — policy-aware suppression: `trusted_mcp_servers` filters
-    // drift entries before a finding is built, and `mcp_allowed_tools`
-    // controls both the lockfile-side disallowed-tool finding and the
-    // per-server drift severity ladder.
-    // -----------------------------------------------------------------------
+    // Chunk 3 — policy-aware suppression: trusted_mcp_servers filters drift; mcp_allowed_tools
+    // drives the lockfile-side finding and the drift severity ladder.
 
     #[test]
     fn trusted_server_suppresses_drift_finding() {
-        // Lockfile records server "trusted"; current config has dropped
-        // "trusted" entirely (so drift would fire by default). With
-        // `trusted_mcp_servers` listing "trusted", the entire drift is
-        // filtered out and no finding fires.
+        // A trusted server's drift (here, dropped from config) is filtered out → no finding.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1181,8 +880,7 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Drop the trusted server from the config — the lockfile would
-        // therefore record drift, but trust suppresses it.
+        // Drop the trusted server — drift would fire, but trust suppresses it.
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
 
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
@@ -1197,8 +895,7 @@ mod tests {
 
     #[test]
     fn untrusted_server_still_drifts_when_others_are_trusted() {
-        // Two drifts: one for a trusted name, one for an untrusted one.
-        // Only the untrusted one surfaces.
+        // Two drifts (trusted + untrusted); only the untrusted one surfaces.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1211,8 +908,7 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Mutate both: trusted rotates command (drift), untrusted also
-        // rotates command (drift).
+        // Both rotate command (both drift).
         write_config(
             repo.path(),
             ".mcp.json",
@@ -1248,9 +944,8 @@ mod tests {
 
     #[test]
     fn unparseable_lockfile_still_fires_even_with_trusted_servers() {
-        // A malformed lockfile is itself a finding — and policy's
-        // trusted-server list does NOT silence it, because the lockfile
-        // could not even be parsed to know which servers it concerns.
+        // Trust can't silence a malformed lockfile — it couldn't be parsed to know which
+        // servers it concerns.
         let repo = tempdir().unwrap();
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
@@ -1258,7 +953,6 @@ mod tests {
         let lock_path = lockdir.join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
 
-        // Trust list is non-empty but the lockfile can't be parsed.
         let trusted = vec!["trusted".to_string()];
         let findings = check(&content, Some(&lock_path), &trusted, &HashMap::new());
         assert_eq!(
@@ -1271,9 +965,7 @@ mod tests {
 
     #[test]
     fn lockfile_recording_disallowed_tool_fires_finding() {
-        // The lockfile itself records a tool that is not in the
-        // `mcp_allowed_tools` set for that server. Surfaces as a High-
-        // severity finding naming the offending tool.
+        // A lockfile-recorded tool outside `mcp_allowed_tools` → High finding naming it.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1309,9 +1001,7 @@ mod tests {
 
     #[test]
     fn lockfile_within_allowed_tools_fires_no_disallowed_finding() {
-        // Every recorded tool is in the allowed set → no disallowed-tool
-        // finding (and the inventory matches the lockfile, so no drift
-        // finding either).
+        // Every recorded tool is allowed → no disallowed-tool finding (and no drift).
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1339,9 +1029,7 @@ mod tests {
 
     #[test]
     fn server_not_in_mcp_allowed_tools_is_unconstrained() {
-        // A server whose name is NOT a key in `mcp_allowed_tools` is
-        // unconstrained — even if it lists tools, no disallowed-tool
-        // finding fires.
+        // A server not keyed in `mcp_allowed_tools` is unconstrained — no finding.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1369,8 +1057,7 @@ mod tests {
 
     #[test]
     fn drift_with_disallowed_added_tool_upgrades_to_high_severity() {
-        // A `Changed` drift that adds a tool not in the allowed set
-        // upgrades the drift finding's severity from Medium to High.
+        // A `Changed` drift adding a disallowed tool upgrades the drift Medium→High.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1395,8 +1082,7 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &[], &allowed);
-        // At least one drift finding fires; the one matching the drift
-        // shape (1 changed) is High.
+        // The drift finding (1 changed) is High.
         let drift_finding = findings
             .iter()
             .find(|f| f.description.contains("1 changed"))
@@ -1411,8 +1097,7 @@ mod tests {
 
     #[test]
     fn drift_with_only_allowed_added_tool_stays_medium() {
-        // A `Changed` drift that adds a tool already in the allowed set
-        // keeps the drift finding at the default Medium severity.
+        // A `Changed` drift adding an allowed tool stays Medium.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1454,8 +1139,7 @@ mod tests {
 
     #[test]
     fn empty_allowed_tools_for_server_forbids_any_new_tool() {
-        // A server listed in `mcp_allowed_tools` with an empty allow
-        // list explicitly forbids ANY tool — every new tool is out-of-set.
+        // An empty allow-list (`[]`) forbids ANY tool — every new tool is out-of-set.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1487,29 +1171,18 @@ mod tests {
         assert_eq!(drift.severity, Severity::High);
     }
 
-    // -----------------------------------------------------------------------
-    // CodeRabbit follow-up — extend the `mcp_allowed_tools` severity ladder
-    // to the `Added` path. A brand-new server smuggling a disallowed tool
-    // must escalate the drift finding to High, mirroring the `Changed`
-    // path's `tools_added` check. (Before this fix, the ladder fired only
-    // on `Changed` and "added a server with a disallowed tool" silently
-    // stayed at Medium.)
-    // -----------------------------------------------------------------------
+    // CodeRabbit follow-up — extend the ladder to the `Added` path: a new server smuggling
+    // a disallowed tool must escalate to High, mirroring `Changed`'s `tools_added` check.
 
     #[test]
     fn added_server_with_disallowed_tool_upgrades_to_high_severity() {
-        // Lockfile predates server "newcomer". The config then adds
-        // "newcomer" with a tool that is NOT in its `mcp_allowed_tools`
-        // entry. The drift finding for the addition must be High.
+        // Lockfile has no servers; the config then adds "newcomer" with a disallowed tool.
         let repo = tempdir().unwrap();
-        // Step 1: lock with no servers (the baseline doesn't know about
-        // "newcomer" yet).
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Step 2: a brand-new server appears in the config, exposing
-        // "evil_tool" (which policy does not permit for "newcomer").
+        // A brand-new server exposing "evil_tool" (not permitted for "newcomer").
         write_config(
             repo.path(),
             ".mcp.json",
@@ -1538,9 +1211,7 @@ mod tests {
 
     #[test]
     fn added_server_with_only_allowed_tools_stays_medium() {
-        // A brand-new server whose every tool IS in the policy's allowed
-        // set keeps the default Medium severity — the ladder must not
-        // upgrade indiscriminately on Added.
+        // A new server whose every tool is allowed stays Medium (no indiscriminate upgrade).
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
@@ -1576,10 +1247,7 @@ mod tests {
 
     #[test]
     fn added_server_unlisted_in_mcp_allowed_tools_stays_medium() {
-        // A brand-new server whose NAME does not appear in
-        // `mcp_allowed_tools` is unconstrained (same semantics as the
-        // Changed path's "server unlisted → no upgrade"). It surfaces as a
-        // drift but stays at the default Medium.
+        // A new server unlisted in `mcp_allowed_tools` is unconstrained → drifts but Medium.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
@@ -1592,8 +1260,7 @@ mod tests {
                 "tools": ["anything", "goes"] } } }"#,
         );
 
-        // Policy mentions a DIFFERENT server — the newcomer is unlisted
-        // and therefore not subject to per-server constraints.
+        // Policy mentions a DIFFERENT server, so the newcomer is unconstrained.
         let mut allowed = HashMap::new();
         allowed.insert(
             "different-server".to_string(),
@@ -1618,10 +1285,7 @@ mod tests {
 
     #[test]
     fn added_server_with_empty_allowed_tools_and_any_tool_is_high() {
-        // A brand-new server whose `mcp_allowed_tools` entry is the empty
-        // list `[]` (explicit "forbid every tool") exposing ANY tool must
-        // escalate to High — mirroring the Changed-path semantics
-        // documented in `empty_allowed_tools_for_server_forbids_any_new_tool`.
+        // A new server under an empty `[]` allow-list exposing ANY tool escalates to High.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
         let old_inv = mcp_lock::build_inventory(repo.path());
@@ -1655,9 +1319,7 @@ mod tests {
 
     #[test]
     fn added_server_with_no_tools_stays_medium_even_under_empty_allow_list() {
-        // A brand-new server that declares NO tools — even when its
-        // `mcp_allowed_tools` entry is `[]` (forbid all) — does not
-        // trigger the upgrade: there is no exposed tool to flag.
+        // A new server declaring NO tools stays Medium even under `[]` (no tool to flag).
         // Guards against an over-eager "Added → always High" regression.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
@@ -1690,23 +1352,15 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F1 — `UnsupportedVersion` surfaces as its own
-    // category in the `finding_for_unparseable_lockfile` arm, so the
-    // operator sees "this lockfile speaks an older / newer schema, refresh
-    // it" rather than "the JSON is corrupt".
-    // -----------------------------------------------------------------------
+    // F1 — `UnsupportedVersion` surfaces as its own category (schema-version, not "corrupt").
 
     #[test]
     fn unparseable_finding_version_mismatch_arm_names_versions() {
-        // A v999 lockfile must surface as a `McpServerDrift` finding whose
-        // title and description name the schema-version case distinctly.
+        // A v999 lockfile surfaces as a `McpServerDrift` naming the schema-version case.
         let repo = tempdir().unwrap();
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
-        // Ensure the rule's repo-root validation passes by planting an
-        // MCP config under the repo too (so `looks_like_repo_root`
-        // succeeds — see the F9 test below).
+        // Plant an MCP config so `looks_like_repo_root` admits (see the F9 test).
         fs::write(repo.path().join(".mcp.json"), r#"{ "mcpServers": {} }"#).unwrap();
         fs::write(
             lockdir.join("mcp.lock"),
@@ -1725,8 +1379,7 @@ mod tests {
         let f = &findings[0];
         assert_eq!(f.rule_id, RuleId::McpServerDrift);
         assert_eq!(f.severity, Severity::Medium);
-        // Title names the version-mismatch case distinctly (not generic
-        // "unparseable").
+        // Title names the version-mismatch case (not generic "unparseable").
         assert!(
             f.title.contains("schema version") || f.title.contains("incompatible"),
             "title must name the schema-version case: {}",
@@ -1740,38 +1393,19 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F9 — `check` validates that the derived repo root
-    // looks like a real repository before treating absence-of-configs as
-    // drift. Scanning a stray `.tirith/mcp.lock` under `/tmp/random/` must
-    // produce zero findings, not a finding storm.
-    // -----------------------------------------------------------------------
+    // F9 — `check` requires the derived repo root to look like a real repo before treating
+    // absence-of-configs as drift; a stray `.tirith/mcp.lock` must produce zero findings.
 
     #[test]
     fn check_returns_empty_when_only_tirith_directory_present() {
-        // Regression guard for CodeRabbit cid 3292118206: a previous
-        // version of `looks_like_repo_root` admitted on `<repo>/.tirith/`,
-        // which is *tautological* for any real scan path. The rule self-
-        // selects on `is_mcp_lockfile(file_path)`, meaning the scanned
-        // path is `<X>/.tirith/mcp.lock`; on any scan path that actually
-        // read the lockfile off disk, `<X>/.tirith/` is *guaranteed* to
-        // exist. That arm therefore always passed, defeating F9's whole
-        // point — a stray `.tirith/mcp.lock` outside any repo still
-        // produced the every-server-removed finding storm.
-        //
-        // After the fix, a derived repo root whose ONLY signal is the
-        // `.tirith/` directory (no `.git`, no MCP discovery probe) must
-        // NOT admit. The rule returns no findings — silence, not noise.
+        // Regression (CodeRabbit cid 3292118206): the old `.tirith/` admit arm was
+        // tautological (the lockfile lives inside `.tirith/`), defeating F9. After the fix,
+        // a root whose ONLY signal is `.tirith/` (no `.git`, no MCP probe) must NOT admit.
         let repo = tempdir().unwrap();
-        // Build the lockfile path: <repo>/.tirith/mcp.lock. Creating
-        // <repo>/.tirith/ here is the deliberate setup for this test —
-        // it is the *only* signal under the repo root.
+        // `<repo>/.tirith/` is the deliberate, ONLY signal under the root.
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
-        // No `.git`, no `.mcp.json`, no other MCP discovery probe.
-        // The lockfile records one server that the (empty) current
-        // inventory does not — so if the gate were still tautological,
-        // a drift finding would fire.
+        // The lockfile records a server the empty inventory doesn't — would drift if tautological.
         let inv = McpInventory {
             servers: vec![McpServerEntry {
                 name: "a".into(),
@@ -1804,19 +1438,11 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_repo_root_has_no_markers() {
-        // The F9 regression case: a `.tirith/mcp.lock` whose derived
-        // repo root has NO `.git`, NO `.tirith/` admit signal, AND NO
-        // MCP discovery probes. We construct this by pointing
-        // `file_path` at a non-existent layout: the rule does not need
-        // the file to physically exist (it takes `content` as an
-        // argument), but it does derive the repo root from the path.
-        // A non-existent grandparent has nothing for
-        // `looks_like_repo_root` to admit on, so the rule must return
-        // no findings.
+        // F9: a derived repo root with NO `.git`/`.tirith` admit signal and NO MCP probe
+        // (a non-existent layout) has nothing for `looks_like_repo_root` to admit on.
         let non_existent =
             std::path::PathBuf::from("/tmp/tirith_F9_does_not_exist_xyz_xyz_xyz/.tirith/mcp.lock");
-        // A well-formed (v4) lockfile body. The content is fine; it's
-        // the path that should make us bail.
+        // A well-formed v4 body — it's the path, not the content, that should make us bail.
         let inv = McpInventory {
             servers: vec![McpServerEntry {
                 name: "a".into(),
@@ -1845,12 +1471,10 @@ mod tests {
 
     #[test]
     fn check_admits_when_git_marker_present() {
-        // `.git/` (as a directory) is an admit signal — drift fires
-        // normally. This is the most common admit case.
+        // A `.git/` directory is an admit signal — drift fires normally (the common case).
         let repo = tempdir().unwrap();
         fs::create_dir_all(repo.path().join(".git")).unwrap();
-        // Plant a lockfile that records a server the current inventory
-        // does not have.
+        // Lockfile records a server the current inventory lacks.
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
         let inv = McpInventory {
@@ -1881,23 +1505,13 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // PR #121 item 8 — `mcp_allowed_tools` enforcement no longer bows to
-    // `trusted_mcp_servers`. Trust suppresses drift findings (operator
-    // accepted the surface as-is) but does NOT suppress the explicit
-    // per-tool allow-list — that's a separate, orthogonal mechanism. An
-    // operator who configures both means "trust drift, but still hold
-    // this server's tools to [list]"; the OLD behavior conflated the two
-    // and let trust silently override the allow-list.
-    // -----------------------------------------------------------------------
+    // PR #121 item 8 — `mcp_allowed_tools` no longer bows to `trusted_mcp_servers`: trust
+    // suppresses drift only, not the explicit per-tool allow-list (orthogonal mechanisms).
 
     #[test]
     fn trusted_server_does_not_bypass_mcp_allowed_tools() {
-        // The lockfile records a tool outside `mcp_allowed_tools` for the
-        // ONLY server in the lockfile, AND that server is in
-        // `trusted_mcp_servers`. The lockfile-side finding MUST still
-        // fire — trust suppresses drift findings only, not the per-tool
-        // allow-list.
+        // A trusted server recording a tool outside its allow-list still fires the
+        // lockfile-side finding (trust suppresses drift only).
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1908,9 +1522,7 @@ mod tests {
         let inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &inv);
 
-        // Policy: server "trusted" is allowed only "read" — so
-        // "evil_tool" must fire the lockfile-side finding, regardless
-        // of trust.
+        // "trusted" allows only "read", so "evil_tool" must fire regardless of trust.
         let mut allowed = HashMap::new();
         allowed.insert("trusted".to_string(), vec!["read".to_string()]);
 
@@ -1938,12 +1550,8 @@ mod tests {
 
     #[test]
     fn trusted_server_without_mcp_allowed_tools_still_silent() {
-        // Trust still suppresses *when there is no explicit
-        // `mcp_allowed_tools` entry for the server* — the case that
-        // motivated the original trust-bypass behavior. With no
-        // per-tool policy declared, there is nothing for the lockfile-
-        // side check to enforce, and the drift-side trust filter does
-        // its job (no finding fires).
+        // Trust still suppresses when the server has NO `mcp_allowed_tools` entry — nothing
+        // to enforce, so no finding fires.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1969,11 +1577,8 @@ mod tests {
 
     #[test]
     fn both_trusted_and_untrusted_fire_lockfile_side_when_both_have_allow_lists() {
-        // PR #121 item 8 — Both servers have an explicit
-        // `mcp_allowed_tools` entry (here, an empty allow-list that
-        // permits no tools). Trust no longer bypasses the lockfile-side
-        // disallowed-tool finding for the explicit-policy case, so BOTH
-        // servers' offending tools must appear.
+        // PR #121 item 8 — Both servers have an explicit (empty) allow-list. Trust no longer
+        // bypasses the lockfile-side finding, so BOTH servers' offending tools must appear.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -2017,20 +1622,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F22 (PRT II-5) — the `mcp_allowed_tools` severity
-    // ladder only applies to NEW exposure (Added / Changed arms, via
-    // `any_added_tool_out_of_allowed`). A `Removed` drift is lost exposure,
-    // not new exposure, so it must NOT trigger the High-severity upgrade
-    // even when the (now-gone) server's lockfile record carries a tool
-    // outside its allowed set. Pin the contract.
-    // -----------------------------------------------------------------------
+    // F22 (PRT II-5) — the ladder applies to NEW exposure only. A `Removed` drift is lost
+    // exposure, so it must NOT upgrade to High even if the gone server recorded a bad tool.
 
     #[test]
     fn removed_server_with_disallowed_tools_in_lockfile_stays_medium() {
-        // Step 1: a repo declares server "s" with a tool "evil" that is
-        // NOT in its `mcp_allowed_tools` allowed-set; the lockfile records
-        // this state.
+        // Lockfile records "s" with disallowed tool "evil"...
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -2041,14 +1638,10 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Step 2: the user removes server "s" from .mcp.json entirely.
-        // The current inventory now has no servers; against the lockfile,
-        // this produces exactly one `McpDrift::Removed` entry for "s".
+        // ...then remove "s" entirely → one `Removed` drift.
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
 
-        // Policy: server "s" is allowed only "read" (so "evil" is outside
-        // the allowed set). The Changed/Added arm would upgrade to High
-        // for the same shape; the Removed arm must NOT.
+        // "s" allows only "read", so the Changed/Added arm would go High; Removed must NOT.
         let mut allowed = HashMap::new();
         allowed.insert("s".to_string(), vec!["read".to_string()]);
 
@@ -2056,8 +1649,7 @@ mod tests {
         let content = fs::read_to_string(&lock_path).unwrap();
         let findings = check(&content, Some(&lock_path), &[], &allowed);
 
-        // The drift finding (the one whose description contains "1 removed")
-        // must be present and must stay at the default Medium severity.
+        // The "1 removed" drift finding must stay Medium.
         let drift_finding = findings
             .iter()
             .find(|f| f.description.contains("1 removed"))
@@ -2070,12 +1662,8 @@ mod tests {
              never lost exposure: {drift_finding:?}",
         );
 
-        // The lockfile-side disallowed-tool finding fires too — the
-        // lockfile still records "s" with the offending tool. That finding
-        // is independent of the drift severity ladder (different code path,
-        // own High severity). Pin its presence so the test reflects the
-        // full per-scan output and a future refactor that accidentally
-        // suppresses one of the two findings is caught.
+        // The lockfile-side finding still fires (independent code path); pin it so a refactor
+        // that drops one of the two findings is caught.
         let lockfile_findings: Vec<&Finding> = findings
             .iter()
             .filter(|f| f.title.contains("records tools outside"))
@@ -2090,18 +1678,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Wave-end finding F23 (PRT II-6) — two findings from one scan:
-    // `check` can emit BOTH the lockfile-side disallowed-tool finding
-    // (`finding_for_disallowed_lockfile_tools`) AND the drift finding
-    // (`finding_for_drift`) in the same call, when both conditions hold.
-    // Existing tests cover each path in isolation but never the cohabitation.
-    // -----------------------------------------------------------------------
+    // F23 (PRT II-6) — `check` can emit BOTH the lockfile-side finding AND the drift finding
+    // in one call. Existing tests cover each path alone but never the cohabitation.
 
     #[test]
     fn check_emits_two_findings_when_lockfile_records_disallowed_tools_and_drift_present() {
-        // Setup: a repo declares server "s" with tool "read" (in the
-        // allowed set) — the lockfile records this state.
+        // "s" with tool "read" (allowed), recorded in the lockfile.
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -2112,10 +1694,7 @@ mod tests {
         let old_inv = mcp_lock::build_inventory(repo.path());
         write_lockfile_for(repo.path(), &old_inv);
 
-        // Now manually rewrite the lockfile so it ALSO records a
-        // disallowed tool "evil" for "s" — simulating the failure mode
-        // of "a tool was snuck past `tirith mcp lock`" the lockfile-side
-        // check is designed to catch.
+        // Doctor the lockfile to ALSO record disallowed tool "evil" (snuck past `mcp lock`).
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let lockfile_doctored = r#"{
             "format_version": 5,
@@ -2133,8 +1712,7 @@ mod tests {
         }"#;
         fs::write(&lock_path, lockfile_doctored).unwrap();
 
-        // Then mutate the config: add a brand-new server "new" so a
-        // drift fires alongside the lockfile-side check.
+        // Add a brand-new server "new" so a drift fires alongside the lockfile-side check.
         write_config(
             repo.path(),
             ".mcp.json",
@@ -2144,8 +1722,7 @@ mod tests {
             } }"#,
         );
 
-        // Policy: "s" allows only "read" (so the doctored "evil" tool is
-        // outside the allowed set, firing the lockfile-side finding).
+        // "s" allows only "read", so the doctored "evil" fires the lockfile-side finding.
         let mut allowed = HashMap::new();
         allowed.insert("s".to_string(), vec!["read".to_string()]);
 
@@ -2158,8 +1735,7 @@ mod tests {
             "exactly two findings: the lockfile-side disallowed-tool finding \
              AND the drift finding for the brand-new server. got: {findings:?}",
         );
-        // Both must be `McpServerDrift` — no new `RuleId` is introduced
-        // by the dual-firing case.
+        // Both use `McpServerDrift` — no new RuleId from the dual-firing case.
         for f in &findings {
             assert_eq!(
                 f.rule_id,
@@ -2167,9 +1743,7 @@ mod tests {
                 "both findings must use the McpServerDrift rule id: {f:?}",
             );
         }
-        // Their titles must be distinct so a reader can tell them apart at
-        // a glance — the lockfile-side title names policy, the drift title
-        // names drift.
+        // Distinct titles so a reader can tell them apart.
         let titles: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.title.as_str()).collect();
         assert_eq!(
@@ -2178,10 +1752,7 @@ mod tests {
             "the two findings must have distinct titles so they are \
              distinguishable in human / JSON output: titles={titles:?}",
         );
-        // Pin the actual title content — the lockfile-side finding's
-        // title references the allow-list (the canonical phrase
-        // `records tools outside`), and the drift-side finding's title
-        // references drift.
+        // Pin the title content: lockfile-side names the allow-list, drift-side names drift.
         assert!(
             findings
                 .iter()

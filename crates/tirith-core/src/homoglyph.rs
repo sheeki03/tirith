@@ -56,10 +56,8 @@ fn get_char_description(ch: char, script_name: &str) -> String {
         'ѕ' => "Cyrillic 'ѕ' (looks like Latin 's')",
         'ԁ' => "Cyrillic 'ԁ' (looks like Latin 'd')",
         'ɡ' => "Latin Small Letter Script G (looks like 'g')",
-        // Armenian
         'ո' => "Armenian 'ո' (looks like Latin 'n')",
         'ա' => "Armenian 'ա' (looks like Latin 'u')",
-        // Greek uppercase
         'Α' => "Greek 'Α' (looks like Latin 'A')",
         'Β' => "Greek 'Β' (looks like Latin 'B')",
         'Ε' => "Greek 'Ε' (looks like Latin 'E')",
@@ -73,7 +71,6 @@ fn get_char_description(ch: char, script_name: &str) -> String {
         'Τ' => "Greek 'Τ' (looks like Latin 'T')",
         'Χ' => "Greek 'Χ' (looks like Latin 'X')",
         'Ζ' => "Greek 'Ζ' (looks like Latin 'Z')",
-        // Greek lowercase
         'ο' => "Greek 'ο' (looks like Latin 'o')",
         _ => "",
     };
@@ -85,10 +82,8 @@ fn get_char_description(ch: char, script_name: &str) -> String {
     }
 }
 
-/// Convert a hostname to its ASCII/punycode equivalent using IDNA/UTS-46.
-///
-/// The url crate implements the full UTS-46 rules, so we wrap `raw` in a dummy
-/// URL and read back `host_str()` rather than reimplementing IDNA here.
+/// Convert a hostname to its ASCII/punycode equivalent via the url crate's
+/// UTS-46 host parsing (wrap in a dummy URL, read back `host_str()`).
 fn escape_to_ascii(raw: &str) -> String {
     let dummy_url = format!("https://{raw}/");
     match url::Url::parse(&dummy_url) {
@@ -147,8 +142,7 @@ mod tests {
 
     #[test]
     fn test_escape_mixed_labels() {
-        // First label has a homoglyph, second is pure ASCII — only the
-        // homoglyph label should be punycoded.
+        // Only the homoglyph label should be punycoded; ASCII labels preserved.
         let escaped = escape_to_ascii("аpple.example.com");
         assert!(escaped.contains("xn--"), "First label should be punycode");
         assert!(escaped.contains("example.com"), "ASCII labels preserved");

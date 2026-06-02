@@ -59,8 +59,7 @@ impl UrlLike {
                 if let Some(reg) = registry {
                     Some(reg.as_str())
                 } else {
-                    // Docker distribution spec default registry.
-                    Some("docker.io")
+                    Some("docker.io") // distribution-spec default
                 }
             }
             UrlLike::Unparsed { raw_host, .. } => raw_host.as_deref(),
@@ -163,11 +162,10 @@ impl UrlLike {
     }
 }
 
-/// Extract the raw authority (host portion) from a URL string BEFORE IDNA
-/// normalization. Handles IPv6, userinfo, port, and percent-encoded separators.
-///
-/// Needed because `Url::parse` IDNA-normalizes the host, which would hide
-/// homograph/punycode signals that the hostname rules depend on.
+/// Extract the raw host from a URL string BEFORE IDNA normalization (handles
+/// IPv6, userinfo, port, percent-encoded separators). Needed because
+/// `Url::parse` IDNA-normalizes the host, hiding the homograph/punycode signals
+/// the hostname rules depend on.
 pub fn extract_raw_host(url_str: &str) -> Option<String> {
     let after_scheme = if let Some(idx) = url_str.find("://") {
         &url_str[idx + 3..]
@@ -190,10 +188,8 @@ pub fn extract_raw_host(url_str: &str) -> Option<String> {
     Some(host.to_string())
 }
 
-/// Split userinfo from authority, returning the host+port part.
-///
-/// Splits on the LAST unencoded `@` so that `user%40name@host` resolves to
-/// `host` (percent-encoded `%40` is part of the userinfo, not a separator).
+/// Split userinfo from authority on the LAST unencoded `@` (so `user%40name@host`
+/// resolves to `host` — `%40` is userinfo, not a separator).
 fn split_userinfo(authority: &str) -> &str {
     let bytes = authority.as_bytes();
     let mut last_at = None;
@@ -239,8 +235,7 @@ fn extract_host_from_hostport(hostport: &str) -> &str {
 
     match last_colon {
         Some(idx) => {
-            // Only treat the colon as a port separator when the suffix is all digits,
-            // otherwise `foo:bar` would be split incorrectly.
+            // Colon is a port separator only when the suffix is all digits.
             let after = &hostport[idx + 1..];
             if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
                 &hostport[..idx]
@@ -254,8 +249,7 @@ fn extract_host_from_hostport(hostport: &str) -> &str {
 
 /// Parse a URL string into a UrlLike.
 pub fn parse_url(raw: &str) -> UrlLike {
-    // SCP-style refs (`git@host:path`) look nothing like standard URLs and must
-    // be matched before the generic `Url::parse`.
+    // SCP refs (`git@host:path`) must be matched before generic `Url::parse`.
     if let Some(scp) = try_parse_scp(raw) {
         return scp;
     }
@@ -282,8 +276,7 @@ fn try_parse_scp(raw: &str) -> Option<UrlLike> {
 
     let (user_host, path) = raw.split_once(':')?;
     if path.starts_with("//") {
-        // Looks like a scheme-relative URL, not SCP.
-        return None;
+        return None; // scheme-relative URL, not SCP
     }
 
     let (user, host) = if let Some((u, h)) = user_host.split_once('@') {
@@ -292,8 +285,7 @@ fn try_parse_scp(raw: &str) -> Option<UrlLike> {
         (None, user_host)
     };
 
-    // Require a dot or `localhost` so we don't mistake `foo:bar` shell syntax
-    // (e.g. `make:build`) for an SCP ref.
+    // Require a dot or `localhost` so `foo:bar` shell syntax isn't an SCP ref.
     if !host.contains('.') && host != "localhost" {
         return None;
     }
@@ -319,8 +311,7 @@ pub fn parse_docker_ref(raw: &str) -> UrlLike {
     if let Some(colon_idx) = remaining.rfind(':') {
         let potential_tag = &remaining[colon_idx + 1..];
         let before_colon = &remaining[..colon_idx];
-        // `/` in the suffix would mean this colon is a registry:port separator,
-        // not a tag.
+        // A `/` in the suffix means this colon is a registry:port, not a tag.
         if !potential_tag.contains('/') {
             tag = Some(potential_tag.to_string());
             remaining = before_colon;
@@ -330,12 +321,11 @@ pub fn parse_docker_ref(raw: &str) -> UrlLike {
     let parts: Vec<&str> = remaining.split('/').collect();
 
     let (registry, image) = if parts.len() == 1 {
-        // `nginx` → `docker.io/library/nginx` (implicit `library/` namespace).
+        // `nginx` → implicit `library/nginx`.
         (None, format!("library/{}", parts[0]))
     } else {
         let first = parts[0];
-        // A host-like first segment (has `.`/`:` or is `localhost`) is a registry;
-        // otherwise every segment is part of the image name.
+        // A host-like first segment (`.`/`:` or `localhost`) is a registry.
         let is_registry = first.contains('.') || first.contains(':') || first == "localhost";
 
         if is_registry {

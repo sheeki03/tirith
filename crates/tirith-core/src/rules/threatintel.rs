@@ -13,10 +13,8 @@ pub struct PackageRef {
     pub version: Option<String>,
 }
 
-/// Split a `name<sep>version` string (e.g. `serde@1.0` or `rails:7.0`).
-///
-/// Returns `(name, Some(version))` when `sep` is found and the version part
-/// is non-empty, otherwise `(input, None)`.
+/// Split a `name<sep>version` string (e.g. `serde@1.0`). `(name, None)` when
+/// `sep` is absent or the version part is empty.
 fn split_name_version(s: &str, sep: char) -> (&str, Option<String>) {
     if let Some(pos) = s.find(sep) {
         let name = &s[..pos];
@@ -34,13 +32,9 @@ fn split_name_version(s: &str, sep: char) -> (&str, Option<String>) {
     }
 }
 
-/// Extract package references from tokenized shell segments.
-///
-/// Recognizes install/add commands for: pip, npm, yarn, pnpm, bun, npx,
-/// cargo, gem, go, composer, dotnet.
-///
-/// Skips flags (tokens starting with `-`) and known non-package arguments
-/// like `--index-url <url>`, `--save-dev`, etc.
+/// Extract package references from tokenized shell segments. Recognizes
+/// install/add commands for pip, npm, yarn, pnpm, bun, npx, cargo, gem, go,
+/// composer, dotnet; skips flags and known non-package arguments.
 pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
     let mut packages = Vec::new();
 
@@ -50,7 +44,7 @@ pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
             None => continue,
         };
 
-        // Strip path prefix: `/usr/bin/pip3` -> `pip3`.
+        // `/usr/bin/pip3` -> `pip3`.
         let cmd_name = cmd.rsplit('/').next().unwrap_or(&cmd);
 
         match cmd_name {
@@ -143,8 +137,6 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // pip spec shapes we handle: foo==1.2.3, foo>=1.0, foo~=2.0, foo!=1.0,
-        // foo[extra]==1.0, foo[a,b]>=1.0.
         let pkg_str = arg.as_str();
 
         // Strip extras: `foo[bar,baz]==1.0` -> name=`foo`, rest=`==1.0`.
@@ -195,8 +187,7 @@ fn normalize_pypi_name(name: &str) -> String {
         .collect()
 }
 
-/// Extract exact version from pip version specifier.
-/// Only returns a version for `==` (exact match).
+/// Exact pip version — only `==` (exact match) yields a version.
 fn extract_pip_version(spec: &str) -> Option<String> {
     if let Some(ver) = spec.strip_prefix("==") {
         let v = ver.trim();
@@ -222,8 +213,8 @@ fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<Pack
     let mut iter = args.iter().peekable();
     let mut found_subcmd = false;
 
-    // npx is special: `npx foo` runs `foo` directly. `--package`/-p can override,
-    // in which case the first positional is an entry point, not a package.
+    // npx is special: `npx foo` runs `foo` directly; `--package`/-p overrides
+    // (then the first positional is an entry point, not a package).
     if cmd_name == "npx" {
         let mut has_explicit_package = false;
         while let Some(arg) = iter.next() {
@@ -282,8 +273,7 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
     }
 
     let (name, version) = if spec.starts_with('@') {
-        // Scoped package: @scope/name@version
-        // Find the version @ after the scope
+        // Scoped `@scope/name@version` — find the version `@` after the scope.
         if let Some(slash_pos) = spec.find('/') {
             let after_scope = &spec[slash_pos + 1..];
             if let Some(at_pos) = after_scope.find('@') {
@@ -294,8 +284,7 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
                 (spec, None)
             }
         } else {
-            // Invalid scoped package (no slash)
-            return None;
+            return None; // invalid scoped package (no slash)
         }
     } else if let Some(at_pos) = spec.find('@') {
         let name = &spec[..at_pos];
@@ -371,7 +360,6 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // `cargo add foo@1.0.0` form.
         let (name, version) = split_name_version(arg, '@');
 
         if !name.is_empty() {
@@ -503,7 +491,7 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        // `dotnet add package <name>` — skip the project file arg
+        // `dotnet add package <name>` — skip the project-file arg.
         if !found_package {
             if lower == "package" {
                 found_package = true;
@@ -587,18 +575,9 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
     }
 }
 
-/// Extract IPv4 addresses from a shell token.
-///
-/// Handles:
-/// - Bare IP: `1.2.3.4`
-/// - user@IP: `user@1.2.3.4`
-/// - IP:port: `1.2.3.4:22`
-/// - user@IP:port: `user@1.2.3.4:22`
-///
-/// Does NOT match:
-/// - IPv6 addresses
-/// - Non-IP text
-/// - IPs embedded inside URLs (those are handled by URL extraction)
+/// Extract an IPv4 address from a shell token: bare, `user@IP`, `IP:port`,
+/// `user@IP:port`. Does NOT match IPv6, non-IP text, or IPs inside URLs (those
+/// are handled by URL extraction).
 pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
     let after_at = if let Some(at_pos) = token.rfind('@') {
         &token[at_pos + 1..]
@@ -606,8 +585,8 @@ pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
         token
     };
 
-    // Only strip a trailing `:NNNN` — anything else after `:` would be part of
-    // an IPv6 literal or something else we shouldn't touch.
+    // Only strip a trailing `:NNNN`; anything else after `:` is likely an IPv6
+    // literal we shouldn't touch.
     let ip_str = if let Some(colon_pos) = after_at.rfind(':') {
         let after_colon = &after_at[colon_pos + 1..];
         if !after_colon.is_empty() && after_colon.chars().all(|c| c.is_ascii_digit()) {
@@ -619,7 +598,7 @@ pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
         after_at
     };
 
-    // Some formats wrap with `[...]`; strip before parsing.
+    // Some formats wrap with `[...]`.
     let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']');
 
     ip_str.parse::<Ipv4Addr>().ok()
@@ -649,9 +628,7 @@ fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity
         threatdb::ThreatSource::ThreatFoxIoc => {
             (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC hostname")
         }
-        // Package/IP-oriented sources and FireHOL aren't expected on hostname
-        // records, but enumerate them explicitly so the compiler flags any new
-        // variant added later instead of falling through a `_` arm.
+        // Enumerated explicitly (no `_` arm) so the compiler flags any new variant.
         threatdb::ThreatSource::OssfMalicious
         | threatdb::ThreatSource::DatadogMalicious
         | threatdb::ThreatSource::FeodoTracker
@@ -674,7 +651,7 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
         threatdb::ThreatSource::ThreatFoxIoc => {
             (RuleId::ThreatThreatFoxIoc, Severity::High, "IOC IP")
         }
-        // Same exhaustive-match rationale as the hostname mapping above.
+        // Enumerated explicitly (no `_` arm) so the compiler flags any new variant.
         threatdb::ThreatSource::OssfMalicious
         | threatdb::ThreatSource::DatadogMalicious
         | threatdb::ThreatSource::FeodoTracker
@@ -689,11 +666,8 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
     }
 }
 
-/// Check input against the local threat intelligence database.
-///
-/// Fail-open: if `db` is `None` (no DB file loaded), returns an empty Vec
-/// and does not block the command. All lookups are in-memory binary search
-/// with no network I/O.
+/// Check input against the local threat intelligence database. Fail-open: a
+/// `None` db returns no findings. All lookups are in-memory, no network I/O.
 pub fn check(
     input: &str,
     shell: ShellType,
@@ -702,8 +676,7 @@ pub fn check(
 ) -> Vec<Finding> {
     let db = match db {
         Some(d) => d,
-        // Fail-open: no DB loaded means no findings, never block the user.
-        None => return Vec::new(),
+        None => return Vec::new(), // fail-open: no DB → no findings
     };
 
     let mut findings = Vec::new();
@@ -741,7 +714,7 @@ pub fn check(
                 mitre_id: None,
                 custom_rule_id: None,
             });
-            // A confirmed-malicious package already explains itself — don't pile on typosquat findings.
+            // A confirmed-malicious finding suffices — skip the typosquat checks.
             continue;
         }
 
@@ -822,7 +795,7 @@ pub fn check(
                 });
             }
 
-            // URL host may itself be an IP literal (e.g. `https://203.0.113.50/payload`).
+            // URL host may itself be an IP literal.
             if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
@@ -853,7 +826,7 @@ pub fn check(
         }
     }
 
-    // IP literals in command tokens — ssh/scp/nc and friends.
+    // IP literals in command tokens (ssh/scp/nc and friends).
     for seg in &segments {
         for arg in &seg.args {
             if let Some(ip) = extract_ipv4_from_token(arg) {

@@ -1,65 +1,36 @@
-//! Shared writer for `.devcontainer/devcontainer.json` (M8 ch5).
+//! Shared idempotent writer for `.devcontainer/devcontainer.json` (M8 ch5):
+//! adds a tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1` to `containerEnv`.
 //!
-//! Both `tirith devcontainer inject` and `tirith codespaces setup` /
-//! `inject` need to (a) parse an existing `devcontainer.json` (JSONC —
-//! comments and trailing commas are allowed), (b) append a tirith
-//! `postCreateCommand` line, and (c) set `TIRITH_DEVCONTAINER=1` in
-//! `containerEnv`. All three steps must be **idempotent** — re-running
-//! the inject must be a no-op.
-//!
-//! ## JSONC parser decision
-//!
-//! `serde_jsonc` is NOT a workspace dep (and the published crate has
-//! limited test coverage). Instead this module strips line comments
-//! (`// …`), block comments (`/* … */`), and trailing commas itself,
-//! then parses with `serde_json::Value`. The strip step is
-//! string-aware so a `//` or `/*` inside a JSON string literal is
-//! preserved verbatim.
-//!
-//! **Honest scope.** The JSONC support here is **best-effort, not a
-//! complete JSONC implementation**: single-quoted string literals,
-//! unquoted object keys, and Unicode escape edge cases are NOT handled.
-//! Comments INSIDE the file are dropped on the rewrite path — the writer
-//! re-emits via `serde_json::to_string_pretty`, so operator-added
-//! comments do not survive injection. The injection is idempotent (a
-//! re-run with the tirith hook already present is a no-op), so the only
-//! real loss is the formatting in fields tirith does not touch — values
-//! like `name`, `image`, `features`, and `customizations` survive but
-//! lose their original whitespace and comments.
+//! JSONC support is best-effort, not complete (no single-quoted strings,
+//! unquoted keys, or Unicode-escape edge cases): we strip line/block comments
+//! and trailing commas string-aware, then parse with `serde_json`. Comments
+//! inside the file do NOT survive the rewrite (we re-emit via
+//! `to_string_pretty`); untouched fields keep their values but lose formatting.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-/// Sentinel string we embed in the `postCreateCommand` so the next
-/// inject run can detect that tirith has already wired itself.
+/// Sentinel embedded in `postCreateCommand` so a re-run detects prior wiring.
 pub const TIRITH_HOOK_MARKER: &str = "tirith init";
 
 /// Outcome of an inject / setup operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectOutcome {
-    /// File did not exist — `setup` created a minimal one with the
-    /// tirith hook. `inject` returns this only when called with
-    /// `create_if_missing = true`.
+    /// File did not exist; created a minimal one (only when `create_if_missing`).
     Created(PathBuf),
-    /// File existed and was modified to add the tirith hook /
-    /// `TIRITH_DEVCONTAINER=1`.
+    /// File existed and was modified to add the tirith hook + env flag.
     Updated(PathBuf),
     /// File already contained the tirith hook — no-op.
     AlreadyInjected(PathBuf),
-    /// File did not exist and `create_if_missing` was false. `inject`
-    /// reports this as an error to the caller.
+    /// File did not exist and `create_if_missing` was false.
     NotFound(PathBuf),
-    /// File existed but could not be parsed as JSONC. The caller
-    /// should surface the message to the operator.
+    /// File existed but could not be parsed as JSONC.
     ParseError(PathBuf, String),
 }
 
-/// Find the devcontainer.json file under `cwd`. Searches:
-///   1. `cwd/.devcontainer/devcontainer.json`
-///   2. `cwd/.devcontainer.json` (Codespaces also accepts this)
-///
-/// Returns the first existing one, or `None` when neither exists.
+/// Find devcontainer.json under `cwd`: nested `.devcontainer/` first, then the
+/// flat `.devcontainer.json` Codespaces also accepts. `None` if neither exists.
 pub fn find_devcontainer_json(cwd: &Path) -> Option<PathBuf> {
     let nested = cwd.join(".devcontainer").join("devcontainer.json");
     if nested.is_file() {
@@ -72,21 +43,15 @@ pub fn find_devcontainer_json(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Default devcontainer.json path used when `find_devcontainer_json`
-/// returns `None`. Always the nested variant — Codespaces' UI defaults
-/// to the same layout when scaffolding a new container.
+/// Default path when none exists: always the nested variant (matches the
+/// layout Codespaces scaffolds).
 pub fn default_devcontainer_json(cwd: &Path) -> PathBuf {
     cwd.join(".devcontainer").join("devcontainer.json")
 }
 
-/// Append the tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1`
-/// `containerEnv` entry to an existing devcontainer.json, OR (when
-/// `create_if_missing = true`) write a minimal one with just the
-/// tirith hook.
-///
-/// **Idempotent.** Re-running with the marker already present
-/// returns [`InjectOutcome::AlreadyInjected`] and does not touch the
-/// file.
+/// Append the tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1` to an
+/// existing devcontainer.json, or (with `create_if_missing`) write a minimal
+/// one. Idempotent: a re-run with the marker present is a no-op.
 pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome {
     let content_str = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -94,10 +59,7 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
             if !create_if_missing {
                 return InjectOutcome::NotFound(path.to_path_buf());
             }
-            // Write a minimal devcontainer.json with the tirith hook
-            // wired in. Operators routinely re-edit this file with
-            // their image / features / name, so we keep the seed
-            // narrow.
+            // Minimal seed kept narrow — operators re-edit image/features/name.
             let value = json!({
                 "name": "tirith-protected devcontainer",
                 "postCreateCommand": format!("{TIRITH_HOOK_MARKER} --shell auto || true"),
@@ -113,7 +75,6 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
         }
     };
 
-    // Parse the JSONC.
     let stripped = strip_jsonc_comments(&content_str);
     let mut value: Value = match serde_json::from_str(&stripped) {
         Ok(v) => v,
@@ -122,15 +83,10 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
         }
     };
 
-    // Already injected? Check whether `postCreateCommand` contains the
-    // marker `tirith init`. Two shapes: a string or an array of strings.
     if has_tirith_marker(&value) && has_env_flag(&value) {
         return InjectOutcome::AlreadyInjected(path.to_path_buf());
     }
 
-    // Merge in the hook + env. The merge is order-preserving where we
-    // can, but the strip-and-rewrite step always reformats the file,
-    // so we don't try to preserve original whitespace.
     upsert_post_create(&mut value);
     upsert_container_env_flag(&mut value);
 
@@ -140,15 +96,11 @@ pub fn inject_tirith_hook(path: &Path, create_if_missing: bool) -> InjectOutcome
     }
 }
 
-/// Helper for the codespaces setup path: ensures `<cwd>/.gitignore`
-/// has a `.tirith/` entry so per-codespace state directories never
-/// leak into the operator's repo. Idempotent.
+/// Idempotently ensure `<cwd>/.gitignore` has a `.tirith/` entry so
+/// per-codespace state never leaks into the repo.
 pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     let path = cwd.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // Match the bare `.tirith/` or `.tirith` line (with optional
-    // leading whitespace / trailing slash variants). Word-anchored
-    // comparison would be overkill; line-trimmed prefix is enough.
     for line in existing.lines() {
         let t = line.trim();
         if t == ".tirith" || t == ".tirith/" || t == "/.tirith" || t == "/.tirith/" {
@@ -164,8 +116,6 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     std::fs::write(&path, new_content)?;
     Ok(true)
 }
-
-// ─── internals ─────────────────────────────────────────────────────
 
 fn has_tirith_marker(value: &Value) -> bool {
     match value.get("postCreateCommand") {
@@ -201,8 +151,7 @@ fn upsert_post_create(value: &mut Value) {
             if s.contains(TIRITH_HOOK_MARKER) {
                 obj.insert("postCreateCommand".to_string(), Value::String(s));
             } else {
-                // Join with `&&` so the user's command still runs
-                // before tirith installs the hook.
+                // `&&` so the user's command still runs before the tirith hook.
                 let joined = format!("{s} && {tirith_cmd}");
                 obj.insert("postCreateCommand".to_string(), Value::String(joined));
             }
@@ -219,8 +168,7 @@ fn upsert_post_create(value: &mut Value) {
             obj.insert("postCreateCommand".to_string(), Value::Array(items));
         }
         Some(other) => {
-            // Unknown shape — replace with our string form rather than
-            // silently corrupting the file.
+            // Unknown shape — preserve it rather than corrupt the file.
             obj.insert("postCreateCommand".to_string(), other);
         }
         None => {
@@ -258,16 +206,8 @@ fn write_pretty(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Strip JSONC-style comments and trailing commas from `input`,
-/// returning a valid JSON string.
-///
-/// Handles:
-///  * `// line comments`
-///  * `/* block comments */`
-///  * Trailing commas before `]` and `}` (legal in JSONC).
-///
-/// String-aware: `"..."` literals (with `\"` escapes) are preserved
-/// verbatim.
+/// Strip JSONC line/block comments and trailing commas (before `]`/`}`),
+/// returning valid JSON. String-aware: `"..."` literals are preserved verbatim.
 pub fn strip_jsonc_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -300,7 +240,7 @@ pub fn strip_jsonc_comments(input: &str) -> String {
             i += 1;
             continue;
         }
-        // Line comment: skip until newline (preserve the newline).
+        // Line comment: skip to newline (keep the newline).
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             i += 2;
             while i < bytes.len() && bytes[i] != b'\n' {
@@ -325,8 +265,7 @@ pub fn strip_jsonc_comments(input: &str) -> String {
         i += 1;
     }
 
-    // Trailing-comma cleanup pass. Walk byte-by-byte, drop a `,` that
-    // is followed by optional whitespace and then `}` or `]`.
+    // Trailing-comma cleanup: drop a `,` followed only by whitespace then `}`/`]`.
     let mut clean: Vec<u8> = Vec::with_capacity(out.len());
     let mut j = 0;
     let mut in_str = false;
@@ -364,8 +303,7 @@ pub fn strip_jsonc_comments(input: &str) -> String {
                 k += 1;
             }
             if k < out.len() && (out[k] == b'}' || out[k] == b']') {
-                // Skip the comma entirely (keep the whitespace so
-                // line numbers stay roughly stable in errors).
+                // Skip the comma; keep whitespace so error line numbers stay stable.
                 j += 1;
                 continue;
             }
@@ -392,7 +330,6 @@ mod tests {
             ],
         }"#;
         let out = strip_jsonc_comments(input);
-        // Must parse cleanly as serde_json.
         let v: Value = serde_json::from_str(&out).expect("strip output should parse");
         assert_eq!(v.get("name").and_then(Value::as_str), Some("demo"));
         assert_eq!(

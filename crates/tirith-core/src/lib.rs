@@ -82,8 +82,7 @@ pub mod webhook;
 pub mod runner;
 pub mod script_analysis;
 
-/// Crate-wide mutex for tests that mutate process-global environment variables.
-/// `std::env::set_var` is not thread-safe — all env-mutating tests across every
-/// module in this crate MUST hold this lock.
+/// Crate-wide mutex all env-mutating tests MUST hold (`std::env::set_var` is not
+/// thread-safe).
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

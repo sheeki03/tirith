@@ -1,28 +1,18 @@
 //! `tirith temp-run` — run a command in a throwaway temp directory and diff
 //! its filesystem impact (M10 ch6, design-decision D1).
 //!
-//! HONESTY-OF-CLAIM (the dominant requirement for this command):
-//! `temp-run` is **file isolation only — NOT a sandbox and NOT a security
-//! boundary**. The command runs with the user's FULL privileges. It can read
-//! the keychain, ssh keys, AWS / cloud credentials, and reach the network
-//! exactly as if you had run it directly. The ONLY thing `temp-run` changes is
-//! the *working directory*: the command starts in a fresh `mkdtemp` dir (empty
-//! by default, or a `.git`-stripped copy of the repo with `--copy-repo`) so
-//! files it WRITES land there instead of polluting your tree, and you get a
-//! diff of what it touched. Use it for filesystem-impact PREVIEW only.
+//! HONESTY-OF-CLAIM (the dominant requirement): `temp-run` is **file isolation
+//! only — NOT a sandbox and NOT a security boundary**. The command runs with
+//! the user's FULL privileges (keychain, ssh keys, cloud creds, network); the
+//! only thing constrained is the working directory (a fresh `mkdtemp`), so
+//! writes land there and we can diff them. Runtime sandboxing is an explicit
+//! tirith non-goal (see `docs/threat-model.md`) and this does not contradict it.
 //!
-//! Runtime sandboxing is an explicit tirith non-goal (see
-//! `docs/threat-model.md`). This command does not contradict that non-goal — it
-//! is a file-isolation workflow, not a containment boundary.
-//!
-//! Portability notes (why this is pure Rust, no shell-out):
-//!   * `--copy-repo` walks the tree with `walkdir` + `fs::copy`, filtering any
-//!     path with a `.git/` component. We do NOT use `cp -R --exclude=.git`:
-//!     `--exclude` is a GNU coreutils extension and is absent on BSD/macOS `cp`.
-//!   * `--strip-env` uses `Command::env_clear()` then re-adds an explicit
-//!     allowlist (HOME, PATH, USER, LANG, TERM). We do NOT use `env -i HOME
-//!     PATH …`: the bare-name passthrough form of `env -i` is inconsistent
-//!     across coreutils and BSD `env` (BSD treats the names as commands).
+//! Pure Rust, no shell-out, for portability:
+//!   * `--copy-repo` walks via `walkdir` + `fs::copy`, filtering `.git/` — not
+//!     `cp -R --exclude` (a GNU-only extension absent on BSD/macOS).
+//!   * `--strip-env` uses `env_clear()` + an explicit allowlist — not
+//!     `env -i NAME …` (the bare-name form is non-portable across coreutils/BSD).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,38 +22,31 @@ use std::time::SystemTime;
 use crate::cli::{confirm, write_json_stdout};
 
 /// The single honesty banner reused across help text and every human output
-/// surface. Pinned by `help_snapshots.rs::help_temp_run` and the
-/// `docs/threat-model.md` wording so the three never drift apart.
+/// surface. Pinned by `help_snapshots.rs::help_temp_run` and
+/// `docs/threat-model.md` so the three never drift.
 pub const NOT_A_SANDBOX_BANNER: &str = "\
 file isolation only; not a sandbox. The command runs with full user privileges \
 and can read your keychain, ssh keys, AWS creds, and the network. Use this for \
 filesystem-impact preview ONLY.";
 
-/// Stable machine-readable marker carried by every JSON envelope so a
-/// downstream consumer can never mistake `temp-run` for a security boundary.
-/// This is the string form of [`IsolationKind::FileOnlyNotASandbox`]; the
-/// `isolation_kind_const_matches_enum` test pins them together so the honesty
-/// contract has a single source of truth. Kept as a `pub` string for external
-/// consumers and the threat-model wording even though JSON is now emitted
-/// through the typed enum.
+/// String form of [`IsolationKind::FileOnlyNotASandbox`], kept `pub` for
+/// external consumers / threat-model wording. The
+/// `isolation_kind_const_matches_enum` test pins it to the enum so the honesty
+/// marker has one source of truth.
 #[allow(dead_code)]
 pub const ISOLATION_KIND: &str = "file_only_not_a_sandbox";
 
-/// The honesty-of-claim contract for `temp-run`, as a TYPE rather than a bare
-/// string literal (type-design #1). Serializing through this enum means a future
-/// edit cannot silently change or drop the `isolation_kind` marker — the only
-/// representable value is the not-a-sandbox one, and the serde rename pins the
-/// wire string. `temp-run`'s dominant requirement is that no consumer mistakes
-/// it for a sandbox, so the contract is worth encoding in the type system.
+/// The honesty-of-claim contract as a TYPE (type-design #1): the only
+/// representable value is the not-a-sandbox one and the serde rename pins the
+/// wire string, so a future edit cannot drop or change the `isolation_kind`
+/// marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IsolationKind {
     #[serde(rename = "file_only_not_a_sandbox")]
     FileOnlyNotASandbox,
 }
 
-/// Environment variables preserved under `--strip-env`. Deliberately tiny:
-/// enough for most commands to find a home, a PATH, and render text, but not
-/// the broad surface (tokens, cloud creds) a real run would inherit. This is a
+/// Environment variables preserved under `--strip-env`. Deliberately tiny — a
 /// convenience knob, NOT a secret-scrubbing security control.
 const STRIP_ENV_ALLOWLIST: [&str; 5] = ["HOME", "PATH", "USER", "LANG", "TERM"];
 
@@ -72,12 +55,9 @@ const MAX_FILES: usize = 100_000;
 
 /// `tirith temp-run -- <cmd>` — mkdtemp, optionally seed it, run the command
 /// there with the user's full privileges, diff the temp dir, then prompt to
-/// delete or keep it.
-///
-/// This is NOT a sandbox (see the module docs and [`NOT_A_SANDBOX_BANNER`]).
-/// The exit code is the CHILD command's exit code, except a usage error (2) or
-/// a setup/spawn failure (2). The filesystem diff is reported but never
-/// overrides the child's exit code.
+/// keep or delete it. NOT a sandbox (see [`NOT_A_SANDBOX_BANNER`]). Returns the
+/// child's exit code, or 2 on a usage / setup / spawn failure; the diff never
+/// overrides it.
 pub fn run(command: &[String], copy_repo: bool, strip_env: bool, json: bool) -> i32 {
     let command_str = command.join(" ");
     if command_str.trim().is_empty() {
@@ -88,9 +68,8 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, json: bool) -> 
         return 2;
     }
 
-    // mkdtemp. The TempDir handle stays alive for the whole function so its
-    // Drop never fires mid-run or mid-diff (cleanup-race guard). We only delete
-    // at the very end, and only on explicit confirmation.
+    // The TempDir handle stays alive for the whole function so its Drop never
+    // fires mid-run or mid-diff; we delete only at the end, on confirmation.
     let temp = match tempfile::Builder::new()
         .prefix("tirith-temp-run-")
         .tempdir()
@@ -122,12 +101,9 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, json: bool) -> 
         print_preamble(&command_str, &temp_path, copy_repo, strip_env, copied);
     }
 
-    // Baseline inventory AFTER seeding — so `--copy-repo` files aren't reported
-    // as "new". An empty temp dir yields an empty baseline.
+    // Baseline inventory AFTER seeding so `--copy-repo` files aren't "new".
     let before = inventory(&temp_path);
 
-    // Run the command IN the temp dir, with the user's full privileges. The
-    // working directory is the only thing we constrain.
     let exit_code = match run_in_dir(&command_str, &temp_path, strip_env) {
         Ok(code) => code,
         Err(e) => {
@@ -140,19 +116,17 @@ pub fn run(command: &[String], copy_repo: bool, strip_env: bool, json: bool) -> 
     let (new_files, modified_files) = diff_inventories(&before, &after, &temp_path);
 
     // Decide keep-vs-delete BEFORE moving the TempDir handle. Non-interactive
-    // (or an explicit "no") keeps the dir and prints its path; interactive "yes"
-    // deletes it. We never delete out from under the diff above.
+    // (or "no") keeps the dir; interactive "yes" deletes it.
     let delete = confirm(
         &format!("tirith temp-run: delete temp dir {}?", temp_path.display()),
         false,
     );
 
     let kept_path = if delete {
-        // Dropping the handle removes the directory.
-        drop(temp);
+        drop(temp); // dropping the handle removes the directory
         None
     } else {
-        // Persist the directory past Drop and surface the path for review.
+        // Persist past Drop and surface the path for review.
         let persisted = temp.keep();
         Some(persisted)
     };
@@ -189,7 +163,6 @@ fn print_preamble(
         tirith_core::style::bold("temp-run:", s),
         command_str
     );
-    // The honesty banner, loud and unmissable, on every invocation.
     println!("  {}", tirith_core::style::red(NOT_A_SANDBOX_BANNER, s));
     println!("  temp dir: {}", temp_path.display());
     if copy_repo {
@@ -250,9 +223,8 @@ fn emit_json(
     kept_path: Option<&Path>,
 ) {
     let json_val = serde_json::json!({
-        // The load-bearing honesty field: a consumer reading this can never
-        // mistake temp-run for a security boundary. Emitted through the typed
-        // `IsolationKind` enum so the contract cannot drift (type-design #1).
+        // Load-bearing honesty field, emitted through the typed enum so it
+        // cannot drift (type-design #1).
         "isolation_kind": IsolationKind::FileOnlyNotASandbox,
         "not_a_sandbox": true,
         "disclaimer": NOT_A_SANDBOX_BANNER,
@@ -270,11 +242,10 @@ fn emit_json(
     write_json_stdout(&json_val, "tirith temp-run: failed to write JSON output");
 }
 
-/// Run `command_str` through the platform shell with its working directory set
-/// to `dir`. With `strip_env`, the child's environment is cleared and rebuilt
-/// from the explicit allowlist. Returns the child's exit code (128 if killed by
-/// a signal with no code). The command runs with the user's full privileges —
-/// this is NOT isolation.
+/// Run `command_str` through the platform shell with cwd set to `dir`. With
+/// `strip_env`, the child env is cleared and rebuilt from the allowlist.
+/// Returns the child's exit code (128 if signal-killed). NOT isolation —
+/// the command runs with the user's full privileges.
 fn run_in_dir(command_str: &str, dir: &Path, strip_env: bool) -> std::io::Result<i32> {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -289,9 +260,8 @@ fn run_in_dir(command_str: &str, dir: &Path, strip_env: bool) -> std::io::Result
     cmd.current_dir(dir);
 
     if strip_env {
-        // Portable env trimming: clear everything, then re-add only the
-        // allowlist values that are actually set in the current environment.
-        // (NOT `env -i NAME …` — the bare-name form is non-portable.)
+        // Portable env trimming (NOT `env -i NAME …` — the bare-name form is
+        // non-portable): clear, then re-add only the set allowlist values.
         cmd.env_clear();
         for key in STRIP_ENV_ALLOWLIST {
             if let Some(val) = std::env::var_os(key) {
@@ -304,11 +274,9 @@ fn run_in_dir(command_str: &str, dir: &Path, strip_env: bool) -> std::io::Result
     Ok(status.code().unwrap_or(128))
 }
 
-/// Copy the repo rooted at `src` into `dst`, excluding any path with a `.git`
-/// component. Pure `walkdir` + `fs::copy` — portable, no `cp --exclude`.
-/// Returns the number of regular files copied. Symlinks are skipped (we copy
-/// file contents only; a copied tree is for impact preview, not a faithful
-/// mirror).
+/// Copy the repo at `src` into `dst`, excluding any `.git` component. Returns
+/// the count of regular files copied; symlinks are skipped (this is an impact
+/// preview, not a faithful mirror).
 fn copy_repo_into(src: &Path, dst: &Path) -> std::io::Result<usize> {
     use walkdir::WalkDir;
 
@@ -327,8 +295,8 @@ fn copy_repo_into(src: &Path, dst: &Path) -> std::io::Result<usize> {
             Err(_) => continue,
         };
         let path = entry.path();
-        // Belt-and-suspenders: skip anything that still has a `.git` component
-        // (e.g. a nested submodule `.git` file) that slipped past the prune.
+        // Belt-and-suspenders: skip any `.git` component (e.g. a submodule
+        // `.git` file) that slipped past the prune.
         if path
             .components()
             .any(|c| c.as_os_str().to_str() == Some(".git"))
@@ -376,8 +344,7 @@ fn inventory(root: &Path) -> BTreeMap<String, SystemTime> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        // Record files and symlinks (anything that isn't a directory) so a
-        // newly-created symlink shows up in the diff.
+        // Record non-directories (incl. symlinks) so a new symlink is diffed.
         if !meta.is_dir() {
             if let Ok(mtime) = meta.modified() {
                 out.insert(entry.path().to_string_lossy().into_owned(), mtime);

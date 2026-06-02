@@ -1,13 +1,7 @@
 //! Threat DB compiler — builds the binary threat intelligence database from
-//! multiple open-source feeds.
-//!
-//! This binary is used by CI (`.github/workflows/threatdb.yml`) to compile
-//! OSSF malicious-packages, Datadog dataset, Feodo Tracker, CISA KEV, and
-//! ecosyste.ms typosquats into a signed `.dat` file.
-//!
-//! The binary format is defined in `tirith_core::threatdb` — this compiler
-//! uses `ThreatDbWriter` from there to produce files that are compatible
-//! with the reader.
+//! multiple open-source feeds (OSSF, Datadog, Feodo, CISA KEV, ecosyste.ms,
+//! …) into a signed `.dat`. Used by CI (`.github/workflows/threatdb.yml`).
+//! The binary format and `ThreatDbWriter` live in `tirith_core::threatdb`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -24,10 +18,6 @@ use tirith_core::threatdb_feeds::{
     parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
     parse_urlhaus_csv,
 };
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(
@@ -115,10 +105,8 @@ enum Commands {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Types — intermediate types used during parsing before feeding to ThreatDbWriter.
-// Ecosystem, ThreatSource, and Confidence are imported from tirith_core::threatdb.
-// ---------------------------------------------------------------------------
+// Intermediate parse types fed to ThreatDbWriter. Ecosystem, ThreatSource, and
+// Confidence are imported from tirith_core::threatdb.
 
 /// A malicious package entry.
 #[derive(Debug, Clone)]
@@ -151,9 +139,7 @@ struct PopularEntry {
     name: String,
 }
 
-/// CISA KEV entry (stored as-is in Phase A, no cross-ref).
-/// Fields are read from JSON but only used for counting in Phase A.
-/// Phase C will use these for runtime OSV.dev cross-reference.
+/// CISA KEV entry. Phase A only counts these; Phase C will cross-ref OSV.dev.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -184,10 +170,6 @@ struct KevCatalog {
     vulnerabilities: Vec<KevVulnerability>,
 }
 
-// ---------------------------------------------------------------------------
-// Normalization
-// ---------------------------------------------------------------------------
-
 /// Normalize package name per ecosystem conventions.
 fn normalize_name(eco: Ecosystem, name: &str) -> String {
     match eco {
@@ -205,10 +187,6 @@ fn normalize_name(eco: Ecosystem, name: &str) -> String {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// OSSF malicious-packages parser
-// ---------------------------------------------------------------------------
 
 /// OSV JSON schema (subset used for malicious-packages).
 #[derive(Debug, serde::Deserialize)]
@@ -281,7 +259,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
         skipped_corrupt: 0,
     };
 
-    // Walk the directory tree for JSON files
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -310,7 +287,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
 
         stats.total_entries += 1;
 
-        // Determine confidence from database_specific.type
         let confidence = match osv
             .database_specific
             .as_ref()
@@ -328,7 +304,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
             Some("MALWARE")
         );
 
-        // Extract first reference URL
         let reference = osv.references.first().map(|r| r.url.clone());
 
         for affected in &osv.affected {
@@ -351,7 +326,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
             let has_ranges = !affected.ranges.is_empty();
 
             if has_versions {
-                // Exact version list available — use it
                 entries.push(PackageEntry {
                     ecosystem,
                     name,
@@ -363,10 +337,10 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
                 });
                 stats.parsed_packages += 1;
             } else if has_ranges {
-                // Has ranges but no explicit version list — skip in Phase A
+                // Ranges but no explicit version list — skipped in Phase A.
                 stats.skipped_range_only_count += 1;
             } else if is_malware {
-                // MALWARE with no versions AND no ranges — entire package is malicious
+                // MALWARE with no versions and no ranges — whole package is bad.
                 entries.push(PackageEntry {
                     ecosystem,
                     name,
@@ -378,7 +352,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
                 });
                 stats.parsed_packages += 1;
             } else {
-                // Not MALWARE, no versions, no ranges — skip
                 stats.skipped_range_only_count += 1;
             }
         }
@@ -386,10 +359,6 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
 
     (entries, stats)
 }
-
-// ---------------------------------------------------------------------------
-// Datadog malicious-packages-dataset parser
-// ---------------------------------------------------------------------------
 
 /// Datadog dataset entry format.
 #[derive(Debug, serde::Deserialize)]
@@ -410,7 +379,6 @@ fn parse_datadog(root: &Path) -> (Vec<PackageEntry>, usize, usize) {
     let mut skipped = 0usize;
     let mut files_read = 0usize;
 
-    // Try to find JSON files in the repo
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -433,7 +401,7 @@ fn parse_datadog(root: &Path) -> (Vec<PackageEntry>, usize, usize) {
 
         files_read += 1;
 
-        // Try parsing as an array of entries
+        // Try an array of entries, then a single entry, then OSV-shaped JSON.
         if let Ok(arr) = serde_json::from_str::<Vec<DatadogEntry>>(&content) {
             for dd in arr {
                 if let Some(eco) = Ecosystem::from_name(&dd.ecosystem) {
@@ -456,7 +424,6 @@ fn parse_datadog(root: &Path) -> (Vec<PackageEntry>, usize, usize) {
             continue;
         }
 
-        // Try parsing as a single entry
         if let Ok(dd) = serde_json::from_str::<DatadogEntry>(&content) {
             if let Some(eco) = Ecosystem::from_name(&dd.ecosystem) {
                 let name = normalize_name(eco, &dd.name);
@@ -477,13 +444,11 @@ fn parse_datadog(root: &Path) -> (Vec<PackageEntry>, usize, usize) {
             continue; // Don't fall through to OSV parse — avoids double-counting
         }
 
-        // Also try parsing as OSV format (Datadog may use OSV-like structures)
         if let Ok(osv) = serde_json::from_str::<OsvEntry>(&content) {
             for affected in &osv.affected {
                 if let Some(pkg) = &affected.package {
                     if let Some(eco) = Ecosystem::from_name(&pkg.ecosystem) {
-                        // Only include entries with explicit version lists,
-                        // matching the OSSF parser behavior (skip range-only).
+                        // Only explicit version lists, like the OSSF parser.
                         if affected.versions.is_empty() {
                             continue;
                         }
@@ -506,10 +471,6 @@ fn parse_datadog(root: &Path) -> (Vec<PackageEntry>, usize, usize) {
     (entries, skipped, files_read)
 }
 
-// ---------------------------------------------------------------------------
-// Feodo Tracker IP blocklist parser
-// ---------------------------------------------------------------------------
-
 fn parse_feodo(path: &Path) -> Vec<Ipv4Addr> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -529,12 +490,11 @@ fn parse_feodo(path: &Path) -> Vec<Ipv4Addr> {
         };
         let trimmed = line.trim();
 
-        // Skip comments and empty lines
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Parse IPv4 address (may have trailing whitespace or other data)
+        // Take the first whitespace-delimited token as the IP.
         let ip_str = trimmed.split_whitespace().next().unwrap_or("");
         if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
             ips.push(ip);
@@ -545,10 +505,6 @@ fn parse_feodo(path: &Path) -> Vec<Ipv4Addr> {
     ips.dedup();
     ips
 }
-
-// ---------------------------------------------------------------------------
-// CISA KEV parser
-// ---------------------------------------------------------------------------
 
 fn parse_cisa_kev(path: &Path) -> Vec<KevVulnerability> {
     let content = match std::fs::read_to_string(path) {
@@ -570,9 +526,7 @@ fn parse_cisa_kev(path: &Path) -> Vec<KevVulnerability> {
     catalog.vulnerabilities
 }
 
-// ---------------------------------------------------------------------------
-// Phase B feed parsers
-// ---------------------------------------------------------------------------
+// Phase B feed parsers.
 
 fn parse_urlhaus_file(path: &Path) -> Vec<String> {
     let file = match std::fs::File::open(path) {
@@ -660,10 +614,6 @@ fn parse_tor_exit_file(path: &Path) -> Vec<Ipv4Addr> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ecosyste.ms typosquats CSV parser
-// ---------------------------------------------------------------------------
-
 fn parse_typosquats_csv(path: &Path) -> Vec<TyposquatEntry> {
     let mut entries = Vec::new();
 
@@ -688,7 +638,7 @@ fn parse_typosquats_csv(path: &Path) -> Vec<TyposquatEntry> {
             Err(_) => continue,
         };
 
-        // Expected columns: ecosystem, name, target_name
+        // Columns: ecosystem, name, target_name
         if record.len() < 3 {
             continue;
         }
@@ -713,12 +663,8 @@ fn parse_typosquats_csv(path: &Path) -> Vec<TyposquatEntry> {
     entries
 }
 
-// ---------------------------------------------------------------------------
-// Popular packages CSV parser
-// ---------------------------------------------------------------------------
-
-/// Default popular packages CSV embedded from the tirith crate's own
-/// assets so `cargo publish` can verify the tarball in isolation.
+/// Default popular packages CSV, embedded from the crate's own assets so
+/// `cargo publish` can verify the tarball in isolation.
 const DEFAULT_POPULAR_CSV: &str = include_str!("../../assets/data/popular_packages.csv");
 
 fn parse_popular_csv(path: Option<&Path>) -> Vec<PopularEntry> {
@@ -774,10 +720,6 @@ fn parse_popular_from_string(csv_content: &str) -> Vec<PopularEntry> {
     entries
 }
 
-// ---------------------------------------------------------------------------
-// Deduplication
-// ---------------------------------------------------------------------------
-
 /// Composite key for deduplication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct PackageKey {
@@ -798,13 +740,13 @@ fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
         by_key
             .entry(key)
             .and_modify(|existing| {
-                // Keep highest confidence
+                // Keep highest confidence.
                 if entry.confidence > existing.confidence {
                     existing.confidence = entry.confidence;
                     existing.source = entry.source;
                 }
 
-                // Merge affected_versions (union)
+                // Union the affected_versions.
                 let existing_versions: HashSet<String> =
                     existing.affected_versions.iter().cloned().collect();
                 for v in &entry.affected_versions {
@@ -813,12 +755,11 @@ fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
                     }
                 }
 
-                // If either source says all versions are malicious, honor it
                 if entry.all_versions_malicious {
                     existing.all_versions_malicious = true;
                 }
 
-                // Keep richest reference (prefer non-None)
+                // Keep the richest reference (prefer non-None).
                 if existing.reference.is_none() && entry.reference.is_some() {
                     existing.reference = entry.reference.clone();
                 }
@@ -829,16 +770,8 @@ fn deduplicate_packages(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
     by_key.into_values().collect()
 }
 
-// Binary format writing is handled by `tirith_core::threatdb::ThreatDbWriter`.
-// The compiler feeds parsed data into that writer, which produces files
-// compatible with the reader.
-
-// ---------------------------------------------------------------------------
-// Signing key loading
-// ---------------------------------------------------------------------------
-
 fn load_signing_key(env_var: Option<&str>, key_file: Option<&Path>) -> Option<SigningKey> {
-    // Try env var first
+    // Try env var first, then key file.
     if let Some(var_name) = env_var {
         if let Ok(b64) = std::env::var(var_name) {
             let b64_trimmed = b64.trim();
@@ -863,7 +796,6 @@ fn load_signing_key(env_var: Option<&str>, key_file: Option<&Path>) -> Option<Si
         }
     }
 
-    // Try key file
     if let Some(path) = key_file {
         match std::fs::read_to_string(path) {
             Ok(content) => {
@@ -907,14 +839,10 @@ fn sign_payload(payload: &str, key: &SigningKey) -> String {
     BASE64.encode(signature.to_bytes())
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 fn main() {
     let cli = Cli::parse();
 
-    // Handle sign-payload subcommand
+    // Handle sign-payload subcommand.
     if let Some(Commands::SignPayload { payload, key_env }) = &cli.command {
         let key = load_signing_key(Some(key_env), None).unwrap_or_else(|| {
             eprintln!("error: could not load signing key from env var {key_env}");
@@ -924,10 +852,8 @@ fn main() {
         return;
     }
 
-    // Main compilation flow
     eprintln!("tirith-threatdb-compile: starting compilation");
 
-    // Parse all sources
     let mut all_packages = Vec::new();
     let mut total_files_scanned = 0usize;
     let mut total_files_skipped = 0usize;
@@ -982,7 +908,7 @@ fn main() {
         all_packages.extend(dd_packages);
     }
 
-    // Fail if >50% of input files were skipped (corrupt/unreadable)
+    // Fail if >50% of input files were skipped (corrupt/unreadable).
     if total_files_scanned > 0 && total_files_skipped * 2 > total_files_scanned {
         eprintln!(
             "error: {total_files_skipped}/{total_files_scanned} input files skipped (>{:.0}%) — aborting to avoid corrupt DB",
@@ -1092,12 +1018,10 @@ fn main() {
         }
     };
 
-    // Build DB using tirith_core::threatdb::ThreatDbWriter
     let timestamp = chrono::Utc::now().timestamp() as u64;
     let sequence = cli.sequence.unwrap_or(timestamp);
     let mut writer = ThreatDbWriter::new(timestamp, sequence);
 
-    // Feed deduplicated packages
     for pkg in &packages {
         let version_refs: Vec<&str> = pkg.affected_versions.iter().map(|s| s.as_str()).collect();
         writer.add_package(
@@ -1111,7 +1035,6 @@ fn main() {
         );
     }
 
-    // Feed IPs
     for ip in &ips {
         writer.add_ip(*ip, ThreatSource::FeodoTracker);
     }
@@ -1140,24 +1063,21 @@ fn main() {
         writer.add_ip(*ip, ThreatSource::TorExit);
     }
 
-    // Feed typosquats
     for typo in &typosquats {
         writer.add_typosquat(typo.ecosystem, &typo.name, &typo.target_name);
     }
 
-    // Feed popular packages
     for pop in &popular {
         writer.add_popular(pop.ecosystem, &pop.name);
     }
 
-    // Build and sign — ThreatDbWriter handles sorting, dedup, index generation,
-    // header layout, and signing in a format compatible with the reader.
+    // ThreatDbWriter handles sorting, dedup, index generation, header layout,
+    // and signing in a format compatible with the reader.
     let data = writer.build(&signing_key).unwrap_or_else(|e| {
         eprintln!("error: failed to build threat DB: {e}");
         std::process::exit(1);
     });
 
-    // Write to output file
     let mut file = std::fs::File::create(&cli.output).unwrap_or_else(|e| {
         eprintln!(
             "error: cannot create output file {}: {e}",
@@ -1170,7 +1090,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Summary
     let ecosystems_seen: BTreeSet<String> = packages
         .iter()
         .map(|p| format!("{:?}", p.ecosystem))
@@ -1200,10 +1119,6 @@ fn main() {
     );
     eprintln!("  signed:                yes");
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1355,14 +1270,11 @@ mod tests {
 
         let data = writer.build(&key).expect("build failed");
 
-        // Verify magic
         assert_eq!(&data[..8], b"TIRITHDB");
-
-        // Verify format version
         let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
         assert_eq!(version, 1);
 
-        // Verify the DB can be read back by the core reader
+        // The DB must read back via the core reader.
         let db = ThreatDb::from_bytes(data, 0).expect("reader should accept writer output");
         let stats = db.stats();
         assert_eq!(stats.package_count, 1);
@@ -1374,7 +1286,6 @@ mod tests {
 
     #[test]
     fn test_sign_payload_deterministic() {
-        // Use a fixed test key
         let key_bytes = [42u8; 32];
         let key = SigningKey::from_bytes(&key_bytes);
 
@@ -1386,7 +1297,6 @@ mod tests {
 
     #[test]
     fn test_ossv_confidence_mapping() {
-        // Test the confidence mapping logic directly
         let malware_type: Option<&str> = Some("MALWARE");
         let confidence = match malware_type {
             Some("MALWARE") => Confidence::Confirmed,

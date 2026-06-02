@@ -6,16 +6,11 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     check_bytes_with_ignore(input, &[])
 }
 
-/// Like [`check_bytes`] but skips bytes whose offset falls inside any of the
-/// supplied ignore ranges when deciding whether to emit a finding and when
-/// assembling its evidence.
-///
-/// Used to carve out the inert argument span of tirith's own inspection
-/// subcommands (`diff`/`score`/`why`/`receipt`/`explain`). Unicode-style
-/// findings emitted with `Evidence::Text` (e.g. `UnicodeTags`) assemble their
-/// detail string from the raw bytes, so the ignore has to be threaded into the
-/// scan itself — filtering by offset after the fact cannot remove content that
-/// was already decoded into the evidence string.
+/// Like [`check_bytes`] but skips bytes whose offset falls inside `ignore_ranges`
+/// when deciding to emit a finding and assembling its evidence. Carves out the
+/// inert arg span of tirith inspection subcommands (`diff`/`score`/`why`/…); the
+/// ignore must be threaded into the scan because `Evidence::Text` findings (e.g.
+/// `UnicodeTags`) build their detail from raw bytes.
 pub fn check_bytes_with_ignore(
     input: &[u8],
     ignore_ranges: &[std::ops::Range<usize>],
@@ -107,7 +102,7 @@ pub fn check_bytes_with_ignore(
             .collect();
 
         if !zw_evidence.is_empty() {
-            // Zero-width chars in otherwise pure ASCII have no legitimate use — elevate.
+            // Zero-width chars in otherwise pure ASCII have no legit use — elevate.
             let ascii_only = std::str::from_utf8(input)
                 .map(|s| {
                     s.chars()
@@ -167,9 +162,7 @@ pub fn check_bytes_with_ignore(
 
     if scan.has_unicode_tags {
         // Decode excluding ignore-range bytes so hidden-text evidence can't leak
-        // content from an inert arg span. If every tag byte was in an ignore range,
-        // the decoder returns empty even though `scan.has_unicode_tags` was true —
-        // skip emission in that case (nothing left to report on).
+        // from an inert arg span; if every tag byte was ignored, skip emission.
         let decoded = decode_unicode_tags(input, ignore_ranges);
         if !decoded.is_empty() || has_unicode_tag_outside_ranges(input, ignore_ranges) {
             findings.push(Finding {
@@ -236,11 +229,9 @@ pub fn check_bytes_with_ignore(
 
     if scan.has_confusable_text {
         // Two-tier suppression to avoid firing on natural multilingual text:
-        //   - Math alphanumerics ("text confusable U+"): no legitimate terminal use,
-        //     so a ±16-byte ASCII proximity check is enough.
-        //   - Standard Cyrillic/Greek confusables ("confusable U+"): only flag when
-        //     mixed INTO the same word as ASCII.
-        //     "gіthub" (attack) vs "Note: Привет" (benign multilingual).
+        // math alphanumerics ("text confusable U+") use a ±16-byte ASCII
+        // proximity check; standard Cyrillic/Greek ("confusable U+") only flag
+        // when mixed INTO an ASCII word ("gіthub" attack vs "Note: Привет" benign).
         let confusable_details: Vec<_> = scan
             .details
             .iter()
@@ -308,11 +299,9 @@ pub fn check_bytes_with_ignore(
     findings
 }
 
-/// Decode Unicode Tag characters (U+E0000–U+E007F) to their hidden ASCII message.
-/// Each tag character encodes one ASCII byte: codepoint - 0xE0000 = ASCII value.
-///
-/// Byte offsets in `ignore_ranges` are skipped, so content inside an inert argument
-/// span does not leak back out through the decoded evidence string.
+/// Decode Unicode Tag characters (U+E0000–U+E007F) to hidden ASCII (codepoint -
+/// 0xE0000). `ignore_ranges` offsets are skipped so inert-arg-span content can't
+/// leak out through the evidence string.
 fn decode_unicode_tags(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> String {
     let Ok(s) = std::str::from_utf8(input) else {
         eprintln!("tirith: warning: unicode tag decode failed: input is not valid UTF-8");
@@ -358,8 +347,8 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
 
     let lines: Vec<&str> = input.lines().collect();
     if lines.len() > 1 {
-        // Skip line 0: the visible first line is what the user means to run.
-        // Suspicious command shapes on subsequent lines are the paste-smuggling shape.
+        // Skip line 0 (what the user means to run); suspicious shapes on later
+        // lines are the paste-smuggling pattern.
         for (i, line) in lines.iter().enumerate().skip(1) {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -391,10 +380,10 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
     findings
 }
 
-/// Check if a byte offset in the input is surrounded by joining-script characters.
-/// ZWJ and ZWNJ are legitimate in scripts that use character joining (Arabic, Devanagari, etc.).
-/// Returns true only if BOTH immediate non-Common neighbors are in the same joining script.
-/// One-sided joining (e.g., Latin + ZWJ + Arabic) is suspicious and not suppressed.
+/// `true` only when BOTH non-Common neighbors of the ZWJ/ZWNJ at `byte_offset`
+/// are in the SAME joining script (Arabic, Devanagari, …), where they are
+/// legitimate. One-sided joining (Latin + ZWJ + Arabic) is suspicious and not
+/// suppressed.
 fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
@@ -438,8 +427,8 @@ fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
         None
     };
 
-    // Require the SAME joining script on both sides. One-sided (Latin + ZWJ + Arabic)
-    // or mismatched (Arabic + ZWJ + Devanagari) is the attack shape we want to flag.
+    // Require the SAME joining script on both sides; one-sided or mismatched is
+    // the attack shape we want to flag.
     match (before_script, after_script) {
         (Some(before), Some(after)) => before == after && is_joining_script(before),
         _ => false,
@@ -471,18 +460,15 @@ fn is_joining_script(script: unicode_script::Script) -> bool {
     )
 }
 
-/// Check clipboard HTML for hidden content not visible in the plain-text paste.
-///
-/// When a user pastes text, the terminal only sees the plain-text representation,
-/// but the clipboard may carry HTML with hidden content (CSS hiding, color hiding,
-/// hidden attributes) or extra text not visible in the plain-text version.
+/// Check clipboard HTML for content hidden from the plain-text paste (CSS/color
+/// hiding, hidden attributes, or extra text) that the terminal never sees.
 pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let rendered_findings = crate::rules::rendered::check(html, None);
 
-    // Hidden-content rules become ClipboardHidden — same evidence, different rule id
-    // so downstream UI can distinguish "paste says more than user sees" from
+    // Hidden-content rules become ClipboardHidden (same evidence, distinct rule
+    // id) so downstream UI can tell "paste hides more than shown" from a
     // "rendered page has hidden bits".
     for f in rendered_findings {
         match f.rule_id {
@@ -553,18 +539,15 @@ fn strip_html_tags(html: &str) -> String {
     s.trim().to_string()
 }
 
-/// Broad proximity check: ASCII letters within ±16 bytes.
-/// Used for math alphanumeric symbols which have no legitimate terminal use.
+/// ASCII letters within ±16 bytes (for math alphanumerics, no legit terminal use).
 fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
     let start = offset.saturating_sub(16);
     let end = (offset + 16).min(input.len());
     input[start..end].iter().any(|b| b.is_ascii_alphabetic())
 }
 
-/// Same-word check: the confusable char and ASCII letters share the same word
-/// (no whitespace or common punctuation separating them).
-/// "gіthub" → true (і mixed into ASCII word)
-/// "Note: Привет" → false (different words separated by ": ")
+/// `true` when the confusable char and ASCII letters share a word (no boundary
+/// between them): "gіthub" → true, "Note: Привет" → false.
 fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
     fn is_word_boundary(b: u8) -> bool {
         matches!(
@@ -591,19 +574,16 @@ fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
         )
     }
 
-    // Walk backwards to word start
     let mut word_start = offset;
     while word_start > 0 && !is_word_boundary(input[word_start - 1]) {
         word_start -= 1;
     }
 
-    // Walk forwards to word end (skip past the multi-byte char at offset)
     let mut word_end = offset;
     while word_end < input.len() && !is_word_boundary(input[word_end]) {
         word_end += 1;
     }
 
-    // Check if any byte in this word is an ASCII letter
     input[word_start..word_end]
         .iter()
         .any(|b| b.is_ascii_alphabetic())

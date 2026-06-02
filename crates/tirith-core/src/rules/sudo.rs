@@ -1,56 +1,25 @@
 //! Sudo-escalation rules (M8 ch4).
 //!
-//! These rules fire when the parsed command's leader resolves to `sudo`
-//! (including `sudo -u user`, `sudo --user=user`, `sudo -E`, `env`-prefixed
-//! sudo, etc.). The PATTERN_TABLE entry `sudo_cmd` (`\bsudo\b`) is the
-//! tier-1 gate for the exec context.
+//! Fire when the parsed leader resolves to `sudo` (incl. `sudo -u user`,
+//! `--user=`, `-E`, `env`-prefixed sudo). PATTERN_TABLE entry `sudo_cmd`
+//! (`\bsudo\b`) is the only tier-1 gate; detection short-circuits otherwise.
 //!
-//! Five rule ids ship in this chunk:
+//! Five High rules:
+//! 1. **`SudoShellSpawn`** — `sudo sh|bash|…` opens a root shell tirith can't see
+//!    (it intercepts the local shell, not a nested process).
+//! 2. **`SudoEnvPreserveSensitive`** — `sudo -E` / `--preserve-env` with a sensitive
+//!    env var (`sensitive_env.toml`) set; the value becomes readable via
+//!    `/proc/<pid>/environ` (exfil-by-misconfiguration).
+//! 3. **`SudoTeeSystemFile`** — `… | sudo tee <system-path>` (`/etc/…`,
+//!    `/usr/local/bin/…`, `/lib/systemd/…`, `/etc/cron*`). Shape-specific:
+//!    `/tmp`, `~/…`, repo-relative targets are NOT flagged.
+//! 4. **`SudoDownloadInstall`** — `sudo curl|wget|fetch -o <system-path>`; same target list.
+//! 5. **`SudoRecursivePermsBroadPath`** — `sudo chmod|chown -R … /` (or `/home`,
+//!    `/usr`, `/etc`); strips setuid bits, locks out homedirs, breaks packages.
 //!
-//! 1. **`SudoShellSpawn`** (High) — `sudo sh|bash|zsh|fish|dash|ksh|tcsh|
-//!    pwsh|powershell|nu` opens an interactive root shell. Once inside,
-//!    every subsequent command runs as root with zero tirith visibility
-//!    (tirith intercepts the LOCAL shell, not a nested shell process).
-//!
-//! 2. **`SudoEnvPreserveSensitive`** (High) — `sudo -E` (or
-//!    `--preserve-env`) with at least one sensitive env var from the
-//!    `sensitive_env.toml` list currently exported. Passing
-//!    `AWS_SECRET_ACCESS_KEY` to a privileged process is exactly the
-//!    shape of an exfil-by-misconfiguration attack — the value lives in
-//!    the elevated process's environment and is now visible to anything
-//!    that reads `/proc/<pid>/environ`.
-//!
-//! 3. **`SudoTeeSystemFile`** (High) — `… | sudo tee <system-path>`
-//!    pattern targeting `/etc/…`, `/usr/local/bin/…`, `/lib/systemd/…`,
-//!    or `/etc/cron*`. Legitimate `sudo tee /tmp/foo` / `sudo tee
-//!    ~/something` / repo-relative targets are NOT flagged — the rule
-//!    is shape-specific.
-//!
-//! 4. **`SudoDownloadInstall`** (High) — `sudo curl|wget|fetch -o
-//!    <system-path>` or equivalent download-and-install-as-root shape.
-//!    Same target list as `SudoTeeSystemFile`.
-//!
-//! 5. **`SudoRecursivePermsBroadPath`** (High) — `sudo chmod|chown
-//!    -R … /` (or `/home`, `/usr`, `/etc`). Recursively chmod'ing one of
-//!    these wide trees rarely ends well — even when intentional it
-//!    routinely strips `setuid` bits, locks operators out of their
-//!    homedirs, or breaks distro packages.
-//!
-//! ## Detection guard
-//!
-//! Detection short-circuits when the parsed leader is not `sudo` (or a
-//! `sudo` wrapped behind `env VAR=… sudo …`). The PATTERN_TABLE entry
-//! `sudo_cmd` is the only tier-1 admission ticket.
-//!
-//! ## Policy integration
-//!
-//! When `policy.sudo_require_reason` is on AND the operator has an
-//! active sudo-session (see `crate::sudo_session::read_active_session`),
-//! we DOWNGRADE these findings from High to Medium so the operator
-//! still sees the signal but doesn't trip the block. When
-//! `sudo_require_reason` is OFF the session file is consulted purely
-//! for the `tirith sudo session status` reporting surface and never
-//! affects rule outcomes.
+//! Policy: when `sudo_require_reason` is on AND an active sudo-session exists, these
+//! findings DOWNGRADE High→Medium (signal kept, block avoided). When off, the session
+//! file is only read for `tirith sudo session status` and never affects outcomes.
 
 use crate::policy::Policy;
 use crate::tokenize::{self, ShellType};
@@ -77,10 +46,8 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
         return findings;
     }
 
-    // Severity downgrade when a tagged sudo session is active AND the
-    // operator has opted into `sudo_require_reason`. The session is
-    // consulted lazily so the fast-path (no-finding case) doesn't touch
-    // disk.
+    // Downgrade severity when a tagged sudo session is active and the operator opted
+    // into `sudo_require_reason`. Consulted lazily so the no-finding fast path skips disk.
     if policy.sudo_require_reason {
         if let Some(_session) = crate::sudo_session::read_active_session() {
             for f in &mut findings {
@@ -94,32 +61,24 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     findings
 }
 
-/// Internal representation of a `sudo` invocation: the inner command
-/// (after stripping sudo flags) and a snapshot of which sudo flags
-/// were observed.
+/// A parsed `sudo` invocation: the inner command (post-flag-strip) plus observed flags.
 struct SudoParsed {
-    /// Whether `-E` / `--preserve-env` (no value) appeared. Distinct
-    /// from `--preserve-env=VAR_LIST` which is the targeted form.
+    /// `-E` / `--preserve-env` (no value): preserve ALL. Distinct from `--preserve-env=LIST`.
     preserve_env_all: bool,
-    /// Specific env vars preserved via `--preserve-env=A,B,C`.
-    /// Stored lowercased / unchanged — the SENSITIVE list is matched
-    /// case-insensitively.
+    /// Specific vars from `--preserve-env=A,B,C` (matched case-insensitively).
     preserve_env_vars: Vec<String>,
-    /// Inner command base name (post-sudo, post-flag-strip). Empty
-    /// when sudo had no positional inner command.
+    /// Inner command base name; empty when sudo had no positional command.
     inner_cmd: String,
     /// Inner command's args (raw, quotes preserved).
     inner_args: Vec<String>,
 }
 
-/// Parse a single segment as a `sudo` invocation when its leader (after
-/// `env`-wrapper resolution) is `sudo`. Returns `None` for non-sudo
-/// segments.
+/// Parse a segment as a `sudo` invocation when its leader (after `env`-wrapper
+/// resolution) is `sudo`. `None` for non-sudo segments.
 fn parse_sudo_invocation(seg: &tokenize::Segment, shell: ShellType) -> Option<SudoParsed> {
     let cmd = seg.command.as_deref()?;
     let base = command_basename(cmd, shell);
 
-    // Direct `sudo …`.
     if base == "sudo" {
         return Some(parse_sudo_args(&seg.args, shell));
     }
@@ -138,10 +97,8 @@ fn parse_sudo_invocation(seg: &tokenize::Segment, shell: ShellType) -> Option<Su
     None
 }
 
-/// Special-case parser for the trailing segment of a pipe (`… | sudo tee
-/// /etc/foo`). The trailing segment's leader is `sudo` already, so the
-/// regular `parse_sudo_invocation` already handles it — this helper is
-/// kept for symmetry / future extension. Currently delegates.
+/// Parser for the trailing pipe segment (`… | sudo tee /etc/foo`). The leader is already
+/// `sudo`, so `parse_sudo_invocation` handles it; kept for symmetry. Currently delegates.
 fn parse_pipe_into_sudo_tee(seg: &tokenize::Segment, shell: ShellType) -> Option<SudoParsed> {
     let leader = seg.command.as_deref().map(|c| command_basename(c, shell))?;
     if leader != "sudo" {
@@ -150,9 +107,8 @@ fn parse_pipe_into_sudo_tee(seg: &tokenize::Segment, shell: ShellType) -> Option
     Some(parse_sudo_args(&seg.args, shell))
 }
 
-/// Skip `KEY=VAL` assignments and bare flags between the `env` leader
-/// and the inner command. Returns the index of the first positional
-/// argument that is NOT a `KEY=VAL` assignment or a flag.
+/// Skip `KEY=VAL` assignments and bare flags between the `env` leader and the inner
+/// command. Returns the index of the first non-assignment, non-flag positional.
 fn skip_env_assignments(args: &[String]) -> usize {
     let mut idx = 0;
     while idx < args.len() {
@@ -162,11 +118,8 @@ fn skip_env_assignments(args: &[String]) -> usize {
             continue;
         }
         if a.starts_with('-') && a.len() >= 2 {
-            // env's `-i`, `-u VAR`, `--unset=VAR` etc. The plan-text
-            // forms vary; we err on the side of skipping any leading
-            // flag. We do NOT consume a value for `-u`, which would
-            // mis-resolve `env -u SUDO_ASKPASS sudo` — instead we just
-            // skip one slot and fall through.
+            // Skip any leading env flag. We do NOT consume a value for `-u` — that would
+            // mis-resolve `env -u SUDO_ASKPASS sudo`; skip one slot and fall through.
             idx += 1;
             continue;
         }
@@ -179,8 +132,7 @@ fn skip_env_assignments(args: &[String]) -> usize {
     idx
 }
 
-/// Parse a slice of args BEYOND the `sudo` leader. Returns the parsed
-/// view including the inner command + post-flag args.
+/// Parse the args beyond the `sudo` leader into the inner command + post-flag args.
 fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
     let value_short = ["-u", "-g", "-C", "-D", "-R", "-T"];
     let value_long = [
@@ -207,7 +159,7 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             inner_start = Some(idx + 1);
             break;
         }
-        // -E / --preserve-env (no value) — preserve ALL.
+        // -E / --preserve-env (no value): preserve ALL.
         if a == "-E" {
             preserve_env_all = true;
             idx += 1;
@@ -218,7 +170,7 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             idx += 1;
             continue;
         }
-        // --preserve-env=VAR_LIST — preserve specific vars.
+        // --preserve-env=VAR_LIST: specific vars.
         if let Some(rest) = a.strip_prefix("--preserve-env=") {
             for v in rest.split(',') {
                 let v = v.trim();
@@ -229,12 +181,9 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             idx += 1;
             continue;
         }
-        // sudo's `-Eu user` form — `-E` is the only short flag that's
-        // bundleable into a leading position. Be defensive: if we see
-        // a multi-char short with `E`, mark preserve_env_all.
+        // `-Eu user` form: a bundled short flag containing `E` still preserves all env.
         if a.starts_with('-') && a.len() > 1 && !a.starts_with("--") && a.contains('E') {
             preserve_env_all = true;
-            // Continue with the regular short-flag handling.
         }
         if a.starts_with("--") {
             if value_long.contains(&a) {
@@ -252,7 +201,7 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             }
             continue;
         }
-        // First positional — this is the inner command.
+        // First positional: the inner command.
         inner_start = Some(idx);
         break;
     }
@@ -337,8 +286,7 @@ fn rules_for_segment(
             ));
         }
     } else if !parsed.preserve_env_vars.is_empty() {
-        // --preserve-env=VAR_LIST — fire only if any of the listed
-        // vars is in the sensitive set (presence-only, no value read).
+        // --preserve-env=VAR_LIST: fire only if a listed var is sensitive (presence-only).
         let intersecting: Vec<&str> = parsed
             .preserve_env_vars
             .iter()
@@ -429,8 +377,7 @@ fn rules_for_segment(
     findings
 }
 
-/// Interactive shells we refuse to spawn under sudo. This list mirrors
-/// `safe_command::is_interactive_shell` — keep them in sync.
+/// Interactive shells we refuse under sudo. Mirrors `safe_command::is_interactive_shell` — keep in sync.
 fn is_interactive_shell(name: &str) -> bool {
     matches!(
         name,
@@ -460,8 +407,8 @@ fn has_recursive_flag(args: &[String]) -> bool {
     })
 }
 
-/// Pull the first positional that looks like a path (not a flag, not a
-/// numeric mode) from the args. Handles the `-R 777 /home` shape.
+/// Pull the first positional that looks like a path (not a flag/numeric mode).
+/// Handles the `-R 777 /home` shape.
 fn first_broad_path_arg(args: &[String], _shell: ShellType) -> Option<String> {
     let mut after_double_dash = false;
     for arg in args.iter() {
@@ -490,10 +437,8 @@ fn first_broad_path_arg(args: &[String], _shell: ShellType) -> Option<String> {
     None
 }
 
-/// Heuristic: a "broad path" is `/`, `/home`, `/usr`, `/etc`, or a
-/// direct subpath that does NOT narrow into a per-user / per-package
-/// subdirectory. We deliberately keep this narrow — false-positives on
-/// `/etc/myapp/config.d` are noisy.
+/// A "broad path" is `/`, `/home`, `/usr`, `/etc`, etc. — kept deliberately narrow
+/// (false-positives on `/etc/myapp/config.d` would be noisy).
 fn is_broad_path(p: &str) -> bool {
     matches!(
         p,
@@ -557,7 +502,7 @@ fn first_download_output_path(args: &[String]) -> Option<String> {
             return Some(rest.to_string());
         }
         if a == "-o" || a == "--output" || a == "-O" {
-            // Next arg is the path. Some tools (wget) also use `-O`.
+            // Next arg is the path (wget also uses `-O`).
             if let Some((_, next)) = iter.next() {
                 let v = strip_outer_quotes(next);
                 return Some(v.to_string());
@@ -567,17 +512,10 @@ fn first_download_output_path(args: &[String]) -> Option<String> {
     None
 }
 
-/// Returns `true` when the target file path is under a protected system
-/// directory or a well-known shell-init dotfile in the user's home.
-/// Deliberately narrow to keep false-positives low — the
-/// `tee /tmp/foo` / `tee ~/notes.md` / `tee ./relative` shapes never fire.
-///
-/// Home-dotfile protection covers `~/.bashrc` / `~/.zshrc` / `~/.profile`
-/// / `~/.bash_profile` / `~/.zshenv` / `~/.bash_login` / `~/.zprofile` —
-/// the textbook persistence-vector files. The dotfile-overwrite rule
-/// (`check_dotfile_overwrite` in `rules/command.rs`) catches the redirect
-/// shape but not the pipe-into-`sudo tee` shape, so the carveout here
-/// must close that gap.
+/// `true` when the target is under a protected system dir or a home shell-init dotfile.
+/// Deliberately narrow (`tee /tmp/foo` / `~/notes.md` / `./relative` never fire). The
+/// home-dotfile arm closes a gap: `check_dotfile_overwrite` catches the redirect shape
+/// but not the pipe-into-`sudo tee` shape.
 fn is_protected_system_path(p: &str) -> bool {
     // Repo-relative / current-dir — never protected.
     if !p.starts_with('/')
@@ -588,16 +526,12 @@ fn is_protected_system_path(p: &str) -> bool {
         return false;
     }
 
-    // Shell-init dotfiles in the user's home are protected. We match the
-    // bare dotfile name; subdirectories like `~/.config/zsh/...` are not
-    // covered here because the user almost always owns them and they're
-    // not the textbook persistence vector.
+    // Home shell-init dotfiles are protected (bare name only; `~/.config/zsh/…` is not).
     if is_home_shell_init_dotfile(p) {
         return true;
     }
 
-    // Other paths under ~/ and $HOME/ are user-writable and not
-    // protected.
+    // Other paths under ~/ and $HOME/ are user-writable.
     if p.starts_with('~') || p.starts_with("$HOME") || p.starts_with("${HOME") {
         return false;
     }
@@ -637,12 +571,8 @@ fn is_protected_system_path(p: &str) -> bool {
         || p.starts_with("/var/lib/")
 }
 
-/// Returns `true` when the path points at a well-known shell-init
-/// dotfile in the user's home directory. Matches `~/.bashrc`,
-/// `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.zshenv`,
-/// `~/.bash_login`, `~/.zprofile`. Both `~/` and `$HOME/` prefixes are
-/// recognised. Suffixes like `~/.bashrc.bak` are NOT matched — only the
-/// exact basenames listed.
+/// `true` for a home shell-init dotfile (`~/.bashrc`, `~/.zshrc`, … exact basenames only,
+/// no `.bak` suffixes). Recognises both `~/` and `$HOME/` prefixes.
 fn is_home_shell_init_dotfile(p: &str) -> bool {
     const PREFIXES: &[&str] = &["~/", "$HOME/", "${HOME}/", "${HOME:-/root}/"];
     const FILES: &[&str] = &[
@@ -662,8 +592,7 @@ fn is_home_shell_init_dotfile(p: &str) -> bool {
     false
 }
 
-/// Return the list of sensitive env-var names that are currently set in
-/// `std::env`. Order follows `sensitive_env.toml` for determinism.
+/// Sensitive env-var names currently set in `std::env`, ordered by `sensitive_env.toml`.
 fn sensitive_env_active() -> Vec<String> {
     crate::safe_command::sensitive_env_vars()
         .iter()
@@ -820,10 +749,8 @@ mod tests {
 
     #[test]
     fn sudo_tee_home_dotfile_fires() {
-        // Regression: PR-127 review #3. `sudo tee ~/.bashrc` is a
-        // textbook persistence vector that previously bypassed every
-        // sudo rule (carveout) AND the dotfile_overwrite rule (which
-        // only matches the redirect shape, not pipe-into-`sudo tee`).
+        // Regression PR-127 #3: `sudo tee ~/.bashrc` (persistence vector) previously
+        // bypassed every sudo rule AND dotfile_overwrite (which only matches the redirect).
         let policy = Policy::default();
         for path in [
             "~/.bashrc",
@@ -847,8 +774,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_webroot_and_persistent_dirs_fire() {
-        // Regression: PR-127 review #16. /var/www, /srv, /root, /boot,
-        // /var/lib were missing from the protected-paths list.
+        // Regression PR-127 #16: /var/www, /srv, /root, /boot, /var/lib were missing.
         let policy = Policy::default();
         for path in [
             "/var/www/html/x.php",
@@ -961,9 +887,8 @@ mod tests {
 
     #[test]
     fn preserve_env_named_aws_secret_fires() {
-        // We don't mutate the env in this test; we exercise the
-        // explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form so the
-        // libc-environ race is irrelevant.
+        // Uses the explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form (no env mutation,
+        // so the libc-environ race is irrelevant).
         let policy = Policy::default();
         let findings = check(
             "sudo --preserve-env=AWS_SECRET_ACCESS_KEY pip install foo",
@@ -1011,8 +936,7 @@ mod tests {
 
     #[test]
     fn is_protected_system_path_covers_home_shell_init_dotfiles() {
-        // Regression: PR-127 review #3 — `sudo tee ~/.bashrc` was a
-        // textbook persistence vector silently allowed.
+        // Regression PR-127 #3: `sudo tee ~/.bashrc` was silently allowed.
         assert!(is_protected_system_path("~/.bashrc"));
         assert!(is_protected_system_path("~/.zshrc"));
         assert!(is_protected_system_path("~/.profile"));
@@ -1030,8 +954,7 @@ mod tests {
 
     #[test]
     fn is_protected_system_path_covers_webroot_and_persistent_dirs() {
-        // Regression: PR-127 review #16 — /var/www, /srv, /root, /boot,
-        // /var/lib were missing.
+        // Regression PR-127 #16: /var/www, /srv, /root, /boot, /var/lib were missing.
         assert!(is_protected_system_path("/var/www"));
         assert!(is_protected_system_path("/var/www/html/x.php"));
         assert!(is_protected_system_path("/srv/http/index.html"));

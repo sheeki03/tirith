@@ -17,10 +17,9 @@ pub fn offer_zshenv_guard(
     dry_run: bool,
     tirith_bin: &str,
 ) -> Result<(), String> {
-    // Quote for zsh: a path with spaces, apostrophes, or shell metacharacters
-    // would otherwise break the assignment in the asset template. The asset's
-    // `__TIRITH_BIN__` placeholder is intentionally unquoted in the template
-    // because the substitution produces an already-quoted shell literal.
+    // Quote for zsh so a path with spaces/apostrophes/metacharacters can't break
+    // the assignment. The template's `__TIRITH_BIN__` is unquoted because the
+    // substitution yields an already-quoted literal.
     let quoted_tirith_bin = super::shell_profile::shell_quote(tirith_bin, "zsh");
     let guard_content = crate::assets::ZSHENV_GUARD.replace("__TIRITH_BIN__", &quoted_tirith_bin);
     let managed_block = format!("{BEGIN_MARKER}\n{guard_content}\n{END_MARKER}\n");
@@ -58,7 +57,7 @@ pub fn offer_zshenv_guard(
                 );
                 return Ok(());
             }
-            // Syntax validation runs only on the live path — dry-run returns early.
+            // Syntax validation only on the live path (dry-run returned above).
             validate_zsh_syntax(&managed_block)?;
 
             let mut content = existing;
@@ -471,12 +470,9 @@ mod tests {
             });
         }
 
-        /// Helper: write a .zshenv with the guard plus a trailing export,
-        /// then run `zsh -c 'echo $POST_GUARD'` with the given extra env
-        /// vars. Returns (stdout, exit_code).
-        ///
-        /// `tirith_bin` is baked into the guard via placeholder replacement.
-        /// Use a nonexistent path to trigger the "not found" block branch.
+        /// Write a .zshenv with the guard plus a trailing export, then run
+        /// `zsh -c 'echo $POST_GUARD'` with extra env vars. Returns (stdout,
+        /// exit_code). A nonexistent `tirith_bin` triggers the "not found" branch.
         fn run_guard_scenario(
             home: &std::path::Path,
             tirith_bin: &str,
@@ -484,24 +480,21 @@ mod tests {
         ) -> (String, i32) {
             offer_zshenv_guard(true, true, false, tirith_bin).unwrap();
 
-            // Append an export AFTER the guard block to verify that later
-            // .zshenv lines still execute when the guard is skipped.
+            // Export AFTER the guard to verify later .zshenv lines still run
+            // when the guard is skipped.
             let zshenv = home.join(".zshenv");
             let mut content = std::fs::read_to_string(&zshenv).unwrap();
             content.push_str("\nexport POST_GUARD=loaded\n");
             std::fs::write(&zshenv, &content).unwrap();
 
-            // ZDOTDIR + HOME → fake home so zsh reads our .zshenv.
-            // No --no-rcs: that flag suppresses .zshenv too.
-            // Non-interactive `zsh -c` sources .zshenv but NOT .zshrc.
+            // ZDOTDIR + HOME → fake home so zsh reads our .zshenv (no --no-rcs,
+            // which would suppress .zshenv). `zsh -c` sources .zshenv not .zshrc.
             let output = std::process::Command::new("zsh")
                 .arg("-c")
                 .arg("echo \"POST_GUARD=${POST_GUARD:-unset}\"")
                 .env("ZDOTDIR", home)
                 .env("HOME", home)
-                // A developer running tests with TIRITH_BIN exported in their
-                // shell would have it leak into the spawned zsh and shadow
-                // the placeholder logic the guard is exercising.
+                // An exported TIRITH_BIN would leak in and shadow the placeholder.
                 .env_remove("TIRITH_BIN")
                 .envs(extra_env.iter().copied())
                 .output()
@@ -518,9 +511,8 @@ mod tests {
                 return;
             }
             with_fake_home(|home| {
-                // With VSCODE_RESOLVING_ENVIRONMENT the compound condition is
-                // false, so the guard block is skipped entirely even though
-                // tirith_bin points to a nonexistent binary.
+                // VSCODE_RESOLVING_ENVIRONMENT makes the condition false, so the
+                // guard is skipped even with a nonexistent tirith_bin.
                 let (stdout, code) = run_guard_scenario(
                     home,
                     "/nonexistent/tirith",
@@ -591,7 +583,7 @@ mod tests {
             }
             with_fake_home(|home| {
                 use std::os::unix::fs::PermissionsExt;
-                // Real (no-op) tirith binary somewhere PATH below won't reach.
+                // Real (no-op) tirith binary that PATH below won't reach.
                 let dir = tempfile::tempdir().unwrap();
                 let tirith = dir.path().join("tirith");
                 std::fs::write(&tirith, "#!/bin/sh\nexit 0\n").unwrap();

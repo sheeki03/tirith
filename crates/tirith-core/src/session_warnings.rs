@@ -1,11 +1,8 @@
-//! Per-session warning accumulator.
+//! Per-session warning accumulator: tracks warnings across commands within a
+//! shell session so escalation rules can detect repeated suspicious behavior.
 //!
-//! Tracks warnings across commands within a single shell session so that
-//! escalation rules can detect repeated suspicious behavior.
-//!
-//! State is stored as JSON at `state_dir()/sessions/{session_id}.json`.
-//! All I/O is best-effort: failures are silently ignored and never alter
-//! the verdict or panic.
+//! State is JSON at `state_dir()/sessions/{session_id}.json`. All I/O is
+//! best-effort: failures never alter the verdict or panic.
 
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
@@ -59,11 +56,9 @@ pub struct WarningEvent {
     pub domains: Vec<String>,
 }
 
-/// Records when an escalation rule fired, for cooldown scoping.
-///
-/// `rule_id` is the specific finding rule that crossed the threshold, or `"*"`
-/// for wildcard aggregate escalations. `domain` is set only for `domain_scoped`
-/// rules — one domain's escalation does not cool down other domains.
+/// Records when an escalation rule fired, for cooldown scoping. `rule_id` is the
+/// crossing rule or `"*"` for aggregate; `domain` is set only for
+/// `domain_scoped` rules (one domain's escalation doesn't cool down others).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EscalationEvent {
     pub timestamp: String,
@@ -172,10 +167,9 @@ pub fn session_state_path(session_id: &str) -> Option<PathBuf> {
     Some(state.join("sessions").join(format!("{session_id}.json")))
 }
 
-/// Load session warnings from disk. Returns an empty accumulator on any error.
-///
-/// Takes a shared lock so readers never observe the transient empty state
-/// that occurs while `record_warning()` truncates and rewrites the file.
+/// Load session warnings from disk; empty accumulator on any error. Takes a
+/// shared lock so readers never observe the transient empty state during a
+/// `record_warning()` truncate+rewrite.
 pub fn load(session_id: &str) -> SessionWarnings {
     let path = match session_state_path(session_id) {
         Some(p) => p,
@@ -187,7 +181,6 @@ pub fn load(session_id: &str) -> SessionWarnings {
         Err(_) => return SessionWarnings::new(session_id),
     };
 
-    // Shared lock prevents reading mid-truncate from a concurrent writer.
     if fs2::FileExt::lock_shared(&file).is_err() && fs2::FileExt::try_lock_shared(&file).is_err() {
         return SessionWarnings::new(session_id);
     }
@@ -210,20 +203,16 @@ pub fn load(session_id: &str) -> SessionWarnings {
     })
 }
 
-/// Record warning findings into the session accumulator.
-///
-/// Thin wrapper around `record_outcome` with no hidden findings.
+/// Record warning findings (thin wrapper around `record_outcome`, no hidden
+/// findings).
 pub fn record_warning(session_id: &str, findings: &[&Finding], cmd: &str, dlp_patterns: &[String]) {
     record_outcome(session_id, findings, &[], cmd, dlp_patterns);
 }
 
-/// Record warning findings and hidden findings into the session accumulator.
-///
-/// Hidden findings are actual `Finding` references (not just counts) so that
-/// full event details can be stored for `tirith warnings --hidden`.
-///
-/// Delegates to [`with_session_locked`] for atomic lock-read-modify-write.
-/// Never panics or alters the verdict on I/O failure.
+/// Record warning + hidden findings into the session accumulator. Hidden
+/// findings are full `Finding` refs (not counts) so event details can be stored
+/// for `tirith warnings --hidden`. Atomic via [`with_session_locked`]; never
+/// panics or alters the verdict on I/O failure.
 pub fn record_outcome(
     session_id: &str,
     warn_findings: &[&Finding],
@@ -235,7 +224,6 @@ pub fn record_outcome(
         return;
     }
 
-    // Compute hidden counts from the actual findings list.
     let hidden_count = hidden_findings_list.len() as u32;
     let hidden_low = hidden_findings_list
         .iter()
@@ -280,12 +268,10 @@ pub fn record_outcome(
         .collect();
 
     with_session_locked(session_id, |session| {
-        // Increment hidden findings count
         session.hidden_findings = session.hidden_findings.saturating_add(hidden_count);
         session.hidden_low = session.hidden_low.saturating_add(hidden_low);
         session.hidden_info = session.hidden_info.saturating_add(hidden_info);
 
-        // Append warning events
         for fd in &finding_data {
             let event = WarningEvent {
                 timestamp: now.clone(),
@@ -299,7 +285,6 @@ pub fn record_outcome(
             session.total_warnings = session.total_warnings.saturating_add(1);
         }
 
-        // Append hidden events
         for hd in &hidden_data {
             session.hidden_events.push_back(HiddenEvent {
                 timestamp: now.clone(),
@@ -310,23 +295,18 @@ pub fn record_outcome(
             });
         }
 
-        // Cap warning events
         while session.events.len() > MAX_EVENTS {
             session.events.pop_front();
         }
-
-        // Cap hidden events
         while session.hidden_events.len() > MAX_HIDDEN_EVENTS {
             session.hidden_events.pop_front();
         }
     });
 }
 
-/// Record escalation events into the session accumulator.
-///
-/// Called from `post_process_verdict` after an escalation rule upgrades the
-/// action. Must happen outside `record_outcome` because escalated blocks are
-/// `Action::Block` which does not enter the Warn/WarnAck recording gate.
+/// Record escalation events. Called from `post_process_verdict` after an
+/// escalation upgrades the action; separate from `record_outcome` because
+/// escalated `Action::Block`s skip the Warn/WarnAck recording gate.
 pub fn record_escalation_event(session_id: &str, hits: &[crate::escalation::EscalationHit]) {
     if hits.is_empty() {
         return;
@@ -342,18 +322,15 @@ pub fn record_escalation_event(session_id: &str, hits: &[crate::escalation::Esca
                 domain: hit.domain.clone(),
             });
         }
-        // Cap escalation events
         while session.escalation_events.len() > MAX_ESCALATION_EVENTS {
             session.escalation_events.pop_front();
         }
     });
 }
 
-/// Shared helper: open session file, acquire exclusive lock, read or create
-/// session state, call `mutate` to modify it, serialize and write back,
-/// then unlock and run opportunistic GC.
-///
-/// All I/O is best-effort; failures are logged diagnostically and never panic.
+/// Shared atomic lock-read-modify-write: open the session file, take an
+/// exclusive lock, read-or-create state, run `mutate`, write back, unlock, GC.
+/// All I/O is best-effort; failures are logged and never panic.
 fn with_session_locked<F>(session_id: &str, mutate: F)
 where
     F: FnOnce(&mut SessionWarnings),
@@ -363,7 +340,6 @@ where
         None => return,
     };
 
-    // Ensure directory exists
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             crate::audit::audit_diagnostic(format!(
@@ -374,7 +350,7 @@ where
         }
     }
 
-    // Refuse to follow symlinks on Unix
+    // Refuse to follow symlinks (Unix).
     #[cfg(unix)]
     {
         match std::fs::symlink_metadata(&path) {
@@ -389,7 +365,6 @@ where
         }
     }
 
-    // Open file for read+write (atomic load-modify-write under lock).
     let mut open_opts = OpenOptions::new();
     open_opts.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -410,14 +385,14 @@ where
         }
     };
 
-    // Harden permissions on existing files
+    // Harden permissions on existing files.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
-    // Acquire exclusive lock BEFORE reading — this is the atomicity guarantee.
+    // Lock BEFORE reading — this is the atomicity guarantee.
     let locked = file.lock_exclusive().is_ok() || file.try_lock_exclusive().is_ok();
     if !locked {
         crate::audit::audit_diagnostic(format!(
@@ -427,7 +402,6 @@ where
         return;
     }
 
-    // Read existing state under lock
     use std::io::Read;
     let mut content = String::new();
     let _ = (&file).read_to_string(&mut content);
@@ -443,7 +417,6 @@ where
         })
     };
 
-    // Let caller mutate the session state
     mutate(&mut session);
 
     let json = match serde_json::to_string(&session) {
@@ -457,7 +430,7 @@ where
         }
     };
 
-    // Truncate + write under the same lock
+    // Truncate + write under the same lock.
     use std::io::Seek;
     if file.set_len(0).is_err() || (&file).seek(std::io::SeekFrom::Start(0)).is_err() {
         crate::audit::audit_diagnostic(format!(
@@ -483,7 +456,6 @@ where
     let _ = file.sync_all();
     let _ = fs2::FileExt::unlock(&file);
 
-    // Opportunistic GC: clean up stale session files, rate-limited to once per hour.
     opportunistic_gc();
 }
 
@@ -513,7 +485,7 @@ fn extract_host(url: &str) -> Option<String> {
     if let Ok(parsed) = url::Url::parse(url) {
         return parsed.host_str().map(|h| h.to_lowercase());
     }
-    // Schemeless fallback: take first segment before /
+    // Schemeless fallback: first segment before `/`.
     let candidate = url.split('/').next()?;
     if candidate.contains('.') && !candidate.contains(' ') {
         let host = candidate.split(':').next().unwrap_or(candidate);

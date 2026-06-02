@@ -45,8 +45,7 @@ pub fn registrable_domain(host: &str) -> Option<String> {
     if labels.len() < 2 {
         return None;
     }
-    // Longest-suffix match: try the fullest tail first so multi-label
-    // suffixes (e.g. `co.uk`) win over single-label ones.
+    // Longest-suffix match first so multi-label suffixes (`co.uk`) win.
     for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
         if is_public_suffix(&suffix) {
@@ -56,7 +55,6 @@ pub fn registrable_domain(host: &str) -> Option<String> {
             return Some(labels[i - 1..].join("."));
         }
     }
-    // No PSL match: treat the final label as the TLD.
     if labels.len() >= 2 {
         Some(labels[labels.len() - 2..].join("."))
     } else {

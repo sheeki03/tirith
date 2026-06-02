@@ -1,22 +1,18 @@
 //! M11 ch4 — `tirith secret triage|rotate <provider>|revoke --provider <p>`.
 //!
-//! A secret-rotation **ASSISTANT**: it tells you *where* and *how* to rotate a
-//! leaked credential. It does NOT rotate or revoke anything, and it makes
-//! **zero network calls** — there is no HTTP client constructed in this module
-//! or in [`tirith_core::secret_rotation`]. The revocation/doc URLs are inert
-//! strings printed for you to open yourself.
+//! A secret-rotation **ASSISTANT**: it shows *where* and *how* to rotate a
+//! leaked credential. It does NOT rotate or revoke anything and makes **zero
+//! network calls** (no HTTP client here or in [`tirith_core::secret_rotation`]);
+//! the revocation/doc URLs are inert strings for you to open.
 //!
-//! * `triage` — reads RECENT credential-type findings from the local audit log
-//!   ([`tirith_core::audit::audit_log_path`] +
-//!   [`tirith_core::audit_aggregator::read_log`]) and prints a one-line
-//!   next-step per finding, attributing each to a provider where the leaked
-//!   shape is recognizable.
-//! * `rotate <provider>` — prints the provider's revocation URL, doc URL, and
-//!   manual checklist (the `last_verified` date shows under `--verbose`).
+//! * `triage` — reads recent credential findings from the local audit log and
+//!   prints a one-line next-step per finding, attributing a provider where the
+//!   leaked shape is recognizable.
+//! * `rotate <provider>` — prints the revocation URL, doc URL, and checklist.
 //! * `revoke --provider <p>` — the same data, leading with the revocation URL.
 //!
 //! Honesty contract (loud in `--help` and output): tirith does NOT perform
-//! rotation or revocation; it shows you where and how. You do the rotation.
+//! rotation or revocation; you do.
 
 use tirith_core::secret_rotation::{self, Provider, TriageItem, HONESTY_BANNER};
 
@@ -28,20 +24,16 @@ const TRIAGE_RECENT: usize = 25;
 /// `tirith secret triage [--json] [--verbose]` — scan recent audit findings for
 /// credential leaks and print a one-line rotation next-step for each.
 ///
-/// Exit codes:
-///   `0`  successful read (whether or not findings exist).
-///   `1`  the audit-log path cannot be resolved or read (a `triage` fatal error).
-///   `2`  ONLY in `--json` mode, when the JSON itself fails to write (broken pipe
-///        / truncated stdout) — so a piped consumer never pairs truncated/absent
-///        JSON with a success code (CodeRabbit R12 #H). The `1` fatal-error path
-///        keeps exit `1` even if its `{"error":…}` JSON write fails.
+/// Exit `0` on a successful read, `1` if the audit log can't be resolved/read,
+/// and `2` only in `--json` mode when the JSON write itself fails, so a piped
+/// consumer never pairs truncated JSON with success (CodeRabbit R12 #H). The
+/// `1` fatal path stays `1` even if its `{"error":…}` write fails.
 pub fn triage(json: bool, verbose: bool) -> i32 {
     let Some(log_path) = tirith_core::audit::audit_log_path() else {
         return triage_fatal(json, "cannot determine the audit log path");
     };
 
-    // A missing log is the common "nothing has been audited yet" case — report
-    // it as "no findings", not an error.
+    // A missing log is "nothing audited yet" — report as no findings, not error.
     if !log_path.exists() {
         return triage_empty(json, &log_path.display().to_string());
     }
@@ -132,12 +124,9 @@ fn triage_empty(json: bool, scanned_path: &str) -> i32 {
     0
 }
 
-/// Emit a fatal `triage` error (unresolvable / unreadable audit log) and return
-/// exit code 1. In `--json` mode this writes a structured `{"error": ...}`
-/// object on stdout — consistent with the `rotate`/`revoke` unknown-provider
-/// JSON path — so a machine consumer that asked for `--json` always parses JSON
-/// rather than a bare stderr line. Exit stays 1 (the triage fatal code) even if
-/// the JSON write fails, so a piped consumer never reads success.
+/// Emit a fatal `triage` error and return exit 1. In `--json` mode writes a
+/// structured `{"error": ...}` on stdout (so a `--json` consumer always parses
+/// JSON); exit stays 1 even if that write fails.
 fn triage_fatal(json: bool, msg: &str) -> i32 {
     if json {
         let payload = serde_json::json!({ "error": msg });
@@ -234,13 +223,9 @@ pub fn revoke(provider: &str, json: bool, verbose: bool) -> i32 {
     0
 }
 
-/// Shared "unknown provider" error: list the 11 valid providers and exit 2.
-///
-/// In `--json` mode this emits a structured `{"error": ..., "valid_providers":
-/// [...]}` object on stdout rather than a text-only stderr line, so a machine
-/// consumer that asked for JSON always parses JSON — never a bare error string.
-/// Exit is always 2 (the unknown-provider code); a JSON-write failure stays
-/// non-zero so a piped consumer never reads success with truncated output.
+/// Shared "unknown provider" error: list the valid providers and exit 2. In
+/// `--json` mode emits `{"error": ..., "valid_providers": [...]}` on stdout so a
+/// JSON consumer always parses JSON. Exit stays 2 even on a JSON-write failure.
 fn unknown_provider(action: &str, provider: &str, json: bool) -> i32 {
     let valid = secret_rotation::provider_names();
     if json {
@@ -249,10 +234,8 @@ fn unknown_provider(action: &str, provider: &str, json: bool) -> i32 {
             "action": action,
             "valid_providers": valid,
         });
-        // Best-effort: the exit code (2) is already non-zero, so even a failed
-        // write does not need a distinct code — but route through
-        // write_json_stdout so the trailing newline + stderr diagnostic are
-        // consistent with every other JSON surface.
+        // Best-effort write; exit 2 is already non-zero. Route through
+        // write_json_stdout for a consistent newline + stderr diagnostic.
         let _ = write_json_stdout(
             &payload,
             &format!("tirith secret {action}: failed to write JSON output"),

@@ -1,11 +1,10 @@
-//! One-shot test to generate the Ed25519 keypair and test threat DB fixture.
+//! One-shot generator for the Ed25519 keypair and test threat DB fixture.
 //!
 //! Run with: `cargo test -p tirith-core --test generate_test_fixtures -- --ignored`
 //!
-//! This generates:
-//!   - `assets/keys/threatdb-verify.pub` (32-byte raw Ed25519 public key)
-//!   - `<repo>/threatdb-signing.key` (base64-encoded private key, gitignored)
-//!   - `<repo>/tests/fixtures/test-threatdb.dat` (signed test DB)
+//! Generates `assets/keys/threatdb-verify.pub` (raw public key),
+//! `<repo>/threatdb-signing.key` (base64 private key, gitignored), and
+//! `<repo>/tests/fixtures/test-threatdb.dat` (signed test DB).
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -28,9 +27,8 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generate a fresh Ed25519 keypair, write the public key to the assets
-/// directory (embedded in the binary via `include_bytes!`), and write the
-/// private key as base64 to the repo root (gitignored).
+/// Generate a fresh Ed25519 keypair: write the public key to assets (embedded
+/// via `include_bytes!`) and the base64 private key to the repo root (gitignored).
 fn generate_keypair() -> SigningKey {
     let signing_key = SigningKey::generate(&mut OsRng);
 
@@ -98,10 +96,8 @@ fn build_test_db(signing_key: &SigningKey) {
         .unwrap_or_else(|e| panic!("Failed to write test DB: {}", e));
     eprintln!("Wrote test DB to {}", dat_path.display());
 
-    // Structural reload only — verify_signature() would fail because the
-    // public key baked in via `include_bytes!` still reflects the previous
-    // compile. Verification against the embedded key only works after
-    // rebuilding with the freshly written public key.
+    // Structural reload only: verify_signature() fails until a rebuild embeds
+    // the freshly-written public key via `include_bytes!`.
     let db = tirith_core::threatdb::ThreatDb::load_from_path(&dat_path, 0)
         .expect("Failed to reload test DB");
     let stats = db.stats();

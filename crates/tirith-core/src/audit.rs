@@ -19,10 +19,8 @@ fn audit_diagnostics_enabled() -> bool {
     )
 }
 
-/// Emit a non-fatal diagnostic only when debug logging is enabled.
-///
-/// This is used for auxiliary/background paths that must never interfere with
-/// shell-hook execution or change the command verdict.
+/// Emit a non-fatal diagnostic only when `TIRITH_AUDIT_DEBUG` is set. For
+/// background paths that must never interfere with hooks or change the verdict.
 pub fn audit_diagnostic(msg: impl AsRef<str>) {
     if audit_diagnostics_enabled() {
         eprintln!("{}", msg.as_ref());
@@ -75,48 +73,32 @@ pub struct AuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_scope: Option<String>,
 
-    /// Best-effort origin of the caller. Populated by [`log_verdict_with_raw`]
-    /// (via [`log_verdict_with_origin`]) for verdict entries; left `None` for
-    /// `hook_telemetry` and `trust_change` entries. Old log files without
-    /// this field still parse (serde-default on read).
+    /// Best-effort caller origin for verdict entries; `None` for
+    /// hook_telemetry / trust_change. Old logs parse (serde-default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 
-    /// M11 ch2 — the repo command manifest's `allowed[*].name` that matched
-    /// this command, if any. AUDIT-CONTEXT ONLY: copied verbatim from
-    /// [`crate::verdict::Verdict::manifest_allowed_match`] so an operator can
-    /// see *why* an otherwise-clean command was not annotated
-    /// `repo_command_unknown` (it was catalogued). This field is NEVER read by
-    /// any action-derivation path — the manifest is suppression-bounded and
-    /// cannot weaken a verdict. `None` for `hook_telemetry` / `trust_change`
-    /// entries and when no `allowed[]` entry matched. Old logs without this
-    /// field still parse (serde-default on read).
+    /// M11 ch2 — the matched manifest `allowed[*].name`, if any. AUDIT-CONTEXT
+    /// ONLY: never read by any action-derivation path (manifest is
+    /// suppression-bounded and cannot weaken a verdict). Old logs parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_allowed_match: Option<String>,
 }
 
-/// Outcome of an audit-log append.
-///
-/// The distinction matters for callers that want to surface a failed write:
-/// [`AuditWrite::Skipped`] is *not* an error (the user turned logging off, or
-/// no log path could be resolved), whereas [`AuditWrite::Failed`] is a real I/O
-/// failure that broke the "recorded transaction" promise.
+/// Outcome of an audit-log append. [`AuditWrite::Skipped`] is NOT an error
+/// (logging off / no path); [`AuditWrite::Failed`] broke the recorded-transaction promise.
 enum AuditWrite {
-    /// The entry was written; the serialized line is carried for the optional
-    /// remote-upload spool.
+    /// Written; the serialized line is carried for the optional remote-upload spool.
     Written(String),
-    /// Logging was intentionally not performed — `TIRITH_LOG=0`, or no log
-    /// path. Not an error.
+    /// Intentionally not performed — `TIRITH_LOG=0` or no log path. Not an error.
     Skipped,
-    /// A real write failure. The string is a human-readable reason.
+    /// A real write failure; the string is a human-readable reason.
     Failed(String),
 }
 
-/// Shared I/O helper: serialize an AuditEntry and append it to the audit log.
-/// Handles TIRITH_LOG check, path resolution, dir creation, symlink guard,
-/// open, lock, write, sync, unlock. Never panics or changes behavior on failure;
-/// a real write failure is reported as [`AuditWrite::Failed`] so callers may
-/// surface it.
+/// Serialize an AuditEntry and append it to the audit log (TIRITH_LOG check,
+/// path resolution, symlink guard, open/lock/write/sync/unlock). Never panics;
+/// a real write failure is reported as [`AuditWrite::Failed`].
 fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWrite {
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
         return AuditWrite::Skipped;
@@ -201,10 +183,8 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         let _ = fs2::FileExt::unlock(&file);
         return AuditWrite::Failed(reason);
     }
-    // A failed `sync_all()` means the line reached the OS buffer but was not
-    // durably flushed to disk — the "recorded transaction" promise is not met.
-    // Report it as a real write failure so the caller can surface it, rather
-    // than claiming the entry was written.
+    // A failed `sync_all()` means the line is not durably on disk — the
+    // recorded-transaction promise is unmet, so report it as a write failure.
     if let Err(e) = file.sync_all() {
         let reason = format!("sync failed: {e}");
         audit_diagnostic(format!("tirith: audit: {reason}"));
@@ -216,16 +196,12 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
     AuditWrite::Written(line)
 }
 
-/// Append an entry to the audit log. Never panics or changes verdict on failure.
+/// Append a verdict entry to the audit log. Never panics or changes the verdict.
 ///
-/// `custom_dlp_patterns` are Team-tier regex patterns applied alongside built-in
-/// DLP redaction before the command is written to the log.
-///
-/// Returns `Ok(())` when the entry was written *or* logging was intentionally
-/// not performed (`TIRITH_LOG=0`, no resolvable log path). Returns `Err(reason)`
-/// only on a real write failure — a caller that promises a "recorded
-/// transaction" can surface that failure as a non-fatal notice. The result is
-/// `#[must_use]`: a caller that genuinely does not care must `let _ =` it.
+/// `custom_dlp_patterns` are Team-tier regexes applied alongside built-in DLP
+/// redaction before the command is logged. Returns `Ok(())` when written OR
+/// intentionally skipped (`TIRITH_LOG=0`, no path); `Err(reason)` only on a real
+/// write failure.
 #[must_use = "a failed audit write is silently lost unless the Result is handled"]
 pub fn log_verdict(
     verdict: &Verdict,
@@ -245,12 +221,8 @@ pub fn log_verdict(
     )
 }
 
-/// Like `log_verdict` but accepts optional raw (pre-post-processing) action and rule_ids.
-///
-/// `raw_action` captures the engine's original action before overrides/escalation.
-/// `raw_rule_ids` captures all rule_ids from raw detection (before paranoia).
-///
-/// Returns `Err(reason)` only on a real write failure (see [`log_verdict`]).
+/// Like [`log_verdict`] but also records the raw (pre-post-processing) action
+/// (before overrides/escalation) and rule_ids (before paranoia).
 #[must_use = "a failed audit write is silently lost unless the Result is handled"]
 pub fn log_verdict_with_raw(
     verdict: &Verdict,
@@ -290,28 +262,20 @@ pub fn log_verdict_with_raw(
         trust_action: None,
         trust_ttl_expires: None,
         trust_scope: None,
-        // M4 item 8: carry the caller's self-identified origin through to
-        // the audit entry when the verdict path set one. The origin is
-        // already consulted for enforcement upstream of this call (see
-        // `escalation::apply_agent_rules`); the audit record preserves it
+        // Carry the caller origin (already consulted for enforcement upstream)
         // so downstream tooling can attribute verdicts after the fact.
         agent_origin: verdict.agent_origin.clone(),
-        // M11 ch2: audit-context only — record the repo-command-manifest
-        // `allowed[]` match for traceability. Never consulted for action.
+        // Audit-context only; never consulted for action.
         manifest_allowed_match: verdict.manifest_allowed_match.clone(),
     };
 
     let line = match append_to_audit_log(&entry, log_path) {
         AuditWrite::Written(l) => l,
-        // Logging was intentionally off — not a failure the caller should hear
-        // about.
         AuditWrite::Skipped => return Ok(()),
-        // A real write failure — the "recorded transaction" promise broke.
         AuditWrite::Failed(reason) => return Err(reason),
     };
 
-    // If a policy server is configured via env vars, spool the redacted audit
-    // entry for background upload.
+    // If a policy server is configured via env, spool the entry for background upload.
     let server_url = std::env::var("TIRITH_SERVER_URL")
         .ok()
         .filter(|s| !s.is_empty());
@@ -324,10 +288,8 @@ pub fn log_verdict_with_raw(
     Ok(())
 }
 
-/// Log a hook telemetry event to the audit log. Never panics or changes behavior on failure.
-///
-/// This reuses the same log file and I/O pattern as `log_verdict`, but with
-/// `entry_type = "hook_telemetry"` and `action = "hook"` (sentinel).
+/// Log a hook telemetry event (`entry_type = "hook_telemetry"`). Best-effort,
+/// never panics; reuses the same log file / I/O pattern as `log_verdict`.
 pub fn log_hook_event(
     integration: &str,
     hook_type: &str,
@@ -360,27 +322,17 @@ pub fn log_hook_event(
         trust_action: None,
         trust_ttl_expires: None,
         trust_scope: None,
-        // Hook telemetry already carries `integration` (the hook name); we
-        // deliberately do NOT synthesize an `AgentOrigin::Agent` here because
-        // a hook event isn't a verdict — it's a probe / heartbeat from the
-        // shell hook. Chunk 2+ may revisit and emit a synthetic origin for
-        // hook events that originated from a known agent integration.
+        // A hook event is a probe/heartbeat, not a verdict — no synthetic origin.
         agent_origin: None,
-        // M11 ch2: not applicable to telemetry / trust-change entries.
         manifest_allowed_match: None,
     };
 
-    // Telemetry / trust-change entries are best-effort; a write failure here is
-    // not surfaced to the user (unlike `log_verdict`'s recorded-transaction
-    // promise). The diagnostic inside `append_to_audit_log` still fires under
-    // `TIRITH_AUDIT_DEBUG`.
+    // Best-effort: a write failure here is not surfaced to the user.
     let _ = append_to_audit_log(&entry, None);
 }
 
-/// Log a trust change (add/remove) to the audit log. Never panics or changes behavior on failure.
-///
-/// This reuses the same log file and I/O pattern as `log_verdict`, but with
-/// `entry_type = "trust_change"` and `action = "trust"` (sentinel).
+/// Log a trust change (`entry_type = "trust_change"`). Best-effort, never panics;
+/// reuses the same log file / I/O pattern as `log_verdict`.
 pub fn log_trust_change(
     pattern: &str,
     rule_id: Option<&str>,
@@ -413,18 +365,12 @@ pub fn log_trust_change(
         trust_action: Some(trust_action.to_string()),
         trust_ttl_expires: ttl_expires.map(String::from),
         trust_scope: Some(scope.to_string()),
-        // Trust changes are operator/admin actions, not commands attributed
-        // to an agent. Leaving `agent_origin` as `None` keeps the entry
-        // type's semantics clear.
+        // Trust changes are operator actions, not agent-attributed commands.
         agent_origin: None,
-        // M11 ch2: not applicable to telemetry / trust-change entries.
         manifest_allowed_match: None,
     };
 
-    // Telemetry / trust-change entries are best-effort; a write failure here is
-    // not surfaced to the user (unlike `log_verdict`'s recorded-transaction
-    // promise). The diagnostic inside `append_to_audit_log` still fires under
-    // `TIRITH_AUDIT_DEBUG`.
+    // Best-effort: a write failure here is not surfaced to the user.
     let _ = append_to_audit_log(&entry, None);
 }
 
@@ -432,44 +378,22 @@ fn default_log_path() -> Option<PathBuf> {
     crate::policy::data_dir().map(|d| d.join("log.jsonl"))
 }
 
-/// Public accessor for the audit log path so out-of-crate readers
-/// (e.g. `tirith trust audit`, M6 ch3) can locate it without hard-coding
-/// `data_dir()/log.jsonl`.
+/// Public accessor for the audit log path (so out-of-crate readers need not
+/// hard-code `data_dir()/log.jsonl`).
 pub fn audit_log_path() -> Option<PathBuf> {
     default_log_path()
 }
 
-/// Build a stable, parseable finding identifier from an [`AuditEntry`]'s
-/// `event_id` and the 0-based index into its `rule_ids` array.
-///
-/// The shape is `<event_id>:<index>`. Used by `tirith explain --finding`
-/// (M6 ch3) and any downstream consumer that needs to round-trip a
-/// concrete (audit-entry, rule-position) pair through a short string.
-///
-/// **Why a colon delimiter is safe here.** `event_id` values are
-/// generated by [`crate::session::resolve_session_id`]-derived UUIDs and
-/// engine-side correlation IDs — none of the production callers emit a
-/// colon. We document the contract here (no colons in `event_id`) rather
-/// than encode-escape because (a) every production caller already
-/// satisfies it, (b) [`parse_finding_id`] splits on the LAST colon so
-/// even a colon-bearing `event_id` round-trips when the last segment
-/// parses as a `usize`, and (c) the constructor is one place to enforce
-/// if a future caller needs to.
+/// Build a parseable finding ID `<event_id>:<index>` (used by `tirith explain
+/// --finding`). Colon delimiter is safe: production `event_id`s (UUID-derived)
+/// contain no colon, and [`parse_finding_id`] splits on the LAST colon anyway.
 pub fn finding_id_for(event_id: &str, index: usize) -> String {
     format!("{event_id}:{index}")
 }
 
-/// Parse a finding ID built by [`finding_id_for`] into `(event_id,
-/// index)`. Returns `None` when the input is malformed — no colon, an
-/// empty `event_id` prefix, or an `index` segment that does not parse as
-/// `usize`.
-///
-/// **Splits on the LAST colon.** A future `event_id` containing a colon
-/// (none today; see [`finding_id_for`] for the contract) still
-/// round-trips so long as the trailing component is the numeric index.
-/// The `usize` parse is the load-bearing validator: a payload that does
-/// not end with a numeric segment is rejected here rather than producing
-/// an out-of-range read at the call site.
+/// Parse a [`finding_id_for`] ID into `(event_id, index)`, splitting on the LAST
+/// colon. Returns `None` when malformed (no colon, empty prefix, or non-`usize`
+/// index — the `usize` parse is the load-bearing validator against bad indices).
 pub fn parse_finding_id(id: &str) -> Option<(&str, usize)> {
     let (event_id, index_str) = id.rsplit_once(':')?;
     if event_id.is_empty() {
@@ -653,12 +577,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_audit_refuses_symlink() {
-        // Hermetic: hold the env lock and pin every input that could otherwise
-        // route this through `AuditWrite::Skipped` (which would yield `Ok` and
-        // silently break the assertion). A runner-set `TIRITH_LOG=0` would skip
-        // logging entirely; an `XDG_STATE_HOME`/`APPDATA` difference only
-        // affects the remote-upload spool but is pinned for full isolation.
-        // The log path itself is the explicit `symlink_path` below.
+        // Hermetic: pin every env input that could otherwise route this through
+        // `AuditWrite::Skipped` (which would yield Ok and break the assertion).
         let _guard = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -723,11 +643,8 @@ mod tests {
         unsafe { std::env::remove_var("APPDATA") };
     }
 
-    /// CR2: a write that reaches `append_to_audit_log` but cannot be durably
-    /// recorded must surface as a write failure, not a silent success. The
-    /// symlink-refusal path is one such failure and is the closest
-    /// deterministically-triggerable proxy for the `sync_all()` failure the
-    /// CR2 fix also now reports — both return `AuditWrite::Failed` → `Err`.
+    /// CR2: a write that cannot be durably recorded must surface as a failure,
+    /// not a silent success (a dir-as-log-path is the deterministic proxy here).
     #[cfg(unix)]
     #[test]
     fn test_audit_durability_failure_is_reported() {
@@ -743,8 +660,7 @@ mod tests {
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
 
-        // A directory cannot be opened for append — `append_to_audit_log` must
-        // report this as `AuditWrite::Failed`, never silently succeed.
+        // A directory can't be opened for append → must report Failed.
         let log_path = dir.path().join("not-a-file");
         std::fs::create_dir(&log_path).unwrap();
 
@@ -786,9 +702,7 @@ mod tests {
         unsafe { std::env::remove_var("APPDATA") };
     }
 
-    /// M4 item 8 chunk 1 — the verdict's `agent_origin` must flow through
-    /// `log_verdict_with_raw` into the audit entry and survive the JSON
-    /// round-trip cleanly.
+    /// `agent_origin` must flow through into the audit entry and survive the JSON round-trip.
     #[cfg(unix)]
     #[test]
     fn test_audit_entry_carries_agent_origin() {
@@ -853,8 +767,7 @@ mod tests {
         }
     }
 
-    /// M4 item 8 chunk 1 — an old log line without an `agent_origin` field
-    /// must still parse cleanly (serde-default).
+    /// An old log line without an `agent_origin` field must still parse (serde-default).
     #[cfg(unix)]
     #[test]
     fn test_audit_record_parses_legacy_line_without_agent_origin() {
@@ -880,8 +793,7 @@ mod tests {
         );
     }
 
-    /// M4 item 8 chunk 1 — a verdict with `agent_origin: None` must NOT
-    /// emit the field on the wire (kept clean via skip_serializing_if).
+    /// A verdict with `agent_origin: None` must NOT emit the field on the wire.
     #[cfg(unix)]
     #[test]
     fn test_audit_entry_omits_field_when_no_origin() {
@@ -936,13 +848,8 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // finding_id_for / parse_finding_id round-trip — used by
-    // `tirith explain --finding` (M6 ch3) to resolve an audit-log finding
-    // back to its rule. The shape contract here is the only contract those
-    // call sites depend on: `<event_id>:<index>`, parseable back by
-    // splitting on the LAST colon and `usize`-parsing the trailing segment.
-    // -----------------------------------------------------------------------
+    // finding_id_for / parse_finding_id round-trip — shape contract is
+    // `<event_id>:<index>`, parsed back by splitting on the LAST colon.
 
     #[test]
     fn finding_id_round_trip_simple() {
@@ -955,11 +862,7 @@ mod tests {
 
     #[test]
     fn parse_finding_id_handles_colon_in_event_id() {
-        // Even though production event_ids today never contain a colon
-        // (see `finding_id_for`'s contract comment), the parser splits on
-        // the LAST colon so a future caller emitting a colon-bearing
-        // event_id still round-trips so long as the trailing component
-        // is the numeric index.
+        // Splitting on the LAST colon lets a colon-bearing event_id round-trip.
         let id = "ns:evt-with:colon:7";
         let parsed = parse_finding_id(id).expect("trailing-int form must parse");
         assert_eq!(parsed.0, "ns:evt-with:colon");
@@ -968,22 +871,16 @@ mod tests {
 
     #[test]
     fn parse_finding_id_rejects_malformed_input() {
-        // No colon → no split.
         assert_eq!(parse_finding_id("no-colon-here"), None);
-        // Empty event_id segment.
         assert_eq!(parse_finding_id(":5"), None);
-        // Index segment not numeric.
         assert_eq!(parse_finding_id("evt:not-a-number"), None);
-        // Trailing colon with empty index.
         assert_eq!(parse_finding_id("evt:"), None);
-        // Empty input.
         assert_eq!(parse_finding_id(""), None);
     }
 
     #[test]
     fn parse_finding_id_rejects_negative_index() {
-        // `usize` cannot parse negatives — this is the contract; the CLI
-        // surfaces it as a clear "malformed finding ID" error.
+        // `usize` cannot parse negatives.
         assert_eq!(parse_finding_id("evt:-1"), None);
     }
 }

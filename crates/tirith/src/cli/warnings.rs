@@ -34,7 +34,7 @@ pub fn run(
 
     let warnings = session_warnings::load(&sid);
 
-    // discover_partial is local-only; the shell-exit hot path must not trigger a network fetch.
+    // discover_partial is local-only — the shell-exit hot path must not fetch.
     let cwd = std::env::current_dir().ok();
     let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
     let policy = tirith_core::policy::Policy::discover_partial(cwd_str);

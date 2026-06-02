@@ -34,20 +34,15 @@ pub fn run(
         return run_bundle(json);
     }
 
-    // `--quick`: the fast status path the VS Code extension polls (~every 30s).
-    // It gathers ONLY the three cheap fields the extension needs and skips every
-    // expensive probe the full report runs (audit-log parse, threat-DB
-    // deserialize, baseline-store read, PATH walk for shadow binaries, and the
-    // bash-capability cache read). Read-only: it never materializes hooks or
-    // mutates state. Handled before the full `gather_info()` so none of those
-    // probes can run.
+    // `--quick`: the fast, read-only status path the VS Code extension polls
+    // (~30s). Gathers ONLY the three cheap fields and skips every expensive
+    // probe; handled before `gather_info()` so none of those probes can run.
     if quick {
         return run_quick(json);
     }
 
     // A plain `tirith doctor` refreshes the bash enter-mode capability cache as
-    // a side effect: the PTY self-test is cheap, timeout-bound, and keeps the
-    // cache the hook reads at startup current. Skipped in JSON mode so machine
+    // a side effect (cheap, timeout-bound). Skipped in JSON mode so machine
     // consumers get a fast, side-effect-free report.
     #[cfg(unix)]
     if !json && crate::cli::init::detect_shell() == "bash" {
@@ -214,7 +209,7 @@ fn hooks_stale() -> bool {
         None => return false, // no hooks at all; hooks_installed() handles that
     };
 
-    // Only check staleness for materialized (data-dir) hooks
+    // Only materialized (data-dir) hooks can be stale.
     let data_dir = match tirith_core::policy::data_dir() {
         Some(d) => d,
         None => return false,
@@ -231,9 +226,8 @@ fn hooks_stale() -> bool {
     }
 }
 
-/// Check whether any policy file can be discovered, using the same local
-/// discovery the engine uses (TIRITH_POLICY_ROOT, walk-up to the `.git`
-/// boundary, then the user config dir). Existence-based: no network fetch.
+/// Whether NO policy file can be discovered via the engine's local discovery
+/// (TIRITH_POLICY_ROOT → walk-up to `.git` → user config dir). Existence-based.
 fn policy_missing() -> bool {
     let cwd = std::env::current_dir()
         .ok()
@@ -241,16 +235,14 @@ fn policy_missing() -> bool {
     tirith_core::policy::discover_local_policy_path(cwd.as_deref()).is_none()
 }
 
-/// Build the de-duplicated list of policy paths `doctor` should display. The
-/// first entry (if any) is the policy the engine would actually load. A second
-/// entry can appear only for a present-but-shadowed user-config-dir policy — a
-/// `TIRITH_POLICY_ROOT` policy, when present, has top resolution priority, so it
-/// is always the active first entry and never a shadowed one.
+/// De-duplicated list of policy paths `doctor` displays. First entry (if any)
+/// is the policy the engine would load; a second appears only for a
+/// present-but-shadowed user-config policy (a TIRITH_POLICY_ROOT policy always
+/// wins resolution, so it is never the shadowed one).
 fn collect_policy_paths(cwd: Option<&str>) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
 
-    // The active policy is the first entry; `paths` is empty here, so the dedup
-    // guard the later push sites use is not needed.
+    // Active policy is the first entry; `paths` is empty so no dedup guard needed.
     if let Some(active) = tirith_core::policy::discover_local_policy_path(cwd) {
         paths.push(active.display().to_string());
     }
@@ -282,11 +274,10 @@ fn collect_policy_paths(cwd: Option<&str>) -> Vec<String> {
     paths
 }
 
-/// One detected AI coding tool. `configured_scope` carries the scope at
-/// which a tirith-managed file was found (so `--fix` can pass it through to
-/// `setup::run`); `None` means we found a coarse "tool installed but tirith
-/// not configured yet" signal and `--fix` should bootstrap with the tool's
-/// default scope.
+/// One detected AI coding tool. `configured_scope` is the scope a
+/// tirith-managed file was found at (passed through to `setup::run`); `None`
+/// means "tool installed but tirith not configured" — `--fix` bootstraps at the
+/// tool's default scope.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct DetectedTool {
@@ -338,8 +329,8 @@ fn detect_ai_tools_with(
         });
     }
 
-    // Copilot CLI: only push when our managed file is at the repo root, to
-    // avoid false-positive matches on every GitHub repo.
+    // Copilot CLI: only when the managed file is at the repo root, to avoid
+    // matching on every GitHub repo.
     if tirith_core::policy::find_repo_root(None)
         .map(|r| r.join(".github/hooks/tirith-security.json").exists())
         .unwrap_or(false)
@@ -374,11 +365,9 @@ fn detect_ai_tools_with(
             configured_scope: Some("user"),
         });
     } else if project_kiro_dir.is_some() || user_kiro {
-        // Bootstrap: workspace `.kiro/` or `~/.kiro/` exists with no managed
-        // file. Both bootstrap branches collapse into one push because they
-        // both pass `configured_scope: None` to setup (which then defaults
-        // to project scope). The project-vs-user precedence only matters for
-        // the configured cases above.
+        // Bootstrap: a `.kiro/` exists with no managed file. Both bootstrap
+        // branches collapse to one push (`configured_scope: None`); the
+        // project-vs-user precedence only matters for the configured cases above.
         tools.push(DetectedTool {
             name: "kiro",
             configured_scope: None,
@@ -394,8 +383,8 @@ fn bash_safe_mode_active() -> bool {
         .unwrap_or(false)
 }
 
-/// Match the truthy values the bash hook accepts for `TIRITH_BASH_*` boolean
-/// env vars: `1`, `true`, `yes`, `on` (case-insensitive).
+/// Truthy values the bash hook accepts for `TIRITH_BASH_*` booleans: `1`,
+/// `true`, `yes`, `on` (case-insensitive).
 fn env_is_truthy(s: &str) -> bool {
     matches!(
         s.trim().to_ascii_lowercase().as_str(),
@@ -403,16 +392,15 @@ fn env_is_truthy(s: &str) -> bool {
     )
 }
 
-/// True when a persisted bash safe-mode flag exists but `TIRITH_BASH_MODE=enter`
-/// overrides it, so the hook re-attempts enter mode on every new shell despite
-/// the recorded prior failure. Exact, case-sensitive match — mirrors the hook's
-/// `[[ "$_TIRITH_BASH_MODE" == "enter" ]]`.
+/// True when a persisted bash safe-mode flag is overridden by
+/// `TIRITH_BASH_MODE=enter` (so the hook re-attempts enter mode despite the
+/// recorded failure). Case-sensitive — mirrors the hook's `== "enter"` test.
 fn safe_mode_overridden_by_env(bash_safe_mode: bool, requested_mode: Option<&str>) -> bool {
     bash_safe_mode && requested_mode == Some("enter")
 }
 
-/// Create a minimal starter policy at .tirith/policy.yaml in the repo root,
-/// or fall back to the user config dir.
+/// Create a minimal starter policy at `.tirith/policy.yaml` in the repo root,
+/// falling back to the user config dir.
 fn create_default_policy() -> Result<PathBuf, String> {
     let content = "\
 # tirith policy — see https://github.com/sheeki03/tirith for options
@@ -424,7 +412,6 @@ allowlist: []
 blocklist: []
 ";
 
-    // Try repo root first
     if let Some(repo_root) = tirith_core::policy::find_repo_root(None) {
         let policy_dir = repo_root.join(".tirith");
         if std::fs::create_dir_all(&policy_dir).is_ok() {
@@ -441,7 +428,6 @@ blocklist: []
         }
     }
 
-    // Fall back to user config dir
     if let Some(config) = tirith_core::policy::config_dir() {
         if std::fs::create_dir_all(&config).is_ok() {
             let path = config.join("policy.yaml");
@@ -460,7 +446,7 @@ blocklist: []
     Err("could not determine a location for policy file".to_string())
 }
 
-/// Detection gap analysis: what findings are hidden by the current paranoia level.
+/// Findings hidden by the current paranoia level.
 #[derive(Debug, Clone, serde::Serialize)]
 struct DetectionGapInfo {
     total_commands: usize,
@@ -476,12 +462,10 @@ struct DetectionGapInfo {
     current_paranoia: u8,
 }
 
-/// Analyze audit log data from the last 7 days to show detection coverage gaps.
-///
-/// For each verdict record that has `raw_rule_ids`, computes the multiset diff
-/// (raw minus effective) to find exactly which rules were suppressed by paranoia
-/// filtering. Records without `raw_rule_ids` (legacy, pre-upgrade) are counted
-/// but skipped in the delta computation.
+/// Analyze the last 7 days of audit data for detection coverage gaps. For each
+/// verdict with `raw_rule_ids`, computes the multiset diff (raw minus effective)
+/// to find rules paranoia filtering suppressed; legacy records lacking
+/// `raw_rule_ids` are counted but skipped in the delta.
 fn check_detection_gaps() -> Option<DetectionGapInfo> {
     let data_dir = tirith_core::policy::data_dir()?;
     let log_path = data_dir.join("log.jsonl");
@@ -531,7 +515,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
     let mut records_with_raw = 0usize;
     let mut records_without_raw = 0usize;
     let mut total_findings = 0usize;
-    // Scoped only to records with raw data — legacy pre-upgrade rows are excluded.
+    // Scoped to records with raw data; legacy pre-upgrade rows are excluded.
     let mut raw_total_findings_analyzed = 0usize;
     let mut hidden_findings = 0usize;
     let mut hidden_rule_counts: HashMap<String, usize> = HashMap::new();
@@ -544,8 +528,8 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
                 records_with_raw += 1;
                 raw_total_findings_analyzed += raw_ids.len();
 
-                // Multiset diff: raw_rule_ids minus rule_ids — an unmatched
-                // raw entry means paranoia filtering suppressed it.
+                // Multiset diff (raw minus effective): an unmatched raw entry
+                // was suppressed by paranoia filtering.
                 let mut effective_counts: HashMap<&str, u32> = HashMap::new();
                 for rid in &record.rule_ids {
                     *effective_counts.entry(rid.as_str()).or_insert(0) += 1;
@@ -622,20 +606,17 @@ struct DoctorInfo {
     /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
-    /// Live protection status exported by the hook as `TIRITH_STATUS`
-    /// (`blocks` / `warn-only` / `degraded` / `off`). `degraded` specifically
-    /// means protection was downgraded from a stronger level during this
-    /// session. Absent means no tirith hook was sourced in this process.
+    /// Live protection status from `TIRITH_STATUS` (`blocks` / `warn-only` /
+    /// `degraded` / `off`); `degraded` = downgraded mid-session. Absent means no
+    /// hook was sourced in this process.
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
-    /// Cached bash enter-mode delivery capability verdict (`works` / `broken` /
-    /// `inconclusive`), as recorded by the last self-test. Absent when no
-    /// capability cache has been written yet.
+    /// Cached bash enter-mode capability verdict from the last self-test
+    /// (`works` / `broken` / `inconclusive`); absent if never run.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_enter_capability: Option<String>,
-    /// Whether the cached capability verdict is for the running bash — a
-    /// `false` here means the cache is stale (a different bash) and the hook
-    /// will ignore it.
+    /// Whether the cached verdict is for the running bash — `false` means stale
+    /// (a different bash) and the hook ignores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_enter_capability_fresh: Option<bool>,
     /// Human-readable reason recorded with the cached capability verdict.
@@ -662,15 +643,14 @@ struct DoctorInfo {
     /// Threat intelligence database status.
     #[serde(skip_serializing_if = "Option::is_none")]
     threat_db: Option<ThreatDbDoctorInfo>,
-    /// M10 ch5 — opt-in anomaly-baseline status. Always present (the baseline
-    /// is a core feature); `enabled` reflects `policy.baseline_enabled`.
+    /// M10 ch5 — opt-in anomaly-baseline status. Always present; `enabled`
+    /// reflects `policy.baseline_enabled`.
     baseline: BaselineDoctorInfo,
 }
 
-/// M10 ch5 — anomaly-baseline status for the doctor report. Surfaces whether
-/// the opt-in baseline is enabled, how many observations are in the window, and
-/// the early-baseline-mode flag (per risk #2: until ~30 observations the signal
-/// is not yet meaningful).
+/// M10 ch5 — anomaly-baseline status: enabled flag, in-window observation
+/// count, and the early-baseline-mode flag (risk #2: signal not meaningful
+/// until ~30 observations).
 #[derive(Debug, Clone, serde::Serialize)]
 struct BaselineDoctorInfo {
     /// `policy.baseline_enabled` (opt-in; default false).
@@ -692,48 +672,30 @@ struct ThreatDbDoctorInfo {
     error: Option<String>,
 }
 
-/// Minimal, stable status payload emitted by `tirith doctor --quick --format
-/// json`. This is the contract the VS Code extension polls (~every 30s), so the
-/// shape is deliberately small and documented (see `docs/doctor-modes.md`):
-/// exactly three status fields plus a `schema_version` for forward
-/// compatibility. It is built by `gather_quick_info`, which touches ONLY cheap
-/// sources — none of the expensive `DoctorInfo` probes run.
-///
-/// `schema_version` matches the `prompt_status` JSON convention (a stable,
-/// machine-polled surface starts at `1`).
+/// Minimal, stable status payload for `tirith doctor --quick --format json` —
+/// the contract the VS Code extension polls (~30s; see `docs/doctor-modes.md`):
+/// three status fields + a `schema_version`. Built by `gather_quick_info`,
+/// which touches ONLY cheap sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct QuickDoctorInfo {
-    /// Stable schema version for the polled shape. Bumped only on a
-    /// breaking change to the field set / meaning.
+    /// Schema version for the polled shape; bumped only on a breaking change.
     schema_version: u32,
-    /// Live protection mode derived from the hook-exported `TIRITH_STATUS`,
-    /// using the SAME vocabulary as `tirith prompt-status` /
-    /// `docs/prompt-integration.md`: `guarded` (a dangerous command is
-    /// blocked), `warn-only`, `degraded` (downgraded this session), or `off`
-    /// (no hook ran / protection off). An unrecognized status is passed
-    /// through verbatim for forward compatibility.
+    /// Live protection mode from `TIRITH_STATUS`, using the SAME vocabulary as
+    /// `tirith prompt-status`: `guarded` (blocking), `warn-only`, `degraded`,
+    /// `off`; unknown values passed through verbatim.
     protection_mode: String,
-    /// The single policy file the engine would actually load for the current
-    /// directory (local discovery: `TIRITH_POLICY_ROOT`, then walk-up to the
-    /// `.git` boundary, then the user config dir), or `null` when no policy is
-    /// discovered. Existence-based — never a network fetch.
+    /// The single policy file the engine would load (local discovery only), or
+    /// `null` when none is discovered. Existence-based — never a network fetch.
     policy_path_used: Option<String>,
-    /// Whether the tirith shell hook is configured in the detected shell's
-    /// profile. Mirrors the full report's `hook_configured`.
+    /// Whether the shell hook is configured in the detected shell's profile
+    /// (mirrors the full report's `hook_configured`).
     hook_configured: bool,
 }
 
-/// Gather ONLY the three cheap fields the quick status path needs. This is the
-/// unit-testable seam: it must touch nothing expensive — no audit-log read
-/// (`check_detection_gaps`), no threat-DB deserialize (`gather_threat_db_info`),
-/// no baseline-store read (`gather_baseline_info`), no PATH walk
-/// (`find_shadow_binaries`), and no bash-capability cache read.
-///
-/// - `protection_mode`: derived from `TIRITH_STATUS` (one env read).
-/// - `policy_path_used`: the active local policy path, via the same
-///   `discover_local_policy_path` the engine uses (existence checks only).
-/// - `hook_configured`: `check_shell_profile` for the detected shell (one profile
-///   read).
+/// Gather ONLY the three cheap quick-status fields. The unit-testable seam:
+/// must touch nothing expensive — no audit-log read, threat-DB deserialize,
+/// baseline read, PATH walk, or bash-capability cache. Fields come from
+/// `TIRITH_STATUS`, `discover_local_policy_path`, and `check_shell_profile`.
 fn gather_quick_info() -> QuickDoctorInfo {
     let detected_shell = crate::cli::init::detect_shell().to_string();
     let (_profile, hook_configured) = check_shell_profile(&detected_shell, "tirith: doctor:");
@@ -741,8 +703,7 @@ fn gather_quick_info() -> QuickDoctorInfo {
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
         .filter(|s| !s.is_empty());
-    // Shared single-source-of-truth mapping with `tirith prompt-status` so the
-    // two surfaces never drift (see `cli::prompt_status::protection_mode_from_status`).
+    // Shared with `tirith prompt-status` so the two surfaces never drift.
     let protection_mode =
         crate::cli::prompt_status::protection_mode_from_status(tirith_status.as_deref());
 
@@ -760,10 +721,8 @@ fn gather_quick_info() -> QuickDoctorInfo {
     }
 }
 
-/// `tirith doctor --quick`: fast, read-only status for the VS Code extension's
-/// ~30s poll. JSON mode emits the minimal `QuickDoctorInfo` through the
-/// broken-pipe-safe writer; human mode prints a 2-3 line summary. Never runs the
-/// expensive `DoctorInfo` probes.
+/// `tirith doctor --quick`: fast, read-only status. JSON mode emits the minimal
+/// `QuickDoctorInfo`; human mode prints a 2-3 line summary.
 fn run_quick(json: bool) -> i32 {
     let info = gather_quick_info();
     if json {
@@ -776,8 +735,7 @@ fn run_quick(json: bool) -> i32 {
     0
 }
 
-/// Human-readable 2-3 line summary for `tirith doctor --quick` (no `--format
-/// json`). Mirrors the `key:` two-column style of the full `print_human`.
+/// Human-readable 2-3 line summary for `tirith doctor --quick`.
 fn print_quick_human(info: &QuickDoctorInfo) {
     println!("  protection:   {}", info.protection_mode);
     println!(
@@ -806,7 +764,7 @@ fn gather_info() -> DoctorInfo {
     let hooks_materialized = hook_dir
         .as_ref()
         .map(|d| {
-            // Hook dir inside data_dir means it was materialized (vs system/homebrew).
+            // Inside data_dir means materialized (vs system/homebrew).
             if let Some(data) = tirith_core::policy::data_dir() {
                 d.starts_with(&data)
             } else {
@@ -832,8 +790,7 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Live state vars exported by the hook (effective state). Absence means the
-    // bash hook was not sourced in this process.
+    // Live state exported by the hook; absence = bash hook not sourced here.
     let bash_effective_mode = std::env::var("TIRITH_BASH_EFFECTIVE_MODE")
         .ok()
         .filter(|s| !s.is_empty());
@@ -841,10 +798,8 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // `TIRITH_STATUS` is the cross-shell live protection indicator exported by
-    // every tirith hook (bash, zsh, fish, PowerShell, nushell). Absence means
-    // no tirith hook ran in the process that invoked `doctor` — typically a
-    // non-interactive subshell.
+    // `TIRITH_STATUS`: cross-shell live protection indicator from every hook.
+    // Absence = no hook ran here (typically a non-interactive subshell).
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
         .filter(|s| !s.is_empty());
@@ -865,8 +820,7 @@ fn gather_info() -> DoctorInfo {
     let baseline = gather_baseline_info();
 
     // Cached bash enter-mode delivery verdict (issue #111). Read-only here —
-    // the cache is written by the self-test in `--simulate-enter` and by a
-    // plain `tirith doctor` run; this just surfaces it.
+    // written by the self-test; this just surfaces it.
     let (
         bash_enter_capability,
         bash_enter_capability_fresh,
@@ -940,8 +894,8 @@ fn gather_info() -> DoctorInfo {
     }
 }
 
-/// M10 ch5 — read the anomaly-baseline status for the doctor report. Reads the
-/// store + the `policy.baseline_enabled` flag (no writes, no env mutation).
+/// M10 ch5 — read the anomaly-baseline status (store + `baseline_enabled`
+/// flag; no writes, no env mutation).
 fn gather_baseline_info() -> BaselineDoctorInfo {
     let enabled = tirith_core::policy::Policy::discover_partial(None).baseline_enabled;
     let total = tirith_core::baseline::entry_count();
@@ -1016,15 +970,14 @@ fn gather_threat_db_info() -> Option<ThreatDbDoctorInfo> {
 
 // --- Compatibility report (`tirith doctor --compat`) -----------------------
 //
-// A focused, static shell/terminal compatibility view. It reuses the existing
-// `gather_info()` machinery rather than re-deriving install state, and adds
-// best-effort detection of co-installed shell tools that historically interact
-// with shell hooks. It introspects NOTHING about the parent shell's live
-// state — a child process cannot — it only consumes what the hook exports.
+// A focused, static shell/terminal compatibility view reusing `gather_info()`,
+// plus best-effort detection of co-installed shell tools. It introspects
+// nothing about the parent shell's live state — it only consumes what the hook
+// exports.
 
 /// One co-installed shell tool that historically interacts with shell hooks.
-/// `on_path` and `in_profile` are independent best-effort signals; presence is
-/// reported honestly without claiming a definite conflict.
+/// `on_path` / `in_profile` are independent best-effort signals — reported
+/// honestly, not claimed as a definite conflict.
 #[derive(Debug, Clone, serde::Serialize)]
 struct ShellToolPresence {
     name: &'static str,
@@ -1110,34 +1063,21 @@ fn detect_shell_tool_conflicts(profile: Option<&std::path::Path>) -> Vec<ShellTo
         .collect()
 }
 
-/// PowerShell hook compatibility information for `tirith doctor --compat`.
-///
-/// Reported when either `pwsh` (PowerShell 7+) or `powershell` (Windows
-/// PowerShell 5.1) is on PATH; absent on hosts without either binary. The
-/// outer `Option<PsCompatInfo>` on `CompatReport.powershell_compat` carries
-/// the "no PowerShell binary at all" signal, so we do NOT need a separate
-/// `available: bool` field — and `binary` is always populated when this
-/// struct exists, so it is a plain `String`. Likewise, `tirith_status` is
-/// already surfaced by the parent `CompatReport.tirith_status` (both read
-/// the same env var), so we do not duplicate it here.
-///
-/// This is a diagnostic surface only — the shell-hook health gate in
-/// `tirith init` is authoritative for actual hook behavior.
+/// PowerShell hook compatibility for `tirith doctor --compat`. Present only when
+/// `pwsh` or `powershell` is on PATH (the outer `Option` carries the "no binary"
+/// signal, so no `available` field is needed). Diagnostic only — `tirith init`'s
+/// health gate is authoritative.
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 struct PsCompatInfo {
-    /// The resolved binary name — `"pwsh"` when PowerShell 7+ is installed,
-    /// `"powershell"` for Windows PowerShell 5.1 only.
+    /// Resolved binary name — `"pwsh"` (7+) or `"powershell"` (5.1).
     binary: String,
-    /// PSReadLine module available to the resolved PowerShell binary
-    /// (required for the key binding). `None` if no binary was found OR
-    /// the probe timed out / errored.
+    /// PSReadLine module available to the resolved binary (required for the key
+    /// binding). `None` if no binary was found or the probe timed out / errored.
     #[serde(skip_serializing_if = "Option::is_none")]
     psreadline_available: Option<bool>,
-    /// Hook version embedded in the binary matches the materialized hook
-    /// file on disk. `None` for now — the PowerShell hook file has no
-    /// machine-parseable version tag yet (TODO: add a `# tirith-hook-version: x.y.z`
-    /// comment to `shell/lib/powershell-hook.ps1` so this field can become
-    /// meaningful; deferred from M5 because it touches all hooks).
+    /// `None` for now: the PowerShell hook file has no machine-parseable version
+    /// tag yet (TODO: add a `# tirith-hook-version:` comment to
+    /// `shell/lib/powershell-hook.ps1`; deferred from M5 — touches all hooks).
     #[serde(skip_serializing_if = "Option::is_none")]
     hook_version_match: Option<bool>,
 }
@@ -1192,13 +1132,10 @@ struct CompatReport {
     visual_audit: Option<VisualAuditCompatInfo>,
 }
 
-/// M12 ch2 — visual-audit summary for `tirith doctor --compat`.
-///
-/// Reported when `config_dir()/visual-audit-result.json` exists and is readable;
-/// absent otherwise (mirrors the `powershell_compat` "no signal at all" gating
-/// via the outer `Option`). The result is INHERENTLY LOCAL — `terminal` records
-/// the `$TERM` the audit ran under so a reader knows it describes this machine's
-/// rendering only. This is a diagnostic surface; it never gates behavior.
+/// M12 ch2 — visual-audit summary for `tirith doctor --compat`. Present only
+/// when `config_dir()/visual-audit-result.json` exists and is readable. The
+/// result is INHERENTLY LOCAL — `terminal` records the `$TERM` it ran under, so
+/// a reader knows it describes this machine's rendering only. Never gates behavior.
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 struct VisualAuditCompatInfo {
     /// RFC-3339 timestamp the recorded audit ran.
@@ -1215,8 +1152,7 @@ struct VisualAuditCompatInfo {
     skipped: usize,
 }
 
-/// Build the compat report from the shared `gather_info()` state plus
-/// shell-tool conflict detection.
+/// Build the compat report from `gather_info()` plus shell-tool detection.
 fn gather_compat() -> CompatReport {
     let info = gather_info();
     let profile = info.shell_profile.as_ref().map(std::path::PathBuf::from);
@@ -1250,17 +1186,13 @@ fn gather_compat() -> CompatReport {
     }
 }
 
-/// M12 ch2 — read the last `tirith visual-audit` result from
-/// `config_dir()/visual-audit-result.json` and summarize it for the compat
-/// report. FAIL-SAFE: a missing, unreadable, oversized, or unparseable file
-/// yields `None` (no `visual_audit` key in the JSON / no section in the human
-/// report) — never a panic. Reads through the shared, race-free
-/// `read_regular_capped` helper so a result path swapped for a FIFO / device
-/// cannot hang `doctor`.
+/// M12 ch2 — read+summarize the last `tirith visual-audit` result. FAIL-SAFE: a
+/// missing, unreadable, oversized, or unparseable file yields `None`, never a
+/// panic. Reads via the race-free `read_regular_capped` so a result path swapped
+/// for a FIFO/device cannot hang `doctor`.
 fn gather_visual_audit_compat() -> Option<VisualAuditCompatInfo> {
     let path = tirith_core::policy::config_dir()?.join("visual-audit-result.json");
-    // 64 KiB is far more than a genuine result (a timestamp + counts + ~20
-    // per-pair entries) needs; anything larger is treated as unreadable.
+    // 64 KiB far exceeds a genuine result; larger is treated as unreadable.
     let bytes = tirith_core::util::read_regular_capped(&path, 64 * 1024).ok()?;
     let result: crate::cli::visual_audit::VisualAuditResult =
         serde_json::from_slice(&bytes).ok()?;
@@ -1274,55 +1206,27 @@ fn gather_visual_audit_compat() -> Option<VisualAuditCompatInfo> {
     })
 }
 
-/// Detect PowerShell hook compatibility for the `tirith doctor --compat` report.
-///
-/// Returns `None` on hosts where neither `pwsh` nor `powershell` is on PATH so
-/// that JSON consumers see no `powershell_compat` key (the field is
-/// `skip_serializing_if = "Option::is_none"`). When a PowerShell binary IS on
-/// PATH, returns `Some(PsCompatInfo { ... })` with:
-///   - `binary` = the resolved binary name (`"pwsh"` preferred, else `"powershell"`),
-///   - `tirith_status` from the current process env (set by the hook on session start),
-///   - `psreadline_available` from a 3s-budget probe of `Get-Module -ListAvailable PSReadLine`
-///     against the *same* binary (so we don't probe `pwsh` then ask `powershell`
-///     about its modules),
-///   - `hook_version_match` always `None` for now (see field doc).
-///
-/// Timeout pattern: we spawn the PowerShell binary via `std::process::Command::spawn`,
-/// poll `try_wait()` on a 50ms interval, and call `child.kill()` directly on the
-/// owned `Child` handle when the budget expires. This avoids the PID-reuse race
-/// of `libc::kill(pid, SIGKILL)`: `Child::kill()` is safe even if the child
-/// already exited (returns an ignored NotFound on Unix), and we never extract
-/// the raw PID.
+/// Detect PowerShell hook compatibility. `None` when neither `pwsh` nor
+/// `powershell` is on PATH (so JSON consumers see no `powershell_compat` key);
+/// otherwise resolves the binary and probes PSReadLine against the SAME binary.
 fn gather_ps_compat(detected_shell: &str) -> Option<PsCompatInfo> {
     let binary = detect_powershell_binary(detected_shell)?;
-    // The probe returns `Option<bool>` so we can distinguish three states:
-    //   Some(true)  — PSReadLine module is present,
-    //   Some(false) — PSReadLine module is NOT present,
-    //   None        — the probe failed (spawn error, timeout, stdout-read fail).
-    // Collapsing the third case into Some(false) would lie to the operator that
-    // the module is missing when in fact we just could not check. Assign the
-    // Option directly to the field — no extra wrapping.
+    // `Option<bool>` keeps three states: Some(true)/Some(false)/None (probe
+    // failed). Collapsing None into Some(false) would falsely report "missing".
     let psreadline_available = probe_psreadline_available(binary);
     Some(PsCompatInfo {
         binary: binary.to_string(),
         psreadline_available,
-        // hook_version_match: intentionally None until all shell hook files
-        // carry a machine-parseable `# tirith-hook-version:` tag. See the
-        // field doc on `PsCompatInfo::hook_version_match`.
+        // None until all hook files carry a `# tirith-hook-version:` tag.
         hook_version_match: None,
     })
 }
 
-/// Resolve the PowerShell binary on PATH that best matches the operator's
-/// active shell. If the operator's `detected_shell` is `powershell`
-/// (Windows PowerShell 5.1) we probe `powershell` first and only fall back
-/// to `pwsh` — otherwise the doctor would report PSReadLine health from a
-/// runtime DIFFERENT from the one the operator is actually running in,
-/// which is silently misleading. For `detected_shell == "pwsh"` (or any
-/// other value — Unix shells, missing info) we keep the original
-/// pwsh-first order. Returns the static name to be used by both the
-/// availability check AND the PSReadLine probe so module detection
-/// always runs against the same interpreter we reported as found.
+/// Resolve the PATH PowerShell binary best matching the active shell. For
+/// `detected_shell == "powershell"` (5.1) probe `powershell` first, else
+/// pwsh-first — otherwise PSReadLine health would be reported from a DIFFERENT
+/// runtime than the operator runs. Used for both the availability check and the
+/// PSReadLine probe so they agree on one interpreter.
 fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
     let candidates: [&'static str; 2] = match detected_shell {
         "powershell" => ["powershell", "pwsh"],
@@ -1333,59 +1237,35 @@ fn detect_powershell_binary(detected_shell: &str) -> Option<&'static str> {
         .find(|&candidate| probe_command_available(candidate))
 }
 
-/// Run a PowerShell command body with the discipline flags
-/// (`-NoProfile -NonInteractive`) and a 3-second timeout. Returns the
-/// completed `Output` on a clean exit, or `None` if the binary failed to
-/// spawn, the run timed out, or the wait errored.
+/// Run a PowerShell command body with `-NoProfile -NonInteractive` and a 3s
+/// timeout. `None` on spawn failure, timeout, or wait error.
 ///
-/// `-NoProfile` is critical: `-NonInteractive` alone does NOT prevent profile
-/// loading, so without `-NoProfile` user-defined hooks could interfere with
-/// module detection (e.g. by mutating `$env:PSModulePath`) or cause spurious
-/// failures from profile errors. Centralising both flags here means the two
-/// PS probe call sites cannot drift on the discipline.
-///
-/// IMPORTANT: the argument list is PowerShell-specific — this is only valid
-/// for `pwsh` or `powershell.exe`. Calling with any other binary would pass
-/// nonsense arguments.
+/// `-NoProfile` is critical: `-NonInteractive` alone does NOT stop profile
+/// loading, so a user profile could mutate `$env:PSModulePath` or error out and
+/// skew module detection. Args are PowerShell-specific (pwsh / powershell.exe
+/// only).
 fn run_powershell(binary: &str, body: &str) -> Option<std::process::Output> {
     let mut cmd = std::process::Command::new(binary);
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", body]);
     run_with_timeout(&mut cmd, std::time::Duration::from_secs(3))
 }
 
-/// Probe whether a PowerShell binary is available on PATH using a no-op
-/// command. We deliberately do NOT use `--version` here: Windows PowerShell
-/// 5.1 (`powershell.exe`) does not accept `--version`, only `pwsh` does.
-/// Microsoft recommends `$PSVersionTable.PSVersion` for 5.1 introspection;
-/// for a portable existence check, `-Command "exit 0"` works on both
-/// `pwsh` and `powershell.exe`.
+/// Probe whether a PowerShell binary is on PATH via a no-op command. NOT
+/// `--version`: Windows PowerShell 5.1 rejects it (only `pwsh` accepts it);
+/// `-Command "exit 0"` works on both.
 fn probe_command_available(name: &str) -> bool {
-    // Spawn failure (ENOENT — binary not on PATH) and timeout both collapse
-    // to `None` → `false`. A spawned child that exits non-zero is also
-    // treated as "not available", since the only success indicator is
-    // `status.success()`.
+    // Spawn failure / timeout collapse to `None` → `false`; a non-zero exit is
+    // also "not available" (only `status.success()` counts).
     run_powershell(name, "exit 0")
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Probe whether PSReadLine is available to the resolved PowerShell binary.
-/// Required for the Enter / Ctrl+V key bindings in
-/// `shell/lib/powershell-hook.ps1`. We deliberately ask the shell to print
-/// a literal `yes` / `no` rather than relying on exit code, so a non-zero
-/// exit (e.g. PSReadLine missing AND `Get-Module` erroring on some hosts) is
-/// distinguishable from a clean negative.
-///
-/// Returns `Option<bool>` to preserve the three-state semantics promised by
-/// `PsCompatInfo::psreadline_available`:
-/// - `Some(true)` — probe completed AND output trimmed equals (case-insensitive) "yes".
-/// - `Some(false)` — probe completed AND output trimmed equals (case-insensitive)
-///   something other than "yes" (the literal "no", or garbage / empty output from
-///   a profile error that escaped `-NoProfile`).
-/// - `None` — the probe never produced a usable result (spawn fail, killed by
-///   the timeout budget, or stdout couldn't be read). Renders as "unknown
-///   (probe failed or timed out)" in the human report; serializes as `null`
-///   in the JSON report.
+/// Probe whether PSReadLine is available to the resolved PowerShell binary
+/// (required for the key bindings in `shell/lib/powershell-hook.ps1`). Asks for
+/// a literal `yes`/`no` rather than trusting the exit code, so a probe error is
+/// distinguishable from a clean negative. `Option<bool>`: `Some(true)` = "yes",
+/// `Some(false)` = anything else, `None` = probe failed/timed out.
 fn probe_psreadline_available(binary: &str) -> Option<bool> {
     let output = run_powershell(
         binary,
@@ -1395,18 +1275,12 @@ fn probe_psreadline_available(binary: &str) -> Option<bool> {
     Some(stdout.trim().eq_ignore_ascii_case("yes"))
 }
 
-/// Spawn `cmd`, wait up to `timeout` for output, kill on timeout. Returns
-/// `None` if spawn fails, the child cannot be waited on, or the timeout
-/// fires before output arrives.
+/// Spawn `cmd`, wait up to `timeout`, kill on timeout. `None` on spawn/wait
+/// failure or timeout.
 ///
-/// Uses a `try_wait`-based polling loop (50ms cadence) so the original
-/// `std::process::Child` handle stays in scope on the parent thread. On
-/// timeout we call `child.kill()` directly — which is safe even if the
-/// child already exited between the last `try_wait` and the kill call: it
-/// returns an `Os { kind: NotFound }` error in that case which we ignore.
-/// This avoids the PID-reuse race of extracting a raw PID and calling
-/// `libc::kill(pid, SIGKILL)` (the PID may have been recycled for an
-/// unrelated process by then).
+/// Polls `try_wait` (50ms) so the owned `Child` stays in scope and we call
+/// `child.kill()` directly on timeout — safe even if the child already exited
+/// (NotFound is ignored). Avoids the PID-reuse race of `libc::kill(pid, …)`.
 fn run_with_timeout(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -1418,22 +1292,17 @@ fn run_with_timeout(
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            // Child exited cleanly within the budget — collect output.
+            // Exited within budget — collect output.
             Ok(Some(_status)) => return child.wait_with_output().ok(),
-            // Still running: check budget and either keep polling or kill.
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    // Safe even on race with child exiting just now: kill()
-                    // on an already-exited child returns NotFound which we ignore.
-                    let _ = child.kill();
-                    // Reap to avoid leaving a zombie; ignore the result —
-                    // the child is on its way out regardless.
-                    let _ = child.wait();
+                    let _ = child.kill(); // NotFound on an already-exited child is ignored
+                    let _ = child.wait(); // reap to avoid a zombie
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            // Wait failed (rare, e.g. EINTR loop exhausted) — best-effort kill.
+            // Wait failed (rare) — best-effort kill.
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1463,28 +1332,20 @@ fn run_compat(json: bool) -> i32 {
 
 // --- Diagnostic bundle (`tirith doctor --bundle`) --------------------------
 //
-// Roadmap item #25. Produces a single redacted text file a user can attach to
-// a bug report: doctor info, tirith + hook versions, shell / mode / effective
-// protection, hook-chain state, policy discovery, threat-DB status, and a
-// curated slice of the environment. `--redacted-report` and `--shell-trace`
-// are aliases for the same output.
+// Roadmap item #25. A single redacted text file for bug reports (doctor info,
+// versions, shell/mode/protection, hook chain, policy, threat-DB, curated env).
 //
-// Redaction is the load-bearing safety property and is deliberately layered:
-//
-//   1. The environment section emits only a CURATED ALLOWLIST of variable
-//      names — never the whole environment — so an unrelated `AWS_SECRET…`
-//      or `OPENAI_API_KEY` is never even a candidate for inclusion.
-//   2. Every value that *is* emitted is still run through `redact_secrets`,
-//      which masks anything that looks like a token/secret. Defense in depth:
-//      even an allowlisted var (or a free-text field) cannot leak a secret.
-//   3. As the final pass over the fully-assembled text, the literal
-//      home-directory path is replaced with `~`, so absolute paths in the
-//      report do not reveal the account's username.
+// Redaction is the load-bearing safety property, layered:
+//   1. The env section emits only a CURATED ALLOWLIST of names — so an
+//      `AWS_SECRET…` / `OPENAI_API_KEY` is never even a candidate.
+//   2. Every emitted value still runs through `redact_secrets` (defense in
+//      depth — even an allowlisted var cannot leak a secret).
+//   3. A final pass replaces the literal home-dir path with `~` so absolute
+//      paths don't reveal the username.
 
-/// Environment variables relevant to a tirith diagnostics bundle. ONLY these
-/// names are emitted — the bundle never dumps the full environment. Anything
-/// not on this list (cloud credentials, API keys, unrelated app secrets) is
-/// excluded by construction. Values are still scrubbed by `redact_secrets`.
+/// Env variables emitted in a diagnostics bundle. ONLY these names appear (the
+/// bundle never dumps the full env); anything else (creds, API keys) is excluded
+/// by construction. Values are still scrubbed by `redact_secrets`.
 const BUNDLE_ENV_ALLOWLIST: &[&str] = &[
     // Shell identity / interactivity.
     "SHELL",
@@ -1518,23 +1379,20 @@ const BUNDLE_ENV_ALLOWLIST: &[&str] = &[
     "HISTIGNORE",
 ];
 
-/// Mask the literal home-directory path wherever it appears in `text`,
-/// replacing it with `~`. The bundle is full of absolute paths (hook dir,
-/// policy paths, data dir); without this they would spell out the account
-/// username. Applied as the very last pass over the assembled report.
-///
-/// Returns the input unchanged when the home directory cannot be determined.
+/// Replace the literal home-directory path with `~` everywhere in `text` (the
+/// bundle's absolute paths would otherwise spell out the username). Applied as
+/// the last pass. Input unchanged when home can't be determined.
 fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
     let home = match home {
         Some(h) => h.to_string_lossy().into_owned(),
         None => return text.to_string(),
     };
-    // An empty or `/` home would turn the replacement into nonsense — skip.
+    // An empty or `/` home would make the replacement nonsense — skip.
     if home.is_empty() || home == "/" {
         return text.to_string();
     }
-    // Strip one trailing separator so both `/Users/alice` and `/Users/alice/`
-    // forms collapse onto `~` consistently.
+    // Strip a trailing separator so `/Users/alice` and `/Users/alice/` both
+    // collapse to `~`.
     let trimmed = home.trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
         return text.to_string();
@@ -1542,14 +1400,12 @@ fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
     text.replace(trimmed, "~")
 }
 
-/// Heuristically mask secret-looking values in a single line of bundle text.
-///
-/// This is the second redaction layer (after the env allowlist): it scrubs any
-/// `key=value` / `key: value` pair whose key OR value looks credential-bearing.
-/// Conservative by design — for a diagnostic bundle, a false-positive redaction
-/// is harmless, a missed secret is not.
+/// Heuristically mask secret-looking values in one line of bundle text (the
+/// second redaction layer): scrub any `key=value` / `key: value` whose key OR
+/// value looks credential-bearing. Conservative by design — a false-positive
+/// redaction is harmless, a missed secret is not.
 fn redact_secrets(line: &str) -> String {
-    // Split on the first `=` or `:` so we can inspect key and value separately.
+    // Split on the first `=` or `:` to inspect key and value separately.
     let (key, sep, value) = if let Some(idx) = line.find('=') {
         (&line[..idx], '=', &line[idx + 1..])
     } else if let Some(idx) = line.find(": ") {
@@ -1562,7 +1418,7 @@ fn redact_secrets(line: &str) -> String {
     let key_signals_secret = ["token", "secret", "password", "passwd", "api_key", "apikey"]
         .iter()
         .any(|m| key_l.contains(m))
-        // `*_key` / `*-key` but not the benign `keyboard`, `keymap`, etc.
+        // `*key` but matched by suffix, so benign `keyboard`/`keymap` don't trip.
         || key_l.ends_with("key")
         || key_l.ends_with("_key")
         || key_l.ends_with("-key");
@@ -1571,8 +1427,7 @@ fn redact_secrets(line: &str) -> String {
     let value_signals_secret = looks_like_secret(trimmed_value);
 
     if key_signals_secret || value_signals_secret {
-        // `key` carries any leading indentation already, so reuse it verbatim
-        // and only swap the value. The separator form is preserved.
+        // Reuse `key` verbatim (keeps indentation), swap only the value.
         if sep == ':' {
             format!("{key}: <redacted>")
         } else {
@@ -1583,9 +1438,8 @@ fn redact_secrets(line: &str) -> String {
     }
 }
 
-/// True when `value` looks like a token / secret: a long unbroken run of
-/// base64/hex-ish characters, or a well-known credential prefix. Short or
-/// obviously non-secret values (paths, numbers, words) return false.
+/// True when `value` looks like a token/secret: a long base64/hex-ish run or a
+/// known credential prefix. Paths, numbers, and words return false.
 fn looks_like_secret(value: &str) -> bool {
     if value.is_empty() || value == "<redacted>" {
         return false;
@@ -1609,15 +1463,14 @@ fn looks_like_secret(value: &str) -> bool {
     if SECRET_PREFIXES.iter().any(|p| value.starts_with(p)) {
         return true;
     }
-    // A long unbroken high-entropy-looking run (no spaces, no path separators):
-    // 24+ chars drawn only from the base64url / hex alphabet.
+    // A long (24+) high-entropy run from the base64url/hex alphabet, no spaces
+    // or path separators.
     if value.len() >= 24
         && !value.contains([' ', '/', '\\'])
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '_' | '-' | '=' | '.'))
-        // …and it actually mixes character classes, so a long plain word or a
-        // long path-free filename does not trip it.
+        // …mixing character classes, so a long word / path-free filename is exempt.
         && value.chars().any(|c| c.is_ascii_digit())
         && value.chars().any(|c| c.is_ascii_alphabetic())
     {
@@ -1626,10 +1479,8 @@ fn looks_like_secret(value: &str) -> bool {
     false
 }
 
-/// Assemble the full diagnostic bundle as a single redacted text blob.
-///
-/// `home` is threaded in (rather than read inside) so tests can drive the
-/// home-path redaction deterministically.
+/// Assemble the full diagnostic bundle as a single redacted text blob. `home` is
+/// a parameter so tests can drive the home-path redaction deterministically.
 fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     let info = gather_info();
     let compat = gather_compat();
@@ -1790,8 +1641,7 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
                 continue;
             }
             any_env = true;
-            // `redact_secrets` scrubs the value if it (or the key) looks
-            // credential-bearing — a second layer behind the allowlist.
+            // Second layer behind the allowlist: scrub credential-looking values.
             line(redact_secrets(&format!("{name}={value}")));
         }
     }
@@ -1806,27 +1656,19 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     redact_home_path(&out, home)
 }
 
-/// Write `text` to a freshly-created, randomly-named bundle file in `dir` and
-/// return the path it landed at.
+/// Write `text` to a freshly-created, randomly-named bundle file in `dir`.
 ///
-/// The filename is *random*, not a predictable `tirith-bundle-<timestamp>`:
-/// `tempfile::Builder` creates the file with `O_EXCL`, so an attacker cannot
-/// pre-create the path as a symlink and redirect the write, and two runs in the
-/// same second cannot collide or clobber. The `tirith-bundle-` prefix is purely
-/// cosmetic — the security comes entirely from the random suffix and the
-/// exclusive create. On Unix the file handle is chmod'd to `0600` *before* the
-/// content is written, so the redacted-but-still-diagnostic bundle is never
-/// even briefly world-readable. `keep()` persists the temp file at its existing
-/// random path (it is deliberately NOT `persist()`ed onto a predictable name —
-/// that would reintroduce the symlink/TOCTOU hole). Mirrors the safe-write
-/// style of `bash_capability::write_cache`.
+/// The random name + `O_EXCL` create (via `tempfile::Builder`) closes the
+/// symlink/TOCTOU hole a predictable `tirith-bundle-<timestamp>` would open; the
+/// prefix is cosmetic. On Unix the handle is chmod'd `0600` BEFORE the write, so
+/// the bundle is never briefly world-readable. `keep()` persists at the random
+/// path (NOT `persist()` onto a guessable name).
 fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathBuf> {
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-bundle-")
         .suffix(".txt")
         .tempfile_in(dir)?;
-    // Tighten permissions on the open handle before writing any content, so the
-    // bundle is never momentarily readable by other users.
+    // Tighten permissions before writing any content.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1836,20 +1678,18 @@ fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathB
     use std::io::Write;
     tmp.write_all(text.as_bytes())?;
     tmp.flush()?;
-    // `keep()` disarms the auto-delete and hands back the file's *current*
-    // (random) path — exactly what we print. No rename onto a guessable name.
+    // keep() hands back the current (random) path — no rename onto a guessable name.
     let (_file, path) = tmp.keep().map_err(|e| e.error)?;
     Ok(path)
 }
 
-/// `tirith doctor --bundle`: write the redacted diagnostic bundle to a file
-/// and print its path. With `--format json`, prints `{"bundle_path": "..."}`.
+/// `tirith doctor --bundle`: write the redacted bundle to a file and print its
+/// path. With `--format json`, prints `{"bundle_path": "..."}`.
 fn run_bundle(json: bool) -> i32 {
     let home = home::home_dir();
     let text = build_bundle_text(home.as_deref());
 
-    // Write into the tirith state dir, which already exists for any configured
-    // install; fall back to the system temp dir if it cannot be determined.
+    // Write into the state dir; fall back to the system temp dir.
     let dir = tirith_core::policy::state_dir().unwrap_or_else(std::env::temp_dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("tirith: could not create {}: {e}", dir.display());
@@ -1865,8 +1705,7 @@ fn run_bundle(json: bool) -> i32 {
     };
 
     if json {
-        // The path itself can contain the home dir; redact it the same way the
-        // bundle body is redacted so the JSON is as safe as the file.
+        // The path can contain the home dir; redact it like the bundle body.
         let shown = redact_home_path(&path.display().to_string(), home.as_deref());
         match serde_json::to_string_pretty(&serde_json::json!({ "bundle_path": shown })) {
             Ok(s) => println!("{s}"),
@@ -1886,16 +1725,10 @@ fn run_bundle(json: bool) -> i32 {
     0
 }
 
-/// The `protection status:` line for `tirith doctor --compat`, derived from the
-/// hook-exported `TIRITH_STATUS` value. `None` when the line should be omitted.
-///
-/// `TIRITH_STATUS` is exported by *every* tirith shell hook — bash, zsh, fish,
-/// PowerShell, nushell — so this status MUST be surfaced regardless of the
-/// detected shell. It was previously printed only inside the bash-only branch,
-/// which silently dropped it for, e.g., a zsh session with
-/// `TIRITH_STATUS=degraded`. A `degraded` status gets an explicit callout; an
-/// unset variable yields `None` (the rest of the report still indicates the
-/// hook was not loaded).
+/// The `protection status:` line for `tirith doctor --compat`, from
+/// `TIRITH_STATUS`; `None` to omit. Surfaced for EVERY shell (the var is
+/// exported by every hook), not just bash — a previous bash-only gate dropped it
+/// for e.g. a degraded zsh session. `degraded` gets an explicit callout.
 fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
     match status {
         Some("degraded") => Some(
@@ -1907,11 +1740,8 @@ fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
 }
 
 /// Render the full `tirith doctor --compat` human report into a string.
-///
-/// Returning a `String` (rather than printing directly) keeps the report
-/// unit-testable — in particular the F3 property that `TIRITH_STATUS` is
-/// surfaced for *non-bash* shells, which a stdout-only function could not be
-/// asserted on without process plumbing.
+/// Returning a `String` (vs printing) keeps it unit-testable — notably the F3
+/// property that `TIRITH_STATUS` is surfaced for non-bash shells.
 fn format_compat_human(r: &CompatReport) -> String {
     let mut out = String::new();
     let mut line = |s: &str| {
@@ -1927,13 +1757,11 @@ fn format_compat_human(r: &CompatReport) -> String {
     line(&format!("  interactive:   {}", r.interactive));
     line("");
 
-    // Shell mode / protection. Bash is the only shell with a requested-vs-
-    // effective split today; for other shells we just report what (if
-    // anything) the hook exported into this process.
+    // Bash is the only shell with a requested-vs-effective split; others just
+    // report what the hook exported.
     line("Shell hook mode");
-    // Live cross-shell protection status, from the hook-exported
-    // `TIRITH_STATUS`. Emitted unconditionally — every shell's hook exports it,
-    // so it must not be gated behind the bash-only branch below.
+    // Cross-shell `TIRITH_STATUS` — emitted unconditionally (every hook exports
+    // it), NOT gated behind the bash-only branch below.
     if let Some(status_line) = compat_protection_status_line(r.tirith_status.as_deref()) {
         line(&status_line);
     }
@@ -2078,12 +1906,9 @@ fn format_compat_human(r: &CompatReport) -> String {
         }
     }
 
-    // PowerShell hook health — only emitted when a PowerShell binary
-    // (`pwsh` or `powershell`) is on PATH. Same gating as the JSON field:
-    // hosts without PowerShell get no section.  TIRITH_STATUS is intentionally
-    // NOT re-printed here: the parent report (`Shell hook mode`) already
-    // surfaces it from the same env var, and duplicating it would let a
-    // future refactor drift one copy from the other.
+    // PowerShell hook health — only when a PS binary is on PATH (same gating as
+    // the JSON field). TIRITH_STATUS is NOT re-printed: `Shell hook mode` above
+    // already surfaces it, and a duplicate could drift.
     if let Some(ps) = &r.powershell_compat {
         line("");
         line("--- PowerShell compat ---");
@@ -2097,10 +1922,9 @@ fn format_compat_human(r: &CompatReport) -> String {
         // until shell hook files carry a `# tirith-hook-version:` tag.
     }
 
-    // Visual-audit summary — only emitted when the operator has run
-    // `tirith visual-audit` at least once (the result file exists). Same gating
-    // as the JSON field. The recorded answers describe only the terminal the
-    // audit ran under, so the `TERM` is shown alongside.
+    // Visual-audit summary — only when the result file exists (same gating as
+    // the JSON field). Answers describe only the terminal it ran under, so the
+    // `TERM` is shown alongside.
     if let Some(va) = &r.visual_audit {
         line("");
         line("--- Visual audit (local terminal/font) ---");
@@ -2133,10 +1957,8 @@ fn print_compat_human(r: &CompatReport) {
     print!("{}", format_compat_human(r));
 }
 
-/// Render the cross-shell `protection status:` line from the hook-exported
-/// `TIRITH_STATUS` value. A `degraded` status gets an explicit, unmistakable
-/// callout — the whole point of the indicator is that a downgrade is never
-/// something the reader has to infer.
+/// Render the cross-shell `protection:` line from `TIRITH_STATUS`. A `degraded`
+/// status gets an explicit callout so a downgrade is never something to infer.
 fn print_protection_status(status: Option<&str>) {
     match status {
         Some("blocks") => {
@@ -2158,14 +1980,12 @@ fn print_protection_status(status: Option<&str>) {
             println!("  protection:   off (the tirith hook installed nothing in this shell)");
         }
         Some(other) => {
-            // Forward-compatible: an unrecognised value is shown verbatim
-            // rather than silently dropped.
+            // Forward-compatible: unrecognised value shown verbatim.
             println!("  protection:   {other}");
         }
         None => {
-            // No hook ran in the invoking process — usually a non-interactive
-            // subshell. The bash block below prints the fuller "not loaded"
-            // diagnostic; here we stay quiet to avoid a redundant line.
+            // No hook ran (usually a non-interactive subshell); the bash block
+            // below prints the fuller "not loaded" diagnostic.
         }
     }
 }
@@ -2222,7 +2042,7 @@ fn print_human(info: &DoctorInfo) {
                 println!("    tirith init --shell nushell");
                 println!("    # Then add to ~/.config/nushell/config.nu:");
                 if let Some(ref dir) = info.hook_dir {
-                    // Escape for Nushell double-quoted string: \ → \\, " → \"
+                    // Escape for a Nushell double-quoted string.
                     let escaped = dir.replace('\\', r"\\").replace('"', r#"\""#);
                     println!(r#"    source "{escaped}/lib/nushell-hook.nu""#);
                 } else {
@@ -2238,15 +2058,10 @@ fn print_human(info: &DoctorInfo) {
         }
         println!();
     }
-    // Cross-shell live protection status, from the hook-exported
-    // `TIRITH_STATUS`. A degraded session is called out explicitly here so the
-    // reader never has to infer it from `effective protection: warn-only`.
+    // Cross-shell live protection status from `TIRITH_STATUS`.
     print_protection_status(info.tirith_status.as_deref());
-    // Bash-only block: show requested vs effective state so mid-session
-    // degrades and env misconfigurations are legible. Also shown whenever any
-    // bash-related env var is present, so users who source the hook from a
-    // non-bash parent (e.g. a zsh login shell that spawns bash) still get the
-    // right diagnostics.
+    // Bash-only block: requested vs effective state. Also shown whenever any
+    // bash env var is present (e.g. a zsh parent that spawns bash).
     let has_any_bash_env = info.bash_requested_mode.is_some()
         || info.bash_requested_enforce.is_some()
         || info.bash_requested_require_enter.is_some()
@@ -2298,9 +2113,8 @@ fn print_human(info: &DoctorInfo) {
             println!("  safe mode:            off");
         }
 
-        // Cached bash enter-mode delivery capability (issue #111). The hook
-        // selects enter mode (blocking) by default only when this verdict is
-        // `works` and fresh; otherwise it falls back to preexec (warn-only).
+        // Cached bash enter-mode capability (issue #111): the hook picks enter
+        // mode (blocking) only when this is `works` and fresh, else preexec.
         match info.bash_enter_capability.as_deref() {
             Some(verdict) => {
                 let fresh = info.bash_enter_capability_fresh.unwrap_or(false);
@@ -2338,7 +2152,7 @@ fn print_human(info: &DoctorInfo) {
             println!("                        recorded failure and stay in preexec.");
         }
     } else if info.bash_safe_mode {
-        // Non-bash shell but safe-mode flag exists: still surface it.
+        // Non-bash shell, but the safe-mode flag exists — surface it anyway.
         println!("  bash safe mode:       on (Reset: tirith doctor --reset-bash-safe-mode)");
     }
     if info.policy_paths.is_empty() {
@@ -2421,10 +2235,9 @@ fn print_human(info: &DoctorInfo) {
         println!("  threat DB:    not available");
     }
 
-    // M10 ch5 — opt-in anomaly baseline. Always shown so the reader knows it
-    // exists and whether it is on. When on but sparse, call out early-baseline
-    // mode (per risk #2) so a flood of "first time" Info notes is understood as
-    // expected, not a bug.
+    // M10 ch5 — opt-in anomaly baseline, always shown. When on but sparse, call
+    // out early-baseline mode (risk #2) so the "first time" Info flood reads as
+    // expected.
     if info.baseline.enabled {
         if info.baseline.early_baseline_mode {
             println!(
@@ -2470,7 +2283,7 @@ fn print_human(info: &DoctorInfo) {
             );
         } else {
             let pct = if gaps.raw_total_findings > 0 {
-                // Scoped to analyzed records (those with raw_rule_ids), not the full set.
+                // Scoped to analyzed (raw_rule_ids) records, not the full set.
                 (gaps.hidden_findings as f64 / gaps.raw_total_findings as f64 * 100.0) as usize
             } else {
                 0
@@ -2545,10 +2358,9 @@ fn print_human(info: &DoctorInfo) {
     }
 }
 
-/// Format the "could not read a shell profile" diagnostic. Kept as a pure,
-/// caller-neutral helper so the prefix is whatever the caller passed (e.g.
-/// `"tirith: doctor:"` or `"tirith: onboard:"`) rather than a hard-coded label,
-/// and so a unit test can assert the message wording without capturing stderr.
+/// Format the "could not read a shell profile" diagnostic. Caller-neutral (the
+/// prefix is the caller's `command_label`, not a hard-coded "doctor:") and pure,
+/// so a unit test can assert the wording without capturing stderr.
 fn unreadable_profile_msg(
     command_label: &str,
     profile: &std::path::Path,
@@ -2560,17 +2372,10 @@ fn unreadable_profile_msg(
     )
 }
 
-/// Check if the user's shell profile contains tirith init configuration.
-/// Returns (profile_path, is_configured).
-///
-/// `pub(crate)` so the read-only `tirith onboard` detector can reuse the exact
-/// same "is the shell hook wired into the profile?" check rather than
-/// reinventing profile discovery.
-///
-/// `command_label` is the log prefix the *caller* uses for its own diagnostics
-/// (e.g. `"tirith: doctor:"` or `"tirith: onboard:"`); the helper itself stays
-/// caller-neutral so the same code path can be reused outside `doctor` without
-/// surfacing a misleading "doctor:" prefix.
+/// Whether the user's shell profile contains tirith init config. Returns
+/// `(profile_path, is_configured)`. `pub(crate)` so the `tirith onboard`
+/// detector reuses the same check. `command_label` is the caller's log prefix
+/// (so the shared path doesn't surface a misleading "doctor:" elsewhere).
 pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<PathBuf>, bool) {
     let home = match home::home_dir() {
         Some(h) => h,
@@ -2620,8 +2425,7 @@ pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<P
         _ => return (None, false),
     };
 
-    // Scan ALL candidates — a profile can exist without containing the hook,
-    // so the first existing file is not necessarily the configured one.
+    // Scan ALL candidates — the first existing file may not be the configured one.
     let mut first_existing = None;
     for profile in &profile_candidates {
         if profile.exists() {
@@ -2648,15 +2452,11 @@ pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<P
     (primary, false)
 }
 
-/// `tirith doctor --simulate-enter`: run the bash enter-mode delivery
-/// self-test, print a verdict, and cache the result for the hook to read.
-///
-/// The self-test spawns a disposable bash through a PTY, sources the real hook
-/// in enter mode, and verifies that an allowed command is delivered exactly
-/// once AND that a command tirith would block is actually stopped. Enter mode
-/// is the only bash mode that can truly block, but `bind -x` on Enter does not
-/// reliably accept the line in every environment (issue #111) — this proves
-/// whether it works *here* rather than guessing from the bash version.
+/// `tirith doctor --simulate-enter`: run the bash enter-mode delivery self-test
+/// (spawn a disposable PTY bash, source the hook in enter mode, verify an
+/// allowed command runs once and a blocked one is stopped) and cache the result
+/// for the hook. Proves whether `bind -x` on Enter works HERE (issue #111)
+/// rather than guessing from the bash version.
 #[cfg(unix)]
 fn run_simulate_enter() -> i32 {
     println!("tirith: running bash enter-mode delivery self-test...");
@@ -2677,9 +2477,8 @@ fn run_simulate_enter() -> i32 {
     }
 
     println!();
-    // Enter mode is only actually enabled for new shells when BOTH the verdict
-    // is `works` AND the cache was written — the hook reads the cache file, so
-    // a failed write means new shells still fall back to preexec.
+    // Enter mode is enabled for new shells only when the verdict is `works` AND
+    // the cache was written (the hook reads the cache; a failed write → preexec).
     if outcome.capability.enables_enter() && outcome.cache_path.is_some() {
         println!("tirith: enter mode (blocking) is enabled for bash in new shells.");
     } else if outcome.capability.enables_enter() {
@@ -2693,7 +2492,7 @@ fn run_simulate_enter() -> i32 {
     0
 }
 
-/// Non-Unix stub: enter mode and its `bind -x` machinery are Unix-only.
+/// Non-Unix stub: enter mode / `bind -x` are Unix-only.
 #[cfg(not(unix))]
 fn run_simulate_enter() -> i32 {
     println!("tirith: --simulate-enter is only meaningful on Unix (bash enter mode)");
@@ -2742,9 +2541,8 @@ mod tests {
         tools.iter().filter(|t| t.name == name).count()
     }
 
-    // M13 PR #132 round-24 finding F2: `check_shell_profile` is shared by
-    // `doctor`, `onboard`, and `dashboard`, so its unreadable-profile diagnostic
-    // must use the *caller's* prefix rather than a hard-coded "doctor:" label.
+    // M13 #132 F2: the shared `check_shell_profile` diagnostic must use the
+    // caller's prefix, not a hard-coded "doctor:".
     #[test]
     fn unreadable_profile_msg_uses_caller_label_not_hardcoded_doctor() {
         let profile = PathBuf::from("/tmp/.zshrc");
@@ -2879,11 +2677,9 @@ mod tests {
         });
     }
 
-    /// Regression for the fix in policy.rs::find_workspace_kiro_dir: when cwd
-    /// is *under* $HOME and only `~/.kiro/agents/tirith-security.json` exists
-    /// (no project workspace), detection must report user-scope. Without the
-    /// home-exclusion, find_workspace_kiro_dir would walk up to $HOME, find
-    /// `~/.kiro/`, and incorrectly classify it as a project workspace.
+    /// Regression (policy.rs::find_workspace_kiro_dir): cwd under $HOME with only
+    /// `~/.kiro/agents/tirith-security.json` must report user-scope, not project
+    /// (without the home-exclusion it would treat `~/.kiro/` as a workspace).
     #[test]
     fn detect_ai_tools_does_not_classify_home_kiro_as_project() {
         with_fake_env(true, |home, _cwd| {
@@ -2906,9 +2702,8 @@ mod tests {
         });
     }
 
-    /// Regression: even WITHOUT a managed file, a cwd under $HOME must not
-    /// pick up `~/.kiro/` as a project-bootstrap signal — that should fire
-    /// the user-bootstrap branch, not project-bootstrap.
+    /// Regression: with no managed file, a cwd under $HOME must take the
+    /// user-bootstrap branch, not project-bootstrap, from `~/.kiro/`.
     #[test]
     fn detect_ai_tools_home_kiro_only_is_user_bootstrap_not_project() {
         with_fake_env(true, |home, _cwd| {
@@ -2946,10 +2741,9 @@ mod tests {
 
     // --- collect_policy_paths (#112) ---------------------------------------
     //
-    // Every test isolates BOTH `TIRITH_POLICY_ROOT` and `XDG_CONFIG_HOME`:
-    // `with_fake_env` fakes `$HOME` but not those, and a machine-level
-    // `XDG_CONFIG_HOME`/`TIRITH_POLICY_ROOT` would otherwise leak into the
-    // assertions. cwd is passed explicitly so process cwd is never relied on.
+    // Each test isolates `TIRITH_POLICY_ROOT` and `XDG_CONFIG_HOME` (which
+    // `with_fake_env` does not fake) so machine-level values can't leak in; cwd
+    // is passed explicitly.
 
     #[test]
     fn collect_policy_paths_finds_repo_root_policy() {
@@ -3253,19 +3047,16 @@ mod tests {
 
     // --- bundle assembly: end-to-end redaction ----------------------------
 
-    /// The load-bearing safety test: the assembled bundle must NOT contain a
-    /// secret-shaped value placed in an allowlisted env var, and must NOT
-    /// contain the literal home-directory path.
+    /// Load-bearing safety test: the bundle must NOT contain a secret-shaped
+    /// value in an allowlisted env var, nor the literal home-dir path.
     #[test]
     fn build_bundle_text_redacts_secrets_and_home_path() {
         with_fake_env(false, |home, _cwd| {
-            // `TIRITH_SESSION_ID` is on the env allowlist, so it WILL be
-            // emitted — but its value here is token-shaped, so the value
-            // layer must scrub it.
+            // `TIRITH_SESSION_ID` is allowlisted so it IS emitted — but its
+            // token-shaped value must be scrubbed by the value layer.
             let secret = "ghp_DEADBEEFdeadbeef0123456789abcdef0123";
             let _sid = EnvGuard::set("TIRITH_SESSION_ID", std::path::Path::new(secret));
-            // A genuinely secret-named var that is NOT on the allowlist must
-            // never appear at all (allowlist layer).
+            // A secret-named var NOT on the allowlist must never appear at all.
             let _leak = EnvGuard::set(
                 "AWS_SECRET_ACCESS_KEY",
                 std::path::Path::new("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
@@ -3320,10 +3111,8 @@ mod tests {
         });
     }
 
-    /// True when `name` has the predictable `tirith-bundle-<UTC-timestamp>.txt`
-    /// shape the F2 fix eliminates — `tirith-bundle-` + `YYYYMMDDTHHMMSSZ` (8
-    /// digits, `T`, 6 digits, `Z`) + `.txt`. The new code must NOT produce a
-    /// name of this form; it uses a random `tempfile` suffix instead.
+    /// True for the predictable `tirith-bundle-YYYYMMDDTHHMMSSZ.txt` shape the F2
+    /// fix eliminates (the new code uses a random suffix instead).
     fn is_predictable_timestamp_bundle_name(name: &str) -> bool {
         let Some(mid) = name
             .strip_prefix("tirith-bundle-")
@@ -3535,14 +3324,9 @@ mod tests {
         }
     }
 
-    // ── PowerShell compat section in format_compat_human (M5 wave-end ──
-    // ── finding B: doctor --compat PS-success-path was untested) ──────
-    //
-    // The probe of `pwsh` only happens on hosts with PowerShell on PATH,
-    // so the success branches of `format_compat_human`'s PS section
-    // could not be exercised in CI. Build a `CompatReport` with the
-    // PS section pre-populated and assert each `psreadline_available`
-    // branch renders the expected human text.
+    // M5 finding B: the PS-success branches of `format_compat_human` are
+    // unreachable in CI (no `pwsh` on PATH), so pre-populate the PS section and
+    // assert each `psreadline_available` branch's human text.
 
     fn compat_report_with_ps(psreadline_available: Option<bool>) -> CompatReport {
         let mut r = compat_report_for("powershell", None);
@@ -3584,9 +3368,8 @@ mod tests {
     // ── Visual-audit compat (M12 ch2) ─────────────────────────────────
     //
     // `gather_visual_audit_compat` reads `config_dir()/visual-audit-result.json`
-    // (driven by `XDG_CONFIG_HOME` on Unix via etcetera). These tests isolate
-    // `XDG_CONFIG_HOME` under `ENV_LOCK` so they don't race other env-mutating
-    // tests, and synthesize the result file directly (no live audit run).
+    // via `XDG_CONFIG_HOME`. Isolated under `ENV_LOCK`, result file synthesized
+    // directly (no live audit run).
 
     /// A synthesized result file is read and summarized, fields intact.
     #[test]
@@ -3594,8 +3377,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = tempfile::tempdir().expect("config tempdir");
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", cfg.path());
-        // etcetera's config_dir() == $XDG_CONFIG_HOME, and tirith appends
-        // `tirith/`. Write the result where `config_dir()` will look.
+        // config_dir() == $XDG_CONFIG_HOME + `tirith/`; write the result there.
         let tirith_cfg = cfg.path().join("tirith");
         std::fs::create_dir_all(&tirith_cfg).expect("mkdir tirith config");
         std::fs::write(
@@ -3690,21 +3472,13 @@ mod tests {
 
     // ── Quick status path (M14 — `tirith doctor --quick`) ─────────────────
     //
-    // The VS Code extension polls `tirith doctor --quick --format json` (~30s).
-    // These tests pin the minimal JSON contract (exactly three status fields +
-    // `schema_version`) and prove the quick gather touches ONLY cheap sources —
-    // no audit-log / threat-DB / baseline / shadow-binary probe runs.
-    //
-    // Env isolation mirrors the `collect_policy_paths` tests: `with_fake_env`
-    // fakes `$HOME`/cwd, and we additionally pin `TIRITH_POLICY_ROOT`,
-    // `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `TIRITH_THREATDB_PATH`, and
-    // `TIRITH_STATUS` under the held `ENV_LOCK` so machine-level values can't
-    // leak into the assertions.
+    // Pins the minimal JSON contract (three status fields + `schema_version`)
+    // and proves the quick gather touches ONLY cheap sources (no audit-log /
+    // threat-DB / baseline / shadow-binary probe). Env isolated under
+    // `ENV_LOCK` so machine-level values can't leak in.
 
-    /// The `doctor --quick` protection-mode mapping is the SAME shared
-    /// function as `tirith prompt-status` uses
-    /// (`cli::prompt_status::protection_mode_from_status`): `blocks` → `guarded`,
-    /// others verbatim, `off`/empty/absent → `off`, unknown passed through.
+    /// The shared mapping (also used by `prompt-status`): `blocks` → `guarded`,
+    /// `off`/empty/absent → `off`, unknown passed through verbatim.
     #[test]
     fn protection_mode_from_status_maps_known_and_unknown() {
         use crate::cli::prompt_status::protection_mode_from_status;
@@ -3721,19 +3495,13 @@ mod tests {
         );
     }
 
-    /// Guard against a future re-divergence between the two protection-mode
-    /// entry points. `tirith doctor --quick` (via `gather_quick_info`) and
-    /// `tirith prompt-status` (via `detect_protection_mode`) BOTH derive
-    /// `protection_mode` from the same `TIRITH_STATUS` env var; they now share
-    /// `prompt_status::protection_mode_from_status`, so for any given status
-    /// value the two surfaces must report an identical mode. We assert that by
-    /// setting `TIRITH_STATUS` and comparing `doctor`'s quick output against
-    /// `prompt_status`'s wrapper for each representative input.
+    /// Guard against re-divergence: `doctor --quick` and `prompt-status` both
+    /// derive `protection_mode` from `TIRITH_STATUS` via the shared
+    /// `protection_mode_from_status`, so they must agree for every status value.
     #[test]
     fn doctor_quick_and_prompt_status_agree_on_protection_mode() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Capture + restore the ambient `TIRITH_STATUS` on Drop; we overwrite it
-        // per-iteration below under the held lock.
+        // Restore ambient `TIRITH_STATUS` on Drop; overwritten per-iteration.
         let _status_guard = EnvGuard::remove("TIRITH_STATUS");
 
         for status in ["blocks", "warn-only", "degraded", "off", "", "futureValue"] {
@@ -3750,9 +3518,8 @@ mod tests {
         }
     }
 
-    /// The quick JSON has EXACTLY the documented field set — the four keys
-    /// `schema_version`, `protection_mode`, `policy_path_used`, `hook_configured`
-    /// and nothing else (the extension contract must stay minimal/stable).
+    /// The quick JSON has EXACTLY the four documented keys and nothing else
+    /// (the extension contract must stay minimal/stable).
     #[test]
     fn quick_json_has_exactly_the_documented_fields() {
         let info = QuickDoctorInfo {
@@ -3845,15 +3612,10 @@ mod tests {
         });
     }
 
-    /// The quick gather must NOT consult the audit log, threat DB, or baseline
-    /// store. We plant a poisoned `log.jsonl` and a garbage threat-DB file in the
-    /// fake data dir and a garbage baseline in the state dir; `gather_quick_info`
-    /// still returns the values derived purely from the cheap sources we set
-    /// (status + policy + profile). If the quick path read any of those files it
-    /// would either error/log on the corrupt log or deserialize the DB — neither
-    /// can affect the result here, which is the structural proof those probes are
-    /// skipped. (The expensive probes are private to the full `gather_info`; this
-    /// asserts the smallest observable seam.)
+    /// The quick gather must NOT consult the audit log, threat DB, or baseline.
+    /// We plant corrupt versions of each; `gather_quick_info` still returns
+    /// values derived purely from the cheap sources (status + policy + profile),
+    /// which is the structural proof those probes are skipped.
     #[test]
     fn gather_quick_info_ignores_audit_log_threatdb_and_baseline() {
         with_fake_env(true, |home, _cwd| {
@@ -3861,36 +3623,32 @@ mod tests {
             let _xdg_cfg = EnvGuard::remove("XDG_CONFIG_HOME");
             let _status = EnvGuard::set("TIRITH_STATUS", std::path::Path::new("warn-only"));
 
-            // Point the data dir at a temp location (covers Linux's XDG_DATA_HOME;
-            // on macOS the data dir is under the faked $HOME already, so also drop
-            // a poisoned log there). Then plant corrupt artifacts the expensive
-            // probes would choke on.
+            // Point the data dir at a temp location (and, for macOS, the faked
+            // $HOME too), then plant corrupt artifacts the expensive probes
+            // would choke on.
             let data = tempfile::tempdir().expect("data tempdir");
             let _xdg_data = EnvGuard::set("XDG_DATA_HOME", data.path());
             let _xdg_state = EnvGuard::set("XDG_STATE_HOME", data.path());
 
             let plant = |dir: &std::path::Path| {
                 std::fs::create_dir_all(dir).unwrap();
-                // A non-JSONL audit log: check_detection_gaps would read+parse this.
+                // check_detection_gaps would read+parse this.
                 std::fs::write(dir.join("log.jsonl"), b"{ this is not valid jsonl\n").unwrap();
-                // Garbage threat DB: gather_threat_db_info would deserialize this.
+                // gather_threat_db_info would deserialize this.
                 std::fs::write(dir.join("threatdb.bin"), b"not a real threat db").unwrap();
             };
-            // Cover both possible data-dir resolutions (XDG vs $HOME/Library or
-            // $HOME/.local/share) so the planted files sit wherever the probes
-            // would actually look.
+            // Cover both data-dir resolutions (XDG vs $HOME) so the planted
+            // files sit wherever the probes would look.
             plant(data.path().join("tirith").as_path());
             for rel in [".local/share/tirith", "Library/Application Support/tirith"] {
                 plant(home.join(rel).as_path());
             }
-            // Force the threat-DB path explicitly at a garbage file too.
             let _tdb = EnvGuard::set(
                 "TIRITH_THREATDB_PATH",
                 data.path().join("tirith/threatdb.bin").as_path(),
             );
 
-            // The call returns cleanly, deriving fields ONLY from the cheap
-            // sources — the corrupt files above are never consulted.
+            // Returns cleanly from the cheap sources only — corrupt files unread.
             let info = gather_quick_info();
             assert_eq!(info.schema_version, 1);
             assert_eq!(
@@ -3905,10 +3663,8 @@ mod tests {
         });
     }
 
-    /// `run_quick(true)` (JSON mode) emits parseable JSON with the three status
-    /// fields and exits 0. Exercises the public quick entry end-to-end (capturing
-    /// real stdout is avoided; we assert the gather + serialize contract the
-    /// entry composes).
+    /// `run_quick(true)` emits parseable JSON with the status fields and exits 0
+    /// (we assert the gather + serialize contract, not captured stdout).
     #[test]
     fn run_quick_json_emits_parseable_minimal_object() {
         with_fake_env(true, |_home, _cwd| {

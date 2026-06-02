@@ -9,7 +9,7 @@ use crate::tokenize::ShellType;
 
 use super::types::{ContentItem, ToolCallResult, ToolDefinition};
 
-/// Validate that a path is within the current working directory (path traversal protection).
+/// Validate a path is within the cwd (path-traversal protection).
 fn validate_path_scope(path: &std::path::Path) -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot determine working directory: {e}"))?;
@@ -144,7 +144,7 @@ pub fn list() -> Vec<ToolDefinition> {
         },
     ];
 
-    // Unix-only: cloaking detection (requires network access)
+    // Unix-only: cloaking detection (needs network).
     #[cfg(unix)]
     tools.push(ToolDefinition {
         name: "tirith_fetch_cloaking".into(),
@@ -215,20 +215,15 @@ fn call_check_command(args: &Value) -> ToolCallResult {
 
     let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
 
-    // M4 item 8. Stamp the MCP client origin on the raw verdict;
-    // post-processing (below) consults this via
-    // `escalation::apply_agent_rules` against the active policy's
-    // `agent_rules.deny`, then clones the origin through to the
-    // effective verdict, and the audit entry picks it up automatically.
-    // The `bypass_honored` branch skips post-processing, so deny does
-    // not currently enforce under bypass on this path.
+    // Stamp the MCP client origin; post-processing enforces `agent_rules.deny`
+    // against it and carries it through to the effective verdict + audit. The
+    // `bypass_honored` branch skips post-processing (deny does not enforce
+    // under bypass here).
     raw_verdict.agent_origin = super::origin::current();
 
     let mut verdict = if raw_verdict.bypass_honored {
-        // M4 item 8 chunk 3 — the engine no longer audits its own bypass
-        // path; the caller does. Log the bypass-honored verdict here so
-        // the audit entry carries the MCP client origin we just stamped.
-        // Best-effort — a write failure must not change the verdict.
+        // The engine no longer audits its own bypass path; the caller does, so
+        // the entry carries the origin just stamped. Best-effort.
         let _ = crate::audit::log_verdict(
             &raw_verdict,
             command,
@@ -270,8 +265,8 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: url"),
     };
 
-    // Wrap URL in a minimal curl command so the full pipeline runs.
-    // Shell-quote the URL to prevent metacharacters from being tokenized as separate commands.
+    // Wrap in a minimal curl command so the full pipeline runs; shell-quote the
+    // URL so metacharacters aren't tokenized as separate commands.
     let input = format!("curl '{}'", url.replace('\'', "'\\''"));
     let ctx = AnalysisContext {
         input: input.clone(),
@@ -288,63 +283,36 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    // PR #120 fix-8 (CodeRabbit Major): use the same engine API as
-    // `call_check_command` so analysis and enforcement / approval /
-    // audit all see the same Policy snapshot. The split
-    // `engine::analyze(&ctx)` + `Policy::discover(None)` pair allowed a
-    // mid-call edit of `.tirith/policy.yaml` to swap the policy out
-    // from under the rest of the pipeline.
+    // Single Policy snapshot for analysis + enforcement + approval + audit (the
+    // split `analyze` + `Policy::discover` pair let a mid-call policy edit swap
+    // the policy out from under the pipeline).
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
-    // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
+    // Diagnostic tool — paranoia filter + approval only, no escalation/session.
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // M4 item 8 chunk 3 follow-up — stamp the MCP client origin so the
-    // verdict carries the caller's identity for both observation and
-    // enforcement.
+    // Stamp the MCP client origin for observation + enforcement.
     verdict.agent_origin = super::origin::current();
 
     if verdict.bypass_honored {
-        // M4 PR #120 fix-7 (Greptile P1): pre-fix-3 the engine wrote this
-        // audit entry on its own bypass-fast-exit path; fix-3 (5d94c71)
-        // moved that responsibility to the caller. `call_check_command`
-        // was correctly updated to write a bypass-honored audit entry
-        // (see lines 230-236 above) but the two diagnostic MCP tools
-        // (`call_check_url`, `call_check_paste`) were missed. Restore
-        // the audit-write here so an operator running an MCP-driven
-        // `tirith_check_url` under `TIRITH=0` still gets an audit trail
-        // for the honored-bypass verdict (with the freshly-stamped
-        // `agent_origin`). Best-effort — a write failure must not change
-        // the verdict. The non-bypass diagnostic path remains
-        // audit-silent by design (pre-existing).
+        // fix-7: the engine no longer audits its bypass path; the diagnostic MCP
+        // tools must write it themselves so a `TIRITH=0` `tirith_check_url` still
+        // gets an audit trail (with the stamped origin). Best-effort; the
+        // non-bypass diagnostic path stays audit-silent by design.
         let _ =
             crate::audit::log_verdict(&verdict, &input, None, None, &policy.dlp_custom_patterns);
     } else {
-        // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on
-        // this diagnostic MCP tool. `call_check_url` does not route
-        // through `post_process_verdict` (it intentionally skips
-        // escalation / session bookkeeping), so without this call an
-        // operator who writes a `deny` matcher to block an untrusted
-        // MCP client would see deny enforce on `tirith_check_command`
-        // but silently fail on `tirith_check_url`. The helper is a
-        // no-op on `Allowed`/`Unspecified`.
-        //
-        // M4 PR #120 fix-6 (Greptile P1): the bypass-skip behavior the
-        // hot paths in `check`/`gateway`/`call_check_command` use is
-        // now captured by the outer `else` — under `TIRITH=0`, the raw
-        // verdict already wins and `apply_agent_rules` must NOT
-        // silently re-Block. Pinned by
-        // `agent_rules_deny_skipped_under_tirith_bypass_today` and the
-        // per-surface mirrors.
+        // Enforce `agent_rules.deny` here: this tool skips
+        // `post_process_verdict`, so without this a deny matcher would enforce on
+        // `tirith_check_command` but not here. No-op on `Allowed`/`Unspecified`.
+        // The outer `else` keeps the bypass-skip contract — under `TIRITH=0` the
+        // raw verdict wins and this must NOT re-Block (pinned by
+        // `agent_rules_deny_skipped_under_tirith_bypass_today`).
         crate::escalation::apply_agent_rules(&mut verdict, &policy);
 
-        // M4 PR #120 fix-6 (CodeRabbit Major): derive approval AFTER
-        // `apply_agent_rules` and ONLY when the verdict is not already
-        // Block. Otherwise a denied MCP client would receive both
-        // `action: block` AND `requires_approval` / `approval_*`
-        // metadata, which gives conflicting client instructions ("Block
-        // this" plus "Ask the user to approve"). Pinned by
-        // `mcp_check_url_deny_does_not_emit_approval_metadata`.
+        // Derive approval AFTER deny and only when not already Block, else a
+        // denied client gets conflicting `action: block` + `approval_*` metadata
+        // (pinned by `mcp_check_url_deny_does_not_emit_approval_metadata`).
         if verdict.action != crate::verdict::Action::Block {
             if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
                 crate::approval::apply_approval(&mut verdict, &meta);
@@ -391,52 +359,30 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    // PR #120 fix-8 (CodeRabbit Major): single Policy snapshot for
-    // analysis + enforcement + approval + audit. See `call_check_url`
-    // for the rationale.
+    // Single Policy snapshot for analysis + enforcement + approval + audit (see
+    // `call_check_url`).
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
-    // Diagnostic tool — use paranoia filter + approval only, no escalation/session recording
+    // Diagnostic tool — paranoia filter + approval only, no escalation/session.
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
 
-    // M4 item 8 chunk 3 follow-up — stamp the MCP caller origin on the
-    // paste-diagnostic verdict the same way `check_command` does.
+    // Stamp the MCP caller origin, as `check_command` does.
     verdict.agent_origin = super::origin::current();
 
     if verdict.bypass_honored {
-        // M4 PR #120 fix-7 (Greptile P1): paired with the same fix in
-        // `call_check_url` — pre-fix-3 the engine wrote this audit
-        // entry on its bypass-fast-exit path; fix-3 (5d94c71) moved
-        // that responsibility to the caller and `call_check_command`
-        // was updated, but the two diagnostic MCP tools were missed.
-        // Restore the audit-write here so an operator running an
-        // MCP-driven `tirith_check_paste` under `TIRITH=0` still gets
-        // an audit trail for the honored-bypass verdict. Best-effort —
-        // a write failure must not change the verdict. The non-bypass
-        // diagnostic path remains audit-silent by design (pre-existing).
+        // fix-7 (paired with `call_check_url`): the diagnostic MCP tools must
+        // write the bypass audit entry themselves. Best-effort; non-bypass stays
+        // audit-silent.
         let _ =
             crate::audit::log_verdict(&verdict, &input, None, None, &policy.dlp_custom_patterns);
     } else {
-        // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on
-        // this diagnostic MCP tool. `call_check_paste` does not route
-        // through `post_process_verdict` (it intentionally skips
-        // escalation / session bookkeeping), so without this call deny
-        // would stamp but not enforce on the MCP-side clipboard-
-        // poisoning surface. The helper is a no-op on
-        // `Allowed`/`Unspecified`.
-        //
-        // M4 PR #120 fix-6 (Greptile P1): the bypass-skip behavior the
-        // hot paths use is now captured by the outer `else` — under
-        // `TIRITH=0`, the raw verdict already wins and
-        // `apply_agent_rules` must NOT silently re-Block.
+        // Enforce `agent_rules.deny` here (this tool skips
+        // `post_process_verdict`). No-op on `Allowed`/`Unspecified`; the outer
+        // `else` keeps the bypass-skip contract so `TIRITH=0` doesn't re-Block.
         crate::escalation::apply_agent_rules(&mut verdict, &policy);
 
-        // M4 PR #120 fix-6 (CodeRabbit Major): derive approval AFTER
-        // `apply_agent_rules` and ONLY when the verdict is not already
-        // Block. Otherwise a denied MCP client would receive both
-        // `action: block` AND `requires_approval` / `approval_*`
-        // metadata. Pinned by
-        // `mcp_check_paste_deny_does_not_emit_approval_metadata`.
+        // Derive approval AFTER deny and only when not already Block (pinned by
+        // `mcp_check_paste_deny_does_not_emit_approval_metadata`).
         if verdict.action != crate::verdict::Action::Block {
             if let Some(meta) = crate::approval::check_approval(&verdict, &policy) {
                 crate::approval::apply_approval(&mut verdict, &meta);
@@ -575,7 +521,7 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
 
     let policy = crate::policy::Policy::discover(None);
 
-    // Use scan_single_file — it routes through FileScan which runs configfile rules
+    // scan_single_file routes through FileScan, which runs configfile rules.
     match scan::scan_single_file(&path) {
         Some(mut result) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
@@ -644,8 +590,8 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
     }
 }
 
-/// Build the MCP response for a cloaking check result.
-/// Extracted for testability — diff_text is DLP-redacted before serialization.
+/// Build the MCP response for a cloaking result. Extracted for testability;
+/// diff_text is DLP-redacted before serialization.
 #[cfg(unix)]
 fn build_cloaking_response(
     mut result: crate::rules::cloaking::CloakingResult,
@@ -666,7 +612,7 @@ fn build_cloaking_response(
         format!("No cloaking detected for {}", result.url)
     };
 
-    // DLP-redact diff text before serialization
+    // DLP-redact diff text before serialization.
     for diff in &mut result.diff_pairs {
         if let Some(ref text) = diff.diff_text {
             diff.diff_text = Some(crate::redact::redact_with_custom(text, dlp_patterns));
@@ -800,7 +746,6 @@ mod tests {
             .as_str()
             .expect("diff_text should be present");
 
-        // The OpenAI key pattern should be redacted
         assert!(
             !diff_text.contains(secret),
             "diff_text should not contain raw secret: {diff_text}"
@@ -878,9 +823,8 @@ mod tests {
         );
     }
 
-    /// Snapshot an env var on construction and restore on `Drop` — same shape
-    /// as the `EnvVarGuard` in `policy.rs::tests` (cannot import directly
-    /// because that one is `mod tests`-scoped).
+    /// Snapshot an env var and restore on `Drop` (same shape as the one in
+    /// `policy.rs::tests`, which is not importable across `mod tests`).
     struct EnvVarGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
@@ -903,9 +847,8 @@ mod tests {
         }
     }
 
-    /// Seed a `.tirith/policy.yaml` under `root` whose `agent_rules.deny`
-    /// matches an MCP client named `client`. Returns the temp dir handle so
-    /// the caller can hold it for the lifetime of the test.
+    /// Seed a `.tirith/policy.yaml` whose `agent_rules.deny` matches MCP client
+    /// `client`. Returns the temp dir for the caller to hold.
     fn seed_mcp_deny_policy(client: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let tirith_dir = dir.path().join(".tirith");
@@ -915,15 +858,9 @@ mod tests {
         dir
     }
 
-    /// M4 item 8 chunk 3 follow-up — finding B in the M4 PR #120 wave-end
-    /// review. `tirith_check_url` is a diagnostic MCP tool that does not
-    /// route through `post_process_verdict`. Before this fix the path
-    /// stamped `agent_origin` for audit but never invoked
-    /// `apply_agent_rules`, so an operator who wrote a `deny` matcher to
-    /// block a hostile MCP client would see deny enforce on
-    /// `tirith_check_command` but silently fail on `tirith_check_url`.
-    /// The fix calls `apply_agent_rules` directly between the origin
-    /// stamp and the response build.
+    /// `tirith_check_url` skips `post_process_verdict`, so a `deny` matcher
+    /// must be enforced via a direct `apply_agent_rules` call — else deny would
+    /// enforce on `tirith_check_command` but silently fail here.
     #[test]
     fn mcp_check_url_with_agent_rules_deny_forces_block() {
         let _env_lock = crate::TEST_ENV_LOCK
@@ -963,15 +900,11 @@ mod tests {
         );
     }
 
-    /// Seed a `.tirith/policy.yaml` with BOTH a deny matcher AND an
-    /// approval rule targeting `plain_http_to_sink`. Used by the
-    /// "deny does not emit approval metadata" tests below: a plain
-    /// HTTP URL in sink context would otherwise raise PlainHttpToSink
-    /// (HIGH) and match the approval rule. The CodeRabbit Major fix
-    /// reorders the MCP handler so `apply_agent_rules` runs BEFORE
-    /// `check_approval`, and `check_approval` is gated on `action !=
-    /// Block`. With deny firing the verdict is Block, and the response
-    /// must NOT carry `requires_approval` / `approval_*` fields.
+    /// Seed a `.tirith/policy.yaml` with BOTH a deny matcher AND an approval rule
+    /// for `plain_http_to_sink`. Used by the "deny does not emit approval
+    /// metadata" tests: a plain-HTTP sink URL would otherwise match the approval
+    /// rule, but with deny firing the verdict is Block and no `approval_*` fields
+    /// should appear.
     fn seed_mcp_deny_plus_approval_policy(client: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let tirith_dir = dir.path().join(".tirith");
@@ -990,15 +923,9 @@ mod tests {
         dir
     }
 
-    /// M4 PR #120 fix-6 (CodeRabbit Major) — pin that the
-    /// `call_check_url` handler does NOT emit approval metadata when
-    /// the verdict is denied. Before fix-6, the handler computed
-    /// `check_approval` / `apply_approval` BEFORE `apply_agent_rules`,
-    /// so a denied MCP client received both `action: block` and
-    /// `requires_approval` / `approval_*` fields — conflicting client
-    /// instructions ("Block this" plus "Ask the user to approve").
-    /// Fix-6 reorders the pipeline so apply_agent_rules runs first
-    /// and approval is only derived when the verdict isn't already Block.
+    /// Pin: the `call_check_url` handler does NOT emit approval metadata when the
+    /// verdict is denied (approval is derived after deny, only when not Block) —
+    /// else a denied client gets conflicting `block` + `approval_*` instructions.
     #[test]
     fn mcp_check_url_deny_does_not_emit_approval_metadata() {
         let _env_lock = crate::TEST_ENV_LOCK
@@ -1014,11 +941,8 @@ mod tests {
         let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
         let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
 
-        // Plain HTTP URL in sink context — would normally raise
-        // PlainHttpToSink (HIGH), which matches the approval rule and
-        // would normally populate the approval_* metadata. With the
-        // deny matcher in play the verdict is Block and approval must
-        // NOT be derived.
+        // Plain-HTTP sink URL: would match the approval rule, but with deny in
+        // play the verdict is Block and approval must NOT be derived.
         let resp = call_check_url(&json!({"url": "http://example.com/install.sh"}));
         assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
         let structured = resp
@@ -1031,10 +955,8 @@ mod tests {
             "deny matcher must produce Block verdict: {structured}"
         );
 
-        // Pin (2) — NO approval metadata. The fields may be absent
-        // entirely (serde `skip_serializing_if = "Option::is_none"`)
-        // OR explicitly null; both are acceptable. The pin is that
-        // they are NOT a populated approval contract.
+        // Pin (2) — NO approval metadata (fields absent or null are both fine;
+        // the pin is they are not a populated approval contract).
         let requires_approval = structured.get("requires_approval");
         assert!(
             requires_approval.is_none() || requires_approval == Some(&json!(null)),
@@ -1054,8 +976,7 @@ mod tests {
         }
     }
 
-    /// M4 PR #120 fix-6 (CodeRabbit Major) — paired with
-    /// `mcp_check_url_deny_does_not_emit_approval_metadata` above; the
+    /// Paired with `mcp_check_url_deny_does_not_emit_approval_metadata`; the
     /// paste handler had the same reorder bug.
     #[test]
     fn mcp_check_paste_deny_does_not_emit_approval_metadata() {
@@ -1072,9 +993,8 @@ mod tests {
         let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
         let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
 
-        // Paste content with a plain HTTP URL — normally raises
-        // PlainHttpToSink (matches the approval rule). Under deny,
-        // verdict must be Block with no approval_* metadata.
+        // Plain-HTTP paste: matches the approval rule, but under deny the verdict
+        // must be Block with no approval_* metadata.
         let resp = call_check_paste(&json!({"content": "curl http://example.com/install.sh"}));
         assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
         let structured = resp
@@ -1105,9 +1025,8 @@ mod tests {
         }
     }
 
-    /// M4 item 8 chunk 3 follow-up — paired with `mcp_check_url_*` above.
-    /// `tirith_check_paste` had the same enforcement gap as
-    /// `tirith_check_url`; this test pins the fix for the paste handler.
+    /// `tirith_check_paste` had the same deny-enforcement gap as
+    /// `tirith_check_url`; this pins the paste-handler fix.
     #[test]
     fn mcp_check_paste_with_agent_rules_deny_forces_block() {
         let _env_lock = crate::TEST_ENV_LOCK
@@ -1144,43 +1063,17 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // M4 PR #120 fix-7 (Greptile P1) — bypass-honored MCP diagnostic
-    // tools must still write the audit entry.
-    //
-    // Background. fix-3 (5d94c71) removed the engine's internal
-    // bypass-fast-exit audit-write and moved the responsibility to the
-    // caller so each surface can stamp `agent_origin` BEFORE the entry
-    // is recorded. `call_check_command` was correctly updated (see the
-    // `if raw_verdict.bypass_honored { audit::log_verdict(...) }`
-    // branch in `call_check_command`). The two diagnostic MCP tools
-    // (`call_check_url`, `call_check_paste`) were missed — fix-7
-    // restores the audit-write on those bypass paths.
-    //
-    // Test plan, per handler:
-    //   1. Seed `agent_origin` to a hostile client name.
-    //   2. Seed a policy that BOTH opts in to non-interactive bypass
-    //      AND carries a deny matcher for that client (so we can pin
-    //      that deny does NOT fire under honored bypass — the audit
-    //      `rule_ids` must NOT carry `agent_denied_by_policy`).
-    //   3. Point `XDG_DATA_HOME` at a tempdir so the audit log lands
-    //      there and the test can read it back.
-    //   4. Set `TIRITH=0` to request bypass.
-    //   5. Invoke the handler with input that fires tier-1 (so the
-    //      engine reaches the bypass branch — tier-1-clean input
-    //      fast-exits at tier-1 and never produces `bypass_honored:
-    //      true`).
-    //   6. Assert: `bypass_honored: true` in the structured response,
-    //      audit log has a `verdict` entry with `bypass_honored: true`
-    //      and the stamped `agent_origin`, and the entry carries NO
-    //      `agent_denied_by_policy` rule id (bypass-skip contract).
-    // -----------------------------------------------------------------
+    // fix-7: bypass-honored MCP diagnostic tools must still write the audit
+    // entry. fix-3 moved the engine's bypass audit-write to the caller;
+    // `call_check_command` was updated but the diagnostic tools were missed.
+    // Per-handler test plan: seed a hostile origin + a policy that opts into
+    // non-interactive bypass AND denies that client; point `XDG_DATA_HOME` at a
+    // tempdir; set `TIRITH=0`; invoke with tier-1-firing input; assert
+    // `bypass_honored: true` + an audit entry carrying the origin but NOT
+    // `agent_denied_by_policy` (the bypass-skip contract).
 
-    /// Seed a `.tirith/policy.yaml` that opts in to `TIRITH=0` bypass
-    /// in non-interactive contexts (cargo test spawns non-interactive
-    /// children — same with in-process MCP `interactive: false`) AND
-    /// carries a deny matcher for `client`. Used by the fix-7 audit
-    /// tests below — see the module-level comment for the contract.
+    /// Seed a `.tirith/policy.yaml` opting into non-interactive `TIRITH=0`
+    /// bypass AND carrying a deny matcher for `client`.
     fn seed_mcp_bypass_plus_deny_policy(client: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let tirith_dir = dir.path().join(".tirith");
@@ -1197,12 +1090,8 @@ mod tests {
         dir
     }
 
-    /// M4 PR #120 fix-7 (Greptile P1) — pin that `call_check_url`
-    /// writes an audit entry on the bypass-honored fast-exit path.
-    /// Pre-fix-3 the engine did this internally; fix-3 moved
-    /// responsibility to the caller and `call_check_command` was
-    /// updated, but the diagnostic MCP tools were missed. See the
-    /// module-level comment above for the full test plan.
+    /// fix-7: pin that `call_check_url` writes an audit entry on the
+    /// bypass-honored path. See the module comment above for the test plan.
     #[test]
     fn mcp_check_url_bypass_writes_audit_entry() {
         let _env_lock = crate::TEST_ENV_LOCK
@@ -1218,23 +1107,16 @@ mod tests {
         let policy_dir = seed_mcp_bypass_plus_deny_policy("hostile-mcp-client");
         let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
 
-        // Point audit log at a tempdir we control. `data_dir()` uses
-        // `etcetera::choose_base_strategy().data_dir()` which on macOS
-        // & Linux honors `XDG_DATA_HOME` (etcetera 0.8 returns the Xdg
-        // base on macOS — verified in
-        // `etcetera-0.8.0/src/base_strategy.rs:47-59`).
+        // Point the audit log at a tempdir (`data_dir()` honors `XDG_DATA_HOME`
+        // on macOS & Linux via etcetera 0.8).
         let data_tmp = tempfile::tempdir().expect("data tempdir");
         let _data = EnvVarGuard::set("XDG_DATA_HOME", data_tmp.path());
-        // Be explicit — TIRITH_LOG default is "on" but the env may
-        // carry a stale "0" from a prior test in this process.
+        // Explicit: TIRITH_LOG defaults on, but the env may carry a stale "0".
         let _log = EnvVarGuard::set("TIRITH_LOG", "1");
         let _bypass = EnvVarGuard::set("TIRITH", "0");
 
-        // URL that fires tier-1 once wrapped in `curl '...'` —
-        // `plain_http_to_sink` triggers on http:// + .sh path. Tier-1
-        // MUST trigger for the engine to reach the bypass branch
-        // (line 482 of engine.rs); tier-1-clean inputs fast-exit at
-        // line 461 without setting `bypass_honored`.
+        // URL that fires tier-1 once wrapped in `curl '...'` (http:// + .sh).
+        // Tier-1 MUST trigger or the engine fast-exits without `bypass_honored`.
         let resp = call_check_url(&json!({"url": "http://example.com/install.sh"}));
         assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
         let structured = resp
@@ -1276,9 +1158,7 @@ mod tests {
             entry["bypass_honored"], true,
             "audit entry MUST reflect bypass_honored=true: {entry}"
         );
-        // origin is carried through `log_verdict` (see audit.rs:286).
-        // The MCP variant serializes as `{kind:"mcp", client_name:..}`
-        // — see `AgentOrigin::Mcp` in agent_origin.rs.
+        // Origin carried through `log_verdict`; serializes as `{kind:"mcp", ..}`.
         assert_eq!(
             entry["agent_origin"]["kind"], "mcp",
             "audit entry agent_origin kind must be `mcp`: {entry}"
@@ -1297,9 +1177,8 @@ mod tests {
         );
     }
 
-    /// M4 PR #120 fix-7 (Greptile P1) — paired with
-    /// `mcp_check_url_bypass_writes_audit_entry`. Same gap on the
-    /// paste handler. See module-level comment above for plan.
+    /// fix-7: paired with `mcp_check_url_bypass_writes_audit_entry`; same gap on
+    /// the paste handler.
     #[test]
     fn mcp_check_paste_bypass_writes_audit_entry() {
         let _env_lock = crate::TEST_ENV_LOCK
@@ -1320,8 +1199,7 @@ mod tests {
         let _log = EnvVarGuard::set("TIRITH_LOG", "1");
         let _bypass = EnvVarGuard::set("TIRITH", "0");
 
-        // Paste content that fires tier-1 (pipe-to-shell) — engine
-        // must reach the bypass branch for `bypass_honored: true`.
+        // Paste that fires tier-1 (pipe-to-shell) so the engine reaches bypass.
         let resp =
             call_check_paste(&json!({"content": "curl https://example.com/install.sh | bash"}));
         assert!(!resp.is_error, "tool dispatch must succeed: {resp:?}");
@@ -1360,8 +1238,7 @@ mod tests {
             entry["bypass_honored"], true,
             "paste audit entry MUST reflect bypass_honored=true: {entry}"
         );
-        // The MCP variant serializes as `{kind:"mcp", client_name:..}`
-        // — see `AgentOrigin::Mcp` in agent_origin.rs.
+        // MCP origin serializes as `{kind:"mcp", client_name:..}`.
         assert_eq!(
             entry["agent_origin"]["kind"], "mcp",
             "paste audit entry agent_origin kind must be `mcp`: {entry}"

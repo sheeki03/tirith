@@ -1,23 +1,11 @@
-//! `tirith aliases scan|explain` (M9 ch3).
+//! `tirith aliases scan|explain` — thin presenter over [`tirith_core::aliases`]
+//! (enumeration + classification live in the library; this module is output).
 //!
-//! Thin presenter over [`tirith_core::aliases`]. Enumeration + classification
-//! live entirely in the library; this module is output only.
-//!
-//! ## `scan`
-//!
-//! Enumerates aliases + functions (statically by default; additionally via
-//! no-rc shell-outs with `--include-runtime`) and reports risky ones. Prints
-//! both an inventory line per definition and the findings.
-//!
-//! Exit codes:
-//! - `0` — no High/Critical finding (clean, or only Medium/Low/Info).
-//! - `1` — at least one High/Critical finding (network call / credential read).
-//!
-//! ## `explain <name>`
-//!
-//! Shows the body of every definition matching `<name>` plus any findings
-//! against it. Body text is credential-redacted before display. Always exits 0
-//! (informational).
+//! `scan` enumerates aliases + functions (statically; also via no-rc shell-outs
+//! with `--include-runtime`) and reports risky ones: exit `1` on any
+//! High/Critical finding, else `0`. `explain <name>` shows each matching
+//! definition's body (credential-redacted) plus findings; exit 0/2 (2 = unknown
+//! name).
 
 use tirith_core::aliases::{self, AliasEntry, AliasFinding, AliasScan};
 use tirith_core::redact::redact;
@@ -25,7 +13,6 @@ use tirith_core::verdict::Severity;
 
 use super::write_json_stdout;
 
-/// `tirith aliases scan` — enumerate + classify. Exit 1 if any High/Critical.
 pub fn scan(include_runtime: bool, json: bool) -> i32 {
     let scan = aliases::scan(include_runtime);
     let any_high = scan.findings.iter().any(AliasFinding::is_high);
@@ -46,9 +33,8 @@ pub fn scan(include_runtime: bool, json: bool) -> i32 {
     }
 }
 
-/// `tirith aliases explain <name>` — show body + analysis for a single name.
-/// Always exits 0 (informational); exit 2 if the name is unknown so a script
-/// can distinguish "no such alias" from "found, clean".
+/// Exit 0 when found, 2 when the name is unknown (lets a script distinguish
+/// "no such alias" from "found, clean").
 pub fn explain(name: &str, include_runtime: bool, json: bool) -> i32 {
     let ex = aliases::explain(name, include_runtime);
 
@@ -67,8 +53,6 @@ pub fn explain(name: &str, include_runtime: bool, json: bool) -> i32 {
         0
     }
 }
-
-// ─── human output ──────────────────────────────────────────────────────────────
 
 fn print_human_scan(scan: &AliasScan, include_runtime: bool) {
     let aliases_n = scan
@@ -100,7 +84,6 @@ fn print_human_scan(scan: &AliasScan, include_runtime: bool) {
     }
     eprintln!();
 
-    // Inventory.
     for e in &scan.entries {
         let parsed = if e.body_parsed {
             ""
@@ -196,8 +179,6 @@ fn severity_label(sev: Severity) -> &'static str {
         Severity::Critical => "CRITICAL",
     }
 }
-
-// ─── JSON output ─────────────────────────────────────────────────────────────
 
 fn scan_json_body(scan: &AliasScan, include_runtime: bool) -> serde_json::Value {
     let high = scan.findings.iter().filter(|f| f.is_high()).count();

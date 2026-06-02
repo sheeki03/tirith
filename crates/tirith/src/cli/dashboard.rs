@@ -1,32 +1,25 @@
-//! `tirith dashboard export|serve` — M13 ch3.
-//!
-//! Builds a local-only security snapshot (via [`tirith_core::dashboard`]) and
-//! either writes it as a self-contained HTML file (`export`) or serves it over a
-//! loopback-only HTTP server guarded by an ephemeral token (`serve`).
+//! `tirith dashboard export|serve` — M13 ch3. Builds a local-only security
+//! snapshot (via [`tirith_core::dashboard`]) and either writes it as a
+//! self-contained HTML file (`export`) or serves it over a loopback-only HTTP
+//! server guarded by an ephemeral token (`serve`).
 //!
 //! # Security posture
 //!
-//! This is the security-sensitive chunk: a local web server plus an HTML report
-//! built from user-controlled audit bytes. The invariants:
+//! A local web server plus an HTML report built from user-controlled audit
+//! bytes. Invariants:
 //!
-//! * **HTML escaping** — every interpolated value passes through
-//!   `tirith_core::dashboard::html_escape`; there is no raw path. The escaping
-//!   test lives in core.
-//! * **Loopback only** — `serve` binds `127.0.0.1` exclusively, never `0.0.0.0`.
-//! * **Ephemeral token** — a fresh random token (OS CSPRNG via `getrandom`, the
-//!   same source the canary store uses) is generated per `serve` invocation and
-//!   lives ONLY in process memory. It is printed in the URL and never written to
-//!   `policy.yaml` or any file. The token also has a hard TTL ([`TOKEN_TTL`]):
-//!   after it expires every request 401s even with the right token.
-//! * **DNS-rebinding guard** — a request whose `Host:` header is not
-//!   `127.0.0.1[:port]` / `localhost[:port]` is rejected 403. A rebinding
-//!   attacker's browser sends the attacker hostname in `Host`.
-//! * **Token mismatch / missing** — 401.
-//! * **Zero telemetry, zero network** beyond the bound loopback port.
+//! * HTML escaping — every interpolated value passes through
+//!   `tirith_core::dashboard::html_escape` (test in core).
+//! * Loopback only — `serve` binds `127.0.0.1`, never `0.0.0.0`.
+//! * Ephemeral token — a fresh CSPRNG token (`getrandom`) per `serve`, in
+//!   process memory only, never written to disk, with a hard TTL ([`TOKEN_TTL`]).
+//! * DNS-rebinding guard — a `Host:` other than `127.0.0.1`/`localhost`
+//!   (`[:port]`) is rejected 403.
+//! * Token mismatch / missing — 401.
+//! * Zero telemetry/network beyond the bound loopback port.
 //!
-//! The request-authorization decision is a PURE function ([`authorize`]) so all
-//! of the above can be unit-tested without binding a socket. The accept loop is
-//! a thin shell around it.
+//! The authorization decision is a PURE function ([`authorize`]), unit-testable
+//! without a socket; the accept loop is a thin shell around it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -35,35 +28,23 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use tirith_core::dashboard::{self, DashboardSnapshot, HookSummary};
 
-/// Hard time-to-live for a `serve` token. After this elapses every request is
-/// rejected 401 regardless of whether the token value matches — a browser tab
-/// left open overnight cannot keep reading the dashboard.
+/// Hard TTL for a `serve` token — after this every request 401s even with the
+/// right token, so a tab left open overnight can't keep reading the dashboard.
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour
 
-/// `true` once a monotonic `elapsed` has reached the hard token TTL.
-///
-/// This is the AUTHORITATIVE, clock-jump-resistant TTL check (CodeRabbit M13 PR
-/// #132 R7-4). The wall-clock TTL inside [`authorize`] is bypassable by setting
-/// the system clock BACKWARDS — `Utc::now() - issued_at` shrinks, so a token
-/// could outlive the 1h bound. A monotonic [`Instant`] never runs backwards
-/// (it is not tied to wall-clock), so an elapsed-based gate cannot be defeated
-/// that way.
-///
-/// DUAL-LAYER BY DESIGN: we keep BOTH checks. `authorize()`'s wall-clock TTL
-/// stays as defense-in-depth (and to keep its pure unit tests intact); this
-/// monotonic gate is layered in FRONT of it as the enforcement that actually
-/// upholds the ≤1h invariant under an adversarial clock. Whichever fires first
-/// expires the token.
+/// `true` once a monotonic `elapsed` reaches the TTL — the AUTHORITATIVE,
+/// clock-jump-resistant check (R7-4). `authorize()`'s wall-clock TTL is
+/// bypassable by setting the clock backwards; a monotonic [`Instant`] is not.
+/// Both are kept (dual-layer): whichever fires first expires the token.
 fn mono_ttl_expired(elapsed: Duration) -> bool {
     elapsed >= TOKEN_TTL
 }
 
 /// How long the accept loop blocks per `recv_timeout` before re-checking the
-/// token TTL / shutdown. Keeps the loop responsive to TTL expiry without busy
-/// polling.
+/// TTL / shutdown — responsive to expiry without busy-polling.
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
 
-/// The outcome of authorizing a single request. Maps directly to an HTTP status.
+/// The outcome of authorizing a request — maps directly to an HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// Authorized — serve the report (HTTP 200).
@@ -74,21 +55,15 @@ pub enum Decision {
     Forbidden,
 }
 
-/// Decide whether a single request is authorized. PURE — no sockets, no clock of
-/// its own (the caller passes `now`), no globals. This is the security core of
-/// `serve`; the accept loop is a thin wrapper that calls it.
+/// Decide whether a request is authorized. PURE — no sockets, no clock (caller
+/// passes `now`), no globals. The security core of `serve`.
 ///
-/// Decision order (Host BEFORE token):
-///   1. **Host check (DNS-rebinding guard).** If `host_header` is absent or is
-///      not a loopback host (`127.0.0.1` / `localhost`, with an optional
-///      `:port`), return [`Decision::Forbidden`]. Checking Host first means a
-///      rebinding attacker — whose browser sends the attacker's hostname — is
-///      rejected 403 before the token is even consulted, so a leaked token from
-///      a different vector still cannot be replayed through a foreign Host.
-///   2. **Token TTL.** If `now - issued_at >= TOKEN_TTL`, return
-///      [`Decision::Unauthorized`] (the token has expired).
-///   3. **Token value.** If `query_token` is absent or does not match
-///      `expected_token` (compared in constant time), return
+/// Decision order, Host BEFORE token:
+///   1. Host check (DNS-rebinding guard) — a non-loopback or absent `Host`
+///      returns [`Decision::Forbidden`], so a leaked token can't be replayed
+///      through a foreign Host.
+///   2. Token TTL — an expired token returns [`Decision::Unauthorized`].
+///   3. Token value — absent/mismatch (constant-time) returns
 ///      [`Decision::Unauthorized`].
 ///   4. Otherwise [`Decision::Ok`].
 pub fn authorize(
@@ -104,14 +79,11 @@ pub fn authorize(
         _ => return Decision::Forbidden,
     }
 
-    // 2. TTL — an expired token is rejected even if the value matches.
-    //    `now - issued_at` may be negative if clocks jump backwards; a negative
-    //    age is treated as "not expired" (fail toward the live window — the hard
-    //    upper bound is what matters for the leave-a-tab-open threat).
+    // 2. TTL. A negative age (backward clock jump) is treated as not-expired;
+    //    the hard upper bound is what matters here. The mono check enforces it.
     let age = now.signed_duration_since(issued_at);
-    // `from_std` only errors on an out-of-range duration; `TOKEN_TTL` is a fixed
-    // 1h so it never does, but fall back to 1h rather than SKIPPING the expiry
-    // check (a silent skip would let a stale token live forever).
+    // Fall back to 1h rather than skipping the check (a skip would let a stale
+    // token live forever); `from_std` can't actually fail for a fixed 1h.
     let ttl = chrono::Duration::from_std(TOKEN_TTL).unwrap_or_else(|_| chrono::Duration::hours(1));
     if age >= ttl {
         return Decision::Unauthorized;
@@ -124,22 +96,17 @@ pub fn authorize(
     }
 }
 
-/// `true` when `host` (a raw `Host:` header value) names a loopback target:
-/// `127.0.0.1` or `localhost`, optionally followed by `:<port>`. Any other
-/// host — including `0.0.0.0`, a LAN IP, or an attacker domain — is rejected.
-///
-/// We deliberately do NOT accept `::1` here: `serve` only ever binds an IPv4
-/// loopback socket, so a request arriving with an IPv6 `Host` is not one we
-/// issued and is safer to reject. (The bracketed-IPv6 `Host` form `[::1]:port`
-/// is likewise rejected.)
+/// `true` when `host` names a loopback target: `127.0.0.1` or `localhost`, with
+/// an optional `:<port>`. Everything else (`0.0.0.0`, a LAN IP, a domain) is
+/// rejected. `::1` / `[::1]:port` are deliberately rejected too: `serve` only
+/// binds IPv4 loopback, so an IPv6 `Host` is not one we issued.
 fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
-    // Split off an optional `:port`. A bare IPv6 literal would contain multiple
-    // colons; we only accept the two known IPv4 loopback spellings, so a value
-    // with more than one colon (or a leading `[`) can never match.
+    // Split off an optional `:port`. We accept only the two IPv4 spellings, so a
+    // value with multiple colons (or a leading `[`) can never match.
     let hostname = match host.rsplit_once(':') {
         Some((name, port)) => {
-            // The port must be all-numeric; otherwise this is not `host:port`.
+            // The port must be all-numeric, else this isn't `host:port`.
             if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
                 return false;
             }
@@ -150,11 +117,9 @@ fn is_loopback_host(host: &str) -> bool {
     hostname.eq_ignore_ascii_case("127.0.0.1") || hostname.eq_ignore_ascii_case("localhost")
 }
 
-/// Constant-time byte comparison. Avoids leaking how many leading bytes of the
-/// token matched via response timing. A length mismatch returns `false`; for
-/// equal lengths every byte is folded so the running time does not depend on the
-/// position of the first differing byte. (The token is a fixed-length hex string,
-/// so the length check itself reveals nothing useful.)
+/// Constant-time byte comparison — avoids leaking via timing how many leading
+/// bytes matched. Length mismatch returns `false` (the token is fixed-length
+/// hex, so that reveals nothing); equal lengths fold every byte.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -166,9 +131,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Extract the `token` query parameter from a request target like
-/// `/?token=abc&x=1`. Returns the FIRST `token` value, percent-decoded for the
-/// `%xx` and `+` forms a browser may emit. Returns `None` when absent.
+/// Extract the first `token` query parameter from a request target (e.g.
+/// `/?token=abc&x=1`), percent-decoded. `None` when absent.
 fn token_from_target(target: &str) -> Option<String> {
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     for pair in query.split('&') {
@@ -180,8 +144,8 @@ fn token_from_target(target: &str) -> Option<String> {
     None
 }
 
-/// Minimal application/x-www-form-urlencoded value decode (`+` → space, `%xx` →
-/// byte). Good enough for a hex token; unknown escapes are passed through.
+/// Minimal form-urlencoded value decode (`+` → space, `%xx` → byte); unknown
+/// escapes pass through. Good enough for a hex token.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -215,9 +179,8 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Build a snapshot for the current working directory, with the shell-hook state
-/// resolved via the SAME read-only probe `tirith onboard` / `doctor` use (never
-/// materializes hooks).
+/// Build a snapshot for the cwd, resolving shell-hook state via the same
+/// read-only probe `onboard`/`doctor` use (never materializes hooks).
 fn build_snapshot() -> DashboardSnapshot {
     let detected_shell = crate::cli::init::detect_shell().to_string();
     let (_profile, hook_installed) =
@@ -232,20 +195,11 @@ fn build_snapshot() -> DashboardSnapshot {
     dashboard::build_snapshot(None, Some(&cwd_str), hook)
 }
 
-/// Emit an operator error from `dashboard export|serve`.
-///
-/// In `--json` mode the error MUST be a structured JSON object on stdout, not a
-/// human stderr line — otherwise a machine consumer that asked for `--json` gets
-/// non-JSON bytes on the error path while the exit code claims failure, breaking
-/// the JSON output contract (CodeRabbit M13 PR #132 finding F2). The shape is the
-/// SAME `{ "error": <msg> }` object the rest of the CLI emits for `--json` errors
-/// (`cli::ai::emit_error`, `cli::canary::emit_error`, `cli::rule`), written via
-/// the shared [`crate::cli::write_json_stdout`]. In human mode it keeps the
-/// existing `eprintln!`.
-///
-/// Returns `true` on success; `false` ONLY when the JSON write itself failed
-/// (broken pipe) so the caller can return the broken-pipe exit code (2), matching
-/// the success paths' broken-pipe handling. The human path always returns `true`.
+/// Emit an operator error from `dashboard export|serve`. In `--json` mode this
+/// is the structured `{ "error": <msg> }` object on stdout (finding F2: a
+/// `--json` consumer must never get non-JSON on the error path); human mode
+/// uses `eprintln!`. Returns `false` only on a JSON-write failure (broken pipe →
+/// exit 2); the human path always returns `true`.
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
@@ -265,11 +219,9 @@ struct ExportJson<'a> {
     snapshot: &'a DashboardSnapshot,
 }
 
-/// `tirith dashboard export [--out <path>] [--json]`.
-///
-/// Default output path: `~/Documents/tirith-dashboard-<date>.html`. `--out .`
-/// writes `./dashboard.html`; `--out <dir>` (an existing directory) writes
-/// `<dir>/dashboard.html`; `--out <file>` writes exactly that file.
+/// `tirith dashboard export [--out <path>] [--json]`. Default output:
+/// `~/Documents/tirith-dashboard-<date>.html`; `--out .` or a dir writes
+/// `<dir>/dashboard.html`; otherwise the exact file.
 pub fn export(out: Option<&str>, json: bool) -> i32 {
     let snapshot = build_snapshot();
     let html = dashboard::render_html(&snapshot);
@@ -277,9 +229,7 @@ pub fn export(out: Option<&str>, json: bool) -> i32 {
     let path = match resolve_export_path(out) {
         Ok(p) => p,
         Err(e) => {
-            // `--json`-aware: a structured error on stdout in JSON mode, the
-            // human stderr line otherwise. A JSON write failure is exit 2
-            // (broken pipe); the resolve failure itself is exit 1.
+            // JSON-write failure → exit 2; the resolve failure itself → exit 1.
             if !emit_error(json, "tirith dashboard export", &e) {
                 return 2;
             }
@@ -318,12 +268,9 @@ pub fn export(out: Option<&str>, json: bool) -> i32 {
     0
 }
 
-/// Resolve the export output path from the optional `--out`.
-///
-/// * `None` → `~/Documents/tirith-dashboard-<YYYY-MM-DD>.html` (falls back to the
-///   cwd if the home directory cannot be determined).
-/// * `"."` or an existing directory → `<dir>/dashboard.html`.
-/// * any other value → treated as the exact file path.
+/// Resolve the export path from `--out`: `None` → dated file in `~/Documents`
+/// (cwd fallback); `"."`/existing dir → `<dir>/dashboard.html`; else the exact
+/// file path.
 fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
     match out {
         None => {
@@ -346,48 +293,27 @@ fn resolve_export_path(out: Option<&str>) -> Result<PathBuf, String> {
 }
 
 /// Write `html` to `path`, creating parent dirs. The report may carry
-/// repo-internal hostnames / paths even after redaction, so it should be
-/// "private by default" (mirrors `incident report --out`).
+/// repo-internal hostnames/paths even after redaction, so it is private by
+/// default.
 ///
-/// Atomic publish (M13 PR #132 finding R19-N3): the bytes are written to a
-/// sibling temp file in the SAME directory, `sync_all`'d, then renamed over
-/// `path` — via the shared [`crate::cli::write_file_atomic`] helper. A mid-write
-/// failure (disk full, crash) therefore can no longer truncate or corrupt a
-/// previously-good export at `path`: a reader sees either the old complete file
-/// or the new complete file, never a partial one.
+/// Atomic publish (R19-N3): written to a sibling temp file, `sync_all`'d, then
+/// renamed over `path` via [`crate::cli::write_file_atomic`], so a mid-write
+/// failure never truncates a previously-good export.
 ///
-/// Platform split (M13 PR #132 finding R12-3):
-///
-/// * **Unix** — `write_file_atomic`'s temp file is created `0600`
-///   (`tempfile::NamedTempFile`'s default mode) and the rename carries that
-///   permission onto the destination, so the published report is owner-only
-///   regardless of any pre-existing world-readable file at `path`. The 0600 mode
-///   is applied to the temp file BEFORE the rename publishes it, so sensitive
-///   content never lands in a world-readable file even momentarily.
-/// * **Non-Unix (Windows)** — `std` has no portable equivalent of `chmod 0600`
-///   without an extra crate, so we do NOT apply an explicit restriction. We do
-///   NOT fail closed: the default destination (`%USERPROFILE%\Documents`) is
-///   already user-private via the inherited NTFS ACL, and failing the write
-///   would needlessly break a valid export. Instead we emit a one-line stderr
-///   WARNING so the user knows the file's protection relies on the directory's
-///   inherited permissions on this platform — relevant if they later move it
-///   somewhere shared. (A restrictive DACL applied via the Windows API is a
-///   possible future enhancement; it is intentionally out of scope here to
-///   avoid adding a dependency.)
+/// Permissions (R12-3): on Unix the temp file is `0600` and the rename carries
+/// that mode onto the destination, so the report is owner-only even before
+/// publish. On Windows there is no portable `chmod`; we do NOT fail closed (the
+/// default `%USERPROFILE%\Documents` is already user-private via NTFS ACL) but
+/// emit a one-line stderr warning that protection relies on directory perms.
 fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
-    // Atomic temp+fsync+rename via the shared helper. `overwrite = true` replaces
-    // an existing export (the operator asked to (re)write this report). On Unix
-    // the temp file is mode 0600 by default and the rename preserves that mode, so
-    // the published file is owner-only even if a world-readable file existed at
-    // `path` before. `write_file_atomic` also creates any missing parent dirs (it
-    // places the temp file beside the resolved destination).
+    // Atomic temp+fsync+rename; `overwrite = true` replaces an existing export.
+    // On Unix the 0600 temp mode is preserved by the rename; the helper also
+    // creates any missing parent dirs.
     crate::cli::write_file_atomic(path, html.as_bytes(), /* overwrite = */ true)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
 
-    // On platforms without Unix file modes we could not apply an explicit
-    // owner-only restriction (see the doc comment above). Warn — to stderr so
-    // `--json` / piped stdout stays uncorrupted — that the file's access
-    // restriction relies on the OS directory permissions here.
+    // No Unix file modes here — warn (to stderr, keeping --json/stdout clean)
+    // that protection relies on the OS directory permissions.
     #[cfg(not(unix))]
     {
         eprintln!(
@@ -402,17 +328,10 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Bind the `serve` HTTP listener to the IPv4 LOOPBACK interface only —
-/// `127.0.0.1:<port>`, or `127.0.0.1:0` (an OS-assigned ephemeral port) when
-/// `port` is `None`. NEVER `0.0.0.0` or any non-loopback interface: the
-/// dashboard exposes a local-only security snapshot and must not be reachable
-/// off-host.
-///
-/// Factored out of [`serve`] so the "binds loopback exclusively" invariant is
-/// unit-testable against the PRODUCTION bind (the integration test binds its own
-/// listener, which would not catch a regression here). Returns `tiny_http`'s own
-/// boxed error on bind failure — `serve` maps it to its `cannot bind …` message
-/// + non-zero exit (M13 PR #132 finding F2).
+/// Bind the `serve` listener to IPv4 LOOPBACK only — `127.0.0.1:<port>`, or
+/// `127.0.0.1:0` when `port` is `None`. NEVER `0.0.0.0`: the dashboard must not
+/// be reachable off-host. Factored out of [`serve`] so the loopback-only
+/// invariant is unit-testable against the production bind (finding F2).
 fn bind_loopback(
     port: Option<u16>,
 ) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -420,17 +339,15 @@ fn bind_loopback(
     tiny_http::Server::http(bind_addr)
 }
 
-/// `tirith dashboard serve [--port <p>] [--json]`.
-///
-/// Binds `127.0.0.1:<port>` (or an OS-assigned ephemeral port when `--port` is
-/// omitted), prints the loopback URL carrying an ephemeral in-memory token, and
-/// serves the rendered HTML at `/` for an authorized request until SIGINT.
+/// `tirith dashboard serve [--port <p>] [--json]`. Binds `127.0.0.1:<port>`
+/// (ephemeral when omitted), prints the loopback URL carrying an ephemeral
+/// in-memory token, and serves the HTML at `/` for an authorized request until
+/// SIGINT.
 pub fn serve(port: Option<u16>, json: bool) -> i32 {
     let token = match dashboard::generate_serve_token() {
         Ok(t) => t,
         Err(e) => {
-            // `--json`-aware error (structured object on stdout in JSON mode);
-            // exit 2 on a JSON write failure, exit 1 for the token failure.
+            // JSON-write failure → exit 2; token failure → exit 1.
             if !emit_error(json, "tirith dashboard serve", &e) {
                 return 2;
             }
@@ -438,16 +355,12 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         }
     };
 
-    // Loopback ONLY. The literal IP is never `0.0.0.0` — we never bind a
-    // non-loopback interface. The bind itself is factored into `bind_loopback`
-    // so a unit test can pin the "binds 127.0.0.1 exclusively" contract against
-    // the PRODUCTION code path (M13 PR #132 finding F2).
+    // Loopback ONLY (via `bind_loopback`, so a unit test pins it against the
+    // production path — finding F2).
     let bind_port = port.unwrap_or(0);
     let server = match bind_loopback(port) {
         Ok(s) => s,
         Err(e) => {
-            // `--json`-aware: the same `cannot bind …` text in human mode, a
-            // structured `{ "error": ... }` object on stdout in JSON mode.
             if !emit_error(
                 json,
                 "tirith dashboard serve",
@@ -459,7 +372,7 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         }
     };
 
-    // Read back the actual bound port (resolves the ephemeral `:0` case).
+    // Resolve the actual bound port (the ephemeral `:0` case).
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
         None => {
@@ -477,8 +390,7 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
     let url = format!("http://127.0.0.1:{actual_port}/?token={token}");
     let issued_at = Utc::now();
     // Monotonic issue instant — the authoritative, clock-jump-resistant TTL
-    // reference (see `mono_ttl_expired`). Captured alongside the wall-clock
-    // `issued_at` so the two TTL layers share the same logical issue time.
+    // reference (see `mono_ttl_expired`), sharing `issued_at`'s logical time.
     let issued_mono = Instant::now();
 
     if json {
@@ -489,8 +401,7 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
             port: u16,
             token_ttl_secs: u64,
         }
-        // The token is part of `url`; we intentionally do not break it out as a
-        // separate field, but it is fully present in `url` for a scripted opener.
+        // The token lives only inside `url` (no separate field).
         if !crate::cli::write_json_stdout(
             &ServeJson {
                 url: url.clone(),
@@ -514,28 +425,23 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         println!("never written to disk. Press Ctrl-C to stop.");
     }
 
-    // A server that cannot accept connections must NOT report success
-    // (CodeRabbit M13 PR #132 R20). The TTL-expiry exit is a normal end-of-life
-    // (exit 0); a genuine accept/recv ERROR is fatal (non-zero).
+    // TTL expiry is a normal end-of-life (exit 0); a genuine accept/recv error
+    // is fatal (R20).
     loop_outcome_exit_code(serve_loop(&server, &token, issued_at, issued_mono))
 }
 
-/// Why [`serve_loop`] returned. `TtlExpired` is the EXPECTED end-of-life (the
-/// token's TTL elapsed and the loop polled it out — `recv_timeout`'s timeout
-/// branch is part of this normal flow, not a failure). `AcceptError` is a
-/// genuine `recv`/accept failure (channel disconnected, IO error) — the server
-/// can no longer serve, so it is fatal.
+/// Why [`serve_loop`] returned: `TtlExpired` is the expected end-of-life
+/// (success); `AcceptError` is a genuine recv/accept failure (fatal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopOutcome {
-    /// The token TTL elapsed; nothing useful is left to serve. Success.
+    /// The token TTL elapsed; nothing left to serve. Success.
     TtlExpired,
     /// The accept socket failed (not a timeout tick). Fatal.
     AcceptError,
 }
 
-/// Map a [`LoopOutcome`] to the process exit code: a clean TTL expiry is
-/// success (0); an accept/recv error is fatal (1) so a dashboard that could
-/// never (or no longer) accept connections does not masquerade as a success.
+/// Map a [`LoopOutcome`] to the exit code: TTL expiry → 0; accept/recv error →
+/// 1, so a non-serving dashboard never masquerades as success.
 fn loop_outcome_exit_code(outcome: LoopOutcome) -> i32 {
     match outcome {
         LoopOutcome::TtlExpired => 0,
@@ -543,19 +449,11 @@ fn loop_outcome_exit_code(outcome: LoopOutcome) -> i32 {
     }
 }
 
-/// The blocking accept loop. Re-renders the snapshot per request (cheap; keeps
-/// the served report fresh) and routes every request through [`authorize`].
-///
-/// `recv_timeout` is used so the loop wakes periodically: once the token TTL has
-/// elapsed there is nothing useful left to serve, so the loop exits and the
-/// process returns (the token can never be revived). SIGINT terminates the
-/// process directly.
-///
-/// TTL is enforced with a MONOTONIC [`Instant`] (`issued_mono`) — see
-/// `mono_ttl_expired`. This is clock-jump-resistant: moving the system clock
-/// backwards cannot keep the server alive past the hard 1h bound. The
-/// wall-clock TTL inside [`authorize`] remains as a second, defense-in-depth
-/// layer (and keeps its pure unit tests meaningful).
+/// The blocking accept loop — re-renders the snapshot per request and routes
+/// each through [`authorize`]. `recv_timeout` lets it wake periodically and exit
+/// once the TTL elapses (the token can't be revived); SIGINT ends the process.
+/// TTL is enforced with a MONOTONIC [`Instant`] (clock-jump-resistant); the
+/// wall-clock TTL in [`authorize`] stays as defense-in-depth.
 fn serve_loop(
     server: &tiny_http::Server,
     token: &str,
@@ -563,9 +461,8 @@ fn serve_loop(
     issued_mono: Instant,
 ) -> LoopOutcome {
     loop {
-        // Stop accepting once the token has expired — every request would 401.
-        // Monotonic check: immune to a backward wall-clock jump. This is the
-        // normal end-of-life, NOT a failure.
+        // Stop once the token expires (every request would 401). Monotonic:
+        // immune to a backward clock jump. Normal end-of-life, not a failure.
         if mono_ttl_expired(issued_mono.elapsed()) {
             eprintln!("tirith dashboard serve: token expired; stopping.");
             return LoopOutcome::TtlExpired;
@@ -573,12 +470,9 @@ fn serve_loop(
 
         match server.recv_timeout(ACCEPT_POLL) {
             Ok(Some(request)) => handle_request(request, token, issued_at, issued_mono),
-            // `Ok(None)` is the EXPECTED timeout tick (the TTL poll); keep looping
-            // so the next iteration re-checks the TTL. It is never fatal.
-            Ok(None) => continue,
-            // A genuine recv/accept ERROR (channel disconnected, IO error) means
-            // the server can no longer accept connections. Surface it as fatal so
-            // `serve()` exits non-zero rather than reporting a false success.
+            Ok(None) => continue, // expected TTL-poll tick; re-check the TTL
+            // A genuine recv/accept error: the server can no longer serve, so
+            // surface it as fatal rather than a false success.
             Err(e) => {
                 eprintln!("tirith dashboard serve: accept error: {e}");
                 return LoopOutcome::AcceptError;
@@ -587,24 +481,16 @@ fn serve_loop(
     }
 }
 
-/// Apply the response-hardening header set to `response` and return it.
-///
-/// Every response we emit — 200, 401, AND 403 — carries the same headers so the
-/// hardening cannot drift between the success and error paths (M13 PR #132
-/// finding D6-3). `Cache-Control: no-store` keeps even an unauthorized response
-/// out of any browser/proxy cache; the strict CSP, `nosniff`, and
-/// `no-referrer` apply browser hardening regardless of status.
-///
-/// `Header::from_bytes` only fails on a non-ASCII header name/value, which none
-/// of these are, so the `if let Ok(..)` is best-effort and never drops a header
-/// in practice.
+/// Apply the response-hardening header set (Cache-Control no-store, strict CSP,
+/// nosniff, no-referrer) to `response`. Applied to EVERY response — 200/401/403
+/// — so hardening can't drift between paths (finding D6-3). `Header::from_bytes`
+/// only fails on non-ASCII, which none of these are.
 fn with_security_headers(
     mut response: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     for (name, value) in [
         ("Content-Type", "text/html; charset=utf-8"),
-        // Defense in depth for the report itself — it has no scripts, but
-        // a strict CSP makes that explicit and blocks any injected one.
+        // Strict CSP — the report has no scripts; this blocks any injected one.
         (
             "Content-Security-Policy",
             "default-src 'none'; style-src 'unsafe-inline'",
@@ -620,31 +506,22 @@ fn with_security_headers(
     response
 }
 
-/// Authorize + respond to one request. Pulls the `Host` header and `token` query
-/// param, calls [`authorize`], and emits 200 (HTML) / 401 / 403 accordingly.
-///
-/// Authorization is decided BEFORE the request body is touched (M13 PR #132
-/// finding K): the decision derives only from the `Host` header + the `token`
-/// query parameter, so an unauthenticated client can never make us read (and
-/// buffer) an unbounded body pre-auth.
-///
-/// We never read the request body at all — not even on the authorized path
-/// (M13 PR #132 finding R12-4). This is a read-only GET surface; there is
-/// nothing to consume. A post-auth blocking drain would let a client holding a
-/// valid token trickle a body slowly and stall this single-threaded serve loop,
-/// so once authorized we respond immediately. `tiny_http` discards any unread
-/// body and tears the connection down cleanly when the `Request` drops.
+/// Authorize + respond to one request: pull `Host` + the `token` query param,
+/// call [`authorize`], emit 200 (HTML) / 401 / 403. Authorization is decided
+/// BEFORE the body is touched (finding K), so an unauthenticated client can't
+/// make us buffer an unbounded body. We never read the body at all — even when
+/// authorized (finding R12-4): a post-auth drain would let a valid-token client
+/// trickle a body and stall this single-threaded loop. `tiny_http` discards any
+/// unread body on drop.
 fn handle_request(
     request: tiny_http::Request,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
 ) {
-    // AUTHORITATIVE TTL gate, checked FIRST (CodeRabbit M13 PR #132 R7-4). A
-    // monotonic `Instant` cannot be wound back by a system-clock change, so an
-    // expired token 401s here even if the wall-clock TTL inside `authorize`
-    // were defeated by a backward clock jump. We respond before touching the
-    // body, with the same hardening headers as every other response.
+    // AUTHORITATIVE TTL gate, checked FIRST (R7-4): a monotonic `Instant` can't
+    // be wound back, so an expired token 401s here even if `authorize`'s
+    // wall-clock TTL were defeated by a backward clock jump.
     if mono_ttl_expired(issued_mono.elapsed()) {
         let response = tiny_http::Response::from_string("401 Unauthorized").with_status_code(401);
         let _ = request.respond(with_security_headers(response));
@@ -666,11 +543,8 @@ fn handle_request(
         issued_at,
     );
 
-    // Reject unauthorized / forbidden requests immediately, WITHOUT reading the
-    // body — a pre-auth client cannot grow our memory or keep the handler busy.
-    // The error responses carry the SAME hardening headers as the 200 path (see
-    // `with_security_headers`) so an unauthorized reply is never cacheable and
-    // never misses the browser hardening.
+    // Reject unauthorized/forbidden immediately, WITHOUT reading the body, with
+    // the same hardening headers as the 200 path.
     if decision != Decision::Ok {
         let response = match decision {
             Decision::Unauthorized => {
@@ -685,17 +559,11 @@ fn handle_request(
         return;
     }
 
-    // Authorized (Decision::Ok) — the only path that reaches here. We do NOT
-    // read the request body: this is a read-only GET surface, and a blocking
-    // post-auth drain would let a valid-token client trickle a body slowly and
-    // stall this single-threaded serve loop (M13 PR #132 finding R12-4).
-    // Respond immediately; `tiny_http` discards any unread body on drop.
-    //
-    // Re-render fresh each request so a long-lived tab reflects new activity.
-    // The render escapes every value (see core).
+    // Authorized — respond immediately without reading the body (R12-4); a
+    // post-auth drain would stall this single-threaded loop. Re-render fresh so
+    // a long-lived tab reflects new activity (the render escapes every value).
     let snapshot = build_snapshot();
     let html = dashboard::render_html(&snapshot);
-    // Same hardening header set as the 401/403 paths (see `with_security_headers`).
     let response = with_security_headers(tiny_http::Response::from_string(html));
     let _ = request.respond(response);
 }
@@ -704,27 +572,17 @@ fn handle_request(
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // CodeRabbit M13 PR #132 F2 — the export/serve error branches must honor
-    // `--json`. In `--json` mode an error must be a STRUCTURED JSON object on
-    // stdout (never a plain stderr line), so a machine consumer that asked for
-    // `--json` never gets non-JSON on the error path while the exit code claims
-    // failure. In human mode the error keeps the existing `eprintln!`.
-    //
-    // We follow the SAME race-free strategy `cli::rule`'s F1 tests use: pin the
-    // JSON SHAPE on the pure helper (no process-wide stdout FD capture, which
-    // races libtest's own output under the parallel harness), and pin the EXIT
-    // CODE end-to-end through the real `export()` for an unwritable `--out`.
-    // -----------------------------------------------------------------------
+    // F2 — export/serve error branches must honor `--json` (structured JSON on
+    // stdout, never a stderr line). We pin the JSON SHAPE on the pure helper and
+    // the EXIT CODE end-to-end through `export()` (avoids racing libtest's stdout
+    // under the parallel harness).
 
-    /// The JSON-mode error is the canonical `{ "error": <msg> }` object the rest
-    /// of the CLI emits (`cli::ai::emit_error` / `cli::rule`), and it round-trips
-    /// as parseable JSON carrying the message — not plain text.
+    /// The JSON-mode error is the canonical `{ "error": <msg> }` object,
+    /// round-tripping as parseable JSON, not plain text.
     #[test]
     fn emit_error_json_shape_is_structured_error_object() {
-        // Reproduce the value `emit_error(json=true, ..)` writes via
-        // `write_json_stdout` so we can assert its shape without capturing the
-        // process stdout FD (which would race the parallel harness).
+        // Reproduce the value `emit_error(json=true, ..)` writes, asserting its
+        // shape without capturing the process stdout FD.
         let v = serde_json::json!({ "error": "write /no/such/dir/x.html: nonexistent" });
         let s = serde_json::to_string(&v).expect("error JSON must serialize");
         let parsed: serde_json::Value =
@@ -741,38 +599,26 @@ mod tests {
         );
     }
 
-    /// Routing/return contract of the shared helper: the human arm returns
-    /// `true` (the caller then maps to its exit-1 error code) and writes nothing
-    /// to stdout; the JSON arm returns `true` on a successful stdout write. A
-    /// `false` return is reserved for a JSON write failure (broken pipe), which
-    /// the callers map to exit 2.
+    /// Return contract: both arms return `true` on success (human → stderr,
+    /// JSON → stdout); `false` is reserved for a JSON-write failure (→ exit 2).
     #[test]
     fn emit_error_human_arm_returns_true_without_touching_stdout_contract() {
-        // Human mode: writes to stderr, returns true (no JSON-write failure).
         assert!(
             emit_error(false, "tirith dashboard export", "boom"),
             "human-mode emit_error must return true (only a JSON write failure returns false)"
         );
-        // JSON mode against the real (writable) stdout returns true as well —
-        // the object is emitted successfully. (The broken-pipe `false` branch is
-        // covered by `write_json_stdout`'s own FailingWriter unit test in mod.rs.)
+        // JSON mode against real stdout also returns true. (The broken-pipe
+        // branch is covered by `write_json_stdout`'s own test.)
         assert!(
             emit_error(true, "tirith dashboard export", "boom"),
             "json-mode emit_error must return true when the stdout write succeeds"
         );
     }
 
-    /// End-to-end exit code: `export(--json)` to an UNWRITABLE `--out` (a path
-    /// whose parent component is a regular FILE, so the atomic temp-file
-    /// placement fails with ENOTDIR) must exit NON-ZERO — the exit code stays
-    /// authoritative and the structured JSON error went to stdout. The
-    /// human-mode (`json=false`) call on the same unwritable path must exit with
-    /// the SAME non-zero code (it just routes the message to stderr instead).
-    ///
-    /// `export()` calls `build_snapshot()` first, which resolves config/data/
-    /// state dirs and the shell profile from the process environment; we hold
-    /// `ENV_LOCK` and redirect every base at FRESH EMPTY temp dirs so the build
-    /// is deterministic and cannot race a sibling env-mutating CLI test.
+    /// End-to-end exit code: `export` to an UNWRITABLE `--out` (parent is a
+    /// regular file → ENOTDIR) must exit non-zero in both JSON and human modes.
+    /// `build_snapshot()` reads the process env, so we hold `ENV_LOCK` and point
+    /// every base at fresh empty temp dirs for a deterministic, race-free build.
     #[test]
     fn export_unwritable_path_exits_nonzero_in_both_modes() {
         use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
@@ -790,19 +636,17 @@ mod tests {
         let _appdata = EnvGuard::set("APPDATA", config_tmp.path());
         let _localappdata = EnvGuard::set("LOCALAPPDATA", config_tmp.path());
 
-        // Build an unwritable destination: a REGULAR FILE used as if it were a
-        // directory. `<file>/dashboard.html`'s parent is `<file>` (not a dir),
-        // so `write_file_atomic`'s `NamedTempFile::new_in(parent)` fails — a
-        // deterministic, platform-independent write error (no permission games).
+        // Unwritable destination: a regular FILE used as a dir, so
+        // `<file>/dashboard.html`'s parent isn't a dir and the temp-file
+        // placement fails deterministically (no permission games).
         let dir = tempfile::tempdir().expect("out tempdir");
         let not_a_dir = dir.path().join("regular-file");
         std::fs::write(&not_a_dir, b"i am a file, not a directory").unwrap();
         let bad_out = not_a_dir.join("dashboard.html");
         let bad_out = bad_out.to_string_lossy().into_owned();
 
-        // JSON mode: structured error to stdout, exit non-zero (1 — the write
-        // failure; 2 is reserved for a JSON-write/broken-pipe failure, which is
-        // not the case here against a live stdout).
+        // JSON mode: structured error to stdout, exit 1 (the write failure; 2 is
+        // reserved for a JSON-write/broken-pipe failure).
         let code_json = export(Some(&bad_out), true);
         assert_ne!(
             code_json, 0,
@@ -821,12 +665,9 @@ mod tests {
         );
     }
 
-    // CodeRabbit M13 PR #132 R20: `serve_loop` must distinguish a clean TTL
-    // expiry (success) from a fatal accept/recv error — a server that can no
-    // longer accept connections must NOT exit 0. Pin the smallest decision
-    // point: the outcome→exit-code mapping. A `recv_timeout` TIMEOUT tick
-    // (`Ok(None)`) never reaches this mapping — it `continue`s the loop — so the
-    // only two terminal outcomes are TtlExpired (0) and AcceptError (non-zero).
+    // R20: `serve_loop` must distinguish a clean TTL expiry (0) from a fatal
+    // accept/recv error (non-zero). Pin the outcome→exit-code mapping (a timeout
+    // tick `Ok(None)` never reaches it — it continues the loop).
     #[test]
     fn loop_outcome_exit_code_maps_ttl_to_success_and_error_to_failure() {
         assert_eq!(
@@ -842,17 +683,13 @@ mod tests {
         assert_eq!(err_code, 1, "the fatal accept-error exit code is 1");
     }
 
-    // -----------------------------------------------------------------------
-    // M13 PR #132 finding F2 — the PRODUCTION bind helper `bind_loopback`
-    // binds 127.0.0.1 EXCLUSIVELY (never 0.0.0.0), for both an explicit port
-    // and the ephemeral `:0` case. The end-to-end `serve_loopback_*` test below
-    // binds its OWN listener, so it would not catch a regression in the bind
-    // address chosen by `serve` itself; this pins that contract on the real
-    // helper `serve` calls.
-    // -----------------------------------------------------------------------
+    // F2 — the production `bind_loopback` binds 127.0.0.1 exclusively (never
+    // 0.0.0.0) for both an explicit port and the ephemeral `:0` case. The
+    // end-to-end test below binds its own listener, so this pins the contract on
+    // the real helper `serve` calls.
 
-    /// Assert a freshly-bound `bind_loopback` server's local address is the IPv4
-    /// loopback `127.0.0.1` specifically — loopback AND not `0.0.0.0`.
+    /// Assert a `bind_loopback` server's address is IPv4 loopback specifically
+    /// (loopback AND not `0.0.0.0`).
     fn assert_bound_loopback(server: &tiny_http::Server, label: &str) {
         let addr = server
             .server_addr()
@@ -873,30 +710,20 @@ mod tests {
 
     #[test]
     fn bind_loopback_ephemeral_binds_127_0_0_1() {
-        // `None` → ephemeral `127.0.0.1:0`; the OS assigns a non-zero port but
-        // the IP must still be the IPv4 loopback, never 0.0.0.0.
+        // `None` → ephemeral `127.0.0.1:0`; the IP must still be IPv4 loopback.
         let server = bind_loopback(None).expect("ephemeral loopback bind must succeed");
         assert_bound_loopback(&server, "bind_loopback(None)");
-        // An ephemeral bind resolves to a concrete non-zero port.
         let port = server.server_addr().to_ip().unwrap().port();
         assert_ne!(port, 0, "an ephemeral bind must resolve to a concrete port");
     }
 
     #[test]
     fn bind_loopback_explicit_port_is_honored_and_loopback() {
-        // Prove `bind_loopback(Some(port))` (a) BINDS LOOPBACK and (b) HONORS the
-        // explicit port — without the (inherently racy under the parallel harness)
-        // "free a port then re-bind that exact number" dance, which collides with
-        // every other ephemeral bind churning in sibling tests.
-        //
-        // Hold a live ephemeral loopback server on a known port P, then attempt a
-        // SECOND `bind_loopback(Some(P))`. It MUST fail with AddrInUse: that proves
-        // the helper actually attempted to bind the EXPLICIT port P (had it ignored
-        // the arg, or bound `0.0.0.0:0` / an ephemeral port, the second bind would
-        // have succeeded). The IP half is pinned by the ephemeral test above and by
-        // the held server's own loopback address asserted here. This is fully
-        // deterministic — P stays occupied for the whole window, so there is no
-        // freed-port race for a sibling test to win.
+        // Prove `bind_loopback(Some(port))` honors the explicit port without a
+        // racy free-then-rebind dance: hold a server on port P, then a SECOND
+        // `bind_loopback(Some(P))` must fail with AddrInUse (had the arg been
+        // ignored or bound ephemerally, it would have succeeded). Deterministic:
+        // P stays occupied for the whole window.
         let held = bind_loopback(None).expect("hold a loopback server");
         assert_bound_loopback(&held, "held loopback server");
         let port = held.server_addr().to_ip().unwrap().port();
@@ -907,7 +734,7 @@ mod tests {
             "binding the explicit, already-held port {port} must fail (proves the explicit \
              port is honored, not silently replaced with an ephemeral/0.0.0.0 bind)"
         );
-        // `held` stays alive until here so `port` cannot be reused mid-test.
+        // `held` stays alive until here so `port` can't be reused mid-test.
         drop(held);
     }
 
@@ -919,10 +746,8 @@ mod tests {
         Utc::now()
     }
 
-    // -----------------------------------------------------------------------
-    // Invariant G — authorize() is pure and every branch is unit-tested
-    // WITHOUT binding a socket.
-    // -----------------------------------------------------------------------
+    // Invariant G — authorize() is pure; every branch is unit-tested without a
+    // socket.
 
     #[test]
     fn authorize_ok_for_loopback_host_and_good_token() {
@@ -931,7 +756,7 @@ mod tests {
             authorize(Some("127.0.0.1:8080"), Some(token()), token(), n, n),
             Decision::Ok
         );
-        // `localhost` and a bare host (no port) are also loopback.
+        // `localhost` and a bare host are also loopback.
         assert_eq!(
             authorize(Some("localhost:9000"), Some(token()), token(), n, n),
             Decision::Ok
@@ -1027,20 +852,15 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // R7-4 (CodeRabbit M13 PR #132) — the AUTHORITATIVE TTL is monotonic and so
-    // cannot be defeated by a backward wall-clock jump. `mono_ttl_expired` is a
-    // pure function of an elapsed `Duration`, so we can pin both edges of the
-    // boundary deterministically (no sleeping, no real clock). The wall-clock
-    // `authorize()` TTL tests above stay green as the defense-in-depth layer.
-    // -----------------------------------------------------------------------
+    // R7-4 — the authoritative TTL is monotonic, so a backward clock jump can't
+    // defeat it. `mono_ttl_expired` is pure, so both boundary edges are pinned
+    // deterministically (no sleeping).
     #[test]
     fn mono_ttl_expired_at_and_past_the_boundary() {
         // Fresh / mid-window → not expired.
         assert!(!mono_ttl_expired(Duration::from_secs(0)));
         assert!(!mono_ttl_expired(TOKEN_TTL - Duration::from_secs(1)));
-        // Exactly at the TTL is expired (the bound is inclusive, matching
-        // `authorize`'s `age >= ttl`).
+        // Exactly at the TTL is expired (inclusive, like `authorize`'s `age >= ttl`).
         assert!(mono_ttl_expired(TOKEN_TTL));
         // Past the TTL is expired.
         assert!(mono_ttl_expired(TOKEN_TTL + Duration::from_secs(1)));
@@ -1059,10 +879,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // is_loopback_host unit coverage
-    // -----------------------------------------------------------------------
-
     #[test]
     fn loopback_host_accepts_only_known_loopback_spellings() {
         assert!(is_loopback_host("127.0.0.1"));
@@ -1080,10 +896,6 @@ mod tests {
         assert!(!is_loopback_host("localhost.evil.com"));
         assert!(!is_loopback_host(""));
     }
-
-    // -----------------------------------------------------------------------
-    // token query parsing
-    // -----------------------------------------------------------------------
 
     #[test]
     fn token_from_target_extracts_and_decodes() {
@@ -1137,22 +949,18 @@ mod tests {
         assert_eq!(p, dir.path().join("dashboard.html"));
     }
 
-    /// R19-N3: a successful export lands the COMPLETE rendered HTML at `path`
-    /// (no truncation) and, on Unix, the published file is owner-only `0600` —
-    /// the atomic temp+fsync+rename via `write_file_atomic` must preserve both
-    /// the byte content and the restrictive mode through the rename. Also assert
-    /// no stray `.tmp*` sibling is left behind in the directory.
+    /// R19-N3: a successful export lands the complete HTML (no truncation), on
+    /// Unix is owner-only `0600`, and leaves no stray `.tmp*` sibling — the
+    /// atomic temp+fsync+rename must preserve content and mode.
     #[test]
     fn write_html_file_lands_intact_bytes_and_0600_perms() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dashboard.html");
-        // Distinctive multi-line body so a truncating/partial write would be
-        // visible as a short read.
+        // Multi-line body so a truncating write shows as a short read.
         let html = "<html>\n<body>tirith dashboard export — intact?</body>\n</html>\n";
 
         write_html_file(&path, html).expect("export must succeed");
 
-        // Byte-for-byte intact.
         let read_back = std::fs::read(&path).expect("read exported file");
         assert_eq!(
             read_back,
@@ -1184,9 +992,8 @@ mod tests {
         }
     }
 
-    /// R19-N3 (the core preservation guarantee): a SECOND successful export over
-    /// an existing file replaces it atomically with the new complete content and
-    /// keeps the 0600 mode — i.e. re-exporting never leaves a half-written file.
+    /// R19-N3: a second export over an existing file replaces it atomically with
+    /// the complete new content and keeps 0600 — never a half-written file.
     #[test]
     fn write_html_file_overwrite_preserves_intact_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -1212,23 +1019,19 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Light integration test (invariant B/D/E end-to-end over a REAL socket).
-    //
-    // The security LOGIC coverage lives in the pure `authorize` tests above;
-    // this binds 127.0.0.1:0 and pushes three forged raw HTTP/1.1 requests
-    // through the actual `handle_request` path to confirm the bound server
-    // wires the decision to the right status code. We forge the `Host` header
-    // by hand (a normal HTTP client would set it to the request authority),
-    // which is exactly what a DNS-rebinding attacker's browser does.
-    // -----------------------------------------------------------------------
+    // Light integration test (invariants B/D/E end-to-end over a real socket).
+    // The security LOGIC lives in the pure `authorize` tests above; this binds
+    // 127.0.0.1:0 and pushes forged raw HTTP/1.1 requests through
+    // `handle_request` to confirm the bound server wires each decision to the
+    // right status code. We forge the `Host` header by hand — what a
+    // DNS-rebinding attacker's browser does.
 
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
 
-    /// Send a raw HTTP/1.1 GET with an explicit `Host` header and read the FULL
-    /// response back as `(status_code, raw_text)`. The raw text includes the
-    /// header block so a caller can assert on response headers.
+    /// Send a raw HTTP/1.1 GET with an explicit `Host` and return
+    /// `(status_code, raw_text)` — the raw text includes the header block for
+    /// header assertions.
     fn raw_get_response(port: u16, target: &str, host: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let req = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
@@ -1236,7 +1039,6 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).expect("read response");
         let text = String::from_utf8_lossy(&buf).into_owned();
-        // Status line: "HTTP/1.1 <code> <reason>".
         let status = text
             .lines()
             .next()
@@ -1306,13 +1108,9 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    // -----------------------------------------------------------------------
-    // M13 PR #132 finding D6-3 — the hardening header set is applied to the
-    // 401 (wrong token) and 403 (foreign Host) responses too, not just 200.
-    // An unauthorized response must still be uncacheable (`Cache-Control:
-    // no-store`) and carry the strict CSP / nosniff / no-referrer headers so
-    // the hardening cannot drift between the success and error paths.
-    // -----------------------------------------------------------------------
+    // D6-3 — the hardening header set applies to 401/403 too, not just 200, so
+    // an unauthorized response is still uncacheable and carries the strict
+    // CSP/nosniff/no-referrer headers.
     #[test]
     fn unauthorized_responses_carry_hardening_headers() {
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
@@ -1364,20 +1162,11 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    // -----------------------------------------------------------------------
-    // M13 PR #132 finding K — authorization happens BEFORE we read the body.
-    //
-    // `handle_request` now decides `authorize()` from the Host header + the
-    // `token` query param and EARLY-RETURNS 401/403 before entering the body
-    // drain. We can't reliably observe "didn't read the body" over a real
-    // socket because `tiny_http::Request::respond()` itself drains any unread
-    // body to keep HTTP framing intact. Instead we assert the observable
-    // contract that the reordering guarantees: a POST carrying a non-trivial
-    // body, sent with a FORBIDDEN (foreign) Host, is rejected 403 — the auth
-    // verdict never depends on the request body. (The pure `authorize` tests
-    // above pin the decision order; this end-to-end test pins that the bound
-    // server reaches that verdict for a body-bearing request.)
-    // -----------------------------------------------------------------------
+    // Finding K — authorization happens BEFORE the body is read. We can't
+    // observe "didn't read the body" over a real socket (`respond()` itself
+    // drains for framing), so we assert the observable contract: a body-bearing
+    // POST with a foreign Host is rejected 403 — the verdict never depends on
+    // the body.
     #[test]
     fn unauthorized_body_bearing_request_is_rejected_by_auth() {
         use std::time::Duration as StdDuration;
@@ -1398,9 +1187,8 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        // Foreign Host + a COMPLETE (Content-Length-matching) body. The body is
-        // present so the auth verdict provably does not require its absence; the
-        // verdict must still be 403 (Host fails the rebinding guard).
+        // Foreign Host + a complete body present, so the 403 verdict provably
+        // doesn't require the body's absence.
         let body = "x".repeat(2048);
         let req = format!(
             "POST /?token=wrong HTTP/1.1\r\n\
@@ -1439,47 +1227,23 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    // -----------------------------------------------------------------------
-    // M13 PR #132 finding R12-4 — an authorized request is answered WITHOUT a
-    // pre-response body-drain loop. The deleted drain blocked the
-    // single-threaded serve loop inside `reader.read()`; removing it means the
-    // handler responds as soon as it has authorized, never looping over the
-    // request body.
+    // R12-4 — an authorized request is answered WITHOUT a pre-response body
+    // drain (the deleted drain blocked the single-threaded loop). We assert both
+    // shapes the surface sees — a plain GET and a complete-body POST — return
+    // 200 promptly; a deadline-bounded read turns a re-introduced drain into a
+    // timeout failure rather than a hang. Each request uses its own server so
+    // `Connection: close` teardowns don't interact.
     //
-    // We assert the observable contract for the two request shapes the surface
-    // actually sees: (1) a plain authorized GET with no body — what a browser
-    // sends — and (2) an authorized request carrying a COMPLETE body (the case
-    // the old drain claimed to "consume for connection reuse"). Both must come
-    // back 200 promptly. A generous, deadline-bounded read turns a regression
-    // (a re-introduced blocking drain) into a hard timeout failure here rather
-    // than a hang. Each request is served by its own freshly-bound server so
-    // the `Connection: close` teardown of one cannot interact with the next.
+    // ENV ISOLATION (fixes a parallel-suite flake): the 200 path runs
+    // `build_snapshot()`, which resolves config/data/state dirs + policy
+    // discovery from the process env. Without isolation this raced every
+    // env-mutating CLI test (which serialize on `ENV_LOCK`) and did slow real-FS
+    // work, pushing the render past the read deadline (intermittent status-0).
+    // We hold `ENV_LOCK` and point every base at fresh empty temp dirs (+ empty
+    // cwd, no `.git`) so the build is fast, deterministic, and unraceable.
     //
-    // ENV ISOLATION (fixes a parallel-suite flake): the authorized 200 path
-    // runs `handle_request` → `build_snapshot()` → `tirith_core::dashboard`'s
-    // `build_policy_summary` / `build_audit_summary` / `build_threatdb_summary`
-    // / `build_trust_summary`. Those resolve config/data/state dirs from the
-    // process environment (`config_dir()`/`data_dir()`/`state_dir()` read
-    // `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`, with `HOME`/
-    // `USERPROFILE` and `%APPDATA%`/`%LOCALAPPDATA%` as the per-OS bases) and
-    // probe policy discovery via `TIRITH_POLICY_ROOT` / `TIRITH_SERVER_URL` /
-    // `TIRITH_API_KEY`. The previous version of this test isolated NONE of
-    // those, so it (a) RACED every env-mutating CLI test — they serialize on
-    // `crate::cli::test_harness::ENV_LOCK`, but this test never took it, so a
-    // concurrent `set_var("HOME", …)` could be observed mid-build — and (b) did
-    // real-filesystem work against the developer's actual home/repo, which is
-    // slow under load. Either could push the server thread's render past the
-    // client read deadline, yielding the intermittent status-0 timeout. We now
-    // hold `ENV_LOCK` and point every resolved base at FRESH EMPTY temp dirs
-    // (and an empty cwd, so the repo walk-up finds no `.git`). With nothing on
-    // disk to read, the snapshot build is fast and deterministic, and no other
-    // test can mutate the environment underneath it.
-    //
-    // (We deliberately do NOT test a never-completed oversized body: tiny_http
-    // 0.12's own `Request::respond` blocks reconciling an unread lazy body for
-    // HTTP framing regardless of our code, so that shape is a property of the
-    // dependency, not of the drain we removed.)
-    // -----------------------------------------------------------------------
+    // (We don't test a never-completed oversized body: tiny_http 0.12's own
+    // `respond` blocks reconciling an unread lazy body regardless of our code.)
     #[test]
     fn authorized_request_is_served_without_body_drain() {
         use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
@@ -1487,22 +1251,17 @@ mod tests {
 
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
 
-        // HERMETIC ENV: serialize against every other env-mutating CLI test on
-        // the shared crate lock, then redirect every base the snapshot build
-        // resolves config/data/state from at fresh EMPTY temp dirs. `EnvGuard`
-        // restores each var on Drop; `_lock` releases at end of test. Tolerate a
-        // poisoned lock so one panicking test does not cascade-fail this one.
+        // HERMETIC ENV: serialize on the shared lock, then redirect every base
+        // the snapshot build resolves at fresh empty temp dirs. `EnvGuard`
+        // restores each var on Drop. Tolerate a poisoned lock.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home_tmp = tempfile::tempdir().expect("home tempdir");
         let config_tmp = tempfile::tempdir().expect("config tempdir");
         let data_tmp = tempfile::tempdir().expect("data tempdir");
         let state_tmp = tempfile::tempdir().expect("state tempdir");
         let cwd_tmp = tempfile::tempdir().expect("cwd tempdir");
-        // Per-OS bases for `config_dir()`/`data_dir()`/`state_dir()` +
-        // `home::home_dir()`. On Linux/macOS the XDG_* vars win; on Windows the
-        // %APPDATA%/%LOCALAPPDATA% + %USERPROFILE% bases do — set BOTH families
-        // so the test is hermetic on either. Pointing them at empty dirs means
-        // every policy/audit/threat-db/trust/canary file lookup misses fast.
+        // Per-OS bases (XDG_* on Linux/macOS, %APPDATA%/%USERPROFILE% on
+        // Windows) — set BOTH families so every file lookup misses fast.
         let _home = EnvGuard::set("HOME", home_tmp.path());
         let _userprofile = EnvGuard::set("USERPROFILE", home_tmp.path());
         let _xdg_config = EnvGuard::set("XDG_CONFIG_HOME", config_tmp.path());
@@ -1510,19 +1269,17 @@ mod tests {
         let _xdg_state = EnvGuard::set("XDG_STATE_HOME", state_tmp.path());
         let _appdata = EnvGuard::set("APPDATA", config_tmp.path());
         let _localappdata = EnvGuard::set("LOCALAPPDATA", config_tmp.path());
-        // Policy discovery + remote-fetch probes: remove so discovery finds no
-        // local-only root and never even considers a network fetch.
+        // Remove policy-discovery + remote-fetch probes so discovery finds no
+        // root and never considers a network fetch.
         let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
         let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
         let _api_key = EnvGuard::remove("TIRITH_API_KEY");
-        // An empty cwd (no `.git`) so `find_repo_root` returns `None` and the
-        // repo-scope policy/trust/org overlays resolve to nothing.
+        // Empty cwd (no `.git`) so the repo-scope overlays resolve to nothing.
         let _cwd = CwdGuard::set(cwd_tmp.path());
 
-        // Serve exactly one forged request through the real `handle_request`
-        // path and return its numeric status. A fresh issue time keeps the TTL
-        // open; a generous, deadline-bounded client read means a regression
-        // (a re-introduced blocking drain) still fails — just not flakily.
+        // Serve one forged request through the real `handle_request` and return
+        // its status. A deadline-bounded read makes a re-introduced drain fail
+        // (not flakily).
         fn serve_one(token: &str, raw_request: &str) -> u16 {
             let issued = Utc::now();
             let issued_mono = Instant::now();
@@ -1542,24 +1299,17 @@ mod tests {
             let req = raw_request.replace("{port}", &port.to_string());
             stream.write_all(req.as_bytes()).expect("write request");
             stream.flush().expect("flush");
-            // Per-syscall timeout kept short so a blocked read wakes often; the
-            // hard ceiling below is what actually bounds the regression. We keep
-            // it generous (well above any legitimate snapshot-build latency)
-            // because a re-introduced blocking drain makes the server block
-            // ~indefinitely, so even a long ceiling still catches it.
+            // Short per-syscall timeout so a blocked read wakes often; the hard
+            // ceiling below is what bounds the regression.
             stream
                 .set_read_timeout(Some(StdDuration::from_secs(2)))
                 .expect("set read timeout");
 
-            // Read until a status line is parseable or a hard deadline elapses.
-            // We do NOT drain to EOF: a re-introduced blocking drain would delay
-            // the status line itself, so observing it promptly is the regression
-            // signal. Crucially we LOOP rather than collapse a single transient
-            // empty / `WouldBlock` / `TimedOut` read into status 0 — under a busy
-            // parallel suite the server thread can be scheduled late, and a one-
-            // shot read would race that scheduling and report a false 0. A real
-            // hang still fails because the parsed-status branch is never reached
-            // before the 30s ceiling.
+            // Read until a status line parses or the deadline elapses (no
+            // drain-to-EOF: a re-introduced drain would delay the status line).
+            // We LOOP rather than collapse a transient WouldBlock/TimedOut into
+            // status 0, since a late-scheduled server thread would otherwise
+            // race to a false 0; a real hang still fails at the ceiling.
             let deadline = StdInstant::now() + StdDuration::from_secs(30);
             let mut acc: Vec<u8> = Vec::with_capacity(256);
             loop {
@@ -1569,24 +1319,20 @@ mod tests {
                 }
                 if StdInstant::now() >= deadline {
                     handle.join().expect("server thread");
-                    // No status line within the ceiling ⇒ a genuine hang (the
-                    // regression this test exists to catch). Surface 0 so the
-                    // caller's assert_eq! fails with its descriptive message.
+                    // No status line within the ceiling ⇒ a genuine hang. Return
+                    // 0 so the caller's assert_eq! fails with its message.
                     return 0;
                 }
                 let mut buf = [0u8; 256];
                 match stream.read(&mut buf) {
-                    // EOF before a status line: the peer closed without a
-                    // complete response. Stop reading and let the (absent)
-                    // status fail the assertion.
+                    // EOF before a status line: peer closed; let the assertion fail.
                     Ok(0) => {
                         handle.join().expect("server thread");
                         return parse_status_line(&acc).unwrap_or(0);
                     }
                     Ok(n) => acc.extend_from_slice(&buf[..n]),
-                    // A per-read timeout or non-blocking would-block is NOT a
-                    // failure on its own — the server may just be slow to be
-                    // scheduled. Retry until the hard deadline.
+                    // A timeout/would-block isn't a failure — the server may be
+                    // slow to schedule; retry until the deadline.
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -1599,14 +1345,12 @@ mod tests {
             }
         }
 
-        // Parse the numeric status from the first line of an (possibly partial)
-        // HTTP response. Returns `None` until a full status line ("HTTP/1.1 200
-        // …\r\n") has arrived, so a half-read header block keeps the caller
-        // looping instead of mis-parsing a truncated line.
+        // Parse the status from a (possibly partial) response. `None` until a
+        // full status line has arrived, so a half-read block keeps the caller
+        // looping rather than mis-parsing.
         fn parse_status_line(bytes: &[u8]) -> Option<u16> {
             let text = String::from_utf8_lossy(bytes);
-            // Only trust the first line once it is terminated — otherwise we
-            // could be mid-status-line and parse a partial code.
+            // Trust the first line only once terminated.
             let (first, _rest) = text.split_once("\r\n")?;
             first.split_whitespace().nth(1)?.parse().ok()
         }
@@ -1622,9 +1366,8 @@ mod tests {
             "an authorized GET with no body must be served 200 promptly"
         );
 
-        // 2. Authorized request with a COMPLETE (Content-Length-matching) body —
-        //    the case the deleted drain claimed to consume. With the drain gone
-        //    the handler must still respond 200 and must not block on the body.
+        // 2. Authorized request with a complete body (what the drain claimed to
+        //    consume) — must still respond 200 without blocking on the body.
         let body = "ignored-body-bytes";
         let post = format!(
             "POST /?token={token} HTTP/1.1\r\n\

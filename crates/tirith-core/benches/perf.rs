@@ -1,8 +1,7 @@
 //! Performance benchmarks for tirith-core.
 //!
 //! Targets: Tier 1 exit (no URL) p50 < 0.5ms / p95 < 2ms; full analysis
-//! p50 < 3ms / p95 < 5ms. End-to-end hook latency is covered separately by
-//! shell integration tests.
+//! p50 < 3ms / p95 < 5ms. End-to-end hook latency is covered by shell tests.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tirith_core::engine::{self, AnalysisContext};

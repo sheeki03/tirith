@@ -1,15 +1,9 @@
 //! `tirith devcontainer guard|inject` (M8 ch5).
 //!
-//! Two operator surfaces:
-//!
-//! 1. **`guard on|off|status`** — flips `policy.context_guard_enabled`
-//!    (the shared M8 operator switch). When OFF, the M8 ch5 container
-//!    rules silence uniformly with the M8 ch1..ch4 context guards.
-//!
-//! 2. **`inject [--path <dir>]`** — locates `<dir>/.devcontainer/
-//!    devcontainer.json` (or `<dir>/.devcontainer.json`) and appends a
-//!    tirith `postCreateCommand` line + `TIRITH_DEVCONTAINER=1` env
-//!    flag. **Idempotent.** Re-running is a no-op.
+//! 1. `guard on|off|status` — flips `policy.context_guard_enabled` (the shared
+//!    M8 switch); when OFF the M8 ch5 container rules silence with ch1..ch4.
+//! 2. `inject [--path <dir>]` — locates the devcontainer.json under `<dir>` and
+//!    appends a tirith `postCreateCommand` + `TIRITH_DEVCONTAINER=1`. Idempotent.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -97,11 +91,9 @@ fn guard_status(json: bool) -> i32 {
 // ─── inject ───────────────────────────────────────────────────────────────
 
 /// `tirith devcontainer inject [--path <dir>] [--create]` — locate the
-/// devcontainer.json under `<dir>` (or cwd) and add the tirith hook.
-/// Idempotent: re-running is a no-op.
-///
-/// `create` controls whether a missing file is created. The CLI
-/// forwards `--create` here; without it a missing file is an error.
+/// devcontainer.json under `<dir>` (or cwd) and add the tirith hook
+/// (idempotent). `create` controls whether a missing file is created; without
+/// it a missing file is an error.
 pub fn inject(path: Option<&Path>, create: bool, json: bool) -> i32 {
     let cwd = match path {
         Some(p) => p.to_path_buf(),

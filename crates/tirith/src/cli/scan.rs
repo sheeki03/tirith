@@ -5,20 +5,10 @@ use tirith_core::policy::Policy;
 use tirith_core::scan::{self, ScanConfig};
 use tirith_core::verdict::{RuleId, Severity};
 
-// ---------------------------------------------------------------------------
-// Built-in scan profiles
-// ---------------------------------------------------------------------------
-//
-// `tirith scan --profile <name>` tunes a scan for a specific use case. Three
-// profiles are built in; a policy `scan.profiles.<name>` entry with the same
-// name overrides the built-in one (the user's policy always wins).
-//
-// A built-in profile sets a default `fail_on`, an `exclude` list, and a
-// per-rule overlay that runs *after* the scan: it can suppress a rule's
-// findings entirely (a check that does not apply to this use case) or pin a
-// rule's severity (so the profile, not the rule's default, decides whether a
-// finding fails CI). The overlay is intentionally small and explicit — no
-// profile can ever invent a finding, only suppress or re-grade one.
+// `tirith scan --profile <name>` tunes a scan for a use case. A policy
+// `scan.profiles.<name>` entry overrides a same-named built-in. A built-in sets
+// a default `fail_on`, an `exclude` list, and a per-rule overlay applied AFTER
+// the scan — it may only suppress or re-grade findings, never invent one.
 
 /// What a built-in profile does to one rule's findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,25 +31,11 @@ struct BuiltInProfile {
     rule_overlay: &'static [(RuleId, ProfileRuleAction)],
 }
 
-/// Resolve a built-in profile by name, or `None` when the name is not a
-/// built-in. The three profiles:
-///
-/// * **`ci-hardening`** — hardening a CI/CD pipeline. Every CI/repo
-///   supply-chain check runs at full strength and `fail_on` is `high`, so a
-///   `pull_request_target` trigger or a `curl | bash` step fails the build.
-///   Unpinned-action and un-pinned-image findings (hardening gaps) are kept
-///   but pinned to `medium` so they surface without failing CI on their own.
-/// * **`ai-agent-repo`** — a repository an AI coding agent operates in. The
-///   priority is config-poisoning and injection risk, not pinning hygiene:
-///   the high-severity injection / dangerous-trigger / dangerous-script rules
-///   stay, while the noisy hardening-gap rules (unpinned action, un-pinned
-///   image) are suppressed so an agent is not flooded with low-value findings.
-/// * **`oss-maintainer`** — an open-source maintainer reviewing a contributed
-///   change. The priority is contributor-controllable attack surface:
-///   workflow script-injection, the `pull_request_target` trigger, and
-///   dangerous `package.json` lifecycle scripts are emphasised (kept at
-///   `high`); pinning-hygiene findings are downgraded to `low`. `fail_on` is
-///   `high`.
+/// Resolve a built-in profile by name, or `None`. All three default `fail_on`
+/// to `high`:
+/// * `ci-hardening` — pinning-gap findings kept but pinned to `medium`.
+/// * `ai-agent-repo` — pinning-gap findings suppressed (low-value noise for an agent).
+/// * `oss-maintainer` — pinning-gap findings downgraded to `low`.
 fn built_in_profile(name: &str) -> Option<BuiltInProfile> {
     match name {
         "ci-hardening" => Some(BuiltInProfile {
@@ -80,8 +56,6 @@ fn built_in_profile(name: &str) -> Option<BuiltInProfile> {
             fail_on: "high",
             exclude: &[],
             rule_overlay: &[
-                // Pinning-hygiene gaps are low-value noise for an agent — the
-                // agent is not the one choosing action versions.
                 (RuleId::WorkflowUnpinnedAction, ProfileRuleAction::Suppress),
                 (RuleId::DockerfileUnpinnedImage, ProfileRuleAction::Suppress),
             ],
@@ -90,9 +64,6 @@ fn built_in_profile(name: &str) -> Option<BuiltInProfile> {
             fail_on: "high",
             exclude: &[],
             rule_overlay: &[
-                // Hardening gaps are real but not the maintainer's
-                // review priority on an incoming PR — keep them visible but
-                // low so attention goes to the injection / trigger findings.
                 (
                     RuleId::WorkflowUnpinnedAction,
                     ProfileRuleAction::SetSeverity(Severity::Low),
@@ -107,13 +78,10 @@ fn built_in_profile(name: &str) -> Option<BuiltInProfile> {
     }
 }
 
-/// Names of every built-in profile, for help text and the unknown-profile
-/// error message.
+/// Names of every built-in profile, for help text and the unknown-profile error.
 const BUILT_IN_PROFILE_NAMES: &[&str] = &["ci-hardening", "ai-agent-repo", "oss-maintainer"];
 
-/// Apply a built-in profile's per-rule overlay to a slice of findings:
-/// suppress findings for a `Suppress` rule, re-grade findings for a
-/// `SetSeverity` rule. Returns the filtered/adjusted findings.
+/// Apply a built-in profile's per-rule overlay: suppress or re-grade findings.
 fn apply_rule_overlay(
     findings: Vec<tirith_core::verdict::Finding>,
     overlay: &[(RuleId, ProfileRuleAction)],
@@ -151,8 +119,7 @@ pub fn run(
     let mut effective_exclude: Vec<String> = exclude.to_vec();
     let mut effective_ignore: Vec<String> = ignore.to_vec();
     let mut effective_fail_on = fail_on.to_string();
-    // The per-rule overlay from a resolved built-in profile, applied to scan
-    // results after the scan. Empty when no built-in profile is in effect.
+    // Per-rule overlay from a resolved built-in profile (empty otherwise).
     let mut rule_overlay: Vec<(RuleId, ProfileRuleAction)> = Vec::new();
 
     if let Some(profile_name) = profile {
@@ -161,8 +128,7 @@ pub fn run(
         let built_in = built_in_profile(profile_name);
 
         if let Some(scan_profile) = policy_profile {
-            // A policy `scan.profiles.<name>` entry — the user's policy always
-            // wins over a same-named built-in profile.
+            // A policy profile entry — the user's policy wins over a built-in.
             if effective_include.is_empty() {
                 effective_include = scan_profile.include.clone();
             }
@@ -172,15 +138,13 @@ pub fn run(
             if effective_ignore.is_empty() {
                 effective_ignore = scan_profile.ignore.clone();
             }
-            // Profile fail_on applies only when CLI is at its default value.
+            // Profile fail_on applies only at the CLI default.
             if fail_on == "critical" {
                 if let Some(ref profile_fail_on) = scan_profile.fail_on {
                     effective_fail_on = profile_fail_on.clone();
                 }
             }
         } else if let Some(bp) = &built_in {
-            // A built-in profile: default fail_on, scope excludes, and a
-            // per-rule overlay applied to the results below.
             if effective_exclude.is_empty() {
                 effective_exclude = bp.exclude.iter().map(|s| s.to_string()).collect();
             }
@@ -243,10 +207,8 @@ pub fn run(
     };
 
     let mut result = scan::scan(&config);
-    // A built-in profile re-grades / suppresses findings before output and
-    // before the exit-code decision, so the profile's policy is what CI sees.
-    // `scanned_count` is left untouched — a file whose findings were all
-    // suppressed was still scanned; only display and the verdict change.
+    // Apply the overlay before output and the exit-code decision, so CI sees the
+    // profile's verdict. `scanned_count` is left untouched.
     if !rule_overlay.is_empty() {
         for file_result in &mut result.file_results {
             let findings = std::mem::take(&mut file_result.findings);
@@ -254,10 +216,8 @@ pub fn run(
         }
     }
 
-    // A JSON / SARIF write failure is the command's own I/O failure: a piped
-    // consumer must not receive truncated output paired with a `0` success
-    // code. When the scan would otherwise exit 0, surface exit 1 instead. A
-    // non-zero finding-driven code already propagates and is kept.
+    // A JSON/SARIF write failure must surface exit 1 instead of a `0` paired
+    // with truncated output; a finding-driven non-zero code is kept.
     let output_ok = if sarif {
         print_sarif_result(&result)
     } else if json {
@@ -312,8 +272,7 @@ fn run_stdin(
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
-    // A JSON / SARIF write failure must not be reported as a `0` success —
-    // see `run`.
+    // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
         print_sarif_file_result(&result)
     } else if json {
@@ -362,8 +321,7 @@ fn run_single_file(
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
-    // A JSON / SARIF write failure must not be reported as a `0` success —
-    // see `run`.
+    // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
         print_sarif_file_result(&result)
     } else if json {
@@ -400,9 +358,8 @@ fn parse_severity(s: &str) -> Severity {
     }
 }
 
-/// Emit a directory-scan result as JSON. Returns `false` on a JSON-write
-/// failure so the caller can exit non-zero — a piped consumer must not see
-/// truncated JSON paired with a success code.
+/// Emit a directory-scan result as JSON. Returns `false` on a write failure so
+/// the caller can exit non-zero (no truncated JSON with a success code).
 fn print_json_result(result: &scan::ScanResult) -> bool {
     #[derive(serde::Serialize)]
     struct JsonScanOutput<'a> {
@@ -582,7 +539,7 @@ fn print_human_file_result(result: &scan::FileScanResult) {
     }
 }
 
-/// Check whether a single file should be skipped based on include/exclude/ignore filters.
+/// Whether a file should be skipped per include/exclude/ignore filters.
 fn should_skip_file(
     file_path: &str,
     include: &[String],
@@ -662,7 +619,6 @@ mod tests {
         assert!(built_in_profile("ai-agent-repo").is_some());
         assert!(built_in_profile("oss-maintainer").is_some());
         assert!(built_in_profile("nonexistent").is_none());
-        // Every advertised name resolves.
         for name in BUILT_IN_PROFILE_NAMES {
             assert!(
                 built_in_profile(name).is_some(),
@@ -680,13 +636,12 @@ mod tests {
             finding(RuleId::WorkflowUnpinnedAction, Severity::Medium),
         ];
         let out = apply_rule_overlay(findings, bp.rule_overlay);
-        // The dangerous-trigger High finding survives untouched.
         assert!(
             out.iter()
                 .any(|f| f.rule_id == RuleId::WorkflowDangerousTrigger
                     && f.severity == Severity::High)
         );
-        // The unpinned-action finding is kept (still Medium under ci-hardening).
+        // Unpinned-action kept (still Medium under ci-hardening).
         assert!(
             out.iter()
                 .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction
@@ -703,11 +658,10 @@ mod tests {
             finding(RuleId::DockerfileUnpinnedImage, Severity::Medium),
         ];
         let out = apply_rule_overlay(findings, bp.rule_overlay);
-        // The injection finding stays.
+        // Injection finding stays; pinning-hygiene findings suppressed.
         assert!(out
             .iter()
             .any(|f| f.rule_id == RuleId::WorkflowUntrustedInput));
-        // Pinning-hygiene findings are suppressed entirely.
         assert!(!out
             .iter()
             .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction));
@@ -724,11 +678,10 @@ mod tests {
             finding(RuleId::WorkflowUnpinnedAction, Severity::Medium),
         ];
         let out = apply_rule_overlay(findings, bp.rule_overlay);
-        // The dangerous-script finding keeps its High severity.
+        // Dangerous-script stays High; unpinned-action downgraded to Low.
         assert!(out
             .iter()
             .any(|f| f.rule_id == RuleId::PackageScriptDangerous && f.severity == Severity::High));
-        // The unpinned-action finding is downgraded to Low.
         assert!(out
             .iter()
             .any(|f| f.rule_id == RuleId::WorkflowUnpinnedAction && f.severity == Severity::Low));
@@ -745,7 +698,6 @@ mod tests {
 
     #[test]
     fn overlay_leaves_unlisted_rules_untouched() {
-        // A rule not in the overlay passes through unchanged.
         let bp = built_in_profile("ci-hardening").unwrap();
         let findings = vec![finding(RuleId::ConfigInjection, Severity::High)];
         let out = apply_rule_overlay(findings, bp.rule_overlay);

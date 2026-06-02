@@ -1,48 +1,30 @@
 //! M11 ch1 — signed "command cards".
 //!
-//! A command card is an ed25519-signed attestation of what a command *does*:
-//! the exact command string, the domains it is expected to contact, the
-//! SHA-256 of the script it pipes, the paths it writes, whether it needs
-//! sudo, and an expiry date. A maintainer publishes a card alongside their
-//! install one-liner; a user verifies the card against the command they are
-//! about to run.
+//! An ed25519-signed attestation of what a command does: the exact command
+//! string, expected domains, piped-script SHA-256, written paths, sudo need, and
+//! an expiry. A maintainer publishes a card alongside their install one-liner; a
+//! user verifies it against the command they are about to run.
 //!
-//! ## v1 scope (attestation only — NO suppression)
+//! v1 is ATTESTATION-ONLY — no suppression. A verified card emits one Info
+//! [`RuleId::CommandCardVerified`] and does NOT change any other finding's
+//! action/severity; a `curl … | sh` with a valid card still warns/blocks. A
+//! mismatched command emits [`RuleId::CommandCardMismatch`] (High). v1
+//! verification checks ONLY the signature, expiry, and exact command string —
+//! the other signed fields (`script_sha256`, `expected_domains`, `writes`,
+//! `requires_sudo`) are recorded but NOT enforced (enforcing `script_sha256`
+//! would need the script body, forbidden by no-network-on-`check`).
 //!
-//! A *verified* card emits a single [`RuleId::CommandCardVerified`] (Info)
-//! finding. It improves audit confidence but **does NOT change any other
-//! finding's action or severity** — a `curl … | sh` with a valid card still
-//! warns/blocks exactly as it would without the card. A *mismatched* card
-//! (command text differs from the signed `command`) emits
-//! [`RuleId::CommandCardMismatch`] (High). There is deliberately no
-//! `expected_suppressed_rules` field and no suppression allowlist in v1;
-//! card-driven suppression is a deferred v2 candidate.
+//! Trust model (v1, manual key distribution): signatures verify against ed25519
+//! pubkeys the operator trusted by dropping `<key_id>.pub` (raw/hex/base64) into
+//! `~/.config/tirith/trusted-card-keys/`. `key_id` = first 16 hex of
+//! `sha256(pubkey)`. An untrusted key is treated as unverified — never
+//! `CommandCardVerified`. No automatic key fetch.
 //!
-//! v1 verification checks ONLY the signature, the expiry, and the exact command
-//! string. The attestation's other fields (`script_sha256`, `expected_domains`,
-//! `writes`, `requires_sudo`) are signed and recorded but **NOT enforced** on
-//! the hot path — enforcing `script_sha256`, for instance, would require
-//! fetching the script body, which the no-network-on-`check` invariant forbids.
-//! They document maintainer intent; do not read them as guarantees.
-//!
-//! ## Trust model (v1 — manual key distribution)
-//!
-//! Card signatures are verified against ed25519 public keys the operator has
-//! explicitly trusted by dropping `<key_id>.pub` (32 raw bytes, hex, or
-//! base64) into `~/.config/tirith/trusted-card-keys/`. The `key_id` is the
-//! first 16 hex chars of `sha256(pubkey_bytes)`. A card signed by a key that
-//! is not in that directory is treated as *unverified*: tirith does NOT emit
-//! `CommandCardVerified` (it may emit an Info "signed by an untrusted key"
-//! note instead). There is no automatic key fetch.
-//!
-//! ## No hot-path network
-//!
-//! Card *content* is only ever read from disk on the analysis hot path
-//! (`tirith check`), via a `--card <path>` sidecar flag or a
-//! `# tirith-card: <local-path>` shell comment. A URL-shaped reference is
-//! never fetched during `tirith check` — the user must run
-//! `tirith command-card fetch <url>` first (the only remote-I/O path), which
-//! caches the card under `~/.cache/tirith/cards/<sha256>.json`.
+//! No hot-path network: card content is read only from disk on `tirith check`
+//! (via `--card <path>` or a `# tirith-card: <local-path>` comment). A
+//! URL-shaped reference is never fetched during `check`; the user runs
+//! `tirith command-card fetch <url>` first (the only remote-I/O path), caching
+//! under `~/.cache/tirith/cards/<sha256>.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -59,37 +41,25 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of an ed25519 signature in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// Read cap for a trusted public-key file (`<key_id>.pub`). A real key is 32 raw
-/// bytes, a 64-char hex string, or ~44-char base64 — all far below this. The cap
-/// only exists to bound a malicious/oversized file (CodeRabbit R13 #2); 4 KiB is
-/// generous slack for trailing whitespace/newlines while still refusing anything
-/// that is plainly not a key.
+/// Read cap for a trusted public-key file (`<key_id>.pub`). A real key is well
+/// under 4 KiB; the cap only bounds a malicious/oversized file.
 const TRUSTED_PUBKEY_READ_CAP: u64 = 4096;
 
-/// `true` for the ASCII whitespace a POSIX/PowerShell shell treats as a TOKEN
-/// SEPARATOR: space, tab, newline, carriage-return (CodeRabbit R13 #3).
-///
-/// Deliberately NARROWER than [`char::is_ascii_whitespace`], which also returns
-/// `true` for `\x0C` FORM FEED — a control character that is NOT a shell token
-/// separator. Trimming a trailing form feed (or, by the same token, a vertical
-/// tab `\x0B`, which `is_ascii_whitespace` already excludes) when comparing two
-/// commands could equate a command a shell would treat as DIFFERENT (`echo hi`
-/// vs `echo hi\x0C`), which for a signed-card / manifest gate is a verification
-/// bypass. Used by the command-equality comparisons ([`CommandCard::command_matches`]
-/// and the manifest matcher) so the trim is exactly the surrounding run a shell
-/// would itself ignore.
+/// `true` for the ASCII whitespace a shell treats as a TOKEN SEPARATOR (space,
+/// tab, `\n`, `\r`). Deliberately NARROWER than [`char::is_ascii_whitespace`],
+/// which also counts `\x0C` FORM FEED: trimming `\x0C`/`\x0B` when comparing
+/// commands could equate strings a shell treats as DIFFERENT — a signed-card /
+/// manifest verification bypass. Used by the command-equality comparisons so the
+/// trim is exactly what a shell would itself ignore.
 pub(crate) fn is_shell_significant_ws(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r')
 }
 
 /// The signature algorithm a card is signed with. v1 supports ONLY ed25519.
 ///
-/// Modeled as a closed enum (not a free `String`) so the "only ed25519"
-/// invariant is enforced at the type level: a card whose `algo` is anything but
-/// `"ed25519"` (e.g. `"none"`, `"ED25519"`, `"rsa"`) FAILS to deserialize —
-/// there is no catch-all arm — which kills the `algo: "none"` /
-/// casing-confusion attack class at parse time rather than via a runtime string
-/// compare. Serializes/deserializes as the lowercase string `"ed25519"`.
+/// A closed enum (not a free `String`) so any non-`"ed25519"` value (`"none"`,
+/// `"ED25519"`, `"rsa"`) FAILS to deserialize, killing the algo-confusion attack
+/// class at parse time. Serializes as the lowercase string `"ed25519"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SignatureAlgo {
@@ -110,29 +80,23 @@ impl std::fmt::Display for SignatureAlgo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CardSignature {
-    /// Signature algorithm. v1 only supports [`SignatureAlgo::Ed25519`]; an
-    /// unknown value fails at deserialize time.
+    /// Signature algorithm (only [`SignatureAlgo::Ed25519`] in v1).
     pub algo: SignatureAlgo,
-    /// First 16 hex chars of `sha256(pubkey_bytes)` — identifies which trusted
-    /// public key should verify this card.
+    /// First 16 hex of `sha256(pubkey)` — which trusted key verifies this card.
     pub key_id: String,
     /// Lowercase-hex ed25519 signature over the canonical signing payload.
     pub value: String,
 }
 
 /// A command card: the unsigned attestation fields plus an optional signature.
+/// The signature covers [`Card::signing_payload`] — every field except the
+/// signature block.
 ///
-/// The signature covers the [`Card::signing_payload`] — every field *except*
-/// the signature block itself. Serializing/deserializing is plain JSON with
-/// the field names the spec pins.
-///
-/// `deny_unknown_fields` (CodeRabbit R13b): a signed card is a security
-/// attestation, so `from_json` must reject any field not represented here.
-/// Without it, an unknown on-disk field would be silently dropped before
-/// `signing_payload` re-serializes the typed struct — i.e. it would ride along
-/// outside the attested boundary. Rejecting unknown fields keeps the verified
-/// document byte-equivalent to what was signed. (Compatible: no `#[serde(flatten)]`
-/// here; `#[serde(default)]` on optional fields still tolerates MISSING ones.)
+/// `deny_unknown_fields`: a signed card is a security attestation, so an unknown
+/// on-disk field must be rejected rather than silently dropped before
+/// `signing_payload` re-serializes — otherwise it would ride outside the
+/// attested boundary. (`#[serde(default)]` on optional fields still tolerates
+/// MISSING ones.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Card {
@@ -141,16 +105,10 @@ pub struct Card {
     /// Domains (or `host/path` prefixes) the command is expected to contact.
     #[serde(default)]
     pub expected_domains: Vec<String>,
-    /// SHA-256 (hex) of the script the command downloads/pipes, if any.
-    ///
-    /// RECORDED-BUT-NOT-ENFORCED in v1. This field is part of the signed
-    /// attestation, but `tirith check` does NOT compare it against the piped
-    /// script body — enforcement would require fetching/reading the script on
-    /// the hot path, which the no-network-on-check invariant forbids. v1
-    /// verification checks ONLY the signature, expiry, and exact command match.
-    /// Treat this as documentation of the maintainer's intent, not a guarantee
-    /// that a server-side script swap is caught. (Enforcement is a v2 candidate
-    /// once the script bytes are available out-of-band.)
+    /// SHA-256 (hex) of the piped script, if any. RECORDED-BUT-NOT-ENFORCED in
+    /// v1: signed, but `tirith check` does NOT compare it against the script body
+    /// (that would need network on the hot path). Maintainer intent, not a
+    /// guarantee that a server-side script swap is caught.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_sha256: Option<String>,
     /// Filesystem paths the command is expected to write.
@@ -307,9 +265,8 @@ impl Card {
         }
     }
 
-    /// The canonical bytes that the signature covers: the card with its
-    /// `signature` field cleared, serialized as compact JSON. Both sign and
-    /// verify use this exact serialization so the signature is stable.
+    /// The canonical bytes the signature covers: the card with `signature`
+    /// cleared, as compact JSON. Both sign and verify use this exact form.
     pub fn signing_payload(&self) -> Result<Vec<u8>, CardError> {
         let mut unsigned = self.clone();
         unsigned.signature = None;
@@ -326,8 +283,7 @@ impl Card {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// Sign the card with a 32-byte ed25519 secret key, stamping the
-    /// `signature` block (algo, key_id, hex signature).
+    /// Sign with a 32-byte ed25519 secret key, stamping the `signature` block.
     pub fn sign(&mut self, secret_key: &[u8; SECRET_KEY_LEN]) -> Result<(), CardError> {
         let signing_key = SigningKey::from_bytes(secret_key);
         let verifying_key = signing_key.verifying_key();
@@ -344,16 +300,14 @@ impl Card {
         Ok(())
     }
 
-    /// Verify the card's signature against a known public key. Returns `Ok(())`
-    /// only when the signature is present, the algo is ed25519, the key_id
-    /// matches the supplied pubkey, and the signature verifies. Does NOT check
-    /// expiry — see [`Card::verify_against_trusted`] for the full check.
+    /// Verify the signature against a known public key. `Ok(())` only when the
+    /// signature is present, the algo is ed25519, the key_id matches `pubkey`,
+    /// and the signature verifies. Does NOT check expiry — see
+    /// [`Card::verify_against_trusted`].
     pub fn verify_signature(&self, pubkey: &[u8; PUBLIC_KEY_LEN]) -> Result<(), VerifyFailure> {
         let sig_block = self.signature.as_ref().ok_or(VerifyFailure::Unsigned)?;
-        // The algo is a closed enum (an unknown value already failed to
-        // deserialize), so this match is total. The explicit arm keeps
-        // `UnsupportedAlgo` reachable and forces a compile error if a future
-        // variant is added without handling its verification path.
+        // Closed enum, so this match is total; the explicit arm forces a compile
+        // error if a future variant skips its verification path.
         match sig_block.algo {
             SignatureAlgo::Ed25519 => {}
         }
@@ -377,29 +331,24 @@ impl Card {
             .map_err(|_| VerifyFailure::BadSignature)
     }
 
-    /// True when the card's `expires` date is today or later. A malformed
-    /// expiry returns `Err(UnparseableExpiry)`.
+    /// True when `expires` is today or later (inclusive). Malformed expiry →
+    /// `Err(UnparseableExpiry)`.
     pub fn not_expired(&self, today: chrono::NaiveDate) -> Result<bool, VerifyFailure> {
         let exp = chrono::NaiveDate::parse_from_str(self.expires.trim(), "%Y-%m-%d")
             .map_err(|_| VerifyFailure::UnparseableExpiry)?;
-        // Inclusive: a card is valid through the end of its expiry date.
         Ok(today <= exp)
     }
 
-    /// Full trust check: resolve the card's `key_id` against the trusted-keys
-    /// directory, verify the signature, and confirm the card has not expired.
-    ///
-    /// `trusted_keys_dir` is `~/.config/tirith/trusted-card-keys/` in
-    /// production; tests pass a `tempfile::tempdir()`.
+    /// Full trust check: resolve `key_id` against the trusted-keys dir, verify
+    /// the signature, and confirm the card has not expired.
     pub fn verify_against_trusted(
         &self,
         trusted_keys_dir: &Path,
         today: chrono::NaiveDate,
     ) -> Result<(), VerifyFailure> {
         let sig_block = self.signature.as_ref().ok_or(VerifyFailure::Unsigned)?;
-        // No string algo check here: `algo` is a closed enum (unknown values
-        // fail to deserialize) and `verify_signature` re-checks it. We only
-        // need the key_id to resolve the trusted key.
+        // Only need the key_id to resolve the trusted key; `verify_signature`
+        // re-checks the algo.
         let pubkey = load_trusted_pubkey(trusted_keys_dir, &sig_block.key_id)
             .ok_or(VerifyFailure::UntrustedKey)?;
         self.verify_signature(&pubkey)?;
@@ -409,53 +358,40 @@ impl Card {
         Ok(())
     }
 
-    /// Does the card's `command` match `cmd` byte-for-byte (after trimming
-    /// surrounding shell-significant whitespace)? This is the mismatch gate.
-    ///
-    /// We trim only the ASCII whitespace a shell treats as a TOKEN SEPARATOR
-    /// (space, tab, newline, CR — see `is_shell_significant_ws`), NOT
-    /// `str::trim` (the whole Unicode `White_Space` set) and NOT even
-    /// [`char::is_ascii_whitespace`] (which includes `\x0C` FORM FEED). A command
-    /// tampered to differ solely by a Unicode-whitespace character — e.g. a
-    /// U+00A0 NO-BREAK SPACE for an ASCII space — or by a trailing form feed MUST
-    /// be treated as a MISMATCH, not silently equated to the signed text:
-    /// collapsing characters a shell would NOT ignore is a signed-card
-    /// verification bypass.
+    /// The mismatch gate: does `command` match `cmd` byte-for-byte after trimming
+    /// only shell-significant whitespace (see [`is_shell_significant_ws`])? NOT
+    /// `str::trim` and NOT `char::is_ascii_whitespace` (which counts `\x0C`): a
+    /// command differing only by U+00A0 or a trailing form feed MUST mismatch —
+    /// equating chars a shell would not ignore is a verification bypass.
     pub fn command_matches(&self, cmd: &str) -> bool {
         self.command.trim_matches(is_shell_significant_ws)
             == cmd.trim_matches(is_shell_significant_ws)
     }
 }
 
-/// Load a trusted public key (32 bytes) for `key_id` from `dir/<key_id>.pub`.
-///
-/// The `.pub` file may hold the key as 32 raw bytes, a 64-char hex string, or
-/// standard base64. The decoded key's own key_id must equal `key_id` (so a
-/// mislabeled file cannot impersonate a different key). Returns `None` if the
-/// file is absent or cannot be decoded into a matching key.
+/// Load a trusted 32-byte public key for `key_id` from `dir/<key_id>.pub`. The
+/// file may be 32 raw bytes, hex, or base64; the decoded key's own key_id must
+/// equal `key_id` (a mislabeled file cannot impersonate another key). `None` if
+/// absent or undecodable.
 pub fn load_trusted_pubkey(dir: &Path, key_id: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
     // Guard against path traversal via a crafted key_id from a card.
     if key_id.is_empty() || !key_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let path = dir.join(format!("{key_id}.pub"));
-    // Hardened read (CodeRabbit R13 #2): route through `read_regular_capped` so a
-    // FIFO/device at the key path cannot block (O_NONBLOCK open + fstat) and an
-    // oversized `.pub` cannot exhaust memory. A real pubkey file is tiny (32 raw
-    // bytes, 64-char hex, or ~44-char base64) so a small cap is ample; anything
-    // larger is not a key. Any open/stat/read failure (absent, non-regular, too
-    // large, I/O) maps to `None` — the same "no usable key" surface as before.
+    // Hardened read: `read_regular_capped` O_NONBLOCK-opens + fstats so a
+    // FIFO/device cannot block and an oversized `.pub` cannot exhaust memory.
+    // Any open/read failure → `None`.
     let raw = crate::util::read_regular_capped(&path, TRUSTED_PUBKEY_READ_CAP).ok()?;
     let key = decode_pubkey_bytes(&raw)?;
-    // Defense in depth: the file's content must actually be the key it claims.
+    // Defense in depth: the content must be the key it claims.
     if key_id_for_pubkey(&key) != key_id {
         return None;
     }
     Some(key)
 }
 
-/// Decode public-key file contents into 32 raw bytes, accepting raw / hex /
-/// base64 encodings.
+/// Decode public-key file contents into 32 raw bytes (raw / hex / base64).
 fn decode_pubkey_bytes(raw: &[u8]) -> Option<[u8; PUBLIC_KEY_LEN]> {
     // Raw 32 bytes.
     if raw.len() == PUBLIC_KEY_LEN {
@@ -523,47 +459,33 @@ pub enum CardRef {
     RemoteUrl(String),
 }
 
-/// Scan a command's text for a leading `# tirith-card: <ref>` shell comment.
+/// Scan for a leading `# tirith-card: <ref>` comment, returning the first ref.
+/// `http://`/`https://` → [`CardRef::RemoteUrl`] (never fetched on the hot path);
+/// anything else → [`CardRef::LocalPath`].
 ///
-/// The reference is the rest of the line after the marker. A value that starts
-/// with `http://` or `https://` is classified as [`CardRef::RemoteUrl`] (never
-/// fetched on the hot path); anything else is a [`CardRef::LocalPath`].
-/// Returns the first such reference found.
-///
-/// SCOPE: only the LEADING prelude is scanned. We iterate from the top and stop
-/// at the first non-empty line that is NOT a `# tirith-card:` marker — that line
-/// is where the real command begins. A `# tirith-card:` string appearing AFTER
-/// the command starts (e.g. inside a heredoc body or a later script line) is
-/// command content, NOT transport metadata, and must be ignored here; otherwise
-/// a heredoc carrying that text would skew the manifest match and spuriously
-/// trip [`CardOutcome::Mismatch`].
-///
-/// Whitespace between the `#` and `tirith-card:` is flexible to stay in sync
-/// with the tier-1 marker regex (`#\s*tirith-card:`): `#tirith-card:` (no space)
-/// and `#  tirith-card:` (multiple) parse identically to the canonical
-/// `# tirith-card:`. If they didn't, such a line would force past the tier-1
-/// fast-exit yet be silently dropped here.
+/// SCOPE: only the LEADING prelude. Scanning stops at the first non-empty
+/// non-marker line (the command start), so a `# tirith-card:` inside a heredoc
+/// body is command content, not transport metadata — counting it would skew the
+/// manifest match and spuriously trip [`CardOutcome::Mismatch`]. Whitespace after
+/// the `#` is flexible to match the tier-1 `#\s*tirith-card:` regex, so
+/// `#tirith-card:` / `#  tirith-card:` are not silently dropped after passing
+/// tier-1.
 pub fn find_card_comment(input: &str) -> Option<CardRef> {
     for line in input.lines() {
         match card_comment_value(line) {
             Some(rest) => {
-                // Trim the reference value on the SAME shell-significant
-                // whitespace set as the marker detection in `card_comment_value`
-                // (and `Card::command_matches`) — never `\x0C`/`\x0B`/Unicode.
+                // Trim on the same shell-significant set as the marker detection
+                // (never `\x0C`/`\x0B`/Unicode).
                 let value = rest.trim_matches(is_shell_significant_ws);
                 if value.is_empty() {
-                    // A bare `# tirith-card:` with no ref: keep scanning the
-                    // prelude (a later marker line may carry the ref).
+                    // Bare `# tirith-card:` with no ref: keep scanning.
                     continue;
                 }
                 return Some(classify_card_ref(value));
             }
             None => {
-                // A blank prelude line stays inside the leading prelude; a
-                // non-blank non-marker line is the start of the real command —
-                // stop. (Shell-significant blankness, so a line containing a form
-                // feed `\x0C` or pure Unicode whitespace ends the prelude,
-                // matching `card_comment_value` and the command compare.)
+                // Blank prelude lines continue; a non-blank non-marker line is
+                // the command start. Shell-significant blankness only.
                 if is_blank_prelude_line(line) {
                     continue;
                 }
@@ -574,49 +496,29 @@ pub fn find_card_comment(input: &str) -> Option<CardRef> {
     None
 }
 
-/// If `line` is a `# tirith-card: <ref>` marker (with flexible whitespace after
-/// the `#`, matching the tier-1 `#\s*tirith-card:` regex), return the trailing
-/// reference text (un-trimmed). `None` for any non-marker line. Shared by
-/// [`find_card_comment`] and [`strip_card_comment_lines`] so the resolver and
-/// the strip-before-compare step treat exactly the same lines as card markers.
+/// If `line` is a `# tirith-card: <ref>` marker (flexible whitespace after `#`,
+/// matching tier-1 `#\s*tirith-card:`), return the trailing ref (un-trimmed);
+/// else `None`. Shared by [`find_card_comment`] and [`strip_card_comment_lines`].
 ///
-/// SHELL-SIGNIFICANT whitespace only (CodeRabbit R8 #1 + R12; sibling of the R7
-/// [`Card::command_matches`] fix). Both trims strip ONLY the shell-significant
-/// set — space, tab, `\n`, `\r` (see [`is_shell_significant_ws`]) — never the
-/// form feed `\x0C`, the vertical tab `\x0B`, nor the full Unicode `White_Space`
-/// set. A line whose leading indentation or `#`-to-keyword gap is a form feed or
-/// a Unicode-whitespace character (e.g. U+00A0 NO-BREAK SPACE) is NOT treated as a
-/// whitespace-prefixed marker. This keeps the marker/prelude parsers in EXACT
-/// lockstep with the [`Card::command_matches`] mismatch gate (which also trims on
-/// [`is_shell_significant_ws`]): a marker the resolver recognizes is stripped
-/// before the byte-for-byte command compare, so the two must agree on EXACTLY
-/// which lines are markers. (Stripping a line the gate would not have trimmed
-/// equal — e.g. an `\x0C`-padded one — could mutate the command out from under a
-/// signed card. `char::is_ascii_whitespace`, which counts `\x0C`, would re-open
-/// exactly that desync.)
+/// Trims SHELL-SIGNIFICANT whitespace only (space, tab, `\n`, `\r`) — never
+/// `\x0C`/`\x0B`/Unicode. This keeps the marker/prelude parsers in EXACT lockstep
+/// with the [`Card::command_matches`] gate: stripping a line the gate would not
+/// trim equal (e.g. `\x0C`-padded) could mutate a signed command.
 fn card_comment_value(line: &str) -> Option<&str> {
     let after_hash = line
         .trim_start_matches(is_shell_significant_ws)
         .strip_prefix('#')?;
-    // `#\s*tirith-card:` — zero-or-more shell-significant spaces between `#` and
-    // the keyword (NOT `\x0C`, to match the command compare).
     after_hash
         .trim_start_matches(is_shell_significant_ws)
         .strip_prefix("tirith-card:")
 }
 
-/// `true` when `line` is blank — empty or only SHELL-SIGNIFICANT whitespace
-/// (space, tab, `\n`, `\r`). Used by the prelude scanners to decide whether a
-/// line is transport padding inside the leading prelude. Restricted to the
-/// shell-significant set to stay in lockstep with [`card_comment_value`] and the
-/// [`Card::command_matches`] gate: a line of pure Unicode whitespace (e.g. a lone
-/// U+00A0) OR one containing a form feed `\x0C` is NOT a blank prelude line — it
-/// ends the prelude, exactly as it would be the start of the command for the
-/// mismatch gate. (Treating it as blank — as `u8::is_ascii_whitespace`, which
-/// counts `\x0C`, would — could let the prelude scan walk past a line the command
-/// compare considers content, mutating a signed command.)
+/// `true` when `line` is empty or only SHELL-SIGNIFICANT whitespace (space, tab,
+/// `\n`, `\r`). Restricted to that set for lockstep with [`card_comment_value`]
+/// and the [`Card::command_matches`] gate: a pure-Unicode-whitespace or
+/// `\x0C`-containing line is NOT blank — it ends the prelude (counting it blank
+/// could walk the scan past content the command compare keeps).
 fn is_blank_prelude_line(line: &str) -> bool {
-    // Byte form of `is_shell_significant_ws`: space, tab, LF, CR — NOT `\x0C`/`\x0B`.
     line.bytes()
         .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
 }
@@ -631,85 +533,51 @@ pub fn classify_card_ref(value: &str) -> CardRef {
     }
 }
 
-/// Remove any `# tirith-card: <ref>` marker line(s) from `input`, returning the
-/// command text the card actually attests to. The marker is transport
-/// metadata, never part of the signed command, so it MUST be stripped before
-/// the byte-for-byte [`Card::command_matches`] comparison — otherwise a command
-/// carried via a `# tirith-card:` comment would always falsely mismatch its own
-/// (correctly-signed) card, since the analyzed input still contains the marker.
+/// Remove the leading `# tirith-card:` prelude from `input`, returning the
+/// attested command text. The marker is transport metadata, never part of the
+/// signed command, so it MUST be stripped before the byte-for-byte
+/// [`Card::command_matches`] compare — else a comment-carried command would
+/// always falsely mismatch its own card.
 ///
-/// Matches the same flexible-whitespace marker shape as [`find_card_comment`]
-/// (via [`card_comment_value`]), so exactly the line(s) the resolver treats as
-/// the card reference are removed — including `#tirith-card:` / `#  tirith-card:`
-/// variants. If this diverged from the resolver, a `#tirith-card:` line picked
-/// up as the card ref would survive the strip and make the command falsely
-/// mismatch its own signed card.
-///
-/// LINE ENDINGS ARE PRESERVED BYTE-FOR-BYTE. The body (everything from the first
-/// real command line on) is returned verbatim — we do NOT split-and-rejoin it,
-/// so a card command authored with `\r\n` (CRLF) endings still compares equal in
-/// [`Card::command_matches`] instead of being silently normalized to `\n`. Only
-/// the LEADING prelude (marker + any blank lines before the command) is removed;
-/// the returned tail is exactly `&input[offset..]` where `offset` is the byte
-/// position at which the command begins.
-///
-/// SCOPE (mirrors [`find_card_comment`]): only marker lines in the LEADING
-/// prelude are stripped. Scanning stops at the first non-empty line that is not
-/// a marker — every byte from there on (the real command, including any heredoc
-/// body) is preserved VERBATIM, even if it happens to contain the text
-/// `# tirith-card:`. Stripping such an in-body line would mutate the command
-/// before [`Card::command_matches`] and cause a spurious mismatch.
+/// Matches the same flexible-whitespace marker shape as [`find_card_comment`].
+/// LINE ENDINGS ARE PRESERVED BYTE-FOR-BYTE (the body is `&input[offset..]`, not
+/// split-and-rejoined), so a CRLF-authored command still compares equal instead
+/// of being normalized to `\n`. SCOPE mirrors [`find_card_comment`]: only the
+/// leading prelude is stripped; an in-body `# tirith-card:` is preserved.
 pub fn strip_card_comment_lines(input: &str) -> String {
     input[prelude_end_offset(input)..].to_string()
 }
 
-/// Byte offset into `input` at which the real command begins, i.e. where the
-/// leading `# tirith-card:` prelude (marker line(s) + any blank lines between
-/// them and the command) ends. Returns `0` when there is no leading prelude (the
-/// first non-empty line is not a marker), so the whole input is the command.
-///
-/// This is the single source of truth for "where does the prelude end"; both
-/// [`strip_card_comment_lines`] (which returns `&input[offset..]` verbatim) and
-/// [`has_card_comment_prelude`] derive from the same line scan, so the strip and
-/// the resolver always agree on which leading lines are transport metadata. The
-/// returned offset is always a line boundary, hence a valid `str` boundary.
+/// Byte offset at which the real command begins (end of the leading
+/// `# tirith-card:` prelude). `0` when there is no leading prelude. Single source
+/// of truth for "where does the prelude end" — both [`strip_card_comment_lines`]
+/// and [`has_card_comment_prelude`] derive from this scan. Always a line (hence
+/// `str`) boundary.
 fn prelude_end_offset(input: &str) -> usize {
     let mut offset = 0usize;
-    // Only a prelude that ACTUALLY contains a `# tirith-card:` marker is
-    // stripped. Leading blank lines are transport padding around a marker — they
-    // are not, on their own, a reason to mutate the command. Without this guard
-    // `"\n\necho hi"` (no marker) would return offset 2 and `strip_card_comment_lines`
-    // would drop the blanks, diverging from `strip_card_comment_lines_cow`
-    // (which borrows unchanged because `has_card_comment_prelude` is false) and
-    // silently rewriting command text for direct callers.
+    // Only strip a prelude that ACTUALLY contains a marker; leading blanks alone
+    // are not a reason to mutate the command. Without this guard `"\n\necho hi"`
+    // would drop the blanks and diverge from `strip_card_comment_lines_cow`.
     let mut marker_seen = false;
-    // `split_inclusive('\n')` keeps each line's trailing separator (`\r\n` or
-    // `\n`) attached, so summing the chunk lengths walks real byte offsets and
-    // never drops a `\r`. The line content we classify is the chunk with its
-    // line ending trimmed.
+    // `split_inclusive('\n')` keeps each separator attached, so summing chunk
+    // lengths walks real byte offsets and never drops a `\r`.
     for chunk in input.split_inclusive('\n') {
         let line = chunk.strip_suffix('\n').unwrap_or(chunk);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if card_comment_value(line).is_some() {
-            // A prelude marker line: drop it (transport metadata).
             marker_seen = true;
             offset += chunk.len();
             continue;
         }
         if is_blank_prelude_line(line) {
-            // Blank prelude line: provisionally part of the leading prelude. Kept
-            // ONLY if a marker is present somewhere in the prelude (checked below);
-            // otherwise the offset is reset to 0 so a marker-less blank prefix
-            // leaves the command unchanged.
+            // Provisionally prelude; kept only if a marker appears (below).
             offset += chunk.len();
             continue;
         }
-        // First non-empty non-marker line: the command starts here. Everything
-        // from this byte on is returned verbatim.
+        // First non-empty non-marker line: the command starts here.
         break;
     }
-    // No marker anywhere in the leading prelude → nothing to strip; the blanks we
-    // walked are part of the command, not transport metadata.
+    // No marker → nothing to strip (the blanks are part of the command).
     if marker_seen {
         offset
     } else {
@@ -717,38 +585,27 @@ fn prelude_end_offset(input: &str) -> usize {
     }
 }
 
-/// `true` when `input`'s LEADING prelude contains at least one
-/// `# tirith-card:` marker line — i.e. when [`strip_card_comment_lines`] would
-/// actually remove something. Mirrors the prelude scope of [`find_card_comment`]
-/// / [`strip_card_comment_lines`]: scanning stops at the first non-empty
-/// non-marker line (a marker inside a heredoc body is command content, not a
-/// prelude marker). Cheap: returns on the first marker or the first real line.
+/// `true` when `input`'s LEADING prelude has at least one `# tirith-card:`
+/// marker (i.e. when [`strip_card_comment_lines`] would remove something).
+/// Mirrors the prelude scope: scanning stops at the first non-empty non-marker
+/// line. Cheap.
 pub fn has_card_comment_prelude(input: &str) -> bool {
     for line in input.lines() {
         if card_comment_value(line).is_some() {
             return true;
         }
         if is_blank_prelude_line(line) {
-            // Blank line stays inside the leading prelude.
             continue;
         }
-        // First non-blank non-marker line: the command starts here, no prelude
-        // marker preceded it.
         return false;
     }
     false
 }
 
-/// Like [`strip_card_comment_lines`] but ZERO-allocation on the common path:
-/// when `input` carries no leading `# tirith-card:` prelude marker, the original
-/// is borrowed UNCHANGED. When a prelude marker IS present we allocate the
-/// stripped command — but even then the body is preserved byte-for-byte
-/// (`&input[offset..]`), so trailing newlines and `\r\n` (CRLF) endings survive
-/// on both paths.
-///
-/// This is the form the engine's EXEC analysis path uses to feed prelude-free
-/// command text into URL extraction and the exec-scoped rule set without paying
-/// an allocation on every command that carries no card.
+/// [`strip_card_comment_lines`] but ZERO-allocation when `input` has no leading
+/// prelude (borrowed unchanged). When a marker is present the body is still
+/// preserved byte-for-byte (`&input[offset..]`), so CRLF survives on both paths.
+/// Used by the engine's EXEC path to avoid allocating on every card-less command.
 pub fn strip_card_comment_lines_cow(input: &str) -> std::borrow::Cow<'_, str> {
     if has_card_comment_prelude(input) {
         std::borrow::Cow::Owned(strip_card_comment_lines(input))
@@ -757,9 +614,8 @@ pub fn strip_card_comment_lines_cow(input: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Evaluate an already-loaded card against the analyzed command, given the
-/// trusted-keys directory and today's date. Pure: callers do the disk read for
-/// the card and key files (or, in tests, supply a tempdir).
+/// Evaluate an already-loaded card against the analyzed command. Pure — callers
+/// do the disk reads for the card and key files.
 pub fn evaluate_card(
     card: &Card,
     cmd: &str,
@@ -775,31 +631,21 @@ pub fn evaluate_card(
             }
         }
         Err(failure) => {
-            // Reached ONLY on a verify failure (unsigned / untrusted key / bad
-            // signature / expired / unparseable expiry). The command-mismatch
-            // case is NOT reachable here — it requires a SUCCESSFUL verify and
-            // is handled in the Ok arm above. Any verify failure is Unverified.
+            // Any verify failure is Unverified. The mismatch case needs a
+            // SUCCESSFUL verify and is handled in the Ok arm above.
             CardOutcome::Unverified(failure)
         }
     }
 }
 
-/// Build the [`Finding`]s for a card outcome. v1 attestation-only contract:
-///
-/// * [`CardOutcome::Verified`] → one Info `CommandCardVerified` (the ONLY rule
-///   that ever claims verification).
-/// * [`CardOutcome::Mismatch`] → one High `CommandCardMismatch`.
-/// * [`CardOutcome::Unverified`] → exactly one Info `CommandCardUnverified`
-///   note (NEVER `CommandCardVerified` — a failed verify must not be tagged as
-///   a verified one). This INCLUDES the `Unsigned` failure: this helper runs
-///   only after a card REFERENCE was resolved and read, so an `Unsigned` outcome
-///   means a card was SUPPLIED but unsigned — it must stay visible in audit/JSON,
-///   not be silently dropped. (The genuinely card-LESS command stays silent via
-///   an early return in the engine's `check_command_card_hot`, BEFORE this
-///   helper is ever reached.)
-///
-/// Crucially, none of these change any OTHER finding's action — the engine's
-/// action derivation runs over the full findings list unchanged.
+/// Build the [`Finding`]s for a card outcome (v1 attestation-only):
+/// `Verified` → one Info `CommandCardVerified` (the ONLY rule claiming
+/// verification); `Mismatch` → one High `CommandCardMismatch`; `Unverified` →
+/// one Info `CommandCardUnverified` (NEVER tagged verified). `Unverified`
+/// includes `Unsigned`: this helper runs only after a card ref was resolved+read,
+/// so a supplied-but-unsigned card must stay visible (the card-LESS case returns
+/// early in `check_command_card_hot` before reaching here). None of these change
+/// any OTHER finding's action.
 pub fn findings_for_outcome(outcome: &CardOutcome) -> Vec<Finding> {
     match outcome {
         CardOutcome::Verified => vec![Finding {
@@ -835,14 +681,9 @@ pub fn findings_for_outcome(outcome: &CardOutcome) -> Vec<Finding> {
             custom_rule_id: None,
         }],
         CardOutcome::Unverified(failure) => {
-            // Every Unverified case — INCLUDING `Unsigned` — emits the Info note.
-            // This helper runs ONLY after a card REFERENCE was resolved and the
-            // card was read+parsed (the engine's `check_command_card_hot` returns
-            // early, before reaching here, when no `--card` flag and no
-            // `# tirith-card:` comment were found). So "Unsigned" here means a
-            // card WAS supplied but carries no signature — that must be VISIBLE in
-            // audit/JSON, not hidden. The "no card → stay silent" case is handled
-            // upstream by that early return, not by suppressing the finding here.
+            // Every Unverified case (incl. `Unsigned`) emits the Info note: this
+            // runs only after a card was supplied, so it must stay VISIBLE. The
+            // card-LESS "stay silent" case is the engine's early return upstream.
             vec![Finding {
                 rule_id: RuleId::CommandCardUnverified,
                 severity: Severity::Info,
@@ -864,9 +705,7 @@ pub fn findings_for_outcome(outcome: &CardOutcome) -> Vec<Finding> {
     }
 }
 
-/// Generate a fresh ed25519 keypair, returning `(secret_key_bytes,
-/// public_key_bytes)`. Uses the OS CSPRNG via `getrandom`. Helper for the
-/// `command-card` CLI's key bootstrap and for tests.
+/// Generate a fresh ed25519 keypair `(secret, public)` via the OS CSPRNG.
 pub fn generate_keypair() -> Result<([u8; SECRET_KEY_LEN], [u8; PUBLIC_KEY_LEN]), CardError> {
     let mut secret = [0u8; SECRET_KEY_LEN];
     getrandom::fill(&mut secret).map_err(|e| CardError::Crypto(format!("RNG failure: {e}")))?;
@@ -894,7 +733,7 @@ mod tests {
         )
     }
 
-    /// Write `<key_id>.pub` (raw 32 bytes) into `dir` for the given pubkey.
+    /// Write `<key_id>.pub` (raw 32 bytes) into `dir`.
     fn write_trusted_key(dir: &Path, pubkey: &[u8; PUBLIC_KEY_LEN]) {
         let key_id = key_id_for_pubkey(pubkey);
         std::fs::write(dir.join(format!("{key_id}.pub")), pubkey).unwrap();
@@ -922,7 +761,6 @@ mod tests {
         let mut card = sample_card();
         card.sign(&secret).unwrap();
         assert!(card.verify_signature(&pubkey).is_ok());
-        // key_id on the card matches the signing key.
         assert_eq!(
             card.signature.as_ref().unwrap().key_id,
             key_id_for_pubkey(&pubkey)
@@ -942,17 +780,13 @@ mod tests {
         );
     }
 
-    /// CodeRabbit R7 #1: the mismatch gate must trim ONLY ASCII whitespace.
-    /// `str::trim` strips the full Unicode `White_Space` set, so a command
-    /// tampered to differ solely by a Unicode-whitespace char (U+00A0 NO-BREAK
-    /// SPACE vs an ASCII space) would be wrongly considered EQUAL and slip past
-    /// the gate — a signed-card verification bypass.
+    /// The mismatch gate must trim ONLY shell-significant whitespace: a command
+    /// differing solely by U+00A0 (vs an ASCII space) must NOT be equated —
+    /// `str::trim` would, opening a signed-card verification bypass.
     #[test]
     fn command_matches_does_not_trim_unicode_whitespace() {
         let card = sample_card();
-        // The signed command (from `sample_card`) uses ASCII spaces. A command
-        // with a U+00A0 NO-BREAK SPACE swapped in for one of those spaces is a
-        // DIFFERENT command and must NOT match.
+        // A U+00A0 swapped in for an ASCII space is a DIFFERENT command.
         let tampered = card.command.replacen(' ', "\u{00A0}", 1);
         assert_ne!(
             tampered, card.command,
@@ -963,21 +797,16 @@ mod tests {
             "a command differing only by a Unicode (U+00A0) whitespace must NOT match the signed text"
         );
 
-        // Plain shell-significant leading/trailing whitespace (spaces, tabs,
-        // newlines, CR) still trims equal — the gate stays tolerant of the
-        // surrounding run a shell would itself ignore.
+        // Surrounding shell-significant whitespace still trims equal.
         let padded = format!(" \t\r\n{}\n  ", card.command);
         assert!(
             card.command_matches(&padded),
             "surrounding shell-significant whitespace must still trim equal"
         );
-        // And the exact command (no padding) matches.
         assert!(card.command_matches(&card.command));
 
-        // CodeRabbit R13 #3: a FORM FEED (`\x0C`) is NOT a shell token separator,
-        // so a command differing only by a trailing form feed is a DIFFERENT
-        // command and must NOT match — even though `char::is_ascii_whitespace`
-        // would have trimmed it. (Vertical tab `\x0B` is likewise not trimmed.)
+        // A FORM FEED (`\x0C`) / vertical tab (`\x0B`) is NOT a shell separator,
+        // so a command differing only by a trailing one must NOT match.
         let ff_padded = format!("{}\u{000C}", card.command);
         assert_ne!(ff_padded, card.command, "sanity: the FF actually differs");
         assert!(
@@ -997,7 +826,6 @@ mod tests {
         let (_other_secret, other_pubkey) = generate_keypair().unwrap();
         let mut card = sample_card();
         card.sign(&secret).unwrap();
-        // Verifying with a different key whose key_id != card.key_id.
         assert_eq!(
             card.verify_signature(&other_pubkey),
             Err(VerifyFailure::UntrustedKey)
@@ -1034,7 +862,7 @@ mod tests {
         let mut card = sample_card();
         card.sign(&secret).unwrap();
 
-        // Tamper the command the user is actually running (NOT the card).
+        // Tamper the command being run (NOT the card).
         let outcome = evaluate_card(
             &card,
             "curl -fsSL https://example.com/install.sh | sh --extra-evil",
@@ -1069,9 +897,8 @@ mod tests {
         );
 
         let findings = findings_for_outcome(&outcome);
-        // An Info note tagged CommandCardUnverified — NOT CommandCardVerified
-        // (a failed verify must never carry the "verified" rule_id, which would
-        // corrupt audit counts).
+        // Info CommandCardUnverified, NOT CommandCardVerified (a failed verify
+        // must never carry the "verified" rule_id).
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::CommandCardUnverified);
         assert_ne!(findings[0].rule_id, RuleId::CommandCardVerified);
@@ -1100,13 +927,10 @@ mod tests {
         assert!(findings[0].description.contains("expired"));
     }
 
-    /// CodeRabbit/Greptile R4 #3: a SUPPLIED-but-unsigned card must be VISIBLE.
-    /// `findings_for_outcome` only runs after a card ref was resolved + read, so
-    /// an `Unsigned` outcome means "a card was supplied but carries no signature"
-    /// — that belongs in audit/JSON as an Info `CommandCardUnverified`, NOT
-    /// dropped. (The genuinely card-LESS command stays silent via an early return
-    /// in `engine::check_command_card_hot`, never reaching this helper — covered
-    /// by `engine::tests::no_card_stays_silent_even_when_trust_store_unresolvable`.)
+    /// A SUPPLIED-but-unsigned card must be VISIBLE: `findings_for_outcome` runs
+    /// only after a card ref was resolved+read, so `Unsigned` belongs in
+    /// audit/JSON as an Info `CommandCardUnverified`, not dropped. (The card-LESS
+    /// command stays silent via the engine's early return.)
     #[test]
     fn unsigned_supplied_card_is_visible() {
         let dir = tempfile::tempdir().unwrap();
@@ -1118,8 +942,7 @@ mod tests {
             today(),
         );
         assert_eq!(outcome, CardOutcome::Unverified(VerifyFailure::Unsigned));
-        // A supplied unsigned card emits exactly one Info CommandCardUnverified —
-        // visible, but NEVER tagged as verified (which would corrupt audit counts).
+        // Exactly one Info CommandCardUnverified — visible, never tagged verified.
         let findings = findings_for_outcome(&outcome);
         assert_eq!(
             findings.len(),
@@ -1172,10 +995,8 @@ mod tests {
 
     #[test]
     fn find_card_comment_flexible_whitespace_matches_tier1() {
-        // The tier-1 marker regex is `#\s*tirith-card:` (zero-or-more spaces),
-        // so `#tirith-card:` and `#  tirith-card:` force past the fast-exit.
-        // The parser MUST accept the same shapes or the card is silently
-        // dropped after being pulled past tier-1.
+        // tier-1 is `#\s*tirith-card:`, so the parser MUST accept the same
+        // shapes or the card is silently dropped after passing tier-1.
         let expected = Some(CardRef::LocalPath("./c.json".to_string()));
         // No space after `#`.
         assert_eq!(
@@ -1187,14 +1008,13 @@ mod tests {
             find_card_comment("#  tirith-card: ./c.json\necho hi"),
             expected
         );
-        // Canonical single space (sanity — same result).
+        // Canonical single space (sanity).
         assert_eq!(
             find_card_comment("# tirith-card: ./c.json\necho hi"),
             expected
         );
-        // The strip step must treat the same flexible shapes as markers, so a
-        // `#tirith-card:` line is removed before command_matches (otherwise the
-        // surviving marker would falsely mismatch the signed command).
+        // The strip step must treat the same shapes as markers, else a surviving
+        // marker would falsely mismatch the signed command.
         assert_eq!(
             strip_card_comment_lines("#tirith-card: ./c.json\necho hi"),
             "echo hi"
@@ -1207,18 +1027,13 @@ mod tests {
 
     #[test]
     fn card_marker_whitespace_handling_is_shell_significant() {
-        // CodeRabbit R8 #1 + R12 (sibling of the R7 `command_matches` Critical):
-        // the marker/prelude parsers must restrict whitespace handling to the
-        // SHELL-SIGNIFICANT set (space, tab, `\n`, `\r`), so they stay in lockstep
-        // with the `command_matches` gate, which trims on the same set. A U+00A0
-        // NO-BREAK SPACE is Unicode whitespace but not shell-significant, so a
-        // marker padded with it must NOT be recognized as a whitespace-prefixed
-        // marker (otherwise the strip step could mutate a command the mismatch
-        // gate would never have trimmed equal).
+        // The marker/prelude parsers restrict whitespace to the SHELL-SIGNIFICANT
+        // set for lockstep with the `command_matches` gate. A U+00A0-padded
+        // marker must NOT be recognized (else the strip could mutate a command
+        // the gate would never have trimmed equal).
         let nbsp = '\u{A0}';
 
-        // Leading U+00A0 before `#`: NOT a marker (a real ASCII-space-indented
-        // marker still is — see below).
+        // Leading U+00A0 before `#`: NOT a marker.
         let lead_nbsp = format!("{nbsp}# tirith-card: ./c.json\necho hi");
         assert_eq!(
             find_card_comment(&lead_nbsp),
@@ -1226,20 +1041,17 @@ mod tests {
             "U+00A0 before `#` must not be treated as ASCII indentation"
         );
         assert!(!has_card_comment_prelude(&lead_nbsp));
-        // No prelude marker recognized → the input is left verbatim (the first
-        // line is the command), not stripped.
+        // No marker recognized → input left verbatim, not stripped.
         assert_eq!(strip_card_comment_lines(&lead_nbsp), lead_nbsp);
         assert_eq!(prelude_end_offset(&lead_nbsp), 0);
 
-        // U+00A0 between `#` and the keyword: also NOT a marker (tier-1 `\s*`
-        // is matched ASCII-only here for the same lockstep reason).
+        // U+00A0 between `#` and the keyword: also NOT a marker.
         let gap_nbsp = format!("#{nbsp}tirith-card: ./c.json\necho hi");
         assert_eq!(find_card_comment(&gap_nbsp), None);
         assert!(!has_card_comment_prelude(&gap_nbsp));
 
-        // A line of ONLY Unicode whitespace ends the prelude (it is not a blank
-        // prelude line), so a marker that follows it is command content, not a
-        // prelude marker.
+        // A line of ONLY Unicode whitespace ends the prelude, so a following
+        // marker is command content.
         let unicode_blank_then_marker = format!("{nbsp}\n# tirith-card: ./c.json\necho hi");
         assert_eq!(find_card_comment(&unicode_blank_then_marker), None);
         assert!(!has_card_comment_prelude(&unicode_blank_then_marker));
@@ -1248,14 +1060,9 @@ mod tests {
             unicode_blank_then_marker
         );
 
-        // FORM FEED `\x0C` is the byte where `char::is_ascii_whitespace` (counts
-        // it) and `is_shell_significant_ws` (does NOT) diverge. Because
-        // `command_matches` trims on the shell-significant set, `\x0C` is COMMAND
-        // CONTENT — so the marker/prelude parsers must NOT treat an `\x0C`-padded
-        // line as a whitespace-prefixed marker or as a blank prelude line. (Under
-        // the pre-fix `is_ascii_whitespace` helpers every assertion below was the
-        // opposite — the line was stripped — which let a `\x0C`-padded prelude
-        // mutate the command out from under a signed card.)
+        // `\x0C` is where `char::is_ascii_whitespace` (counts it) and
+        // `is_shell_significant_ws` (does NOT) diverge. It is COMMAND CONTENT, so
+        // an `\x0C`-padded line must NOT be a marker or a blank prelude line.
         let ff = '\u{0C}';
         // Leading `\x0C` before `#`: NOT a marker; input left verbatim.
         let lead_ff = format!("{ff}# tirith-card: ./c.json\necho hi");
@@ -1271,8 +1078,7 @@ mod tests {
         let gap_ff = format!("#{ff}tirith-card: ./c.json\necho hi");
         assert_eq!(find_card_comment(&gap_ff), None);
         assert!(!has_card_comment_prelude(&gap_ff));
-        // A line of ONLY `\x0C` ends the prelude (it is not blank), so a marker
-        // that follows it is command content, not a prelude marker.
+        // A line of ONLY `\x0C` ends the prelude, so a following marker is content.
         let ff_blank_then_marker = format!("{ff}\n# tirith-card: ./c.json\necho hi");
         assert_eq!(find_card_comment(&ff_blank_then_marker), None);
         assert!(!has_card_comment_prelude(&ff_blank_then_marker));
@@ -1281,9 +1087,8 @@ mod tests {
             ff_blank_then_marker
         );
 
-        // Regression guard: ASCII-space/tab-indented markers STILL parse and
-        // strip, and an ASCII-blank line before the marker is still transport
-        // padding inside the prelude.
+        // Regression guard: ASCII-space/tab-indented markers STILL parse/strip,
+        // and an ASCII-blank line before the marker is still prelude padding.
         let expected = Some(CardRef::LocalPath("./c.json".to_string()));
         assert_eq!(
             find_card_comment("  \t# tirith-card: ./c.json\necho hi"),
@@ -1322,11 +1127,9 @@ mod tests {
 
     #[test]
     fn strip_leaves_marker_less_leading_blank_lines_intact() {
-        // CodeRabbit R6 #6: leading blank lines with NO `# tirith-card:` marker
-        // are part of the command, not transport metadata. `strip_card_comment_lines`
-        // must NOT drop them (it previously returned "echo hi" for "\n\necho hi",
-        // diverging from `strip_card_comment_lines_cow`, which borrows the input
-        // unchanged because `has_card_comment_prelude` is false).
+        // Leading blank lines with NO marker are part of the command, not
+        // transport metadata, so they must NOT be dropped (and the two strip
+        // variants must agree).
         assert_eq!(strip_card_comment_lines("\n\necho hi"), "\n\necho hi");
         assert_eq!(prelude_end_offset("\n\necho hi"), 0);
         // The two strip variants must agree on a marker-less input.
@@ -1353,11 +1156,9 @@ mod tests {
 
     #[test]
     fn card_marker_only_parsed_in_leading_prelude_not_heredoc_body() {
-        // A `# tirith-card:` line that appears AFTER the real command starts
-        // (here inside a heredoc body) is COMMAND CONTENT, not transport
-        // metadata. It must NOT be parsed as a card reference, and it must NOT
-        // be stripped — otherwise the marker text in the body would skew the
-        // manifest match and spuriously trip CommandCardMismatch.
+        // A `# tirith-card:` AFTER the command starts (here in a heredoc body) is
+        // COMMAND CONTENT — must not be parsed as a ref nor stripped, else it
+        // would spuriously trip CommandCardMismatch.
         let body_marker = "cat <<'EOF' > script.sh\n# tirith-card: ./evil.json\necho hi\nEOF";
         assert_eq!(
             find_card_comment(body_marker),
@@ -1370,8 +1171,8 @@ mod tests {
             "a marker inside a heredoc body must be preserved verbatim, not stripped"
         );
 
-        // A non-marker `#` comment as the first line ends the prelude, so a
-        // later marker is also treated as command content (consistent scope).
+        // A non-marker `#` first line ends the prelude, so a later marker is
+        // command content too.
         let comment_then_marker = "# build script\n# tirith-card: ./c.json\necho hi";
         assert_eq!(find_card_comment(comment_then_marker), None);
         assert_eq!(
@@ -1379,7 +1180,7 @@ mod tests {
             comment_then_marker
         );
 
-        // Sanity: a LEADING marker is still parsed/stripped (the prelude case).
+        // Sanity: a LEADING marker is still parsed/stripped.
         let leading = "# tirith-card: ./c.json\necho hi";
         assert_eq!(
             find_card_comment(leading),
@@ -1390,11 +1191,9 @@ mod tests {
 
     #[test]
     fn heredoc_body_marker_does_not_cause_spurious_mismatch() {
-        // End-to-end (CRITICAL): a trusted, signed card whose `command` is a
-        // multi-line heredoc that itself CONTAINS the text `# tirith-card:` in
-        // its body must still VERIFY. Before the prelude-scoping fix, the body
-        // marker line was stripped, mutating the command, so command_matches
-        // failed and the outcome was a spurious Mismatch.
+        // CRITICAL end-to-end: a signed card whose `command` is a heredoc
+        // CONTAINING `# tirith-card:` in its body must still VERIFY. Before the
+        // prelude-scoping fix the body marker was stripped → spurious Mismatch.
         let dir = tempfile::tempdir().unwrap();
         let (secret, pubkey) = generate_keypair().unwrap();
         write_trusted_key(dir.path(), &pubkey);
@@ -1404,8 +1203,8 @@ mod tests {
         card.command = command.to_string();
         card.sign(&secret).unwrap();
 
-        // The analyzed input has a LEADING marker (real transport metadata)
-        // plus the command, whose body coincidentally contains a marker too.
+        // Analyzed input: a LEADING marker plus a command whose body also
+        // contains a marker.
         let analyzed_input = format!("# tirith-card: ./card.json\n{command}");
         let stripped = strip_card_comment_lines(&analyzed_input);
         assert_eq!(
@@ -1423,21 +1222,17 @@ mod tests {
 
     #[test]
     fn comment_carried_card_verifies_after_marker_strip() {
-        // Regression (CRITICAL): a trusted, signed, non-expired card whose
-        // `command` equals the real command, referenced via a `# tirith-card:`
-        // comment, must yield Verified — NOT Mismatch. The marker line is
-        // transport metadata and must be stripped before the byte-for-byte
-        // command comparison. Before the fix, the analyzed input still carried
-        // the marker line, so a correctly-signed comment-carried card always
-        // falsely mismatched.
+        // CRITICAL regression: a signed card referenced via a `# tirith-card:`
+        // comment must yield Verified, not Mismatch — the marker must be stripped
+        // before the byte-for-byte compare (else a comment-carried card always
+        // falsely mismatched).
         let dir = tempfile::tempdir().unwrap();
         let (secret, pubkey) = generate_keypair().unwrap();
         write_trusted_key(dir.path(), &pubkey);
         let mut card = sample_card(); // command = "curl -fsSL https://example.com/install.sh | sh"
         card.sign(&secret).unwrap();
 
-        // The full analyzed input as the engine sees it: marker comment +
-        // the real command on the next line.
+        // Analyzed input as the engine sees it: marker comment + command.
         let analyzed_input =
             "# tirith-card: ./install-card.json\ncurl -fsSL https://example.com/install.sh | sh";
         let command = strip_card_comment_lines(analyzed_input);
@@ -1455,11 +1250,9 @@ mod tests {
 
     #[test]
     fn crlf_multiline_command_carried_card_verifies_without_normalization() {
-        // Regression (CodeRabbit R5 #1): a multi-LINE card command authored with
-        // `\r\n` (CRLF) endings, referenced via a CRLF-terminated `# tirith-card:`
-        // prelude, must still VERIFY. The previous `lines()` + `join("\n")` strip
-        // silently normalized CRLF→LF, so `command_matches` compared LF-joined
-        // text against the card's CRLF `command` field and falsely Mismatched.
+        // Regression: a CRLF-authored multi-line command via a CRLF-terminated
+        // prelude must still VERIFY. The old `lines()` + `join("\n")` strip
+        // normalized CRLF→LF and falsely Mismatched.
         let dir = tempfile::tempdir().unwrap();
         let (secret, pubkey) = generate_keypair().unwrap();
         write_trusted_key(dir.path(), &pubkey);
@@ -1473,8 +1266,7 @@ mod tests {
         // Analyzed input: a CRLF-terminated prelude marker, then the CRLF body.
         let analyzed_input = format!("# tirith-card: ./card.json\r\n{command}");
 
-        // The strip must preserve the body byte-for-byte (CRLF intact), removing
-        // ONLY the leading prelude marker line.
+        // The strip preserves the body byte-for-byte (CRLF intact).
         let stripped = strip_card_comment_lines(&analyzed_input);
         assert_eq!(
             stripped, command,
@@ -1510,10 +1302,8 @@ mod tests {
 
     #[test]
     fn unknown_json_fields_are_rejected() {
-        // CodeRabbit R13b: a signed card is an attestation, so `from_json` must
-        // REJECT any field not in the struct. Otherwise an unknown on-disk field
-        // would be silently dropped before `signing_payload` re-serializes the
-        // typed struct — i.e. it would ride outside the attested boundary.
+        // A signed card is an attestation, so `from_json` must REJECT any field
+        // not in the struct — else it would ride outside the attested boundary.
         let extra_top = r#"{
             "command": "echo hi",
             "expires": "2026-08-01",
@@ -1540,10 +1330,8 @@ mod tests {
 
     #[test]
     fn unknown_algo_fails_at_deserialize() {
-        // type-design #2 / code-reviewer #4: `algo` is a closed enum, so a card
-        // claiming `algo: "none"` (or any non-ed25519 / wrong-casing value)
-        // FAILS to parse — the confusion-attack class is killed at deserialize
-        // time, before any verify logic runs.
+        // `algo` is a closed enum, so `algo: "none"` (or any non-ed25519 /
+        // wrong-casing value) FAILS to parse before any verify logic runs.
         let bad = r#"{
             "command": "x",
             "expires": "2026-08-01",
@@ -1608,7 +1396,7 @@ mod tests {
 
     #[test]
     fn load_trusted_pubkey_rejects_mislabeled_file() {
-        // A file named after key_id A but containing key B must not load.
+        // A file named key_id A but containing key B must not load.
         let dir = tempfile::tempdir().unwrap();
         let (_s1, key_a) = generate_keypair().unwrap();
         let (_s2, key_b) = generate_keypair().unwrap();
@@ -1617,11 +1405,8 @@ mod tests {
         assert!(load_trusted_pubkey(dir.path(), &id_a).is_none());
     }
 
-    /// CodeRabbit R13 #2: a FIFO at the `<key_id>.pub` path must NOT hang
-    /// `load_trusted_pubkey` and must yield no key. The hardened
-    /// `read_regular_capped` opens with O_NONBLOCK and rejects the FIFO via the
-    /// post-open fstat, so the lookup returns `None` promptly (a blocking read
-    /// would hang here, caught by the suite timeout). Unix-only (needs mkfifo).
+    /// A FIFO at the `<key_id>.pub` path must NOT hang and must yield no key:
+    /// `read_regular_capped` opens O_NONBLOCK and rejects it via fstat. Unix-only.
     #[cfg(unix)]
     #[test]
     fn load_trusted_pubkey_fifo_does_not_hang_and_yields_none() {
@@ -1642,16 +1427,14 @@ mod tests {
         );
     }
 
-    /// CodeRabbit R13 #2: an oversized `.pub` file is refused (by the read cap)
-    /// rather than buffered into memory — even one that, after the cap, might
-    /// otherwise have decoded. The lookup yields `None`.
+    /// An oversized `.pub` file is refused by the read cap, not buffered. Lookup
+    /// yields `None`.
     #[test]
     fn load_trusted_pubkey_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (_secret, pubkey) = generate_keypair().unwrap();
         let key_id = key_id_for_pubkey(&pubkey);
-        // Write a file far larger than TRUSTED_PUBKEY_READ_CAP (valid hex bytes,
-        // so size — not content — is what rejects it).
+        // Far larger than the cap (valid hex, so size — not content — rejects it).
         let oversized = "a".repeat((TRUSTED_PUBKEY_READ_CAP as usize) + 1);
         std::fs::write(dir.path().join(format!("{key_id}.pub")), oversized).unwrap();
         assert!(

@@ -2,28 +2,18 @@
 //!
 //! A thin CLI over the repo command manifest (`.tirith/commands.yaml`,
 //! [`tirith_core::commands_manifest`]). The manifest is SUPPRESSION-BOUNDED: it
-//! can suppress only the Info `repo_command_unknown` annotation for an exact
-//! `allowed[]` match, and ELEVATE via a blocking `repo_command_dangerous_pattern`
-//! on a `dangerous[]` glob match. It can NEVER weaken a real engine finding —
-//! see the module doc on `commands_manifest`.
-//!
-//! - `init` — write the starter manifest to `<repo>/.tirith/commands.yaml`.
-//! - `list` — print the catalogued `allowed[]` / `dangerous[]` entries.
-//! - `run` — look up an `allowed[]` entry by name and execute its command, but
-//!   ONLY after re-checking it through the engine (an allowed entry that the
-//!   engine flags High/Critical is refused — the manifest cannot bypass
-//!   detection here either).
-//! - `check` — evaluate an arbitrary command against the manifest + engine
-//!   (delegates to `tirith check`).
+//! can only suppress the Info `repo_command_unknown` annotation on an exact
+//! `allowed[]` match and ELEVATE via a blocking `repo_command_dangerous_pattern`
+//! on a `dangerous[]` glob; it can NEVER weaken a real engine finding. `run`
+//! re-checks the resolved command through the engine and refuses a block — the
+//! manifest cannot bypass detection on the execution path either.
 
 use std::process::Command;
 
 use tirith_core::commands_manifest::{CommandsManifest, DangerousAction, ManifestError};
 
-/// `tirith commands init` — write the starter `.tirith/commands.yaml`.
-///
-/// Refuses to overwrite an existing file unless `force` is set (so a hand-
-/// edited manifest is never clobbered by accident).
+/// `tirith commands init` — write the starter `.tirith/commands.yaml`. Refuses to
+/// overwrite an existing file unless `force` is set.
 pub fn init(force: bool, json: bool) -> i32 {
     let cwd = std::env::current_dir()
         .ok()
@@ -32,8 +22,7 @@ pub fn init(force: bool, json: bool) -> i32 {
     let path = match tirith_core::commands_manifest::init_manifest_path(cwd.as_deref()) {
         Some(p) => p,
         None => {
-            // A broken-pipe JSON write returns 2 (the JSON error never reached the
-            // consumer); otherwise the semantic 1.
+            // Broken-pipe JSON write → 2; otherwise the semantic 1.
             if !emit_error(
                 json,
                 "tirith commands init",
@@ -60,10 +49,9 @@ pub fn init(force: bool, json: bool) -> i32 {
     }
 
     if let Some(parent) = path.parent() {
-        // If `.tirith` is created fresh here, its new directory entry in the repo
-        // root must be fsync'd too — `write_file_atomic` below only fsyncs `.tirith`
-        // (commands.yaml's parent), not `.tirith`'s parent. A crash could otherwise
-        // lose the whole `.tirith` dir despite init succeeding. CodeRabbit R13b.
+        // If `.tirith` is created fresh, fsync its entry in the repo root too:
+        // `write_file_atomic` only fsyncs commands.yaml's parent, so a crash could
+        // otherwise lose the whole `.tirith` dir despite init succeeding (CodeRabbit R13b).
         let parent_existed = parent.exists();
         if let Err(e) = std::fs::create_dir_all(parent) {
             if !emit_error(
@@ -80,11 +68,9 @@ pub fn init(force: bool, json: bool) -> i32 {
         }
     }
 
-    // Write the manifest ATOMICALLY (temp-in-same-dir → fsync → rename → parent
-    // fsync) rather than truncating in place: a crash mid-write must never lose
-    // an existing manifest or leave a half-written one the loader then rejects.
-    // No-clobber unless `--force` (`overwrite=force`): a manifest created in the
-    // race window after the `exists()` check is not silently clobbered.
+    // Write ATOMICALLY (temp → fsync → rename → parent fsync), not truncate-in-
+    // place, so a crash can't lose or half-write the manifest. No-clobber unless
+    // `--force` so a manifest created in the post-`exists()` race window survives.
     if let Err(e) = super::write_file_atomic(
         &path,
         tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
@@ -105,9 +91,8 @@ pub fn init(force: bool, json: bool) -> i32 {
             "written": path.display().to_string(),
             "forced": force,
         });
-        // A failed JSON write (e.g. broken pipe) must exit non-zero: the manifest
-        // WAS written on disk, but a piped consumer that saw truncated JSON must
-        // not also read a success code (mirrors command-card sign/verify).
+        // A failed JSON write must exit non-zero: the manifest WAS written, but a
+        // consumer that saw truncated JSON must not also read success.
         if !super::write_json_stdout(&v, "tirith commands init: failed to write JSON output") {
             return 2;
         }
@@ -129,8 +114,7 @@ pub fn list(json: bool) -> i32 {
         Ok(None) => {
             if json {
                 let v = serde_json::json!({ "manifest": null, "allowed": [], "dangerous": [] });
-                // A failed JSON write must surface non-zero so a piped consumer
-                // never pairs truncated/absent JSON with a success exit.
+                // A failed JSON write must surface non-zero (no truncated JSON + success).
                 if !super::write_json_stdout(
                     &v,
                     "tirith commands list: failed to write JSON output",
@@ -164,8 +148,7 @@ pub fn list(json: bool) -> i32 {
             .map(|e| serde_json::json!({ "pattern": e.pattern, "action": dangerous_action_label(e.action) }))
             .collect();
         let v = serde_json::json!({ "allowed": allowed, "dangerous": dangerous });
-        // A failed JSON write must surface non-zero so a piped consumer never
-        // pairs a truncated catalogue with a success exit.
+        // A failed JSON write must surface non-zero (no truncated catalogue + success).
         if !super::write_json_stdout(&v, "tirith commands list: failed to write JSON output") {
             return 2;
         }
@@ -190,15 +173,13 @@ pub fn list(json: bool) -> i32 {
     0
 }
 
-/// `tirith commands run <name>` — execute the `allowed[]` command named
-/// `name`, after re-checking it through the engine.
+/// `tirith commands run <name>` — execute the `allowed[]` command `name` after
+/// re-checking it through the engine.
 ///
-/// SECURITY: being in `allowed[]` only suppresses the `repo_command_unknown`
-/// annotation; it does NOT make a command safe to run blindly. We run the
-/// resolved command back through `tirith check` first and REFUSE to execute if
-/// the engine blocks it (a `dangerous[]` match or any real High/Critical
-/// finding). This keeps the "manifest cannot bypass detection" invariant on the
-/// execution path too.
+/// SECURITY: `allowed[]` only suppresses the `repo_command_unknown` annotation;
+/// it does NOT make a command safe to run blindly. We re-run the resolved command
+/// through the engine and REFUSE to execute on a block — keeping "manifest cannot
+/// bypass detection" on the execution path too.
 pub fn run(name: &str, json: bool) -> i32 {
     let cwd = std::env::current_dir()
         .ok()
@@ -247,15 +228,9 @@ pub fn run(name: &str, json: bool) -> i32 {
     };
     let command = entry.command.clone();
 
-    // Re-check the resolved command through the engine. The manifest CANNOT
-    // bypass detection: if the engine blocks (dangerous match, High/Critical
-    // finding), we refuse to run it.
-    //
-    // The engine ALSO returns the repo policy it resolved while analyzing
-    // (CodeRabbit R18 #2): reuse it for the audit-log / findings redaction below
-    // instead of a SECOND `Policy::discover` (a duplicate `.git`-boundary walk
-    // and, for a remote policy, a duplicate fetch). Same single-discovery pattern
-    // `check.rs` uses.
+    // Re-check through the engine; refuse to run on a block (the manifest cannot
+    // bypass detection). The engine also returns the policy it resolved (CodeRabbit
+    // R18 #2), reused below for audit/redaction instead of a second `Policy::discover`.
     let (verdict, policy) = analyze_command(&command, cwd.as_deref());
     if verdict.action == tirith_core::verdict::Action::Block {
         // Audit the refusal so the blocked attempt is traceable.
@@ -267,27 +242,15 @@ pub fn run(name: &str, json: bool) -> i32 {
             &policy.dlp_custom_patterns,
         );
         if json {
-            // ONE combined JSON object: the verdict (action + findings) AND the
-            // refusal, never two concatenated documents. (Previously
-            // `render_findings` wrote a verdict JSON and `emit_error` wrote a
-            // second `{"error":...}` JSON.)
-            //
-            // REDACT the command embedded in the refusal message (CodeRabbit R13
-            // #6): this string lands in the JSON `error` field, which (like the
-            // top-level `command` and the `findings`) goes to machine-readable
-            // stdout and any log collector consuming it. Leaving the raw command
-            // here would leak credentials / custom-DLP matches even though the
-            // sibling `command`/`findings` fields are scrubbed. Use the SAME
-            // built-in + custom DLP redaction as `build_run_json`.
+            // ONE combined JSON object (verdict + refusal), never two concatenated
+            // documents. REDACT the command in the refusal message (CodeRabbit R13
+            // #6): it lands in the machine-readable `error` field, so a raw command
+            // would leak credentials even though `command`/`findings` are scrubbed.
             let redacted_command =
                 tirith_core::redact::redact_command_text(&command, &policy.dlp_custom_patterns);
             let refusal = block_refusal_message(name, &redacted_command);
-            // If the single-object write fails (e.g. broken pipe), the `--json`
-            // contract that a machine consumer reads exactly one parseable object
-            // is broken — returning the block exit code would falsely signal a
-            // clean refusal even though nothing reached the caller. Report the
-            // JSON-write failure instead (exit 2, the same code the
-            // allow/warn-proceed write-failure path uses below).
+            // If the write fails the single-object `--json` contract is broken, so
+            // report exit 2 rather than the block code (nothing reached the caller).
             let wrote = emit_run_json(
                 name,
                 &command,
@@ -299,10 +262,8 @@ pub fn run(name: &str, json: bool) -> i32 {
             );
             return json_refusal_exit_code(wrote, verdict.action.exit_code());
         } else {
-            // Human: surface WHY it was blocked (findings to stderr), then the
-            // refusal line (also stderr) — mirroring `tirith check`. This is the
-            // operator's OWN terminal (not a machine/log sink), so the refusal
-            // shows the command verbatim — same as the `Running …`/abort lines.
+            // Human: findings then refusal to stderr (mirroring `tirith check`).
+            // The operator's own terminal, so the command shows verbatim.
             let refusal = block_refusal_message(name, &command);
             render_findings(&verdict, &policy.dlp_custom_patterns, json);
             emit_error(json, "tirith commands run", &refusal);
@@ -310,22 +271,15 @@ pub fn run(name: &str, json: bool) -> i32 {
         return verdict.action.exit_code();
     }
 
-    // NOTE: the "command ran" audit is DEFERRED past this point (CodeRabbit R18
-    // #1). It is written only AFTER the interactive warn acknowledgement passes
-    // AND the shell spawn SUCCEEDS (see `audit_run` below), so declining the warn
-    // or a failed spawn never records a command as having run. The BLOCK refusal
-    // above is still audited where it is (a refused command must remain
-    // traceable).
+    // NOTE: the "command ran" audit is DEFERRED (CodeRabbit R18 #1) — written only
+    // after the warn ack passes AND the spawn succeeds (see `audit_run`), so a
+    // declined warn / failed spawn never records a run. The BLOCK refusal above is
+    // still audited where it is.
 
-    // A Warn/WarnAck verdict on an allowed command must NEVER be silently
-    // swallowed: render its findings just like `tirith check` does. In an
-    // interactive TTY, require explicit acknowledgement before running (mirrors
-    // check.rs's strict-warn prompt); non-interactive callers see the findings
-    // and proceed. (Block already returned above.)
-    //
-    // In JSON mode the findings are NOT rendered here (that would emit a
-    // standalone verdict JSON); they are folded into the single combined object
-    // emitted at the running/abort exit below.
+    // A Warn/WarnAck on an allowed command must NOT be swallowed: render findings
+    // like `tirith check`, and require an interactive ack before running. In JSON
+    // mode findings are folded into the single combined object below, not rendered
+    // here (which would emit a standalone verdict JSON).
     if verdict.action != tirith_core::verdict::Action::Allow {
         if !json {
             render_findings(&verdict, &policy.dlp_custom_patterns, json);
@@ -337,26 +291,22 @@ pub fn run(name: &str, json: bool) -> i32 {
             is_terminal::is_terminal(std::io::stderr())
         };
         if interactive {
-            // Prompt always goes to stderr so stdout stays a single JSON object.
+            // Prompt to stderr so stdout stays a single JSON object.
             eprint!(
                 "tirith: proceed with {} warning(s) and run '{name}'? [y/N] ",
                 verdict.findings.len()
             );
             let mut input = String::new();
-            // Surface (don't swallow) a stdin read error for diagnostic parity
-            // with the shared `confirm()` gate. The fail direction is SAFE: on
-            // error `input` stays empty, so the match below fails and we abort —
-            // an unreadable prompt must never be treated as a "yes".
+            // Surface (don't swallow) a stdin read error. Fail-safe: on error
+            // `input` stays empty so the match below aborts — never a "yes".
             if let Err(e) = std::io::stdin().read_line(&mut input) {
                 eprintln!("tirith commands run: could not read confirmation input: {e}");
             }
             if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
                 if json {
-                    // Declined: ONE object recording the warn verdict + that we
-                    // did not run it (refused by the user). A failed write breaks
-                    // the single-object `--json` contract, so report the
-                    // JSON-write failure (exit 2) rather than the abort code (1) —
-                    // the caller never received the abort record.
+                    // Declined: ONE object recording the warn verdict + not-run. A
+                    // failed write reports exit 2 (broken single-object contract),
+                    // not the abort code 1.
                     let wrote = emit_run_json(
                         name,
                         &command,
@@ -376,21 +326,15 @@ pub fn run(name: &str, json: bool) -> i32 {
     }
 
     if json {
-        // SPAWN FIRST, then emit the single JSON document reflecting the ACTUAL
-        // outcome (CodeRabbit R17 #3). Previously a `running:true` object was
-        // written BEFORE the spawn, so a spawn failure (no such shell, ENOMEM,
-        // …) still reported `running:true` to a machine consumer even though the
-        // command never started. Now:
-        //   * spawn FAILS  → one object with `running:false` + the spawn `error`.
-        //   * spawn OK     → one object with `running:true`, THEN wait for exit.
+        // SPAWN FIRST, then emit the single document reflecting the ACTUAL outcome
+        // (CodeRabbit R17 #3): a `running:true` written before the spawn would lie
+        // on a spawn failure. spawn fails → `running:false` + error; spawn OK →
+        // `running:true`, then wait for exit.
         let spawned = match spawn_shell_command_json(&command) {
             Ok(s) => s,
             Err(e) => {
-                // The command never started: emit ONE `running:false` object
-                // carrying the spawn error. A failed JSON write breaks the
-                // single-object contract (the consumer never received the
-                // record), so report the write failure (exit 2) instead of the
-                // semantic spawn-failure code (1) via `json_refusal_exit_code`.
+                // Never started: emit ONE `running:false` object with the error. A
+                // failed write reports exit 2 (broken contract), not the spawn code 1.
                 let wrote = emit_run_json(
                     name,
                     &command,
@@ -404,18 +348,13 @@ pub fn run(name: &str, json: bool) -> i32 {
             }
         };
 
-        // The spawn SUCCEEDED — the command is now running, so this is the
-        // moment to audit the actual execution (CodeRabbit R18 #1). A declined
-        // warn or a spawn failure returned above WITHOUT reaching here, so the
-        // audit log never records a command that did not run.
+        // Spawn SUCCEEDED — audit the actual execution now (CodeRabbit R18 #1); a
+        // declined warn / spawn failure returned above, so a non-run is never audited.
         audit_run(&verdict, &command, &policy.dlp_custom_patterns);
 
-        // Emit the single `running:true` object. The round-9/15
-        // abort-on-write-failure contract
-        // is preserved: if THIS write fails, a `--json` consumer saw a truncated
-        // record and must not have the command silently run to completion, so we
-        // KILL + reap the (already-spawned) child and report the write failure
-        // (exit 2) rather than waiting on it.
+        // Emit the single `running:true` object. If THIS write fails the consumer
+        // saw a truncated record, so KILL + reap the child and report exit 2 rather
+        // than let it run to completion (round-9/15 contract).
         if !emit_run_json(
             name,
             &command,
@@ -429,9 +368,8 @@ pub fn run(name: &str, json: bool) -> i32 {
             return 2;
         }
 
-        // One JSON document is on stdout; wait for the child and return its exit
-        // code. A wait failure (extremely rare — the child is already running)
-        // keeps stdout a single document by reporting only to stderr.
+        // One JSON document on stdout; wait for the child and return its exit code
+        // (a rare wait failure reports only to stderr to keep stdout one document).
         match spawned.wait() {
             Ok(code) => code,
             Err(e) => {
@@ -441,9 +379,8 @@ pub fn run(name: &str, json: bool) -> i32 {
         }
     } else {
         eprintln!("Running allowed command '{name}': {command}");
-        // SPAWN first so the "command ran" audit fires only AFTER a successful
-        // spawn (CodeRabbit R18 #1): a spawn failure must not record a run. A
-        // declined warn already returned above without reaching here.
+        // SPAWN first so the audit fires only after a successful spawn (CodeRabbit
+        // R18 #1): a spawn failure must not record a run.
         match build_shell_command(&command).spawn() {
             Ok(mut child) => {
                 audit_run(&verdict, &command, &policy.dlp_custom_patterns);
@@ -467,11 +404,9 @@ pub fn run(name: &str, json: bool) -> i32 {
     }
 }
 
-/// Audit a (now-actually-executing) allowed command run. Called only AFTER the
-/// shell spawn SUCCEEDS (and any interactive warn was acknowledged), so the audit
-/// log records the command as run ONLY when it really did — never on a declined
-/// warn or a failed spawn (CodeRabbit R18 #1). Best-effort: a write failure must
-/// not change the run's exit code.
+/// Audit an executing allowed command run, called only AFTER the spawn succeeds
+/// (CodeRabbit R18 #1) so a declined warn / failed spawn never records a run.
+/// Best-effort: a write failure must not change the exit code.
 fn audit_run(
     verdict: &tirith_core::verdict::Verdict,
     command: &str,
@@ -480,13 +415,9 @@ fn audit_run(
     let _ = tirith_core::audit::log_verdict(verdict, command, None, None, dlp_custom_patterns);
 }
 
-/// Map a refusal-path JSON write result to the process exit code. On a clean
-/// write the caller's refusal code (block action code, or 1 for a user abort) is
-/// returned; on a write failure the single-object `--json` contract is broken
-/// (the consumer never received the refusal record), so exit 2 — the same
-/// JSON-write-failure code the allow/warn-proceed path returns — is reported
-/// instead. Pure so the contract is unit-testable without a deterministically-
-/// failing real stdout (mirrors the seam note on `cli::write_json_to`).
+/// Map a refusal-path JSON write result to the exit code: the refusal code on a
+/// clean write, else exit 2 (the broken single-object `--json` contract). Pure so
+/// the contract is unit-testable without a deterministically-failing stdout.
 fn json_refusal_exit_code(wrote_ok: bool, refusal_code: i32) -> i32 {
     if wrote_ok {
         refusal_code
@@ -495,14 +426,10 @@ fn json_refusal_exit_code(wrote_ok: bool, refusal_code: i32) -> i32 {
     }
 }
 
-/// Format the block-refusal message for manifest entry `name` running
-/// `command_for_display`.
-///
-/// `command_for_display` is whatever the CALLER decided is safe to surface: the
-/// JSON path passes the DLP-REDACTED command (the message lands in the
-/// machine-readable `error` field — CodeRabbit R13 #6), the human path passes the
-/// raw command (the operator's own terminal). Pure so the redaction contract on
-/// the JSON path is unit-testable without spawning a process.
+/// Format the block-refusal message. `command_for_display` is what the caller
+/// deems safe to surface: DLP-redacted on the JSON path (it lands in the
+/// machine-readable `error` field — CodeRabbit R13 #6), raw on the human path.
+/// Pure so the redaction contract is unit-testable.
 fn block_refusal_message(name: &str, command_for_display: &str) -> String {
     format!(
         "refusing to run '{name}' ({command_for_display}): tirith blocked it. \
@@ -510,16 +437,12 @@ fn block_refusal_message(name: &str, command_for_display: &str) -> String {
     )
 }
 
-/// Emit the single combined `commands run --json` object and return whether the
-/// write succeeded. This is the ONLY JSON writer on the `commands run` stdout
-/// path — every exit (block-refuse, warn-decline, allow/warn-proceed) routes
-/// through it so a machine consumer always reads exactly one parseable object
-/// per invocation, never two concatenated documents.
+/// Emit the single combined `commands run --json` object; returns whether the
+/// write succeeded. The ONLY JSON writer on the `commands run` stdout path, so a
+/// consumer always reads exactly one parseable object.
 ///
 /// Shape: `{"name","command","action","findings":[...],"running":bool,
-/// "refused":bool,"error":null|"..."}`. `findings` carries the same redacted
-/// `Finding` records `tirith check` emits (DLP-redacted with the repo policy's
-/// custom patterns).
+/// "refused":bool,"error":null|"..."}` (findings DLP-redacted).
 fn emit_run_json(
     name: &str,
     command: &str,
@@ -542,12 +465,9 @@ fn emit_run_json(
 }
 
 /// Build the `commands run --json` object. Pure (no I/O) so the redaction
-/// contract is unit-testable without a capturable stdout (mirrors the
-/// `json_refusal_exit_code` seam). BOTH the `findings` AND the top-level
-/// `command` are scrubbed with the same built-in + custom DLP patterns — leaving
-/// the raw `command` would leak credentials / custom-DLP matches into JSON
-/// stdout (and any log collector consuming it) even though `findings` is
-/// redacted.
+/// contract is unit-testable. BOTH `findings` AND the top-level `command` are
+/// DLP-scrubbed — a raw `command` would leak credentials even though `findings`
+/// is redacted.
 fn build_run_json(
     name: &str,
     command: &str,
@@ -570,10 +490,9 @@ fn build_run_json(
     })
 }
 
-/// Render a non-Allow verdict's findings the SAME way `tirith check` does so a
-/// `commands run` Warn/Block surfaces its rules instead of being swallowed.
-/// JSON goes to stdout (machine-readable), human output to stderr (so it does
-/// not corrupt the executed command's stdout). No-op for an empty finding list.
+/// Render a non-Allow verdict's findings like `tirith check` does, so a Warn/Block
+/// surfaces its rules. JSON → stdout, human → stderr (so it doesn't corrupt the
+/// executed command's stdout). No-op for an empty list.
 fn render_findings(
     verdict: &tirith_core::verdict::Verdict,
     dlp_custom_patterns: &[String],
@@ -602,12 +521,10 @@ fn render_findings(
 }
 
 /// `tirith commands check -- "<cmd>"` — evaluate `cmd` against the manifest +
-/// the full engine. Delegates to `tirith check`, which wires the manifest
-/// (`repo_command_unknown` / `repo_command_dangerous_pattern`) into its normal
-/// analysis. Exit code is the engine's action exit code.
+/// engine by delegating to `tirith check` (which wires the manifest into its
+/// normal analysis). Exit code is the engine's action exit code.
 pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
-    // Reuse the exact `tirith check` path so manifest + engine semantics are
-    // identical to a normal shell-hook check (no second, divergent code path).
+    // Reuse the exact `tirith check` path — no divergent second code path.
     super::check::run(
         cmd, shell, json, /* non_interactive */ false, /* interactive_flag */ false,
         /* approval_check */ false, /* strict_warn */ false, /* no_daemon */ true,
@@ -616,25 +533,18 @@ pub fn check(cmd: &str, shell: &str, json: bool) -> i32 {
     )
 }
 
-/// The [`ShellType`](tirith_core::tokenize::ShellType) the safety re-check must
-/// tokenize with: it MUST match the shell `build_shell_command` actually
-/// executes (`cmd /C` on Windows, a deterministic POSIX `/bin/sh -c` elsewhere).
-/// Analyzing a command with the wrong shell can mis-tokenize pipes/operators and
-/// miss findings.
+/// The [`ShellType`](tirith_core::tokenize::ShellType) the safety re-check
+/// tokenizes with — MUST match the shell `build_shell_command` executes
+/// (`cmd /C` on Windows, deterministic POSIX `/bin/sh -c` elsewhere), else a
+/// mis-tokenized pipe/operator could miss findings.
 #[cfg(windows)]
 const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Cmd;
 #[cfg(not(windows))]
 const RUN_SHELL: tirith_core::tokenize::ShellType = tirith_core::tokenize::ShellType::Posix;
 
-/// Analyze `command` through the engine for `commands run`'s safety re-check,
-/// returning BOTH the verdict AND the policy the engine resolved.
-///
-/// Reusing the engine-resolved policy (CodeRabbit R18 #2) lets `run()` avoid a
-/// SECOND `Policy::discover` (a duplicate filesystem walk and, for a remote
-/// policy, a duplicate fetch) just to drive audit-log / findings redaction — the
-/// engine already discovered exactly that policy while analyzing. Mirrors
-/// `check.rs`, which threads `engine::analyze_returning_policy`'s policy through
-/// for the same reason.
+/// Analyze `command` for `commands run`'s safety re-check, returning the verdict
+/// AND the engine-resolved policy. Reusing that policy (CodeRabbit R18 #2) lets
+/// `run()` skip a second `Policy::discover` for audit/redaction; mirrors `check.rs`.
 fn analyze_command(
     command: &str,
     cwd: Option<&str>,
@@ -644,7 +554,7 @@ fn analyze_command(
 
     let ctx = AnalysisContext {
         input: command.to_string(),
-        // Match the shell that will actually run the command (see RUN_SHELL).
+        // Match the shell that runs the command (see RUN_SHELL).
         shell: RUN_SHELL,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
@@ -660,70 +570,48 @@ fn analyze_command(
     engine::analyze_returning_policy(&ctx)
 }
 
-/// Run `command` through the platform shell. Returns the child's exit code (128
-/// if killed by a signal with no code).
-///
-/// The shell family here MUST match what [`analyze_command`] tokenized with
-/// (see [`RUN_SHELL`]): the safety re-check is only sound if the engine parsed
-/// the command the way the shell that runs it will. On non-Windows we therefore
-/// execute via a POSIX `sh -c` (matching `ShellType::Posix`) rather than
-/// `$SHELL -c` — `$SHELL` may be fish/csh, whose word-splitting and operator
-/// semantics differ from POSIX, which would let the re-check parse a DIFFERENT
-/// command than the one actually executed. Windows uses `cmd /C` (matching
-/// `ShellType::Cmd`).
-///
-/// STDOUT ROUTING (CodeRabbit R9 #E): in `--json` mode tirith's stdout is exactly
-/// ONE JSON document (already written before this call). If the child inherited
-/// stdout, its output would append to that document and corrupt it. So in JSON
-/// mode the child's stdout is REDIRECTED to tirith's stderr — the operator still
-/// sees the command's output, but tirith's stdout stays pure JSON. The child's
-/// own stderr is inherited in both modes. In human mode the child inherits stdout
-/// normally (output goes straight to the terminal, unchanged).
+/// Build the platform shell command for `command`. The shell family MUST match
+/// what [`analyze_command`] tokenized with ([`RUN_SHELL`]): a POSIX `sh -c` (NOT
+/// `$SHELL -c`, which may be fish/csh with different semantics) on non-Windows,
+/// `cmd /C` on Windows — else the re-check parses a different command than runs.
 fn build_shell_command(command: &str) -> Command {
     if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(command);
         c
     } else {
-        // Deterministically POSIX `sh`, NOT `$SHELL`, so execution matches the
-        // Posix analysis in `analyze_command`.
+        // POSIX `/bin/sh`, NOT `$SHELL`, to match `analyze_command`'s Posix analysis.
         let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
     }
 }
 
-/// A successfully-spawned `commands run --json` child plus its stdout-pump
-/// thread. Separating SPAWN from WAIT (CodeRabbit R17 #3) lets the caller emit
-/// the single JSON document only AFTER it knows the spawn succeeded — so a
-/// spawn failure is reported as `running:false`+`error`, never a misleading
-/// `running:true`. The child is left RUNNING; [`SpawnedJsonChild::wait`]
-/// (success) or [`SpawnedJsonChild::kill_and_reap`] (JSON-write failure) drives
-/// it to completion.
+/// A successfully-spawned `commands run --json` child plus its stdout-pump thread.
+/// Separating SPAWN from WAIT (CodeRabbit R17 #3) lets the caller emit the JSON
+/// document only after the spawn succeeded. Driven to completion by [`wait`]
+/// (success) or [`kill_and_reap`] (write failure).
 struct SpawnedJsonChild {
     child: std::process::Child,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SpawnedJsonChild {
-    /// Wait for the child to exit and join the stdout pump, returning the child's
-    /// exit code (128 if killed by a signal with no code).
+    /// Wait for the child and join the stdout pump, returning its exit code (128
+    /// if signal-killed with no code).
     fn wait(mut self) -> std::io::Result<i32> {
         let status = self.child.wait()?;
         if let Some(h) = self.pump.take() {
-            // Join the pump so all child output is flushed to stderr before we
-            // return (and the thread never outlives the process). The child has
-            // exited, so its stdout pipe is at EOF and the copy completes.
+            // Join the pump so all output flushes before we return (the child has
+            // exited, so its stdout is at EOF and the copy completes).
             let _ = h.join();
         }
         Ok(status.code().unwrap_or(128))
     }
 
-    /// Best-effort kill + reap when the single-JSON-document write FAILED after
-    /// the spawn (CodeRabbit R17 #3). The round-9/15 contract is that a `--json`
-    /// consumer who saw a truncated record must NOT have the command silently run
-    /// to completion; since the child is already spawned we kill it and reap it
-    /// (and join the pump) so it cannot outlive tirith.
+    /// Best-effort kill + reap when the JSON write FAILED after the spawn
+    /// (CodeRabbit R17 #3): a consumer that saw a truncated record must NOT have
+    /// the command silently run to completion, so the spawned child is killed.
     fn kill_and_reap(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -733,11 +621,10 @@ impl SpawnedJsonChild {
     }
 }
 
-/// Spawn `command` for the JSON path with its stdout PIPED to a helper thread
-/// that copies it to tirith's stderr (so a large output cannot deadlock by
-/// filling the pipe, and tirith's stdout stays a single JSON document). The
-/// child's stderr is inherited. Returns the running child + pump on success; the
-/// spawn error otherwise (the caller maps it to a `running:false` JSON object).
+/// Spawn `command` for the JSON path with its stdout PIPED to a helper thread that
+/// copies it to tirith's stderr (so large output can't deadlock by filling the
+/// pipe, and stdout stays one JSON document). Stderr inherited. Returns the
+/// running child + pump, or the spawn error (mapped to a `running:false` object).
 fn spawn_shell_command_json(command: &str) -> std::io::Result<SpawnedJsonChild> {
     use std::process::Stdio;
     let mut cmd = build_shell_command(command);
@@ -745,26 +632,18 @@ fn spawn_shell_command_json(command: &str) -> std::io::Result<SpawnedJsonChild> 
     let mut child = cmd.spawn()?;
     let pump = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || {
-            // Stream child stdout → tirith's stderr on a helper thread so a large
-            // output cannot deadlock by filling the pipe. See
-            // [`pump_stdout_draining`] for the drain-after-stderr-error contract
-            // that keeps the child from blocking when our stderr is broken.
             pump_stdout_draining(&mut out, &mut std::io::stderr());
         })
     });
     Ok(SpawnedJsonChild { child, pump })
 }
 
-/// Forward everything `reader` (the child's stdout) produces to `writer`
-/// (tirith's stderr), reading to EOF.
+/// Forward the child's stdout (`reader`) to tirith's stderr (`writer`) to EOF.
 ///
-/// We DELIBERATELY do not use [`std::io::copy`]: it stops on the FIRST writer
-/// error. If tirith's stderr is closed/broken while the child keeps writing,
-/// stopping the read would let the child's stdout pipe FILL, and the child would
-/// then BLOCK forever on its next write — `child.wait()` would hang with it
-/// (CodeRabbit R15 #4). Instead, on a writer error we drop to DRAIN-ONLY mode:
-/// keep reading `reader` to EOF (discarding bytes), just stop forwarding. The
-/// child never blocks on a full pipe, so `wait()` always returns.
+/// NOT [`std::io::copy`], which stops on the first writer error: if stderr breaks
+/// while the child keeps writing, stopping the read would fill the child's stdout
+/// pipe and block it forever (hanging `child.wait()` — CodeRabbit R15 #4). On a
+/// writer error we drop to DRAIN-ONLY: keep reading to EOF, just stop forwarding.
 fn pump_stdout_draining<R: std::io::Read, W: std::io::Write>(reader: &mut R, writer: &mut W) {
     let mut buf = [0u8; 8 * 1024];
     let mut forwarding = true;
@@ -773,24 +652,19 @@ fn pump_stdout_draining<R: std::io::Read, W: std::io::Write>(reader: &mut R, wri
             Ok(0) => break, // EOF — the child closed its stdout.
             Ok(n) => {
                 if forwarding && writer.write_all(&buf[..n]).is_err() {
-                    // Writer (stderr) is gone: stop forwarding but keep draining
-                    // so the child's pipe never fills.
+                    // Stderr is gone: stop forwarding but keep draining.
                     forwarding = false;
                 }
-                // When `!forwarding` we discard `buf[..n]` and keep looping.
             }
-            // Retry an interrupted read; any other read error means the pipe is
-            // gone, so there is nothing left to drain.
+            // Retry an interrupted read; any other error means the pipe is gone.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
 }
 
-/// Stable label for a `dangerous[]` entry's action, shared by the JSON and
-/// human `list` renderers. The action is per-entry (`block` → Block, `warn` →
-/// Warn); hardcoding "block" here would misreport a `DangerousAction::Warn`
-/// entry.
+/// Stable per-entry label for a `dangerous[]` action (hardcoding "block" would
+/// misreport a `Warn` entry).
 fn dangerous_action_label(action: DangerousAction) -> &'static str {
     match action {
         DangerousAction::Block => "block",
@@ -803,12 +677,9 @@ fn manifest_err(e: &ManifestError) -> String {
     format!("could not load .tirith/commands.yaml: {e}")
 }
 
-/// Emit an error to stderr (human) or as a JSON `{"error": ...}` object.
-///
-/// Returns `false` when the JSON write itself failed (broken pipe / truncated
-/// output) so a `--json` caller can surface a write failure rather than pairing a
-/// semantic exit code with no JSON delivered (CodeRabbit R8 #5). Human mode
-/// always returns `true` — the stderr line is best-effort and not gated.
+/// Emit an error to stderr (human) or as a JSON `{"error": ...}` object. Returns
+/// `false` only when the JSON write itself failed (CodeRabbit R8 #5); human mode
+/// always returns `true`.
 fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
     if json {
         let v = serde_json::json!({ "error": msg });
@@ -826,76 +697,57 @@ mod tests {
 
     #[test]
     fn run_shell_matches_execution_platform() {
-        // F7: the `commands run` safety re-check must tokenize with the SAME
-        // shell family `build_shell_command` executes: `cmd /C` on Windows, and a
-        // deterministic POSIX `/bin/sh -c` (NOT `$SHELL -c`, which could be
-        // fish/csh) elsewhere. A mismatch (e.g. analyze-as-Posix but run-as-fish)
-        // can mis-tokenize and miss findings.
+        // F7: the re-check must tokenize with the SAME shell family
+        // `build_shell_command` executes, else a mismatch can miss findings.
         #[cfg(windows)]
         assert_eq!(RUN_SHELL, ShellType::Cmd);
         #[cfg(not(windows))]
         assert_eq!(RUN_SHELL, ShellType::Posix);
     }
 
-    /// F7: the resolved execution shell must match `RUN_SHELL`'s family even when
-    /// `$SHELL` points at a non-POSIX shell. We can't easily introspect the
-    /// `Command` built by the private `build_shell_command`, so we pin the
-    /// invariant: on non-Windows the analysis is Posix AND execution is hardwired
-    /// to `/bin/sh` (a POSIX shell), independent of `$SHELL`. This is a
-    /// compile-time/structural guarantee — the function no longer reads `$SHELL`.
+    /// F7: on non-Windows the analysis is Posix AND execution is hardwired to
+    /// `/bin/sh`, independent of `$SHELL` (the function no longer reads it).
     #[cfg(not(windows))]
     #[test]
     fn execution_shell_is_posix_independent_of_env_shell() {
-        // The constant the analysis uses is Posix...
         assert_eq!(RUN_SHELL, ShellType::Posix);
-        // ...and `/bin/sh` exists on the unix CI/runners we target, so the
-        // hardwired execution path is a real POSIX shell rather than `$SHELL`.
+        // `/bin/sh` exists on the unix runners we target.
         assert!(
             std::path::Path::new("/bin/sh").exists(),
             "the deterministic POSIX execution shell /bin/sh must exist"
         );
     }
 
-    /// CodeRabbit/Greptile R4 #4: on the `commands run --json` REFUSAL paths
-    /// (engine-block and user-abort), a FAILED single-object JSON write must
-    /// override the refusal exit code with 2 (the JSON-write-failure code) —
-    /// returning the block/abort code while nothing reached the caller would
-    /// falsely signal a clean refusal over a broken `--json` contract. A clean
-    /// write preserves the refusal code. (The real stdout cannot be made to fail
-    /// deterministically across platforms — see the `cli::write_json_to` seam
-    /// note — so the exit-code decision is factored into this pure helper.)
+    /// CodeRabbit/Greptile R4 #4: on a `commands run --json` REFUSAL path, a FAILED
+    /// JSON write overrides the refusal code with 2; a clean write preserves it.
+    /// Factored into a pure helper since real stdout can't fail deterministically.
     #[test]
     fn json_refusal_exit_code_overrides_on_write_failure() {
         use super::json_refusal_exit_code;
-        // Block-refuse path: clean write keeps the block exit code (1); a failed
-        // write reports the JSON-write failure (2).
+        // Block-refuse path: clean write keeps the block code (1); failed → 2.
         assert_eq!(json_refusal_exit_code(true, 1), 1);
         assert_eq!(json_refusal_exit_code(false, 1), 2);
         // User-abort path passes refusal_code = 1: same contract.
         assert_eq!(json_refusal_exit_code(true, 1), 1);
         assert_eq!(json_refusal_exit_code(false, 1), 2);
-        // A non-1 block action code (defensive) is likewise preserved on a clean
-        // write and overridden to 2 on failure.
+        // A non-1 block action code is preserved on clean write, 2 on failure.
         assert_eq!(json_refusal_exit_code(true, 3), 3);
         assert_eq!(json_refusal_exit_code(false, 3), 2);
     }
 
     /// CodeRabbit R6 #1: `commands run --json` must DLP-redact the top-level
-    /// `command` string with the same patterns the findings use. A raw command
-    /// would leak credentials / custom-DLP matches into JSON stdout (and any log
-    /// collector), even though `findings` is already scrubbed.
+    /// `command` with the same patterns the findings use, else a raw command leaks
+    /// credentials even though `findings` is scrubbed.
     #[test]
     fn run_json_redacts_top_level_command_with_custom_dlp() {
         use super::build_run_json;
         use tirith_core::verdict::{Timings, Verdict};
 
-        // A custom DLP pattern that matches an internal token shape, plus a
-        // built-in-matching GitHub PAT to prove built-in patterns apply too.
+        // A custom DLP pattern plus a built-in-matching GitHub PAT.
         let custom = vec![r"ACME-[A-Z0-9]{6}".to_string()];
         let secret_token = "ACME-AB12CD";
-        // Build the GitHub PAT at runtime (CodeRabbit R7 #7): a contiguous
-        // `ghp_<36+>` LITERAL in the source trips secret scanners. 40 body chars
-        // (`[A-Za-z0-9]`) still satisfy the built-in `ghp_[A-Za-z0-9]{36,}`.
+        // Build the PAT at runtime (CodeRabbit R7 #7) so a `ghp_<36+>` literal
+        // doesn't trip secret scanners; 40 body chars satisfy the built-in regex.
         let pat = format!("ghp_{}", "a1B2c3D4".repeat(5)); // 40 alphanumeric chars
         let command = format!("deploy --token {secret_token} --pat {pat}");
 
@@ -928,12 +780,9 @@ mod tests {
         assert!(emitted.contains("deploy --token"), "got: {emitted}");
     }
 
-    /// CodeRabbit R13 #6: the block-refusal message on the `commands run --json`
-    /// path embeds the command, and that message lands in the JSON `error` field
-    /// (machine-readable stdout / log sink). It MUST be DLP-redacted the same way
-    /// the `command`/`findings` fields are — a raw secret-shaped token in the
-    /// refusal would leak even though the sibling fields are scrubbed. This pins
-    /// the pure construction the JSON branch uses (redact → `block_refusal_message`).
+    /// CodeRabbit R13 #6: the block-refusal message embeds the command and lands in
+    /// the machine-readable JSON `error` field, so it MUST be DLP-redacted like the
+    /// sibling fields. Pins the JSON branch's redact → `block_refusal_message`.
     #[test]
     fn json_block_refusal_message_redacts_command() {
         use super::block_refusal_message;
@@ -969,17 +818,10 @@ mod tests {
     }
 
     /// CodeRabbit R17 #3: a `commands run --json` SPAWN FAILURE must surface as a
-    /// single object with `running:false` + an `error` — NEVER the
-    /// success-shaped `running:true`. The `run()` JSON branch now spawns FIRST
-    /// and, on a spawn `Err`, emits exactly this object (the
-    /// "shell could not be executed" path). A genuine spawn failure needs the
-    /// system shell (`/bin/sh` / `cmd`) to be unspawnable, which is not portably
-    /// forcible at the integration level, so we pin the machine-readable contract
-    /// at the pure `build_run_json` seam the branch uses (mirroring the
-    /// `json_block_refusal_message_redacts_command` seam test). The companion
-    /// integration test `commands_run_json_nonzero_command_still_reports_running`
-    /// proves the inverse: a shell that DID spawn but whose command exits
-    /// non-zero still (correctly) reports `running:true`.
+    /// single object with `running:false` + an `error`, never `running:true`. A
+    /// genuine spawn failure isn't portably forcible, so pin the contract at the
+    /// pure `build_run_json` seam (the inverse — spawned but non-zero exit still
+    /// reports `running:true` — is the companion integration test).
     #[test]
     fn run_json_spawn_failure_reports_not_running_with_error() {
         use super::build_run_json;
@@ -1018,25 +860,19 @@ mod tests {
         assert!(v["findings"].as_array().is_some(), "got: {v}");
     }
 
-    /// CodeRabbit R15 #4: the `commands run --json` stdout→stderr pump must KEEP
-    /// DRAINING the child's stdout after a stderr write error, so a child that
-    /// emits a lot of stdout while our stderr is broken never blocks on a full
-    /// pipe (which would hang `child.wait()`).
-    ///
-    /// The pump loop is factored into [`super::pump_stdout_draining`] over generic
-    /// `Read`/`Write` so we can drive it with an always-erroring writer and a
-    /// large in-memory reader — no real process, no real pipe, fully time-boxed
-    /// (the reader yields EOF, so the loop cannot actually hang). We pin BOTH
-    /// properties: (1) the drain reads the reader to EOF even when every write
-    /// fails, and (2) a working writer still receives every byte (forwarding is
-    /// unchanged from the prior `std::io::copy` behavior).
+    /// CodeRabbit R15 #4: the pump must KEEP DRAINING the child's stdout after a
+    /// stderr write error, so a child emitting lots of stdout over a broken stderr
+    /// never blocks on a full pipe (hanging `child.wait()`). Driven via the generic
+    /// [`super::pump_stdout_draining`] with an always-erroring writer + finite
+    /// reader. Pins (1) drain-to-EOF on every write failing, (2) a working writer
+    /// still receives every byte.
     #[test]
     fn pump_drains_stdout_after_stderr_write_error() {
         use super::pump_stdout_draining;
         use std::io::{self, Read, Write};
 
-        // A reader that hands out a large, finite payload, counting bytes read so
-        // we can prove the pump consumed ALL of it (drained to EOF).
+        // A reader handing out a large finite payload, counting bytes read so we
+        // can prove the pump drained ALL of it.
         struct CountingReader {
             remaining: usize,
             read_total: std::rc::Rc<std::cell::Cell<usize>>,
@@ -1067,8 +903,7 @@ mod tests {
             }
         }
 
-        // Far more than one pipe buffer's worth — the bug would block a real child
-        // here; the helper must still consume every byte.
+        // Far more than one pipe buffer — the bug would block a real child here.
         let payload = 512 * 1024;
         let read_total = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let mut reader = CountingReader {

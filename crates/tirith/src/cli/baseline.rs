@@ -1,25 +1,16 @@
-//! `tirith baseline learn|status|reset` (M10 ch5, design-decision **D2**).
+//! `tirith baseline learn|status|reset` (M10 ch5, design-decision D2).
 //!
-//! Thin presenter over [`tirith_core::baseline`]. The sliding window, salted
-//! hashing, and all store I/O live in the library; this module is output, the
-//! `policy.baseline_enabled` flag toggle, and the `reset` confirmation prompt.
+//! Thin presenter over [`tirith_core::baseline`] (the window, salted hashing,
+//! and store I/O live in the library); this module is output, the
+//! `policy.baseline_enabled` toggle, and the `reset` prompt.
 //!
-//! The anomaly baseline is **OPT-IN** (D2): a fresh install does nothing. The
-//! three subcommands:
+//! The anomaly baseline is OPT-IN (D2). Subcommands: `learn` flips
+//! `policy.baseline_enabled` to `true`; `status` shows the top 20 patterns plus
+//! the enabled flag and an early-baseline note; `reset` zeroes the store
+//! (prompts unless `--yes`; `--json` requires `--yes`).
 //!
-//! * `learn` — flip `policy.baseline_enabled` to `true` (append-or-rewrite a
-//!   single line in the local `policy.yaml`, mirroring `tirith env guard on`).
-//!   Once on, the engine records a privacy-hashed observation for every
-//!   detection-rule firing and surfaces an Info anomaly finding for first-time /
-//!   rare patterns.
-//! * `status` — the top 20 patterns by in-window count, plus the enabled flag
-//!   and an early-baseline-mode note while the window is sparse.
-//! * `reset` — zero the store (prompts unless `--yes`; in `--json` mode `--yes`
-//!   is required).
-//!
-//! Privacy: the store records only salted-sha256 hashes (host, cwd/repo) and
-//! low-cardinality categoricals (ecosystem, sudo). It never holds raw hostnames
-//! or paths — see the `tirith_core::baseline` module doc.
+//! Privacy: the store records only salted-sha256 hashes and low-cardinality
+//! categoricals — never raw hostnames or paths.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -31,7 +22,7 @@ use super::{confirm, write_json_stdout};
 
 // ─── learn (enable) ──────────────────────────────────────────────────────────
 
-/// `tirith baseline learn` — turn the opt-in anomaly baseline ON by setting
+/// `tirith baseline learn` — turn the opt-in baseline ON by setting
 /// `policy.baseline_enabled = true` in the local policy file.
 pub fn learn(json: bool) -> i32 {
     let target_path = match resolve_policy_path() {
@@ -76,8 +67,8 @@ pub fn learn(json: bool) -> i32 {
 
 // ─── status ──────────────────────────────────────────────────────────────────
 
-/// `tirith baseline status` — show the top 20 patterns, the enabled flag, and
-/// the early-baseline-mode note. Always exits 0 (informational).
+/// `tirith baseline status` — top 20 patterns, the enabled flag, and the
+/// early-baseline note. Always exits 0.
 pub fn status(json: bool) -> i32 {
     let policy = Policy::discover_partial(None);
     let top = baseline::status(20);
@@ -143,8 +134,8 @@ pub fn status(json: bool) -> i32 {
 
 // ─── reset ─────────────────────────────────────────────────────────────────--
 
-/// `tirith baseline reset` — zero the store. Prompts for confirmation unless
-/// `--yes`; in `--json` mode `--yes` is required (no prompt on a machine surface).
+/// `tirith baseline reset` — zero the store. Prompts unless `--yes`; `--json`
+/// requires `--yes` (no prompt on a machine surface).
 pub fn reset(yes: bool, json: bool) -> i32 {
     let total = baseline::entry_count();
 
@@ -203,9 +194,8 @@ pub fn reset(yes: bool, json: bool) -> i32 {
 
 // ─── helpers ───────────────────────────────────────────────────────────────--
 
-/// Resolve the policy file `learn` should write to: the active local policy if
-/// one is discoverable, else the user config-dir default. Mirrors
-/// `cli::env_guard::resolve_policy_path_for_guard`.
+/// Resolve the policy file `learn` writes to: the active local policy if
+/// discoverable, else the user config-dir default.
 fn resolve_policy_path() -> Result<PathBuf, i32> {
     if let Some(existing) = policy_mod::discover_local_policy_path(None) {
         return Ok(existing);
@@ -217,9 +207,8 @@ fn resolve_policy_path() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set / update the `baseline_enabled` line in a policy YAML file.
-/// Append-or-rewrite — never touches other lines (mirrors
-/// `cli::env_guard::update_policy_guard_key`).
+/// Idempotently set the `baseline_enabled` line in a policy YAML file:
+/// append-or-rewrite, never touching other lines.
 fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -273,7 +262,7 @@ mod tests {
         assert!(content.contains("baseline_enabled: true"), "{content}");
         assert!(content.contains("paranoia: 2"), "other lines preserved");
 
-        // Flip off — must REPLACE the existing line, not duplicate it.
+        // Flip off — must REPLACE the line, not duplicate it.
         update_baseline_flag(&path, false).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("baseline_enabled: false"), "{content}");

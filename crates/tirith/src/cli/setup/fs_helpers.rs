@@ -24,8 +24,7 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
         Err(_) => mode,
     };
 
-    // PID + monotonic counter keeps temp file names unique across concurrent
-    // setups without needing stat+retry loops for name collisions.
+    // PID + monotonic counter keeps temp file names unique across concurrent setups.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     let tmp = {
@@ -39,8 +38,7 @@ pub fn atomic_write(path: &Path, content: &str, mode: u32) -> Result<(), String>
             .create_new(true)
             .open(&tmp_path);
 
-        // Collisions come from stale temps left by previous crashes; retry
-        // up to 3 times before giving up.
+        // Collisions come from stale temps left by previous crashes; retry up to 3 times.
         for _ in 0..3 {
             if f_result.is_ok() {
                 break;

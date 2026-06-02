@@ -1,44 +1,22 @@
-//! `tirith logs scan|summarize|redact` (M7 ch5).
+//! `tirith logs scan|summarize|redact` (M7 ch5) — treats agent-output /
+//! build-log / error-log files as untrusted content.
 //!
-//! The `logs` subcommand family treats agent-output / build-log / error-log
-//! files as untrusted content. The three actions are deliberately distinct:
+//! - `scan` — engine file-scan + credential + prompt-injection checks; exit 1
+//!   on any finding.
+//! - `summarize` — compressed view, optionally `--safe-for-agent` to redact
+//!   secrets / internal-IP / customer IDs and strip ANSI before emitting.
+//! - `redact` — audience-aware DLP scrubbing, same shape as `tirith share`.
 //!
-//! - `scan` — runs the engine's file-scan + credential checks over the file
-//!   and reports findings. Exit 1 on any finding.
-//! - `summarize` — produces a human-friendly compressed view of the log,
-//!   optionally with `--safe-for-agent` to redact secrets / internal-IP /
-//!   customer-ID patterns and strip ANSI escape sequences before emitting.
-//! - `redact` — the share-engine wrapper for log content: audience-aware
-//!   DLP scrubbing, same shape as `tirith share`.
+//! Honest scope: `scan`'s prompt-injection rule catches only well-known seed
+//! phrases — NOT a complete defense. Treat all agent output as untrusted.
 //!
-//! ## Honest scope on prompt injection
-//!
-//! `scan` invokes `rules::prompt_injection` which catches **well-known
-//! seed phrases** ("ignore previous instructions", "act as <role>",
-//! "DAN mode", "system:"). It is NOT a complete prompt-injection
-//! defense — sophisticated injections (encoded payloads, paraphrases,
-//! cross-language phrasing) will slip past. Treat every line of agent
-//! output as untrusted regardless of whether the rule fired.
-//!
-//! ## Streaming
-//!
-//! `summarize` and `redact` MUST stream — a 1 GiB+ log read entirely
-//! into RAM would OOM the process and any agent driving it. Both
-//! actions read raw bytes via `BufReader::read_until(b'\n', …)` and
-//! lossy-decode each line so a corrupt UTF-8 byte (FFFD) doesn't abort
-//! the stream. They write incrementally to stdout.
-//! `scan` falls back to a bounded read (64 MiB cap; see [`SCAN_MAX_BYTES`])
-//! because the engine needs the whole input to spot patterns that cross
-//! line boundaries.
-//!
-//! ## Truncation contract for `summarize`
-//!
-//! When the log has more than `--max-lines` lines after collapse, we
-//! preserve a head + tail window (half the budget each, rounded up for
-//! head). A line `[... N lines collapsed ...]` separates them so the
-//! reader knows context was dropped. The trailer (to stderr) reports
-//! the per-action counts: secrets removed, duplicate-line collapses,
-//! escape sequences stripped.
+//! `summarize` / `redact` MUST stream (a 1 GiB+ log would OOM): they
+//! `read_until(b'\n', …)` and lossy-decode per line so a corrupt byte doesn't
+//! abort the stream. `scan` uses a bounded read (see [`SCAN_MAX_BYTES`]) because
+//! the engine needs the whole input for cross-line patterns. `summarize`
+//! head+tail truncation keeps half the `--max-lines` budget each side with a
+//! `[... N lines collapsed ...]` marker; the stderr trailer reports per-action
+//! counts.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -57,21 +35,10 @@ const SCAN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 // ─── scan ───────────────────────────────────────────────────────────────────
 
-/// `tirith logs scan` — analyze a log file for findings.
-///
-/// Reads the file (up to [`SCAN_MAX_BYTES`]) and runs:
-/// 1. `engine::analyze` with `ScanContext::FileScan` — picks up prompt-
-///    injection seeds, terminal-deception bytes (ANSI/zero-width/bidi
-///    via `rules::terminal::check_bytes`), and any file-scan rules
-///    that self-select on extension.
-/// 2. `rules::credential::check` with `ScanContext::Paste` — the file-
-///    scan path does NOT run credentials (see `rules::credential::check`
-///    early-return), but secrets in log lines are a primary log-scan
-///    concern, so we invoke it directly here.
-///
-/// Exit codes:
-/// - 0 — clean, no findings
-/// - 1 — at least one finding (any severity) OR an I/O failure
+/// `tirith logs scan` — analyze a log file (up to [`SCAN_MAX_BYTES`]) for
+/// findings via `engine::analyze` (FileScan) plus credential and
+/// prompt-injection checks opted back in below. Exit 0 clean, 1 on any finding
+/// or I/O failure.
 pub fn scan(path: &Path, json: bool) -> i32 {
     let content = match read_capped(path, SCAN_MAX_BYTES) {
         Ok(s) => s,
@@ -99,17 +66,12 @@ pub fn scan(path: &Path, json: bool) -> i32 {
 
     let mut verdict = engine::analyze(&ctx);
 
-    // Two extra layers explicit to the logs surface (the general `tirith scan`
-    // skips these on purpose):
-    //   * Credentials — the FileScan path in `engine::analyze` returns early
-    //     in `rules::credential::check` because secrets in source files are
-    //     a separate workflow (audit / commit hooks). Logs are a PRIMARY
-    //     leak vector, so we opt back in here.
-    //   * Prompt-injection seeds — `engine::analyze`'s FileScan path
-    //     deliberately does NOT scan for these because a repo-wide
-    //     `tirith scan` would false-flag legitimate security docs that
-    //     quote injection phrases verbatim. `tirith logs scan` targets
-    //     agent output / build logs where the rule is appropriate.
+    // Two layers the general `tirith scan` skips, opted back in for logs:
+    //   * Credentials — FileScan skips them (source-file secrets are an
+    //     audit/commit-hook workflow), but logs are a PRIMARY leak vector.
+    //   * Prompt-injection seeds — FileScan skips them so a repo-wide scan
+    //     doesn't false-flag security docs quoting injection phrases; agent
+    //     output / build logs are exactly where the rule fits.
     let cred_findings =
         tirith_core::rules::credential::check(&content, ShellType::Posix, ScanContext::Paste);
     verdict.findings.extend(cred_findings);
@@ -186,21 +148,12 @@ fn emit_scan_json(path: &Path, verdict: &tirith_core::verdict::Verdict) -> i32 {
 
 // ─── summarize ──────────────────────────────────────────────────────────────
 
-/// `tirith logs summarize` — produce a compressed, optionally-sanitized
-/// view of a log file.
+/// `tirith logs summarize` — a compressed, optionally-sanitized view of a log.
 ///
-/// When `safe_for_agent` is true:
-/// 1. Redact secrets, internal hostnames, customer IDs via
-///    `redact_for_audience_with_custom(input, ShareAudience::Llm)`.
-/// 2. Strip ANSI / OSC / DCS escape sequences and zero-width characters
-///    (the same approach `tirith view` uses).
-/// 3. Collapse consecutive duplicate lines into `line [×N]`.
-/// 4. Truncate the result to `max_lines` (default 200) — keep head and
-///    tail halves, print `[... N lines collapsed ...]` between.
-///
-/// Streams via `BufReader::lines()`; never reads the full file into a
-/// single String. The trailer ("summary: K secrets removed, M lines
-/// collapsed, N escape sequences stripped") is printed to stderr.
+/// With `safe_for_agent`: redact secrets / hostnames / customer IDs (LLM
+/// audience), strip ANSI/OSC/DCS escapes and zero-width chars, collapse
+/// duplicate lines into `line [×N]`, then head+tail truncate to `max_lines`.
+/// Streams per line (never reads the whole file); the trailer goes to stderr.
 pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool) -> i32 {
     let max_lines = max_lines.max(1);
 
@@ -222,9 +175,8 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         Vec::new()
     };
 
-    // First pass: stream-collapse duplicates and (optionally) redact +
-    // strip ANSI. Holds at most `max_lines * 2` "collapsed" entries in
-    // memory; far smaller than the input.
+    // Stream-collapse duplicates and (optionally) redact + strip ANSI; holds at
+    // most `max_lines * 2` collapsed entries, far smaller than the input.
     let mut collected: Vec<String> = Vec::new();
     let mut collapsed_runs: usize = 0;
     let mut secret_count: usize = 0;
@@ -242,10 +194,8 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         }
     };
 
-    // Silent-failure fix (Sev-5): `reader.lines()` aborts the entire stream
-    // on the first non-UTF-8 byte. A single corrupt byte in a 1 GiB log would
-    // make `logs summarize` unusable. Read raw bytes per-line and lossy-decode
-    // each line independently — bad bytes degrade to U+FFFD, the rest streams.
+    // Sev-5 silent-failure fix: `lines()` aborts the whole stream on the first
+    // non-UTF-8 byte. Read raw per line and lossy-decode (bad bytes → U+FFFD).
     let mut reader = reader;
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -258,8 +208,7 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
                 return 1;
             }
         };
-        // Strip trailing \n (and \r if present) before lossy decode so the
-        // line content matches what `BufReader::lines()` would have emitted.
+        // Strip trailing \n (and \r) before decode to match `lines()` output.
         let mut end = n;
         if end > 0 && buf[end - 1] == b'\n' {
             end -= 1;
@@ -405,8 +354,7 @@ fn head_tail_truncate(lines: &[String], max_lines: usize) -> (Vec<String>, usize
     if lines.len() <= max_lines {
         return (lines.to_vec(), 0);
     }
-    // Reserve one slot for the elision marker. Split the remaining budget
-    // head-heavy (head gets the larger half when odd).
+    // Reserve one slot for the marker; head gets the larger half when odd.
     let budget = max_lines.saturating_sub(1);
     let head_count = budget.div_ceil(2);
     let tail_count = budget.saturating_sub(head_count);
@@ -423,12 +371,9 @@ fn head_tail_truncate(lines: &[String], max_lines: usize) -> (Vec<String>, usize
 }
 
 /// Strip ANSI / OSC / DCS escape sequences and zero-width characters from a
-/// single line. Returns `(stripped, count_of_escape_sequences_removed)`.
-///
-/// Kept in sync with `cli::view::sanitize_into` — we re-implement here
-/// instead of exposing the view helper because the two callers prefer
-/// different shapes (view writes bytes incrementally; logs operates on
-/// per-line strings and needs a count).
+/// line. Returns `(stripped, escape_sequences_removed)`. Kept in sync with
+/// `cli::view::sanitize_into` (re-implemented: that one writes bytes
+/// incrementally, this one needs per-line strings and a count).
 fn strip_ansi_and_zero_width(input: &str) -> (String, usize) {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -484,7 +429,7 @@ fn strip_ansi_and_zero_width(input: &str) -> (String, usize) {
             }
         }
 
-        // Zero-width chars are multi-byte; decode the codepoint and skip if matched.
+        // Decode a multi-byte codepoint and skip it if zero-width.
         if b >= 0xC0 {
             let remaining = &bytes[i..];
             if let Some(ch) = std::str::from_utf8(remaining)
@@ -503,9 +448,7 @@ fn strip_ansi_and_zero_width(input: &str) -> (String, usize) {
             }
         }
 
-        // Drop other low control chars except tab; CR was already line-stripped
-        // by `BufReader::lines()`. We do NOT drop newline here because lines()
-        // strips it already.
+        // Drop low control chars except tab (CR/LF already line-stripped).
         if b < 0x20 && b != b'\t' {
             i += 1;
             continue;
@@ -538,14 +481,10 @@ fn merge_redaction_count(into: &mut Vec<RedactionCount>, r: &RedactionCount) {
 
 // ─── redact ─────────────────────────────────────────────────────────────────
 
-/// `tirith logs redact` — apply the share-engine to a log file.
-///
-/// Thin streaming wrapper over [`redact_for_audience_with_custom`].
-/// Each input line is redacted independently to keep peak memory
-/// bounded; the per-line counts are aggregated into a single summary
-/// at the end. The audience string is parsed via
-/// [`tirith_core::redact::ShareAudience::parse_cli`] — the same
-/// validation `tirith share --target` uses.
+/// `tirith logs redact` — streaming share-engine wrapper over
+/// [`redact_for_audience_with_custom`]. Each line is redacted independently
+/// (bounded memory); counts are aggregated at the end. The audience is parsed
+/// via [`tirith_core::redact::ShareAudience::parse_cli`], like `tirith share`.
 pub fn redact(path: &Path, audience_str: &str, json: bool) -> i32 {
     let audience = match ShareAudience::parse_cli(audience_str) {
         Some(a) => a,
@@ -574,9 +513,8 @@ pub fn redact(path: &Path, audience_str: &str, json: bool) -> i32 {
     let mut out_lines: Vec<String> = Vec::new();
     let mut stdout = std::io::stdout().lock();
 
-    // Silent-failure fix (Sev-5): same `BufReader::lines()` UTF-8 abort
-    // hazard as `summarize`. Lossy-decode per line so a corrupt byte does
-    // not lose the rest of a 1 GiB log.
+    // Sev-5 silent-failure fix: same `lines()` UTF-8 abort hazard as
+    // `summarize` — lossy-decode per line.
     let mut reader = reader;
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -649,8 +587,7 @@ fn emit_redact_json(
         audience: &'a str,
         total_redactions: usize,
         redactions: &'a [RedactionCount],
-        // `redacted_content` mirrors the share-engine envelope (a single
-        // joined string). Per-line is also exposed for downstream tooling.
+        // Mirrors the share-engine envelope (joined string); per-line also below.
         redacted_content: String,
         lines: &'a [String],
     }
@@ -772,14 +709,12 @@ mod tests {
 
     #[test]
     fn summarize_survives_non_utf8_bytes() {
-        // Regression for Sev-5 silent-failure: a single non-UTF-8 byte in a
-        // log line previously aborted `summarize` with an I/O error. The
-        // lossy-decode path turns the bad byte into U+FFFD and keeps going.
+        // Sev-5 regression: a non-UTF-8 byte once aborted `summarize`; the
+        // lossy-decode path now turns it into U+FFFD and keeps going.
         use std::io::Write;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"clean line one\n").unwrap();
-        // 0xFF is invalid as a UTF-8 leading byte → would have made
-        // BufReader::lines() return Err(InvalidData).
+        // 0xFF is an invalid UTF-8 leading byte.
         f.write_all(b"garbled \xff trailing\n").unwrap();
         f.write_all(b"clean line three\n").unwrap();
         let code = summarize(f.path(), false, 100, false);

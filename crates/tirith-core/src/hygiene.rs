@@ -1,42 +1,20 @@
-//! Workstation file-permission / credential-file hygiene scanner (M9 ch1).
+//! Workstation file-permission / credential-file hygiene scanner.
 //!
-//! This module walks a small, fixed set of well-known sensitive paths under a
-//! user's home directory (plus the current repo root) and reports hygiene
-//! problems: world/group-readable private keys, cloud credential files with
-//! loose permissions, plaintext registry tokens, unsafe SSH `Include`
-//! directives, `git credential.helper = store` (which writes plaintext), shell
-//! histories that contain credential-shaped secrets, and stray database
-//! dumps committed into a repo.
+//! Walks a fixed set of well-known sensitive paths under `~` (plus the repo
+//! root) and reports hygiene problems: loose-perm private keys / cloud creds,
+//! plaintext registry tokens, unsafe SSH `Include`s, `git credential.helper =
+//! store`, secret-shaped shell histories, and stray DB dumps in a repo.
 //!
-//! ## Design
+//! The testable entry point [`scan_with_root`] takes the home root + optional
+//! repo root; [`scan`] resolves the real dirs and calls it. Tests point it at a
+//! tempdir and NEVER mutate `HOME`/`std::env` (process-global env mutation is a
+//! libc data race — PR #125).
 //!
-//! The single testable entry point is [`scan_with_root`], which takes the
-//! home-directory root and an optional repo root as parameters. [`scan`] is a
-//! thin wrapper that resolves the *real* home dir (and cwd repo root) and calls
-//! it. Tests point [`scan_with_root`] at a `tempfile::tempdir()` and **never**
-//! mutate `HOME` / `std::env` — mutating process-global env in tests is a libc
-//! data race (see PR #125 history).
-//!
-//! ## Severity → exit code
-//!
-//! [`scan`]'s CLI wrapper exits 1 if any [`Severity::High`] (or `Critical`)
-//! finding is present, 0 otherwise. The scan itself never mutates anything.
-//!
-//! ## `fix` is chmod-only
-//!
-//! The [`HygieneFinding::fix_kind`] field tells the CLI fixer what mechanical
-//! remediation is available. The only auto-fix tirith performs is
-//! `chmod 0600` on a loose-permission file. Hygiene **never** moves or deletes
-//! a file; content/location problems carry [`FixKind::Manual`] and are only
-//! ever reported, with a human-readable [`HygieneFinding::fix_suggestion`].
-//!
-//! ## Permission comparison is mask-based, not exact octal
-//!
-//! macOS and Linux differ on sticky / setgid bits, and a file can legitimately
-//! carry `0o100600` (regular file, 0600). We compare `mode & 0o077` ("can group
-//! or other access this?") rather than requiring an exact octal, so a private
-//! key at `0o600` passes regardless of the file-type bits or a stray sticky
-//! bit.
+//! `fix` is chmod-only: the sole auto-fix is `chmod 0600` on a loose file.
+//! Hygiene NEVER moves or deletes; content/location problems carry
+//! [`FixKind::Manual`] and are only reported. Permission comparison is
+//! mask-based (`mode & 0o077`), not exact octal, to tolerate file-type /
+//! sticky / setgid bit variation across macOS and Linux.
 
 use std::path::{Path, PathBuf};
 
@@ -50,12 +28,11 @@ use crate::verdict::{RuleId, Severity};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HygieneCategory {
-    /// File-permission problem (loose mode bits).
+    /// Loose mode bits.
     Perm,
-    /// File-contents problem (plaintext secret inside a config / history).
+    /// Plaintext secret inside a config / history.
     Contents,
-    /// File-location problem (sensitive artifact in the wrong place, e.g. a
-    /// DB dump committed into a repo).
+    /// Sensitive artifact in the wrong place (e.g. a DB dump in a repo).
     Location,
 }
 
@@ -69,54 +46,43 @@ impl HygieneCategory {
     }
 }
 
-/// What mechanical fix (if any) is available for a finding.
-///
-/// `fix` is **chmod-only**. Anything that would require moving or deleting a
-/// file is [`FixKind::Manual`] — reported, never auto-applied.
+/// What mechanical fix (if any) is available. `fix` is chmod-only; anything
+/// requiring a move/delete is [`FixKind::Manual`] (reported, never auto-applied).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FixKind {
-    /// `chmod <mode>` the file. The only automated remediation.
+    /// `chmod <mode>` — the only automated remediation.
     Chmod { mode: u32 },
-    /// No safe mechanical rewrite — the operator must act (rotate a token,
-    /// move a dump, edit a config). Reported with `fix_suggestion`, never
-    /// auto-applied.
+    /// No safe mechanical rewrite; reported with `fix_suggestion`, never auto-applied.
     Manual,
 }
 
 /// A single hygiene finding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HygieneFinding {
-    /// The rule that fired.
     pub rule_id: RuleId,
     /// Absolute path to the offending file.
     pub path: PathBuf,
-    /// Severity (drives the scan exit code).
+    /// Drives the scan exit code.
     pub severity: Severity,
-    /// Category (perm / contents / location).
     pub category: HygieneCategory,
-    /// Human-readable expected state (e.g. `"0600"`, `"no plaintext token"`).
+    /// Expected state, e.g. `"0600"`, `"no plaintext token"`.
     pub expected: String,
-    /// Human-readable actual state (e.g. `"0644"`, `"plaintext _authToken"`).
+    /// Actual state, e.g. `"0644"`, `"plaintext _authToken"`.
     pub actual: String,
     /// One-line remediation guidance shown to the operator.
     pub fix_suggestion: String,
-    /// What automated fix (if any) is available.
     pub fix_kind: FixKind,
 }
 
 impl HygieneFinding {
-    /// `true` when this finding is High or Critical (drives scan exit 1).
+    /// `true` when High or Critical (drives scan exit 1).
     pub fn is_high(&self) -> bool {
         matches!(self.severity, Severity::High | Severity::Critical)
     }
 }
 
-/// Scan the real home directory + the current working directory's repo root.
-///
-/// Resolves `HOME` via the `home` crate. The repo root is the current working
-/// directory (the CLI passes cwd; dump-in-repo checks walk that subtree).
-/// Returns an empty list if the home directory cannot be resolved.
+/// Scan the real home dir + cwd repo root. Empty if home cannot be resolved.
 pub fn scan() -> Vec<HygieneFinding> {
     let home = home::home_dir();
     let cwd = std::env::current_dir().ok();
@@ -132,13 +98,8 @@ pub fn scan() -> Vec<HygieneFinding> {
     }
 }
 
-/// Testable entry point: scan `home` (a stand-in for `~`) plus an optional
-/// `repo_root` for stray-dump detection.
-///
-/// `home` is treated as the home directory: `<home>/.ssh`, `<home>/.aws`,
-/// `<home>/.kube/config`, `<home>/.npmrc`, `<home>/.pypirc`,
-/// `<home>/.gitconfig`, and the common shell histories under it are inspected.
-/// Tests pass a `tempfile::tempdir()` path here.
+/// Testable entry point: scan `home` (stand-in for `~`) plus an optional
+/// `repo_root` for stray-dump detection. Tests pass a `tempfile::tempdir()`.
 pub fn scan_with_root(home: &Path, repo_root: Option<&Path>) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
 
@@ -157,8 +118,6 @@ pub fn scan_with_root(home: &Path, repo_root: Option<&Path>) -> Vec<HygieneFindi
     findings
 }
 
-// ─── per-target scanners ─────────────────────────────────────────────────────
-
 /// `~/.ssh`: private keys must be 0600; `config` must not carry an unsafe
 /// `Include` directive pointing outside `~/.ssh`.
 fn scan_ssh_dir(ssh_dir: &Path) -> Vec<HygieneFinding> {
@@ -175,7 +134,6 @@ fn scan_ssh_dir(ssh_dir: &Path) -> Vec<HygieneFinding> {
             None => continue,
         };
 
-        // SSH config: scan for unsafe Include directives.
         if name == "config" {
             if let Some(f) = check_ssh_config_includes(&path, ssh_dir) {
                 findings.push(f);
@@ -183,7 +141,6 @@ fn scan_ssh_dir(ssh_dir: &Path) -> Vec<HygieneFinding> {
             continue;
         }
 
-        // Only regular files are key candidates.
         if !path.is_file() {
             continue;
         }
@@ -222,7 +179,7 @@ fn check_ssh_config_includes(config_path: &Path, ssh_dir: &Path) -> Option<Hygie
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Match `Include <path>` (case-insensitive keyword per ssh_config(5)).
+        // `Include <path>` — case-insensitive keyword per ssh_config(5).
         let mut parts = line.splitn(2, char::is_whitespace);
         let keyword = parts.next().unwrap_or("");
         if !keyword.eq_ignore_ascii_case("include") {
@@ -256,21 +213,18 @@ fn check_ssh_config_includes(config_path: &Path, ssh_dir: &Path) -> Option<Hygie
 /// `~/.ssh` directory, or it escapes upward with `../`. Relative paths without
 /// `..` resolve under `~/.ssh` (ssh's default) and are fine.
 fn include_target_is_unsafe(target: &str, ssh_dir: &Path) -> bool {
-    // Strip surrounding quotes ssh tolerates.
     let target = target.trim_matches('"').trim_matches('\'');
 
-    // Tilde-expanded or absolute path: unsafe unless it stays under ~/.ssh.
+    // `~/`-expanded: `~/.ssh/...` is fine, anything else under `~` is outside.
     if let Some(stripped) = target.strip_prefix("~/") {
-        // `~/.ssh/...` is fine; anything else under ~ is outside ~/.ssh.
         return !stripped.starts_with(".ssh/") && stripped != ".ssh";
     }
+    // Absolute: unsafe unless confined to ~/.ssh (best-effort prefix check).
     if target.starts_with('/') {
         let p = Path::new(target);
-        // Confined to ~/.ssh? (Best-effort prefix check; ssh_dir may be a temp
-        // dir in tests, a real path in production.)
         return !p.starts_with(ssh_dir);
     }
-    // Relative path: unsafe only if it climbs out with `..`.
+    // Relative: unsafe only if it climbs out with `..`.
     target.split('/').any(|seg| seg == "..")
 }
 
@@ -300,8 +254,7 @@ fn scan_aws_dir(aws_dir: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// `~/.kube/config`: group-readable kubeconfigs leak cluster credentials to
-/// other accounts in the same group. Medium (not High) because the common
+/// `~/.kube/config`: group-readable leaks cluster creds. Medium (not High):
 /// distro default is 0644 and the threat is local-multiuser only.
 fn scan_kubeconfig(kube_config: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
@@ -325,8 +278,7 @@ fn scan_kubeconfig(kube_config: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// `~/.npmrc`: a plaintext `_authToken` / `//registry/:_authToken=` writes a
-/// registry credential to disk. High — the token is a publish/install secret.
+/// `~/.npmrc`: a plaintext `_authToken` is a publish/install secret on disk. High.
 fn scan_npmrc(npmrc: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
     let contents = match read_text_if_file(npmrc) {
@@ -352,8 +304,8 @@ fn scan_npmrc(npmrc: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// A `.npmrc` carries a plaintext token when an `_authToken` / `_password` /
-/// `_auth` assignment has a literal value (not an `${ENV}` reference).
+/// True when an `_authToken` / `_password` / `_auth` assignment has a literal
+/// value (not an `${ENV}` reference).
 fn npmrc_has_plaintext_token(contents: &str) -> bool {
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -378,8 +330,8 @@ fn npmrc_has_plaintext_token(contents: &str) -> bool {
     false
 }
 
-/// `~/.pypirc`: a plaintext `password = ...` (or a literal `pypi-` token) under
-/// a `[pypi]` / `[testpypi]` / index-server section is a publish credential.
+/// `~/.pypirc`: a plaintext `password` or literal `pypi-` token is a publish
+/// credential. High.
 fn scan_pypirc(pypirc: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
     let contents = match read_text_if_file(pypirc) {
@@ -405,15 +357,14 @@ fn scan_pypirc(pypirc: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// A `.pypirc` carries a plaintext token when a `password`/`username:__token__`
-/// pair has a literal value, or a literal `pypi-…` API token appears.
+/// True when a `password` has a literal value, or a literal `pypi-…` API token
+/// appears in a value position.
 fn pypirc_has_plaintext_token(contents: &str) -> bool {
     for raw_line in contents.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Literal upload-token form: `password = pypi-AgE...`.
         if line.contains("pypi-") {
             // Only a value position counts (after `=` / `:`).
             if let Some(value) = line
@@ -438,8 +389,8 @@ fn pypirc_has_plaintext_token(contents: &str) -> bool {
     false
 }
 
-/// `~/.gitconfig`: `credential.helper = store` persists every git credential
-/// as cleartext in `~/.git-credentials`. Medium — surfaced, not blocked.
+/// `~/.gitconfig`: `credential.helper = store` persists git creds as cleartext
+/// in `~/.git-credentials`. Medium — surfaced, not blocked.
 fn scan_gitconfig(gitconfig: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
     let contents = match read_text_if_file(gitconfig) {
@@ -467,9 +418,8 @@ fn scan_gitconfig(gitconfig: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// Detect `helper = store` inside a `[credential]` section. The git config
-/// format allows `[credential]` and `[credential "https://host"]`; the helper
-/// can also appear as a one-line `credential.helper = store`.
+/// Detect `helper = store` in a `[credential]` (or `[credential "url"]`) section,
+/// or the one-line `credential.helper = store` form.
 fn gitconfig_uses_store_helper(contents: &str) -> bool {
     let mut in_credential_section = false;
     for raw_line in contents.lines() {
@@ -478,7 +428,6 @@ fn gitconfig_uses_store_helper(contents: &str) -> bool {
             continue;
         }
         if line.starts_with('[') {
-            // Section header. `[credential]` or `[credential "url"]`.
             let header = line.trim_start_matches('[').trim_end_matches(']');
             let section = header
                 .split_whitespace()
@@ -488,10 +437,8 @@ fn gitconfig_uses_store_helper(contents: &str) -> bool {
             in_credential_section = section == "credential";
             continue;
         }
-        // One-line dotted form anywhere: `credential.helper = store`; or a
-        // bare `helper = store` inside a `[credential]` section (the
-        // `in_credential_section` check is the real guard against a stray
-        // `helper = store` outside any section).
+        // Dotted `credential.helper = store` anywhere, or bare `helper = store`
+        // only inside a `[credential]` section (the section check is the guard).
         if let Some((key, value)) = line.split_once('=') {
             let key_lc = key.trim().to_ascii_lowercase();
             let value_lc = value.trim().to_ascii_lowercase();
@@ -506,11 +453,9 @@ fn gitconfig_uses_store_helper(contents: &str) -> bool {
     false
 }
 
-/// Shell histories: scan for credential-shaped secrets using the SHIPPING
-/// high-confidence credential detector (`rules::credential::check` in Paste
-/// context). We do NOT invent new regex here — false positives on history
-/// files are costly, so we reuse the same provider-pattern + entropy gate that
-/// the paste interceptor uses.
+/// Shell histories: reuse the shipping credential detector
+/// (`rules::credential::check` in Paste context) rather than inventing new
+/// regex — false positives on history files are costly.
 fn scan_shell_histories(home: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
     let histories = [
@@ -525,13 +470,10 @@ fn scan_shell_histories(home: &Path) -> Vec<HygieneFinding> {
             Some(c) => c,
             None => continue,
         };
-        // Reuse the shipping credential detector in Paste context (which runs
-        // both the provider-pattern layer AND the entropy-gated generic layer).
         let creds =
             crate::rules::credential::check(&contents, ShellType::Posix, ScanContext::Paste);
         if !creds.is_empty() {
-            // One finding per history file (not per match) to keep output
-            // actionable; the count is surfaced in `actual`.
+            // One finding per history file (not per match); count is in `actual`.
             let titles: Vec<String> = creds.iter().map(|f| f.title.clone()).collect();
             findings.push(HygieneFinding {
                 rule_id: RuleId::HygieneShellHistorySecretLike,
@@ -557,18 +499,12 @@ fn scan_shell_histories(home: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-/// Repo root: flag stray database dumps and environment files.
-///
-/// - `*.dump` / `*.sql` → `HygieneDbDumpInRepo` (Medium, location).
-/// - `*.env*` that is world-readable → `HygieneEnvWorldReadable` (High, perm).
-///
-/// The walk is shallow-bounded (skips `.git`, `node_modules`, `target`,
-/// `vendor`, and dot-directories) so a large repo does not turn the scan into
-/// a full-tree crawl.
+/// Repo root: flag stray DB dumps (`*.dump`/`*.sql` → Medium) and world-readable
+/// env files (`*.env*` → High). The walk is bounded (skips `.git`,
+/// `node_modules`, `target`, `vendor`, dot-dirs) to avoid a full-tree crawl.
 fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
     let mut findings = Vec::new();
     let mut stack = vec![root.to_path_buf()];
-    // Bound the number of directories we descend into to keep the scan fast.
     let mut budget: usize = 5_000;
 
     while let Some(dir) = stack.pop() {
@@ -583,19 +519,16 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // `entry.file_type()` does NOT follow symlinks. We deliberately keep
-            // it for the DIRECTORY-descent decision so a symlinked directory is
-            // not descended into (loop / escape prevention). But for LEAF file
-            // candidates we must follow the link via `path.is_file()` — a
-            // world-readable `.env` exposed through a symlink would otherwise
-            // stay off-radar (an attacker could hide a secret behind a link).
+            // `entry.file_type()` does NOT follow symlinks: use it for the
+            // descent decision (a symlinked dir is NOT descended — loop/escape
+            // prevention) but follow the link via `path.is_file()` for leaf
+            // candidates, else a world-readable `.env` behind a symlink hides.
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(_) => continue,
             };
 
             if file_type.is_dir() {
-                // Real directory (not a symlink-to-dir): descend.
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if is_skippable_dir(name) {
                         continue;
@@ -604,10 +537,6 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
                 stack.push(path);
                 continue;
             }
-            // A regular file OR a symlink that resolves to a regular file is a
-            // leaf candidate (`is_file()` follows the link). A symlink pointing
-            // at a directory is not treated as a leaf and is not descended
-            // (loop prevention) — it simply falls through.
             if !path.is_file() {
                 continue;
             }
@@ -617,7 +546,6 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
                 None => continue,
             };
 
-            // Database dumps committed into a repo.
             if is_db_dump_name(name) {
                 findings.push(HygieneFinding {
                     rule_id: RuleId::HygieneDbDumpInRepo,
@@ -637,7 +565,6 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
                 continue;
             }
 
-            // Environment files that are world-readable.
             if is_env_file_name(name) {
                 if let Some(mode) = file_mode(&path) {
                     if mode_is_world_readable(mode) {
@@ -660,8 +587,6 @@ fn scan_repo_root(root: &Path) -> Vec<HygieneFinding> {
     findings
 }
 
-// ─── shared helpers ──────────────────────────────────────────────────────────
-
 /// Directories we never descend into during the repo walk.
 fn is_skippable_dir(name: &str) -> bool {
     matches!(
@@ -676,22 +601,18 @@ fn is_db_dump_name(name: &str) -> bool {
     lower.ends_with(".dump") || lower.ends_with(".sql")
 }
 
-/// `.env`, `.env.local`, `.env.production`, `prod.env`, etc. — anything whose
-/// name is exactly `.env` or contains `.env` as a segment / suffix.
+/// `.env`, `.env.local`, `.env.production`, `prod.env`, etc.
 fn is_env_file_name(name: &str) -> bool {
     if name == ".env" {
         return true;
     }
-    // `.env.local`, `.env.production` …
     if name.starts_with(".env.") {
         return true;
     }
-    // `something.env`, `prod.env` …
     name.ends_with(".env")
 }
 
-/// Read a path as UTF-8 text only when it is a regular file. Returns `None` for
-/// directories, missing files, permission errors, or non-UTF-8 content.
+/// Read a path as UTF-8 text only when it is a regular file; `None` otherwise.
 fn read_text_if_file(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
@@ -699,19 +620,17 @@ fn read_text_if_file(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// A config value is a "literal secret" when it is non-empty and is NOT an
-/// environment-variable reference (`${VAR}` / `$VAR`). This is what
-/// distinguishes a committed token from the recommended env-indirection form.
+/// A config value is a "literal secret" when non-empty and NOT an env reference
+/// (`${VAR}` / `$VAR`) — distinguishing a committed token from the recommended
+/// env-indirection form. A bare `__token__` placeholder is not a secret.
 fn value_is_literal_secret(value: &str) -> bool {
     let v = value.trim().trim_matches('"').trim_matches('\'').trim();
     if v.is_empty() {
         return false;
     }
-    // Env-reference forms are the SAFE pattern, not a leak.
     if v.starts_with("${") || (v.starts_with('$') && v.len() > 1) {
         return false;
     }
-    // A bare placeholder like `__token__` is not a secret value.
     if v.eq_ignore_ascii_case("__token__") {
         return false;
     }
@@ -725,25 +644,24 @@ fn file_mode(path: &Path) -> Option<u32> {
     std::fs::metadata(path).ok().map(|m| m.mode())
 }
 
-/// On non-Unix, file permission bits are not POSIX modes; perm rules no-op.
+/// Non-Unix has no POSIX modes; perm rules no-op.
 #[cfg(not(unix))]
 fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-/// `true` when group or other has ANY access bit set (`mode & 0o077 != 0`).
-/// Mask-based to tolerate sticky/setgid/file-type bit variation across OSes.
+/// `true` when group or other has ANY access bit (`mode & 0o077`). Mask-based to
+/// tolerate sticky/setgid/file-type bit variation across OSes.
 fn mode_is_group_or_other_accessible(mode: u32) -> bool {
     mode & 0o077 != 0
 }
 
-/// `true` when "other" has the read bit set (`mode & 0o004 != 0`).
+/// `true` when "other" has the read bit (`mode & 0o004`).
 fn mode_is_world_readable(mode: u32) -> bool {
     mode & 0o004 != 0
 }
 
-/// Render the permission bits of `mode` as a 4-digit octal string (e.g.
-/// `"0644"`), masking off the file-type bits.
+/// Permission bits of `mode` as a 4-digit octal string (e.g. `"0644"`).
 fn format_mode(mode: u32) -> String {
     format!("{:04o}", mode & 0o7777)
 }
@@ -1057,14 +975,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_world_readable_env_is_flagged() {
-        // A world-readable `.env` exposed through a symlink in the repo must be
-        // flagged — `entry.file_type()` does not follow links, so following via
-        // `path.is_file()` for leaf candidates is what catches it.
+        // A world-readable `.env` reached via symlink must be flagged (follows
+        // the link through `path.is_file()` for leaf candidates).
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let target_dir = tempdir().unwrap();
-        // The real secret lives outside the repo; a symlink named `.env`
-        // inside the repo points at it.
         let real_env = target_dir.path().join("real_secret.env");
         std::fs::write(&real_env, b"SECRET=hunter2\n").unwrap();
         chmod(&real_env, 0o644);
@@ -1081,8 +996,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_dir_is_not_descended() {
-        // A symlink-to-directory must NOT be descended (loop / escape
-        // prevention) — a dump inside the link target stays unflagged.
+        // A symlink-to-dir must NOT be descended (loop/escape prevention).
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();

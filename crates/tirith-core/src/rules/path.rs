@@ -12,7 +12,7 @@ pub fn check(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    // Use raw_path for non-ASCII detection — the url crate percent-encodes non-ASCII before we see it.
+    // raw_path is pre-encoding; the url crate percent-encodes non-ASCII before we see it.
     if let Some(rp) = raw_path {
         check_non_ascii_path(rp, &mut findings);
         check_homoglyph_in_path(rp, &mut findings);

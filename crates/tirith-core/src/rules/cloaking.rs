@@ -1,7 +1,6 @@
-/// Server-side cloaking detection — Unix only.
-///
-/// Fetches a URL with multiple user-agents and compares responses to detect
-/// content differentiation (serving different content to AI bots vs browsers).
+/// Server-side cloaking detection (Unix only): fetch a URL with multiple
+/// user-agents and compare responses to detect content differentiation (e.g.
+/// serving different content to AI bots vs browsers).
 #[cfg(unix)]
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -46,8 +45,7 @@ pub struct DiffPair {
 
 #[cfg(unix)]
 impl CloakingResult {
-    /// Serialize to JSON. When `include_diff_text` is true (Pro tier), diff text
-    /// is included in the output; otherwise it is omitted.
+    /// Serialize to JSON; diff text is included only when `include_diff_text`.
     pub fn to_json(&self, include_diff_text: bool) -> serde_json::Value {
         serde_json::json!({
             "url": self.url,
@@ -121,11 +119,11 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
         return Err("all user-agent fetches failed — cannot perform cloaking analysis".to_string());
     }
 
-    // chrome is the baseline (USER_AGENTS[0]); other agents are compared against it.
+    // chrome (USER_AGENTS[0]) is the baseline; others compare against it.
     let baseline_idx = 0;
     let baseline_body = &responses[baseline_idx].2;
 
-    // If the baseline fetch failed we'd otherwise flag every successful agent as cloaked.
+    // A failed baseline would otherwise flag every successful agent as cloaked.
     if baseline_body.is_empty() {
         let agent_responses: Vec<AgentResponse> = responses
             .iter()
@@ -239,7 +237,7 @@ fn fetch_with_ua(
         }
     }
 
-    // Belt-and-braces cap on the actual stream — Content-Length may be missing or lying.
+    // Cap the actual stream too — Content-Length may be missing or lying.
     use std::io::Read as _;
     let mut body_bytes = Vec::with_capacity(max_body.min(1024 * 1024));
     response
@@ -254,8 +252,8 @@ fn fetch_with_ua(
     Ok((status, body))
 }
 
-/// Normalize HTML for comparison — strip volatile content that changes
-/// between requests (scripts, styles, CSRF tokens, nonces, timestamps).
+/// Normalize HTML for comparison — strip content that varies between requests
+/// (scripts, styles, CSRF tokens, nonces).
 #[cfg(unix)]
 fn normalize_html(input: &str) -> String {
     use once_cell::sync::Lazy;
@@ -287,8 +285,8 @@ fn word_counts(s: &str) -> std::collections::HashMap<&str, usize> {
     counts
 }
 
-/// Generate a human-readable summary of word-level differences between two texts.
-/// Shows words present in one response but not the other (capped at 500 chars).
+/// Human-readable summary of word-level differences (words in one response but
+/// not the other), capped at 500 chars.
 #[cfg(unix)]
 fn generate_diff_text(baseline: &str, other: &str) -> String {
     let counts_a = word_counts(baseline);
@@ -342,7 +340,7 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
         }
     }
 
-    // Char-safe truncation — slicing on a byte boundary inside a UTF-8 codepoint panics.
+    // Char-safe truncation (byte-slicing mid-codepoint panics).
     if result.len() > 500 {
         let truncated: String = result.chars().take(497).collect();
         result = format!("{truncated}...");
@@ -350,11 +348,8 @@ fn generate_diff_text(baseline: &str, other: &str) -> String {
     result
 }
 
-/// Simple word-level diff size in characters.
-///
-/// Counts total characters in words that are in one string but not the other.
-/// This is a rough measure — not a proper edit distance, but sufficient for
-/// detecting meaningful content differences vs. cosmetic variations.
+/// Rough word-level diff size in characters (chars in words present in one
+/// string but not the other) — enough to tell content from cosmetic differences.
 #[cfg(unix)]
 fn word_diff_size(a: &str, b: &str) -> usize {
     let counts_a = word_counts(a);
@@ -402,8 +397,8 @@ mod tests {
 
     #[test]
     fn test_normalize_html_strips_nonces() {
-        // Test on a non-script element — the SCRIPT regex would otherwise strip the
-        // whole `<script>` tag before NONCE runs and the assertion would pass vacuously.
+        // Non-script element: the SCRIPT regex would otherwise strip a `<script>`
+        // before NONCE runs, passing vacuously.
         let input = r#"<div nonce="abc123">Content</div><p>More</p>"#;
         let normalized = normalize_html(input);
         assert!(

@@ -1,67 +1,49 @@
 //! Self-verification and self-update support (`tirith verify-self`,
 //! `tirith update`, `tirith version --provenance`).
 //!
-//! This module holds the *effect-free, testable* core: install-method
-//! detection, version parsing, and the data types describing what tirith was
-//! able to verify about its own binary. The networked / filesystem-mutating
-//! parts (download, atomic swap, rollback) and the entire CLI surface live in
-//! `tirith::cli::selfupdate`.
+//! Effect-free, testable core: install-method detection, version parsing, and
+//! the verification data types. The networked / fs-mutating parts (download,
+//! atomic swap, rollback) and the CLI surface live in `tirith::cli::selfupdate`.
 //!
-//! ## What the release pipeline actually produces
+//! Per `v*` tag, `release.yml` publishes per-target archives
+//! (`tirith-<target>.tar.gz`, `.zip` on Windows), a `sha256sum` `checksums.txt`
+//! over the ARCHIVES, and a cosign keyless (Sigstore) signature over it (identity
+//! `github.com/sheeki03/tirith`, issuer `token.actions.githubusercontent.com`).
 //!
-//! `.github/workflows/release.yml` publishes, per `v*` tag:
-//!
-//!   * per-target archives `tirith-<target>.tar.gz` (`.zip` on Windows),
-//!     each containing the `tirith` binary plus completions and the man page;
-//!   * `checksums.txt` — `sha256sum` output over the **archive files**;
-//!   * `checksums.txt.sig` + `checksums.txt.pem` — a cosign *keyless*
-//!     (Sigstore) signature over `checksums.txt`, with signing identity
-//!     `github.com/sheeki03/tirith` and OIDC issuer
-//!     `https://token.actions.githubusercontent.com`.
-//!
-//! Two consequences drive this module's honesty guarantees:
-//!
-//!   1. The checksum is over the **archive**, not the bare binary. The
-//!      installed binary's own SHA-256 does not appear anywhere in a release.
-//!      So "verify the running binary" must mean: re-download the archive for
-//!      this exact version+target, confirm the archive matches `checksums.txt`,
-//!      then confirm the binary extracted from that archive is byte-identical
-//!      to the running binary.
-//!   2. cosign keyless verification needs the `cosign` binary (it talks to
-//!      Rekor/Fulcio). tirith has no in-process Sigstore implementation, so
-//!      signature verification is only possible when `cosign` is on `PATH`.
-//!      When it is absent, signature verification is honestly *unavailable* —
-//!      never silently reported as "verified".
+//! Two honesty guarantees follow:
+//!   1. The checksum is over the ARCHIVE, not the bare binary. So "verify the
+//!      running binary" means: re-download this version+target's archive, confirm
+//!      it matches `checksums.txt`, then confirm the extracted binary is
+//!      byte-identical to the running one.
+//!   2. cosign keyless verification needs the `cosign` binary (Rekor/Fulcio);
+//!      tirith has no in-process Sigstore. Without `cosign` on `PATH`, signature
+//!      verification is honestly *unavailable*, never reported as "verified".
 
 use std::path::{Path, PathBuf};
 
-/// How this tirith binary appears to have been installed. Detection is
-/// best-effort and deliberately conservative: when in doubt we report
-/// [`InstallMethod::Unknown`] rather than guess, because a wrong guess here
-/// could lead `tirith update` to clobber a package-manager-managed file.
+/// How this tirith binary appears to have been installed. Conservative: when in
+/// doubt report [`InstallMethod::Unknown`] rather than guess, since a wrong guess
+/// could let `tirith update` clobber a package-manager-managed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallMethod {
-    /// The `install.sh` tarball install, or a hand-placed standalone binary.
-    /// This is the ONLY method tirith may self-update or roll back, because
-    /// tirith owns the file and no package manager tracks it.
+    /// `install.sh` tarball or a hand-placed standalone binary. The ONLY method
+    /// tirith may self-update or roll back (tirith owns the file).
     SelfManaged,
-    /// Homebrew (`brew install`). Path lives under a Homebrew Cellar/prefix.
+    /// Homebrew — path under a Cellar/prefix.
     Homebrew,
-    /// `cargo install tirith`. Path lives under a Cargo install root
-    /// (`$CARGO_HOME/bin` or `~/.cargo/bin`).
+    /// `cargo install tirith` — path under a Cargo install root.
     Cargo,
-    /// npm (`npm install -g tirith`). Path lives under a `node_modules` tree.
+    /// npm `-g` — path under a `node_modules` tree.
     Npm,
-    /// Scoop (Windows). Path lives under a `scoop\apps` tree.
+    /// Scoop (Windows) — path under `scoop\apps`.
     Scoop,
-    /// Arch User Repository / pacman. Binary is a system path owned by pacman.
+    /// AUR / pacman — a system path owned by pacman.
     Aur,
-    /// A Debian/Ubuntu `.deb` install (`apt`, `dpkg`).
+    /// Debian/Ubuntu `.deb` (`apt`, `dpkg`).
     Apt,
-    /// An RPM install (`dnf`, `yum`, `rpm`).
+    /// RPM (`dnf`, `yum`, `rpm`).
     Dnf,
-    /// Could not be determined. Treated like a package-managed install for
-    /// safety: `tirith update` will NOT self-modify, it will only advise.
+    /// Undetermined. Treated as package-managed for safety: `update` only advises.
     Unknown,
 }
 
@@ -81,18 +63,15 @@ impl InstallMethod {
         }
     }
 
-    /// Whether tirith may safely replace its own binary in place for this
-    /// install method. True ONLY for [`InstallMethod::SelfManaged`]: every
-    /// other method (including `Unknown`) is managed by something else, and
-    /// self-modifying it would desync the package manager's database, break
-    /// its own upgrade path, or get reverted on the next `brew upgrade`.
+    /// Whether tirith may replace its own binary in place. True ONLY for
+    /// [`InstallMethod::SelfManaged`]; every other method (incl. `Unknown`) is
+    /// managed elsewhere, so self-modifying would desync its package database.
     pub fn is_self_replaceable(&self) -> bool {
         matches!(self, InstallMethod::SelfManaged)
     }
 
-    /// The exact command the user should run to upgrade a package-managed
-    /// install, or `None` for a self-managed install (tirith handles it) or an
-    /// unknown install (no command can be recommended honestly).
+    /// The command to upgrade a package-managed install, or `None` for
+    /// self-managed (tirith handles it) or unknown (no honest recommendation).
     pub fn upgrade_command(&self) -> Option<&'static str> {
         match self {
             InstallMethod::Homebrew => Some("brew upgrade tirith"),
@@ -103,9 +82,8 @@ impl InstallMethod {
                 Some("update via your AUR helper, e.g. `yay -S tirith` or `paru -S tirith`")
             }
             InstallMethod::Apt => {
-                // tirith is not in the official Debian/Ubuntu archives; the
-                // .deb is a GitHub release artifact, so `apt upgrade` will not
-                // find it. Be honest about that.
+                // Not in the Debian/Ubuntu archives; the .deb is a GitHub release
+                // artifact, so `apt upgrade` won't find it.
                 Some("download the latest tirith_*.deb from the GitHub releases page and `sudo dpkg -i` it")
             }
             InstallMethod::Dnf => {
@@ -116,23 +94,14 @@ impl InstallMethod {
     }
 }
 
-/// Detect the install method from the *canonicalized* path of the running
-/// binary. The caller passes the already-resolved absolute path (resolving
-/// symlinks / npm wrappers is done by `cli::resolve_effective_tirith_target`),
-/// so this function is a pure path-shape classifier and is fully unit-testable.
-///
-/// The path is matched case-insensitively on Windows-style components only
-/// where it matters (Scoop); everything else uses exact component matching.
+/// Detect the install method from the canonicalized path of the running binary.
+/// The caller passes the already-resolved absolute path (symlink/npm-wrapper
+/// resolution is `cli::resolve_effective_tirith_target`'s job), so this is a pure,
+/// unit-testable path-shape classifier.
 pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
-    // Lowercased path segments, for whole-segment checks. We look at the
-    // *whole* resolved path, not just the parent dir, because package managers
-    // each have a recognizable directory layout.
-    //
-    // The string is split on BOTH separators (`/` and `\`) regardless of the
-    // host OS: a Windows Scoop path classified on a Unix host (e.g. in a unit
-    // test, or a path read from a file) would otherwise be a single opaque
-    // `Component` and the segment checks would all miss. Splitting the raw
-    // string makes the classifier host-OS-independent.
+    // Whole-segment checks over the FULL resolved path (each package manager has
+    // a recognizable layout). Split on BOTH `/` and `\` regardless of host OS, so
+    // a Windows Scoop path classified on Unix isn't one opaque `Component`.
     let path_lower = canonical_path.to_string_lossy().to_lowercase();
     let components: Vec<&str> = path_lower
         .split(['/', '\\'])
@@ -146,15 +115,13 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
         return InstallMethod::Npm;
     }
 
-    // Scoop (Windows): `…\scoop\apps\tirith\…`. Match the `scoop` + `apps`
-    // pair so an unrelated dir literally named "apps" does not trip it.
+    // Scoop (Windows): match the `scoop` + `apps` pair so an unrelated "apps"
+    // dir doesn't trip it.
     if has("scoop") && has("apps") {
         return InstallMethod::Scoop;
     }
 
-    // Homebrew: the Cellar, or an opt/bin under a `homebrew` or `linuxbrew`
-    // prefix. `/opt/homebrew/...`, `/usr/local/Cellar/...`,
-    // `/home/linuxbrew/.linuxbrew/...`.
+    // Homebrew: the Cellar, or an opt/bin under a `homebrew`/`linuxbrew` prefix.
     if has("cellar")
         || path_lower.contains("/homebrew/")
         || path_lower.contains("/linuxbrew/")
@@ -163,23 +130,15 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
         return InstallMethod::Homebrew;
     }
 
-    // Cargo: `$CARGO_HOME/bin/tirith` or `~/.cargo/bin/tirith`. The `.cargo`
-    // component is the reliable marker; `registry`/`git` subtrees are build
-    // artifacts, not installs, but `cargo install` always lands in `bin`.
+    // Cargo: the `.cargo` component is the reliable marker (`cargo install`
+    // always lands in `bin`; `registry`/`git` subtrees are build artifacts).
     if has(".cargo") {
         return InstallMethod::Cargo;
     }
 
-    // System package managers (Linux): a `.deb` from cargo-deb installs the
-    // binary to `/usr/bin/tirith`; the RPM spec installs to `/usr/bin` too.
-    // We cannot tell `apt` from `dnf` from the path alone — both use
-    // `/usr/bin` — so this branch is only reached as a hint and the caller
-    // refines it with `os-release` / a package-database probe. From the path
-    // alone we can only say "a system path we must not self-modify".
-    //
-    // Returning `Unknown` here (rather than guessing `Apt`) is the safe
-    // choice: `Unknown` is already treated as non-self-replaceable, and the
-    // CLI layer does the real apt-vs-dnf disambiguation with `detect_system_pm`.
+    // System package managers (Linux): both .deb and RPM install to `/usr/bin`,
+    // so the path alone can't tell apt from dnf. Return `Unknown` (already
+    // non-self-replaceable); the CLI refines apt-vs-dnf via `detect_system_pm`.
     if path_lower.starts_with("/usr/bin/")
         || path_lower.starts_with("/usr/local/bin/")
         || path_lower.starts_with("/bin/")
@@ -187,26 +146,20 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
         return InstallMethod::Unknown;
     }
 
-    // A binary under the user's `~/.local/bin` (the install.sh default) — or
-    // anywhere else not recognized above — is treated as self-managed: that is
-    // exactly where `install.sh` places it, and a hand-dropped standalone
-    // binary lives in user-writable space too. This is the install.sh path.
+    // `~/.local/bin` is the install.sh default (user-writable, hand-dropped
+    // binaries too) → self-managed.
     if path_lower.contains("/.local/bin/") {
         return InstallMethod::SelfManaged;
     }
 
-    // Anything else: be honest. We do not know. `Unknown` is non-replaceable.
+    // Anything else: unknown (non-replaceable).
     InstallMethod::Unknown
 }
 
-/// Refine a [`InstallMethod::Unknown`] coming from a system-path binary into
-/// `Apt` vs `Dnf` using an `/etc/os-release`-style ID list. `os_release_ids`
-/// is the set of lowercased tokens from the `ID` and `ID_LIKE` fields
-/// (e.g. `["ubuntu", "debian"]` or `["fedora", "rhel"]`). Passed in so the
-/// function is testable without reading `/etc`.
-///
-/// Returns the original method unchanged if it is not `Unknown` (a confidently
-/// detected method is never downgraded) or if the OS family is unrecognized.
+/// Refine a system-path [`InstallMethod::Unknown`] into `Apt` vs `Dnf` from an
+/// `/etc/os-release` `ID`/`ID_LIKE` token list (passed in so it's testable
+/// without reading `/etc`). Non-`Unknown` methods and unrecognized OS families
+/// are returned unchanged.
 pub fn refine_system_pm(method: InstallMethod, os_release_ids: &[String]) -> InstallMethod {
     if method != InstallMethod::Unknown {
         return method;
@@ -227,12 +180,8 @@ pub fn refine_system_pm(method: InstallMethod, os_release_ids: &[String]) -> Ins
     InstallMethod::Unknown
 }
 
-/// The target triple this binary was built for, as used in release archive
-/// names (`tirith-<target>.tar.gz`). Built from `std::env::consts` so it is
-/// correct for the running binary without a build script.
-///
-/// Returns `None` for a platform tirith does not publish a release artifact
-/// for (so the caller can honestly say "no release artifact for this target").
+/// The target triple this binary was built for, as used in release archive names.
+/// `None` for a platform tirith publishes no artifact for.
 pub fn release_target_triple() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
@@ -244,8 +193,7 @@ pub fn release_target_triple() -> Option<&'static str> {
     }
 }
 
-/// The release archive file name for a given target triple. Windows ships a
-/// `.zip`; every other target ships a `.tar.gz`.
+/// Release archive file name for a target triple (`.zip` on Windows, else `.tar.gz`).
 pub fn release_archive_name(target: &str) -> String {
     if target.contains("windows") {
         format!("tirith-{target}.zip")
@@ -254,9 +202,8 @@ pub fn release_archive_name(target: &str) -> String {
     }
 }
 
-/// A parsed semantic version (`MAJOR.MINOR.PATCH`), enough for tirith's own
-/// release comparison. Pre-release / build metadata are not used by tirith
-/// releases, so they are intentionally not modeled.
+/// A parsed `MAJOR.MINOR.PATCH` version. Pre-release / build metadata are not
+/// used by tirith releases and intentionally not modeled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemVer {
     pub major: u64,
@@ -265,15 +212,13 @@ pub struct SemVer {
 }
 
 impl SemVer {
-    /// Parse `MAJOR.MINOR.PATCH`, tolerating a leading `v` and surrounding
-    /// whitespace. Returns `None` for anything not in that exact shape — a
-    /// strict parser is correct here, because a version we cannot parse must
-    /// not be silently treated as "older" or "newer".
+    /// Parse `MAJOR.MINOR.PATCH` (tolerating a leading `v` and whitespace).
+    /// Strict: `None` for anything else, so an unparseable version is never
+    /// silently treated as older or newer.
     pub fn parse(s: &str) -> Option<SemVer> {
         let s = s.trim();
         let s = s.strip_prefix('v').unwrap_or(s);
-        // Reject pre-release / build-metadata forms explicitly rather than
-        // parsing a partial prefix of them.
+        // Reject pre-release / build-metadata rather than parse a partial prefix.
         if s.contains('-') || s.contains('+') {
             return None;
         }
@@ -298,28 +243,22 @@ impl std::fmt::Display for SemVer {
     }
 }
 
-/// The verification outcome for the running binary or for a downloaded
-/// candidate. The variants are ordered weakest → strongest in
-/// confidence; never report a stronger variant than the evidence supports.
+/// Verification outcome for the running binary or a downloaded candidate.
+/// Variants are ordered weakest → strongest; never report stronger than the
+/// evidence supports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationStatus {
-    /// Full provenance verified: the artifact's SHA-256 matched the signed
-    /// `checksums.txt`, AND the cosign signature over `checksums.txt` verified
+    /// SHA-256 matched signed `checksums.txt` AND the cosign signature verified
     /// against the expected Sigstore identity.
     VerifiedSigned,
-    /// The artifact's SHA-256 matched `checksums.txt`, but the cosign
-    /// signature could not be checked — `cosign` is not installed. The
-    /// checksum match still proves the bytes are what that release published,
-    /// but not (cryptographically, here) that the release itself is genuine.
+    /// SHA-256 matched `checksums.txt` but the cosign signature could not be
+    /// checked (`cosign` not installed) — proves the bytes, not the release.
     VerifiedChecksumOnly,
-    /// Verification could not be performed at all. `reason` says why
-    /// (offline, a dev build with no matching release, an unknown install,
-    /// the running version is not a published release, …). This is NOT a
-    /// failure verdict — it is an honest "unknown".
+    /// Verification could not run (offline, dev build, unknown install, …).
+    /// `reason` says why. An honest "unknown", not a failure.
     Unverified { reason: String },
-    /// Verification ran and FAILED: a checksum mismatch, a signature that did
-    /// not verify, or a signing identity that did not match. `reason` carries
-    /// the detail. This is a hard failure and must abort an update.
+    /// Verification ran and FAILED (checksum mismatch, bad signature, identity
+    /// mismatch). A hard failure that must abort an update.
     Failed { reason: String },
 }
 
@@ -334,8 +273,7 @@ impl VerificationStatus {
         }
     }
 
-    /// Whether this status represents a *positive* verification of integrity
-    /// (the bytes match the published checksum). Both signed and
+    /// Positive integrity (bytes match the published checksum): signed and
     /// checksum-only count; unverified and failed do not.
     pub fn is_integrity_ok(&self) -> bool {
         matches!(
@@ -344,66 +282,48 @@ impl VerificationStatus {
         )
     }
 
-    /// Whether an update may proceed given this status when `--verify` was
-    /// requested. Only a hard `Failed` blocks; an honest `Unverified` is
-    /// surfaced to the user but the *decision* to block on it is the CLI's
-    /// (it does, for `--verify`). Exposed for testing the contract.
+    /// Only a hard `Failed` blocks an update; `Unverified` is surfaced but the
+    /// block decision is the CLI's. Exposed for testing the contract.
     pub fn is_hard_failure(&self) -> bool {
         matches!(self, VerificationStatus::Failed { .. })
     }
 }
 
-/// Provenance of the running binary, for `tirith version --provenance` and as
-/// the basis of `tirith verify-self`.
+/// Provenance of the running binary, for `tirith version --provenance` and the
+/// basis of `tirith verify-self`.
 #[derive(Debug, Clone)]
 pub struct Provenance {
     /// Compile-time crate version (`CARGO_PKG_VERSION`).
     pub version: String,
     /// Absolute path of the running executable (best-effort).
     pub binary_path: Option<PathBuf>,
-    /// SHA-256 of the running executable's own bytes, lowercase hex.
+    /// Lowercase-hex SHA-256 of the running executable's bytes.
     pub binary_sha256: Option<String>,
-    /// Detected install method.
     pub install_method: InstallMethod,
     /// Release target triple, or `None` for an unpublished platform.
     pub target: Option<String>,
-    /// `true` when this looks like a local dev/debug build rather than a
-    /// release binary (see [`looks_like_dev_build`]).
+    /// Looks like a local dev/debug build (see [`looks_like_dev_build`]).
     pub dev_build: bool,
-    /// `true` when the running binary's path could NOT be fully resolved
-    /// (symlink / npm-wrapper / shim canonicalization failed) and the
-    /// unresolved path was used as a fallback. The install-method
-    /// classification — and therefore any "is this a self-managed install"
-    /// decision — is then made from a possibly-wrong path, so consumers
-    /// (`version --provenance`, `verify-self`) should note lower confidence.
+    /// The binary's path could NOT be fully resolved (symlink/npm-wrapper/shim
+    /// canonicalization failed) and the unresolved path was used. The
+    /// install-method classification is then from a possibly-wrong path, so
+    /// consumers should note lower confidence.
     pub path_resolution_failed: bool,
 }
 
-/// Heuristic: does the running binary look like a local dev build rather than
-/// an installed release? A dev build cannot be verified against any release
-/// checksum, so `verify-self` must say so honestly instead of failing.
+/// Heuristic: does the running binary look like a local dev build (which cannot
+/// be verified against a release checksum, so `verify-self` says so honestly)?
 ///
-/// `binary_path` is the canonicalized executable path; `debug_assertions` is
-/// whether the binary was compiled without optimizations (passed in so the
-/// function stays testable — the CLI passes `cfg!(debug_assertions)`).
+/// `debug_assertions` is passed in (CLI passes `cfg!(debug_assertions)`) so the
+/// function stays testable.
 pub fn looks_like_dev_build(binary_path: Option<&Path>, debug_assertions: bool) -> bool {
     if debug_assertions {
         return true;
     }
-    // A release-profile binary sitting inside a Cargo `target/` directory is
-    // a `cargo build --release` artifact from a checkout, not an install.
-    //
-    // The Cargo layout is `target/release/tirith` or, with `--target`,
-    // `target/<triple>/release/tirith`. In BOTH layouts the `target`
-    // component is immediately followed by either `release`/`debug` (the
-    // profile dir) or the target triple. Matching a bare `target` component
-    // anywhere AND a bare `release`/`debug` component anywhere — independently
-    // — is too loose: a perfectly normal install under, say,
-    // `…/target/bin/release/tirith` would misclassify as a dev build. Require
-    // the `target` component to be IMMEDIATELY followed by `release` or
-    // `debug` (covering `target/release/...`) — the cross-compiled
-    // `target/<triple>/release/...` is handled by also accepting a triple
-    // component between them.
+    // A release-profile binary inside a Cargo `target/` is a checkout artifact,
+    // not an install. F24: require `target` IMMEDIATELY followed by `release`/
+    // `debug` (or a triple then the profile) — matching the two components
+    // independently would misclassify a real install under `…/target/bin/release/`.
     if let Some(p) = binary_path {
         let comps: Vec<&std::ffi::OsStr> = p
             .components()
@@ -416,8 +336,7 @@ pub fn looks_like_dev_build(binary_path: Option<&Path>, debug_assertions: bool) 
             s == std::ffi::OsStr::new("release") || s == std::ffi::OsStr::new("debug")
         };
         let looks_like_triple = |s: &std::ffi::OsStr| {
-            // A Rust target triple (`x86_64-unknown-linux-gnu`,
-            // `aarch64-apple-darwin`, …): contains `-`, no path-ish chars.
+            // A Rust target triple: contains `-`, no path-ish chars.
             s.to_str()
                 .map(|t| t.contains('-') && !t.contains(' ') && !t.contains('.'))
                 .unwrap_or(false)
@@ -426,11 +345,11 @@ pub fn looks_like_dev_build(binary_path: Option<&Path>, debug_assertions: bool) 
             if *c != std::ffi::OsStr::new("target") {
                 continue;
             }
-            // `target/release` or `target/debug`.
+            // `target/release` | `target/debug`.
             if comps.get(i + 1).is_some_and(|n| is_profile(n)) {
                 return true;
             }
-            // `target/<triple>/release` or `target/<triple>/debug`.
+            // `target/<triple>/release` | `target/<triple>/debug`.
             if comps.get(i + 1).is_some_and(|n| looks_like_triple(n))
                 && comps.get(i + 2).is_some_and(|n| is_profile(n))
             {
@@ -441,14 +360,9 @@ pub fn looks_like_dev_build(binary_path: Option<&Path>, debug_assertions: bool) 
     false
 }
 
-/// Parse a GNU-coreutils `checksums.txt` (`sha256sum` output: `<hex>  <name>`)
-/// and return the lowercase hex digest recorded for `archive_name`, if any.
-///
-/// `sha256sum` separates the digest from the name with **two** spaces (the
-/// second being the "text mode" indicator); a single space after the digest
-/// is also tolerated. Returns `Err` if the file lists the same archive name
-/// more than once (a malformed or tampered checksum file — never silently
-/// pick one).
+/// Parse a `sha256sum` `checksums.txt` (`<hex>  <name>`) and return the
+/// lowercase digest for `archive_name`, if any. `Err` if the same archive is
+/// listed more than once with conflicting digests (tampered — never pick one).
 pub fn checksum_for(checksums_txt: &str, archive_name: &str) -> Result<Option<String>, String> {
     let mut found: Option<String> = None;
     for line in checksums_txt.lines() {
@@ -456,9 +370,8 @@ pub fn checksum_for(checksums_txt: &str, archive_name: &str) -> Result<Option<St
         if line.is_empty() {
             continue;
         }
-        // Split into <digest> <rest>. The digest is the first whitespace-
-        // delimited token; the name is the remainder with one leading
-        // separator char (` ` or `*`) stripped.
+        // <digest> = first whitespace-delimited token; name = the remainder with
+        // one leading separator (` ` or `*`) stripped.
         let mut it = line.splitn(2, char::is_whitespace);
         let digest = match it.next() {
             Some(d) if !d.is_empty() => d,
@@ -468,8 +381,8 @@ pub fn checksum_for(checksums_txt: &str, archive_name: &str) -> Result<Option<St
             Some(r) => r,
             None => continue,
         };
-        // `rest` begins with one extra space (text mode) or `*` (binary
-        // mode), or is the name directly. Strip a single leading marker.
+        // `rest` may start with a space (text mode) or `*` (binary mode); strip
+        // a single leading marker.
         let name = rest
             .strip_prefix(' ')
             .or_else(|| rest.strip_prefix('*'))
@@ -490,8 +403,7 @@ pub fn checksum_for(checksums_txt: &str, archive_name: &str) -> Result<Option<St
                     "checksums.txt lists {archive_name} more than once with conflicting digests"
                 ));
             }
-            // Identical duplicate line — tolerate, but a conflicting one above
-            // already errored.
+            // Identical duplicate — tolerate (a conflicting one already errored).
         }
         found = Some(digest_l);
     }
@@ -503,14 +415,9 @@ fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Case-insensitive, whitespace-tolerant equality for two hex digests.
-///
-/// This is NOT a constant-time comparison: it trims, lowercases, and uses a
-/// plain `String` equality that short-circuits. That is fine here — the
-/// digests being compared (a SHA-256 of a release archive against the digest
-/// in a public `checksums.txt`) are public values, so comparison timing leaks
-/// nothing. The trim/lowercase normalization just makes a digest copied with
-/// stray whitespace or mixed case still compare equal.
+/// Case-insensitive, whitespace-tolerant hex-digest equality. NOT constant-time,
+/// which is fine: both digests are public values (a release archive's SHA-256 vs
+/// a public `checksums.txt`), so timing leaks nothing.
 pub fn digest_eq(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
@@ -519,8 +426,6 @@ pub fn digest_eq(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    // --- install-method detection -----------------------------------------
 
     #[test]
     fn detect_npm_install() {
@@ -562,8 +467,8 @@ mod tests {
 
     #[test]
     fn detect_system_path_is_unknown_not_self_managed() {
-        // A /usr/bin binary is package-managed (deb/rpm). It must NOT be
-        // classified self-managed — that would let `update` clobber it.
+        // A /usr/bin binary is package-managed; must NOT be self-managed (else
+        // `update` could clobber it).
         let p = PathBuf::from("/usr/bin/tirith");
         let m = detect_install_method(&p);
         assert_eq!(m, InstallMethod::Unknown);
@@ -618,7 +523,7 @@ mod tests {
         assert!(InstallMethod::Aur.upgrade_command().is_some());
         assert!(InstallMethod::Apt.upgrade_command().is_some());
         assert!(InstallMethod::Dnf.upgrade_command().is_some());
-        // Self-managed and unknown deliberately have no PM command.
+        // Self-managed and unknown have no PM command.
         assert_eq!(InstallMethod::SelfManaged.upgrade_command(), None);
         assert_eq!(InstallMethod::Unknown.upgrade_command(), None);
     }
@@ -640,8 +545,8 @@ mod tests {
 
     #[test]
     fn refine_system_pm_never_downgrades_confident_method() {
-        // A confidently-detected Homebrew install must survive refinement
-        // even if os-release looks like Debian.
+        // A confident Homebrew detection survives refinement even if os-release
+        // looks like Debian.
         let m = refine_system_pm(InstallMethod::Homebrew, &["debian".to_string()]);
         assert_eq!(m, InstallMethod::Homebrew);
     }
@@ -651,8 +556,6 @@ mod tests {
         let m = refine_system_pm(InstallMethod::Unknown, &["plan9".to_string()]);
         assert_eq!(m, InstallMethod::Unknown);
     }
-
-    // --- version parsing --------------------------------------------------
 
     #[test]
     fn semver_parses_plain_and_v_prefixed() {
@@ -682,7 +585,7 @@ mod tests {
         assert_eq!(SemVer::parse("1.2.3.4"), None);
         assert_eq!(SemVer::parse("1.2.x"), None);
         assert_eq!(SemVer::parse("latest"), None);
-        // Pre-release / build metadata are rejected, not partially parsed.
+        // Pre-release / build metadata rejected, not partially parsed.
         assert_eq!(SemVer::parse("1.2.3-rc1"), None);
         assert_eq!(SemVer::parse("1.2.3+build"), None);
     }
@@ -700,8 +603,6 @@ mod tests {
         assert_eq!(a, SemVer::parse("v0.3.1").unwrap());
     }
 
-    // --- release target / archive naming ----------------------------------
-
     #[test]
     fn release_archive_name_picks_extension_by_os() {
         assert_eq!(
@@ -717,8 +618,6 @@ mod tests {
             "tirith-x86_64-pc-windows-msvc.zip"
         );
     }
-
-    // --- dev-build heuristic ----------------------------------------------
 
     #[test]
     fn dev_build_true_when_debug_assertions() {
@@ -744,29 +643,24 @@ mod tests {
 
     #[test]
     fn dev_build_false_when_target_and_release_are_not_adjacent() {
-        // F24: a real install whose path merely happens to contain a `target`
-        // component AND, separately, a `release` component must NOT be
-        // misclassified as a dev build. Here `target` is followed by `bin`,
-        // not by `release`/`debug`, so the Cargo `target/release` layout does
-        // not actually appear.
+        // F24: a path with `target` and `release` components that are NOT
+        // adjacent must not be a dev build (the marker is the Cargo layout, not
+        // the words). Here `target` is followed by `bin`.
         let p = PathBuf::from("/opt/target/bin/release/tirith");
         assert!(
             !looks_like_dev_build(Some(&p), false),
             "non-adjacent target/release components must not be a dev build"
         );
-        // A user literally installing into `~/.local/share/target/release`
-        // would be unusual, but the marker is the Cargo layout, not the words.
         let p2 = PathBuf::from("/home/bob/target-archive/old/release-notes/tirith");
         assert!(!looks_like_dev_build(Some(&p2), false));
-        // A home dir named with a leading `target` segment, binary in bin/.
         let p3 = PathBuf::from("/home/target/release-team/tirith/bin/tirith");
         assert!(!looks_like_dev_build(Some(&p3), false));
     }
 
     #[test]
     fn dev_build_true_only_for_adjacent_cargo_layout() {
-        // F24: the two genuine Cargo layouts — `target/release` and the
-        // cross-compiled `target/<triple>/release` — must still be detected.
+        // F24: both genuine Cargo layouts (`target/release` and
+        // `target/<triple>/release`) must still be detected.
         let plain = PathBuf::from("/home/alice/src/tirith/target/release/tirith");
         assert!(looks_like_dev_build(Some(&plain), false));
         let plain_debug = PathBuf::from("/home/alice/src/tirith/target/debug/tirith");
@@ -775,8 +669,6 @@ mod tests {
             PathBuf::from("/home/alice/src/tirith/target/aarch64-apple-darwin/release/tirith");
         assert!(looks_like_dev_build(Some(&triple), false));
     }
-
-    // --- checksums.txt parsing --------------------------------------------
 
     #[test]
     fn checksum_for_extracts_matching_entry() {
@@ -802,8 +694,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  tirith-aarch64
 
     #[test]
     fn checksum_for_rejects_conflicting_duplicates() {
-        // The SAME archive listed twice with DIFFERENT digests is a tampered
-        // or malformed file — must error, never silently pick one.
+        // Same archive, different digests = tampered/malformed → must error.
         let txt = "\
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  tirith-x86_64-apple-darwin.tar.gz
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  tirith-x86_64-apple-darwin.tar.gz
@@ -831,15 +722,13 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  tirith-x86_64-
 
     #[test]
     fn checksum_for_tolerates_binary_mode_star_separator() {
-        // GNU sha256sum binary mode prefixes the name with `*`.
+        // sha256sum binary mode prefixes the name with `*`.
         let txt = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd *tirith-x86_64-apple-darwin.tar.gz\n";
         assert_eq!(
             checksum_for(txt, "tirith-x86_64-apple-darwin.tar.gz").unwrap(),
             Some("d".repeat(64))
         );
     }
-
-    // --- verification-status contract -------------------------------------
 
     #[test]
     fn verification_status_integrity_and_failure_flags() {

@@ -130,8 +130,7 @@ pub fn parse_threatfox_zip<R: Read + Seek>(reader: R) -> Result<FeedEntries, Str
             continue;
         }
 
-        // Cap decompressed size to prevent zip bombs (compressed feed may
-        // expand far beyond the download size limit).
+        // Cap decompressed size to prevent zip bombs.
         const MAX_DECOMPRESSED: u64 = 512 * 1024 * 1024;
         let mut csv_bytes = Vec::new();
         file.by_ref()
@@ -187,8 +186,8 @@ pub fn parse_domain_blocklist(contents: &str) -> FeedEntries {
             continue;
         }
 
-        // Strip inline comments: everything from '#' onward is ignored.
-        // Then take the last non-comment token (handles "0.0.0.0 bad.example" format).
+        // Strip inline `#` comments, then take the last token (handles the
+        // "0.0.0.0 bad.example" hosts format).
         let token = line
             .split_whitespace()
             .take_while(|value| !value.starts_with('#'))

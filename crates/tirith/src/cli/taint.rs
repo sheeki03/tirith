@@ -1,19 +1,8 @@
-//! `tirith taint list|explain|clear` (M10 ch3).
+//! `tirith taint list|explain|clear` (M10 ch3) — thin presenter over
+//! [`tirith_core::taint`]; the store and all logic live in the library.
 //!
-//! Thin presenter over [`tirith_core::taint`]. The store (a JSONL file at
-//! `state_dir()/taint.jsonl`) and all read/write/normalize logic live in the
-//! library; this module is output + the `clear` confirmation prompt.
-//!
-//! A file becomes tainted via `tirith fetch --save <path> <url>` (a download
-//! kept at a known path). A later `bash <path>` then fires
-//! `ExecOfTaintedFile` from the engine. These subcommands inspect and manage
-//! the store:
-//!
-//! * `list` — every recorded taint (path, origin, when, source URL/repo).
-//! * `explain <file>` — the recorded mark for one file, or a clear "not
-//!   tainted" message.
-//! * `clear <file>` — remove the mark for one file (prompts for confirmation
-//!   unless `--yes`, or non-interactive without `--yes` refuses).
+//! A file becomes tainted via `tirith fetch --save <path> <url>`; a later
+//! `bash <path>` fires `ExecOfTaintedFile` from the engine.
 
 use std::path::Path;
 
@@ -95,7 +84,6 @@ pub fn explain(file: &str, json: bool) -> i32 {
 /// `tirith taint clear <file>` — remove the mark for one file. Prompts for
 /// confirmation unless `--yes`. Non-interactive without `--yes` refuses.
 pub fn clear(file: &str, yes: bool, json: bool) -> i32 {
-    // Show what we are about to clear so the confirmation is informed.
     let existing = taint::is_tainted(Path::new(file), None);
     if existing.is_none() {
         if json {
@@ -123,8 +111,7 @@ pub fn clear(file: &str, yes: bool, json: bool) -> i32 {
         println!("Aborted — taint mark left in place.");
         return 0;
     }
-    // In JSON mode, require `--yes` to proceed non-interactively (no prompt on a
-    // machine-readable surface). Without it, refuse rather than silently clear.
+    // JSON mode requires `--yes`: refuse rather than silently clear with no prompt.
     if json && !yes {
         eprintln!("tirith taint clear: --yes required in JSON mode to confirm removal");
         return 2;

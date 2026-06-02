@@ -1,30 +1,17 @@
 //! M12 ch2 — `tirith visual-audit`.
 //!
-//! An interactive audit that renders pairs of visually-confusable glyphs and
-//! asks the operator whether they can tell them apart **in their terminal and
-//! font**. tirith's homograph / confusable detection is heuristic and
-//! conservative; this command lets an operator measure the OTHER half of the
-//! problem — whether their own terminal renders, say, a Cyrillic `а` (U+0430)
-//! indistinguishably from a Latin `a`.
+//! Renders pairs of visually-confusable glyphs and asks the operator whether they
+//! can tell them apart in their own terminal + font — measuring the half of the
+//! homograph problem tirith's heuristic detection can't (does THIS terminal render
+//! a Cyrillic `а` like a Latin `a`?).
 //!
-//! ## The result is inherently LOCAL
+//! The result is inherently LOCAL: it depends on the emulator + font + rendering
+//! stack, so it is NOT portable, and both the human summary and JSON say so. We
+//! ship only the raw operator answers, never a "your terminal is safe" verdict.
 //!
-//! The whole point is that the answer depends on the operator's terminal
-//! emulator + font + rendering stack. A pair that is obviously distinct in one
-//! font may be pixel-identical in another. So the recorded result is NOT
-//! portable: it describes THIS machine's rendering, and the human summary and
-//! the JSON envelope both say so. We deliberately do not ship a "your terminal
-//! is safe" verdict — only the raw operator answers.
-//!
-//! ## Headless / CI
-//!
-//! `--non-interactive` skips all prompting and records every selected pair as
-//! `skipped`, exiting 0. It NEVER reads stdin, so a headless CI lane can run
-//! `tirith visual-audit --non-interactive --pairs critical` deterministically.
-//! In interactive mode without `--non-interactive`, we gate the stdin read on
-//! `is_terminal(stdin)` (the same gate `command-card create` uses): a non-TTY
-//! stdin prints a clear message and exits rather than blocking on a read that
-//! will never receive input.
+//! `--non-interactive` skips prompting, records every pair as `skipped`, never reads
+//! stdin (CI-deterministic). Interactive mode gates the stdin read on
+//! `is_terminal(stdin)` so a non-TTY prints a message instead of blocking forever.
 
 use std::io::Write;
 
@@ -49,18 +36,13 @@ pub struct ConfusablePair {
     pub critical: bool,
 }
 
-/// The full audit pair table. Spans the confusable classes tirith's detection
-/// cares about: Cyrillic / Greek look-alikes, fullwidth forms, math-alphanumeric
-/// styled letters, plus the two "is something hidden here?" cases (a zero-width
-/// space embedded between two letters, and a right-to-left override). The
-/// `critical` subset is the handful most likely to appear in a real homograph
-/// domain / typosquat attack.
+/// The full audit pair table: Cyrillic / Greek look-alikes, fullwidth forms,
+/// math-alphanumeric letters, plus a zero-width space and an RTL override. The
+/// `critical` subset is the handful most likely in a real homograph / typosquat attack.
 ///
-/// NOTE: the zero-width and bidi entries deliberately embed the invisible
-/// character INSIDE `confusable` so the operator is judging exactly what the
-/// terminal renders — there is no separate "control" glyph for those two.
+/// NOTE: the zero-width and bidi entries embed the invisible character INSIDE
+/// `confusable` so the operator judges exactly what the terminal renders.
 pub const PAIRS: &[ConfusablePair] = &[
-    // ---- Cyrillic look-alikes (the classic homograph alphabet) -------------
     ConfusablePair {
         name: "latin-i-vs-cyrillic-i",
         ascii: "i",
@@ -117,7 +99,6 @@ pub const PAIRS: &[ConfusablePair] = &[
         codepoints: "U+0079 vs U+0443",
         critical: false,
     },
-    // ---- Greek look-alikes -------------------------------------------------
     ConfusablePair {
         name: "latin-o-vs-greek-omicron",
         ascii: "o",
@@ -146,7 +127,6 @@ pub const PAIRS: &[ConfusablePair] = &[
         codepoints: "U+0042 vs U+0392",
         critical: false,
     },
-    // ---- Fullwidth forms (common in pasted CJK-locale text) ----------------
     ConfusablePair {
         name: "latin-a-vs-fullwidth-a",
         ascii: "a",
@@ -161,7 +141,6 @@ pub const PAIRS: &[ConfusablePair] = &[
         codepoints: "U+0047 vs U+FF27",
         critical: false,
     },
-    // ---- Math-alphanumeric styled letters (U+1D400–U+1D7FF) ----------------
     ConfusablePair {
         name: "latin-cap-o-vs-math-script-o",
         ascii: "O",
@@ -183,7 +162,6 @@ pub const PAIRS: &[ConfusablePair] = &[
         codepoints: "U+0053 vs U+1D516",
         critical: false,
     },
-    // ---- Latin diacritic look-alike ----------------------------------------
     ConfusablePair {
         name: "latin-a-vs-latin-a-ring",
         ascii: "a",
@@ -191,24 +169,19 @@ pub const PAIRS: &[ConfusablePair] = &[
         codepoints: "U+0061 vs U+00E5",
         critical: false,
     },
-    // ---- Invisible / hidden characters (judge what the terminal renders) ---
+    // Invisible/hidden-char entries: the confusable embeds the invisible char inline.
     ConfusablePair {
         name: "zero-width-space-between-letters",
-        // The benign reference is the two letters with NOTHING between them.
         ascii: "ab",
-        // The confusable embeds U+200B ZERO WIDTH SPACE between `a` and `b`:
-        // "is there a hidden character here?"
+        // Embeds U+200B ZERO WIDTH SPACE between `a` and `b`.
         confusable: "a\u{200B}b",
         codepoints: "ab vs a<U+200B>b (zero-width space)",
         critical: true,
     },
     ConfusablePair {
         name: "bidi-rtl-override-demo",
-        // Benign: the plain word.
         ascii: "abc.txt",
-        // Confusable: a right-to-left override (U+202E) flips display order —
-        // the classic `report\u{202e}txt.exe` filename-spoofing trick, here
-        // shown inline so the operator sees how their terminal handles it.
+        // U+202E RTL override flips display order (the classic filename-spoofing trick).
         confusable: "abc\u{202E}txt.exe",
         codepoints: "U+202E RIGHT-TO-LEFT OVERRIDE",
         critical: true,
@@ -248,17 +221,10 @@ pub struct PairResult {
     pub verdict: Verdict,
 }
 
-/// One operator answer, as a closed set rather than a free `String`. A
-/// stringly-typed field constrained only by convention let a typo'd or
-/// out-of-set value silently count as none of the three buckets and break the
+/// One operator answer, as a closed set (not a free `String`) so the
 /// `distinguishable + indistinguishable + skipped == pairs_total` partition that
-/// `tally` and `doctor --compat` rely on. The enum makes the set total at the
-/// type level.
-///
-/// `#[serde(rename_all = "snake_case")]` serializes the variants to exactly the
-/// previous JSON tokens (`"distinguishable"` / `"indistinguishable"` /
-/// `"skipped"`), so the on-disk `visual-audit-result.json` and the `doctor`
-/// read path are byte-for-byte backward/forward compatible.
+/// `tally` / `doctor --compat` rely on is total at the type level. `snake_case`
+/// serde keeps the on-disk JSON tokens byte-for-byte backward/forward compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -287,18 +253,11 @@ pub fn select_pairs(selector: Option<&str>) -> (Vec<&'static ConfusablePair>, bo
     }
 }
 
-/// `tirith visual-audit` entry point.
-///
-/// * `non_interactive` — never read stdin; record every selected pair as
-///   `skipped` and exit 0 (CI-safe).
-/// * `pairs` — `critical` (default) or `all`.
-/// * `json` — also emit the [`VisualAuditResult`] as JSON on stdout.
-///
-/// Returns the process exit code. 0 on the happy path (including the
-/// non-interactive and non-TTY-degrade paths); 1 on a stdout JSON write failure
-/// (broken pipe) OR when a persist was requested (the `--non-interactive` and
-/// interactive paths persist) but failed to write the result file — so a caller
-/// is never told the audit was recorded when it was not.
+/// `tirith visual-audit` entry point. `non_interactive` records every pair as
+/// `skipped` without reading stdin; `pairs` is `critical` (default) or `all`; `json`
+/// also emits [`VisualAuditResult`]. Returns the exit code: 0 on the happy path, 1 on
+/// a JSON write failure or a requested-but-failed persist (never report a non-recorded
+/// audit as recorded).
 pub fn run(non_interactive: bool, pairs: Option<String>, json: bool) -> i32 {
     let (selected, recognized) = select_pairs(pairs.as_deref());
     if !recognized {
@@ -310,35 +269,27 @@ pub fn run(non_interactive: bool, pairs: Option<String>, json: bool) -> i32 {
 
     let term = std::env::var("TERM").unwrap_or_default();
 
-    // ---- non-interactive (CI): no prompting, all pairs recorded as skipped --
-    // An EXPLICIT `--non-interactive` is a deliberate choice, so we DO persist
-    // the all-skipped result — it leaves an honest trace ("an audit ran but was
-    // skipped") that `tirith doctor --compat` can then surface. (The non-TTY
-    // DEGRADE path below — where the operator forgot the flag — does NOT
-    // persist, because there was no deliberate run and no judgment.) Records no
-    // operator judgment either way; every pair is `skipped`.
+    // Explicit `--non-interactive` is deliberate, so we DO persist the all-skipped
+    // result (an honest trace `doctor --compat` can surface). The non-TTY degrade
+    // path below does NOT persist — there was no deliberate run and no judgment.
     if non_interactive {
         let result = build_skipped_result(&term, &selected);
         return finish(result, json, /*persist=*/ true);
     }
 
-    // ---- interactive read requires a TTY on stdin --------------------------
-    // `prompt_verdict` reads a line from stdin; if stdin is NOT a terminal we
-    // must not block on a read that will never get input. Mirrors the
-    // `command-card create` gate (is_terminal on the actual stream we read).
+    // Interactive read needs a TTY: don't block on a stdin read that never gets input.
+    // Mirrors the `command-card create` gate.
     if !is_terminal::is_terminal(std::io::stdin()) {
         eprintln!(
             "tirith visual-audit: stdin is not a TTY — cannot prompt interactively.\n  \
              Run this in a real terminal, or pass --non-interactive for a headless (all-skipped) run."
         );
-        // Not a failure: a CI lane that forgot --non-interactive should not
-        // turn red. Record an all-skipped result (NOT persisted — there was no
-        // operator judgment) and exit 0.
+        // Not a failure (a CI lane that forgot the flag shouldn't turn red): exit 0
+        // with an all-skipped result, NOT persisted (no operator judgment).
         let result = build_skipped_result(&term, &selected);
         return finish(result, json, /*persist=*/ false);
     }
 
-    // ---- interactive prompt loop -------------------------------------------
     eprintln!(
         "tirith visual-audit: rendering {} confusable pair(s).",
         selected.len()
@@ -408,11 +359,9 @@ fn tally(term: &str, results: Vec<PairResult>) -> VisualAuditResult {
     }
 }
 
-/// Persist (when `persist`), then print the human summary and/or JSON. Returns
-/// the exit code: 1 when a persist was REQUESTED but failed (so CI /
-/// `tirith doctor --compat` are not told the audit was recorded when it wasn't),
-/// 1 on a JSON write failure, else 0. The JSON / human output is still emitted on
-/// a persist failure so a caller can see the (unsaved) result.
+/// Persist (when `persist`), then print the human summary and/or JSON. Exit code: 1 on
+/// a requested-but-failed persist or a JSON write failure, else 0. Output is still emitted
+/// on a persist failure so a caller sees the (unsaved) result.
 fn finish(result: VisualAuditResult, json: bool, persist: bool) -> i32 {
     let mut persist_failed = false;
     if persist {
@@ -432,8 +381,6 @@ fn finish(result: VisualAuditResult, json: bool, persist: bool) -> i32 {
     } else {
         print_human_summary(&result);
     }
-    // A requested-but-failed persist is a failure: the result was NOT recorded,
-    // so exiting 0 would falsely signal success to CI / `tirith doctor --compat`.
     if persist_failed {
         1
     } else {
@@ -482,17 +429,10 @@ fn print_human_summary(result: &VisualAuditResult) {
     eprintln!("  This result describes only this machine and is not portable.");
 }
 
-/// Drive the per-pair prompt loop. `prompt(idx, pair)` returns the operator's
-/// verdict for one pair, or `None` on EOF / unreadable stdin.
-///
-/// Once `prompt` returns `None` we set an `input_closed` flag and record EVERY
-/// remaining pair as skipped WITHOUT calling `prompt` again — a closed stdin
-/// stays closed, so re-prompting would just spin returning `None` (and, for a
-/// real terminal, spam the same prompt for each remaining pair). The result is
-/// always well-formed: one [`PairResult`] per selected pair, in order.
-///
-/// Factored out (taking the prompt as a closure) so a mid-audit EOF can be
-/// exercised in a unit test without driving real stdin.
+/// Drive the per-pair prompt loop. `prompt(idx, pair)` returns the operator's verdict,
+/// or `None` on EOF / unreadable stdin. After the first `None` we record every remaining
+/// pair as skipped WITHOUT re-prompting (a closed stdin stays closed). Factored to take
+/// the prompt as a closure so a mid-audit EOF is unit-testable without real stdin.
 fn collect_verdicts<F>(selected: &[&'static ConfusablePair], mut prompt: F) -> Vec<PairResult>
 where
     F: FnMut(usize, &ConfusablePair) -> Option<Verdict>,
@@ -501,15 +441,12 @@ where
     let mut input_closed = false;
     for (idx, pair) in selected.iter().enumerate() {
         let verdict = if input_closed {
-            // stdin already closed earlier this run — do not prompt again.
             Verdict::Skipped
         } else {
             match prompt(idx, pair) {
                 Some(v) => v,
                 None => {
-                    // EOF / unreadable stdin mid-loop: stop prompting for the
-                    // rest of this run; record everything remaining as skipped so
-                    // the result stays well-formed.
+                    // EOF mid-loop: stop prompting; record the rest as skipped.
                     input_closed = true;
                     eprintln!(
                         "tirith visual-audit: input closed; recording remaining pairs as skipped."
@@ -527,10 +464,8 @@ where
     results
 }
 
-/// Prompt on stderr, read one line from stdin, and map the answer to a verdict.
-/// `y`/`yes` → distinguishable, `n`/`no` → indistinguishable, anything else
-/// (`s`, `skip`, blank) → skipped. Returns `None` on EOF / read error so the
-/// caller can stop the loop cleanly.
+/// Prompt on stderr, read one stdin line, map to a verdict. Returns `None` on EOF /
+/// read error so the caller can stop the loop cleanly.
 fn prompt_verdict(label: &str) -> Option<Verdict> {
     eprint!("{label}: ");
     let _ = std::io::stderr().flush();
@@ -541,14 +476,12 @@ fn prompt_verdict(label: &str) -> Option<Verdict> {
     }
 }
 
-/// Map a raw answer line to a [`Verdict`]. Factored out so the mapping is
-/// unit-testable without stdin. Case-insensitive, trimmed.
+/// Map a raw answer line to a [`Verdict`]. Case-insensitive, trimmed.
 fn verdict_from_answer(answer: &str) -> Verdict {
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Verdict::Distinguishable,
         "n" | "no" => Verdict::Indistinguishable,
-        // `s`, `skip`, empty, or anything else → skipped (the safe default —
-        // we never infer a judgment the operator did not give).
+        // `s`, `skip`, empty, anything else → skipped (never infer an unguessed judgment).
         _ => Verdict::Skipped,
     }
 }
@@ -660,11 +593,8 @@ mod tests {
         );
     }
 
-    /// Mid-audit EOF: once the prompt closure returns `None`, NO further prompts
-    /// are issued and every remaining pair is recorded as skipped. We answer the
-    /// first two pairs, then "close" stdin — the closure must not be called for
-    /// pair index ≥ 2, and the tail is all skipped. Guards the regression where
-    /// the loop kept calling `prompt_verdict` after EOF.
+    /// Mid-audit EOF: after the closure returns `None`, no further prompts are issued
+    /// and the tail is all skipped. Regression guard against re-prompting after EOF.
     #[test]
     fn collect_verdicts_stops_prompting_after_eof() {
         let (selected, _) = select_pairs(Some("all"));
@@ -786,11 +716,9 @@ mod tests {
         assert!(back.results.iter().all(|p| p.verdict == Verdict::Skipped));
     }
 
-    /// The [`Verdict`] enum serializes to EXACTLY the three legacy JSON tokens, so
-    /// the on-disk `visual-audit-result.json` and the `doctor --compat` read path
-    /// stay byte-for-byte backward/forward compatible after the String → enum
-    /// migration. Asserts both directions on the wire form (not just a Rust
-    /// round-trip) — the contract that lets `doctor` deserialize an existing file.
+    /// [`Verdict`] serializes to EXACTLY the three legacy JSON tokens, keeping the
+    /// on-disk file and `doctor --compat` byte-for-byte compatible after the String→enum
+    /// migration. Asserts both wire directions, not just a Rust round-trip.
     #[test]
     fn verdict_serializes_to_legacy_tokens() {
         assert_eq!(
@@ -805,16 +733,13 @@ mod tests {
             serde_json::to_string(&Verdict::Skipped).unwrap(),
             r#""skipped""#
         );
-        // And an existing on-disk token deserializes back into the enum — the
-        // forward-compat direction `doctor --compat` exercises.
+        // Forward-compat direction `doctor --compat` exercises: token → enum.
         assert_eq!(
             serde_json::from_str::<Verdict>(r#""indistinguishable""#).unwrap(),
             Verdict::Indistinguishable
         );
 
-        // A whole record deserialized from the LEGACY wire shape (verdict as the
-        // bare string) parses identically — the precise bytes a pre-migration
-        // tirith wrote to `visual-audit-result.json`.
+        // A whole record in the legacy wire shape (bare-string verdict) parses identically.
         let legacy = r#"{"name":"latin-a-vs-cyrillic-a","codepoints":"U+0061 vs U+0430","verdict":"indistinguishable"}"#;
         let pr: PairResult = serde_json::from_str(legacy).unwrap();
         assert_eq!(pr.verdict, Verdict::Indistinguishable);

@@ -1,13 +1,10 @@
 //! Integration tests for the registry-API-backed package-risk signals.
 //!
-//! These drive the **real** HTTP client and JSON parsers in
-//! `tirith_core::registry_api` — but against a local `mockito` mock server,
-//! never the real npm / PyPI / crates.io registries. The mock server binds to
-//! `127.0.0.1` on a random port; no test here reaches the public internet.
-//!
-//! `HttpRegistryClient::with_base_url_for_test` points all three registry base
-//! URLs at the mock server and disables the on-disk cache, so each test is
-//! hermetic.
+//! These drive the real HTTP client and JSON parsers in
+//! `tirith_core::registry_api` against a local `mockito` mock server (bound to
+//! `127.0.0.1`), never the public registries.
+//! `HttpRegistryClient::with_base_url_for_test` points all three base URLs at
+//! the mock and disables the on-disk cache, so each test is hermetic.
 
 use tirith_core::package_risk::{self, ApiSignals, NameVsPopular, PackageSignals};
 use tirith_core::registry_api::{HttpRegistryClient, RegistryClient};
@@ -104,8 +101,7 @@ fn npm_404_degrades_to_unavailable() {
         .create();
 
     let client = HttpRegistryClient::with_base_url_for_test(&server.url());
-    // The full signal-gathering path must degrade a 404 to Unavailable AND
-    // surface a positive `PackageExistence::NotFound` (M6 ch6).
+    // A 404 must degrade to Unavailable AND surface NotFound (M6 ch6).
     let (sig, existence) =
         tirith_core::registry_api::gather_api_signals(&client, Ecosystem::Npm, "ghost-package");
     assert!(
@@ -290,8 +286,8 @@ fn online_score_folds_in_api_factors_end_to_end() {
     };
     let breakdown = package_risk::score_package(&signals);
 
-    // The breakdown must verify, and it must carry several API factors:
-    // very-new package, version spike, low downloads, missing repo URL.
+    // Must verify and carry the very-new / version-spike / low-downloads /
+    // missing-repo API factors.
     assert!(breakdown.verify(), "breakdown must sum to score");
     let api_ids: Vec<&str> = breakdown
         .factors
@@ -344,8 +340,8 @@ fn unsupported_ecosystem_degrades_without_network() {
 
 #[test]
 fn npm_ownerless_established_package_flags_ownership() {
-    // An npm package the registry lists with ZERO maintainers, published long
-    // ago — the ownership signal must fire (npm DOES expose maintainers).
+    // An established npm package with ZERO maintainers must fire the ownership
+    // signal (npm DOES expose maintainers).
     let mut server = mockito::Server::new();
     let body = r#"{
         "dist-tags": { "latest": "2.0.0" },
@@ -384,10 +380,8 @@ fn npm_ownerless_established_package_flags_ownership() {
 
 #[test]
 fn pypi_ownership_signal_is_unknown_not_false_positive() {
-    // PyPI's API carries no maintainer field; the ownership signal must be
-    // honestly `None` (unknown) — never a false `Some(true)` from the
-    // unavoidably-empty maintainer list. This is the flask false-positive
-    // regression guard.
+    // PyPI carries no maintainer field, so the ownership signal must be `None`,
+    // never a false `Some(true)` (the flask false-positive regression guard).
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": { "version": "3.1.0", "yanked": false,
@@ -440,8 +434,8 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
 
 #[test]
 fn npm_response_over_size_cap_degrades() {
-    // A response whose Content-Length exceeds the 8 MiB cap must be rejected
-    // as TooLarge (degraded), not loaded into memory.
+    // A response whose Content-Length exceeds the 8 MiB cap must degrade, not
+    // load into memory.
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/huge-package")

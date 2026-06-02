@@ -1,10 +1,6 @@
-//! Shared test harness for tests that mutate process-global state.
-//!
-//! `setup::tools`, `setup::zshenv`, and `doctor` all need to run tests under
-//! a controlled `HOME` and (sometimes) `cwd`. Without a single shared mutex
-//! these tests would race in parallel: one test's `set_var("HOME", ...)`
-//! would clobber another's. `ENV_LOCK` serializes them across the entire
-//! crate so any callsite is safe regardless of which other tests exist.
+//! Shared test harness for tests that mutate process-global state (`HOME`,
+//! `cwd`, shell-profile env vars). `ENV_LOCK` serializes them crate-wide so
+//! parallel tests can't clobber each other's `set_var`.
 
 use std::ffi::OsString;
 use std::panic;
@@ -65,23 +61,18 @@ impl Drop for CwdGuard {
     }
 }
 
-/// Run `f` with `HOME` pointed at a fresh temp dir and (optionally) `cwd`
-/// pointed at a separate temp dir. Holds `ENV_LOCK` across the closure so
-/// no other test can race on `HOME`/`cwd`. Restores prior state on Drop
-/// even if `f` panics.
-///
-/// The closure receives `(home_path, cwd_path)` where `cwd_path` is `Some`
-/// iff `set_cwd == true`. Both temp dirs live for the duration of the
-/// closure and are cleaned up after.
+/// Run `f` with `HOME` (and optionally `cwd`) pointed at fresh temp dirs,
+/// holding `ENV_LOCK` across the closure and restoring state on Drop even if
+/// `f` panics. The closure gets `(home_path, cwd_path)`, `cwd_path` `Some` iff
+/// `set_cwd`.
 pub(crate) fn with_fake_env<F, R>(set_cwd: bool, f: F) -> R
 where
     F: panic::UnwindSafe + FnOnce(&Path, Option<&Path>) -> R,
 {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_tmp = tempfile::tempdir().expect("home tempdir");
-    // The `home` crate reads `$HOME` on Unix and `%USERPROFILE%` on Windows
-    // (with `$HOME` as a fallback). Override BOTH so a fake-HOME test isolates
-    // production code that calls `home::home_dir()` regardless of platform.
+    // The `home` crate reads `$HOME` (Unix) / `%USERPROFILE%` (Windows) — set
+    // both so `home::home_dir()` is isolated on either platform.
     let _home_guard = EnvGuard::set("HOME", home_tmp.path());
     let _userprofile_guard = EnvGuard::set("USERPROFILE", home_tmp.path());
 

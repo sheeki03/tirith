@@ -12,15 +12,13 @@ pub fn run(
     json: bool,
 ) -> i32 {
     if list {
-        // `--fix` requires `--rule` or `--finding` (enforced by clap), so it
-        // never reaches here.
+        // `--fix` requires `--rule`/`--finding` (clap-enforced), so never reaches here.
         return run_list(category, json);
     }
 
-    // `--finding` resolves to a RuleId via the audit log; once resolved it
-    // behaves exactly like `--rule <id>`. Resolution failure surfaces here
-    // (not as a clap error) so the message can name the audit log path
-    // and the missing fields concretely.
+    // `--finding` resolves to a RuleId via the audit log, then behaves like
+    // `--rule <id>`. Resolution failure surfaces here (not as a clap error) so
+    // the message can name the audit log path concretely.
     if let Some(id) = finding {
         return match resolve_finding_id(id) {
             Ok(rule_id) => run_single(&rule_id.to_string(), fix, json),
@@ -40,14 +38,10 @@ pub fn run(
     }
 }
 
-/// Resolve a finding ID (`<event_id>:<index>`) to its [`RuleId`] by walking
-/// the audit log most-recent-first.
-///
-/// The walk is capped at [`AUDIT_SCAN_LIMIT`] entries so a long-lived audit
-/// log on a busy host doesn't burn unbounded CPU answering an `explain
-/// --finding` lookup. When the cap is hit without a match, the error
-/// names the cap and tells the operator to narrow the lookup via
-/// `tirith audit export --since` first.
+/// Resolve a finding ID (`<event_id>:<index>`) to its [`RuleId`] by walking the
+/// audit log most-recent-first, capped at [`AUDIT_SCAN_LIMIT`] entries so a busy
+/// host's log can't burn unbounded CPU. On a cap miss the error tells the
+/// operator to narrow via `tirith audit export --since`.
 const AUDIT_SCAN_LIMIT: usize = 10_000;
 
 fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
@@ -72,10 +66,8 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
     let read = audit_aggregator::read_log(&log_path)
         .map_err(|e| format!("could not read {}: {e}", log_path.display()))?;
 
-    // Walk newest-first. The aggregator returns records in file order; the
-    // log is append-only with newest entries at the bottom. Bounded by
-    // AUDIT_SCAN_LIMIT — beyond that, fall through to the cap error so the
-    // call doesn't quietly miss the entry.
+    // Walk newest-first (log is append-only, newest at the bottom), bounded by
+    // AUDIT_SCAN_LIMIT so the call doesn't quietly miss the entry past the cap.
     let scanned = read.records.len().min(AUDIT_SCAN_LIMIT);
     let entry = read
         .records
@@ -108,9 +100,8 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
         )
     })?;
 
-    // Shipping serde-roundtrip pattern, mirrors `rule_explanations.rs` line ~112:
-    // a snake_case RuleId variant ("pipe_to_interpreter") parses through the
-    // Deserialize impl when fed as a JSON string value.
+    // serde-roundtrip (mirrors `rule_explanations.rs`): a snake_case RuleId
+    // string ("pipe_to_interpreter") parses through the Deserialize impl.
     let parsed: Result<RuleId, _> =
         serde_json::from_value(serde_json::Value::String(rule_str.clone()));
     parsed.map_err(|_| {

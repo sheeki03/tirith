@@ -1,28 +1,15 @@
-//! M6 ch6 — local JSONL snapshot store for registry-API responses.
+//! Local JSONL snapshot store for registry-API responses.
 //!
-//! Every successful `--online` fetch through `crate::registry_api` writes one
-//! snapshot row per package to
-//! `state_dir()/registry_snapshots/<eco>/<name>.jsonl`. The store is
-//! append-only with a rolling cap of [`MAX_SNAPSHOTS_PER_PACKAGE`] rows per
-//! package — the oldest rows are pruned on each write.
+//! Every successful `--online` fetch writes one snapshot row per package to
+//! `state_dir()/registry_snapshots/<eco>/<name>.jsonl` (append-only, oldest
+//! pruned at [`MAX_SNAPSHOTS_PER_PACKAGE`]). Diffing the two most recent rows
+//! feeds [`crate::package_risk::MaintainerChangeHistory`] / [`OwnershipTransfer`]
+//! — a real maintainer-set diff over time, which a single response cannot show,
+//! superseding the legacy one-response `ApiProvenance::ownership_transferred`.
 //!
-//! Two reads of the most recent rows feed
-//! [`crate::package_risk::MaintainerChangeHistory`] / [`OwnershipTransfer`] —
-//! a real maintainer-set diff between two points in time, which a single
-//! registry response cannot show. This is the core of the *real* ownership-
-//! transfer signal that supersedes the legacy
-//! `ApiProvenance::ownership_transferred` flag (inferred from one response).
-//!
-//! ## Invariants
-//!
-//! * Read-only on failures (best-effort I/O; never panics).
-//! * Reuses an existing API response — never makes an extra request. The
-//!   `gather_api_signals` path writes a snapshot whenever it has fresh data.
-//! * Rolling cap of [`MAX_SNAPSHOTS_PER_PACKAGE`]. Plain JSONL is sufficient
-//!   for the per-package row counts at hand; SQLite is reserved for a future
-//!   wave if real-world counts demand it.
-//! * No personally-identifying data is stored — only registry-public maintainer
-//!   identifiers.
+//! Invariants: best-effort I/O (read-only on failure, never panics); reuses the
+//! already-fetched response (no extra request); rolling cap; stores only
+//! registry-public maintainer identifiers (no PII).
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,29 +22,24 @@ use crate::package_risk::{
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
-/// Rolling cap: at most this many snapshot rows per package on disk.
-/// 12 is enough to keep ~a year of monthly snapshots; older rows are pruned.
+/// Rolling cap of snapshot rows per package on disk (~a year of monthly snaps).
 pub const MAX_SNAPSHOTS_PER_PACKAGE: usize = 12;
 
 /// One snapshot row, one line of JSONL on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRow {
-    /// Unix epoch seconds at the time of capture.
+    /// Unix epoch seconds at capture.
     pub captured_at: u64,
-    /// The maintainer identifiers the registry reported at this point in
-    /// time. Empty vector is a real "zero owners" signal; an absent field is
-    /// the registry not exposing maintainers (PyPI, crates.io).
+    /// Maintainer ids the registry reported. Empty vec = real "zero owners";
+    /// an absent field = registry does not expose maintainers (PyPI, crates.io).
     pub maintainers: Vec<MaintainerRef>,
-    /// Latest version string the registry reported, if any.
     #[serde(default)]
     pub latest_version: Option<String>,
-    /// Registry-reported repository URL, if any.
     #[serde(default)]
     pub repository_url: Option<String>,
 }
 
-/// Resolve the snapshot store path for `(eco, name)`. Returns `None` when
-/// `state_dir()` is unavailable (very unusual; we degrade gracefully).
+/// Snapshot store path for `(eco, name)`. `None` when `state_dir()` is absent.
 fn snapshot_path(eco: Ecosystem, name: &str) -> Option<PathBuf> {
     let state = policy::state_dir()?;
     let dir = state
@@ -74,10 +56,8 @@ fn snapshot_path(eco: Ecosystem, name: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{safe_name}.jsonl")))
 }
 
-/// Record a fresh snapshot for `(eco, name)` from a registry response.
-/// Reuses the already-fetched [`ApiProvenance`]; makes no network call.
-///
-/// Best-effort: any I/O error is silently ignored. Returns `true` on success.
+/// Record a snapshot from an already-fetched [`ApiProvenance`] (no network
+/// call). Best-effort; `true` on success.
 pub fn record_snapshot(eco: Ecosystem, name: &str, prov: &ApiProvenance) -> bool {
     let row = SnapshotRow {
         captured_at: unix_now(),
@@ -99,14 +79,12 @@ fn write_row(eco: Ecosystem, name: &str, row: &SnapshotRow) -> bool {
     if std::fs::create_dir_all(parent).is_err() {
         return false;
     }
-    // Read existing rows so we can prune to the rolling cap.
     let mut rows = read_rows(&path);
     rows.push(row.clone());
     if rows.len() > MAX_SNAPSHOTS_PER_PACKAGE {
         let drop = rows.len() - MAX_SNAPSHOTS_PER_PACKAGE;
         rows.drain(..drop);
     }
-    // Write the (possibly-pruned) set back as JSONL.
     let mut buf = String::new();
     for r in &rows {
         if let Ok(line) = serde_json::to_string(r) {
@@ -117,9 +95,8 @@ fn write_row(eco: Ecosystem, name: &str, row: &SnapshotRow) -> bool {
     std::fs::write(path, buf).is_ok()
 }
 
-/// Read all snapshot rows for `(eco, name)` in chronological order (oldest
-/// first). Returns an empty vector when the file does not exist or any row
-/// fails to parse — best-effort, never panics.
+/// Read all rows from `path` oldest-first. Empty on missing file or parse
+/// failure — best-effort, never panics.
 pub fn read_rows(path: &std::path::Path) -> Vec<SnapshotRow> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -138,9 +115,8 @@ pub fn read_snapshots(eco: Ecosystem, name: &str) -> Vec<SnapshotRow> {
     read_rows(&path)
 }
 
-/// Diff the two most recent snapshots for `(eco, name)`. Returns `None` when
-/// fewer than two snapshots exist — the first `--online` run can only record,
-/// not diff. Documented explicitly in the rule's `false_positive_guidance`.
+/// Diff the two most recent snapshots. `None` when fewer than two exist (the
+/// first `--online` run can only record).
 pub fn diff_recent(eco: Ecosystem, name: &str) -> Option<MaintainerChangeHistory> {
     let rows = read_snapshots(eco, name);
     if rows.len() < 2 {
@@ -182,13 +158,9 @@ pub fn diff_two_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> Maintaine
     }
 }
 
-/// Synthesize an `OwnershipTransfer` record from two snapshot rows. Pure.
-///
-/// `OwnershipTransfer.previous` is the FULL older maintainer set and
-/// `OwnershipTransfer.current` is the FULL newer maintainer set — NOT the
-/// `added` / `removed` diff slices. The diff is already preserved in
-/// [`MaintainerChangeHistory`]; ownership-transfer-as-snapshot needs both
-/// full sets so the consumer can render "from {alice, bob} to {eve}".
+/// Synthesize an `OwnershipTransfer` from two rows. `previous`/`current` are the
+/// FULL older/newer maintainer sets (NOT the added/removed diff slices) so the
+/// consumer can render "from {alice, bob} to {eve}".
 pub fn synthesize_transfer_from_snapshots(
     older: &SnapshotRow,
     newer: &SnapshotRow,
@@ -206,20 +178,14 @@ pub fn synthesize_transfer_from_snapshots(
     }
 }
 
-/// Diff and synthesize-transfer in one shot when both snapshots are needed.
-/// Returns `None` when fewer than two snapshots exist (mirrors `diff_recent`).
+/// Diff and synthesize-transfer in one shot. `None` when fewer than two
+/// snapshots exist (mirrors `diff_recent`).
 ///
-/// The history is the diff (`added` / `removed`); the optional transfer
-/// carries the FULL older/newer maintainer sets so the rule's evidence can
-/// render the snapshots, not just the diff.
-///
-/// The transfer is `Some` ONLY when no maintainer survives from older to
-/// newer (the older set is fully cleared) AND at least one new maintainer
-/// joined — the snapshot-aware definition of a *real* ownership transfer.
-/// This is the canonical predicate; the diff-only
-/// [`MaintainerChangeHistory::is_full_ownership_transfer`] cannot see a
-/// stable maintainer who appears in neither `added` nor `removed`, so it
-/// returns false positives on partial churn.
+/// The transfer is `Some` ONLY on a real takeover (no maintainer survives older
+/// → newer AND at least one new one joined). This is the canonical predicate;
+/// the diff-only [`MaintainerChangeHistory::is_full_ownership_transfer`] can't
+/// see a stable maintainer absent from both `added`/`removed`, so it false-
+/// positives on partial churn.
 pub fn diff_and_transfer_recent(
     eco: Ecosystem,
     name: &str,
@@ -239,8 +205,8 @@ pub fn diff_and_transfer_recent(
     Some((hist, transfer))
 }
 
-/// `true` when newer's maintainer set shares NO ids with older's, and newer
-/// is non-empty — a real ownership transfer between snapshots.
+/// `true` when newer shares NO ids with older and newer is non-empty — a real
+/// ownership transfer between snapshots.
 fn is_full_takeover_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> bool {
     if older.maintainers.is_empty() || newer.maintainers.is_empty() {
         // No data, no claim — only flag when both snapshots carry maintainers.
@@ -254,24 +220,16 @@ fn is_full_takeover_snapshots(older: &SnapshotRow, newer: &SnapshotRow) -> bool 
         .any(|m| old_ids.contains(m.id.as_str()))
 }
 
-/// Pull a maintainer list out of an [`ApiProvenance`]. The new
-/// [`ApiProvenance`] doesn't carry a maintainers field directly (that's a
-/// `RegistryMetadata`-only field), so the recording path passes them in via
-/// the snapshot writer's caller below. This helper is a hook for the future:
-/// when ApiProvenance grows a maintainers field, we read it here. For now,
-/// the snapshot row's `maintainers` defaults to empty unless the recording
-/// site supplies it via [`record_snapshot_with_maintainers`].
+/// `ApiProvenance` carries no maintainer list today, so this returns empty
+/// (honest no-data). Maintainers are written explicitly via
+/// [`record_snapshot_with_maintainers`] from the `RegistryMetadata`-aware paths;
+/// this is a hook for when `ApiProvenance` grows a maintainers field.
 fn maintainers_from_provenance(_prov: &ApiProvenance) -> Vec<MaintainerRef> {
-    // ApiProvenance does not directly carry the maintainer list today (it
-    // carries the *inferred-from-one-response* `ownership_transferred` bool
-    // only). Snapshot maintainers are written explicitly via
-    // [`record_snapshot_with_maintainers`] from the
-    // `RegistryMetadata`-aware paths. Returning empty here is honest no-data.
     Vec::new()
 }
 
-/// Explicit snapshot writer when the caller has the maintainer list on hand
-/// (e.g. from `RegistryMetadata` before it was folded into `ApiProvenance`).
+/// Snapshot writer for when the caller already has the maintainer list (e.g.
+/// from `RegistryMetadata`).
 pub fn record_snapshot_with_maintainers(
     eco: Ecosystem,
     name: &str,
@@ -336,9 +294,7 @@ mod tests {
         let h = diff_two_snapshots(&older, &newer);
         assert!(h.is_full_ownership_transfer());
         let t = synthesize_transfer_from_snapshots(&older, &newer);
-        // The synthesized transfer carries the FULL older/newer maintainer
-        // sets — not just the diff. For the "alice → eve" full takeover both
-        // are singletons, so the sets carry one id each.
+        // Transfer carries the FULL older/newer sets, not the diff.
         assert_eq!(
             t.previous.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["alice"]
@@ -356,10 +312,8 @@ mod tests {
 
     #[test]
     fn synthesize_transfer_carries_full_snapshot_sets_not_diff() {
-        // Partial churn: {alice, bob} → {alice, eve}. The diff is removed=[bob],
-        // added=[eve]; the FULL snapshot sets are {alice, bob} and {alice, eve}.
-        // The synthesized transfer must carry the FULL sets — alice is in
-        // BOTH `previous` and `current` because she sits in both snapshots.
+        // Partial churn {alice,bob} → {alice,eve}: the transfer carries the FULL
+        // sets, so alice appears in both `previous` and `current`.
         let older = row(0, &["alice", "bob"]);
         let newer = row(86_400, &["alice", "eve"]);
         let t = synthesize_transfer_from_snapshots(&older, &newer);
@@ -405,24 +359,13 @@ mod tests {
 
     #[test]
     fn partial_maintainer_churn_via_diff_and_transfer_recent_returns_no_transfer() {
-        // {alice, bob, carol} → {alice, dave}. Bob and Carol leave, Dave joins,
-        // but Alice carries over — this is NOT a full ownership transfer. The
-        // diff-only `is_full_ownership_transfer` cannot see Alice (she's in
-        // neither `added` nor `removed`), so it would incorrectly return true
-        // here. The snapshot-aware `diff_and_transfer_recent` MUST clear the
-        // transfer because Alice survives the change.
-        //
-        // The decisive predicate is: `previous.iter().any(|p|
-        // current.contains(p))` — and that's what the consumer in
-        // `package.rs` should check on the synthesized transfer, NOT the
-        // diff-only `is_full_ownership_transfer`. See the doc on
-        // `MaintainerChangeHistory::is_full_ownership_transfer`.
+        // {alice,bob,carol} → {alice,dave}: alice carries over, so NOT a full
+        // transfer. The decisive predicate the consumer must use is set overlap
+        // on the synthesized transfer, not the diff-only
+        // `is_full_ownership_transfer` (which can't see the surviving alice).
         let older = row(0, &["alice", "bob", "carol"]);
         let newer = row(86_400, &["alice", "dave"]);
         let t = synthesize_transfer_from_snapshots(&older, &newer);
-        // The synthesized transfer carries the FULL sets — Alice is in both.
-        // The consumer can then reject this as a partial transfer by simply
-        // checking overlap.
         let any_overlap = t
             .previous
             .iter()
@@ -458,10 +401,7 @@ mod tests {
 
     #[test]
     fn snapshot_path_sanitizes_name() {
-        // The path-segment sanitizer must replace `/` with `_` so a scoped npm
-        // name does not write to a nested directory.
-        // (Can't assert the exact path without a state_dir; just check it
-        // returns Some for a normal name and the segment encoding is sane.)
+        // `/` must become `_` so a scoped npm name does not write to a nested dir.
         let path = snapshot_path(Ecosystem::Npm, "@org/util");
         if let Some(p) = path {
             let s = p.to_string_lossy();

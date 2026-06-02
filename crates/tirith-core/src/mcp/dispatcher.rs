@@ -14,31 +14,24 @@ enum State {
 /// Per-run options for the MCP server dispatcher.
 ///
 /// `sanitize_tool_output` (M7 ch4) routes every `tools/call` return through
-/// [`crate::mcp::output_filter::filter_tool_result`] so a malicious upstream
-/// (or a malicious tool result the server itself produces, e.g. a paste fed
-/// through `tirith_check_paste`) cannot smuggle OSC52 / hyperlink-mismatch
-/// payloads through to the calling agent. Default: `false` (preserves current
-/// behavior; opt-in until field-tested). When enabled, the dispatcher uses
-/// `fail_mode_closed = true` so an analysis-truncation or rule-error path
-/// denies rather than passes through (stricter than the gateway default).
+/// [`crate::mcp::output_filter::filter_tool_result`] so a malicious tool result
+/// cannot smuggle OSC52 / hyperlink-mismatch payloads to the calling agent.
+/// Default `false` (opt-in). When enabled the dispatcher fails closed (denies on
+/// truncation / rule error), stricter than the gateway default.
 #[derive(Debug, Clone, Default)]
 pub struct DispatcherOptions {
     pub sanitize_tool_output: bool,
 }
 
-/// Run the MCP server loop over stdio with default options.
-///
-/// Reads JSON-RPC messages from `input` (one per line), writes responses to
-/// `output`. Logs go to `log` (typically stderr). Returns exit code 0 on clean
-/// shutdown (EOF on input).
+/// Run the MCP server loop over stdio with default options. Reads JSON-RPC
+/// messages from `input` (one per line), writes responses to `output`, logs to
+/// `log`. Exit code 0 on clean shutdown (EOF).
 pub fn run(input: impl BufRead, output: impl Write, log: impl Write) -> i32 {
     run_with_options(input, output, log, DispatcherOptions::default())
 }
 
-/// Like [`run`] but accepts a [`DispatcherOptions`] for M7 ch4
-/// `--sanitize-tool-output` behavior. `run` is preserved as a back-compat
-/// wrapper so existing callers (and the unit-test suite) do not need to pipe
-/// an options struct through.
+/// Like [`run`] but takes [`DispatcherOptions`] (M7 ch4 `--sanitize-tool-output`).
+/// `run` stays as a back-compat wrapper.
 pub fn run_with_options(
     mut input: impl BufRead,
     mut output: impl Write,
@@ -47,8 +40,7 @@ pub fn run_with_options(
 ) -> i32 {
     let mut state = State::AwaitingInit;
 
-    /// Maximum line size: 10 MiB. Prevents a single huge JSON-RPC message
-    /// from consuming unbounded memory.
+    /// Max line size (caps memory from a single huge JSON-RPC message).
     const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 
     let mut line = String::new();
@@ -64,7 +56,7 @@ pub fn run_with_options(
                     log,
                     "tirith mcp-server: line exceeds {MAX_LINE_BYTES} byte limit, dropping"
                 );
-                // Drain remainder of this oversized line without unbounded allocation
+                // Drain the rest of the oversized line without unbounded alloc.
                 if !line.ends_with('\n') {
                     let mut byte = [0u8; 1];
                     loop {
@@ -90,7 +82,7 @@ pub fn run_with_options(
             continue;
         }
 
-        // Cap individual message size at 10 MiB to prevent DoS
+        // Cap individual message size to prevent DoS.
         const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
         if trimmed.len() > MAX_LINE_LEN {
             let _ = writeln!(
@@ -138,12 +130,11 @@ pub fn run_with_options(
             }
         };
 
-        // JSON-RPC envelope validation: failures here are invalid-request (-32600).
-        // Extract id first so error responses can echo it when the client's id was recoverable.
+        // Envelope validation: failures are invalid-request (-32600). Extract id
+        // first so error responses can echo a recoverable client id.
         let raw_id = raw.get("id").cloned();
 
-        // Recover a usable id: JSON-RPC allows string, number, or null — reject
-        // object/array/bool.
+        // JSON-RPC allows string/number/null for id — reject object/array/bool.
         let usable_id = match &raw_id {
             None => None, // notification (no id field at all)
             Some(Value::Null) | Some(Value::Number(_)) | Some(Value::String(_)) => raw_id.clone(),
@@ -257,10 +248,8 @@ pub fn run_with_options(
                 "tools/call" => {
                     let mut result = handle_tools_call(&params);
                     if options.sanitize_tool_output {
-                        // M7 ch4. Default fail-mode is closed: an analysis
-                        // truncation under `mcp-server --sanitize-tool-output`
-                        // denies rather than passes through. Stricter than the
-                        // gateway default because the calling agent is the
+                        // M7 ch4 — fail closed (deny on truncation), stricter than
+                        // the gateway default: the calling agent is the
                         // highest-privilege consumer of these results.
                         let outcome = output_filter::filter_tool_result(&mut result, true);
                         write_filter_audit(&mut log, &outcome);
@@ -303,13 +292,9 @@ pub fn run_with_options(
     0
 }
 
-/// Pull `clientInfo` out of an `initialize` request's raw `params` JSON.
-///
-/// Deliberately independent of `InitializeParams` deserialization: a payload
-/// with a non-conforming `protocolVersion` (or any unrelated field) still
-/// surfaces its `clientInfo` to the origin store, as long as `clientInfo`
-/// itself is well-formed. A malformed `clientInfo` returns `None` and the
-/// caller falls back to `"unknown-mcp-client"` in `set_from_initialize`.
+/// Pull `clientInfo` out of an `initialize` request's raw `params`, independent
+/// of `InitializeParams` deserialization — so a non-conforming `protocolVersion`
+/// still surfaces a well-formed `clientInfo`. Malformed `clientInfo` → `None`.
 fn extract_client_info(params: &Option<Value>) -> Option<ClientInfo> {
     params
         .as_ref()
@@ -327,17 +312,10 @@ fn handle_initialize(params: &Option<Value>) -> Value {
     let version = negotiate_version(requested_version);
     let pkg_version = env!("CARGO_PKG_VERSION");
 
-    // M4 item 8 chunk 1 — observation-only. Capture the caller-supplied
-    // `clientInfo` so subsequent tool calls can stamp `AgentOrigin::Mcp` on
-    // their verdicts. We pull `clientInfo` directly from the raw JSON so an
-    // unrelated `InitializeParams` field that fails to deserialize (a non-
-    // conforming `protocolVersion`, a future required field, …) does not
-    // strip attribution off a payload whose `clientInfo` was perfectly
-    // valid. A malformed `clientInfo` itself still falls through to the
-    // `None` branch in `set_from_initialize`, which records
-    // `"unknown-mcp-client"` (still "this is an MCP caller", just
-    // anonymous). Nothing here gates the response — `initialize` succeeds
-    // regardless.
+    // M4 item 8 ch1 — observation-only. Capture caller `clientInfo` (from raw
+    // JSON, so an unrelated `InitializeParams` deser failure does not strip a
+    // valid `clientInfo`) so tool calls can stamp `AgentOrigin::Mcp`. A malformed
+    // `clientInfo` records `"unknown-mcp-client"`. Never gates the response.
     let client_info = extract_client_info(params);
     super::origin::set_from_initialize(client_info.as_ref());
 
@@ -424,15 +402,10 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
     }
 }
 
-/// Emit a JSONL audit line for an output-filter pass to `log` (typically
-/// stderr — same channel the dispatcher already uses for diagnostic lines so
-/// operators read one stream).
-///
-/// The line is best-effort: on serialization or write failure we silently
-/// drop, mirroring the dispatcher's existing diagnostic-line policy. The
-/// audit log file and structured audit envelope is owned by the audit module
-/// for verdict-tagged events; the dispatcher does not have a `command` to log
-/// here, so the dedicated stderr line is the right granularity.
+/// Emit a best-effort JSONL audit line for an output-filter pass to `log`
+/// (typically stderr — the dispatcher's diagnostic channel). Dropped silently on
+/// failure; the audit-module log is for verdict-tagged events, and the dispatcher
+/// has no `command` to log here.
 fn write_filter_audit(log: &mut impl Write, outcome: &output_filter::FilterOutcome) {
     let entry = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -468,8 +441,8 @@ fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
             true
         }
         Err(_) => {
-            // Should not happen with well-formed types. Try to send an internal
-            // error response as a fallback so the client isn't left hanging.
+            // Should not happen with well-formed types; send a fallback so the
+            // client isn't left hanging.
             let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
             let _ = writeln!(output, "{fallback}");
             let _ = output.flush();
@@ -483,14 +456,9 @@ mod tests {
     use super::*;
     use std::io::BufReader;
 
-    /// Drive a full dispatcher session over an in-memory transport.
-    ///
-    /// Acquires the origin-store serial lock for the duration of the
-    /// session: any input that includes an `initialize` request will write
-    /// `MCP_ORIGIN`, and we must not race with `mcp::origin::tests::*` cases
-    /// that read or reset it. Acquiring the lock unconditionally is cheap
-    /// and keeps every dispatcher test on the same mutex without having to
-    /// remember which paths touch the global.
+    /// Drive a full dispatcher session over an in-memory transport. Acquires the
+    /// origin-store serial lock for the session (an `initialize` writes
+    /// `MCP_ORIGIN`, must not race `mcp::origin::tests::*`).
     fn run_session(input: &str) -> (String, String) {
         let _serial = super::super::origin::serial_lock();
         let reader = BufReader::new(input.as_bytes());
@@ -632,12 +600,8 @@ mod tests {
         assert!(result["structuredContent"].is_object());
     }
 
-    /// M4 item 8 chunk 1 — the dispatcher must capture `initialize.clientInfo`
-    /// and surface it as `agent_origin` on every subsequent tool call.
-    ///
-    /// `MCP_ORIGIN` is process-global; `run_session` already acquires the
-    /// origin-store serial lock so this read-after-write is race-free
-    /// against `mcp::origin::tests::*`.
+    /// M4 item 8 ch1 — the dispatcher must capture `initialize.clientInfo` and
+    /// surface it as `agent_origin` on every tool call.
     #[test]
     fn test_mcp_origin_is_stamped_on_tool_verdict() {
         let input = format!(
@@ -805,16 +769,10 @@ mod tests {
         assert_eq!(resps[1]["result"], json!({}));
     }
 
-    /// M7 ch4: `--sanitize-tool-output` smoke test. When the option is
-    /// enabled, the dispatcher writes a JSONL audit line to stderr for every
-    /// `tools/call` (kind = "mcp_output_filter"). Pin this so a refactor
-    /// that quietly drops the filter pass is caught here.
-    ///
-    /// We can't easily make a built-in tool emit OSC52 content (every tool
-    /// produces a verdict-shaped text body, not a raw payload), so this
-    /// test only verifies the filter ran. The content-level contract is
-    /// pinned by the `output_filter::tests` and the gateway integration
-    /// test.
+    /// M7 ch4 `--sanitize-tool-output` smoke test: when enabled, every
+    /// `tools/call` writes a JSONL audit line to stderr (kind =
+    /// "mcp_output_filter"). Only verifies the filter ran; the content contract is
+    /// pinned by `output_filter::tests` and the gateway integration test.
     #[test]
     fn test_sanitize_tool_output_emits_audit_line() {
         let input = format!(
@@ -852,11 +810,9 @@ mod tests {
         );
     }
 
-    /// CodeRabbit Minor (cid 3292343379): an `initialize` payload that
-    /// fails the *full* `InitializeParams` deserialization for an unrelated
-    /// reason (here: a non-conforming `protocolVersion` shape) must still
-    /// surface its `clientInfo` to the origin store. Pure-function test
-    /// over `extract_client_info` so no global state is involved.
+    /// CodeRabbit Minor (cid 3292343379): an `initialize` payload that fails the
+    /// full `InitializeParams` deser for an unrelated reason (non-conforming
+    /// `protocolVersion`) must still surface its `clientInfo`.
     #[test]
     fn extract_client_info_survives_malformed_protocol_version() {
         // protocolVersion is an integer; the wrapping `InitializeParams`

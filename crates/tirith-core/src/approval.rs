@@ -5,17 +5,13 @@ use std::time::{Duration, SystemTime};
 use crate::policy::{ApprovalRule, Policy};
 use crate::verdict::Verdict;
 
-/// Approval/warn-ack temp files older than this are considered abandoned
-/// (e.g. a `tirith check --approval-check` invoked from a terminal without
-/// a hook on the receiving end) and removed opportunistically on the next
-/// write. A live hook normally reads + deletes its own file within seconds,
-/// so an hour is a safe bound that won't race.
+/// Approval/warn-ack temp files older than this are abandoned (e.g. an
+/// `--approval-check` run with no hook reading it) and removed on the next
+/// write. A live hook reads + deletes within seconds, so an hour won't race.
 const STALE_APPROVAL_TTL: Duration = Duration::from_secs(3600);
 
-/// Best-effort cleanup of leaked approval/warn-ack temp files in `$TEMP`.
-/// Called before each fresh write so a leak from a prior CLI test doesn't
-/// accumulate forever. Errors are silently ignored — this is housekeeping,
-/// not a hard requirement.
+/// Best-effort cleanup of leaked approval/warn-ack temp files in `$TEMP`, run
+/// before each fresh write. Errors are ignored — housekeeping, not required.
 fn cleanup_stale_temp_files() {
     let dir = std::env::temp_dir();
     let now = SystemTime::now();
@@ -57,10 +53,8 @@ pub struct ApprovalMetadata {
     pub description: String,
 }
 
-/// Check whether a verdict triggers any approval rules from the policy.
-///
-/// Returns `Some(ApprovalMetadata)` if approval is required, `None` otherwise.
-/// This is a Team-tier feature: callers should gate on tier before calling.
+/// `Some(ApprovalMetadata)` if a verdict triggers any policy approval rule.
+/// Team-tier feature: callers should gate on tier before calling.
 pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMetadata> {
     if policy.approval_rules.is_empty() {
         return None;
@@ -98,14 +92,9 @@ pub fn apply_approval(verdict: &mut Verdict, metadata: &ApprovalMetadata) {
     verdict.approval_description = Some(metadata.description.clone());
 }
 
-/// Write approval metadata to a secure temp file.
-///
-/// Returns the path to the temp file. The caller is responsible for printing
-/// this path to stdout. The temp file is persisted (not auto-deleted) so
-/// shell hooks can read it after tirith exits.
-///
-/// Per ADR-7: file is created with O_EXCL + O_CREAT (via tempfile crate),
-/// mode 0600 on Unix, and `.keep()` is called before returning.
+/// Write approval metadata to a secure temp file and return its path. The file
+/// is persisted (not auto-deleted) so shell hooks can read it after tirith exits.
+/// Per ADR-7: O_EXCL + O_CREAT, mode 0600 on Unix, `.keep()` before return.
 pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::io::Error> {
     cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
@@ -148,7 +137,7 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
 
     tmp.flush()?;
 
-    // `.keep()` prevents auto-delete on drop so shell hooks can read the file after tirith exits.
+    // `.keep()` prevents auto-delete so shell hooks can read it after exit.
     let (_, path) = tmp.keep().map_err(|e| e.error)?;
     Ok(path)
 }
@@ -175,11 +164,9 @@ pub fn write_no_approval_file() -> Result<PathBuf, std::io::Error> {
     Ok(path)
 }
 
-/// Write warn-ack metadata to a secure temp file for hook-driven strict_warn.
-///
-/// The shell hook reads this file to know how many warnings need acknowledgement
-/// and the maximum severity. Follows the same security pattern as
-/// `write_approval_file()`: O_EXCL + O_CREAT, mode 0600, `.keep()` before return.
+/// Write warn-ack metadata (count + max severity) to a secure temp file for
+/// hook-driven strict_warn. Same security pattern as `write_approval_file()`:
+/// O_EXCL + O_CREAT, mode 0600, `.keep()` before return.
 pub fn write_warn_ack_file(
     finding_count: usize,
     max_severity: &crate::verdict::Severity,
@@ -212,10 +199,8 @@ fn approval_rule_matches(rule_id_str: &str, approval_rule: &ApprovalRule) -> boo
     approval_rule.rule_ids.iter().any(|r| r == rule_id_str)
 }
 
-/// Sanitize a description string per ADR-7.
-///
-/// Allowlist: `[A-Za-z0-9 .,_:/()\-']`. All other characters stripped.
-/// Consecutive spaces collapsed. Max 200 bytes, truncated with `...`.
+/// Sanitize a description per ADR-7: allowlist `[A-Za-z0-9 .,_:/()\-']`,
+/// collapse consecutive spaces, cap at 200 bytes (truncated with `...`).
 pub fn sanitize_description(input: &str) -> String {
     let filtered: String = input
         .chars()
@@ -228,7 +213,7 @@ pub fn sanitize_description(input: &str) -> String {
         })
         .collect();
 
-    // Collapse consecutive spaces
+    // Collapse consecutive spaces.
     let mut result = String::with_capacity(filtered.len());
     let mut prev_space = false;
     for c in filtered.chars() {
@@ -243,9 +228,8 @@ pub fn sanitize_description(input: &str) -> String {
         }
     }
 
-    // Truncate to 200 bytes
     if result.len() > 200 {
-        // Find a safe UTF-8 boundary
+        // Truncate at a UTF-8 char boundary.
         let mut end = 197;
         while end > 0 && !result.is_char_boundary(end) {
             end -= 1;
@@ -257,11 +241,9 @@ pub fn sanitize_description(input: &str) -> String {
     result
 }
 
-/// Sanitize the approval fallback value per ADR-7.
-///
-/// Only "block", "warn", and "allow" are valid. Any other value
-/// (including values containing newlines, `=`, or shell metacharacters)
-/// defaults to "block" for fail-closed safety.
+/// Sanitize the approval fallback per ADR-7: only "block"/"warn"/"allow" are
+/// valid; anything else (newlines, `=`, shell metachars) defaults to "block"
+/// (fail-closed).
 fn sanitize_fallback(input: &str) -> &'static str {
     match input.trim().to_lowercase().as_str() {
         "block" => "block",
@@ -503,12 +485,9 @@ mod tests {
 
     #[test]
     fn write_approval_file_cleans_up_stale_leaks() {
-        // Regression guard: a `tirith check --approval-check` invoked from a
-        // terminal (or any caller that doesn't consume the temp file) used to
-        // leak `tirith-approval-*.env` into $TEMP forever. The next write must
-        // opportunistically remove leaked files older than the TTL — and must
-        // NOT touch fresh files (a concurrent hook may still be reading them)
-        // or unrelated files.
+        // Regression: leaked `tirith-approval-*.env` files older than the TTL
+        // must be removed on the next write, but fresh files (a concurrent hook
+        // may be reading them) and unrelated files must be left alone.
         use std::fs::File;
         use std::time::{Duration, SystemTime};
 

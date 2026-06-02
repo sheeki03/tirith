@@ -16,9 +16,7 @@ fn validate_sha256(sha256: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Safe short prefix of a hash for display. Uses the existing UTF-8-safe
-/// `truncate_bytes` utility to handle any string safely, including
-/// corrupted receipt JSON with non-ASCII sha256 values.
+/// UTF-8-safe short prefix of a hash for display (tolerates corrupted non-ASCII sha256).
 pub fn short_hash(s: &str) -> String {
     crate::util::truncate_bytes(s, 12)
 }
@@ -188,8 +186,7 @@ mod tests {
 
     #[test]
     fn test_receipt_save_no_predictable_tmp() {
-        // NamedTempFile must replace the earlier predictable `.{sha}.json.tmp`
-        // scheme — none of those files should appear after save().
+        // NamedTempFile must replace the old predictable `.{sha}.json.tmp` scheme.
         let dir = tempfile::tempdir().unwrap();
         let receipts_sub = dir.path().join("receipts");
         std::fs::create_dir_all(&receipts_sub).unwrap();

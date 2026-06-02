@@ -1,10 +1,9 @@
 //! Tests for the bash hook's preexec enforcement path.
 //!
-//! Each test drives an interactive bash subshell with a fake `tirith` binary
-//! on PATH that logs its invocations and returns exit codes chosen by the
-//! input pattern. The hook is sourced, commands are fed via here-doc, and we
-//! assert on side effects — sentinel files a blocked command would have
-//! created — plus the invocation log from the fake tirith.
+//! Each test drives an interactive bash subshell with a fake `tirith` on PATH
+//! that logs its invocations and returns exit codes by input pattern, then
+//! asserts on side effects (sentinel files a blocked command would create) plus
+//! the invocation log.
 
 #![cfg(unix)]
 
@@ -21,12 +20,8 @@ fn hook_path() -> String {
     )
 }
 
-/// Build a fake tirith binary that writes its args to `log_path` and exits
-/// with a code determined by the input:
-///  - contains `BLOCK_TOKEN`  → exit 1
-///  - contains `WARN_TOKEN`   → exit 2
-///  - contains `BADRC_TOKEN`  → exit 99
-///  - else                    → exit 0
+/// Build a fake tirith binary that logs its args to `log_path` and exits by
+/// input token: `BLOCK_TOKEN` → 1, `WARN_TOKEN` → 2, `BADRC_TOKEN` → 99, else 0.
 fn install_fake_tirith(bin_dir: &Path, log_path: &Path) {
     fs::create_dir_all(bin_dir).unwrap();
     let script = format!(
@@ -171,9 +166,8 @@ echo clean_post_block && touch {sentinels}/clean_ran
 
 #[test]
 fn enforce_blocks_whole_pipeline() {
-    // Any blocked producer must keep the downstream `sh` segment from running.
-    // Use `printf` rather than a real network client so an unexpected execute
-    // fails immediately instead of hanging on DNS or connection retries.
+    // A blocked producer must keep the downstream `sh` segment from running.
+    // `printf` (not a real network client) so an unexpected execute fails fast.
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
 printf BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
@@ -193,9 +187,9 @@ printf BLOCK_TOKEN-pipe | sh -c 'touch {sentinels}/pipe_leaked'
 
 #[test]
 fn enforce_blocks_whole_sequence() {
-    // `touch ; sh -c ... BLOCK` — when the second segment blocks, the whole
-    // typed line must skip. Avoid `blocked && touch ...` here because that
-    // control-flow shape is the one hanging on Linux CI under extdebug.
+    // When the second segment of `touch ; sh -c ... BLOCK` blocks, the whole
+    // typed line must skip. (Avoid `blocked && touch ...` — it hangs on Linux CI
+    // under extdebug.)
     let (_out, _err, invocations, sentinel_dir) = run_with_sentinels(
         r#"
 touch {sentinels}/ls_ran; sh -c 'touch {sentinels}/curl_ran' BLOCK_TOKEN-seq
@@ -298,14 +292,13 @@ echo BLOCK_TOKEN-ignorespace && touch {sentinels}/ran_anyway
         ],
     );
 
-    // With ignorespace set at install, enforcement is refused and the session
-    // stays warn-only. A block rc from tirith is NOT enforced.
+    // With ignorespace set at install, enforcement is refused (warn-only); a
+    // block rc is NOT enforced.
     assert!(
         sentinel_path(&sentinel_dir, "ran_anyway").exists(),
         "warn-only must allow the command to run even if tirith returns 1"
     );
-    // The consolidated one-shot degrade banner: a clear headline plus the
-    // hostile-history detail line. Both must be present.
+    // The one-shot degrade banner: headline + hostile-history detail line.
     assert!(
         stderr.contains("protection downgraded to warn-only"),
         "expected the consolidated degrade headline, got: {stderr}"
@@ -389,9 +382,8 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
         stderr.contains("PROT=blocks"),
         "expected PROT=blocks, got stderr: {stderr}"
     );
-    // The opt-in prompt indicator (a non-exported shell variable, read here in
-    // the same shell) must also report `blocks` once enforcement engages — it
-    // starts `warn-only` and upgrades.
+    // The prompt indicator (non-exported shell var, read in the same shell) also
+    // reports `blocks` once enforcement engages (it starts warn-only, upgrades).
     assert!(
         stderr.contains("STATUS=blocks"),
         "engaged enforcement must set TIRITH_STATUS=blocks, got stderr: {stderr}"
@@ -416,10 +408,9 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
         stderr.contains("PROT=warn-only"),
         "hostile install-time config must export warn-only, got: {stderr}"
     );
-    // The user asked for blocking but a hostile history config refused it —
-    // that downgrade from intent surfaces to the prompt indicator (a
-    // non-exported shell variable, read here in the same shell) as `degraded`,
-    // distinct from a shell that simply starts in warn-only.
+    // Blocking was requested but hostile history refused it — that downgrade
+    // surfaces to the prompt indicator as `degraded`, distinct from a shell that
+    // simply starts in warn-only.
     assert!(
         stderr.contains("STATUS=degraded"),
         "enforcement refused by hostile history must set TIRITH_STATUS=degraded, got: {stderr}"
@@ -429,8 +420,7 @@ printf 'STATUS=%s\n' "$TIRITH_STATUS" >&2
 
 #[test]
 fn debug_trap_chains_user_trap() {
-    // A DEBUG trap installed BEFORE sourcing the hook must be wrapped, not
-    // clobbered.
+    // A DEBUG trap installed BEFORE sourcing the hook must be wrapped, not clobbered.
     let (_out, stderr, _inv, _tmp) = run_with_sentinels(
         r#"
 USER_TRAP_COUNT=0
@@ -449,8 +439,8 @@ printf 'USER_TRAP_COUNT=%s\n' "$USER_TRAP_COUNT" >&2
             ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
         ],
     );
-    // The user's trap must have fired at least twice (once per echo command).
-    // The exact count can be higher due to DEBUG firing on sub-expressions.
+    // The user's trap must have fired at least twice (once per echo; can be
+    // higher due to DEBUG firing on sub-expressions).
     let count: u32 = stderr
         .lines()
         .filter_map(|l| l.strip_prefix("USER_TRAP_COUNT="))
@@ -505,18 +495,12 @@ printf 'OWNS=%s\n' "$_TIRITH_OWNS_EXTDEBUG" >&2
 
 #[test]
 fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
-    // Attack shape: with enforcement on,
-    // (1) a clean command produces a cached allow keyed by the typed line;
-    // (2) the user enables HISTCONTROL=ignorespace;
-    // (3) a leading-space `curl BLOCK_TOKEN-...` is filtered out of history,
-    //     so history_index does not advance.
-    // The hook MUST detect drift before honoring the cache and block the
-    // new command.
-    //
-    // Both the fake `curl` shim and the downstream `&& touch` segment must
-    // be skipped — the curl by drift-detection, the touch by the
-    // LINENO-keyed cross-path pin that keeps the rest of the same typed
-    // line blocked even after the session flips to warn-only.
+    // Attack shape: a clean command caches an allow keyed by the typed line, the
+    // user enables HISTCONTROL=ignorespace, then a leading-space `curl
+    // BLOCK_TOKEN` is filtered out of history so history_index doesn't advance.
+    // The hook must detect drift and block. Both the fake `curl` (by drift
+    // detection) and the downstream `&& touch` (by the LINENO-keyed cross-path
+    // pin) must be skipped.
     let tmpdir = tempfile::tempdir().unwrap();
     let bin_dir = tmpdir.path().join("bin");
     let log_path = tmpdir.path().join("tirith.log");
@@ -588,14 +572,10 @@ fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
 
 #[test]
 fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
-    // Warn-only mode previously deduped against `_tirith_last_cmd` across
-    // prompts, so running the same command twice in a row produced only a
-    // single tirith invocation. With the per-typed-line cache key folded
-    // in, each prompt gets its own scan even if the command text is
-    // identical.
-    //
-    // Runs under install-time-hostile HISTCONTROL=ignorespace so we hit
-    // the install-time-degraded warn-only branch.
+    // Warn-only previously deduped against `_tirith_last_cmd` across prompts; with
+    // the per-typed-line cache key, each prompt gets its own scan even for
+    // identical text. Runs under hostile HISTCONTROL=ignorespace to hit the
+    // install-time-degraded warn-only branch.
     let (_out, _err, invocations, _tmp) = run_with_sentinels(
         r#"
  echo repeated_cmd
@@ -622,11 +602,9 @@ fn warn_only_does_not_dedupe_identical_commands_across_prompts() {
 
 #[test]
 fn install_time_hostile_config_uses_bash_command_for_warn_only() {
-    // When enforcement is refused at install time because history is
-    // hostile, the warn-only scan target must be BASH_COMMAND, not the
-    // stale history_line — otherwise DETECTED banners reference whatever
-    // history entry 1 happens to surface, which is by construction not
-    // what the user just ran.
+    // When enforcement is refused at install time (hostile history), the
+    // warn-only scan target must be BASH_COMMAND, not the stale history_line —
+    // else DETECTED banners reference whatever history entry 1 surfaces.
     let (_out, _err, invocations, _tmp) = run_with_sentinels(
         r#"
  echo from_user_command
@@ -638,8 +616,7 @@ fn install_time_hostile_config_uses_bash_command_for_warn_only() {
         ],
     );
 
-    // Tirith was invoked in warn-only mode and its target was the actual user
-    // command, not whatever stale entry history 1 returned.
+    // The warn-only target is the actual user command, not stale history entry 1.
     assert!(
         invocations
             .iter()
@@ -651,9 +628,8 @@ fn install_time_hostile_config_uses_bash_command_for_warn_only() {
 
 #[test]
 fn post_degrade_warn_only_scans_bash_command_not_history() {
-    // Trigger a degrade via BADRC, then run a new command. The degraded
-    // warn-only path should pass BASH_COMMAND (which lacks any `| foo` tail)
-    // to tirith rather than the stale history_line.
+    // After a BADRC degrade, the warn-only path passes BASH_COMMAND to tirith,
+    // not the stale history_line.
     let (_out, _err, invocations, _tmp) = run_with_sentinels(
         r#"
 echo BADRC_TOKEN-drop
@@ -665,9 +641,7 @@ echo post_scan_target
         ],
     );
 
-    // After degrade the warn-only scan uses BASH_COMMAND. The post-degrade
-    // invocation should see `echo post_scan_target` as-is, and the fake
-    // tirith should have been called with `--warn-only`.
+    // The post-degrade invocation should see `echo post_scan_target` with `--warn-only`.
     let post_warn_only_invocations: Vec<&String> = invocations
         .iter()
         .filter(|i| i.contains("--warn-only") && i.contains("post_scan_target"))
@@ -678,67 +652,35 @@ echo post_scan_target
     );
 }
 
-// ===========================================================================
-// Enter-mode capability cache — mode-decision sharp edges (issue #111)
+// === Enter-mode capability cache — mode-decision sharp edges (issue #111) ===
 //
 // The hook reads `bash-enter-capability` at startup to decide enter-vs-preexec.
-// `run_bash` here drives a non-PTY interactive bash. A `works` verdict that
-// resolves to enter mode is observable *during sourcing* — the hook sets and
-// exports `TIRITH_BASH_EFFECTIVE_MODE` before any command runs, so reading
-// that variable does not depend on `bind -x` *delivery* working.
+// `TIRITH_BASH_EFFECTIVE_MODE` is set during sourcing, so reading it does not
+// depend on `bind -x` *delivery* — but it does depend on `bind -x` *installing*:
+// on enter mode the hook binds `\C-m` then health-checks via `bind -X`, and
+// macOS bash 3.2 does NOT honour `bind -x` here, so the gate degrades to preexec.
 //
-// It does, however, depend on `bind -x` *installing*. When the hook selects
-// enter mode it binds `\C-m` and then runs `_tirith_startup_health_check`,
-// which verifies via `bind -X` that the bind took effect; if it did not, the
-// hook degrades enter -> preexec right there during sourcing. On a modern bash
-// (>= 5) the bind installs even in this non-PTY piped-stdin shell. macOS's
-// ancient `/bin/bash` 3.2 does NOT honour `bind -x` here, so the health check
-// fails and the hook (correctly) degrades to preexec — which would make an
-// `EFFMODE=<enter>` assertion fail on bash 3.2 even though the capability cache
-// and its reader are entirely correct.
+// These tests verify the cache *reader*, not bind-x viability, so the
+// `EFFMODE=<enter>` ones pass `_TIRITH_TEST_SKIP_HEALTH=1` (the test-only gate
+// bypass) to stay green on bash 3.2; real delivery is the PTY harness's job.
+// Preexec-fallback tests (`broken`/`absent`/`stale`) need no override.
 //
-// These tests verify the cache *reader*, not whether `bind -x` installs, so
-// the ones that assert `EFFMODE=<enter>` pass `_TIRITH_TEST_SKIP_HEALTH=1` —
-// the hook's documented test-only escape hatch that bypasses the startup
-// health gate. That keeps them meaningful and green on any bash (including
-// bash 3.2 on CI) without losing coverage; actual `bind -x` delivery is the
-// PTY conformance harness's job. `bash_hook_exports.rs` uses the same override
-// for the same reason. Tests that assert the preexec *fallback* (`broken` /
-// `absent` / `stale` verdicts) need no override — preexec is observable on any
-// bash.
-//
-// These tests pin that the cache reader is robust against the bash history
-// configurations that historically perturbed the hook: HISTCONTROL,
-// HISTIGNORE, HISTTIMEFORMAT, a pre-set IFS, and an already-enabled extdebug.
-// None of those affect a file read, but the cache reader uses `wc` and an
-// `IFS='='` loop, so a regression test is cheap insurance.
-// ===========================================================================
+// They also pin the reader against the bash history configs that historically
+// perturbed the hook (HISTCONTROL/HISTIGNORE/HISTTIMEFORMAT/pre-set IFS/extdebug)
+// — none affect a file read, but the reader uses `wc` and an `IFS='='` loop.
 
-/// The hook's test-only switch that bypasses `_tirith_startup_health_check`
-/// (see `_TIRITH_TEST_SKIP_HEALTH` in `bash-hook.bash`).
+/// The hook's test-only switch bypassing `_tirith_startup_health_check` (see
+/// `_TIRITH_TEST_SKIP_HEALTH` in `bash-hook.bash`), so capability-cache tests
+/// verify mode resolution without needing `bind -x` to install (bash 3.2).
 ///
-/// Enter mode binds `\C-m` with `bind -x` and then health-checks the bind.
-/// macOS's `/bin/bash` 3.2 does not honour `bind -x` in this non-PTY
-/// piped-stdin harness, so without this override the health check fails and
-/// the hook degrades enter -> preexec. The capability-cache tests below verify
-/// *mode resolution from the cache*, not bind-x viability, so they skip the
-/// gate; the PTY conformance harness covers real delivery.
-///
-/// CRITICAL: this MUST be delivered as a *session-local shell variable*, never
-/// as a process env var. The hook deliberately unsets any `_TIRITH_TEST_*`
-/// value it sees as *exported* (line ~24 of `bash-hook.bash`) — treating an
-/// inherited env var as attacker-controllable — and honours only a
-/// session-local one. `split_test_env` enforces that: `_TIRITH_TEST_*` entries
-/// become a shell prelude, everything else stays a real env var.
+/// CRITICAL: must be delivered as a session-local shell variable, never an env
+/// var — the hook unsets any EXPORTED `_TIRITH_TEST_*` (treating it as
+/// attacker-controllable). `split_test_env` enforces this.
 const SKIP_HEALTH: (&str, &str) = ("_TIRITH_TEST_SKIP_HEALTH", "1");
 
-/// Split `extra_env` into a session-local shell prelude and real process env
-/// vars. `_TIRITH_TEST_*` overrides MUST be session-local: the hook
-/// deliberately unsets exported (env-inherited) `_TIRITH_TEST_*` values —
-/// treating them as attacker-controllable — and honors only session-local
-/// ones. The prelude is prepended to the sourcing line so the variable is set
-/// (un-exported) before the hook runs. Mirrors `split_test_env` in
-/// `bash_hook_exports.rs`.
+/// Split `extra_env` into a session-local shell prelude (`_TIRITH_TEST_*`, which
+/// must be session-local — see [`SKIP_HEALTH`]) and real process env vars.
+/// Mirrors `split_test_env` in `bash_hook_exports.rs`.
 fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>) {
     let mut prelude = String::new();
     let mut env_vars = Vec::new();
@@ -752,11 +694,9 @@ fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>)
     (prelude, env_vars)
 }
 
-/// `($BASH_VERSION, $BASH)` for the bash a bare `Command::new("bash")` runs.
-///
-/// The hook's capability cache is keyed on both, so a seeded cache must record
-/// the exact values the test's spawned bash will report. Both are read in one
-/// invocation of the same `bash` the tests use.
+/// `($BASH_VERSION, $BASH)` for the bash a bare `Command::new("bash")` runs. The
+/// capability cache is keyed on both, so a seeded cache must record the exact
+/// values the spawned bash reports.
 fn spawned_bash_identity() -> (String, String) {
     let out = Command::new("bash")
         .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
@@ -770,16 +710,15 @@ fn spawned_bash_identity() -> (String, String) {
 }
 
 /// Build a `bash-enter-capability` cache file under `state_dir/tirith` for the
-/// running bash, with the given verdict. `state_dir` must be the same path
-/// passed as `XDG_STATE_HOME` to the shell.
+/// running bash, with the given verdict. `state_dir` must match the
+/// `XDG_STATE_HOME` passed to the shell.
 fn seed_capability_cache(state_dir: &Path, verdict: &str) {
     let (bash_version, bash_path) = spawned_bash_identity();
     let cache_dir = state_dir.join("tirith");
     fs::create_dir_all(&cache_dir).unwrap();
-    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA. tirith_version blank:
-    // the hook only enforces a tirith-version match when a sibling
-    // `.hooks-version` exists, and the hook here is sourced from assets/ which
-    // has none.
+    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA. Blank tirith_version:
+    // the hook only enforces a version match when a sibling `.hooks-version`
+    // exists, which the assets/ hook lacks.
     let body = format!(
         "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
          bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
@@ -787,20 +726,15 @@ fn seed_capability_cache(state_dir: &Path, verdict: &str) {
     fs::write(cache_dir.join("bash-enter-capability"), body).unwrap();
 }
 
-/// Run the hook in a fresh interactive bash with `XDG_STATE_HOME` pointing at a
-/// temp dir, optionally seeding the capability cache first. Returns
-/// `(stdout, stderr)`.
+/// Run the hook in a fresh interactive bash with `XDG_STATE_HOME` at a temp dir,
+/// optionally seeding the capability cache first. Returns `(stdout, stderr)`.
 ///
-/// The hook is sourced and the effective mode is reported on **one line**: in a
-/// piped-stdin interactive bash, once enter mode installs its `bind -x` Enter
-/// override, a *subsequent* stdin line would be intercepted (and, in this
-/// non-PTY context, swallowed). Keeping `source` and the `printf` on the same
-/// readline unit means the whole line was already accepted before `bind -x`
-/// existed, so the mode report always reaches stdout regardless of which mode
-/// the hook selected.
+/// `source` and the mode `printf` are kept on ONE readline unit: once enter mode
+/// installs its `bind -x` Enter override, a subsequent stdin line would be
+/// swallowed in this non-PTY shell, so the report must be on the line already
+/// accepted before `bind -x` existed.
 fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) -> (String, String) {
-    // `TempDir` (not `.keep()`) so the directory is removed when this function
-    // returns — `.keep()` would leak it under `/tmp` across test runs.
+    // `TempDir` (not `.keep()`) so the dir is removed on return.
     let state = tempfile::tempdir().unwrap();
     let state_path = state.path();
     if let Some(v) = verdict {
@@ -808,10 +742,8 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
     }
 
     let hook = hook_path();
-    // `_TIRITH_TEST_*` overrides must be session-local shell variables, not
-    // exported env vars (the hook strips exported ones — see `split_test_env`).
-    // The prelude is on the *same physical line* as `source`, so the whole
-    // sourcing unit is accepted before any `bind -x` Enter override exists.
+    // `_TIRITH_TEST_*` overrides must be session-local (see `split_test_env`);
+    // the prelude is on the same physical line as `source`.
     let (prelude, real_env) = split_test_env(env_vars);
     let full_script = format!(
         "{prelude}source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n"
@@ -865,9 +797,8 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
 
 #[test]
 fn capability_works_cache_selects_enter_mode() {
-    // Baseline: a fresh `works` verdict for the running bash makes the hook
-    // pick enter mode. `SKIP_HEALTH` bypasses the startup health gate so the
-    // mode-resolution assertion holds on any bash (incl. bash 3.2 on CI).
+    // A fresh `works` verdict selects enter mode. `SKIP_HEALTH` bypasses the
+    // health gate so this holds on any bash (incl. bash 3.2).
     let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[SKIP_HEALTH]);
     assert!(
         stdout.contains("EFFMODE=<enter>"),
@@ -895,10 +826,8 @@ fn capability_absent_cache_falls_back_to_preexec() {
 
 #[test]
 fn capability_cache_read_survives_hostile_histcontrol() {
-    // HISTCONTROL=ignorespace is the classic hostile-history config. It gates
-    // preexec *enforcement*, but must not affect the capability cache read or
-    // the enter-vs-preexec decision: a `works` verdict still selects enter.
-    // `SKIP_HEALTH` bypasses the startup health gate (see its doc comment).
+    // HISTCONTROL=ignorespace gates preexec enforcement but must not affect the
+    // capability-cache read: a `works` verdict still selects enter.
     let (stdout, _stderr) = run_hook_with_capability(
         Some("works"),
         &[("HISTCONTROL", "ignorespace"), SKIP_HEALTH],
@@ -911,7 +840,6 @@ fn capability_cache_read_survives_hostile_histcontrol() {
 
 #[test]
 fn capability_cache_read_survives_histignore() {
-    // `SKIP_HEALTH` bypasses the startup health gate (see its doc comment).
     let (stdout, _stderr) =
         run_hook_with_capability(Some("works"), &[("HISTIGNORE", "ls:cd:pwd"), SKIP_HEALTH]);
     assert!(
@@ -922,10 +850,8 @@ fn capability_cache_read_survives_histignore() {
 
 #[test]
 fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
-    // The reader uses an `IFS='='` loop and `wc`. A pre-set `IFS` in the
-    // environment, or a `HISTTIMEFORMAT`, must not break parsing — the reader
-    // sets `IFS` locally per-read. `SKIP_HEALTH` bypasses the startup health
-    // gate (see its doc comment).
+    // The reader sets `IFS` locally per-read, so a pre-set `IFS`/`HISTTIMEFORMAT`
+    // must not break its `IFS='='` loop / `wc`.
     let (stdout, _stderr) = run_hook_with_capability(
         Some("works"),
         &[("HISTTIMEFORMAT", "%F %T "), ("IFS", ":"), SKIP_HEALTH],
@@ -938,11 +864,8 @@ fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
 
 #[test]
 fn capability_cache_decision_independent_of_preset_extdebug() {
-    // `extdebug` already enabled by the user must not change the capability
-    // decision: a `works` verdict still selects enter mode. (extdebug is set
-    // via `shopt`, not an env var; pass it through BASHOPTS, which bash applies
-    // at startup.) `SKIP_HEALTH` bypasses the startup health gate (see its doc
-    // comment).
+    // A user-enabled `extdebug` must not change the decision (passed via BASHOPTS,
+    // which bash applies at startup).
     let (stdout, _stderr) =
         run_hook_with_capability(Some("works"), &[("BASHOPTS", "extdebug"), SKIP_HEALTH]);
     assert!(
@@ -953,24 +876,15 @@ fn capability_cache_decision_independent_of_preset_extdebug() {
 
 #[test]
 fn capability_cache_read_survives_set_plus_o_history() {
-    // `set +o history` disables history *before* the hook is sourced. The
-    // capability cache reader does not touch history, so a `works` verdict must
-    // still select enter mode. A regression here would mean the reader (its
-    // `wc` / `IFS='='` loop) accidentally depends on history being on.
-    //
-    // `_TIRITH_TEST_SKIP_HEALTH=1` bypasses the startup health gate so this
-    // mode-resolution assertion holds on any bash (see `SKIP_HEALTH`).
-    //
-    // `TempDir` (not `.keep()`) so the directory is cleaned up on return.
+    // `set +o history` before sourcing must not change the decision — the reader
+    // does not touch history. `TempDir` (not `.keep()`) cleans up on return.
     let state = tempfile::tempdir().unwrap();
     let state_path = state.path();
     seed_capability_cache(state_path, "works");
 
     let hook = hook_path();
-    // Disable history first, *then* set the session-local health-skip override
-    // and source the hook + report the mode on one line (so enter mode's
-    // `bind -x`, if selected, cannot swallow the report, and so the override is
-    // an un-exported shell variable the hook will honour — see `SKIP_HEALTH`).
+    // Disable history first, then set the session-local skip override + source +
+    // report on one line (so enter mode's `bind -x` cannot swallow the report).
     let (skip_key, skip_val) = SKIP_HEALTH;
     let full_script = format!(
         "set +o history\n\
@@ -1024,15 +938,13 @@ fn capability_cache_read_survives_set_plus_o_history() {
 
 #[test]
 fn capability_broken_cache_with_preexec_enforce_still_blocks() {
-    // The #111 fallback contract: with no `works` cache the hook drops to
-    // preexec, and `TIRITH_BASH_PREEXEC_ENFORCE=1` makes that preexec *block*.
-    // A blocked command (BLOCK_TOKEN) must not run its sentinel.
+    // #111 fallback: with no `works` cache the hook drops to preexec, and
+    // `TIRITH_BASH_PREEXEC_ENFORCE=1` makes that preexec block.
     let (_stdout, _stderr, _invocations, sentinel_dir) = run_with_sentinels(
         "touch {sentinels}/should_not_exist_BLOCK_TOKEN\n",
         &[("TIRITH_BASH_PREEXEC_ENFORCE", "1")],
     );
-    // run_with_sentinels uses run_bash, which has no capability cache → the
-    // hook falls back to preexec, and enforcement turns that into a blocker.
+    // run_bash has no capability cache → preexec fallback → enforcement blocks.
     let blocked = sentinel_path(&sentinel_dir, "should_not_exist_BLOCK_TOKEN");
     assert!(
         !blocked.exists(),
@@ -1043,16 +955,12 @@ fn capability_broken_cache_with_preexec_enforce_still_blocks() {
 
 #[test]
 fn capability_stale_cache_falls_back_and_installs_debug_trap() {
-    // When the capability gate yields preexec, the hook must still install its
-    // DEBUG trap. A stale `works` verdict (wrong bash version) forces the
-    // preexec fallback; the DEBUG trap must then be present.
-    //
-    // `TempDir` (not `.keep()`) so the directory is cleaned up on return.
+    // A stale `works` verdict (wrong bash version) forces the preexec fallback,
+    // which must still install the DEBUG trap. `TempDir` cleans up on return.
     let state = tempfile::tempdir().unwrap();
     let state_path = state.path();
-    // Seed a `works` verdict for a bash version that is NOT the running one →
-    // the hook treats it as stale and falls back to preexec. `bash_path` is the
-    // running bash's real path, so the *version* is the only stale field.
+    // Seed `works` for a NON-running bash version (only the version is stale, so
+    // the hook treats it as stale and falls back to preexec).
     let (_bash_version, bash_path) = spawned_bash_identity();
     let cache_dir = state_path.join("tirith");
     fs::create_dir_all(&cache_dir).unwrap();
@@ -1066,8 +974,7 @@ fn capability_stale_cache_falls_back_and_installs_debug_trap() {
     .unwrap();
 
     let hook = hook_path();
-    // A stale verdict yields preexec (no `bind -x`), but keep `source` and the
-    // first report on one line anyway for consistency with the other helpers.
+    // `source` + first report on one line, consistent with the other helpers.
     let full_script = format!(
         "source '{hook}'; printf 'EFFMODE=<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"\n\
          trap -p DEBUG | grep -q _tirith_debug_trampoline && \

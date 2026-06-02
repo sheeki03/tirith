@@ -1,24 +1,13 @@
 //! `tirith context status|guard|label` (M8 ch1).
 //!
-//! Three actions:
+//! - `status` — print the active context + label per provider (stable JSON).
+//! - `guard on|off` — flip `context_guard_enabled` by appending/rewriting that
+//!   one key in `policy.yaml` (never round-tripping the whole file).
+//! - `label <provider:context> <criticality> [--scope user|repo]` — write one
+//!   entry into the flat-YAML labels file, preserving existing entries.
 //!
-//! 1. **`status`** — call [`tirith_core::context_detect::detect_all`] and
-//!    print the active context per provider, plus its label (if any) from
-//!    the labels file. JSON output is stable.
-//! 2. **`guard on|off`** — flip `policy.context_guard_enabled` for the
-//!    process. Persisted into the local `policy.yaml` (we DO write this
-//!    field because it's an operator switch, not a labels mapping; we add
-//!    just one boolean key, never round-trip the whole file).
-//! 3. **`label <provider:context> <criticality> [--scope user|repo]`** —
-//!    write a single entry into the labels file
-//!    (`~/.config/tirith/context-labels.yaml` or
-//!    `<repo>/.tirith/context-labels.yaml`). Preserves any existing
-//!    entries.
-//!
-//! The labels file is a flat YAML mapping. We never modify `policy.yaml`
-//! when writing labels — that file is hand-edited by operators and we
-//! refuse to round-trip it through serde to keep comments / ordering
-//! intact.
+//! We never round-trip the hand-edited `policy.yaml` through serde (to keep
+//! comments / ordering intact).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,9 +15,8 @@ use std::path::PathBuf;
 use tirith_core::context_detect::{self, ContextDetectFailure, Provider, ProviderContext};
 use tirith_core::policy::{self as policy_mod, Policy};
 
-/// Allowed criticality values. We accept the case-insensitive synonyms
-/// `rules::context::is_critical_label` understands, but persist exactly
-/// what the operator typed (preserving their preferred convention).
+/// Allowed criticality values (case-insensitive synonyms of
+/// `rules::context::is_critical_label`); we persist exactly what the operator typed.
 const ALLOWED_CRITICALITIES: &[&str] = &[
     "critical",
     "production",
@@ -65,8 +53,6 @@ impl LabelScope {
         }
     }
 }
-
-// ─── status ────────────────────────────────────────────────────────────────
 
 /// `tirith context status` — list active contexts and labels.
 pub fn status(json: bool) -> i32 {
@@ -191,15 +177,9 @@ fn emit_status_json(detection: &context_detect::DetectionResult, policy: &Policy
     0
 }
 
-// ─── guard ─────────────────────────────────────────────────────────────────
-
-/// `tirith context guard on|off` — flip the operator switch.
-///
-/// We persist the flag into the local `policy.yaml`. To stay safe with a
-/// hand-edited file we ONLY append (or rewrite) the single
-/// `context_guard_enabled` line; we do not round-trip the entire policy
-/// through serde. If no policy file exists we create one in the user
-/// config dir.
+/// `tirith context guard on|off` — flip the operator switch by appending or
+/// rewriting the single `context_guard_enabled` line in `policy.yaml` (never
+/// round-tripping it through serde). Creates a user-config policy if none exists.
 pub fn guard(action: &str, json: bool) -> i32 {
     let enable = match action {
         "on" | "enable" | "true" => true,
@@ -281,8 +261,8 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
     Ok(user.join("policy.yaml"))
 }
 
-/// Idempotently set / update the `context_guard_enabled` line in a policy
-/// YAML file. Append-or-rewrite semantics — never touches other lines.
+/// Idempotently append-or-rewrite the `context_guard_enabled` line in a policy
+/// YAML file, never touching other lines.
 fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -322,8 +302,6 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     use std::io::Write as _;
     f.write_all(out.as_bytes())
 }
-
-// ─── label ─────────────────────────────────────────────────────────────────
 
 /// `tirith context label <provider:context> <criticality> [--scope user|repo]`.
 pub fn label(label_key: &str, criticality: &str, scope: LabelScope, json: bool) -> i32 {

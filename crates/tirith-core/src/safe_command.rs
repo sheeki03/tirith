@@ -1,50 +1,20 @@
 //! Safe-command suggestions — concrete "what to run instead" rewrites.
 //!
-//! This module is the engine behind `tirith check --suggest-safe-command`. It
-//! is **purely advisory** and never influences detection, verdicts, or exit
-//! codes — it inspects an already-computed [`Verdict`] plus the original
-//! command and, *only where a transformation is genuinely safer and correct*,
-//! emits a concrete rewritten command.
+//! The engine behind `tirith check --suggest-safe-command`. Purely advisory
+//! (never influences detection, verdicts, or exit codes): it inspects a
+//! computed [`Verdict`] plus the command and emits a rewrite only where a
+//! transformation is mechanically correct and genuinely safer. A wrong
+//! suggestion is worse than none — where no safe rewrite exists, it returns no
+//! rewrite and the caller falls back to the per-rule remediation text.
 //!
-//! ## Design rule: a wrong suggestion is worse than none
+//! [`SafeSuggestion::safe_command`] is the only rewrite channel; multi-step
+//! rewrites are one string with steps joined by ` && ` (callers split on it).
 //!
-//! Every rewrite here must be mechanically correct and actually safer than the
-//! input. Where there is no safe mechanical rewrite of the literal command
-//! (homograph hostnames, threat-DB hits with ambiguous targets, …), this
-//! module returns *no rewrite* — the caller falls back to the per-rule
-//! remediation text from [`crate::rule_explanations::remediation`], which is
-//! honest guidance rather than a fabricated command.
-//!
-//! ## Output channel
-//!
-//! [`SafeSuggestion::safe_command`] is the *only* output channel for a
-//! rewrite. Multi-step rewrites (preview-then-extract, backup-then-redirect)
-//! are emitted as a single string with the individual steps joined by ` && `
-//! — no separate `command_steps: Vec<String>` field exists. Callers that need
-//! to display the steps individually should split on ` && `.
-//!
-//! Eight transformations are supported, each mechanically safe:
-//!
-//! 1. **Pipe-to-shell** (`curl URL | bash`) → download to a file, review it,
-//!    then run it. Covers `curl`/`wget`/`http`/`https`/`xh`/`fetch` piped into
-//!    a shell interpreter.
-//! 2. **Insecure TLS flag** (`-k`, `--insecure`, `--no-check-certificate`) →
-//!    drop the flag so certificate verification is restored.
-//! 3. **Plain HTTP to a sink** (`http://…`) → switch the scheme to `https://`.
-//! 4. **Typosquat rewrite** — when the threat DB unambiguously names a popular
-//!    target, suggest `<pm> install <target>` instead.
-//! 5. **Sudo narrow** — command-shape based: when `sudo` wraps a command that
-//!    would be `Allow` without the prefix (and isn't an interactive shell),
-//!    suggest dropping `sudo`.
-//! 6. **Env scrub** — when any High-severity finding is present and sensitive
-//!    env vars (`AWS_*`, `GITHUB_TOKEN`, …) are currently set, suggest
-//!    `env -u VAR1 -u VAR2 ... <original>`.
-//! 7. **Archive list-before-extract** — for [`RuleId::ArchiveExtract`], suggest
-//!    `tar -tzf <archive> | head && tar -xzf <archive>` (analogous for zip /
-//!    unzip / 7z).
-//! 8. **Dotfile redirect** — for [`RuleId::DotfileOverwrite`], suggest
-//!    `cp <target> <target>.bak && <original>` (only when the target actually
-//!    exists on disk).
+//! Eight transformations, each mechanically safe: pipe-to-shell
+//! (download-review-run), insecure TLS flag (drop it), plain HTTP→HTTPS,
+//! typosquat (`<pm> install <target>`), sudo narrow (drop `sudo` when the inner
+//! command is `Allow`), env scrub (`env -u VAR …`), archive list-before-extract,
+//! and dotfile backup-then-redirect.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -54,36 +24,24 @@ use crate::extract::ScanContext;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Finding, RuleId, Severity, Verdict};
 
-/// A single safe-command suggestion tied to one finding.
-///
-/// Multi-step rewrites (preview-then-extract, backup-then-redirect) live in
-/// the single [`Self::safe_command`] field, with steps joined by ` && ` — no
-/// separate `command_steps: Vec<String>` field exists. Callers that need to
-/// display the steps individually should split on ` && `.
+/// A single safe-command suggestion tied to one finding. Multi-step rewrites
+/// live in [`Self::safe_command`] with steps joined by ` && `.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SafeSuggestion {
-    /// The rule this suggestion addresses (snake_case, e.g. `curl_pipe_shell`,
-    /// `sudo_narrow`, `env_scrub`).
+    /// The rule this addresses (snake_case, e.g. `curl_pipe_shell`).
     pub rule_id: String,
-    /// A concrete safer command, when a correct mechanical rewrite exists.
-    /// `None` means there is no safe rewrite of the literal command — the
-    /// `remediation` field below carries honest guidance instead.
-    ///
-    /// Multi-step rewrites are emitted as a single string with steps joined by
-    /// ` && ` — see the type-level docs.
+    /// A concrete safer command, or `None` when no safe rewrite of the literal
+    /// command exists (the `remediation` field carries guidance instead).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_command: Option<String>,
-    /// One-line explanation of why the suggestion is safer, or — when
-    /// `safe_command` is `None` — why no mechanical rewrite is possible.
+    /// Why the suggestion is safer, or why no rewrite is possible.
     pub rationale: String,
     /// The per-rule remediation advice (always populated; never fabricated).
     pub remediation: String,
 }
 
-/// Sensitive environment variable names loaded from `sensitive_env.toml`.
-///
-/// Used by the env-scrub transform and (in a later milestone) by the
-/// env-guard rule. Compiled into the binary at build time via `include_str!`.
+/// Sensitive env-var names loaded from `sensitive_env.toml` (compiled in via
+/// `include_str!`), used by the env-scrub transform and the env-guard rule.
 static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     #[derive(serde::Deserialize)]
     struct SensitiveEnvFile {
@@ -91,8 +49,7 @@ static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     }
     let toml_str = include_str!("../assets/data/sensitive_env.toml");
     let parsed: SensitiveEnvFile = toml::from_str(toml_str).expect("invalid sensitive_env.toml");
-    // Leak each string to get a `&'static str`. The list is tiny (≤30 vars)
-    // and read once for the lifetime of the process.
+    // Leak each string for a `&'static str` — the list is tiny and read once.
     parsed
         .sensitive
         .into_iter()
@@ -100,34 +57,25 @@ static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Public read-only accessor for the sensitive env-var list. M9 ch4's env-guard
-/// rule will share this same list — exposing it here keeps the asset file as
-/// the single source of truth.
+/// Public accessor for the sensitive env-var list (shared with the env-guard
+/// rule so the asset file stays the single source of truth).
 pub fn sensitive_env_vars() -> &'static [&'static str] {
     &SENSITIVE_ENV_VARS
 }
 
-/// Build safe-command suggestions for every actionable finding in `verdict`.
+/// Build safe-command suggestions for every actionable finding in `verdict`,
+/// one [`SafeSuggestion`] per rule id (deduplicated).
 ///
-/// `cmd` is the original command text and `shell` the shell it was checked
-/// under. Returns one [`SafeSuggestion`] per finding, de-duplicated by rule id
-/// (the same rule firing twice yields a single suggestion).
-///
-/// In addition, two *command-shape* transforms run once per verdict and can
-/// append synthetic suggestions with rule ids `"sudo_narrow"` and
-/// `"env_scrub"`. They are not tied to any specific [`RuleId`] — they fire on
-/// the overall command shape and the set of process-level env vars currently
-/// set. Both are conservative: they never produce a rewrite that the engine
-/// itself would still flag.
-///
-/// Returns an empty vec when the verdict has no findings.
+/// Two command-shape transforms (`sudo_narrow`, `env_scrub`) also run once per
+/// verdict, keyed on the command shape / process env rather than a [`RuleId`].
+/// Both are conservative — never a rewrite the engine would still flag. Empty
+/// when the verdict has no findings.
 pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSuggestion> {
     let segments = tokenize::tokenize(cmd, shell);
     let mut out: Vec<SafeSuggestion> = Vec::new();
     let mut seen: Vec<RuleId> = Vec::new();
 
     for finding in &verdict.findings {
-        // One suggestion per rule id — compare the Copy enum, no allocation.
         if seen.contains(&finding.rule_id) {
             continue;
         }
@@ -135,9 +83,8 @@ pub fn suggest(cmd: &str, shell: ShellType, verdict: &Verdict) -> Vec<SafeSugges
         out.push(build_suggestion(cmd, shell, &segments, finding));
     }
 
-    // Command-shape transforms — fire at most once per verdict, independent of
-    // any specific rule id. Only run when the verdict has findings (an empty
-    // verdict has nothing to rewrite).
+    // Command-shape transforms fire at most once per verdict, only when there
+    // are findings to rewrite.
     if !verdict.findings.is_empty() {
         if let Some(s) = build_sudo_narrow_suggestion(cmd, shell, &segments, verdict) {
             out.push(s);
@@ -247,8 +194,7 @@ fn build_suggestion(
                     .to_string(),
             ),
         },
-        // Every other rule: no safe mechanical rewrite of the literal command.
-        // Be honest — the remediation field carries the real guidance.
+        // Every other rule: no safe mechanical rewrite — remediation guides.
         _ => (
             None,
             "No automatic safe rewrite for this finding — see the remediation below.".to_string(),
@@ -273,13 +219,10 @@ fn is_shell_interpreter(name: &str) -> bool {
 
 /// Rewrite `<fetch> URL | <shell>` into a download-review-run sequence.
 ///
-/// Returns `None` (no rewrite) unless the command is exactly a single pipe
-/// from a recognized URL-fetch command into a shell interpreter, and exactly
-/// one `http(s)` URL can be extracted from the fetch side. Anything more
-/// complex (extra pipeline stages, redirections we don't model, no clear URL)
-/// falls through to honest guidance rather than a possibly-wrong rewrite.
+/// `None` unless the command is exactly a single pipe from a URL-fetch command
+/// into a shell interpreter with exactly one `http(s)` URL on the fetch side.
+/// Anything more complex falls through to honest guidance.
 fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
-    // Exactly two segments joined by a single pipe.
     if segments.len() != 2 {
         return None;
     }
@@ -293,7 +236,6 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     let source_cmd = base_command(source.command.as_deref()?, shell);
     let sink_cmd = base_command(sink.command.as_deref()?, shell);
 
-    // Source must be a URL-fetch command; sink must be a shell.
     if !is_url_fetch_command(&source_cmd) {
         return None;
     }
@@ -301,7 +243,7 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
         return None;
     }
 
-    // Need exactly one http(s) URL on the fetch side — ambiguity → no rewrite.
+    // Exactly one http(s) URL on the fetch side — ambiguity → no rewrite.
     let urls = extract_http_urls(&source.args);
     if urls.len() != 1 {
         return None;
@@ -311,12 +253,9 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
         return None;
     }
 
-    // Concrete download-review-run sequence. `/tmp/tirith-review.sh` is a
-    // stable, obvious scratch path; the user reviews, then runs explicitly.
+    // `curl` is the safe, universally-available downloader to suggest.
     let fetch = match source_cmd.as_str() {
         "wget" => format!("wget -O /tmp/tirith-review.sh {url}"),
-        // curl + httpie + xh: `-o`/`--output` style differs, but `curl` is the
-        // safe, universally-available downloader to suggest here.
         _ => format!("curl -fsSL -o /tmp/tirith-review.sh {url}"),
     };
     Some(format!(
@@ -324,25 +263,18 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     ))
 }
 
-/// Remove insecure TLS flags from the command, preserving everything else
-/// verbatim.
+/// Remove insecure TLS flags, preserving everything else verbatim.
 ///
-/// Works by byte-span splicing: it locates each maximal whitespace-delimited
-/// run in the *original* string whose content (quotes stripped) is exactly an
-/// insecure flag and removes that run plus one adjacent whitespace gap. An
-/// insecure flag is itself a simple token — `-k` / `--insecure` /
-/// `--no-check-certificate` never contains internal whitespace — so this is
-/// exact: every other byte of the command, including quoted arguments with
-/// spaces, is left untouched.
-///
-/// Returns `None` if no insecure flag is present, or if the segment-level view
-/// (the same view the detector used) does not also see one — so an `-k` buried
-/// inside an unrelated quoted string is never rewritten.
+/// Byte-span splicing: removes each whitespace-delimited run whose content
+/// (quotes stripped) is exactly an insecure flag, plus one adjacent gap. These
+/// flags have no internal whitespace, so quoted args with spaces are untouched.
+/// `None` if no flag is present, or if the segment-level view (the detector's)
+/// doesn't also see one — so a `-k` buried in a quoted string is never rewritten.
 fn rewrite_drop_insecure_tls(cmd: &str, segments: &[tokenize::Segment]) -> Option<String> {
     const INSECURE: &[&str] = &["-k", "--insecure", "--no-check-certificate"];
 
-    // Cross-check against the tokenizer: only rewrite when a real arg token is
-    // an insecure flag, not when `-k` merely appears inside another argument.
+    // Cross-check the tokenizer: rewrite only when a real arg token is an
+    // insecure flag, not when `-k` appears inside another argument.
     let detector_sees_it = segments.iter().any(|seg| {
         seg.args
             .iter()
@@ -352,7 +284,7 @@ fn rewrite_drop_insecure_tls(cmd: &str, segments: &[tokenize::Segment]) -> Optio
         return None;
     }
 
-    // Collect byte spans of whitespace-delimited runs that are insecure flags.
+    // Byte spans of whitespace-delimited runs that are insecure flags.
     let bytes = cmd.as_bytes();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -374,13 +306,11 @@ fn rewrite_drop_insecure_tls(cmd: &str, segments: &[tokenize::Segment]) -> Optio
         return None;
     }
 
-    // Rebuild the command, dropping each flagged span and the single space
-    // that separated it from the preceding token (so `curl -k URL` collapses
-    // cleanly to `curl URL`, not `curl  URL`).
+    // Rebuild the command, dropping each flagged span plus the single
+    // preceding space so `curl -k URL` collapses to `curl URL`.
     let mut out = String::with_capacity(cmd.len());
     let mut cursor = 0;
     for (start, end) in spans {
-        // Copy everything up to the flag, trimming one trailing space.
         let mut keep_until = start;
         if keep_until > cursor && bytes[keep_until - 1].is_ascii_whitespace() {
             keep_until -= 1;
@@ -396,14 +326,11 @@ fn rewrite_drop_insecure_tls(cmd: &str, segments: &[tokenize::Segment]) -> Optio
     Some(result)
 }
 
-/// Rewrite the first `http://` URL in the command to `https://`.
-///
-/// Only rewrites a literal `http://` scheme; returns `None` if the command has
-/// no plain-HTTP URL. The caller pairs this with an explicit caveat that the
-/// host must actually serve HTTPS.
+/// Rewrite the first `http://` URL in the command to `https://`. `None` if
+/// there's no plain-HTTP URL. The caller adds the caveat that the host must
+/// actually serve HTTPS.
 fn rewrite_http_to_https(cmd: &str) -> Option<String> {
-    // Find a case-insensitive `http://` not immediately preceded by 's'
-    // (so `https://` is never matched).
+    // Case-insensitive `http://` not preceded by 's' (so `https://` is skipped).
     let lower = cmd.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut idx = 0;
@@ -411,7 +338,6 @@ fn rewrite_http_to_https(cmd: &str) -> Option<String> {
         let pos = idx + rel;
         let preceded_by_s = pos > 0 && (bytes[pos - 1] == b's' || bytes[pos - 1] == b'S');
         if !preceded_by_s {
-            // Rewrite this occurrence: insert 's' after `http`.
             let mut rewritten = String::with_capacity(cmd.len() + 1);
             rewritten.push_str(&cmd[..pos + 4]); // up to and including "http"
             rewritten.push('s');
@@ -426,17 +352,11 @@ fn rewrite_http_to_https(cmd: &str) -> Option<String> {
 // ── Typosquat rewrite ───────────────────────────────────────────────────────
 
 /// Extract the typosquat target name from a `ThreatPackageTyposquat` finding.
-///
-/// Both producers — `rules/threatintel.rs` and `install_txn.rs` — format the
-/// finding title as `"Confirmed typosquat: <name> → <target>"`. Parse the arrow
-/// out of the title.
-///
-/// `install_txn.rs` additionally stamps `typosquat_of=<target>` into the
-/// evidence text; that field is checked as a backup signal so the rewrite is
-/// robust against a future title-string tweak.
+/// Both producers format the title as `"Confirmed typosquat: <name> →
+/// <target>"`; `install_txn.rs` also stamps `typosquat_of=<target>` into the
+/// evidence, checked as a backup against a future title tweak.
 fn typosquat_target(finding: &Finding) -> Option<String> {
-    // Primary parse: "Confirmed typosquat: <name> → <target>" — `→` is a BMP
-    // character so byte-indexing via `str::find` is safe.
+    // Primary parse from the title — `→` is BMP so byte-indexing is safe.
     let arrow = " → ";
     if let Some(idx) = finding.title.find(arrow) {
         let target = finding.title[idx + arrow.len()..].trim();
@@ -464,14 +384,10 @@ fn typosquat_target(finding: &Finding) -> Option<String> {
     None
 }
 
-/// Package-manager `install` shape detector. Returns `(pm_binary, install_verb)`
-/// when `segments` is a single segment whose leader is a recognized package
-/// manager and the first non-flag arg is an install-style verb. The verb is
-/// preserved so `npm install` stays `npm install` and `npm i` stays `npm i`.
-///
-/// The supported set mirrors what the install-txn engine pass already handles
-/// (`pip`/`pip3`, `npm`/`yarn`/`pnpm`, `cargo`, `gem`, `go`); other package
-/// managers fall through to "no rewrite".
+/// Package-manager `install` shape detector → `(pm_binary, install_verb)` when
+/// `segments` is one segment whose leader is a recognized PM and the first
+/// non-flag arg is an install verb (preserved, so `npm i` stays `npm i`). The
+/// supported set mirrors the install-txn engine pass; others get no rewrite.
 fn detect_pm_install(segments: &[tokenize::Segment], shell: ShellType) -> Option<(String, String)> {
     if segments.len() != 1 {
         return None;
@@ -501,14 +417,9 @@ fn detect_pm_install(segments: &[tokenize::Segment], shell: ShellType) -> Option
     Some((cmd, verb))
 }
 
-/// Build a typosquat rewrite when the target is unambiguous.
-///
-/// Returns `None` when:
-///  * the finding shape doesn't expose a single target (handled by
-///    [`typosquat_target`]), or
-///  * the command shape isn't a recognized `<pm> install <name>` (the only
-///    shape we can mechanically rewrite — touching a manifest file, a
-///    Brewfile, `npx`, etc. is out of scope for a one-line rewrite).
+/// Build a typosquat rewrite when the target is unambiguous. `None` when the
+/// finding exposes no single target, or the command isn't a recognized `<pm>
+/// install <name>` (the only shape we can mechanically rewrite).
 fn rewrite_typosquat(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -535,15 +446,10 @@ fn archive_command_kind(cmd: &str) -> Option<&'static str> {
     }
 }
 
-/// Find the archive filename in an extract command's args.
-///
-/// `tar -xzf <archive> [-C dir]` and `tar -x -z -f <archive>` both work — the
-/// archive is the first non-flag arg after `-f`/`--file`. For `unzip
-/// <archive>` it's the first non-flag arg. For `7z x <archive>` it's the
-/// first non-flag arg after the verb.
+/// Find the archive filename in an extract command's args. For `tar` it's the
+/// first non-flag arg after `-f`/`--file` (incl. combined `-xzf <file>`); for
+/// `unzip` the first non-flag arg; for `7z` the first non-flag arg after the verb.
 fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
-    // Direct scan: `-f <file>`, `--file=<file>`, `--file <file>`, and combined
-    // short-form `-xzf <file>` / `-tzf <file>`.
     let mut i = 0;
     while i < args.len() {
         let arg = strip_quotes(&args[i]);
@@ -558,8 +464,7 @@ fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
         if let Some(rest) = arg.strip_prefix("--file=") {
             return Some(rest.to_string());
         }
-        // Combined short form `-xzf` / `-tzf` etc — `-f` is the trailing letter
-        // and the next positional is the archive.
+        // Combined short form `-xzf` / `-tzf` — `-f` is the trailing letter.
         if arg.starts_with('-')
             && !arg.starts_with("--")
             && arg.len() > 2
@@ -584,7 +489,7 @@ fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
             .find(|a| !a.starts_with('-') && !a.is_empty()),
         "7z" => {
             let mut it = args.iter().map(|a| strip_quotes(a));
-            // Skip the verb (e.g. `x`, `e`).
+            // Skip the verb (`x`, `e`, …).
             let _verb = it.find(|a| !a.starts_with('-') && !a.is_empty())?;
             it.find(|a| !a.starts_with('-') && !a.is_empty())
         }
@@ -592,10 +497,8 @@ fn find_archive_arg(args: &[String], kind: &str) -> Option<String> {
     }
 }
 
-/// Build the preview-then-extract rewrite for a flagged archive command.
-///
-/// Returns `None` when the command is multi-segment, the leader isn't one of
-/// `tar` / `unzip` / `7z`, or the archive filename can't be located.
+/// Build the preview-then-extract rewrite for a flagged archive command. `None`
+/// when multi-segment, the leader isn't `tar`/`unzip`/`7z`, or no archive arg.
 fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) -> Option<String> {
     if segments.len() != 1 {
         return None;
@@ -609,10 +512,8 @@ fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) 
         return None;
     }
     let raw = seg.raw.trim();
-    // `tar -tf` (NO compression flag) works for .tar / .tar.gz / .tar.bz2 /
-    // .tar.xz / .tar.zst on modern GNU & BSD tar — the binary auto-detects
-    // compression from the archive's magic bytes. Hard-coding `-tzf` (gzip)
-    // would break the preview step for every non-gzip tar variant.
+    // `tar -tf` (no compression flag) auto-detects compression on modern GNU &
+    // BSD tar; hard-coding `-tzf` (gzip) would break non-gzip variants.
     Some(match kind {
         "tar" => format!("tar -tf {archive} | head && {raw}"),
         "unzip" => format!("unzip -l {archive} | head && {raw}"),
@@ -623,9 +524,8 @@ fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) 
 
 // ── Dotfile backup-first redirect ──────────────────────────────────────────
 
-/// Extract the redirect target path from a `> ~/.<file>` / `>> $HOME/.<file>`
-/// shape. Returns the literal token as written (so `~/.zshrc` stays
-/// `~/.zshrc`).
+/// Extract the redirect target from a `> ~/.<file>` / `>> $HOME/.<file>` shape,
+/// returning the literal token as written.
 fn dotfile_redirect_target(cmd: &str) -> Option<String> {
     let bytes = cmd.as_bytes();
     let mut i = 0;
@@ -673,11 +573,8 @@ fn expand_dotfile_to_fs_path(token: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Build the backup-then-redirect rewrite for a dotfile-overwrite command.
-///
-/// Only fires when the target dotfile actually *exists* on disk — backing up a
-/// non-existent file produces a confusing error from `cp` and the backup has
-/// no value (there's nothing to lose).
+/// Build the backup-then-redirect rewrite for a dotfile-overwrite command. Only
+/// fires when the target dotfile exists (backing up a missing file just errors).
 fn rewrite_dotfile_backup_first(
     cmd: &str,
     segments: &[tokenize::Segment],
@@ -703,10 +600,9 @@ fn rewrite_dotfile_backup_first(
 
 // ── Sudo narrow (command-shape based) ──────────────────────────────────────
 
-/// Interactive shells that must never appear as the "narrowed" base command of
-/// a `sudo` rewrite. Suggesting `sh` instead of `sudo sh` would be strictly
-/// worse — it would still produce a root shell, and a user copy-pasting the
-/// suggestion would lose the visible `sudo` cue.
+/// Interactive shells that must never be the "narrowed" base of a `sudo`
+/// rewrite — suggesting `sh` for `sudo sh` still yields a root shell and drops
+/// the visible `sudo` cue.
 fn is_interactive_shell(name: &str) -> bool {
     matches!(
         name,
@@ -714,22 +610,13 @@ fn is_interactive_shell(name: &str) -> bool {
     )
 }
 
-/// Heuristic catch-all for destructive command shapes the engine does not
-/// (yet) model as a finding but for which dropping `sudo` is obviously the
-/// wrong advice. `rm -rf /` is the canonical example: stripping sudo would
-/// still produce a dangerous command, just one that runs as the current user.
-///
-/// Tirith's detection engine deliberately does not have a `rm -rf /` rule —
-/// shell-builtin destructiveness is squarely the user's intent to express —
-/// but the suggester has a stricter mandate: never produce a rewrite a careful
-/// reviewer would call out as obviously worse than `--help` text. This
-/// denylist closes that gap for the handful of shapes everyone agrees on.
+/// Heuristic catch-all for destructive command shapes the engine doesn't model
+/// but where dropping `sudo` is obviously wrong (e.g. `rm -rf /` still danger
+/// just as the current user). The suggester's stricter mandate: never produce a
+/// rewrite a reviewer would call worse than `--help`.
 fn looks_obviously_destructive(inner: &str) -> bool {
-    // Normalize whitespace runs so the matcher is robust against extra spaces.
+    // Normalize whitespace runs, then match against the LEADING segment only.
     let collapsed: String = inner.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Match leading `rm` with `-rf` / `-fr` / `-r -f` etc against `/`, `~`,
-    // `$HOME`, `*`. Bound the check to the LEADING segment of the command —
-    // anything later is somebody else's problem (and is the engine's domain).
     let lower = collapsed.to_ascii_lowercase();
     let triggers = [
         "rm -rf /",
@@ -747,12 +634,10 @@ fn looks_obviously_destructive(inner: &str) -> bool {
     triggers.iter().any(|t| lower.starts_with(t))
 }
 
-/// Strip a leading `sudo` from the command bytes, returning the inner command
-/// as raw text (preserving quoting / spacing). Returns `None` when no inner
-/// command can be located (`sudo` with no arguments, only flags, etc.).
-///
-/// Handles common option flags (`-u USER`, `--user=USER`, `--`, …). Exotic
-/// sudo flags fall through to "no rewrite" rather than risk a wrong strip.
+/// Strip a leading `sudo`, returning the inner command as raw text (quoting /
+/// spacing preserved). `None` when no inner command can be located. Handles
+/// common option flags (`-u USER`, `--user=USER`, `--`); exotic flags fall
+/// through to no-rewrite rather than risk a wrong strip.
 fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
     let segs = tokenize::tokenize(cmd, shell);
     let seg = segs.first()?;
@@ -786,7 +671,7 @@ fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
             if value_long.iter().any(|f| arg == *f) {
                 idx += 2;
             } else {
-                // `--user=root` or any other `--flag=value` consumes one slot.
+                // `--flag=value` consumes one slot.
                 idx += 1;
             }
             continue;
@@ -807,9 +692,8 @@ fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
     if start >= seg.args.len() {
         return None;
     }
-    // Reassemble the inner command from the raw segment so quoting is
-    // preserved verbatim: find where the first inner-arg token begins in the
-    // raw segment text and return everything from there onward.
+    // Reassemble from the raw segment so quoting is preserved verbatim: find
+    // where the first inner-arg token begins and return everything onward.
     let first_arg = &seg.args[start];
     let stripped = strip_quotes(first_arg);
     let raw = &seg.raw;
@@ -819,31 +703,24 @@ fn strip_sudo_prefix(cmd: &str, shell: ShellType) -> Option<String> {
     Some(raw[pos..].trim().to_string())
 }
 
-/// Build the sudo-narrow suggestion for the verdict.
+/// Build the sudo-narrow suggestion. Fires when: (i) the leader is `sudo`,
+/// (ii) the verdict has a finding (caller-checked), (iii) the stripped leader
+/// is NOT an interactive shell, and (iv) re-analyzing the inner command yields
+/// [`Action::Allow`].
 ///
-/// Fires when:
-///  (i)   the parsed command's leader is `sudo`,
-///  (ii)  the verdict has at least one finding (caller-checked),
-///  (iii) the stripped leader is NOT an interactive shell, AND
-///  (iv)  re-running [`engine::analyze`] on the inner command yields
-///        [`Action::Allow`].
-///
-/// When (iii) fails, returns a `safe_command: None` suggestion with the
-/// interactive-shell remediation text. When (iv) fails the inner command is
-/// still flagged — per-finding suggestions already cover it, so returns `None`.
+/// (iii) failing returns a `safe_command: None` interactive-shell suggestion;
+/// (iv) failing returns `None` (per-finding suggestions already cover it).
 fn build_sudo_narrow_suggestion(
     cmd: &str,
     shell: ShellType,
     segments: &[tokenize::Segment],
     _verdict: &Verdict,
 ) -> Option<SafeSuggestion> {
-    // (i) leader is sudo.
     let leader = base_command(segments.first()?.command.as_deref()?, shell);
     if leader != "sudo" {
         return None;
     }
 
-    // Strip the prefix.
     let inner = strip_sudo_prefix(cmd, shell)?;
     if inner.is_empty() {
         return None;
@@ -870,18 +747,15 @@ fn build_sudo_narrow_suggestion(
         });
     }
 
-    // Refuse to rewrite obvious shell-builtin destructiveness (`rm -rf /`)
-    // *before* re-analysis. The engine does not model these — it treats
-    // user-typed `rm -rf /` as expressing intent — but the suggester has the
-    // stricter mandate of never advising something a reviewer would call out
-    // as worse than the original.
+    // Refuse obvious shell-builtin destructiveness (`rm -rf /`) before
+    // re-analysis — the engine doesn't model these, but the suggester must not
+    // advise something worse than the original.
     if looks_obviously_destructive(&inner) {
         return None;
     }
 
-    // (iv) re-analyze the stripped command. If it still flags, the sudo
-    // wrapper was not the dangerous part — per-finding suggestions already
-    // describe the real issue, so we return None here.
+    // (iv) re-analyze the stripped command; if it still flags, sudo wasn't the
+    // dangerous part — per-finding suggestions cover it.
     let ctx = AnalysisContext {
         input: inner.clone(),
         shell,
@@ -915,18 +789,11 @@ fn build_sudo_narrow_suggestion(
 
 // ── Env scrub (command-shape based) ────────────────────────────────────────
 
-/// Currently-set sensitive env vars, in stable order (built-ins first, then any
-/// user `policy.env_guard_sensitive_vars` extension). Stable order keeps the
-/// suggested command deterministic.
-///
-/// M9 ch4 fix: the effective list MERGES the built-in `sensitive_env.toml`
-/// names with the user's `policy.env_guard_sensitive_vars` extension (via
-/// [`crate::env_guard::effective_sensitive_vars`]) so an `env -u …` rewrite
-/// never silently omits a user-declared secret. The previous reasoning that the
-/// two paths could never co-fire was load-bearing and undocumented to the user;
-/// merging the list removes that fragility outright. A partial-policy discover
-/// (local files only) is cheap and only runs when the env-scrub transform is
-/// actually being built.
+/// Currently-set sensitive env vars in stable (deterministic) order. The
+/// effective list MERGES the built-in `sensitive_env.toml` names with the user's
+/// `policy.env_guard_sensitive_vars` (M9 ch4) so an `env -u …` rewrite never
+/// silently omits a user-declared secret. The partial-policy discover is cheap
+/// and only runs when this transform is being built.
 fn sensitive_env_set_in_process() -> Vec<String> {
     let policy = crate::policy::Policy::discover_partial(None);
     let effective = crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
@@ -936,28 +803,17 @@ fn sensitive_env_set_in_process() -> Vec<String> {
         .collect()
 }
 
-/// Returns `true` when `cmd` looks like a *single simple command* that
-/// `env -u VAR ... <cmd>` can safely wrap.
+/// `true` when `cmd` is a single simple command that `env -u VAR … <cmd>` can
+/// safely wrap. `env -u` only scrubs the immediately-following process — any
+/// compound construct (`|`, `&&`/`||`, `;`, redirections, `&`, `` ` ``/`$(`,
+/// subshells) spawns children that inherit the caller's env, so wrapping it
+/// would leak the secret through later stages.
 ///
-/// `env -u VAR <cmd>` only scrubs the environment of the immediately
-/// following process. Pipelines (`|`), logical chains (`&&`, `||`), command
-/// separators (`;`), redirections (`>`, `<`, `>>`, `<<`), background jobs
-/// (`&`), command substitutions (`` ` ``, `$(`), and subshells (`(`, `)`)
-/// all spawn additional child processes that *inherit the caller's env*,
-/// not the scrubbed one. Wrapping such a command with `env -u` produces a
-/// safe-looking rewrite whose later stages still see the secret — strictly
-/// worse than admitting we have no automatic fix.
-///
-/// Implementation: scan byte-by-byte while tracking single-quote,
-/// double-quote, and backslash-escape state. POSIX single quotes
-/// (`'...'`) make their contents literal; inside double quotes only
-/// `$`, `` ` ``, and `\` retain meaning, so `|`, `&`, `;`, `>`, `<`,
-/// `(`, `)` are safe to ignore there. `` ` `` and `$(` are flagged
-/// whenever they appear outside single quotes — they trigger command
-/// substitution even inside `"..."`.
+/// Scans byte-by-byte tracking quote/escape state: single quotes make contents
+/// literal; in double quotes only `$`/`` ` ``/`\` retain meaning, so command
+/// substitution (`` ` ``, `$(`) is flagged outside single quotes only.
 fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
-    // Quote / escape tracking state. Both quote flags cannot be true at
-    // the same time — POSIX shells don't nest the two.
+    // Both quote flags can't be true at once — POSIX doesn't nest the two.
     let mut in_single = false;
     let mut in_double = false;
     let mut escape = false;
@@ -967,8 +823,8 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
     while i < bytes.len() {
         let b = bytes[i];
 
-        // Backslash outside single quotes consumes the next byte verbatim.
-        // Inside single quotes a backslash is literal — POSIX has no escape.
+        // Backslash outside single quotes consumes the next byte verbatim;
+        // inside single quotes it's literal (POSIX has no escape there).
         if escape {
             escape = false;
             i += 1;
@@ -990,7 +846,7 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
         if in_double {
             match b {
                 b'"' => in_double = false,
-                // Command substitution is active inside double quotes.
+                // Command substitution is active even inside double quotes.
                 b'`' => return false,
                 b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return false,
                 _ => {}
@@ -999,7 +855,7 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
             continue;
         }
 
-        // Unquoted context — flag any shell-compound metacharacter.
+        // Unquoted — flag any shell-compound metacharacter.
         match b {
             b'\'' => in_single = true,
             b'"' => in_double = true,
@@ -1010,42 +866,25 @@ fn is_simple_command_for_env_scrub(cmd: &str) -> bool {
         i += 1;
     }
 
-    // Unterminated quotes or trailing backslash — treat as not-simple. A
-    // malformed command is exactly the case where guessing the right
-    // wrapper is most dangerous.
+    // Unterminated quotes / trailing backslash — not-simple; a malformed
+    // command is exactly where guessing the wrapper is most dangerous.
     !(in_single || in_double || escape)
 }
 
-/// Build an env-scrub suggestion for the verdict when:
-///  (i)   the dedicated [`RuleId::EnvSensitiveExposedToUnknownScript`] finding
-///        is present (M9 ch4 — the explicit trigger this transform points at),
-///        OR at least one finding is High severity or above (the original M6
-///        ch5 heuristic, kept for backward compat), AND
-///  (ii)  at least one sensitive env var is currently set in this process,
-///        AND
-///  (iii) the shell is a POSIX shell (bash/zsh/sh/fish/posix) — `env -u`
-///        does not exist on PowerShell, so we'd emit a broken "safe
-///        command". Detect-and-decline for PowerShell rather than ship a
-///        rewrite that won't execute, AND
-///  (iv)  the command is a single simple command (no `|`, `&&`, `;`,
-///        redirections, subshells, or command substitution). `env -u VAR`
-///        only scrubs the immediately-following child process — every
-///        subsequent stage in a pipeline or chain still inherits the real
-///        env, so wrapping a compound command would emit a "safe" rewrite
-///        the secret could still leak through. See
-///        [`is_simple_command_for_env_scrub`].
-///
-/// Returns `None` otherwise.
+/// Build an env-scrub suggestion when: (i) the dedicated
+/// [`RuleId::EnvSensitiveExposedToUnknownScript`] finding is present (M9 ch4) OR
+/// any High-severity finding is (M6 ch5, kept for compat); (ii) a sensitive env
+/// var is set in this process; (iii) the shell is POSIX (`env -u` doesn't exist
+/// on PowerShell); and (iv) the command is a single simple command (else a
+/// compound construct would leak the secret — see
+/// [`is_simple_command_for_env_scrub`]). `None` otherwise.
 fn build_env_scrub_suggestion(
     cmd: &str,
     shell: ShellType,
     verdict: &Verdict,
 ) -> Option<SafeSuggestion> {
-    // Fire when EITHER the dedicated M9 ch4 rule is present (the explicit,
-    // audit-visible trigger this transform was designed to point at) OR any
-    // High-severity finding is present (the original M6 ch5 heuristic, kept
-    // for backward compat). Both paths are valid; the dedicated-rule path
-    // makes the env-scrub trigger explicit in `--explain` / audit output.
+    // Fire on the dedicated M9 ch4 rule (explicit, audit-visible) OR any
+    // High-severity finding (M6 ch5 compat heuristic).
     let dedicated_rule_present = verdict
         .findings
         .iter()
@@ -1058,13 +897,9 @@ fn build_env_scrub_suggestion(
         return None;
     }
 
-    // `env -u VAR1 -u VAR2 ... <cmd>` is POSIX-only. On PowerShell the
-    // equivalent is per-var `$env:VAR = $null` lines, which can't be
-    // expressed as a single inline command without changing semantics
-    // (the lines would mutate the *caller's* session env, not just the
-    // child's). Decline rather than ship a broken rewrite. The user's
-    // remediation field in the per-rule guidance covers the PowerShell
-    // manual unset path.
+    // `env -u VAR …` is POSIX-only; the PowerShell equivalent can't be a single
+    // inline command without mutating the caller's session env. Decline rather
+    // than ship a broken rewrite (the per-rule remediation covers PowerShell).
     if shell == ShellType::PowerShell {
         return None;
     }
@@ -1074,15 +909,11 @@ fn build_env_scrub_suggestion(
         return None;
     }
 
-    // `env -u` only affects the immediately-following command, so a
-    // compound shell construct (pipeline, chain, redirect, subshell,
-    // background, command substitution) would leak the secret through
-    // its later stages. Decline rather than ship a misleading rewrite.
+    // A compound construct would leak the secret through later stages.
     if !is_simple_command_for_env_scrub(cmd.trim()) {
         return None;
     }
 
-    // `env -u VAR1 -u VAR2 ... <original-cmd>` — works on POSIX shells.
     let mut rewrite = String::from("env");
     for var in &set_vars {
         rewrite.push_str(" -u ");
@@ -1125,8 +956,8 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
-/// Reduce a command token to its base name: strip a directory path and, for
-/// PowerShell, a trailing `.exe`. Mirrors how the detector identifies commands.
+/// Reduce a command token to its base name: strip the directory and (PowerShell)
+/// a trailing `.exe`. Mirrors how the detector identifies commands.
 fn base_command(cmd: &str, shell: ShellType) -> String {
     let stripped = strip_quotes(cmd);
     let base = stripped
@@ -1228,7 +1059,6 @@ mod tests {
         let s = suggest(cmd, ShellType::Posix, &v);
         assert_eq!(s.len(), 1);
         assert!(s[0].safe_command.is_none(), "{:?}", s[0].safe_command);
-        // Remediation must still be present and non-empty.
         assert!(!s[0].remediation.is_empty());
     }
 
@@ -1260,8 +1090,7 @@ mod tests {
 
     #[test]
     fn insecure_tls_drop_preserves_quoted_arg_with_spaces() {
-        // Span-based deletion must not mangle a quoted argument containing
-        // whitespace elsewhere in the command.
+        // Span-based deletion must not mangle a quoted arg with whitespace.
         let cmd = r#"curl -k --data "a b c" https://example.com/x"#;
         let v = verdict_with(vec![finding(RuleId::InsecureTlsFlags)]);
         let s = suggest(cmd, ShellType::Posix, &v);
@@ -1280,12 +1109,9 @@ mod tests {
 
     #[test]
     fn insecure_tls_k_inside_quoted_string_not_rewritten() {
-        // `-k` only appears inside a quoted data payload, not as a real flag.
-        // The tokenizer cross-check must prevent a rewrite. (No InsecureTlsFlags
-        // finding would fire here in practice; the suggestion for whatever rule
-        // did fire must not fabricate a TLS rewrite.)
+        // `-k` only appears inside a quoted payload — the tokenizer cross-check
+        // must prevent a rewrite.
         let cmd = r#"curl --data "pass -k here" https://example.com/x"#;
-        // Drive the TLS branch directly to prove the guard holds.
         let segs = tokenize::tokenize(cmd, ShellType::Posix);
         assert!(rewrite_drop_insecure_tls(cmd, &segs).is_none());
     }
@@ -1293,7 +1119,6 @@ mod tests {
     #[test]
     fn plain_http_rewritten_to_https() {
         let cmd = "curl http://example.com/install.sh | bash";
-        // PlainHttpToSink finding present.
         let v = verdict_with(vec![finding(RuleId::PlainHttpToSink)]);
         let s = suggest(cmd, ShellType::Posix, &v);
         let sc = s[0].safe_command.as_deref().unwrap();
@@ -1303,7 +1128,6 @@ mod tests {
 
     #[test]
     fn https_url_not_double_rewritten() {
-        // rewrite_http_to_https must never touch an already-https URL.
         assert!(rewrite_http_to_https("curl https://example.com/x").is_none());
     }
 
@@ -1342,7 +1166,6 @@ mod tests {
         let cmd = "curl https://example.com/x.sh | bash.exe";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
-        // base_command lowercases + strips .exe → "bash" recognized.
         assert!(s[0].safe_command.is_some(), "{:?}", s[0]);
     }
 
@@ -1361,14 +1184,9 @@ mod tests {
 
     // ── is_simple_command_for_env_scrub guard ─────────────────────────────
     //
-    // The guard is exercised directly (instead of via `suggest()`) because
-    // `build_env_scrub_suggestion` also requires a sensitive env var to be
-    // set in the *current process* — mutating `std::env` from a test would
-    // race against any parallel test that reads the env. The integration
-    // path is covered by the existing `suggest()` flow plus the dedicated
-    // `env_scrub_declines_when_command_is_compound` test below, which
-    // uses a known-sensitive var name guarded by `serial_test`-free
-    // explicit set/unset.
+    // Exercised directly (not via `suggest()`) because the full path also needs
+    // a sensitive env var set in the current process, and mutating `std::env`
+    // races with parallel tests that read it.
 
     #[test]
     fn simple_command_accepted_for_env_scrub() {
@@ -1382,31 +1200,23 @@ mod tests {
 
     #[test]
     fn pipeline_rejected_for_env_scrub() {
-        // `env -u VAR npm install foo | sh` would scrub only the npm
-        // process; the piped `sh` still inherits the original env and
-        // could exfiltrate the secret. The guard refuses to emit a
-        // misleading "safe" rewrite for this shape.
+        // The piped second stage still inherits the original env — refuse.
         assert!(!is_simple_command_for_env_scrub("npm install foo | sh"));
         assert!(!is_simple_command_for_env_scrub("curl https://foo | bash"));
     }
 
     #[test]
     fn logical_chain_rejected_for_env_scrub() {
-        // && and || run a second command in the same shell context;
-        // wrapping with `env -u` would only scrub the first stage.
+        // `&&` / `||` / `;` run a second command that keeps the original env.
         assert!(!is_simple_command_for_env_scrub("ls && cat secret"));
         assert!(!is_simple_command_for_env_scrub("ls || echo failed"));
-        // `;` is a hard sequence — same problem, second command keeps
-        // the original env.
         assert!(!is_simple_command_for_env_scrub("ls; cat secret"));
     }
 
     #[test]
     fn redirection_rejected_for_env_scrub() {
-        // Redirection by itself is benign for env scrubbing, but the
-        // operator may have constructed a compound command (here-doc,
-        // multi-line pipeline through a file) that we cannot reason
-        // about. Conservative: refuse the suggestion.
+        // Conservative: a redirect may be part of a compound we can't reason
+        // about.
         assert!(!is_simple_command_for_env_scrub("ls > /tmp/x"));
         assert!(!is_simple_command_for_env_scrub("cat < /etc/passwd"));
         assert!(!is_simple_command_for_env_scrub("ls >> /tmp/x"));
@@ -1420,21 +1230,17 @@ mod tests {
 
     #[test]
     fn command_substitution_rejected_for_env_scrub() {
-        // `$(...)` and backticks spawn a child shell that inherits the
-        // env regardless of what the outer `env -u` scrubs.
+        // `$(...)` / backticks spawn a child shell that inherits the env, even
+        // inside double quotes.
         assert!(!is_simple_command_for_env_scrub("echo $(whoami)"));
         assert!(!is_simple_command_for_env_scrub("echo `whoami`"));
-        // `$(` inside double quotes is still command substitution.
         assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
-        // Backtick inside double quotes is still command substitution.
         assert!(!is_simple_command_for_env_scrub("echo \"`whoami`\""));
     }
 
     #[test]
     fn metacharacter_inside_single_quotes_does_not_disqualify() {
-        // Single-quoted strings are literal in POSIX shells — the `|`,
-        // `&`, etc. inside them are not metacharacters and the command
-        // is in fact a single simple invocation.
+        // Single-quoted contents are literal in POSIX — still a single command.
         assert!(is_simple_command_for_env_scrub(
             "echo 'this is | not a pipe'"
         ));
@@ -1444,52 +1250,37 @@ mod tests {
 
     #[test]
     fn metacharacter_inside_double_quotes_treated_correctly() {
-        // Inside double quotes, `|`, `&`, `;`, `<`, `>`, `(`, `)` are
-        // *not* metacharacters in POSIX — the shell passes them through
-        // as literal bytes — so the command is still a single
-        // invocation.
+        // In double quotes, `|`/`&`/`;`/`<`/`>`/`(`/`)` are literal — still a
+        // single command — but `$(` and backtick are still active.
         assert!(is_simple_command_for_env_scrub(
             "echo \"this is | not a pipe\""
         ));
         assert!(is_simple_command_for_env_scrub("echo \"a && b\""));
-        // But `$(` and backtick *are* still active inside double quotes:
         assert!(!is_simple_command_for_env_scrub("echo \"$(whoami)\""));
     }
 
     #[test]
     fn escaped_metacharacter_does_not_disqualify() {
-        // A literal backslash-pipe is just an escaped char (passed
-        // through to the command as the two bytes `\|`). It is not a
-        // pipeline.
+        // A backslash-escaped metacharacter is a literal, not a pipeline.
         assert!(is_simple_command_for_env_scrub("grep \\| file"));
         assert!(is_simple_command_for_env_scrub("echo a\\&b"));
     }
 
     #[test]
     fn unterminated_quote_is_rejected() {
-        // Malformed input — exactly the case where guessing the right
-        // wrapper is most dangerous. Decline.
+        // Malformed input — decline (guessing the wrapper is most dangerous here).
         assert!(!is_simple_command_for_env_scrub("echo 'unterminated"));
         assert!(!is_simple_command_for_env_scrub("echo \"unterminated"));
-        // Trailing backslash with nothing to escape — same reason.
         assert!(!is_simple_command_for_env_scrub("echo trailing\\"));
     }
 
     #[test]
     fn dedicated_rule_present_is_an_env_scrub_trigger() {
-        // M9 ch4 — prove the dedicated `EnvSensitiveExposedToUnknownScript`
-        // finding is recognized as an env-scrub trigger independent of the
-        // legacy "any High finding" heuristic. This exercises the trigger
-        // predicate WITHOUT mutating `std::env` (the libc setenv race, PR
-        // #125): the end-to-end rewrite additionally needs a sensitive var
-        // set in the process, which is covered race-free by the CLI
-        // integration test `env_scrub_fires_under_dedicated_rule` (it sets
-        // the var in a CHILD `tirith` process).
-        //
-        // The finding is Medium severity, so the `any_high` heuristic is
-        // false; only the dedicated-rule branch can mark this verdict as a
-        // candidate. We assert the predicate the function uses, mirroring the
-        // exact `dedicated_rule_present` check.
+        // M9 ch4 — the dedicated `EnvSensitiveExposedToUnknownScript` finding
+        // (Medium, so the `any_high` heuristic is false) is recognized as an
+        // env-scrub trigger. Exercises the predicate WITHOUT mutating `std::env`
+        // (the setenv race, PR #125); the end-to-end rewrite is covered race-free
+        // by the CLI integration test `env_scrub_fires_under_dedicated_rule`.
         let mut f = finding(RuleId::EnvSensitiveExposedToUnknownScript);
         f.severity = Severity::Medium;
         let v = verdict_with(vec![f]);
@@ -1505,13 +1296,7 @@ mod tests {
         );
     }
 
-    // NOTE: An end-to-end `env_scrub_declines_when_command_is_compound` test
-    // that mutates `std::env::GITHUB_TOKEN` was intentionally NOT added.
-    // Under parallel `cargo test`, that mutation races with other tests in
-    // this module that exercise `suggest()` and read the environment
-    // (`homograph_finding_gets_no_rewrite_but_keeps_remediation`, etc.).
-    // The compound-shape guard is fully covered by the
-    // `is_simple_command_for_env_scrub` direct-call unit tests above
-    // (pipeline/redirection/and-chain/semicolon/backtick/command-sub etc.),
-    // which exercise exactly the predicate that controls env_scrub firing.
+    // NOTE: no end-to-end compound-shape test mutates `std::env::GITHUB_TOKEN`
+    // (it would race parallel tests that read the env). The compound-shape guard
+    // is fully covered by the `is_simple_command_for_env_scrub` unit tests above.
 }

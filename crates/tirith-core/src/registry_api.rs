@@ -1,30 +1,18 @@
 //! Registry-API-backed provenance signals for `tirith package risk --online`.
 //!
-//! This module is the **only** networked half of package-risk scoring, and it
-//! is reached **only** behind an explicit `--online` opt-in — never from
-//! `tirith check` or any hot path. It consults a package's registry API
-//! (the npm registry, the PyPI JSON API, or the crates.io API, selected by
-//! ecosystem) and normalizes the response into a small, registry-agnostic
-//! [`RegistryMetadata`], which [`provenance_from_metadata`] then turns into
-//! the [`ApiProvenance`](crate::package_risk::ApiProvenance) the deterministic
-//! factor model consumes.
+//! The ONLY networked half of package-risk scoring, reached only behind the
+//! explicit `--online` opt-in (never `tirith check` / any hot path). Consults a
+//! package's registry API (npm / PyPI JSON / crates.io) and normalizes the
+//! response into a registry-agnostic [`RegistryMetadata`], which
+//! [`provenance_from_metadata`] turns into the
+//! [`ApiProvenance`](crate::package_risk::ApiProvenance) the factor model
+//! consumes.
 //!
-//! ## Design
-//!
-//! * **Trait-seam for testability.** All network access goes through the
-//!   [`RegistryClient`] trait. The production [`HttpRegistryClient`] uses
-//!   `reqwest` with explicit timeouts and response-size caps (exactly as
-//!   `runner.rs` / `selfupdate.rs` do); tests inject a fixture-fed fake and
-//!   never touch the real network.
-//! * **Graceful degradation.** A failed fetch — offline, timeout, HTTP error,
-//!   an unparseable body, or an ecosystem with no supported API — is NOT a
-//!   crash and NOT a hang: it surfaces as a [`FetchError`] which the caller
-//!   maps to [`ApiSignals::Unavailable`], and the package-risk score falls
-//!   back to its offline signals with an honest reason string.
-//! * **On-disk cache with a TTL.** Successful fetches are cached under the
-//!   tirith state dir for [`CACHE_TTL_SECS`] so repeated `package risk` runs
-//!   do not hammer the registries. The cache is keyed by ecosystem + name and
-//!   self-evicts stale entries. The cache layer mirrors `threatdb_api.rs`.
+//! Design: all network access goes through the [`RegistryClient`] trait (tests
+//! inject a fixture fake). A failed fetch degrades gracefully to a [`FetchError`]
+//! → [`ApiSignals::Unavailable`] with an honest reason — never a crash or hang.
+//! Successful fetches are cached under the state dir for [`CACHE_TTL_SECS`]
+//! (mirrors `threatdb_api.rs`).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,28 +24,18 @@ use crate::package_risk::{ApiProvenance, ApiSignals, PackageExistence, VERY_NEW_
 use crate::policy;
 use crate::threatdb::Ecosystem;
 
-/// HTTP timeout for a single registry request. Short — `package risk` is an
-/// interactive command, and a degraded score beats a long hang.
+/// HTTP timeout for one registry request (short — a degraded score beats a hang).
 const REQUEST_TIMEOUT_SECS: u64 = 12;
-/// Hard cap on a registry JSON response. npm "full" package documents can be
-/// large (every version's metadata); 8 MiB is generous and still bounded.
+/// Hard cap on a registry JSON response (npm "full" docs can be large).
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 /// How long a cached registry response is reused before a fresh fetch.
 pub const CACHE_TTL_SECS: u64 = 6 * 3600;
 /// Cache files older than this are evicted opportunistically.
 const CACHE_EVICT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
-/// Seconds in a day — for age math.
 const SECONDS_PER_DAY: u64 = 86_400;
 
-// ===========================================================================
-// normalized metadata
-// ===========================================================================
-
 /// A package's registry metadata, normalized across npm / PyPI / crates.io.
-///
-/// Every field is `Option` / defaulted: a registry that does not expose a
-/// given datum simply leaves it unset, and the scorer treats an unset datum as
-/// "no signal" rather than inventing one.
+/// Every field is `Option`/defaulted; an unset datum is "no signal", not invented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegistryMetadata {
     /// Which registry the data came from (`"npm"`, `"pypi"`, `"crates.io"`).
@@ -68,18 +46,12 @@ pub struct RegistryMetadata {
     pub latest_version_unix: Option<u64>,
     /// The latest (most recent) version string, when known.
     pub latest_version: Option<String>,
-    /// The previous version string (the one before `latest_version`), used to
-    /// assess an abnormal version jump. `None` when fewer than two versions
-    /// exist.
+    /// Version before `latest_version` (for the version-jump signal). `None`
+    /// when fewer than two versions exist.
     pub previous_version: Option<String>,
-    /// The maintainer / owner identifiers the registry lists for the package.
-    ///
-    /// `Some(list)` — this registry's API exposes a maintainer / owner field
-    /// and `list` is what it carried (an empty `Some(vec![])` is a real
-    /// "registry lists zero owners" signal). `None` — this registry's API does
-    /// not carry a maintainer field at all (the PyPI JSON API and the
-    /// crates.io crate endpoint do not; the npm registry does), so ownership is
-    /// honestly *unknown*, never a false "ownership changed".
+    /// Maintainer/owner ids the registry lists. `Some(list)` = the API exposes
+    /// the field (empty = a real "zero owners" signal); `None` = the API has no
+    /// maintainer field (PyPI/crates.io), so ownership is honestly unknown.
     #[serde(default)]
     pub maintainers: Option<Vec<String>>,
     /// Total downloads over the registry's reported window, when available.
@@ -90,34 +62,23 @@ pub struct RegistryMetadata {
     pub yanked_or_deprecated: bool,
 }
 
-// ===========================================================================
-// fetch errors — every degradation path
-// ===========================================================================
-
 /// Why a registry fetch could not produce usable metadata. Every variant is a
-/// *graceful* degradation: the caller turns it into
-/// [`ApiSignals::Unavailable`] and the offline score stands.
-///
-/// Note there is no `Offline` variant: the `--offline` / `TIRITH_OFFLINE`
-/// decision is made by the CLI layer *before* a [`RegistryClient`] is ever
-/// consulted (it short-circuits to [`ApiSignals::Unavailable`] directly), so
-/// no fetch is attempted and no `FetchError` is produced for that case.
+/// graceful degradation → [`ApiSignals::Unavailable`]. No `Offline` variant: the
+/// `--offline` / `TIRITH_OFFLINE` decision short-circuits before any fetch.
 #[derive(Debug, Clone)]
 pub enum FetchError {
     /// The ecosystem has no registry API wired up here.
     UnsupportedEcosystem(Ecosystem),
-    /// The package name is not a safe single registry path segment — it
-    /// carries a `..` path segment or a stray `/`, either of which a URL
-    /// library would normalize into a request to a *different* registry path.
-    /// Rejected before any URL is built, so no request is ever issued.
+    /// The name carries a `..` segment / stray `/` a URL library would
+    /// normalize into a different path. Rejected before any URL is built.
     InvalidName,
-    /// A connect / timeout / transport error reaching the registry.
+    /// A connect / timeout / transport error.
     Network(String),
-    /// The registry returned a non-success HTTP status.
+    /// A non-success HTTP status.
     HttpStatus(u16),
-    /// The package was not found in the registry (HTTP 404).
+    /// The package was not found (HTTP 404).
     NotFound,
-    /// The response body could not be parsed as the expected JSON shape.
+    /// The body could not be parsed as the expected JSON shape.
     BadResponse(String),
     /// The response exceeded [`MAX_RESPONSE_BYTES`].
     TooLarge,
@@ -128,11 +89,8 @@ impl FetchError {
     pub fn reason(&self) -> String {
         match self {
             FetchError::UnsupportedEcosystem(eco) => {
-                // M6 ch1 — short, machine-friendly reason for the
-                // distro/docker/go ecosystems whose `tirith install` backends
-                // ship command-complete but signal-weak. The CLI surfaces
-                // this verbatim as `api signals: unavailable — no registry
-                // adapter for <eco>`.
+                // M6 ch1 — surfaced verbatim by the CLI as
+                // `api signals: unavailable — no registry adapter for <eco>`.
                 format!("no registry adapter for {eco}")
             }
             FetchError::InvalidName => {
@@ -165,41 +123,19 @@ impl FetchError {
     }
 }
 
-// ===========================================================================
-// the client trait — the test seam
-// ===========================================================================
-
-/// Fetches normalized registry metadata for a package. The single seam
-/// through which package-risk reaches (or does not reach) the network.
-///
-/// Production code uses [`HttpRegistryClient`]; tests inject a fake that
-/// returns fixture data, so no test ever touches the real registries.
+/// Fetches normalized registry metadata — the single seam through which
+/// package-risk reaches (or does not reach) the network. Production uses
+/// [`HttpRegistryClient`]; tests inject a fixture fake.
 pub trait RegistryClient {
-    /// Fetch metadata for `name` in `ecosystem`, or a [`FetchError`]
-    /// describing why it could not be obtained.
+    /// Fetch metadata for `name` in `ecosystem`, or a [`FetchError`].
     fn fetch(&self, ecosystem: Ecosystem, name: &str) -> Result<RegistryMetadata, FetchError>;
 }
 
-// ===========================================================================
-// gather — metadata → ApiSignals
-// ===========================================================================
-
-/// Gather registry-API provenance for a package using `client`, returning the
-/// [`ApiSignals`] AND the [`PackageExistence`] (M6 ch6).
-///
-/// `PackageExistence` is honestly distinct from `ApiSignals::Unavailable`: a
-/// positive HTTP 404 sets `NotFound`, every other failure (transport,
-/// timeout, unsupported registry) sets `Unknown`. Successful fetches always
-/// set `Exists`. Callers fold the existence value into the provenance
-/// (`ApiProvenance::package_existence`) before scoring.
-///
-/// Side effect (best-effort, M6 ch6): on a successful fetch this also writes
-/// one snapshot row to [`crate::registry_history`] using the fetched data —
-/// no extra request, just reuse.
-///
-/// On any [`FetchError`] the returned `ApiSignals` is `Unavailable` with an
-/// honest reason. This function never panics and never blocks beyond the
-/// client's own timeout.
+/// Gather registry-API provenance, returning [`ApiSignals`] AND
+/// [`PackageExistence`] (M6 ch6). 404 → `NotFound`, other failures → `Unknown`,
+/// success → `Exists`. Best-effort side effect: a successful fetch also records
+/// one [`crate::registry_history`] snapshot (no extra request). Never panics or
+/// blocks beyond the client timeout.
 pub fn gather_api_signals(
     client: &dyn RegistryClient,
     ecosystem: Ecosystem,
@@ -207,8 +143,7 @@ pub fn gather_api_signals(
 ) -> (ApiSignals, PackageExistence) {
     match client.fetch(ecosystem, name) {
         Ok(meta) => {
-            // M6 ch6 — record a snapshot from this fetched response. Reuses the
-            // existing API response; no extra request is made.
+            // M6 ch6 — record a snapshot from this response (no extra request).
             let maintainers: Vec<crate::package_risk::MaintainerRef> = meta
                 .maintainers
                 .as_ref()
@@ -246,10 +181,8 @@ pub fn gather_api_signals(
     }
 }
 
-/// Turn normalized [`RegistryMetadata`] into [`ApiProvenance`] — the
-/// already-decided signal booleans the deterministic factor model consumes.
-///
-/// Pure: no I/O, no clock beyond `now`-derived ages. Exhaustively unit-tested.
+/// Turn normalized [`RegistryMetadata`] into the [`ApiProvenance`] signal
+/// booleans the factor model consumes. Pure (no I/O beyond `now`-derived ages).
 pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     let now = unix_now();
 
@@ -260,19 +193,12 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         .latest_version_unix
         .map(|t| now.saturating_sub(t) / SECONDS_PER_DAY);
 
-    // Ownership signal — assessed ONLY when the registry actually exposes a
-    // maintainer / owner field (`maintainers` is `Some`). A single registry API
-    // call carries the *current* maintainer set, not its history, so a literal
-    // "transfer" cannot be proven from one document; what *is* a real,
-    // detectable red flag is a published package the registry lists with
-    // **zero** maintainers (an established package that lost all listed
-    // owners). A very new package is excluded — its lack of a settled owner
-    // set is just newness, not a transfer.
-    //
-    // For a registry whose API does not carry maintainers at all (PyPI,
-    // crates.io here), `maintainers` is `None` and this is `None` — honestly
-    // unknown — never a false `Some(true)` inferred from an unavoidably-empty
-    // list.
+    // Ownership signal — assessed only when the registry exposes maintainers
+    // (`Some`). One document carries the current set, not history, so a transfer
+    // can't be proven; the real red flag is an ESTABLISHED package the registry
+    // lists with ZERO owners (a very new ownerless package is just new). When
+    // the API carries no maintainer field (PyPI/crates.io → `None`), this stays
+    // `None` (honestly unknown), never a false `Some(true)`.
     let ownership_transferred = match &meta.maintainers {
         None => None,
         Some(list) => match (list.is_empty(), package_age_days) {
@@ -287,20 +213,19 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
         _ => None,
     };
 
-    // `None` (the registry API has no repository field) is distinct from
-    // `Some(false)` (the field exists but holds no usable URL).
+    // `None` (no repository field) is distinct from `Some(false)` (field
+    // present, no usable URL).
     let has_source_repo = meta.repository_url.as_deref().map(is_usable_repo_url);
 
-    // Carry the repository URL on the provenance ONLY when it parses as a
-    // usable URL — `PackageRepoMismatch` and the snapshot store both want a
-    // URL that can plausibly be fetched, not the raw, possibly-empty field.
+    // Carry the repo URL only when it parses as usable (callers want a fetchable
+    // URL, not the raw field).
     let repository_url = meta
         .repository_url
         .as_deref()
         .filter(|u| is_usable_repo_url(u))
         .map(|s| s.to_string());
 
-    #[allow(deprecated)] // M6 ch6 grace period — the field is still emitted
+    #[allow(deprecated)] // M6 ch6 grace period
     ApiProvenance {
         source: meta.source.clone(),
         package_age_days,
@@ -316,22 +241,18 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
     }
 }
 
-/// `true` when the jump from `prev` to `latest` looks abnormal: a major-version
-/// increase of 2 or more (e.g. `1.x` → `9.x`). A normal release bumps the
-/// major version by at most 1; a hijacked release commonly ships a wildly
-/// inflated version to capture a broad semver range.
+/// `true` when `prev`→`latest` is an abnormal major-version jump of ≥2 (a
+/// hijacked release commonly inflates the version to capture a broad range).
 fn is_version_spike(prev: &str, latest: &str) -> bool {
     let prev_major = leading_number(prev);
     let latest_major = leading_number(latest);
     match (prev_major, latest_major) {
         (Some(p), Some(l)) => l >= p.saturating_add(2),
-        // If either version is unparseable we cannot assert a spike.
-        _ => false,
+        _ => false, // unparseable → no spike
     }
 }
 
-/// Parse the leading integer of a version string (the major component).
-/// `"1.2.3"` → `Some(1)`, `"v2.0"` → `Some(2)`, `"abc"` → `None`.
+/// Parse the leading integer (major component) of a version string.
 fn leading_number(v: &str) -> Option<u64> {
     let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
     let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -350,7 +271,7 @@ fn is_usable_repo_url(url: &str) -> bool {
         return false;
     }
     let lower = u.to_lowercase();
-    // Must look like a URL or a `git+`/`scp`-style remote.
+    // A URL or a git+/scp-style remote.
     let looks_like_url = lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("git://")
@@ -367,24 +288,18 @@ fn is_usable_repo_url(url: &str) -> bool {
     !placeholders.iter().any(|p| lower.contains(p))
 }
 
-// ===========================================================================
-// the production HTTP client
-// ===========================================================================
-
-/// Default registry base URLs. The per-registry path (`/<name>`,
-/// `/pypi/<name>/json`, `/api/v1/crates/<name>`) is appended in the fetchers.
+/// Default registry base URLs (the per-registry path is appended in fetchers).
 const NPM_BASE: &str = "https://registry.npmjs.org";
 const PYPI_BASE: &str = "https://pypi.org";
 const CRATES_BASE: &str = "https://crates.io";
 
-/// The production [`RegistryClient`]: a `reqwest` blocking client with an
-/// explicit timeout and a response-size cap, plus an on-disk TTL cache.
+/// The production [`RegistryClient`]: a `reqwest` blocking client with a
+/// timeout + response-size cap, plus an on-disk TTL cache.
 pub struct HttpRegistryClient {
     timeout: Duration,
-    /// When `false`, the on-disk cache is bypassed (used by tests).
+    /// When `false`, the on-disk cache is bypassed (tests).
     use_cache: bool,
-    /// Registry base URLs, overridable so an integration test can point the
-    /// real HTTP + parsing path at a local mock server (no real network).
+    /// Base URLs, overridable so a test can point the real HTTP path at a mock.
     npm_base: String,
     pypi_base: String,
     crates_base: String,
@@ -408,8 +323,7 @@ impl HttpRegistryClient {
         Self::default()
     }
 
-    /// A client with caching disabled — for tests that must not read or write
-    /// the shared on-disk cache.
+    /// A client with caching disabled (for tests that must not touch the cache).
     pub fn without_cache() -> Self {
         HttpRegistryClient {
             use_cache: false,
@@ -417,9 +331,8 @@ impl HttpRegistryClient {
         }
     }
 
-    /// Point all three registry base URLs at `base` and disable the on-disk
-    /// cache. For integration tests that drive the real HTTP + JSON-parsing
-    /// path against a local mock server — never the real registries.
+    /// Point all base URLs at `base` and disable the cache — for integration
+    /// tests against a local mock server.
     pub fn with_base_url_for_test(base: &str) -> Self {
         HttpRegistryClient {
             use_cache: false,
@@ -445,8 +358,7 @@ impl HttpRegistryClient {
             )
             .header("Accept", "application/json")
             .send()
-            // A connect / timeout / transport error all degrade the same way:
-            // graceful fallback to the offline score.
+            // Connect/timeout/transport all degrade to the offline score.
             .map_err(|e| FetchError::Network(e.to_string()))?;
 
         let status = resp.status();
@@ -457,7 +369,7 @@ impl HttpRegistryClient {
             return Err(FetchError::HttpStatus(status.as_u16()));
         }
 
-        // Fast-reject via Content-Length before reading the body.
+        // Fast-reject via Content-Length first.
         if let Some(len) = resp.content_length() {
             if len > MAX_RESPONSE_BYTES {
                 return Err(FetchError::TooLarge);
@@ -478,18 +390,14 @@ impl HttpRegistryClient {
 
 impl RegistryClient for HttpRegistryClient {
     fn fetch(&self, ecosystem: Ecosystem, name: &str) -> Result<RegistryMetadata, FetchError> {
-        // Reject a name that is not a safe registry path segment BEFORE any URL
-        // is built or any cache key is derived. A name carrying a `..` segment
-        // (e.g. `../../../x`) is interpolated straight into the registry URL,
-        // and `reqwest` / the `url` crate normalize the `..` away — turning the
-        // request into a GET against an arbitrary same-host path. `name` can
-        // come from untrusted manifest content under `ecosystem scan --online`,
-        // so this is a path-traversal sink; reject it up front.
+        // Reject an unsafe name BEFORE any URL is built. `name` can come from
+        // untrusted manifest content (`ecosystem scan --online`), and a `..`
+        // segment would be normalized into a GET against an arbitrary same-host
+        // path — a path-traversal sink.
         if !is_safe_registry_name(name) {
             return Err(FetchError::InvalidName);
         }
 
-        // Cache hit?
         if self.use_cache {
             if let Some(cached) = load_cache(ecosystem, name) {
                 return Ok(cached);
@@ -512,12 +420,8 @@ impl RegistryClient for HttpRegistryClient {
 
 // --- npm registry ----------------------------------------------------------
 
-/// Fetch and normalize a package document from the npm registry.
-///
-/// `https://registry.npmjs.org/<name>` returns a "full" package document with
-/// a `time` map (publish timestamp per version, plus `created`/`modified`), a
-/// `versions` map, a `maintainers` list, a `dist-tags.latest`, and a
-/// `deprecated` marker on the latest version.
+/// Fetch and normalize an npm "full" package document (`time`, `versions`,
+/// `maintainers`, `dist-tags.latest`, per-version `deprecated`).
 fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
     let url = format!("{}/{}", client.npm_base, url_path_segment(name));
     let bytes = client.get_json_bytes(&url)?;
@@ -544,8 +448,7 @@ fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata
         .as_ref()
         .and_then(|latest| previous_version_key(doc.versions.keys(), latest));
 
-    // The latest version is "deprecated" when its version object carries a
-    // non-empty `deprecated` field.
+    // Deprecated when the latest version object has a non-empty `deprecated`.
     let yanked_or_deprecated = latest_version
         .as_ref()
         .and_then(|v| doc.versions.get(v))
@@ -560,13 +463,9 @@ fn fetch_npm(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata
         latest_version_unix,
         latest_version,
         previous_version,
-        // The npm registry DOES expose a `maintainers` field — `Some(list)`,
-        // so the ownership signal is meaningful for npm packages (even an
-        // empty list is a real "zero listed owners" signal).
+        // npm exposes `maintainers` → `Some` (an empty list is a real signal).
         maintainers: Some(doc.maintainers.into_iter().filter_map(|m| m.name).collect()),
-        // The full npm document does not carry download counts; that is a
-        // separate api.npmjs.org endpoint. We deliberately do not make a
-        // second request — `recent_downloads` stays `None` (no signal).
+        // Download counts are a separate endpoint; no second request.
         recent_downloads: None,
         repository_url,
         yanked_or_deprecated,
@@ -634,12 +533,8 @@ impl NpmRepository {
 
 // --- PyPI JSON API ---------------------------------------------------------
 
-/// Fetch and normalize a package from the PyPI JSON API.
-///
-/// `https://pypi.org/pypi/<name>/json` returns `info` (with `version`,
-/// `yanked`, a `project_urls` map, and a top-level `yanked` flag), and a
-/// `releases` map of version → list of file records each carrying an
-/// `upload_time_iso_8601` and a per-file `yanked` flag.
+/// Fetch and normalize from the PyPI JSON API (`info` with `version`/`yanked`/
+/// `project_urls`, and a `releases` map of file records with upload times).
 fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
     let url = format!("{}/pypi/{}/json", client.pypi_base, url_path_segment(name));
     let bytes = client.get_json_bytes(&url)?;
@@ -648,7 +543,7 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
 
     let latest_version = doc.info.version.clone();
 
-    // First publication = the earliest upload time across all releases.
+    // First publication = earliest upload time across all releases.
     let mut earliest: Option<u64> = None;
     let mut latest_ver_unix: Option<u64> = None;
     for (ver, files) in &doc.releases {
@@ -670,8 +565,7 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
         .as_ref()
         .and_then(|latest| previous_version_key(doc.releases.keys(), latest));
 
-    // Latest version is yanked when the top-level `info.yanked` is true, or
-    // every file of the latest release carries `yanked: true`.
+    // Yanked when `info.yanked`, or every file of the latest release is yanked.
     let latest_files_yanked = latest_version
         .as_ref()
         .and_then(|v| doc.releases.get(v))
@@ -679,9 +573,7 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
         .unwrap_or(false);
     let yanked_or_deprecated = doc.info.yanked.unwrap_or(false) || latest_files_yanked;
 
-    // Repository URL: PyPI carries `info.project_urls` (a free-form map) and a
-    // legacy `info.home_page`. Prefer a project_urls entry whose key names a
-    // source repo; fall back to home_page.
+    // Prefer a `project_urls` entry naming a source repo; fall back to home_page.
     let repository_url = doc
         .info
         .project_urls
@@ -695,10 +587,7 @@ fn fetch_pypi(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadat
         latest_version_unix: latest_ver_unix,
         latest_version,
         previous_version,
-        // PyPI's JSON API does not expose maintainers in a stable machine
-        // form, nor download counts (that is the separate pypistats service).
-        // `maintainers` is `None` — the field is absent — so the ownership
-        // signal is honestly reported as unknown, not falsely inferred.
+        // PyPI's JSON API exposes no maintainers / downloads → `None` (unknown).
         maintainers: None,
         recent_downloads: None,
         repository_url,
@@ -727,8 +616,8 @@ struct PypiFile {
     yanked: Option<bool>,
 }
 
-/// Pick a source-repository URL from a PyPI `project_urls` map: prefer a key
-/// that names a source repo, else any GitHub/GitLab-looking value.
+/// Pick a source-repo URL from `project_urls`: prefer a repo-named key, else any
+/// GitHub/GitLab-looking value.
 fn pick_repo_url(urls: &std::collections::BTreeMap<String, String>) -> Option<String> {
     const REPO_KEYS: &[&str] = &["source", "repository", "code", "github", "source code"];
     for (k, v) in urls {
@@ -747,11 +636,8 @@ fn pick_repo_url(urls: &std::collections::BTreeMap<String, String>) -> Option<St
 
 // --- crates.io API ---------------------------------------------------------
 
-/// Fetch and normalize a crate from the crates.io API.
-///
-/// `https://crates.io/api/v1/crates/<name>` returns a `crate` object (with
-/// `created_at`, `updated_at`, `newest_version`, `downloads`, `repository`)
-/// and a `versions` array (each with `num`, `created_at`, `yanked`).
+/// Fetch and normalize a crate from the crates.io API (a `crate` object +
+/// `versions` array of `{num, created_at, yanked}`).
 fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetadata, FetchError> {
     let url = format!(
         "{}/api/v1/crates/{}",
@@ -770,7 +656,7 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
 
     let latest_version = doc.krate.newest_version.clone();
 
-    // Latest version's publish time + yanked flag from the `versions` array.
+    // Latest version's publish time + yanked flag from `versions`.
     let latest_ver = latest_version
         .as_ref()
         .and_then(|v| doc.versions.iter().find(|cv| cv.num.as_ref() == Some(v)));
@@ -791,9 +677,7 @@ fn fetch_crates(client: &HttpRegistryClient, name: &str) -> Result<RegistryMetad
         latest_version_unix,
         latest_version,
         previous_version,
-        // crates.io does not list per-crate owners on this endpoint (owners
-        // are a separate endpoint); `maintainers` is `None` so the ownership
-        // signal is honestly unknown for crates.
+        // Owners are a separate endpoint → `maintainers: None` (unknown).
         maintainers: None,
         recent_downloads: doc.krate.downloads,
         repository_url: doc.krate.repository,
@@ -828,22 +712,11 @@ struct CratesVersion {
 // shared helpers
 // ===========================================================================
 
-/// Whether `name` is a package name that can be safely interpolated into a
-/// registry URL path. This is a *security* gate, not a full name validator:
-/// it rejects exactly the shapes a URL library would re-interpret.
-///
-/// Rejected:
-///  * a `..` (or `.`) path segment — `url` / `reqwest` collapse `..` during
-///    normalization, so `../../../x` would request a *different* URL path
-///    (a same-host path-traversal);
-///  * an empty path segment (a leading / trailing / doubled `/`);
-///  * more than one `/`, or a single `/` on a name that is not an npm scope
-///    (`@scope/pkg`) — npm scoped names are the only registry names this
-///    module fetches that legitimately contain a `/`; PyPI and crates.io
-///    names never do.
-///
-/// A name that passes still goes through [`url_path_segment`], which
-/// percent-encodes every other non-URL-safe byte.
+/// Whether `name` can be safely interpolated into a registry URL path. A
+/// SECURITY gate (not a full validator): rejects a `.`/`..` segment (which a
+/// URL library would collapse into a same-host traversal), an empty segment,
+/// and any `/` except a single one on an npm scope (`@scope/pkg`). A passing
+/// name still goes through [`url_path_segment`].
 fn is_safe_registry_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -852,24 +725,18 @@ fn is_safe_registry_name(name: &str) -> bool {
     if slash_count > 1 {
         return false;
     }
-    // A single `/` is allowed only for an npm scope: `@scope/pkg`.
+    // A single `/` is allowed only for an npm scope.
     if slash_count == 1 && !name.starts_with('@') {
         return false;
     }
-    // No segment may be empty (catches leading/trailing/doubled `/`), and no
-    // segment may be a `.` / `..` relative-path component.
+    // No empty segment, no `.`/`..` relative component.
     name.split('/')
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// Percent-encode a package name for use as a single URL path segment.
-/// Scoped npm names (`@scope/pkg`) keep their `/` — the npm registry expects
-/// `@scope%2fpkg` actually, but a plain `@scope/pkg` path also resolves; we
-/// encode everything that is not URL-safe and leave `/` so a scoped path works.
-///
-/// Precondition: `name` has already passed [`is_safe_registry_name`]. This
-/// function does *not* collapse `..`, so passing an unvalidated name through
-/// it would leave a path-traversal sequence intact in the URL.
+/// Percent-encode a name as a URL path segment (scoped npm names keep their
+/// `/`). PRECONDITION: `name` has passed [`is_safe_registry_name`] — this does
+/// NOT collapse `..`, so an unvalidated name would leave a traversal intact.
 fn url_path_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -886,7 +753,7 @@ fn url_path_segment(name: &str) -> String {
     out
 }
 
-/// Parse an RFC-3339 / ISO-8601 timestamp to Unix epoch seconds.
+/// Parse an RFC-3339 timestamp to Unix epoch seconds.
 fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
     let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
     let secs = dt.timestamp();
@@ -897,16 +764,14 @@ fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
     }
 }
 
-/// Of a set of version-key strings, return the lexically-greatest by
-/// (major, minor, patch) numeric order — a best-effort "newest version" when
-/// the registry does not give an explicit latest tag.
+/// Greatest version key by `(major, minor, patch)` — a best-effort "newest"
+/// when the registry gives no explicit latest tag.
 fn newest_version_key<'a, I: Iterator<Item = &'a String>>(keys: I) -> Option<String> {
     keys.max_by(|a, b| version_tuple(a).cmp(&version_tuple(b)))
         .cloned()
 }
 
-/// Return the version key immediately *below* `latest` in numeric order — the
-/// previous release. `None` when no such key exists.
+/// The version key immediately below `latest` (the previous release).
 fn previous_version_key<'a, I: Iterator<Item = &'a String>>(
     keys: I,
     latest: &str,
@@ -917,8 +782,8 @@ fn previous_version_key<'a, I: Iterator<Item = &'a String>>(
         .cloned()
 }
 
-/// Decompose a version string into a comparable `(major, minor, patch)` tuple.
-/// Unparseable components become 0, so comparison is total and never panics.
+/// Decompose a version into a comparable `(major, minor, patch)` (unparseable
+/// components → 0, so comparison is total).
 fn version_tuple(v: &str) -> (u64, u64, u64) {
     let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
     let mut it = v.split(['.', '-', '+']);
@@ -937,9 +802,7 @@ fn parse_leading_u64(s: &str) -> Option<u64> {
     }
 }
 
-// ===========================================================================
 // on-disk cache (mirrors threatdb_api.rs)
-// ===========================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -947,7 +810,7 @@ struct CacheEnvelope {
     value: RegistryMetadata,
 }
 
-/// Resolve the cache file path for a package, under the tirith state dir.
+/// Cache file path for a package, under the tirith state dir.
 fn cache_path(ecosystem: Ecosystem, name: &str) -> Option<PathBuf> {
     let state = policy::state_dir()?;
     let key = format!("{ecosystem}:{name}");
@@ -971,8 +834,8 @@ fn load_cache(ecosystem: Ecosystem, name: &str) -> Option<RegistryMetadata> {
     Some(envelope.value)
 }
 
-/// Store a fetched `RegistryMetadata` in the cache. Best-effort: any I/O error
-/// is silently ignored — the cache is a performance convenience only.
+/// Store a fetched `RegistryMetadata` in the cache. Best-effort (I/O errors
+/// ignored — the cache is a performance convenience).
 fn store_cache(ecosystem: Ecosystem, name: &str, value: &RegistryMetadata) {
     let Some(path) = cache_path(ecosystem, name) else {
         return;
@@ -996,8 +859,8 @@ fn store_cache(ecosystem: Ecosystem, name: &str, value: &RegistryMetadata) {
 
 static EVICTION_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Opportunistically purge cache files older than [`CACHE_EVICT_MAX_AGE_SECS`].
-/// Runs at most once per process (a cheap stat-only scan).
+/// Purge cache files older than [`CACHE_EVICT_MAX_AGE_SECS`], at most once per
+/// process (stat-only scan).
 fn evict_stale_cache_once(cache_dir: &std::path::Path) {
     if EVICTION_RAN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1037,7 +900,7 @@ mod tests {
     use super::*;
     use crate::package_risk::LOW_DOWNLOAD_THRESHOLD;
 
-    /// A fixture-fed [`RegistryClient`] — the test seam. No network.
+    /// A fixture-fed [`RegistryClient`] — no network.
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
     }
@@ -1107,7 +970,7 @@ mod tests {
 
     #[test]
     fn unsupported_ecosystem_degrades_gracefully() {
-        // Go has no registry API wired up — must be a graceful Unavailable.
+        // Go has no registry API — a graceful Unavailable.
         let err = FetchError::UnsupportedEcosystem(Ecosystem::Go);
         assert!(err.reason().contains("go"));
         let client = FakeClient {
@@ -1185,7 +1048,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn ownership_transfer_inferred_for_ownerless_old_package() {
-        // npm-shaped: `maintainers` is `Some` (the field exists) but empty.
+        // npm-shaped: `maintainers` is `Some` but empty.
         let mut m = meta_clean();
         m.maintainers = Some(Vec::new());
         m.created_unix = Some(unix_now() - 3650 * SECONDS_PER_DAY);
@@ -1194,8 +1057,7 @@ mod tests {
             Some(true),
             "an established npm package with no listed owners is flagged"
         );
-        // A very new ownerless package is NOT a transfer (just new) — the
-        // signal does not fire (`Some(false)`), so it adds no factor.
+        // A very new ownerless package is just new, not a transfer.
         m.created_unix = Some(unix_now() - 2 * SECONDS_PER_DAY);
         assert_eq!(
             provenance_from_metadata(&m).ownership_transferred,
@@ -1207,9 +1069,8 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn ownership_unknown_when_registry_omits_maintainers() {
-        // A PyPI / crates.io-shaped response: `maintainers` is `None` — the
-        // registry API has no maintainer field — so an ownerless package must
-        // NOT be read as an ownership transfer; it is honestly unknown.
+        // PyPI/crates.io-shaped: `maintainers` is `None`, so an ownerless package
+        // is honestly unknown, not a transfer.
         let mut m = meta_clean();
         m.maintainers = None;
         m.created_unix = Some(unix_now() - 3650 * SECONDS_PER_DAY);
@@ -1245,7 +1106,6 @@ mod tests {
 
     #[test]
     fn npm_doc_parses_real_shape() {
-        // A trimmed-but-realistic npm full-document.
         let json = r#"{
             "dist-tags": { "latest": "2.0.0" },
             "time": {
@@ -1318,7 +1178,7 @@ mod tests {
     fn url_path_segment_encodes_unsafe_chars() {
         assert_eq!(url_path_segment("react"), "react");
         assert_eq!(url_path_segment("@scope/pkg"), "@scope/pkg");
-        // A space is not URL-safe and must be encoded.
+        // A space must be encoded.
         assert_eq!(url_path_segment("bad name"), "bad%20name");
     }
 
@@ -1328,14 +1188,13 @@ mod tests {
         assert!(is_safe_registry_name("@scope/pkg"));
         assert!(is_safe_registry_name("lodash.merge"));
         assert!(is_safe_registry_name("some-crate_name"));
-        // A literal `..` substring with no surrounding `/` is a name
-        // component, not a path-traversal segment — kept.
+        // A `..` substring without a surrounding `/` is a name component, kept.
         assert!(is_safe_registry_name("a..b"));
     }
 
     #[test]
     fn safe_registry_name_rejects_path_traversal() {
-        // F2: a `..` path segment must be rejected before any URL is built.
+        // F2: a `..` path segment is rejected before any URL is built.
         assert!(!is_safe_registry_name("../../../x"));
         assert!(!is_safe_registry_name(".."));
         assert!(!is_safe_registry_name("react/.."));
@@ -1352,11 +1211,8 @@ mod tests {
 
     #[test]
     fn fetch_rejects_traversal_name_without_a_request() {
-        // F2 end-to-end: a `../../../x` name fed to the production client must
-        // short-circuit to `InvalidName` BEFORE any URL is constructed — the
-        // guard runs ahead of the network, so this test issues no request.
-        // (A real fetch for a valid name would hit the network; an invalid
-        // name never reaches that path.)
+        // F2 end-to-end: a traversal name short-circuits to `InvalidName` before
+        // any URL is built, so this test issues no request.
         let client = HttpRegistryClient::without_cache();
         let err = client
             .fetch(Ecosystem::Npm, "../../../etc/passwd")
@@ -1381,12 +1237,8 @@ mod tests {
 
     #[test]
     fn cache_envelope_tolerates_old_maintainers_shape() {
-        // The on-disk cache is best-effort and TTL'd, so the `maintainers` /
-        // `maintainers_known` -> `maintainers: Option<Vec<String>>` shape
-        // change must not hard-fail a stale entry. An old envelope carried a
-        // `maintainers` array and a now-removed `maintainers_known` bool: the
-        // array still deserializes into `Some(list)` and the unknown field is
-        // ignored, so the cache load succeeds (no needless re-fetch).
+        // A stale entry from the old `maintainers` + `maintainers_known` shape
+        // must still deserialize (array → `Some(list)`, unknown field ignored).
         let old = r#"{
             "fetched_at": 1700000000,
             "value": {
@@ -1403,8 +1255,7 @@ mod tests {
             Some(vec!["alice".to_string(), "bob".to_string()])
         );
 
-        // An envelope with no `maintainers` field at all defaults to `None`
-        // (the registry-omits-the-field case) — never a panic.
+        // An envelope with no `maintainers` field defaults to `None`.
         let no_field = r#"{
             "fetched_at": 1700000000,
             "value": { "source": "pypi", "yanked_or_deprecated": false }

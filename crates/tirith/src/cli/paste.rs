@@ -41,7 +41,7 @@ pub fn run(
         }
     };
 
-    // Lossy is fine here — raw bytes are preserved separately for byte-scan rules.
+    // Lossy is fine — raw bytes are preserved separately for byte-scan rules.
     let input = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let interactive = if interactive_flag {
@@ -62,25 +62,11 @@ pub fn run(
         }
     });
 
-    // M12 ch1 — G1 TOCTOU fix, completed with the tri-state. ONLY `--with-source`
-    // consults the companion `clipboard_source.json`, and it reads it EXACTLY
-    // ONCE: the same in-memory record feeds BOTH the engine (which fires
-    // `paste_source_mismatch`) and the `--with-source` display below. The result
-    // is mapped to a `ClipboardSourceState` so the engine can tell "the CLI tried
-    // and found nothing" (`AbsentOrInvalid`) apart from "the CLI never looked"
-    // (`Unread`):
-    //
-    //   * `--with-source` + record found → `Loaded(rec)`; the engine uses this
-    //     exact record, so the displayed `clipboard_source` and the finding can
-    //     never disagree after a fast copy-paste-copy.
-    //   * `--with-source` + nothing found → `AbsentOrInvalid`; the engine must NOT
-    //     re-read disk. Previously this collapsed to `None`, and the engine then
-    //     re-read the file — so a sidecar WRITTEN between the CLI's read and the
-    //     engine's could fire `paste_source_mismatch` while the CLI showed "no
-    //     source". The tri-state closes that window.
-    //   * no `--with-source` → `Unread`; the CLI did not consult the sidecar and
-    //     does not display it, so the engine reads it once itself (the historical
-    //     plain-`tirith paste` behavior, unchanged).
+    // M12 ch1 G1 TOCTOU fix: only `--with-source` reads `clipboard_source.json`, and
+    // exactly ONCE — the same record feeds both the engine (paste_source_mismatch) and
+    // the display below. The tri-state lets the engine distinguish "CLI looked and found
+    // nothing" (`AbsentOrInvalid`, must NOT re-read disk) from "CLI never looked"
+    // (`Unread`, engine reads once itself — the plain `tirith paste` path).
     let display_record = if with_source {
         tirith_core::clipboard::read_source_record()
     } else {
@@ -112,49 +98,28 @@ pub fn run(
         clipboard_source: clipboard_source_state,
     };
 
-    // PR #121 fix-list item 18 (mirrors `install.rs:760` / `check.rs`):
-    // single policy snapshot for analysis + enforcement + audit. Pre-fix
-    // `engine::analyze` discovered policy internally, then the surrounding
-    // code re-ran `Policy::discover` for the `apply_agent_rules` /
-    // `filter_findings_by_paranoia` / audit calls below. A change to
-    // `.tirith/policy.yaml` between the two reads then routed detection
-    // and enforcement against inconsistent policies — a TOCTOU window.
-    // `analyze_returning_policy` returns the same snapshot the engine
-    // used so the rest of this function works against ONE policy.
+    // PR #121 item 18: one policy snapshot for analysis + enforcement + audit, to
+    // close the TOCTOU window where a `.tirith/policy.yaml` change between two
+    // `Policy::discover` reads routed detection and enforcement against different policies.
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
 
-    // M4 item 8: best-effort origin attribution for the paste path. The CLI
-    // is the only place that knows whether the caller looked like a human,
-    // an agent (via TIRITH_INTEGRATION), or a CI runner. The audit entry
-    // below picks the origin up automatically.
+    // M4 item 8: origin attribution — the CLI is the only layer that knows whether the
+    // caller was a human, an agent (TIRITH_INTEGRATION), or CI. The audit below picks it up.
     verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
-    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` here. The
-    // paste path does NOT route through `post_process_verdict` (the engine
-    // is the only consumer of escalation/session bookkeeping). Without
-    // this call, an operator who writes a `deny` matcher to block an
-    // untrusted agent would see deny enforce on `tirith check` but
-    // silently fail on `tirith paste` (a clipboard-poisoning hostile
-    // surface). The helper is a no-op on `Allowed`/`Unspecified`.
-    //
-    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
-    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
-    // verdict already wins and `apply_agent_rules` must NOT silently
-    // re-Block. The pin
-    // `paste_agent_rules_deny_skipped_under_tirith_bypass_today`
-    // covers this; the `check` mirror is
-    // `agent_rules_deny_skipped_under_tirith_bypass_today`.
+    // M4 item 8 ch3: enforce `agent_rules.deny` here — the paste path does NOT route
+    // through `post_process_verdict`, so without this a deny matcher would fire on
+    // `tirith check` but silently fail on `tirith paste`. M4 PR #120 fix-6 (Greptile P1):
+    // skip under bypass (TIRITH=0), mirroring check/gateway — the raw verdict already
+    // wins and apply_agent_rules must not re-Block. Pinned by
+    // `paste_agent_rules_deny_skipped_under_tirith_bypass_today`.
     if !verdict.bypass_honored {
         tirith_core::escalation::apply_agent_rules(&mut verdict, &policy);
     }
 
-    // Audit must capture full detection BEFORE paranoia filtering (ADR-13:
-    // engine always detects everything; paranoia is an output-layer filter).
-    // M4 item 8 chunk 3 — bypass-honored verdicts are now logged here too,
-    // because the engine no longer audits its own bypass path (so the CLI
-    // can stamp `agent_origin` on the verdict before the audit line
-    // is written). Pre-chunk-3 this branch SKIPPED audit when bypass was
-    // honored, trusting `analyze()` to have logged.
+    // Audit must capture full detection BEFORE paranoia filtering (ADR-13: paranoia is
+    // an output-layer filter). M4 item 8 ch3: bypass-honored verdicts are logged here too
+    // (the engine no longer audits its bypass path, so the CLI can stamp agent_origin first).
     let event_id = uuid::Uuid::new_v4().to_string();
     // Best-effort audit on the `paste` hot path — a write failure must not
     // change behavior, so the Result is intentionally dropped.
@@ -173,18 +138,11 @@ pub fn run(
     }
 
     if json {
-        // M12 ch1 — `--with-source`: enrich the JSON envelope with the attributed
-        // clipboard source (the page the paste was copied from), as EXTRA
-        // top-level keys, NOT as a Finding. Attribution only happens when the
-        // companion extension's recorded `content_sha256` matches this paste's
-        // hash; otherwise (no extension / stale record / hash mismatch) we report
-        // a `clipboard_source: null` so a scripted caller can tell "no source
-        // recorded" apart from a missing flag.
+        // M12 ch1 `--with-source`: add the attributed clipboard source as extra top-level
+        // JSON keys (not a Finding). `clipboard_source: null` when no extension / stale
+        // record / hash mismatch, so a caller distinguishes "no source" from a missing flag.
         let source_attribution = if with_source {
-            // Hash the ORIGINAL clipboard bytes, in lockstep with the engine's
-            // `paste_source_mismatch` rule (see `resolve_source_attribution`), so
-            // the displayed source and the finding never disagree for a non-UTF-8
-            // paste.
+            // Hash the ORIGINAL bytes, in lockstep with the engine's paste_source_mismatch.
             let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
             Some(resolve_source_attribution(raw, display_record.as_ref()))
         } else {
@@ -197,9 +155,8 @@ pub fn run(
         if output::write_human_auto(&verdict, false).is_err() {
             eprintln!("tirith: failed to write output");
         }
-        // M12 ch1 — `--with-source` in human mode: print a one-line attribution
-        // note to stderr (the structured keys live in `--json`). Graceful when no
-        // source was recorded for this paste.
+        // M12 ch1 `--with-source` human mode: a one-line stderr attribution note
+        // (structured keys live in `--json`). Graceful when no source was recorded.
         if with_source {
             let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
             match resolve_source_attribution(raw, display_record.as_ref()) {
@@ -220,24 +177,15 @@ pub fn run(
     verdict.action.exit_code()
 }
 
-/// Resolve the attributed clipboard source for this paste, if the companion
-/// extension recorded one whose `content_sha256` matches the pasted bytes.
-/// Returns a JSON object (`{source_url, source_title}`) on a match, or `null`
-/// when there is no recorded source / the hash does not match / the extension
-/// isn't installed — so `--with-source` always emits a `clipboard_source` key and
-/// a scripted caller can distinguish "matched source" from "no source recorded".
+/// Resolve the attributed clipboard source for this paste, if the companion extension
+/// recorded one whose `content_sha256` matches the pasted bytes. Returns
+/// `{source_url, source_title}` on a match, else `null` (no record / hash mismatch /
+/// no extension) so `--with-source` always emits a `clipboard_source` key.
 ///
-/// `raw` is the ORIGINAL clipboard bytes (the caller passes
-/// `ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes())`). We hash THESE,
-/// not the lossy `ctx.input` &str, so this display stays in LOCKSTEP with
-/// the `paste_source_mismatch` rule (which also hashes the raw bytes): a non-UTF-8
-/// paste must never make the displayed `clipboard_source` and the finding
-/// disagree.
-///
-/// G1 TOCTOU fix: the `record` is the SAME one already read once at the top of
-/// `run` and handed to the engine, so the displayed attribution and the
-/// `paste_source_mismatch` finding can never disagree. We do NOT re-read
-/// `clipboard_source.json` here.
+/// `raw` is the ORIGINAL bytes (not lossy `ctx.input`), hashed in LOCKSTEP with the
+/// `paste_source_mismatch` rule so display and finding never disagree on a non-UTF-8
+/// paste. `record` is the SAME one read once at the top of `run` (G1 TOCTOU fix) — we
+/// do not re-read `clipboard_source.json` here.
 fn resolve_source_attribution(
     raw: &[u8],
     record: Option<&tirith_core::clipboard::ClipboardSourceRecord>,
@@ -245,22 +193,14 @@ fn resolve_source_attribution(
     let Some(record) = record else {
         return serde_json::Value::Null;
     };
-    // Same shared comparison the engine's rule uses (`matches_bytes`), so the
-    // displayed attribution and the PasteSourceMismatch finding can never disagree
-    // (Greptile R1 #6). `raw` is the original pasted bytes, not a lossy String.
+    // Same `matches_bytes` the engine's rule uses (Greptile R1 #6), on the original bytes.
     if !record.matches_bytes(raw) {
-        // A recorded source exists, but it does NOT describe this paste (stale
-        // record / clipboard replaced). No attribution.
+        // Recorded source exists but does not describe this paste (stale / replaced).
         return serde_json::Value::Null;
     }
-    // The provenance fields originate from an arbitrary web page via the
-    // (untrusted) browser extension, so they are sanitized before being
-    // surfaced into `--json` or printed to the terminal: the URL's
-    // query/fragment/userinfo (which can carry signed-URL tokens, session ids,
-    // or email identifiers) are dropped, terminal control sequences are
-    // stripped (tirith must not itself emit the injection it detects), and both
-    // fields are length-capped. Both the human stderr path and the JSON path
-    // read these sanitized values, so no raw `source_url`/`source_title` leaks.
+    // Provenance comes from an arbitrary web page via the untrusted extension, so it is
+    // sanitized before surfacing: drop URL query/fragment/userinfo (token-bearing), strip
+    // terminal control sequences, length-cap. Both output paths read these sanitized values.
     serde_json::json!({
         "source_url": sanitize_source_url(&record.source_url),
         "source_title": sanitize_provenance_text(&record.source_title),
@@ -271,15 +211,9 @@ fn resolve_source_attribution(
 /// (potentially sensitive) page title or path can leak into logs / JSON.
 const PROVENANCE_MAX_CHARS: usize = 256;
 
-/// Neutralize one untrusted provenance string before display/logging. The
-/// `source_url` / `source_title` originate from an arbitrary web page (via the
-/// browser extension), so they run through tirith's own output sanitizer — the
-/// same `output_filter` the MCP gateway applies to error fields — which strips
-/// ANSI/OSC/APC/DCS escape sequences, bare CR, other C0 controls, DEL, and
-/// zero-width characters (tirith must never itself emit the terminal injection
-/// it exists to detect). The tabs/newlines that sanitizer legitimately keeps
-/// are then flattened to spaces for a tidy single line, and the result is
-/// length-capped.
+/// Neutralize one untrusted provenance string before display/logging. Runs through the
+/// shared `output_filter` (strips ANSI/OSC/APC/DCS, bare CR, C0 controls, DEL, zero-width),
+/// then flattens tabs/newlines to spaces and length-caps.
 fn sanitize_provenance_text(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
     tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
@@ -291,12 +225,9 @@ fn sanitize_provenance_text(s: &str) -> String {
     cap_chars(flattened.trim(), PROVENANCE_MAX_CHARS)
 }
 
-/// Redact the high-risk parts of a source URL — the query string, fragment, and
-/// any embedded `user:pass@` userinfo can carry signed-URL tokens, session ids,
-/// or email identifiers — while keeping the meaningful `scheme://host/path`
-/// provenance, then sanitize + cap it like any other provenance text. A value
-/// that does not parse as a URL is still sanitized verbatim (we never emit raw
-/// untrusted bytes) but is not structurally redacted.
+/// Redact the high-risk parts of a source URL (query, fragment, `user:pass@` userinfo —
+/// all token-bearing) while keeping `scheme://host/path`, then sanitize + cap. A value
+/// that does not parse as a URL is still sanitized verbatim, just not structurally redacted.
 fn sanitize_source_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
@@ -321,12 +252,9 @@ fn cap_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Write the paste verdict as JSON, optionally splicing a top-level
-/// `clipboard_source` key (`--with-source`). We render the verdict through the
-/// shared `output::write_json` (so the envelope shape is identical to every
-/// other JSON surface), then, only when source attribution was requested, parse
-/// it back into a `serde_json::Value` to add the extra key. Without
-/// `--with-source` this is byte-identical to `output::write_json`.
+/// Write the paste verdict as JSON, optionally splicing a top-level `clipboard_source`
+/// key (`--with-source`). Renders the shared `output::write_json` envelope, then parses
+/// it back to add the extra key. Without `--with-source` it is byte-identical to `write_json`.
 fn write_paste_json(
     verdict: &tirith_core::verdict::Verdict,
     custom_patterns: &[String],
@@ -336,19 +264,14 @@ fn write_paste_json(
     let Some(source) = source_attribution else {
         return output::write_json(verdict, custom_patterns, std::io::stdout().lock());
     };
-    // Render the canonical envelope to a buffer, then add the extra key. A parse
-    // failure here is impossible for our own serializer, but handle it by falling
-    // back to the plain envelope rather than dropping output.
+    // Render to a buffer, then add the extra key. A parse failure is unreachable for our
+    // own serializer; fall back to the plain envelope rather than dropping output.
     let mut buf = Vec::new();
     output::write_json(verdict, custom_patterns, &mut buf)?;
     let mut value: serde_json::Value = match serde_json::from_slice(&buf) {
         Ok(v) => v,
         Err(_) => {
-            // Unreachable in practice (our own serializer always emits valid
-            // JSON), but if it ever happened we must still emit newline-
-            // terminated output for line-oriented consumers. `write_json` already
-            // appended a trailing newline to `buf`; flush it, then guarantee
-            // termination explicitly rather than relying on that invariant.
+            // Still emit newline-terminated output for line-oriented consumers.
             let mut stdout = std::io::stdout().lock();
             stdout.write_all(&buf)?;
             return writeln!(stdout);
@@ -378,8 +301,7 @@ mod tests {
         }
     }
 
-    // A recorded source whose hash does NOT match the paste yields no attribution
-    // (the displayed source must stay in lockstep with the rule's verdict).
+    // A hash mismatch yields no attribution (display stays in lockstep with the rule).
     #[test]
     fn no_attribution_when_hash_mismatches() {
         let rec = record_for(b"the-real-bytes", "https://docs.example.com/x", "X");
@@ -387,9 +309,8 @@ mod tests {
         assert_eq!(v, serde_json::Value::Null);
     }
 
-    // Major (CodeRabbit): provenance comes from an untrusted page, so the URL's
-    // token-bearing query/fragment/userinfo must be stripped and any terminal
-    // control sequence in the title neutralized before either output path emits it.
+    // CodeRabbit Major: untrusted provenance — URL token-bearing parts stripped and
+    // terminal control sequences in the title neutralized before emission.
     #[test]
     fn provenance_is_sanitized_before_emission() {
         let payload = b"install-me";

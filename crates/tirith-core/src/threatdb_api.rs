@@ -202,8 +202,7 @@ fn store_cache<T: Serialize>(kind: &str, key: &str, value: &T) {
     if let Ok(serialized) = serde_json::to_vec(&envelope) {
         let _ = std::fs::write(path, serialized);
     }
-    // Opportunistic eviction: periodically purge stale cache files to prevent
-    // unbounded growth. Runs at most once per process (cheap stat-only scan).
+    // Opportunistic eviction (once per process) to bound cache growth.
     evict_stale_cache_once(&parent_owned);
 }
 
@@ -683,12 +682,8 @@ fn ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
         Ecosystem::Maven => Some("maven"),
         Ecosystem::NuGet => Some("nuget"),
         Ecosystem::Packagist => Some("packagist"),
-        // M6 ch1 — distro / docker backends have no upstream threat-feed
-        // ecosystem label today (no OSV / deps.dev / ecosystems.org
-        // equivalent), so they map to `None`. The downstream HTTP threat
-        // adapters that consult these tables fall through to "skip" for
-        // these ecosystems, which is the right no-data behavior until feed
-        // wiring extends.
+        // M6 ch1 — distro/docker backends have no upstream threat-feed label, so
+        // they map to `None` and the adapters that consult these tables skip them.
         Ecosystem::Apt
         | Ecosystem::Brew
         | Ecosystem::Dnf

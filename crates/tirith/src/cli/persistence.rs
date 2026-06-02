@@ -1,34 +1,13 @@
-//! `tirith persistence scan|watch|diff` (M9 ch2).
+//! `tirith persistence scan|watch|diff` (M9 ch2). Thin presenter over
+//! [`tirith_core::persistence`]; inventory + diff logic lives in the library.
 //!
-//! Thin presenter over [`tirith_core::persistence`]. The inventory + diff logic
-//! lives entirely in the library; this module is output, snapshot persistence,
-//! and the `watch` poll loop.
-//!
-//! ## `scan`
-//!
-//! Inventories every watched persistence surface (shell rc/profile files,
-//! `~/.ssh/{authorized_keys,config}`, `~/.gitconfig`, `~/.npmrc`, the user
-//! crontab, systemd-user units, macOS LaunchAgents, login items, `.envrc` in
-//! the cwd ancestry, git global hooks path) and prints each location + its
-//! current sha256. **Side effect:** `scan` records the inventory as the
-//! baseline snapshot at `state_dir()/persistence_snapshot.json`, so a later
-//! `diff` has a baseline to compare against. Always exits 0 (pure
-//! observability).
-//!
-//! ## `diff`
-//!
-//! Compares the live inventory against the recorded snapshot and prints, for
-//! every changed surface, only the ADDED LINES (never removed lines, never full
-//! content), already run through the shipping credential redactor in the
-//! library. Exits 1 if any High/Critical finding is present, 0 otherwise.
-//! `diff` does NOT update the snapshot — re-run `scan` to re-baseline.
-//!
-//! ## `watch`
-//!
-//! Polls every `--interval` seconds until SIGINT. Each poll diffs against the
-//! last-saved snapshot, prints any findings, then re-saves the snapshot so the
-//! next poll reports only *incremental* changes. A SIGINT handler flips an
-//! atomic flag for a clean shutdown (final summary line). Exits 0 on SIGINT.
+//! `scan` inventories every watched persistence surface (rc/profile files,
+//! ssh, gitconfig, crontab, systemd-user, LaunchAgents, etc.), prints each
+//! location + sha256, and records the baseline snapshot at
+//! `state_dir()/persistence_snapshot.json`. `diff` compares the live inventory
+//! against that snapshot and prints only credential-redacted ADDED lines (exit
+//! 1 on any High/Critical); it does not re-baseline. `watch` polls every
+//! `--interval` seconds until SIGINT, diffing then re-baselining each poll.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +23,6 @@ use super::write_json_stdout;
 pub fn scan(json: bool) -> i32 {
     let entries = persistence::scan();
 
-    // Record the baseline so a later `diff` has something to compare against.
     let snapshot = PersistenceSnapshot::from_entries(&entries);
     let snapshot_note = persist_snapshot(&snapshot);
 
@@ -113,7 +91,7 @@ pub fn watch(interval: u64, json: bool) -> i32 {
         }
     };
 
-    // Clamp the interval to a sane minimum so a `--interval 0` doesn't busy-spin.
+    // Clamp so `--interval 0` doesn't busy-spin.
     let interval = interval.max(1);
     install_sigint_handler();
 
@@ -125,8 +103,8 @@ pub fn watch(interval: u64, json: bool) -> i32 {
         );
     }
 
-    // Seed the baseline from the current inventory if none exists yet so the
-    // first poll doesn't report every present surface as "new".
+    // Seed the baseline if none exists so the first poll doesn't report every
+    // present surface as "new".
     let mut snapshot = persistence::load_snapshot(&path);
     if snapshot.entries.is_empty() {
         snapshot = PersistenceSnapshot::from_entries(&persistence::scan());
@@ -135,8 +113,7 @@ pub fn watch(interval: u64, json: bool) -> i32 {
 
     let mut polls: u64 = 0;
     while !STOP.load(Ordering::Relaxed) {
-        // Sleep in 200ms slices so Ctrl-C is responsive even with a long
-        // interval, instead of blocking the whole interval in one sleep.
+        // Sleep in 200ms slices so Ctrl-C stays responsive on a long interval.
         let mut slept = Duration::ZERO;
         let step = Duration::from_millis(200);
         let target = Duration::from_secs(interval);
@@ -152,10 +129,8 @@ pub fn watch(interval: u64, json: bool) -> i32 {
         let current = persistence::scan();
         let findings = persistence::diff_entries(&current, &snapshot);
 
-        // Track whether this poll's change event was successfully delivered. A
-        // change must NOT be silently dropped: if the (--json) stdout write
-        // fails (e.g. a closed pipe), we skip the re-baseline below so the same
-        // change re-surfaces on the next poll instead of being lost forever.
+        // A change must not be silently dropped: if the --json stdout write
+        // fails, skip the re-baseline below so the change re-surfaces next poll.
         let mut emitted = true;
         if !findings.is_empty() {
             if json {
@@ -167,9 +142,8 @@ pub fn watch(interval: u64, json: bool) -> i32 {
             }
         }
 
-        // Re-baseline so the next poll reports only NEW changes — but only when
-        // any change event was actually emitted. On a delivery failure, leave
-        // the prior baseline in place so the change is reported again.
+        // Re-baseline only when the change was emitted; on a delivery failure
+        // keep the prior baseline so the change is reported again.
         if emitted {
             snapshot = PersistenceSnapshot::from_entries(&current);
             let _ = persistence::save_snapshot(&path, &snapshot);
@@ -181,8 +155,6 @@ pub fn watch(interval: u64, json: bool) -> i32 {
     }
     0
 }
-
-// ─── snapshot persistence ──────────────────────────────────────────────────────
 
 /// Persist `snapshot` to the default state path. Returns a human-readable note
 /// describing the outcome (used in scan output).
@@ -208,34 +180,25 @@ fn run_diff(snapshot: &PersistenceSnapshot) -> Vec<PersistenceFinding> {
     persistence::diff_entries(&current, snapshot)
 }
 
-// ─── SIGINT handling ────────────────────────────────────────────────────────────
-
 /// Set by the SIGINT handler to break the `watch` poll loop for a clean exit.
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// Install a minimal SIGINT handler that flips [`STOP`]. Uses `libc::signal`
-/// directly (no extra dependency); the handler does nothing but a single
-/// atomic store, which is async-signal-safe.
+/// Install a minimal SIGINT handler that flips [`STOP`] via `libc::signal`.
 #[cfg(unix)]
 fn install_sigint_handler() {
     extern "C" fn handle(_sig: libc::c_int) {
         STOP.store(true, Ordering::Relaxed);
     }
-    // SAFETY: `handle` only performs an atomic store, which is
-    // async-signal-safe. Registering a handler for SIGINT is sound. The
-    // double cast (fn item → ptr → sighandler_t) is what `libc` expects and
-    // avoids the `function_casts_as_integer` lint.
+    // SAFETY: `handle` only does an async-signal-safe atomic store; the double
+    // cast (fn item → ptr → sighandler_t) is what `libc` expects.
     unsafe {
         libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
     }
 }
 
-/// On non-Unix, fall back to the default SIGINT behavior (Ctrl-C terminates
-/// the process). The poll loop still honors [`STOP`], which simply stays false.
+/// Non-Unix: default SIGINT behavior; the poll loop honors [`STOP`] (stays false).
 #[cfg(not(unix))]
 fn install_sigint_handler() {}
-
-// ─── human output ──────────────────────────────────────────────────────────────
 
 fn print_human_scan(entries: &[PersistenceEntry], snapshot_note: &str) {
     let present = entries.iter().filter(|e| e.present).count();
@@ -318,11 +281,9 @@ fn severity_label(sev: Severity) -> &'static str {
     }
 }
 
-// ─── JSON output ─────────────────────────────────────────────────────────────
-
 fn scan_json_body(entries: &[PersistenceEntry], snapshot_note: &str) -> serde_json::Value {
-    // Emit fingerprint-only rows (NOT raw content) for the scan surface so the
-    // `--json` consumer never sees verbatim rc/authorized_keys content.
+    // Fingerprint-only rows (NOT raw content) so --json never leaks verbatim
+    // rc/authorized_keys content.
     let rows: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -379,7 +340,6 @@ mod tests {
             present: true,
             sha256: "abc".to_string(),
             size: 10,
-            // Content must NOT leak into the scan JSON.
             content: "export SECRET=hunter2\n".to_string(),
         }];
         let body = scan_json_body(&entries, "baseline recorded");
@@ -388,9 +348,8 @@ mod tests {
         let surfaces = body["surfaces"].as_array().unwrap();
         let row = &surfaces[0];
         assert_eq!(row["sha256"], "abc");
-        // The raw content key must be absent from the scan envelope.
+        // Raw content key absent and the secret must not appear in the JSON.
         assert!(row.get("content").is_none());
-        // And the secret must not appear anywhere in the serialized JSON.
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(!serialized.contains("hunter2"));
     }

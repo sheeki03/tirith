@@ -39,10 +39,8 @@ pub struct FileScanResult {
     pub is_config_file: bool,
 }
 
-/// Known AI config file basenames (scanned first for priority ordering).
-/// Only includes names specific to AI tooling — generic names like settings.json
-/// are only prioritized when found inside a known config directory (handled by
-/// `is_priority_path` checking the parent directory).
+/// AI-specific config basenames scanned first. Generic names (settings.json)
+/// are prioritized only inside a known config dir (via the parent-dir check).
 const PRIORITY_BASENAMES: &[&str] = &[
     ".cursorrules",
     ".cursorignore",
@@ -83,7 +81,6 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         &config.exclude_patterns,
     );
 
-    // Sort: known config files first, then lexicographic
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
         let b_priority = is_priority_file(b);
@@ -98,7 +95,6 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let mut truncation_reason = None;
     let mut skipped_count = 0;
 
-    // Caller-provided safety cap; not a license gate.
     if let Some(max) = config.max_files {
         if files.len() > max {
             skipped_count = files.len() - max;
@@ -202,22 +198,11 @@ pub fn scan_single_file(file_path: &Path) -> Option<FileScanResult> {
     })
 }
 
-/// Wrap `f` in `catch_unwind` for the directory-walk code path. On panic,
-/// log a skip message to stderr and return `None`; the caller then bumps
-/// `skipped_count` so the rest of the walk continues.
-///
-/// **Contract notes:**
-/// - The default Rust panic hook fires *before* unwinding, so the panic
-///   payload + backtrace will already be on stderr before our skip line.
-///   We deliberately don't install a custom panic hook — that would mutate
-///   process-global state and affect every other caller.
-/// - Only effective in `panic = "unwind"` builds (the workspace default).
-///   `panic = "abort"` builds bypass `catch_unwind` entirely.
-/// - `AssertUnwindSafe` is asserted because the closure type does not
-///   auto-impl `UnwindSafe`. Today the closure captures only `&Path` and
-///   a function pointer, both trivially safe; if a future refactor expands
-///   the closure body to capture mutable state, that state must remain
-///   unused after the panic to keep the assertion sound.
+/// Wrap `f` in `catch_unwind` for the directory walk: on panic, log a skip and
+/// return `None` so the caller bumps `skipped_count` and the walk continues.
+/// Only effective in `panic = "unwind"` builds. `AssertUnwindSafe` is sound only
+/// while the closure captures no mutable state used after a panic (today: `&Path`
+/// + a fn pointer).
 fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
@@ -264,17 +249,14 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
     }
 }
 
-/// Check if a path matches a priority config file.
-/// Matches either by AI-specific basename or by being inside a known config directory.
+/// Priority if the basename is AI-specific, or the file sits in a known config dir.
 fn is_priority_file(path: &Path) -> bool {
     let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    // Direct AI-specific basename match
     if PRIORITY_BASENAMES.contains(&basename) {
         return true;
     }
 
-    // Generic filenames are priority only inside known config dirs
     if let Some(parent) = path.parent() {
         let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if PRIORITY_PARENT_DIRS.contains(&parent_name) {
@@ -362,7 +344,6 @@ fn collect_files_recursive(
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Skip hidden dirs (except known config dirs) and common non-useful dirs
         if path.is_dir() {
             if should_skip_dir(name) && !is_known_config_dir(name) {
                 continue;
@@ -381,12 +362,10 @@ fn collect_files_recursive(
             continue;
         }
 
-        // Skip binary/non-text files by extension
         if is_binary_extension(name) {
             continue;
         }
 
-        // Apply ignore patterns against basename and relative path
         let rel_path = path
             .strip_prefix(root)
             .ok()
@@ -399,8 +378,9 @@ fn collect_files_recursive(
             continue;
         }
 
-        // Apply include patterns with negation support.
-        // Patterns prefixed with `!` act as excludes within the include set.
+        // Include patterns with negation support: `!`-prefixed patterns exclude
+        // from the include set. A file passes if it matches a positive include
+        // (or there are none) AND matches no negated pattern.
         if !include_patterns.is_empty() {
             let mut included = false;
             let mut negated = false;
@@ -408,29 +388,25 @@ fn collect_files_recursive(
 
             for pat in include_patterns {
                 if let Some(stripped) = pat.strip_prefix('!') {
-                    // Negation: exclude from the include set
+                    // Negation: exclude from the include set.
                     if matches_ignore_pattern(name, stripped)
                         || matches_ignore_pattern(rel_path, stripped)
                     {
                         negated = true;
                     }
                 } else {
-                    // Positive: file must match at least one
+                    // Positive: file must match at least one.
                     if matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat) {
                         included = true;
                     }
                 }
             }
 
-            // A file passes include if:
-            // - No positive includes OR matches at least one positive include
-            // - AND does not match any negated include
             if negated || (has_positive && !included) {
                 continue;
             }
         }
 
-        // Apply exclude patterns: skip matching files
         if exclude_patterns
             .iter()
             .any(|pat| matches_ignore_pattern(name, pat) || matches_ignore_pattern(rel_path, pat))
@@ -490,27 +466,21 @@ fn is_binary_extension(name: &str) -> bool {
     binary_exts.iter().any(|ext| name_lower.ends_with(ext))
 }
 
-/// Match a filename against an ignore pattern.
-/// Supports simple glob patterns: `*.ext` (suffix), `prefix*` (prefix),
-/// `*middle*` (contains), and exact matches. Falls back to substring
-/// matching for patterns without `*`.
+/// Match a filename against a simple glob: `*.ext`, `prefix*`, `pre*suf`,
+/// `*middle*`, or exact. Patterns without `*` fall back to substring match.
 pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
     if pattern.contains('*') {
         let parts: Vec<&str> = pattern.split('*').collect();
         match parts.as_slice() {
-            // "*.ext" — suffix match
             [prefix, suffix] if prefix.is_empty() && !suffix.is_empty() => name.ends_with(suffix),
-            // "prefix*" — prefix match
             [prefix, suffix] if !prefix.is_empty() && suffix.is_empty() => name.starts_with(prefix),
-            // "pre*suf" — prefix + suffix match
             [prefix, suffix] if !prefix.is_empty() && !suffix.is_empty() => {
                 name.starts_with(prefix)
                     && name.ends_with(suffix)
                     && name.len() >= prefix.len() + suffix.len()
             }
-            // "*" alone matches everything
             [_, _] => true,
-            // Fallback for multiple wildcards: all parts must appear in order
+            // Multiple wildcards: all parts must appear in order.
             _ => {
                 let mut remaining = name;
                 for (i, part) in parts.iter().enumerate() {
@@ -532,7 +502,6 @@ pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
             }
         }
     } else {
-        // No wildcard: substring match (backwards compatible)
         name.contains(pattern)
     }
 }
@@ -563,19 +532,15 @@ mod tests {
         assert_eq!(result, Some(42));
     }
 
-    /// Serializes any test that mutates the global panic hook. Without this,
-    /// a parallel test that panics during the hook-swap window inherits the
-    /// empty hook, and concurrent hook swaps race each other's restore.
-    /// Tolerates poisoning so a single panic doesn't cascade.
+    /// Serializes tests that mutate the global panic hook so concurrent swaps
+    /// don't race each other's restore. Tolerates poisoning.
     static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn catch_panic_scanning_returns_none_on_panic() {
         let _lock = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = Path::new("dummy");
-        // Suppress the default panic-hook output for this test only — we're
-        // intentionally inducing a panic and don't want it cluttering stderr.
-        // The hook is restored before the lock guard drops.
+        // Suppress the default panic-hook output for this intentional panic.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result: Option<i32> = catch_panic_scanning(path, || {
@@ -684,8 +649,7 @@ mod tests {
 
     #[test]
     fn test_variation_selector_visible_in_scan() {
-        // Write a temp file with a variation selector (U+FE0F = EF B8 8F in UTF-8)
-        // into a temp directory with no local policy so paranoia is deterministic.
+        // Variation selector U+FE0F (EF B8 8F) in a temp dir with no policy.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let file_path = tmp.path().join("test_vs.txt");
         std::fs::write(&file_path, b"A\xef\xb8\x8f").expect("write temp file");

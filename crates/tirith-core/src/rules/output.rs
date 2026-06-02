@@ -1,56 +1,22 @@
-//! Output-direction rules (M7 ch1).
+//! Output-direction rules (M7 ch1). Fire from [`crate::engine::analyze_output`]
+//! (and the streaming sibling) over a downstream command's stdout/stderr; never
+//! reached from the exec hot path (the output pipeline bypasses `PATTERN_TABLE`).
 //!
-//! These rules fire from [`crate::engine::analyze_output`] (and the streaming
-//! sibling [`crate::engine::analyze_output_chunk`]) — they scan the
-//! stdout / stderr of a downstream command for terminal escape sequences
-//! that hide or mislead what the user sees. They are NEVER reached from the
-//! `tirith check` exec hot path; the output pipeline is a sibling that
-//! bypasses `PATTERN_TABLE` entirely (see `engine.rs`).
-//!
-//! ## v1 scope decisions
-//!
-//! * **OSC 52 (`output_osc52_clipboard_write`)** — fires unconditionally on
-//!   any `\e]52;…\a` / `\e]52;…\e\\` sequence in the stream. There is no
-//!   legitimate use case for a tool to write to the user's system clipboard
-//!   via a piped output stream.
-//!
-//! * **Hidden text (`output_hidden_text`)** — v1 is deliberately narrow:
-//!   (i) explicit ANSI foreground == explicit ANSI background within a single
-//!   SGR sequence, comparable as ints. We do NOT infer the user's terminal
-//!   default colors, so a single `\e[37m` followed later by `\e[47m` won't
-//!   trip this rule. (ii) a zero-width-character run > 8 chars.
-//!   Theme-dependent detection is out of v1 — documented in the plan and
-//!   listed as a follow-up.
-//!
-//! * **Fake prompt (`output_fake_prompt`)** — root-prompt shapes fire on
-//!   ANY line of the stream (`[root@host …]#` is rarely benign); user-
-//!   prompt shapes (`user@host:path[$# ]`) fire only as a trailing-line
-//!   suffix on a stream that does NOT end in `\n`. Inline `$ cmd` in
-//!   prose paragraphs does NOT fire — too many tutorial logs would
-//!   false-positive.
-//!
-//! * **OSC 8 hyperlink mismatch (`output_terminal_hyperlink_mismatch`)** —
-//!   only fires when the VISIBLE TEXT itself parses as a URL with a host
-//!   that differs from the link's `href` host. "Click here" vs
-//!   `https://example.com` does NOT fire; `github.com` vs
-//!   `https://evil.example` DOES fire.
-//!
-//! * **Title manipulation (`output_title_manipulation`)** — Info severity.
-//!   `\e]0;<title>\a` / `\e]2;<title>\a` in a streamable file is rarely
-//!   benign but isn't a direct attack on its own.
-//!
-//! * **Screen clear (`output_clear_screen`)** — Info severity. `\e[2J` /
-//!   `\e[H` mid-stream in a stored file is almost always trying to hide
-//!   what came before.
+//! v1 scope per rule:
+//! * OSC 52 — fires unconditionally (no legit clipboard write via a pipe).
+//! * Hidden text — (i) explicit fg == explicit bg within ONE SGR (no default-color
+//!   inference), (ii) zero-width run > 8. Theme-dependent detection is a follow-up.
+//! * Fake prompt — root-prompt shapes fire on any line; user-prompt shapes only as
+//!   a trailing suffix on a stream not ending in `\n`. Inline `$ cmd` prose does not fire.
+//! * OSC 8 hyperlink mismatch — only when the VISIBLE TEXT itself parses as a URL
+//!   with a host differing from the href host.
+//! * Title manipulation / screen clear — Info severity.
 
 use crate::extract::{OutputScanResult, OutputSgrHit};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Convert an [`OutputScanResult`] into the corresponding findings.
-///
-/// This is the entire tier-3 rule layer for the output pipeline — every
-/// finding traces back to a structured hit emitted by the byte scanner in
-/// [`crate::extract::scan_output_chunk`].
+/// Convert an [`OutputScanResult`] into findings — the entire tier-3 rule layer
+/// for the output pipeline (every finding traces back to a byte-scanner hit).
 pub fn check(scan: &OutputScanResult) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -165,10 +131,8 @@ fn check_hyperlink_mismatch(scan: &OutputScanResult) -> Vec<Finding> {
     findings
 }
 
-/// SGR-based hidden text: a single sequence sets both foreground and
-/// background to the same color (after resolving aliases between the
-/// 30-37 / 40-47 ranges, the 90-97 / 100-107 bright ranges, and the
-/// 38/48 extended-color forms when both sides specify the same form).
+/// SGR-based hidden text: one sequence sets fg == bg (across the 30-37/40-47,
+/// 90-97/100-107 bright, and 38/48 extended-color forms).
 fn check_hidden_text_via_sgr(scan: &OutputScanResult) -> Vec<Finding> {
     let mut findings = Vec::new();
     for sgr in &scan.sgr {
@@ -222,17 +186,11 @@ fn check_hidden_text_via_zero_width(scan: &OutputScanResult) -> Vec<Finding> {
     findings
 }
 
-/// `OutputFakePrompt` runs on the assembled text (not the byte scan), so it
-/// has its own entry point. The streaming driver in `engine.rs` calls this
-/// once at end-of-stream with the captured text buffer.
+/// `OutputFakePrompt` runs on the assembled text (not the byte scan); the
+/// streaming driver calls this once at end-of-stream with the text buffer.
 pub fn check_fake_prompt(text: &str) -> Vec<Finding> {
-    // Two-line heuristic:
-    //  1. The LAST non-empty line of the stream looks like a prompt
-    //     (`user@host…[$#%] ` or `[root@host …]# `), OR
-    //  2. A prompt-shaped line appears mid-stream surrounded by newlines.
-    // We pick the simpler v1: scan all lines, fire if any is shaped like a
-    // root/`#` prompt OR if the LAST line is a `$ ` / `% ` shape. This keeps
-    // `$ npm test` tutorial paragraphs from false-firing inline.
+    // Fire if any line is a root/`#` prompt OR the LAST line is a `$ `/`% ` shape,
+    // so inline `$ cmd` tutorial paragraphs don't false-fire.
     let mut findings = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -264,9 +222,8 @@ pub fn check_fake_prompt(text: &str) -> Vec<Finding> {
         }
     }
 
-    // Trailing-prompt heuristic on last non-empty line: only fire when the
-    // stream ENDS in a prompt-shaped line WITHOUT a trailing newline (clear
-    // intent to leave the cursor inside the fake prompt).
+    // Trailing-prompt heuristic: fire only when the stream ENDS in a
+    // prompt-shaped line WITHOUT a trailing newline.
     let last_nonempty = lines.iter().rev().find(|l| !l.trim().is_empty()).copied();
     if let Some(last) = last_nonempty {
         let trimmed_end = last.trim_end();
@@ -300,12 +257,9 @@ pub fn check_fake_prompt(text: &str) -> Vec<Finding> {
     findings
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-/// Resolve a 30-37 / 40-47 base color, 38;5;N / 48;5;N indexed, or 38;2;R;G;B
-/// truecolor pair from an SGR param list. Returns the *normalized*
-/// `(fg, bg)` tuple of comparable color tokens — or `None` for either side
-/// when the SGR did NOT specify that side explicitly.
+/// Resolve `(fg, bg)` comparable color tokens from an SGR param list (base
+/// 30-37/40-47, indexed 38;5;N/48;5;N, truecolor 38;2;R;G;B). Either side is
+/// `None` when the SGR did not specify it explicitly (we never infer defaults).
 fn resolve_sgr_colors(params: &[u32]) -> (Option<ColorToken>, Option<ColorToken>) {
     let mut fg: Option<ColorToken> = None;
     let mut bg: Option<ColorToken> = None;
@@ -314,8 +268,7 @@ fn resolve_sgr_colors(params: &[u32]) -> (Option<ColorToken>, Option<ColorToken>
         let p = params[i];
         match p {
             0 => {
-                // Reset — both sides go back to terminal default. Treat as
-                // *unset* for our equality check (we never infer defaults).
+                // Reset → treat both sides as unset (we never infer defaults).
                 fg = None;
                 bg = None;
                 i += 1;
@@ -380,8 +333,7 @@ enum ColorToken {
     Rgb(u32, u32, u32),
 }
 
-/// Does this SGR sequence set both foreground and background to the SAME
-/// explicit color (within the same SGR — we never infer defaults)?
+/// Some(reason) when the SGR sets fg == bg (both explicit) within one sequence.
 fn sgr_marks_invisible(sgr: &OutputSgrHit) -> Option<String> {
     let (fg, bg) = resolve_sgr_colors(&sgr.params);
     match (fg, bg) {
@@ -392,14 +344,9 @@ fn sgr_marks_invisible(sgr: &OutputSgrHit) -> Option<String> {
     }
 }
 
-/// Extract host from a URL string. Returns None if it doesn't parse as one
-/// of the schemes we care about.
-///
-/// The bare-host branch requires the LAST segment (the TLD-shaped slot) to
-/// look like a real TLD — at least two characters, all alpha, not all-digits.
-/// Without this guard, version strings like `v1.2.3` or `1.0.0-alpha` parse
-/// as hosts and produce false-positive OSC8 mismatch findings on completely
-/// benign release-note hyperlinks.
+/// Extract a host from a URL string, or `None`. The bare-host branch requires
+/// the last segment to be TLD-shaped (≥2 chars, all alpha) — without this guard,
+/// version strings like `v1.2.3` parse as hosts and false-fire OSC8 mismatch.
 fn parse_url_host(s: &str) -> Option<String> {
     if let Ok(u) = url::Url::parse(s) {
         return u.host_str().map(|h| h.to_ascii_lowercase());
@@ -418,9 +365,7 @@ fn parse_url_host(s: &str) -> Option<String> {
         if !host_only.contains('.') {
             return None;
         }
-        // TLD-shape check: the last dot-segment must be ≥2 chars, all alpha
-        // (no digits), no leading/trailing hyphen. Rejects `v1.2.3`, `1.0.0`,
-        // `10.0.0.1` (IPs are handled by `Url::parse` above), `foo.123`.
+        // Last dot-segment must be ≥2 chars, all alpha — rejects `v1.2.3`, `foo.123`.
         let last = host_only.rsplit('.').next()?;
         if last.len() < 2 {
             return None;
@@ -591,9 +536,7 @@ mod tests {
 
     #[test]
     fn hyperlink_no_fire_when_visible_text_is_a_version_string() {
-        // Regression: `parse_url_host` previously accepted `v1.2.3` as a
-        // bare-host because every dot-segment was alphanumeric. A release-
-        // notes OSC8 link with the version as label would falsely fire.
+        // Regression: `parse_url_host` once accepted `v1.2.3` as a bare host.
         for label in ["v1.2.3", "1.0.0-alpha", "2.3.4", "release.1.0"] {
             let mut s = scan();
             s.hyperlinks.push(OutputHyperlinkHit {
@@ -613,9 +556,7 @@ mod tests {
 
     #[test]
     fn hyperlink_fires_when_visible_text_is_a_raw_host_string() {
-        // Positive control: a raw "github.com"-shaped label with the wrong
-        // href still fires the mismatch rule. Guards against over-rejecting
-        // the bare-host path in `parse_url_host`.
+        // Positive control: guards against over-rejecting the bare-host path.
         let mut s = scan();
         s.hyperlinks.push(OutputHyperlinkHit {
             offset: 0,

@@ -1,40 +1,21 @@
 //! `tirith install` — the safe-install transaction.
 //!
 //! `tirith install <npm|pip|cargo|url> <args...>` wraps a real package install
-//! with **pre-execution install-risk analysis** and records the transaction.
-//! It is the *assembly chunk* of M3 (Supply-Chain Firewall): it composes
-//! existing tirith building blocks rather than adding new detection —
+//! with pre-execution install-risk analysis and records the transaction. The
+//! M3 assembly chunk: composes existing building blocks (engine rules,
+//! `package_risk` scorer, `checkpoint`, `receipt`/`runner`, `audit`), no new
+//! detection.
 //!
-//!  * the install-command rules, URL rules, and threat-DB package rules, via
-//!    [`tirith_core::engine`];
-//!  * the deterministic package-risk scorer
-//!    ([`tirith_core::package_risk`]) and its opt-in registry-API provenance
-//!    signals;
-//!  * [`tirith_core::checkpoint`] for a before/after file record;
-//!  * [`tirith_core::receipt`] / [`tirith_core::runner`] for the safe
-//!    download-and-run path of the `url` form;
-//!  * [`tirith_core::audit`] for the transaction record.
-//!
-//! The flow is **analyze → inform → record → run**:
-//!  1. *Analyze* — score the package(s) and the would-be install command
-//!     *before* anything is installed, producing one explainable verdict.
-//!  2. *Inform* — present the verdict. A **block** refuses (bypass per
-//!     policy); a **warn** requires an interactive acknowledgement, exactly as
-//!     `tirith check` does; an **allow** proceeds.
-//!  3. *Record* — take a checkpoint of the working directory and audit-log
-//!     the verdict so there is a before/after record of the transaction.
-//!  4. *Run* — only now invoke the real `npm install` / `pip install` /
-//!     `cargo install` (directly, never through a shell), or the downloaded
-//!     script for the `url` form.
+//! Flow is **analyze → inform → record → run**: score before installing
+//! (block refuses, warn needs ack, allow proceeds), checkpoint + audit, then
+//! invoke the real install directly (never via a shell).
 //!
 //! ## What this is NOT
 //!
-//! This is install-risk **analysis** plus a recorded transaction. It does
-//! **not** sandbox, isolate, or contain the install — runtime sandboxing is an
-//! explicit tirith non-goal (see `docs/threat-model.md`). The real install
-//! runs with the user's full privileges. tirith's contribution is that the
-//! install is analyzed, surfaced, and recorded *first* — nothing here, in
-//! `--help`, or in the docs, claims otherwise.
+//! This is analysis + a recorded transaction. It does NOT sandbox, isolate, or
+//! contain the install — runtime sandboxing is an explicit tirith non-goal (see
+//! `docs/threat-model.md`); the real install runs with the user's full
+//! privileges.
 
 #[cfg(unix)]
 use tirith_core::runner::{self, RunOptions};
@@ -52,13 +33,10 @@ use tirith_core::verdict::{Action, Verdict};
 
 /// Which install source the `<source>` positional selects.
 ///
-/// **M6 ch1** — extended with eight distro/docker/go backends:
-/// `apt`, `brew`, `dnf`, `yum`, `pacman`, `scoop`, `docker`, `go`. These ship
-/// command-complete but signal-weak: today no registry adapter exists for
-/// them, so `--online` provenance signals degrade to `Unavailable` with the
-/// honest reason `"no registry adapter for <eco>"`. The CLI prints a banner
-/// to that effect on every `tirith install <backend>` invocation (and embeds
-/// it in JSON), so the operator is never surprised by silent weak coverage.
+/// M6 ch1 added eight distro/docker/go backends. These have no registry adapter,
+/// so `--online` provenance signals degrade to `Unavailable` ("no registry
+/// adapter for <eco>"); the CLI prints a banner (and embeds it in JSON) so weak
+/// coverage is never silent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum InstallSource {
     /// `npm install <pkg...>`
@@ -67,35 +45,29 @@ pub enum InstallSource {
     Pip,
     /// `cargo install <pkg...>`
     Cargo,
-    /// `apt-get install <pkg...>` — Debian/Ubuntu. (M6 ch1 — no registry
-    /// adapter; signals are command-shape + threat-DB name match only.)
+    /// `apt-get install <pkg...>` — Debian/Ubuntu.
     Apt,
-    /// `brew install <pkg...>` — Homebrew. (M6 ch1 — no registry adapter.)
+    /// `brew install <pkg...>` — Homebrew.
     Brew,
-    /// `dnf install <pkg...>` — Fedora / RHEL 8+. (M6 ch1 — no registry adapter.)
+    /// `dnf install <pkg...>` — Fedora / RHEL 8+.
     Dnf,
-    /// `yum install <pkg...>` — RHEL 7 and earlier. (M6 ch1 — no registry adapter.)
+    /// `yum install <pkg...>` — RHEL 7 and earlier.
     Yum,
-    /// `pacman -S <pkg...>` — Arch / Manjaro. (M6 ch1 — no registry adapter.)
+    /// `pacman -S <pkg...>` — Arch / Manjaro.
     Pacman,
-    /// `scoop install <pkg...>` — Windows-only at the real-run step; the
-    /// `--no-exec` dry-run path works on every OS. (M6 ch1 — no registry
-    /// adapter.)
+    /// `scoop install <pkg...>` — Windows-only at the real-run step; `--no-exec`
+    /// dry-run works on every OS.
     Scoop,
-    /// `docker pull <image>[:<tag>|@<digest>]` — image refs are parsed with
-    /// the engine's existing Docker parser. (M6 ch1 — no registry adapter.)
+    /// `docker pull <image>[:<tag>|@<digest>]` — parsed with the engine's Docker parser.
     Docker,
     /// `go install <module>[@<version>]` — version defaults to `latest`.
-    /// (M6 ch1 — no registry adapter for the Go module proxy yet.)
     Go,
-    /// Download and run an install script from a URL (delegates to the
-    /// existing `tirith run` safe download-and-run machinery).
+    /// Download and run an install script from a URL (delegates to `tirith run`).
     Url,
 }
 
 impl InstallSource {
-    /// The package-manager mapping, or `None` for [`InstallSource::Url`]
-    /// (which is not a package-manager transaction).
+    /// The package-manager mapping, or `None` for [`InstallSource::Url`].
     fn package_manager(self) -> Option<PackageManager> {
         match self {
             InstallSource::Npm => Some(PackageManager::Npm),
@@ -114,41 +86,30 @@ impl InstallSource {
     }
 }
 
-/// One completed install — what the runner returns. In streaming (human) mode
-/// only `exit_code` is populated; in capture (JSON) mode `stdout` and `stderr`
-/// carry the buffered child output so the JSON envelope can embed them
-/// alongside the analysis instead of letting them interleave on stdout.
+/// One completed install. Streaming (human) mode populates only `exit_code`;
+/// capture (JSON) mode buffers `stdout`/`stderr` so the JSON envelope can embed
+/// them rather than let them interleave on stdout.
 #[derive(Debug, Clone, Default)]
 pub struct InstallRunOutput {
     /// Process exit code (`None` on signal-termination).
     pub exit_code: Option<i32>,
-    /// Captured stdout, only populated when capture mode was requested.
+    /// Captured stdout, only in capture mode.
     pub stdout: Option<String>,
-    /// Captured stderr, only populated when capture mode was requested.
+    /// Captured stderr, only in capture mode.
     pub stderr: Option<String>,
 }
 
-/// Abstraction over actually running the real package-manager install.
+/// Abstraction over running the real package-manager install. The production
+/// impl ([`ProcessInstallRunner`]) spawns the real process; tests inject a fake
+/// that never installs and never touches the network. Runs the resolved argv
+/// directly, never via a shell.
 ///
-/// The production implementation ([`ProcessInstallRunner`]) spawns the real
-/// process; tests inject a fake so a test **never** installs anything and
-/// **never** touches the network. The trait takes the resolved argv — the
-/// program and its arguments — and runs it *directly*, never via a shell.
-///
-/// Two modes:
-/// * **Streaming** — child stdio inherits the terminal, so install progress
-///   appears live to the user. Used for human (text) output. Captured stdout
-///   and stderr in [`InstallRunOutput`] are `None`.
-/// * **Capture** — child stdout and stderr are buffered and returned. Used
-///   for `--format json` so the JSON envelope can carry the child output
-///   inside the document and a piped consumer sees a single parseable JSON.
+/// Streaming inherits the terminal (live progress; captured fields `None`);
+/// capture buffers stdout/stderr for `--format json`.
 pub trait InstallRunner {
-    /// Run the install command `program args...`.
-    ///
-    /// `capture` selects streaming (`false`) vs capture (`true`). A failure
-    /// to *spawn* the process at all is an `Err` (the production
-    /// implementation's `?`), not a successful run; the caller treats both
-    /// `Err` and a `None` exit code as a non-success.
+    /// Run `program args...`. `capture` selects streaming vs capture. A spawn
+    /// failure is `Err`; the caller treats both `Err` and a `None` exit as
+    /// non-success.
     fn run(
         &self,
         program: &str,
@@ -157,8 +118,7 @@ pub trait InstallRunner {
     ) -> std::io::Result<InstallRunOutput>;
 }
 
-/// Production [`InstallRunner`] — spawns the real package manager with
-/// inherited stdio so its output streams straight to the user's terminal.
+/// Production [`InstallRunner`] — spawns the real package manager.
 pub struct ProcessInstallRunner;
 
 impl InstallRunner for ProcessInstallRunner {
@@ -168,16 +128,12 @@ impl InstallRunner for ProcessInstallRunner {
         args: &[String],
         capture: bool,
     ) -> std::io::Result<InstallRunOutput> {
-        // Direct spawn — `program` is a fixed package-manager name and `args`
-        // are passed through argv, so there is no shell and no word-splitting.
+        // Direct spawn — `program` is a fixed name and `args` go through argv,
+        // so there is no shell and no word-splitting.
         if capture {
-            // PR #121 fix-list item 3 — capture mode for `--format json`. The
-            // child's stdout and stderr are buffered into the returned
-            // `InstallRunOutput`; the caller embeds them in the JSON envelope
-            // instead of letting them interleave on stdout (which previously
-            // produced unparseable output — analysis JSON, then pip's
-            // progress bars, then outcome JSON — three writes, two JSON
-            // objects, separated by non-JSON).
+            // PR #121 fix-list item 3 — capture mode for `--format json` buffers
+            // child stdout/stderr so they don't interleave between JSON objects
+            // (which previously made the output unparseable).
             let output = Command::new(program).args(args).output()?;
             Ok(InstallRunOutput {
                 exit_code: output.status.code(),
@@ -185,8 +141,7 @@ impl InstallRunner for ProcessInstallRunner {
                 stderr: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
             })
         } else {
-            // Streaming (human) mode — child stdio inherits the terminal so
-            // the operator sees install progress live.
+            // Streaming (human) mode — child stdio inherits the terminal.
             let status = Command::new(program).args(args).status()?;
             Ok(InstallRunOutput {
                 exit_code: status.code(),
@@ -197,10 +152,8 @@ impl InstallRunner for ProcessInstallRunner {
     }
 }
 
-/// Entry point for `tirith install`.
-///
-/// `source` selects the install kind; `args` are the user's arguments after
-/// the source (the package list / flags, or the URL for the `url` form).
+/// Entry point for `tirith install`. `source` selects the install kind; `args`
+/// are the package list / flags (or the URL for the `url` form).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     source: InstallSource,
@@ -212,16 +165,12 @@ pub fn run(
     no_exec: bool,
     sha256: Option<String>,
 ) -> i32 {
-    // A tirith-owned flag placed AFTER <source> lands in the package-manager
-    // args (trailing_var_arg), not parsed by tirith. For a tirith flag that is
-    // a safety footgun: `tirith install npm pkg --no-exec` would forward
-    // `--no-exec` to npm and STILL run the real install, despite the user
-    // asking to analyze only. The guarded flags are the tirith-owned options
-    // that no package manager interprets as an install flag, so finding one in
-    // the trailing args is unambiguously a misplaced tirith flag — a hard
-    // error, not a silent no-op. `--offline` is deliberately NOT guarded
-    // (`cargo install --offline` is legitimate), nor `--format` / `--json`
-    // (`npm install --json` is legitimate).
+    // A tirith-owned flag placed AFTER <source> lands in the package-manager args
+    // (trailing_var_arg), not parsed by tirith — a safety footgun (e.g. a
+    // misplaced `--no-exec` would STILL run the real install). Guarded flags are
+    // tirith-owned options no package manager interprets, so finding one trailing
+    // is a hard error. `--offline`/`--format`/`--json` are NOT guarded (legitimate
+    // package-manager flags).
     const MISPLACED_TIRITH_FLAGS: &[&str] = &["--no-exec", "--online", "--yes"];
     if let Some(flag) = args
         .iter()
@@ -241,9 +190,7 @@ pub fn run(
     }
 }
 
-// ===========================================================================
 // package-manager form: npm / pip / cargo
-// ===========================================================================
 
 #[allow(clippy::too_many_arguments)]
 fn run_package_manager(
@@ -275,24 +222,20 @@ fn run_package_manager(
         .map(|p| p.display().to_string());
     let policy = Policy::discover(cwd.as_deref());
 
-    // --- ANALYZE --------------------------------------------------------
-    // Resolve the registry-API path. Offline by default; `--online` opts in,
-    // and `--offline` / `TIRITH_OFFLINE` overrides `--online`. The resolver is
-    // offline-safe — it degrades any registry failure to `Unavailable`.
+    // --- ANALYZE ---
+    // Offline by default; `--online` opts in, `--offline` / `TIRITH_OFFLINE`
+    // overrides it. The resolver degrades any registry failure to `Unavailable`.
     let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
-    // M6 ch6 — `gather_api_signals` now returns `(ApiSignals, PackageExistence)`.
-    // The install path folds existence into the provenance so the policy gate
-    // for `PackageNotFoundInRegistry` can read it directly. A standalone
-    // `Unavailable` with a positive 404 is upgraded to `Available` carrying
-    // only the existence value, mirroring the `tirith package risk` path.
+    // M6 ch6 — fold `PackageExistence` into the provenance so the
+    // `PackageNotFoundInRegistry` gate can read it; an `Unavailable` with a
+    // positive 404 is upgraded to `Available` carrying only existence.
     let resolver = |eco: Ecosystem, name: &str| {
         let (mut signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
         use tirith_core::package_risk::{ApiProvenance, PackageExistence};
         match &mut signals {
             tirith_core::package_risk::ApiSignals::Available { provenance } => {
                 provenance.package_existence = existence;
-                // Dep-confusion heuristic (offline-safe).
                 let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
                 if dc.risk {
                     provenance.dep_confusion = Some(dc);
@@ -334,46 +277,31 @@ fn run_package_manager(
     };
     let mut plan = install_txn::plan_install(&plan_request);
 
-    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
-    // plan's verdict BEFORE the audit-log write below. The engine that built
-    // the plan does not know the caller's identity by design; the CLI does.
-    // Without this stamp, `tirith install` audit lines would land in the
-    // `tirith agent sessions` "unknown" bucket.
+    // M4 item 8 chunk 3 — stamp the caller origin before the audit write (the
+    // engine doesn't know the caller's identity; the CLI does), else audit lines
+    // land in the "unknown" bucket.
     plan.verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
-    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the
-    // install path. `tirith install` does not route through
-    // `post_process_verdict`, so without this call an operator who writes
-    // a `deny` matcher to block an untrusted agent would see deny enforce
-    // on `tirith check` but silently fail on `tirith install npm
-    // evil-pkg` (a package-management hostile surface). The helper is a
-    // no-op on `Allowed`/`Unspecified`.
-    //
-    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
-    // hot paths in `check`/`gateway` use — under `TIRITH=0`, the raw
-    // verdict already wins and `apply_agent_rules` must NOT silently
-    // re-Block. Pinned by
+    // M4 item 8 chunk 3 — enforce `agent_rules.deny` on the install path, which
+    // doesn't route through `post_process_verdict` (no-op on Allowed/Unspecified).
+    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip — under `TIRITH=0`
+    // the raw verdict wins and we must NOT re-Block. Pinned by
     // `install_agent_rules_deny_skipped_under_tirith_bypass_today`.
     if !plan.verdict.bypass_honored {
         tirith_core::escalation::apply_agent_rules(&mut plan.verdict, &policy);
     }
 
-    // --- INFORM ---------------------------------------------------------
-    // PR #121 fix-list item 3 — in JSON mode the analysis JSON is NOT written
-    // here. It is held until the end so analysis + outcome ship as ONE
-    // top-level JSON envelope `{"analysis": ..., "outcome": ...}` — a single
-    // parseable document. Previously the analysis JSON was written here,
-    // then the child manager's stdout interleaved between two JSON objects,
-    // and the "JSON" output could not be parsed as a single document.
+    // --- INFORM ---
+    // PR #121 fix-list item 3 — JSON analysis is NOT written here; it's held so
+    // analysis + outcome ship as ONE envelope `{"analysis":..,"outcome":..}`.
+    // Writing it here let the child's stdout interleave between two JSON objects.
     if !json {
         print_plan_human(&plan, use_online);
     }
 
-    // The gate must be decided *before* the audit is written: a BLOCK that is
-    // bypassed via `TIRITH=0` has to be recorded as bypassed. `--no-exec`
-    // never installs, so there is no bypass and no gate — its audit reflects
-    // the verdict as-is. The exit code on `--no-exec` still mirrors the
-    // verdict so a script can branch on it: 0 allow, 1 block, 2 warn.
+    // Decide the gate BEFORE the audit write so a `TIRITH=0`-bypassed BLOCK is
+    // recorded as bypassed. `--no-exec` never installs (no gate); its exit still
+    // mirrors the verdict (0 allow, 1 block, 2 warn) so a script can branch.
     let decision = if no_exec {
         if !json {
             eprintln!(
@@ -387,23 +315,18 @@ fn run_package_manager(
             Action::Warn | Action::WarnAck => ProceedDecision::Stop(2),
         }
     } else {
-        // A block refuses; a warn needs acknowledgement; an allow proceeds.
         decide_proceed(&plan.verdict, &policy, interactive, yes, json)
     };
 
-    // If the gate bypassed a BLOCK via `TIRITH=0`, stamp the verdict so the
-    // audit entry records what actually happened — without this, a bypassed
-    // block would be logged as `bypass_honored: false`.
+    // If the gate bypassed a BLOCK via `TIRITH=0`, stamp the verdict so the audit
+    // records what happened (else it logs `bypass_honored: false`).
     if matches!(decision, ProceedDecision::Go) && plan.verdict.action == Action::Block {
         plan.verdict.bypass_requested = true;
         plan.verdict.bypass_honored = true;
     }
 
-    // Audit the verdict regardless of the decision — the analysis happened.
-    // A failed audit write does not abort the transaction (it is a record, not
-    // a gate), but it must not be silent: the transaction claims to be
-    // recorded. Surface it as a non-fatal notice, mirroring the checkpoint
-    // path's "skipped (non-fatal)" pattern.
+    // Audit regardless of the decision — the analysis happened. A failed write
+    // is a non-fatal notice (a record, not a gate), not silent.
     if let Err(e) = tirith_core::audit::log_verdict(
         &plan.verdict,
         &format!("install {}", plan.analysis_command),
@@ -418,23 +341,17 @@ fn run_package_manager(
 
     match decision {
         ProceedDecision::Stop(code) => {
-            // In JSON mode for a Stop path (Block refused, Warn declined,
-            // --no-exec), emit the single combined envelope with the analysis
-            // and a no-outcome marker so the document is always parseable.
+            // JSON Stop path (Block refused, Warn declined, --no-exec): emit the
+            // combined envelope with a no-outcome marker so it stays parseable.
             if json && !emit_combined_json(&plan, use_online, /* outcome = */ None) {
                 return 1;
             }
             code
         }
-        // --- RECORD then RUN --------------------------------------------
+        // --- RECORD then RUN ---
         ProceedDecision::Go => {
-            // M6 ch1 — Scoop is Windows-only at the real-run step. The
-            // dry-run / analysis path (above, via --no-exec or a verdict
-            // that stops the gate) runs on every OS so an operator on
-            // macOS / Linux can review Scoop scripts without ceremony, but
-            // we refuse to actually invoke `scoop install foo` outside
-            // Windows — silently succeeding (or worse, failing inside the
-            // child) would be a surprise-execution footgun.
+            // M6 ch1 — Scoop is Windows-only at the real-run step; refuse to
+            // invoke it elsewhere (the dry-run path above runs on every OS).
             if plan.manager.is_windows_only_runtime() && !cfg!(target_os = "windows") {
                 if !json {
                     eprintln!(
@@ -482,14 +399,9 @@ enum ProceedDecision {
     Stop(i32),
 }
 
-/// Apply the verdict gate, consistent with `tirith check`:
-///
-///  * **Block** — refuse. If the policy allows the environment bypass and
-///    `TIRITH=0` is set, the block is bypassed (and audited as such by the
-///    caller). Otherwise exit `1`.
-///  * **Warn / WarnAck** — require acknowledgement. With `--yes`, or an
-///    interactive `y` at the prompt, proceed; otherwise exit `2`.
-///  * **Allow** — proceed.
+/// Apply the verdict gate, consistent with `tirith check`: Block refuses (unless
+/// policy + `TIRITH=0` bypass), Warn/WarnAck need `--yes` or an interactive `y`,
+/// Allow proceeds.
 fn decide_proceed(
     verdict: &Verdict,
     policy: &Policy,
@@ -501,9 +413,8 @@ fn decide_proceed(
         Action::Allow => ProceedDecision::Go,
 
         Action::Block => {
-            // Policy-gated environment bypass — the same `TIRITH=0` escape
-            // hatch `tirith check` honors. A non-interactive session may only
-            // bypass when policy additionally opts that in.
+            // Policy-gated `TIRITH=0` bypass (same as `tirith check`); a
+            // non-interactive session needs the extra policy opt-in.
             let bypass_set = std::env::var("TIRITH").ok().as_deref() == Some("0");
             let bypass_allowed =
                 policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
@@ -549,7 +460,7 @@ fn decide_proceed(
                 }
                 return ProceedDecision::Stop(2);
             }
-            // Interactive acknowledgement, mirroring `tirith check`'s prompt.
+            // Interactive acknowledgement, mirroring `tirith check`.
             eprint!(
                 "tirith install: proceed with {} warning(s) and install? [y/N] ",
                 verdict.findings.len()
@@ -570,12 +481,10 @@ fn decide_proceed(
 }
 
 /// Take a before-install checkpoint, run the real install via `runner`, then
-/// report — the *record* and *run* steps of the transaction.
+/// report — the *record* and *run* steps.
 ///
-/// The checkpoint is best-effort: it snapshots the working directory so the
-/// user has a before/after record (`tirith checkpoint diff <id>`). It is **not**
-/// a sandbox and **not** an automatic rollback — a failed install is not undone
-/// for the user; the checkpoint simply makes the change inspectable.
+/// The checkpoint is best-effort and NOT a sandbox / rollback — it only makes
+/// the change inspectable (`tirith checkpoint diff <id>`).
 fn run_and_record(
     plan: &InstallPlan,
     cwd: Option<&str>,
@@ -583,7 +492,7 @@ fn run_and_record(
     online: bool,
     runner: &dyn InstallRunner,
 ) -> i32 {
-    // --- RECORD: before-install checkpoint ------------------------------
+    // --- RECORD: before-install checkpoint ---
     let checkpoint_id = match cwd {
         Some(dir) => {
             let trigger = format!("install {}", plan.analysis_command);
@@ -599,8 +508,7 @@ fn run_and_record(
                     Some(meta.id)
                 }
                 Err(e) => {
-                    // A checkpoint failure must not abort the install — it is
-                    // a record, not a gate. Report and continue.
+                    // A record, not a gate — report and continue.
                     if !json {
                         eprintln!("tirith install: checkpoint skipped (non-fatal): {e}");
                     }
@@ -611,14 +519,12 @@ fn run_and_record(
         None => None,
     };
 
-    // --- RUN: the real install -----------------------------------------
+    // --- RUN: the real install ---
     if !json {
         eprintln!("tirith install: running '{}' ...", plan.analysis_command);
     }
-    // PR #121 fix-list item 3 — in JSON mode the child's stdout/stderr are
-    // CAPTURED into the outcome envelope instead of inheriting the terminal.
-    // Without capture, the child's progress lines would interleave between
-    // analysis and outcome JSON writes and break single-document parsing.
+    // PR #121 fix-list item 3 — JSON mode CAPTURES child stdout/stderr into the
+    // outcome envelope, else its progress lines break single-document parsing.
     let run_output = match runner.run(
         &plan.argv.program,
         &plan.argv.args,
@@ -629,8 +535,7 @@ fn run_and_record(
             if !json {
                 eprintln!("tirith install: failed to run '{}': {e}", plan.argv.program);
             } else {
-                // Spawn failure still gets a single parseable envelope so a
-                // JSON consumer never sees raw stderr without an envelope.
+                // Spawn failure still gets a single parseable envelope.
                 let _ = emit_combined_json(
                     plan,
                     online,
@@ -662,9 +567,8 @@ fn run_and_record(
     };
 
     if json {
-        // PR #121 fix-list item 3 — emit ONE top-level JSON envelope holding
-        // the analysis and the outcome (with the captured child output
-        // embedded). A piped consumer parses one document, not a stream.
+        // PR #121 fix-list item 3 — emit ONE envelope holding analysis + outcome
+        // (with captured child output embedded), so a consumer parses one document.
         let outcome = OutcomeRecord {
             ran: true,
             exit_code: Some(exit_code),
@@ -673,9 +577,8 @@ fn run_and_record(
             stderr: run_output.stderr.as_deref(),
             spawn_error: None,
         };
-        // A JSON-write failure must not be reported as a `0` success — if the
-        // outcome envelope did not reach the consumer, surface exit 1.
-        // (A non-zero install exit already propagates and is kept.)
+        // A JSON-write failure must not report `0` success — surface exit 1 if the
+        // envelope didn't reach the consumer (a non-zero install exit is kept).
         if !emit_combined_json(plan, online, Some(outcome)) && exit_code == 0 {
             return 1;
         }
@@ -694,32 +597,23 @@ fn run_and_record(
     exit_code
 }
 
-/// One install transaction's outcome record, for the JSON envelope. Borrowed
-/// fields so the same value can be emitted regardless of who owns the strings.
+/// One install transaction's outcome record, for the JSON envelope (borrowed
+/// fields).
 struct OutcomeRecord<'a> {
-    /// `true` when the runner spawned successfully (even if the child then
-    /// exited non-zero or was signal-terminated). `false` when the spawn
-    /// itself failed — `spawn_error` carries the reason and `exit_code` is
-    /// `None`.
+    /// `true` if the runner spawned (even on non-zero/signal exit); `false` on a
+    /// spawn failure (`spawn_error` set, `exit_code` `None`).
     ran: bool,
-    /// Child exit code, when known.
     exit_code: Option<i32>,
-    /// Checkpoint ID, when one was taken.
     checkpoint_id: Option<&'a str>,
-    /// Captured child stdout, in capture mode.
     stdout: Option<&'a str>,
-    /// Captured child stderr, in capture mode.
     stderr: Option<&'a str>,
-    /// On a spawn failure, the OS error message.
     spawn_error: Option<String>,
 }
 
-/// Emit the single top-level `{"analysis": ..., "outcome": ...}` JSON envelope
-/// — PR #121 fix-list item 3. Returns `false` on a write failure.
-///
-/// `outcome` is `None` when the install never ran (Block refused, Warn
-/// declined, `--no-exec`): the envelope still carries an `outcome` field
-/// (`null`) so consumers parse the same shape in every code path.
+/// Emit the single `{"analysis":..,"outcome":..}` JSON envelope (PR #121
+/// fix-list item 3). Returns `false` on a write failure. `outcome` is `None`
+/// when the install never ran (the field is still present as `null` for a
+/// stable shape).
 fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeRecord>) -> bool {
     #[derive(serde::Serialize)]
     struct PackageOut<'a> {
@@ -740,10 +634,8 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         packages: Vec<PackageOut<'a>>,
         verdict: &'a Verdict,
         notes: &'a [String],
-        // M6 ch1 — for backends with no registry adapter, the same banner
-        // string the human output shows is embedded here so a JSON consumer
-        // can detect signal-weak coverage without re-deriving it from the
-        // manager name. Field absent for managers with full registry signals.
+        // M6 ch1 — for backends with no registry adapter, embed the same banner
+        // the human output shows so a JSON consumer can detect weak coverage.
         #[serde(skip_serializing_if = "Option::is_none")]
         signals_note: Option<&'a str>,
     }
@@ -759,9 +651,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         #[serde(skip_serializing_if = "Option::is_none")]
         checkpoint_id: Option<&'a str>,
         verdict_action: String,
-        // Child output captured in JSON / capture mode. Always present so
-        // consumers can detect "the install ran but produced no output" vs
-        // "we did not capture" via the surrounding `ran` flag.
+        // Child output captured in JSON mode.
         #[serde(skip_serializing_if = "Option::is_none")]
         stdout: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -774,9 +664,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         schema_version: u32,
         kind: &'a str,
         analysis: AnalysisEnvelope<'a>,
-        // `null` when the install did not run (block refused, warn declined,
-        // --no-exec). The key is always present so the document shape is
-        // stable across exit paths.
+        // `null` when the install did not run; key always present for a stable shape.
         outcome: Option<OutcomeEnvelope<'a>>,
     }
 
@@ -792,8 +680,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         })
         .collect();
 
-    // M6 ch1 — keep the banner owned at this scope so the borrow inside the
-    // envelope outlives the move into `CombinedEnvelope`.
+    // Own the banner at this scope so its borrow outlives the move into the envelope.
     let signals_banner_owned: Option<String> = if plan.manager.lacks_registry_adapter() {
         Some(plan.manager.no_registry_adapter_banner())
     } else {
@@ -811,8 +698,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         signals_note: signals_banner_owned.as_deref(),
     };
 
-    // Keep `spawn_error` owned at this scope so the borrow inside the
-    // envelope outlives the closure that builds it.
+    // Own `spawn_error` at this scope so its borrow outlives the closure below.
     let spawn_error_owned: Option<String> = outcome.as_ref().and_then(|o| o.spawn_error.clone());
     let outcome_env = outcome.map(|o| OutcomeEnvelope {
         kind: "install_outcome",
@@ -838,24 +724,13 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     write_json_stdout(&combined)
 }
 
-// ===========================================================================
 // url form — delegates to the existing `tirith run` machinery
-// ===========================================================================
 
-/// The `url` form: download-and-run an install script.
-///
-/// Per the assembly principle, this does **not** re-implement download or
-/// execution — it delegates wholly to [`tirith_core::runner`], the existing
-/// `tirith run` safe download-and-run path. `runner::run` already downloads
-/// with a size cap and timeout, computes a SHA-256, statically analyzes the
-/// script body, enforces an interpreter allowlist, writes a [`Receipt`], and
-/// asks for confirmation on the controlling terminal before executing.
-///
-/// `tirith install` adds a *preflight risk verdict* on top: the URL is
-/// analyzed first (download-shaped, not pipe-to-shell, so a legitimate
-/// installer URL is not auto-blocked), and a BLOCK refuses before any
-/// download. A non-blocking preflight then hands off to `runner::run`, whose
-/// own `Execute this script? [y/N]` prompt is the go-ahead for execution.
+/// The `url` form: download-and-run an install script. Does NOT re-implement
+/// download/execution — delegates to [`tirith_core::runner`] (size cap, timeout,
+/// SHA-256, static analysis, interpreter allowlist, [`Receipt`], confirm prompt).
+/// `tirith install` adds a download-shaped preflight verdict on top (a BLOCK
+/// refuses before any download); `runner::run`'s own prompt gates execution.
 #[cfg(unix)]
 fn run_url(
     args: &[String],
@@ -887,52 +762,34 @@ fn run_url(
         .map(|p| p.display().to_string());
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
-    // --- ANALYZE: URL preflight ----------------------------------------
-    // Analyze the URL as a *download* (`curl -fsSL <url>`), NOT as a
-    // pipe-to-shell. Analyzing `curl <url> | sh` would make CurlPipeShell fire
-    // on every URL and turn every URL install into a block. The real script
-    // body is analyzed separately by `runner::run` after download.
+    // --- ANALYZE: URL preflight ---
+    // Analyze the URL as a *download* (`curl -fsSL <url>`), NOT a pipe-to-shell
+    // (which would make CurlPipeShell fire on every URL). The real script body is
+    // analyzed by `runner::run` after download.
     //
-    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): `preflight_url` returns
-    // BOTH the verdict AND the policy snapshot it discovered, so the
-    // surrounding bypass-decision, `apply_agent_rules`, and audit-log
-    // calls below all run against the SAME policy snapshot as the
-    // analysis. Previously the surrounding code called
-    // `Policy::discover` a second time, which let a `.tirith/policy.yaml`
-    // change on disk between the two reads cause analysis and enforcement
-    // to run under different policies.
+    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): `preflight_url` returns BOTH the
+    // verdict AND the policy snapshot it discovered, so the bypass/agent-rules/
+    // audit calls below all run against the SAME snapshot (a second
+    // `Policy::discover` opened a TOCTOU window).
     let (mut preflight, policy) = preflight_url(url, cwd.as_deref(), interactive);
 
-    // M4 item 8 chunk 3 follow-up — stamp the resolved caller origin on the
-    // preflight verdict BEFORE the audit-log write below. The engine that
-    // built the preflight does not know the caller's identity by design; the
-    // CLI does. Without this stamp, `tirith install url` audit lines would
-    // land in the `tirith agent sessions` "unknown" bucket.
+    // M4 item 8 chunk 3 — stamp the caller origin before the audit write, else
+    // audit lines land in the "unknown" bucket.
     preflight.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
 
-    // M4 item 8 chunk 3 follow-up — enforce `agent_rules.deny` on the URL
-    // install path. `tirith install url` does not route through
-    // `post_process_verdict`, so without this call deny would stamp but
-    // not enforce on the URL-download hostile surface. The helper is a
-    // no-op on `Allowed`/`Unspecified`. Runs BEFORE the bypass-decision
-    // block below so a deny-forced Block can still be bypassed by
-    // `TIRITH=0` (consistent with how the regular pipeline behaves —
-    // finding A in the M4 PR #120 wave-end review tracks the
-    // bypass-skips-agent-rules gap).
-    //
-    // M4 PR #120 fix-6 (Greptile P1): mirror the bypass-skip branch the
-    // hot paths use — under `TIRITH=0`, the raw verdict already wins and
-    // `apply_agent_rules` must NOT silently re-Block. The pin is
-    // `install_agent_rules_deny_skipped_under_tirith_bypass_today`
-    // (covers both pkg and url forms via the pkg test; the url-form
-    // pin is `install_url_agent_rules_deny_skipped_under_tirith_bypass_today`).
+    // M4 item 8 chunk 3 — enforce `agent_rules.deny` on the URL path (no-op on
+    // Allowed/Unspecified). Runs BEFORE the bypass block so a deny-forced Block
+    // can still be `TIRITH=0`-bypassed. M4 PR #120 fix-6 (Greptile P1): mirror the
+    // bypass-skip — under `TIRITH=0` the raw verdict wins, no re-Block. Pins:
+    // `install_agent_rules_deny_skipped_under_tirith_bypass_today` (pkg) /
+    // `install_url_agent_rules_deny_skipped_under_tirith_bypass_today` (url).
     if !preflight.bypass_honored {
         tirith_core::escalation::apply_agent_rules(&mut preflight, &policy);
     }
 
     if json {
-        // A JSON-write failure means the consumer never received the preflight
-        // verdict — do not then proceed to download. Exit non-zero.
+        // A JSON-write failure means the consumer never got the verdict — do not
+        // then download. Exit non-zero.
         if !print_url_preflight_json(url, &preflight) {
             return 1;
         }
@@ -947,7 +804,7 @@ fn run_url(
         let bypass_allowed =
             policy.allow_bypass_env && (interactive || policy.allow_bypass_env_noninteractive);
         if bypass_set && bypass_allowed {
-            // Bypassed — stamp the verdict so the audit entry is honest.
+            // Bypassed — stamp so the audit entry is honest.
             preflight.bypass_requested = true;
             preflight.bypass_honored = true;
             false
@@ -958,8 +815,7 @@ fn run_url(
         false
     };
 
-    // A failed audit write does not abort the transaction, but the URL form
-    // also claims to be recorded — surface a non-fatal notice on failure.
+    // A failed audit write is a non-fatal notice (the transaction proceeds).
     if let Err(e) = tirith_core::audit::log_verdict(
         &preflight,
         &format!("install url {url}"),
@@ -989,8 +845,8 @@ fn run_url(
         );
     }
 
-    // A warning preflight is surfaced; `runner::run`'s own confirmation prompt
-    // is the acknowledgement, so there is no second prompt here.
+    // `runner::run`'s own confirmation prompt is the acknowledgement; no second
+    // prompt here.
     if preflight.action != Action::Allow && !json {
         eprintln!(
             "tirith install: URL preflight raised {} finding(s) — the script \
@@ -999,8 +855,8 @@ fn run_url(
         );
     }
 
-    // --- RECORD + RUN: delegate to the existing safe runner -------------
-    // `runner::run` re-analyzes the *downloaded script*, writes a Receipt, and
+    // --- RECORD + RUN: delegate to the safe runner ---
+    // `runner::run` re-analyzes the downloaded script, writes a Receipt, and
     // (unless --no-exec) prompts on /dev/tty before executing.
     let opts = RunOptions {
         url: url.to_string(),
@@ -1032,9 +888,8 @@ fn run_url(
             } else {
                 0
             };
-            // A JSON-write failure must not be reported as a `0` success — if
-            // the outcome JSON did not reach the consumer, surface exit 1.
-            // (A non-zero script exit already propagates and is kept.)
+            // A JSON-write failure must not report `0` success — surface exit 1 if
+            // the outcome didn't reach the consumer (a non-zero script exit is kept).
             if !json_ok && outcome_code == 0 {
                 1
             } else {
@@ -1043,10 +898,8 @@ fn run_url(
         }
         Err(e) => {
             if json {
-                // Route through `write_json_stdout` so the trailing newline is
-                // a fallible write (no broken-pipe panic). The command is
-                // already failing, so a write failure does not change the
-                // exit code.
+                // Via `write_json_stdout` so the trailing newline is a fallible
+                // write (no broken-pipe panic).
                 let _ = write_json_stdout(&serde_json::json!({ "error": e }));
             } else {
                 eprintln!("tirith install: {e}");
@@ -1056,8 +909,8 @@ fn run_url(
     }
 }
 
-/// On non-Unix the `url` form is unavailable — `tirith run` (and thus the
-/// safe runner) is Unix-only. npm/pip/cargo still work.
+/// On non-Unix the `url` form is unavailable (the safe runner is Unix-only);
+/// npm/pip/cargo still work.
 #[cfg(not(unix))]
 fn run_url(
     _args: &[String],
@@ -1074,26 +927,20 @@ fn run_url(
     2
 }
 
-/// Single-quote a value for a synthesized POSIX shell command, so it is
-/// analyzed as one argument. Any embedded single quote is closed, escaped, and
-/// reopened (`'\''`) — without this a URL containing `&`, `;`, a backtick, a
-/// space, or a quote would tokenize as shell syntax and produce spurious
-/// findings.
+/// Single-quote a value for a synthesized POSIX shell command so it is analyzed
+/// as one argument (embedded `'` → `'\''`); else a URL with `&`/`;`/backtick/
+/// space would tokenize as shell syntax and produce spurious findings.
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Analyze a URL as a download (not a pipe-to-shell) and return the verdict.
-///
-/// Separated so it is unit-testable without touching the network — it only
-/// runs the offline `engine::analyze`, no fetch.
+/// Unit-testable without the network — offline `engine::analyze`, no fetch.
 fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, Policy) {
     let ctx = AnalysisContext {
-        // A download shape: a legitimate installer URL must not trip the
-        // pipe-to-shell rule here. The script body is analyzed for real by
-        // the runner after it is fetched. The URL is single-quoted so a URL
-        // containing shell metacharacters (`&`, `;`, backticks, spaces) is
-        // analyzed as a single argument, not as shell syntax.
+        // Download shape so a legitimate installer URL doesn't trip the
+        // pipe-to-shell rule; single-quoted so shell metacharacters in the URL
+        // are one argument, not syntax. The body is analyzed by the runner later.
         input: format!("curl -fsSL {}", shell_single_quote(url)),
         shell: tirith_core::tokenize::ShellType::Posix,
         scan_context: ScanContext::Exec,
@@ -1107,18 +954,12 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, P
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
-    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): return the policy
-    // discovered by the engine so the caller's subsequent
-    // `apply_agent_rules` / bypass / audit calls all share the same
-    // policy snapshot. Previously the caller ran `Policy::discover`
-    // separately, opening a TOCTOU window if `.tirith/policy.yaml`
-    // changed on disk between reads.
+    // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): return the engine-discovered
+    // policy so the caller's bypass/agent-rules/audit calls share one snapshot.
     engine::analyze_returning_policy(&ctx)
 }
 
-// ===========================================================================
 // output
-// ===========================================================================
 
 /// A short, well-known example package per manager, for the usage hint.
 fn example_package(manager: PackageManager) -> &'static str {
@@ -1145,16 +986,13 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
         plan.analysis_command
     );
     eprintln!("  (pre-execution install-risk analysis — not a sandbox)");
-    // M6 ch1 — when the manager has no registry adapter, surface the
-    // "signals are weak" banner up front so the operator sees the coverage
-    // gap before they read the verdict line. Same text shape for every new
-    // backend; matches the string the JSON envelope embeds.
+    // M6 ch1 — surface the weak-signals banner up front for adapter-less backends
+    // (same string the JSON envelope embeds).
     if plan.manager.lacks_registry_adapter() {
         eprintln!("  {}", plan.manager.no_registry_adapter_banner());
     }
     eprintln!();
 
-    // Per-package risk scores.
     if plan.packages.is_empty() {
         eprintln!("  packages: none on the command line (command-shape analysis only)");
     } else {
@@ -1168,7 +1006,6 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
     }
     eprintln!();
 
-    // The verdict.
     match plan.verdict.action {
         Action::Allow => {
             eprintln!(
@@ -1224,13 +1061,9 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
     eprintln!();
 }
 
-/// Write `value` as pretty JSON to stdout. Returns `false` on a write failure
-/// (a broken pipe, a full disk) so the caller can exit non-zero — a piped
-/// consumer must not see truncated JSON paired with a success exit code.
-///
-/// Thin wrapper over [`super::write_json_stdout`] carrying the `tirith
-/// install` error prefix; the shared helper writes the body and the trailing
-/// newline through one locked handle with fallible ops (no broken-pipe panic).
+/// Write `value` as pretty JSON to stdout, returning `false` on a write failure
+/// so the caller can exit non-zero. Thin wrapper over [`super::write_json_stdout`]
+/// with the `tirith install` error prefix.
 fn write_json_stdout<T: serde::Serialize>(value: &T) -> bool {
     super::write_json_stdout(value, "tirith install: failed to write JSON output")
 }
@@ -1271,8 +1104,7 @@ fn print_url_preflight_human(url: &str, verdict: &Verdict) {
     }
 }
 
-/// Render the URL-form preflight verdict (JSON form). Returns `false` on a
-/// JSON-write failure.
+/// Render the URL-form preflight verdict (JSON). `false` on a write failure.
 fn print_url_preflight_json(url: &str, verdict: &Verdict) -> bool {
     let out = serde_json::json!({
         "schema_version": 1,
@@ -1284,8 +1116,7 @@ fn print_url_preflight_json(url: &str, verdict: &Verdict) -> bool {
     write_json_stdout(&out)
 }
 
-/// JSON record of the completed URL transaction (the `runner` result).
-/// Returns `false` on a JSON-write failure.
+/// JSON record of the completed URL transaction. `false` on a write failure.
 #[cfg(unix)]
 fn print_url_outcome_json(result: &runner::RunResult) -> bool {
     let out = serde_json::json!({
@@ -1305,13 +1136,11 @@ mod tests {
     use std::sync::Mutex;
     use tirith_core::verdict::{Finding, RuleId, Severity};
 
-    /// A fake [`InstallRunner`] — records the argv it was asked to run and
-    /// returns a canned exit code. It NEVER spawns a process, so a test using
-    /// it installs nothing and touches no network.
+    /// A fake [`InstallRunner`] — records the argv and returns a canned exit code,
+    /// never spawning a process (installs nothing, no network).
     struct FakeRunner {
         exit_code: Option<i32>,
-        /// Optional canned stdout/stderr to return when capture mode is on,
-        /// so JSON-mode capture tests can assert on embedded child output.
+        /// Canned stdout/stderr for capture-mode tests.
         stdout: Option<String>,
         stderr: Option<String>,
         seen: Mutex<Vec<(String, Vec<String>, bool)>>,
@@ -1404,10 +1233,7 @@ mod tests {
             InstallSource::Cargo.package_manager(),
             Some(PackageManager::Cargo)
         );
-        // M6 ch1 — the 8 new distro/docker/go backends map one-to-one onto
-        // `PackageManager`. A missing arm here would have a corresponding
-        // `package_manager()` panic at runtime; pinning the table catches
-        // it at compile-test time.
+        // M6 ch1 — the 8 new backends map one-to-one onto `PackageManager`.
         assert_eq!(
             InstallSource::Apt.package_manager(),
             Some(PackageManager::Apt)
@@ -1455,7 +1281,6 @@ mod tests {
     #[test]
     fn decide_proceed_block_stops_with_exit_1() {
         let policy = Policy::default();
-        // No TIRITH=0 in env for this test path.
         assert!(matches!(
             decide_proceed(&block_verdict(), &policy, true, false, true),
             ProceedDecision::Stop(1)
@@ -1482,8 +1307,6 @@ mod tests {
 
     #[test]
     fn fake_runner_records_argv_and_never_spawns() {
-        // run_and_record with a fake runner: nothing is installed, the argv is
-        // recorded, and the fake's exit code is returned.
         let req_args = vec!["my-pkg".to_string()];
         let argv = install_txn::build_argv(PackageManager::Npm, &req_args);
         let plan = InstallPlan {
@@ -1495,9 +1318,7 @@ mod tests {
             notes: vec![],
         };
         let runner = FakeRunner::new(Some(0));
-        // cwd = None so no checkpoint is attempted (keeps the test hermetic —
-        // no filesystem writes outside tempdirs). `online=false` matches the
-        // default. `json=true` so the fake's capture path is exercised.
+        // cwd=None so no checkpoint (hermetic); json=true exercises the capture path.
         let code = run_and_record(&plan, None, true, false, &runner);
         assert_eq!(code, 0);
         let seen = runner.seen.lock().unwrap();
@@ -1545,16 +1366,9 @@ mod tests {
 
     #[test]
     fn json_mode_emits_single_parseable_envelope() {
-        // PR #121 fix-list item 3 regression pin — the JSON output is a SINGLE
-        // top-level document `{"analysis": ..., "outcome": ...}` even when
-        // the child manager produced its own stdout output. Captured
-        // stdout/stderr land INSIDE the outcome envelope.
-        //
-        // We can't observe stdout from a unit test cleanly (the harness
-        // captures it), but we CAN assert that the runner is called with
-        // `capture=true` in JSON mode and that the combined-envelope writer
-        // builds a document that round-trips through serde_json — i.e. it
-        // is valid JSON.
+        // PR #121 fix-list item 3 regression pin — JSON mode must request capture
+        // so child output lands INSIDE the single envelope. We can't observe
+        // stdout cleanly here, so we assert the runner is called with capture=true.
         let req_args = vec!["clean-pkg".to_string()];
         let argv = install_txn::build_argv(PackageManager::Pip, &req_args);
         let plan = InstallPlan {
@@ -1579,10 +1393,8 @@ mod tests {
 
     #[test]
     fn detect_manifest_flag_helper_is_internal() {
-        // This is a CLI-side smoke that the core's manifest detector is the
-        // single source of truth — we don't replicate it here. Just exercise
-        // a couple of forms to keep this file in sync with the core change.
-        // (The real coverage lives in `tirith-core::install_txn::tests`.)
+        // CLI-side smoke that the core's manifest detector fires through
+        // `plan_install`; real coverage lives in `tirith-core::install_txn::tests`.
         let req = tirith_core::install_txn::PlanRequest {
             manager: PackageManager::Pip,
             user_args: &["-r".to_string(), "requirements.txt".to_string()],
@@ -1606,8 +1418,7 @@ mod tests {
 
     #[test]
     fn preflight_url_plain_installer_does_not_block() {
-        // A plain https installer URL, analyzed as a *download*, must not be
-        // blocked — analyzing it as a pipe-to-shell would. Offline, no network.
+        // A plain https installer URL, analyzed as a download, must not block.
         let (verdict, _policy) =
             preflight_url("https://get.example-tool.sh/install.sh", None, false);
         assert_ne!(
@@ -1620,8 +1431,7 @@ mod tests {
 
     #[test]
     fn preflight_url_raw_ip_is_flagged() {
-        // A raw-IP URL is suspicious and the preflight should surface it
-        // (raw_ip_url rule) — still offline, no fetch.
+        // A raw-IP URL is suspicious; the preflight should surface it (raw_ip_url).
         let (verdict, _policy) = preflight_url("http://203.0.113.5/install.sh", None, false);
         assert!(
             verdict.action != Action::Allow,
@@ -1631,7 +1441,7 @@ mod tests {
 
     #[test]
     fn shell_single_quote_escapes_metacharacters() {
-        // CR10: a URL with shell metacharacters must become one quoted token.
+        // CR10: a URL with shell metacharacters becomes one quoted token.
         assert_eq!(
             shell_single_quote("https://x.example/a?b=1&c=2"),
             "'https://x.example/a?b=1&c=2'"
@@ -1642,9 +1452,8 @@ mod tests {
 
     #[test]
     fn preflight_url_with_shell_metacharacters_no_spurious_findings() {
-        // CR10: a benign https installer URL carrying `&`, `;`, and a space
-        // must not produce findings from the URL tokenizing as shell syntax.
-        // Quoting it makes `curl -fsSL '<url>'` analyze the URL as one arg.
+        // CR10: a benign URL with `&`/`;`/space must not produce shell-syntax
+        // findings once quoted into `curl -fsSL '<url>'`.
         let url = "https://get.example-tool.sh/install.sh?ref=a&v=1;x y";
         let (verdict, _policy) = preflight_url(url, None, false);
         assert_eq!(
@@ -1657,8 +1466,7 @@ mod tests {
 
     #[test]
     fn preflight_url_quoting_preserves_real_detection() {
-        // The quoting must not hide a genuinely suspicious URL — a raw-IP URL
-        // is still flagged when it also contains shell metacharacters.
+        // Quoting must not hide a raw-IP URL that also carries shell metacharacters.
         let (verdict, _policy) =
             preflight_url("http://203.0.113.5/install.sh?a=1&b=2", None, false);
         assert!(

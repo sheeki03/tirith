@@ -38,10 +38,8 @@ impl std::fmt::Display for Tier {
 }
 
 /// Controls whether unsigned (legacy) tokens are accepted.
-///
-/// - `Legacy`: both signed and unsigned accepted (development/testing)
-/// - `SignedPreferred`: both accepted, but `tirith doctor` warns on unsigned (v0.2.x transition)
-/// - `SignedOnly`: unsigned tokens rejected in official v0.3.0+ builds
+/// `Legacy`: both accepted (dev/testing). `SignedPreferred`: both accepted, but
+/// `tirith doctor` warns on unsigned (v0.2.x). `SignedOnly`: unsigned rejected (v0.3.0+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum EnforcementMode {
@@ -220,7 +218,7 @@ fn decode_signed_token(
         return None;
     }
 
-    // Accept base64url with or without padding.
+    // base64url, with or without padding.
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
@@ -280,11 +278,9 @@ fn decode_signed_token(
     Some(payload)
 }
 
-/// Core dispatch: try signed first (if `.` present), then legacy based on mode.
-///
-/// Note: dispatch is one-way routing — a dot means signed format. In
-/// `SignedPreferred` mode, if a dot-containing token fails signed verification,
-/// we do NOT fall back to legacy (a dot is never valid legacy base64).
+/// Core dispatch: a `.` routes one-way to the signed path (never falling back to
+/// legacy on failure — a dot is never valid legacy base64); otherwise legacy,
+/// subject to `mode`.
 fn decode_tier_at_with_mode(
     key: &str,
     now: DateTime<Utc>,
@@ -333,18 +329,11 @@ fn decode_license_info_at(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> 
 
 /// Determine the current license tier.
 ///
-/// Resolution order:
-/// 1. `TIRITH_LICENSE` env var (raw key)
-/// 2. `~/.config/tirith/license.key` file
-/// 3. Fallback: `Tier::Pro`
-///
-/// Tier verification uses Ed25519-signed tokens. Legacy unsigned tokens were
-/// accepted during the v0.2.x transition period but are rejected in v0.3.0+.
-/// Runtime feature gating has been collapsed to an always-on Pro baseline;
-/// tier parsing remains for compatibility with existing tokens.
-///
-/// Invalid, expired, or missing keys silently fall back to Pro
-/// (no panic, no error exit).
+/// Resolution order: `TIRITH_LICENSE` env var, then `~/.config/tirith/license.key`,
+/// then `Tier::Pro`. Verification uses Ed25519-signed tokens. Invalid, expired,
+/// or missing keys silently fall back to Pro (no panic, no error exit). Runtime
+/// feature gating is collapsed to an always-on Pro baseline; tier parsing
+/// remains for token compatibility.
 pub fn current_tier() -> Tier {
     match read_license_key() {
         Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or_else(|| {
@@ -370,30 +359,23 @@ pub fn license_info() -> LicenseInfo {
     }
 }
 
-/// Reports the structural format of the installed license key.
-///
-/// Lightweight structural check only — does NOT verify signatures or
-/// validate claims. Intended for `tirith doctor` diagnostics.
+/// Structural format of the installed license key. Lightweight check only — does
+/// NOT verify signatures or claims. For `tirith doctor` diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFormatStatus {
     NoKey,
-    /// No `.` separator, valid base64, decodes to JSON with "tier" field.
+    /// No `.`, valid base64, decodes to JSON with a "tier" field.
     LegacyUnsigned,
-    /// No `.` separator, not valid base64 or missing "tier" field.
+    /// No `.`, not valid base64 or missing "tier".
     LegacyInvalid,
-    /// Has exactly one `.` with two non-empty base64url segments.
-    /// Signature/claims may still be invalid — this is structural only.
+    /// One `.`, two non-empty base64url segments. Signature/claims NOT verified.
     SignedStructural,
-    /// Has `.` but structure is wrong (empty segments, multiple dots).
+    /// Has `.` but malformed (empty segments, multiple dots).
     Malformed,
 }
 
-/// Check the structural format of the installed license key.
-///
-/// NOTE: `SignedStructural` only means the token has the right shape
-/// (two non-empty base64url segments separated by a dot). The signature,
-/// claims (iss, aud, exp), and key validity are NOT verified here.
-/// Use `current_tier()` for full verification.
+/// Check the structural format only — `SignedStructural` means the shape is
+/// right, NOT that signature/claims/key are valid. Use `current_tier()` for that.
 pub fn key_format_status() -> KeyFormatStatus {
     use base64::Engine;
     match read_license_key() {
@@ -401,7 +383,6 @@ pub fn key_format_status() -> KeyFormatStatus {
         Some(k) => {
             let trimmed = k.trim();
             if let Some((left, right)) = trimmed.split_once('.') {
-                // Signed format: exactly one dot, both segments non-empty and valid base64url.
                 if left.is_empty() || right.is_empty() || right.contains('.') {
                     return KeyFormatStatus::Malformed;
                 }
@@ -417,7 +398,7 @@ pub fn key_format_status() -> KeyFormatStatus {
                     KeyFormatStatus::Malformed
                 }
             } else {
-                // Legacy: must be valid base64 AND decode to JSON with a "tier" field.
+                // Legacy: valid base64 AND JSON carrying a "tier" field.
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(trimmed)
                     .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed));
