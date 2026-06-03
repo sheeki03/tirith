@@ -420,8 +420,10 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
 
     let policy = crate::policy::Policy::discover(None);
 
-    match scan::scan_single_file(&path) {
-        Some(mut result) => {
+    // Guarded: a long-lived MCP server must not crash if a rule panics on a
+    // crafted file — degrade to a tool error instead of unwinding.
+    match scan::scan_single_file_guarded(&path) {
+        Ok(Some(mut result)) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let structured = json!({
                 "path": result.path.display().to_string(),
@@ -439,7 +441,10 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
                 structured_content: Some(structured),
             }
         }
-        None => tool_error(&format!("Could not read file: {path_str}")),
+        Ok(None) => tool_error(&format!("Could not read file: {path_str}")),
+        Err(scan::RulePanic) => tool_error(&format!(
+            "Internal error scanning {path_str}: a rule panicked; file not scanned"
+        )),
     }
 }
 
@@ -484,6 +489,10 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         "skipped_count": result.skipped_count,
         "truncated": result.truncated,
         "truncation_reason": result.truncation_reason,
+        "panic_count": result.panic_files.len(),
+        "panic_files": result.panic_files.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
         "total_findings": result.total_findings(),
         "files": result.file_results.iter()
             .filter(|r| !r.findings.is_empty())
@@ -522,8 +531,9 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
     let policy = crate::policy::Policy::discover(None);
 
     // scan_single_file routes through FileScan, which runs configfile rules.
-    match scan::scan_single_file(&path) {
-        Some(mut result) => {
+    // Guarded so a crafted config can't crash the long-lived MCP server.
+    match scan::scan_single_file_guarded(&path) {
+        Ok(Some(mut result)) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let mcp_findings: Vec<_> = result
                 .findings
@@ -568,7 +578,10 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
                 structured_content: Some(structured),
             }
         }
-        None => tool_error(&format!("Could not read file: {path_str}")),
+        Ok(None) => tool_error(&format!("Could not read file: {path_str}")),
+        Err(scan::RulePanic) => tool_error(&format!(
+            "Internal error scanning {path_str}: a rule panicked; file not scanned"
+        )),
     }
 }
 
@@ -674,8 +687,19 @@ fn format_file_scan_text(result: &scan::FileScanResult) -> String {
 
 fn format_dir_scan_text(result: &scan::ScanResult) -> String {
     let total = result.total_findings();
+    let panic_note = if result.panic_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n  WARNING: {} file(s) skipped due to a rule panic — results may be incomplete.",
+            result.panic_files.len()
+        )
+    };
     if total == 0 {
-        return format!("{} files scanned, no issues found.", result.scanned_count);
+        return format!(
+            "{} files scanned, no issues found.{panic_note}",
+            result.scanned_count
+        );
     }
     let files_with = result
         .file_results
@@ -703,6 +727,7 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
             out.push_str(&format!("\n  {reason}\n"));
         }
     }
+    out.push_str(&panic_note);
     out
 }
 

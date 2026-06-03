@@ -4710,6 +4710,22 @@ fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
 
+    // Schema v4 (#123): the directory-scan envelope advertises version 4 and
+    // always carries the panic-incomplete-scan fields. A clean walk panics on
+    // nothing, so the count is 0 and the list is present-and-empty.
+    assert_eq!(
+        json["schema_version"], 4,
+        "scan JSON must advertise schema_version 4"
+    );
+    assert_eq!(json["panic_count"], 0, "a clean scan reports zero panics");
+    assert!(
+        json["panic_files"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "panic_files must be present and empty on a clean scan, got: {}",
+        json["panic_files"]
+    );
+
     // Collect every rule_id and the relative file path of every finding across
     // the whole scanned tree.
     let mut rule_ids: Vec<String> = Vec::new();

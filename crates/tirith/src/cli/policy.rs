@@ -521,10 +521,16 @@ fn test_file(file_path: &str, json: bool) -> i32 {
         return 1;
     }
 
-    let result = match scan::scan_single_file(&path) {
-        Some(r) => r,
-        None => {
+    // Guarded so a crafted file that panics a rule reports an error instead of
+    // crashing the process.
+    let result = match scan::scan_single_file_guarded(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             eprintln!("tirith policy test: could not read file: {file_path}");
+            return 1;
+        }
+        Err(scan::RulePanic) => {
+            eprintln!("tirith policy test: internal error scanning {file_path}: a rule panicked");
             return 1;
         }
     };

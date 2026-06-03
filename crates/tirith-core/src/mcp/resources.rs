@@ -60,6 +60,10 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 "scanned_count": result.scanned_count,
                 "skipped_count": result.skipped_count,
                 "truncated": result.truncated,
+                "panic_count": result.panic_files.len(),
+                "panic_files": result.panic_files.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
                 "total_findings": result.total_findings(),
                 "files": result.file_results.iter()
                     .filter(|r| !r.findings.is_empty())
@@ -122,6 +126,10 @@ fn read_project_safety() -> ToolCallResult {
         "scanned_count": result.scanned_count,
         "skipped_count": result.skipped_count,
         "truncated": result.truncated,
+        "panic_count": result.panic_files.len(),
+        "panic_files": result.panic_files.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
         "total_findings": total,
         "files": result.file_results.iter()
             .filter(|r| !r.findings.is_empty())
@@ -133,9 +141,17 @@ fn read_project_safety() -> ToolCallResult {
             .collect::<Vec<_>>(),
     });
 
+    let panic_note = if result.panic_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " WARNING: {} file(s) skipped due to a rule panic — results may be incomplete.",
+            result.panic_files.len()
+        )
+    };
     let text = if total == 0 {
         format!(
-            "Project safety: {} files scanned, no issues found.",
+            "Project safety: {} files scanned, no issues found.{panic_note}",
             result.scanned_count
         )
     } else {
@@ -145,7 +161,7 @@ fn read_project_safety() -> ToolCallResult {
             .filter(|r| !r.findings.is_empty())
             .count();
         format!(
-            "Project safety: {} files scanned, {} finding(s) in {} file(s).",
+            "Project safety: {} files scanned, {} finding(s) in {} file(s).{panic_note}",
             result.scanned_count, total, files_with
         )
     };

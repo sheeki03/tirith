@@ -30,6 +30,10 @@ pub struct ScanResult {
     pub skipped_count: usize,
     pub truncated: bool,
     pub truncation_reason: Option<String>,
+    /// Files skipped specifically because a rule panicked while scanning them
+    /// (a subset of `skipped_count`). Surfaced separately so an incomplete scan
+    /// is distinguishable from benign size/IO skips and never reads as clean.
+    pub panic_files: Vec<PathBuf>,
 }
 
 /// Result of scanning a single file.
@@ -107,13 +111,19 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     let mut file_results = Vec::new();
+    let mut panic_files = Vec::new();
     for file_path in &files {
         // Panic in any rule is bounded to its file; the rest of the walk
-        // continues. Single-file callers (CLI, MCP, `policy test`) bypass
-        // this guard on purpose so panics still surface honestly there.
+        // continues. A panic is recorded in `panic_files` (not just folded into
+        // `skipped_count`) so callers can tell an incomplete scan from benign
+        // size/IO skips.
         match catch_panic_scanning(file_path, || scan_single_file(file_path)) {
             Some(Some(result)) => file_results.push(result),
-            Some(None) | None => skipped_count += 1,
+            Some(None) => skipped_count += 1,
+            None => {
+                skipped_count += 1;
+                panic_files.push(file_path.clone());
+            }
         }
     }
 
@@ -122,6 +132,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         skipped_count,
         truncated,
         truncation_reason,
+        panic_files,
         file_results,
     }
 }
@@ -214,6 +225,26 @@ fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T>
             None
         }
     }
+}
+
+/// A rule panicked while scanning a file (already reported on stderr by the
+/// panic hook + [`catch_panic_scanning`]). Returned by
+/// [`scan_single_file_guarded`] so callers can degrade gracefully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulePanic;
+
+/// Scan a single file with the same per-file panic guard the directory walk
+/// uses, for long-lived/server callers (the MCP server, `policy test`) that must
+/// not crash on a crafted file:
+/// - `Ok(Some(result))` — the file was scanned;
+/// - `Ok(None)` — skipped (too large / unreadable);
+/// - `Err(RulePanic)` — a rule panicked; the caller should degrade to an error
+///   instead of unwinding.
+///
+/// One-shot CLI `scan <file>` deliberately does NOT use this — a panic there
+/// surfaces honestly as a process crash (see the directory-walk comment above).
+pub fn scan_single_file_guarded(file_path: &Path) -> Result<Option<FileScanResult>, RulePanic> {
+    catch_panic_scanning(file_path, || scan_single_file(file_path)).ok_or(RulePanic)
 }
 
 /// Scan content from stdin (no file path).
@@ -548,6 +579,21 @@ mod tests {
         });
         std::panic::set_hook(prev);
         assert!(result.is_none(), "panic must produce None, got {result:?}");
+    }
+
+    #[test]
+    fn scan_single_file_guarded_non_panic_paths() {
+        // A readable file scans to Ok(Some(_)); the panic arm (Err(())) is
+        // exercised by `catch_panic_scanning_returns_none_on_panic` above, which
+        // covers the only branch that yields Err.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file_path = tmp.path().join("note.md");
+        std::fs::write(&file_path, "hello world").expect("write temp file");
+        assert!(matches!(scan_single_file_guarded(&file_path), Ok(Some(_))));
+
+        // An unreadable/missing file is a benign skip: Ok(None), not Err.
+        let missing = tmp.path().join("does_not_exist.md");
+        assert!(matches!(scan_single_file_guarded(&missing), Ok(None)));
     }
 
     #[test]

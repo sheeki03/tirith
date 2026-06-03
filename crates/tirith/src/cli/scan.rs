@@ -229,7 +229,23 @@ pub fn run(
         true
     };
 
+    // Always surface a panic-incomplete scan (a subset of skipped files). Goes
+    // to stderr so it never corrupts --json/--sarif stdout.
+    if !result.panic_files.is_empty() {
+        eprintln!(
+            "tirith scan: WARNING: incomplete scan — {} file(s) were skipped because a rule \
+             panicked (see messages above); results may be missing.",
+            result.panic_files.len()
+        );
+        if ci {
+            eprintln!("tirith scan: --ci: treating an incomplete scan as a failure.");
+        }
+    }
+
     if result.has_findings_at_or_above(fail_on_severity) {
+        1
+    } else if ci && !result.panic_files.is_empty() {
+        // Fail closed in CI: an incomplete scan must not report success.
         1
     } else if result.total_findings() > 0 {
         2
@@ -369,6 +385,10 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
         truncated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         truncation_reason: &'a Option<String>,
+        // Subset of `skipped_count`: files a rule panicked on. Always present so
+        // a consumer can detect an incomplete scan; empty list when none.
+        panic_count: usize,
+        panic_files: Vec<String>,
         total_findings: usize,
         files: Vec<JsonFileOutput<'a>>,
     }
@@ -392,11 +412,17 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
         .collect();
 
     let output = JsonScanOutput {
-        schema_version: 3,
+        schema_version: 4,
         scanned_count: result.scanned_count,
         skipped_count: result.skipped_count,
         truncated: result.truncated,
         truncation_reason: &result.truncation_reason,
+        panic_count: result.panic_files.len(),
+        panic_files: result
+            .panic_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         total_findings: result.total_findings(),
         files,
     };
