@@ -75,8 +75,16 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
             }
+            // Guard redirect *targets* against SSRF (the user-chosen initial URL
+            // is intentional and not re-validated here). Fail with `error`, not
+            // `stop` — `stop` would surface the 3xx as a success and let its
+            // body be processed as the download.
             if attempt.previous().len() >= 10 {
-                attempt.stop()
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
             } else {
                 attempt.follow()
             }
@@ -303,8 +311,16 @@ pub fn download_to_path(
             if let Ok(mut list) = redirect_list_clone.lock() {
                 list.push(attempt.url().to_string());
             }
+            // Guard redirect *targets* against SSRF (the user-chosen initial URL
+            // is intentional and not re-validated here). Fail with `error`, not
+            // `stop` — `stop` would surface the 3xx as a success and let its
+            // body be processed as the download.
             if attempt.previous().len() >= 10 {
-                attempt.stop()
+                attempt.error("too many redirects")
+            } else if let Err(reason) =
+                crate::url_validate::validate_fetch_url(attempt.url().as_str())
+            {
+                attempt.error(reason)
             } else {
                 attempt.follow()
             }

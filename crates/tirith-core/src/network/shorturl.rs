@@ -37,7 +37,8 @@ pub fn is_shortened_url(url: &str) -> bool {
 }
 
 /// Follow redirects from a shortened URL and return the final destination.
-/// `None` for a non-shortener, network failure, or chains over [`MAX_REDIRECTS`].
+/// `None` for a non-shortener, a network failure, a chain over [`MAX_REDIRECTS`],
+/// or a redirect toward a non-public / forbidden destination (SSRF guard).
 /// Results are cached for [`CACHE_TTL`].
 pub fn resolve_shortened_url(url: &str) -> Option<String> {
     if !is_shortened_url(url) {
@@ -75,7 +76,17 @@ fn extract_host(url: &str) -> Option<&str> {
     }
 }
 
-/// Follow the `Location` header chain manually.
+/// One step in a redirect chain: a terminal response, or a redirect carrying
+/// the raw value of its `Location` header.
+enum Hop {
+    Final,
+    Redirect(String),
+}
+
+/// Follow the `Location` chain, validating every URL — the initial one and each
+/// hop — with [`crate::url_validate::validate_fetch_url`] before connecting, so
+/// a shortener cannot steer us into an SSRF target (loopback / private /
+/// link-local / cloud-metadata).
 fn follow_redirects(start_url: &str) -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -84,37 +95,65 @@ fn follow_redirects(start_url: &str) -> Option<String> {
         .build()
         .ok()?;
 
+    follow_redirects_with(
+        start_url,
+        |url| {
+            let resp = client.get(url).send().ok()?;
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)?
+                    .to_str()
+                    .ok()?;
+                Some(Hop::Redirect(location.to_string()))
+            } else {
+                Some(Hop::Final)
+            }
+        },
+        |url| crate::url_validate::validate_fetch_url(url).map(|_| ()),
+    )
+}
+
+/// Pure redirect-following control flow with injected `fetch` and `validate`
+/// closures, so the SSRF guard, the over-limit case, and `Location` resolution
+/// are unit-testable without real HTTP.
+fn follow_redirects_with<F, V>(start_url: &str, fetch: F, validate: V) -> Option<String>
+where
+    F: Fn(&str) -> Option<Hop>,
+    V: Fn(&str) -> Result<(), String>,
+{
     let mut current = start_url.to_string();
 
     for _ in 0..MAX_REDIRECTS {
-        let resp = client.get(&current).send().ok()?;
-
-        if !resp.status().is_redirection() {
-            return Some(current);
+        // SSRF guard: refuse a forbidden destination before connecting. Applies
+        // to the initial URL and every redirect hop.
+        if validate(&current).is_err() {
+            return None;
         }
 
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)?
-            .to_str()
-            .ok()?;
-
-        current = if location.starts_with("http://") || location.starts_with("https://") {
-            location.to_string()
-        } else if location.starts_with('/') {
-            // Absolute path — reuse scheme+host from current URL.
-            if let Some(origin) = extract_origin(&current) {
-                format!("{origin}{location}")
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        };
+        match fetch(&current)? {
+            Hop::Final => return Some(current),
+            Hop::Redirect(location) => current = resolve_location(&current, &location)?,
+        }
     }
 
-    // Exceeded redirect limit — return last URL we saw.
-    Some(current)
+    // Exceeded the redirect limit without resolving. Per the documented
+    // contract this is a failure (`None`) — the last hop was never fetched or
+    // validated as a final destination, so we must not return it.
+    None
+}
+
+/// Resolve a `Location` header against the URL it came from: absolute http(s) is
+/// taken as-is, a leading-`/` path reuses the current origin, anything else
+/// (including protocol-relative) is unsupported and gives up.
+fn resolve_location(current: &str, location: &str) -> Option<String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        Some(location.to_string())
+    } else if location.starts_with('/') {
+        extract_origin(current).map(|origin| format!("{origin}{location}"))
+    } else {
+        None
+    }
 }
 
 /// Return the `scheme://host[:port]` origin portion of a URL.
@@ -210,4 +249,93 @@ mod tests {
 
     // Note: resolve_shortened_url does real HTTP and is not tested in unit tests.
     // Integration tests should be written separately against controlled servers.
+    // The redirect-following control flow below IS tested via injected closures.
+
+    #[test]
+    fn test_follow_redirects_over_limit_returns_none() {
+        // A chain that redirects forever must give up with None (#122), not
+        // return the last unfetched hop.
+        let result = follow_redirects_with(
+            "https://bit.ly/loop",
+            |url| Some(Hop::Redirect(format!("{url}/x"))),
+            |_| Ok(()),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_follow_redirects_initial_url_ssrf_blocked() {
+        // Even the first URL is validated on the passive path.
+        let result = follow_redirects_with(
+            "http://127.0.0.1/x",
+            |_| Some(Hop::Final),
+            |url| {
+                if url.contains("127.0.0.1") {
+                    Err("forbidden".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_follow_redirects_ssrf_hop_blocked() {
+        // A shortener that redirects to a metadata endpoint is refused before
+        // the GET; the fetcher's would-be Final for that host is never reached.
+        let result = follow_redirects_with(
+            "https://bit.ly/evil",
+            |url| {
+                if url.contains("169.254.169.254") {
+                    Some(Hop::Final)
+                } else {
+                    Some(Hop::Redirect(
+                        "http://169.254.169.254/latest/meta-data/".to_string(),
+                    ))
+                }
+            },
+            |url| {
+                if url.contains("169.254.169.254") {
+                    Err("forbidden".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_follow_redirects_resolves_absolute() {
+        let result = follow_redirects_with(
+            "https://bit.ly/x",
+            |url| {
+                if url == "https://example.com/final" {
+                    Some(Hop::Final)
+                } else {
+                    Some(Hop::Redirect("https://example.com/final".to_string()))
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result, Some("https://example.com/final".to_string()));
+    }
+
+    #[test]
+    fn test_follow_redirects_resolves_relative_path() {
+        // `Location: /landing` reuses the origin of the current URL.
+        let result = follow_redirects_with(
+            "https://bit.ly/x",
+            |url| {
+                if url == "https://bit.ly/landing" {
+                    Some(Hop::Final)
+                } else {
+                    Some(Hop::Redirect("/landing".to_string()))
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result, Some("https://bit.ly/landing".to_string()));
+    }
 }
