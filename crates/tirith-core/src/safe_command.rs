@@ -252,6 +252,10 @@ fn rewrite_pipe_to_shell(segments: &[tokenize::Segment], shell: ShellType) -> Op
     if url.is_empty() {
         return None;
     }
+    // Single-quote the untrusted URL so `$( )`, backtick, `;`, `|`, `&`, and
+    // spaces in a hostile URL cannot break out of the generated command when it
+    // is run / eval'd. Refuse the rewrite if it can't be safely single-quoted.
+    let url = shell_single_quote(&url)?;
 
     // `curl` is the safe, universally-available downloader to suggest.
     let fetch = match source_cmd.as_str() {
@@ -430,6 +434,9 @@ fn rewrite_typosquat(
     if target.is_empty() {
         return None;
     }
+    // The target name is parsed out of an untrusted finding title / evidence;
+    // single-quote it so it can't inject shell syntax into `<pm> install …`.
+    let target = shell_single_quote(&target)?;
     let (pm, verb) = detect_pm_install(segments, shell)?;
     Some(format!("{pm} {verb} {target}"))
 }
@@ -511,6 +518,10 @@ fn rewrite_archive_list_first(segments: &[tokenize::Segment], shell: ShellType) 
     if archive.is_empty() {
         return None;
     }
+    // Single-quote ONLY the untrusted archive path on the preview half; the
+    // `{raw}` tail is the user's own original command, re-emitted verbatim, and
+    // must NOT be re-quoted (that would corrupt its existing flags/quoting).
+    let archive = shell_single_quote(&archive)?;
     let raw = seg.raw.trim();
     // `tar -tf` (no compression flag) auto-detects compression on modern GNU &
     // BSD tar; hard-coding `-tzf` (gzip) would break non-gzip variants.
@@ -590,6 +601,15 @@ fn rewrite_dotfile_backup_first(
     }
     let target_token = sanitize_for_display(&target_token);
     if target_token.is_empty() {
+        return None;
+    }
+    // The token is `~/.…` or `$HOME/.…` and MUST stay unquoted so the shell
+    // still expands `~` / `$HOME` in the generated `cp` (single-quoting it would
+    // create a literal `~`/`$HOME` directory). We therefore can't neutralize an
+    // injected `$( )` / backtick by quoting — instead refuse the rewrite unless
+    // the path after the prefix is plain path characters. The `{cmd}` tail is
+    // the user's own original command, re-emitted verbatim (not re-quoted).
+    if !dotfile_redirect_token_is_safe(&target_token) {
         return None;
     }
     Some(format!(
@@ -1005,6 +1025,55 @@ fn sanitize_for_display(s: &str) -> String {
     s.chars().filter(|c| !c.is_ascii_control()).collect()
 }
 
+/// Wrap an untrusted token in single quotes for safe interpolation into a
+/// generated shell command, escaping each embedded `'` as `'\''`
+/// (`foo'bar` → `'foo'\''bar'`). Single quotes make every other byte literal,
+/// so `$( )`, backtick, `;`, `|`, `&`, spaces, and globs cannot break out.
+///
+/// Returns `None` when the token contains a byte that cannot be safely carried
+/// in a single-token single-quoted string — a newline (`\n`) or NUL — so the
+/// caller refuses the rewrite rather than emit a multi-line / truncated command.
+fn shell_single_quote(s: &str) -> Option<String> {
+    if s.bytes().any(|b| b == b'\n' || b == b'\0') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            // Close the quote, emit an escaped literal `'`, reopen the quote.
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
+/// Validate a `~`/`$HOME`-prefixed dotfile redirect token for safe *unquoted*
+/// interpolation. These tokens must stay unquoted so the shell still expands
+/// `~` / `$HOME`, so we cannot single-quote them; instead we require the path
+/// *after* the leading `~/` or `$HOME/` to contain only ordinary path
+/// characters. Anything else (`$`, backtick, `(`, glob, redirection, …) in the
+/// remainder is an injection or glob attempt, and the caller refuses the
+/// rewrite. The extractor already bars whitespace / `;` / `|` / `&`, so this is
+/// belt-and-suspenders against `$(…)`, backticks, globs, and stray redirections.
+fn dotfile_redirect_token_is_safe(token: &str) -> bool {
+    let remainder = token
+        .strip_prefix("~/")
+        .or_else(|| token.strip_prefix("$HOME/"));
+    let Some(remainder) = remainder else {
+        // Unexpected shape (the extractor only emits these two prefixes); refuse.
+        return false;
+    };
+    // The remainder is a plain relative path: filename chars plus `/`.
+    !remainder.is_empty()
+        && remainder
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+' | '@'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,4 +1368,221 @@ mod tests {
     // NOTE: no end-to-end compound-shape test mutates `std::env::GITHUB_TOKEN`
     // (it would race parallel tests that read the env). The compound-shape guard
     // is fully covered by the `is_simple_command_for_env_scrub` unit tests above.
+
+    // ── shell_single_quote — untrusted-token neutralization (PR124) ────────
+
+    #[test]
+    fn shell_single_quote_wraps_plain_token() {
+        assert_eq!(
+            shell_single_quote("requests").as_deref(),
+            Some("'requests'")
+        );
+        assert_eq!(
+            shell_single_quote("https://example.com/install.sh").as_deref(),
+            Some("'https://example.com/install.sh'")
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_command_substitution() {
+        // `$( )` and backticks become inert literals inside single quotes.
+        assert_eq!(
+            shell_single_quote("http://x/$(id)").as_deref(),
+            Some("'http://x/$(id)'")
+        );
+        assert_eq!(
+            shell_single_quote("http://x/`id`").as_deref(),
+            Some("'http://x/`id`'")
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_separators_and_spaces() {
+        assert_eq!(
+            shell_single_quote("http://x/a;rm -rf ~").as_deref(),
+            Some("'http://x/a;rm -rf ~'")
+        );
+        assert_eq!(
+            shell_single_quote("a|b&c>d<e").as_deref(),
+            Some("'a|b&c>d<e'")
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_single_quote() {
+        // foo'bar → 'foo'\''bar' (close, escaped literal quote, reopen).
+        assert_eq!(
+            shell_single_quote("foo'bar").as_deref(),
+            Some(r"'foo'\''bar'")
+        );
+        // A lone quote becomes ''\'' — still a single shell token.
+        assert_eq!(shell_single_quote("'").as_deref(), Some(r"''\'''"));
+    }
+
+    #[test]
+    fn shell_single_quote_refuses_newline_and_nul() {
+        // Newline / NUL can't live in a single-token single-quoted string.
+        assert_eq!(shell_single_quote("a\nb"), None);
+        assert_eq!(shell_single_quote("a\0b"), None);
+    }
+
+    // ── rewrite_pipe_to_shell — URL is single-quoted (PR124) ───────────────
+
+    /// Drive a `<url> | bash` rewrite and return the emitted command.
+    fn pipe_rewrite(url_literal: &str) -> String {
+        let cmd = format!("curl {url_literal} | bash");
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(&cmd, ShellType::Posix, &v);
+        s[0].safe_command
+            .clone()
+            .unwrap_or_else(|| panic!("expected a rewrite for {cmd:?}"))
+    }
+
+    #[test]
+    fn pipe_to_shell_quotes_command_substitution_url() {
+        // The classic PR124 case: a single-quoted URL with `$(id)`.
+        let sc = pipe_rewrite("'http://x/$(id)'");
+        assert!(
+            sc.contains("'http://x/$(id)'"),
+            "URL must stay single-quoted so $(id) cannot execute: {sc}"
+        );
+        // The substitution must NOT appear bare (outside the quoted token).
+        assert!(
+            !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+            "no bare $(id) may survive outside the quoted token: {sc}"
+        );
+        assert!(
+            sc.starts_with("curl -fsSL -o /tmp/tirith-review.sh '"),
+            "{sc}"
+        );
+    }
+
+    #[test]
+    fn pipe_to_shell_quotes_backtick_url() {
+        let sc = pipe_rewrite("'http://x/`id`'");
+        assert!(
+            sc.contains("'http://x/`id`'"),
+            "backtick URL must stay quoted: {sc}"
+        );
+    }
+
+    #[test]
+    fn pipe_to_shell_quotes_semicolon_rm_url() {
+        // `;rm -rf ~` must end up inside the single quotes, not a top-level command.
+        let sc = pipe_rewrite("'http://x/a;rm -rf ~'");
+        assert!(
+            sc.contains("'http://x/a;rm -rf ~'"),
+            "the ;rm payload must be inside single quotes: {sc}"
+        );
+        // After removing the quoted token, no bare `;` separator remains before
+        // the legitimate ` && ` chain — i.e. `rm` is not its own command.
+        let outside = sc.replace("'http://x/a;rm -rf ~'", "");
+        assert!(
+            !outside.contains(";rm"),
+            "rm must not become a top-level command: {sc}"
+        );
+    }
+
+    #[test]
+    fn pipe_to_shell_quotes_space_in_url() {
+        let sc = pipe_rewrite("'http://x/a b'");
+        assert!(
+            sc.contains("'http://x/a b'"),
+            "spaces must be contained by the quotes: {sc}"
+        );
+    }
+
+    #[test]
+    fn pipe_to_shell_wget_quotes_command_substitution_url() {
+        // Same neutralization on the wget branch.
+        let cmd = "wget 'http://x/$(id)' | sh";
+        let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        let sc = s[0].safe_command.as_deref().unwrap();
+        assert!(sc.starts_with("wget -O /tmp/tirith-review.sh '"), "{sc}");
+        assert!(sc.contains("'http://x/$(id)'"), "{sc}");
+        assert!(
+            !sc.replace("'http://x/$(id)'", "").contains("$(id)"),
+            "no bare $(id) outside the quoted token: {sc}"
+        );
+    }
+
+    #[test]
+    fn pipe_to_shell_quotes_embedded_single_quote_url() {
+        // A double-quoted URL carrying a literal single quote: the rewrite must
+        // escape it as '\'' and keep one shell token.
+        let cmd = r#"curl "http://x/a'b" | bash"#;
+        let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        let sc = s[0].safe_command.as_deref().unwrap();
+        assert!(
+            sc.contains(r"'http://x/a'\''b'"),
+            "embedded single quote must be escaped as '\\'': {sc}"
+        );
+    }
+
+    // ── rewrite_archive_list_first — archive path is single-quoted (PR124) ──
+
+    #[test]
+    fn archive_list_first_quotes_command_substitution_path() {
+        // A hostile archive path with `$(id)`. Only the preview half is quoted;
+        // the `&&` tail re-emits the user's raw command verbatim.
+        let cmd = "tar -xzf '$(id).tar.gz'";
+        let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        let sc = s[0].safe_command.as_deref().unwrap();
+        assert!(
+            sc.starts_with("tar -tf '$(id).tar.gz' | head"),
+            "archive path on the preview half must be single-quoted: {sc}"
+        );
+        // The preview half (before ` && `) must not contain a bare $(id).
+        let preview = sc.split(" && ").next().unwrap();
+        assert!(
+            !preview.replace("'$(id).tar.gz'", "").contains("$(id)"),
+            "no bare $(id) on the preview half: {sc}"
+        );
+    }
+
+    #[test]
+    fn archive_list_first_does_not_requote_raw_tail() {
+        // The `&&` tail is the user's ORIGINAL command, re-emitted verbatim —
+        // it must NOT be wrapped in quotes (that would corrupt it).
+        let cmd = "tar -xzf foo.tar.gz -C ~/";
+        let v = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
+        let s = suggest(cmd, ShellType::Posix, &v);
+        let sc = s[0].safe_command.as_deref().unwrap();
+        assert!(
+            sc.ends_with(" && tar -xzf foo.tar.gz -C ~/"),
+            "raw tail must be re-emitted verbatim, unquoted: {sc}"
+        );
+    }
+
+    // ── dotfile_redirect_token_is_safe — refuse-not-quote (PR124) ──────────
+
+    #[test]
+    fn dotfile_token_accepts_plain_paths() {
+        // Legitimate `~`/`$HOME` dotfile paths stay accepted (so the rewrite can
+        // keep them UNQUOTED for shell expansion).
+        assert!(dotfile_redirect_token_is_safe("~/.bashrc"));
+        assert!(dotfile_redirect_token_is_safe(
+            "$HOME/.config/foo/config.toml"
+        ));
+        assert!(dotfile_redirect_token_is_safe("~/.ssh/authorized_keys"));
+    }
+
+    #[test]
+    fn dotfile_token_refuses_injection_payloads() {
+        // Metacharacters after the prefix are an injection/glob attempt — refuse.
+        assert!(!dotfile_redirect_token_is_safe("~/.bashrc$(id)"));
+        assert!(!dotfile_redirect_token_is_safe("~/.b`id`"));
+        assert!(!dotfile_redirect_token_is_safe("$HOME/.x;rm -rf ~"));
+        assert!(!dotfile_redirect_token_is_safe("~/.x|sh"));
+        assert!(!dotfile_redirect_token_is_safe("~/.x*"));
+        assert!(!dotfile_redirect_token_is_safe("~/.x y"));
+        // A second `$` (beyond the legitimate `$HOME` prefix) is refused.
+        assert!(!dotfile_redirect_token_is_safe("$HOME/.x$EVIL"));
+        // Wrong / missing prefix → refuse (defensive; extractor only emits these two).
+        assert!(!dotfile_redirect_token_is_safe("/etc/passwd"));
+        assert!(!dotfile_redirect_token_is_safe("~/"));
+    }
 }
