@@ -1,6 +1,13 @@
 //! Adversarial bypass regression tests for the allowlist and blocklist paths.
 //! Each test attempts to circumvent a security fix; a flip signals a
 //! reintroduced bypass.
+//!
+//! F9 update: a policy discovered by walking up to a `.git` boundary is
+//! REPO-scoped and attacker-controllable, so its suppression fields (`allowlist`,
+//! `allowlist_rules`, `severity_overrides`, …) are NEUTRALIZED — a repo may
+//! tighten but never suppress. The repo-scope tests here therefore assert the
+//! finding STILL FIRES under a repo allowlist; the legitimate org/user-scope
+//! suppression feature is covered in `policy_integration.rs`.
 
 use std::fs;
 
@@ -83,7 +90,12 @@ allowlist_rules:
 }
 
 #[test]
-fn test_bypass_allowlist_rules_suppresses_only_named_rule() {
+fn test_bypass_allowlist_rules_repo_scoped_does_not_suppress_named_rule() {
+    // F9: a repo-scoped `allowlist_rules` is NEUTRALIZED (a repo checkout is
+    // attacker-controllable, so it may tighten but never suppress). Even the
+    // named rule (ShortenedUrl) must keep firing here. The legitimate
+    // org/user-scope suppression feature is covered in policy_integration.rs
+    // (`test_f9_org_scope_policy_is_honored` / `test_f9_user_scope_allowlist_is_honored`).
     let policy = r#"
 fail_mode: open
 allowlist_rules:
@@ -99,20 +111,25 @@ allowlist_rules:
         verdict
             .findings
             .iter()
-            .all(|f| f.rule_id != RuleId::ShortenedUrl),
-        "Rule-scoped allowlist should suppress ShortenedUrl"
+            .any(|f| f.rule_id == RuleId::ShortenedUrl),
+        "F9: repo-scoped allowlist_rules must NOT suppress ShortenedUrl"
     );
     assert!(
         verdict
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::CurlPipeShell),
-        "CurlPipeShell must remain — it was NOT allowlisted"
+        "CurlPipeShell must remain — repo allowlist cannot suppress it either"
     );
 }
 
 #[test]
-fn test_bypass_allowlist_rules_case_insensitive_rule_id() {
+fn test_bypass_allowlist_rules_repo_scoped_uppercase_rule_id_does_not_suppress() {
+    // F9: an uppercase `rule_id` cannot smuggle suppression past the repo-scope
+    // neutralization either — a repo `allowlist_rules` is cleared regardless of
+    // the casing it uses. (The case-insensitive MATCHER itself is exercised at
+    // org scope by `test_f9_org_scope_allowlist_rules_case_insensitive_rule_id`
+    // in policy_integration.rs.)
     let policy = r#"
 fail_mode: open
 allowlist_rules:
@@ -128,13 +145,14 @@ allowlist_rules:
         verdict
             .findings
             .iter()
-            .all(|f| f.rule_id != RuleId::ShortenedUrl),
-        "Case-insensitive rule_id matching should suppress ShortenedUrl"
+            .any(|f| f.rule_id == RuleId::ShortenedUrl),
+        "F9: repo-scoped allowlist_rules (uppercase id) must NOT suppress ShortenedUrl"
     );
 }
 
 #[test]
-fn test_bypass_allowlist_rules_mixed_case_rule_id() {
+fn test_bypass_allowlist_rules_repo_scoped_mixed_case_rule_id_does_not_suppress() {
+    // F9: same as above for a mixed-case `rule_id`.
     let policy = r#"
 fail_mode: open
 allowlist_rules:
@@ -150,8 +168,8 @@ allowlist_rules:
         verdict
             .findings
             .iter()
-            .all(|f| f.rule_id != RuleId::ShortenedUrl),
-        "Mixed-case rule_id should still match via case-insensitive comparison"
+            .any(|f| f.rule_id == RuleId::ShortenedUrl),
+        "F9: repo-scoped allowlist_rules (mixed-case id) must NOT suppress ShortenedUrl"
     );
 }
 
@@ -180,7 +198,12 @@ allowlist_rules:
 }
 
 #[test]
-fn test_bypass_allowlist_rules_pipe_to_shell_trusted_url() {
+fn test_bypass_allowlist_rules_pipe_to_shell_repo_scoped_does_not_suppress() {
+    // F9: a repo-scoped `allowlist_rules` cannot suppress CurlPipeShell — a
+    // hostile repo declaring its own install URL "trusted" is exactly the bypass
+    // F9 closes. The finding must still fire and BLOCK. The legitimate
+    // org-scope version of this exact recipe is honored in
+    // `test_f9_org_scope_policy_is_honored` (policy_integration.rs).
     let policy = r#"
 fail_mode: open
 allowlist_rules:
@@ -196,13 +219,13 @@ allowlist_rules:
         verdict
             .findings
             .iter()
-            .all(|f| f.rule_id != RuleId::CurlPipeShell),
-        "Trusted URL should suppress CurlPipeShell via allowlist_rules"
+            .any(|f| f.rule_id == RuleId::CurlPipeShell),
+        "F9: repo-scoped allowlist_rules must NOT suppress CurlPipeShell"
     );
     assert_eq!(
         verdict.action,
-        Action::Allow,
-        "No remaining findings should mean Allow"
+        Action::Block,
+        "CurlPipeShell still fires under a repo allowlist → Block"
     );
 }
 
@@ -267,7 +290,11 @@ fn test_bypass_allowlist_rules_empty_pattern_string_does_nothing() {
 }
 
 #[test]
-fn test_bypass_global_allowlist_suppresses_all_rules_for_url() {
+fn test_bypass_global_allowlist_repo_scoped_does_not_suppress() {
+    // F9: a repo-scoped global `allowlist` is neutralized (a hostile repo must
+    // not be able to drop a finding for an attacker-chosen URL). ShortenedUrl
+    // must still fire. The legit global-allowlist suppression at user scope is
+    // covered by `test_f9_user_scope_allowlist_is_honored` in policy_integration.rs.
     let policy = r#"
 fail_mode: open
 allowlist:
@@ -281,7 +308,7 @@ allowlist:
         verdict
             .findings
             .iter()
-            .all(|f| f.rule_id != RuleId::ShortenedUrl),
-        "Global allowlist should suppress ShortenedUrl"
+            .any(|f| f.rule_id == RuleId::ShortenedUrl),
+        "F9: repo-scoped global allowlist must NOT suppress ShortenedUrl"
     );
 }

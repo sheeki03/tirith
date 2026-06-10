@@ -1671,7 +1671,11 @@ mod tests {
             ("USERPROFILE", Some(cfg)),
         ]);
 
-        // A valid local policy with exactly one (flat) allowlist entry.
+        // A valid local (REPO-scoped) policy. It carries an `allowlist` line, but
+        // F9 NEUTRALIZES a repo-scoped allowlist (a repo checkout is attacker-
+        // controllable and may tighten but not suppress), so that entry does NOT
+        // reach the effective policy and is NOT counted below. `paranoia` is a
+        // tightening field F9 preserves, so `paranoia: 2` still flows through.
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".git")).unwrap();
         std::fs::create_dir_all(repo.path().join(".tirith")).unwrap();
@@ -1719,11 +1723,14 @@ mod tests {
         };
         assert_eq!(values.paranoia, 2, "local paranoia is preserved");
 
-        // allowlist = 1 local + 1 user flat-file + 1 flat trust entry = 3.
-        // (Round 5's strict-local-only parse would have reported just 1.)
+        // allowlist = 1 user flat-file + 1 flat trust entry = 2. The repo-local
+        // allowlist entry is NOT counted: F9 neutralizes a repo-scoped allowlist
+        // (the user flat-file and trust overlays are user-scoped, so they remain).
+        // (Round 5's strict-local-only parse would have reported 0 overlays.)
         assert_eq!(
-            values.allowlist_count, 3,
-            "allowlist must include the user flat-file + flat trust overlays: {values:?}"
+            values.allowlist_count, 2,
+            "allowlist must include the user flat-file + flat trust overlays \
+             (repo-local entry neutralized by F9): {values:?}"
         );
         // allowlist_rules = 1 rule-scoped trust entry.
         assert_eq!(

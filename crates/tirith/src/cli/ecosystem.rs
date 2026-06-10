@@ -630,7 +630,13 @@ mod tests {
         // PR #121 fix-list item 14 regression pin — `Policy::discover` must
         // anchor at the SCAN TARGET, not cwd. Discovery-anchoring test (not
         // end-to-end): we assert the resolved policy carries the target's
-        // allowlist entry, and cwd's does not.
+        // blocklist entry, and cwd's does not.
+        //
+        // The marker is a `blocklist` entry (not `allowlist`): F9 neutralizes a
+        // repo-scoped `allowlist`, so it would be cleared from the discovered
+        // policy and could no longer prove anchoring. `blocklist` is a tightening
+        // field F9 preserves at repo scope, so it survives and remains a valid
+        // discovery marker.
         let target = tempdir().unwrap();
         let cwd = tempdir().unwrap();
 
@@ -642,7 +648,7 @@ mod tests {
         fs::create_dir_all(target.path().join(".tirith")).unwrap();
         fs::write(
             target.path().join(".tirith").join("policy.yaml"),
-            "allowlist:\n  - my-internal-pkg\n",
+            "blocklist:\n  - my-internal-pkg\n",
         )
         .unwrap();
         fs::write(
@@ -651,24 +657,27 @@ mod tests {
         )
         .unwrap();
 
-        // The discovered policy from the scan target must carry the allowlist
+        // The discovered policy from the scan target must carry the blocklist
         // entry. Anchored at the cwd (no `.tirith/`) it would not.
         let from_target = Policy::discover(target.path().to_str());
         assert!(
-            from_target.allowlist.iter().any(|e| e == "my-internal-pkg"),
-            "policy discovered from the scan target must carry its allowlist: \
+            from_target.blocklist.iter().any(|e| e == "my-internal-pkg"),
+            "policy discovered from the scan target must carry its blocklist: \
              {:?}",
-            from_target.allowlist,
+            from_target.blocklist,
         );
         let from_cwd = Policy::discover(cwd.path().to_str());
         assert!(
-            !from_cwd.allowlist.iter().any(|e| e == "my-internal-pkg"),
+            !from_cwd.blocklist.iter().any(|e| e == "my-internal-pkg"),
             "policy discovered from an unrelated cwd must NOT carry the scan \
-             target's allowlist: {:?}",
-            from_cwd.allowlist,
+             target's blocklist: {:?}",
+            from_cwd.blocklist,
         );
 
         // Smoke: the exported `scan` entry wires discovery — exit 0, no panic.
+        // The ecosystem-scan path does not consume the URL `blocklist` (it gates
+        // packages, and `my-internal-pkg` is unknown to the absent threat DB), so
+        // there are no findings and the scan exits 0.
         let code = scan(
             target.path().to_str(),
             false,
@@ -680,8 +689,8 @@ mod tests {
         );
         assert_eq!(
             code, 0,
-            "ecosystem scan with allowlisted dep must exit 0 (policy discovery \
-             from scan target)"
+            "ecosystem scan exits 0 (policy discovery from scan target; the \
+             blocklist marker does not gate packages)"
         );
     }
 

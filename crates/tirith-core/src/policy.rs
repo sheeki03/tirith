@@ -45,6 +45,33 @@ fn default_context_guard_enabled() -> bool {
     true
 }
 
+/// F8/F9 — provenance of a loaded [`Policy`]: which discovery branch produced
+/// it. Stamped by the loader from the branch that MATCHED, never read from the
+/// YAML (`#[serde(skip)]` on the `Policy::scope` field), so a repo cannot spoof
+/// a wider trust scope by declaring one in its `.tirith/policy.yaml`.
+///
+/// Only [`PolicyScope::Repo`] is treated as untrusted: a repo checkout is
+/// attacker-controllable content, so its policy is neutralized down to
+/// tightening-only via [`Policy::sanitize_repo_scoped`]. Org/User/Remote/Default
+/// are operator-controlled and honored in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyScope {
+    /// Loaded from a repo-local `.tirith/policy.yaml` (walk-up to `.git`).
+    /// UNTRUSTED — may only tighten; suppression/bypass/exfil fields are reset.
+    Repo,
+    /// Loaded from the user config dir (`~/.config/tirith/policy.yaml`). Trusted.
+    User,
+    /// Loaded from `TIRITH_POLICY_ROOT/.tirith/policy.yaml` (org/CI mount). Trusted.
+    Org,
+    /// Loaded from a remote policy server fetch. Trusted (operator-configured).
+    Remote,
+    /// No policy file found anywhere — the built-in defaults. The DEFAULT and a
+    /// NON-repo (trusted) value, so a freshly `Policy::default()`-constructed
+    /// policy is never mistaken for repo-scoped and accidentally sanitized.
+    #[default]
+    Default,
+}
+
 /// Policy configuration loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,6 +79,13 @@ pub struct Policy {
     /// Path this policy was loaded from.
     #[serde(skip)]
     pub path: Option<String>,
+
+    /// F8/F9 — discovery provenance (which branch loaded this policy). NOT
+    /// deserialized (`#[serde(skip)]`): a repo YAML can never set it, so it is a
+    /// spoof-proof trust signal. Stamped by the loader; drives
+    /// [`Self::sanitize_repo_scoped`] (repo policies may only tighten).
+    #[serde(skip)]
+    pub scope: PolicyScope,
 
     /// Schema version (M5.5 F3). Omitted shipping policies are v1; forward
     /// migrations in [`crate::policy_migrations`] run on raw YAML pre-deserialize.
@@ -800,6 +834,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             path: None,
+            scope: PolicyScope::default(),
             schema_version: default_schema_version(),
             fail_mode: FailMode::Open,
             allow_bypass_env: true,
@@ -1027,19 +1062,39 @@ impl Policy {
     fn discover_resolved(cwd: Option<&str>) -> Self {
         let local = Self::discover_local(cwd);
 
-        let server_url = std::env::var("TIRITH_SERVER_URL")
+        // F8 — track the ORIGIN of each connection field so an ambient
+        // (env-sourced) key is never paired with a server URL that came from a
+        // REPO-scoped policy. After F9 a repo's `policy_server_url` is already
+        // `None`, so the fallback below cannot select a repo URL; this is the
+        // explicit belt-and-suspenders guard. `true` = ambient env origin.
+        let url_from_env = std::env::var("TIRITH_SERVER_URL")
             .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| local.policy_server_url.clone());
-        let api_key = std::env::var("TIRITH_API_KEY")
+            .filter(|s| !s.is_empty());
+        let server_url_is_env = url_from_env.is_some();
+        let server_url = url_from_env.or_else(|| local.policy_server_url.clone());
+
+        let key_from_env = std::env::var("TIRITH_API_KEY")
             .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| local.policy_server_api_key.clone());
+            .filter(|s| !s.is_empty());
+        let api_key_is_env = key_from_env.is_some();
+        let api_key = key_from_env.or_else(|| local.policy_server_api_key.clone());
 
         let (server_url, api_key) = match (server_url, api_key) {
             (Some(u), Some(k)) => (u, k),
             _ => return local,
         };
+
+        // F8 guard: an AMBIENT env key must only authenticate to a server URL
+        // that is itself operator-controlled — env-sourced, OR a non-repo local
+        // scope. A URL drawn from a repo-scoped policy paired with an ambient
+        // key would leak that key to repo-controlled infrastructure; refuse and
+        // fall back to the local policy (no fetch).
+        if api_key_is_env && !server_url_is_env && local.scope == PolicyScope::Repo {
+            eprintln!(
+                "tirith: warning: refusing to send ambient TIRITH_API_KEY to a repo-scoped policy_server_url; using local policy"
+            );
+            return local;
+        }
 
         let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
 
@@ -1050,6 +1105,9 @@ impl Policy {
                 match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
                         p.path = Some(format!("remote:{server_url}"));
+                        // F8/F9 — a remote-server policy is operator-controlled
+                        // (trusted); stamp Remote so it is never sanitized as a repo.
+                        p.scope = PolicyScope::Remote;
                         // Retain connection details so audit upload can reuse them.
                         if p.policy_server_url.is_none() {
                             p.policy_server_url = Some(server_url);
@@ -1117,12 +1175,70 @@ impl Policy {
         }
     }
 
-    /// Discover local policy only (no remote fetch).
+    /// Discover local policy only (no remote fetch). Stamps [`Self::scope`] from
+    /// the discovery BRANCH (F8/F9) and, when that branch is
+    /// [`PolicyScope::Repo`], neutralizes the loaded policy down to
+    /// tightening-only via [`Self::sanitize_repo_scoped`] — a repo checkout is
+    /// attacker-controllable, so it may add restrictions but never relax,
+    /// suppress, or exfil.
     fn discover_local(cwd: Option<&str>) -> Self {
-        match discover_local_policy_path(cwd) {
-            Some(path) => Self::load_from_path(&path),
+        match discover_local_policy_path_scoped(cwd) {
+            Some((path, scope)) => {
+                let mut p = Self::load_from_path(&path);
+                p.scope = scope;
+                // F9 — default-deny on the untrusted (repo) branch ONLY. Org/User
+                // are operator-controlled and honored in full. Runs right after
+                // load so the policy.yaml suppression/bypass/exfil fields are
+                // neutralized before any caller sees the policy. (The parallel
+                // repo flat-file suppression channel is closed in
+                // [`Self::load_org_lists`]; the repo `.tirith/trust.json` overlay
+                // in [`Self::load_trust_entries`] is a separate, opt-in trust
+                // surface and is intentionally left to its own review.)
+                if scope == PolicyScope::Repo {
+                    p.sanitize_repo_scoped();
+                }
+                p
+            }
             None => Policy::default(),
         }
+    }
+
+    /// F9 — neutralize a REPO-scoped policy down to tightening-only. A repo
+    /// checkout is attacker-controllable content, so its `.tirith/policy.yaml`
+    /// must never be able to WEAKEN, SUPPRESS, or EXFIL. This resets every field
+    /// a hostile repo could use for those ends back to the
+    /// [`Policy::default()`] value, while LEAVING the tightening-only fields
+    /// (`blocklist`, `network_deny`, `approval_rules`, `action_overrides`
+    /// (upgrade-only by construction), `custom_rules`, `paranoia`, `strict_warn`,
+    /// the M8/M9 guard toggles, etc.) untouched so a repo can still add its own
+    /// restrictions.
+    ///
+    /// Only called for [`PolicyScope::Repo`] (see [`Self::discover_local`]).
+    fn sanitize_repo_scoped(&mut self) {
+        let defaults = Policy::default();
+
+        // Suppression vectors — a repo must not be able to DROP a finding. The
+        // engine's allowlist/allowlist_rules path (engine.rs `findings.retain`)
+        // and severity downgrades are the documented suppression surfaces.
+        self.allowlist = defaults.allowlist;
+        self.allowlist_rules = defaults.allowlist_rules;
+        self.network_allow = defaults.network_allow;
+        self.additional_known_domains = defaults.additional_known_domains;
+        self.severity_overrides = defaults.severity_overrides;
+
+        // Bypass / remote-fail relaxation — a repo must not be able to re-enable
+        // the `TIRITH=0` bypass or steer remote-fetch failure toward open/cached.
+        self.allow_bypass_env = false;
+        self.allow_bypass_env_noninteractive = false;
+        self.policy_fetch_fail_mode = None;
+        self.enforce_fail_mode = None;
+
+        // Exfil / remote redirection — a repo must not be able to ship findings
+        // to its own webhook or point discovery at its own policy server.
+        self.webhooks = defaults.webhooks;
+        self.policy_server_url = None;
+        self.policy_server_api_key = None;
+        self.dlp_custom_patterns = defaults.dlp_custom_patterns;
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -1418,29 +1534,33 @@ impl Policy {
         }
     }
 
-    /// Load and merge org-level lists from a repo root's .tirith/ dir. Org
-    /// policies are repo-committed and may be controlled by other contributors,
-    /// so a diagnostic is emitted to signal repo-level policy is active.
+    /// Load and merge the REPO-scoped `.tirith/` flat lists (allowlist /
+    /// blocklist text files) found by walking up to the repo root.
+    ///
+    /// F9 — this dir is attacker-influenceable repo content (same trust level as
+    /// `.tirith/policy.yaml`), so it is held to the SAME tightening-only rule as
+    /// [`Self::sanitize_repo_scoped`]: the repo **blocklist** (a restriction) is
+    /// honored, but the repo **allowlist** (a SUPPRESSION) is NOT — otherwise a
+    /// hostile repo could re-introduce, via the flat file, exactly the
+    /// finding-dropping that the policy.yaml sanitizer just removed. The allowlist
+    /// load is skipped unconditionally here (the flat file is always repo-scoped),
+    /// not merely when a `policy.yaml` set `scope == Repo`, so a repo that ships
+    /// ONLY `.tirith/allowlist` (no policy.yaml) is covered too.
     pub fn load_org_lists(&mut self, cwd: Option<&str>) {
         if let Some(repo_root) = find_repo_root(cwd) {
             let org_dir = repo_root.join(".tirith");
+            // F9 — repo allowlist (suppression) is intentionally NOT loaded.
             let allowlist_path = org_dir.join("allowlist");
-            if let Ok(content) = std::fs::read_to_string(&allowlist_path) {
+            if allowlist_path.exists() {
                 eprintln!(
-                    "tirith: loading org-level allowlist from {}",
+                    "tirith: ignoring repo-scoped allowlist at {} (repo policy may tighten but not suppress)",
                     allowlist_path.display()
                 );
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
-                        self.allowlist.push(line.to_string());
-                    }
-                }
             }
             let blocklist_path = org_dir.join("blocklist");
             if let Ok(content) = std::fs::read_to_string(&blocklist_path) {
                 eprintln!(
-                    "tirith: loading org-level blocklist from {}",
+                    "tirith: loading repo-scoped blocklist from {}",
                     blocklist_path.display()
                 );
                 for line in content.lines() {
@@ -1534,15 +1654,25 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
 /// (`TIRITH_POLICY_ROOT/.tirith` → walk-up to `.git` → user config). Existence-
 /// based: a present-but-unparseable file still yields its path here.
 pub fn discover_local_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
+    discover_local_policy_path_scoped(cwd).map(|(path, _scope)| path)
+}
+
+/// F8/F9 — like [`discover_local_policy_path`] but ALSO reports WHICH branch
+/// matched, so the loader can stamp [`Policy::scope`] from the discovery branch
+/// (not from the YAML). Order is unchanged: `TIRITH_POLICY_ROOT/.tirith`
+/// ([`PolicyScope::Org`]) → walk-up to `.git` ([`PolicyScope::Repo`]) → user
+/// config ([`PolicyScope::User`]). Returns `None` (→ [`PolicyScope::Default`])
+/// when nothing is found.
+pub fn discover_local_policy_path_scoped(cwd: Option<&str>) -> Option<(PathBuf, PolicyScope)> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         if let Some(path) = find_policy_in_dir(&PathBuf::from(&root).join(".tirith")) {
-            return Some(path);
+            return Some((path, PolicyScope::Org));
         }
     }
     if let Some(path) = discover_policy_path(cwd) {
-        return Some(path);
+        return Some((path, PolicyScope::Repo));
     }
-    user_policy_path()
+    user_policy_path().map(|path| (path, PolicyScope::User))
 }
 
 /// Find the repository root (directory containing .git).
@@ -1639,17 +1769,37 @@ pub fn iac_plans_dir() -> Option<PathBuf> {
     state_dir().map(|s| s.join("iac_plans"))
 }
 
+/// Maximum size of a labels file we will read (F17). Flat `provider:context →
+/// criticality` maps are tiny; 1 MiB is far above any legitimate file and caps a
+/// hostile/oversized one.
+const LABELS_FILE_READ_CAP: u64 = 1024 * 1024;
+
 /// Merge a flat-YAML-map labels file into `into`. Missing files are ignored;
 /// parse errors emit a stderr diagnostic and continue.
+///
+/// F17 — reads via [`util::read_text_no_follow_capped`] so a symlinked label
+/// file cannot redirect the read onto an arbitrary file (the repo-scope label
+/// paths live under an attacker-influenced `<repo>/.tirith/`).
 fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+    let bytes = match crate::util::read_text_no_follow_capped(path, LABELS_FILE_READ_CAP) {
+        Ok(b) => b,
+        Err(crate::util::OpenRegularError::NotFound) => return,
         Err(e) => {
-            // Surface non-NotFound I/O so the operator knows labels were
-            // skipped (PR-127 review #13).
+            // Surface non-NotFound failures (symlink/special-file refusal,
+            // oversize, I/O) so the operator knows labels were skipped
+            // (PR-127 review #13).
             eprintln!(
-                "tirith: warning: context-labels file at {} read error: {e}",
+                "tirith: warning: context-labels file at {} read error: {e:?}",
+                path.display(),
+            );
+            return;
+        }
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "tirith: warning: context-labels file at {} is not valid UTF-8: {e}",
                 path.display(),
             );
             return;
@@ -1691,27 +1841,57 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>) {
 }
 
 /// Write a single label entry (creating file + parent), preserving existing
-/// entries and overwriting only the target key. Used by `tirith context label`.
+/// entries and overwriting only the target key. Used by `tirith context label`
+/// and `tirith ssh label`.
+///
+/// F17 — both label paths are `<root>/<dir>/<file>.yaml` where the repo-scope
+/// `<dir>` (`<repo>/.tirith`) is attacker-influenceable. The write is hardened
+/// two ways:
+///   * [`util::canonical_within`] against the GRANDPARENT (`<root>`)
+///     canonicalizes through `<dir>`, so a SYMLINKED `.tirith` (or `tirith`)
+///     directory that escapes `<root>` is rejected before any write; and
+///   * [`util::open_write_no_follow`] refuses a symlinked FINAL component, so a
+///     pre-planted `<file>.yaml` symlink cannot redirect the write either.
+///
+/// The read-back of existing entries already goes through the symlink-refusing
+/// [`merge_context_labels`].
 pub fn write_context_label(path: &Path, label_key: &str, criticality: &str) -> std::io::Result<()> {
     let mut existing: BTreeMap<String, String> = BTreeMap::new();
     merge_context_labels(path, &mut existing);
     existing.insert(label_key.to_string(), criticality.to_string());
 
+    // The containment root is the grandparent: <repo>/.tirith/<file> → <repo>,
+    // <config>/tirith/<file> → <config>. A label path is always at least three
+    // components deep; refuse a malformed shallower path rather than guess.
+    let containment_root = path.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "label path must be <root>/<dir>/<file>",
+        )
+    })?;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // F17 — reject a symlinked containing directory (e.g. a planted `.tirith`
+    // symlink) that would redirect the write outside its trusted root. Done
+    // after create_dir_all so a legit first-run `.tirith` exists to canonicalize.
+    if !crate::util::canonical_within(path, containment_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to write label outside its trusted root ({})",
+                containment_root.display()
+            ),
+        ));
     }
 
     let yaml = serde_yaml::to_string(&existing).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize: {e}"))
     })?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
+    // F17 — O_NOFOLLOW + 0600 (refuses a symlinked final component).
+    let mut f = crate::util::open_write_no_follow(path, true)?;
     use std::io::Write as _;
     f.write_all(yaml.as_bytes())?;
     Ok(())
@@ -1757,6 +1937,9 @@ fn load_cached_remote_policy() -> Option<Policy> {
     match Policy::try_parse_yaml(&content) {
         Ok(mut p) => {
             p.path = Some(format!("cached:{}", path.display()));
+            // A cached remote policy is operator-controlled (it was fetched from
+            // the configured server); stamp Remote so it is never repo-sanitized.
+            p.scope = PolicyScope::Remote;
             Some(p)
         }
         Err(e) => {
@@ -1933,6 +2116,11 @@ custom_rules:
         )
         .unwrap();
 
+        // F9: `policy_fetch_fail_mode` is reset at REPO scope, so this policy must
+        // be loaded via the ORG branch (TIRITH_POLICY_ROOT) for its `closed`
+        // fetch-fail-mode to be honored. (A repo `.tirith/policy.yaml` could not
+        // steer remote-fetch failure.)
+        unsafe { std::env::set_var("TIRITH_POLICY_ROOT", dir.path()) };
         unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
         unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
 
@@ -1943,6 +2131,7 @@ custom_rules:
 
         unsafe { std::env::remove_var("TIRITH_API_KEY") };
         unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
     }
 
     #[test]
@@ -2010,11 +2199,20 @@ custom_rules:
             FailMode::Open,
             "local fail_mode must be preserved (a fetch+fail-closed would flip it)"
         );
+        // F9: this local file is REPO-scoped (found via the cwd walk-up, no
+        // TIRITH_POLICY_ROOT), so its `allow_bypass_env_noninteractive: true` is
+        // sanitized to false. The "no fetch happened" proof rests on `paranoia`
+        // (a TIGHTENING field the sanitizer keeps) surviving as the local 3 — a
+        // fetch+fail-closed would have reset it to the default 1.
         assert!(
-            policy.allow_bypass_env_noninteractive,
-            "local bypass flag must be preserved (fail-closed would clear it)"
+            !policy.allow_bypass_env_noninteractive,
+            "repo-scoped bypass flag must be sanitized to false (F9)"
         );
-        assert_eq!(policy.paranoia, 3, "local paranoia must be preserved");
+        assert_eq!(
+            policy.paranoia, 3,
+            "local paranoia must be preserved (proves the local file loaded, no fetch)"
+        );
+        assert_eq!(policy.scope, PolicyScope::Repo, "cwd walk-up is repo scope");
 
         // Drop the process-global incident cache so the negative result keyed to
         // this about-to-be-removed tempdir does not leak into a sibling test.
