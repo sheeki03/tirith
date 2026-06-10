@@ -738,34 +738,183 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
     0
 }
 
-/// `tirith trust last` -- show last trigger and offer to trust.
-pub fn last() -> i32 {
-    let data_dir = match tirith_core::policy::data_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("tirith: cannot determine data directory");
-            return 1;
-        }
-    };
-
+/// Read and JSON-parse `last_trigger.json` from the data dir.
+///
+/// Shared by `last()` (interactive prompt) and `from_last_trigger()` (suggest
+/// ready-to-run commands). Returns the parsed value so each caller can pull the
+/// fields it needs without re-reading the file. `Ok(None)` means there is no
+/// recent trigger on disk (missing file); `Err` is a real read/parse failure.
+fn load_last_trigger_value() -> Result<Option<serde_json::Value>, String> {
+    let data_dir = tirith_core::policy::data_dir()
+        .ok_or_else(|| "cannot determine data directory".to_string())?;
     let path = data_dir.join("last_trigger.json");
     if !path.exists() {
-        eprintln!("tirith: no recent trigger found");
-        return 1;
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("failed to read last trigger: {e}"))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse last trigger: {e}"))?;
+    Ok(Some(val))
+}
+
+/// Extract trust targets and rule IDs from a parsed `last_trigger.json`.
+///
+/// `targets` prefer a FULL URL when the finding evidence carries one (a `raw`
+/// string with a scheme that parses) so the suggested trust can be narrow; it
+/// falls back to a bare host/domain otherwise. Order and de-dup mirror the way
+/// `last()` walks findings (per-finding `raw` first, then `raw_host`).
+fn extract_targets_and_rules(val: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut targets: Vec<String> = Vec::new();
+    let push = |t: String, targets: &mut Vec<String>| {
+        if !t.is_empty() && !targets.contains(&t) {
+            targets.push(t);
+        }
+    };
+    if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
+        for finding in findings {
+            if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
+                for ev in evidence {
+                    if let Some(raw) = ev.get("raw").and_then(|v| v.as_str()) {
+                        // Prefer the full URL when `raw` is one; else fall back
+                        // to the bare host so we still have something to trust.
+                        if raw.contains("://") && url::Url::parse(raw).is_ok() {
+                            push(raw.to_string(), &mut targets);
+                        } else if let Some(host) = extract_host(raw) {
+                            push(host, &mut targets);
+                        }
+                    }
+                    if let Some(host) = ev.get("raw_host").and_then(|v| v.as_str()) {
+                        push(host.to_string(), &mut targets);
+                    }
+                }
+            }
+        }
     }
 
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    let rule_ids: Vec<String> = val
+        .get("rule_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (targets, rule_ids)
+}
+
+/// Read + parse + extract in one step: `(targets, rule_ids)`.
+///
+/// `targets` prefer full URLs, else bare domains (see `extract_targets_and_rules`).
+/// `Err` covers both "no recent trigger" (so callers can print a friendly note)
+/// and real read/parse failures.
+fn read_last_trigger() -> Result<(Vec<String>, Vec<String>), String> {
+    match load_last_trigger_value()? {
+        Some(val) => Ok(extract_targets_and_rules(&val)),
+        None => Err("no recent trigger found".into()),
+    }
+}
+
+/// Build the ready-to-run `tirith trust add` suggestion lines for each
+/// (target, rule_id) pair. A full-URL target is narrow, so it is suggested
+/// without `--broad`; a bare domain needs `--broad` because `trust add` rejects
+/// broad scopes without the opt-in (see `add()` / `classify_scope`).
+fn suggestion_lines(targets: &[String], rule_ids: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for target in targets {
+        // A target that classifies as broad (bare domain/wildcard/TLD) needs
+        // `--broad`; a full URL (or any narrow pattern) does not.
+        let needs_broad = classify_scope(target).is_broad();
+        if rule_ids.is_empty() {
+            lines.push(format_add_line(target, None, needs_broad));
+        } else {
+            for rid in rule_ids {
+                lines.push(format_add_line(target, Some(rid), needs_broad));
+            }
+        }
+    }
+    lines
+}
+
+fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> String {
+    let broad = if needs_broad { " --broad" } else { "" };
+    match rule_id {
+        Some(rid) => format!("tirith trust add {target}{broad} --rule {rid} --ttl 30d"),
+        None => format!("tirith trust add {target}{broad} --ttl 30d"),
+    }
+}
+
+/// `tirith trust from-last-trigger [--apply]` -- turn the most recent trigger
+/// into trust commands. Default (suggest) prints ready-to-run `trust add`
+/// lines so the operator can copy/paste the narrowest one; `--apply` runs them.
+///
+/// Print-only by default mirrors the codebase's `policy tune` stance: suggest,
+/// don't mutate.
+pub fn from_last_trigger(apply: bool) -> i32 {
+    let (targets, rule_ids) = match read_last_trigger() {
+        Ok(v) => v,
+        // A missing/empty trigger is not an error for this command -- it is the
+        // common "nothing happened yet" case, so exit 0 with a friendly note.
+        Err(e) if e == "no recent trigger found" => {
+            eprintln!("tirith: no recent trigger to trust");
+            return 0;
+        }
         Err(e) => {
-            eprintln!("tirith: failed to read last trigger: {e}");
+            eprintln!("tirith: trust from-last-trigger: {e}");
             return 1;
         }
     };
 
-    let val: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
+    if targets.is_empty() {
+        eprintln!("tirith: no recent trigger to trust");
+        return 0;
+    }
+
+    if !apply {
+        eprintln!("Suggested trust commands (run the narrowest one that fits):");
+        eprintln!();
+        for line in suggestion_lines(&targets, &rule_ids) {
+            println!("{line}");
+        }
+        eprintln!();
+        eprintln!("Re-run with --apply to add these automatically.");
+        return 0;
+    }
+
+    // --apply: actually add each entry. A bare-domain target is broad, so pass
+    // `broad = true`; a full-URL (narrow) target does not need it.
+    let mut added = 0;
+    for target in &targets {
+        let broad = classify_scope(target).is_broad();
+        if rule_ids.is_empty() {
+            if add(target, None, None, false, broad, None, "user", false) == 0 {
+                added += 1;
+            }
+        } else {
+            for rid in &rule_ids {
+                if add(target, Some(rid), None, false, broad, None, "user", false) == 0 {
+                    added += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!("tirith: added {added} trust entry/entries from last trigger");
+    0
+}
+
+/// `tirith trust last` -- show last trigger and offer to trust.
+pub fn last() -> i32 {
+    let val = match load_last_trigger_value() {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("tirith: no recent trigger found");
+            return 1;
+        }
         Err(e) => {
-            eprintln!("tirith: failed to parse last trigger: {e}");
+            eprintln!("tirith: {e}");
             return 1;
         }
     };
@@ -1984,5 +2133,125 @@ mod tests {
         let removed: Vec<_> = base.difference(&cur).collect();
         assert_eq!(added, vec![&"C"]);
         assert_eq!(removed, vec![&"A"]);
+    }
+
+    /// Plant a `last_trigger.json` under a temp data dir and run `f` with
+    /// `data_dir()` pointed at it. Holds `ENV_LOCK` (process-global env mutation)
+    /// and restores `XDG_DATA_HOME` / `APPDATA` on Drop. `data_dir()` honors
+    /// `XDG_DATA_HOME` on Unix but `%APPDATA%` on Windows (etcetera), so set both.
+    fn with_seeded_last_trigger<F: FnOnce()>(json: &str, f: F) {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
+        let _appdata = EnvGuard::set("APPDATA", dir.path());
+
+        let tirith_data = dir.path().join("tirith");
+        fs::create_dir_all(&tirith_data).expect("create data dir");
+        fs::write(tirith_data.join("last_trigger.json"), json).expect("write last_trigger.json");
+
+        f();
+    }
+
+    /// Same env isolation, but plant NO `last_trigger.json` (empty data dir).
+    fn with_empty_data_dir<F: FnOnce()>(f: F) {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
+        let _appdata = EnvGuard::set("APPDATA", dir.path());
+        f();
+    }
+
+    /// A full-URL evidence target is suggested NARROW: a copy/paste-ready
+    /// `tirith trust add <url> --rule <rule_id> --ttl 30d` line with NO `--broad`.
+    #[test]
+    fn from_last_trigger_suggests_narrow_url_without_broad() {
+        let json = r#"{
+            "rule_ids": ["shortened_url"],
+            "severity": "high",
+            "command_redacted": "curl https://example.com/install.sh | sh",
+            "timestamp": "2026-06-10T00:00:00Z",
+            "findings": [
+                {
+                    "title": "Shortened URL",
+                    "evidence": [
+                        { "raw": "https://example.com/install.sh" }
+                    ]
+                }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            // read_last_trigger prefers the FULL URL as the target.
+            let (targets, rule_ids) = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(targets, vec!["https://example.com/install.sh".to_string()]);
+            assert_eq!(rule_ids, vec!["shortened_url".to_string()]);
+
+            // The suggested line is the narrow, no-`--broad` form.
+            let lines = suggestion_lines(&targets, &rule_ids);
+            let expected =
+                "tirith trust add https://example.com/install.sh --rule shortened_url --ttl 30d";
+            assert!(
+                lines.iter().any(|l| l == expected),
+                "expected narrow URL suggestion {expected:?}, got: {lines:?}"
+            );
+            assert!(
+                lines.iter().all(|l| !l.contains("--broad")),
+                "a full-URL target must NOT be suggested with --broad: {lines:?}"
+            );
+
+            // The real entry point runs clean in suggest (print-only) mode.
+            assert_eq!(from_last_trigger(false), 0);
+        });
+    }
+
+    /// A bare-domain target (only `raw_host`, no URL) needs `--broad` because
+    /// `trust add` rejects broad scopes without the opt-in.
+    #[test]
+    fn from_last_trigger_bare_domain_gets_broad() {
+        let json = r#"{
+            "rule_ids": ["homograph"],
+            "findings": [
+                { "title": "Homograph", "evidence": [ { "raw_host": "example.com" } ] }
+            ]
+        }"#;
+
+        with_seeded_last_trigger(json, || {
+            let (targets, rule_ids) = read_last_trigger().expect("read_last_trigger");
+            assert_eq!(targets, vec!["example.com".to_string()]);
+
+            let lines = suggestion_lines(&targets, &rule_ids);
+            let expected = "tirith trust add example.com --broad --rule homograph --ttl 30d";
+            assert!(
+                lines.iter().any(|l| l == expected),
+                "expected bare-domain suggestion with --broad {expected:?}, got: {lines:?}"
+            );
+        });
+    }
+
+    /// A missing/empty trigger is the common "nothing happened yet" case:
+    /// `from_last_trigger` returns 0 (friendly note), not an error.
+    #[test]
+    fn from_last_trigger_missing_returns_zero() {
+        with_empty_data_dir(|| {
+            assert_eq!(from_last_trigger(false), 0);
+            // read_last_trigger surfaces the no-trigger sentinel for callers.
+            assert_eq!(
+                read_last_trigger().unwrap_err(),
+                "no recent trigger found".to_string()
+            );
+        });
+    }
+
+    /// The refactor must keep `last()` behavior identical: with no trigger on
+    /// disk it still returns 1 (its non-interactive, stdin-free path).
+    #[test]
+    fn last_unchanged_without_trigger_returns_one() {
+        with_empty_data_dir(|| {
+            assert_eq!(last(), 1);
+        });
     }
 }

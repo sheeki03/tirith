@@ -172,19 +172,29 @@ fn run_fix(yes: bool) -> i32 {
     if bash_safe_mode_active() {
         println!("Fix: Clear bash safe-mode flag");
         if confirm("  Clear safe-mode?", yes) {
-            if let Some(state) = tirith_core::policy::state_dir() {
-                let flag = state.join("bash-safe-mode");
-                match std::fs::remove_file(&flag) {
-                    Ok(()) => {
-                        println!("  Safe-mode flag removed. Next shell will attempt enter mode.");
-                        fixed += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to remove safe-mode flag: {e}");
-                    }
-                }
+            // `reset_safe_mode` prints its own result; the flag exists here, so a
+            // 0 return means it was removed (the "no flag" branch is unreachable).
+            if reset_safe_mode() == 0 {
+                fixed += 1;
             }
         }
+    }
+
+    // Shadow-binary GUIDANCE (never auto-delete): surface other `tirith`
+    // executables on PATH so the operator can fix ordering themselves. Plain
+    // `println!` (not `note`): a remediation surfaced under an explicit `--fix`
+    // must show even with `--quiet`. Not counted in `fixed` — guidance only.
+    let shadows = crate::cli::find_shadow_binaries();
+    if !shadows.is_empty() {
+        println!("Manual step: other 'tirith' binaries shadow this one:");
+        for shadow in &shadows {
+            println!("    - {shadow}");
+        }
+        println!("  Remove them or fix PATH order so this binary wins.");
+        println!(
+            "  Run `{}` to inspect.",
+            crate::cli::tirith_path_lookup_command()
+        );
     }
 
     if fixed == 0 {
@@ -677,26 +687,26 @@ struct ThreatDbDoctorInfo {
 /// three status fields + a `schema_version`. Built by `gather_quick_info`,
 /// which touches ONLY cheap sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct QuickDoctorInfo {
+pub(crate) struct QuickDoctorInfo {
     /// Schema version for the polled shape; bumped only on a breaking change.
-    schema_version: u32,
+    pub(crate) schema_version: u32,
     /// Live protection mode from `TIRITH_STATUS`, using the SAME vocabulary as
     /// `tirith prompt-status`: `guarded` (blocking), `warn-only`, `degraded`,
     /// `off`; unknown values passed through verbatim.
-    protection_mode: String,
+    pub(crate) protection_mode: String,
     /// The single policy file the engine would load (local discovery only), or
     /// `null` when none is discovered. Existence-based — never a network fetch.
-    policy_path_used: Option<String>,
+    pub(crate) policy_path_used: Option<String>,
     /// Whether the shell hook is configured in the detected shell's profile
     /// (mirrors the full report's `hook_configured`).
-    hook_configured: bool,
+    pub(crate) hook_configured: bool,
 }
 
 /// Gather ONLY the three cheap quick-status fields. The unit-testable seam:
 /// must touch nothing expensive — no audit-log read, threat-DB deserialize,
 /// baseline read, PATH walk, or bash-capability cache. Fields come from
 /// `TIRITH_STATUS`, `discover_local_policy_path`, and `check_shell_profile`.
-fn gather_quick_info() -> QuickDoctorInfo {
+pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
     let detected_shell = crate::cli::init::detect_shell().to_string();
     let (_profile, hook_configured) = check_shell_profile(&detected_shell, "tirith: doctor:");
 
@@ -736,7 +746,7 @@ fn run_quick(json: bool) -> i32 {
 }
 
 /// Human-readable 2-3 line summary for `tirith doctor --quick`.
-fn print_quick_human(info: &QuickDoctorInfo) {
+pub(crate) fn print_quick_human(info: &QuickDoctorInfo) {
     println!("  protection:   {}", info.protection_mode);
     println!(
         "  hook:         {}",
@@ -1993,7 +2003,9 @@ fn print_protection_status(status: Option<&str>) {
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
     println!("  binary:       {}", info.binary_path);
-    if !info.shadow_binaries.is_empty() {
+    // Low-value advisory: the noisy shadow-binary warning is suppressed under
+    // `--quiet` (the `--fix` guidance block remains a separate, always-shown path).
+    if !info.shadow_binaries.is_empty() && !crate::cli::is_quiet() {
         println!();
         println!("  WARNING: other 'tirith' binaries found on PATH:");
         for shadow in &info.shadow_binaries {

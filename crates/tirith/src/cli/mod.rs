@@ -449,6 +449,7 @@ pub mod secret;
 pub mod selfupdate;
 pub mod share;
 pub mod ssh;
+pub mod status;
 pub mod sudo;
 pub mod taint;
 pub mod temp_run;
@@ -655,6 +656,83 @@ pub fn find_shadow_binaries() -> Vec<String> {
         }
     }
     shadows
+}
+
+/// Process-global quiet flag, set once from the root `--quiet` / `TIRITH_QUIET`.
+/// Low-value advisory lines route through [`note`]; security notices, verdicts,
+/// errors, and JSON do NOT, so quiet never hides anything that matters.
+static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set once in `main()` right after clap parse. `--quiet` OR `TIRITH_QUIET=1/true`.
+pub fn init_quiet(flag: bool) {
+    let env = std::env::var("TIRITH_QUIET")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let _ = QUIET.set(flag || env);
+}
+
+/// True when LOW-VALUE advisory output should be suppressed. Defaults to `false`
+/// (fail-safe: if `init_quiet` somehow never ran, we never accidentally hide output).
+pub fn is_quiet() -> bool {
+    *QUIET.get().unwrap_or(&false)
+}
+
+/// Print a LOW-VALUE advisory line to stderr unless `--quiet`. Use for clean
+/// "no issues" lines, tips, shadow/session footers, the onboard hint — NEVER for
+/// errors, verdicts, or security notices (degraded protection / repo-policy
+/// neutralization), which must always be visible.
+pub fn note(msg: impl std::fmt::Display) {
+    if !is_quiet() {
+        eprintln!("{msg}");
+    }
+}
+
+/// Read at most `max` bytes from stdin — the shared cap used by `check`/`paste`
+/// when consuming piped input. Returns the raw bytes; callers decode lossily.
+pub fn read_stdin_capped(max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    std::io::stdin().take(max + 1).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Once per shell SESSION (per policy), tell the operator that a repo-scoped policy
+/// had WEAKENING fields neutralized (F9 — a repo may tighten, never weaken). A repo
+/// author who sets `allowlist`/`severity_overrides` otherwise gets zero feedback that
+/// it was ignored. This is a SECURITY notice: printed unconditionally, NOT routed
+/// through `note()`/`--quiet`. `tirith policy effective` always lists the full drop
+/// set regardless of this throttle.
+pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
+    use tirith_core::policy::PolicyScope;
+    if policy.scope != PolicyScope::Repo || policy.neutralized_fields.is_empty() {
+        return;
+    }
+    // Throttle by SESSION id (so it re-warns in every new shell) + policy path —
+    // NOT by file mtime, which would suppress the warning across new shells.
+    let Some(dir) = tirith_core::policy::state_dir().map(|d| d.join("policy-weakening-warned"))
+    else {
+        return;
+    };
+    let session = tirith_core::session::resolve_session_id();
+    let path_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        policy.path.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let marker = dir.join(format!("{session}-{path_key}"));
+    if marker.exists() {
+        return;
+    }
+    eprintln!(
+        "tirith: this repo's .tirith/policy.yaml is tightening-only — the following \
+         weakening field(s) were ignored: {}.\n  See the resolved policy with \
+         `tirith policy effective`.",
+        policy.neutralized_fields.join(", ")
+    );
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&marker, b"");
 }
 
 #[cfg(test)]

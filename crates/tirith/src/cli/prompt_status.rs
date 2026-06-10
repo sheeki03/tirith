@@ -255,6 +255,67 @@ pub(crate) fn protection_mode_from_status(status: Option<&str>) -> String {
     }
 }
 
+/// Protection posture classified for an exit-code contract. Built from the
+/// `protection_mode` string [`protection_mode_from_status`] emits plus whether a
+/// shell hook is actually configured — `"off"` splits into [`HookMissing`]
+/// (nothing wired up) versus [`Off`] (hook present but inactive). Drives the new
+/// `tirith status` exit code; `prompt-status` stays always-0.
+///
+/// [`HookMissing`]: ProtectionHealth::HookMissing
+/// [`Off`]: ProtectionHealth::Off
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectionHealth {
+    Guarded,
+    WarnOnly,
+    Degraded,
+    Off,
+    HookMissing,
+    Unknown,
+}
+
+impl ProtectionHealth {
+    /// Map a `protection_mode` string (same vocabulary as
+    /// [`protection_mode_from_status`]) plus `hook_configured` to a health.
+    /// `"off"` resolves to [`HookMissing`](Self::HookMissing) when no hook is
+    /// configured, otherwise [`Off`](Self::Off). Anything outside the known
+    /// vocabulary (including values passed through verbatim) is
+    /// [`Unknown`](Self::Unknown).
+    pub(crate) fn classify(protection_mode: &str, hook_configured: bool) -> Self {
+        match protection_mode {
+            "guarded" => Self::Guarded,
+            "warn-only" => Self::WarnOnly,
+            "degraded" => Self::Degraded,
+            "off" if !hook_configured => Self::HookMissing,
+            "off" => Self::Off,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Exit-code contract: `0` only when actively blocking ([`Guarded`]); every
+    /// other posture (warn-only, degraded, off, hook-missing, unknown) is `1` so
+    /// callers can fail CI / prompts on anything less than full protection.
+    ///
+    /// [`Guarded`]: Self::Guarded
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Guarded => 0,
+            _ => 1,
+        }
+    }
+
+    /// Stable lowercase label for human/JSON output.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Guarded => "guarded",
+            Self::WarnOnly => "warn-only",
+            Self::Degraded => "degraded",
+            Self::Off => "off",
+            Self::HookMissing => "hook-missing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Test-only `pub(crate)` shim exposing the real env-reading
 /// `detect_protection_mode` to `cli::doctor`'s cross-module agreement test.
 /// Caller sets `TIRITH_STATUS` under the shared env lock.
@@ -523,6 +584,40 @@ mod tests {
         unsafe {
             std::env::remove_var("TIRITH_STATUS");
         }
+    }
+
+    #[test]
+    fn protection_health_classify_and_exit_codes() {
+        // Guarded is the only posture that exits 0 (actively blocking).
+        let guarded = ProtectionHealth::classify("guarded", true);
+        assert_eq!(guarded, ProtectionHealth::Guarded);
+        assert_eq!(guarded.exit_code(), 0);
+        assert_eq!(guarded.label(), "guarded");
+
+        // Everything else exits 1.
+        let warn_only = ProtectionHealth::classify("warn-only", true);
+        assert_eq!(warn_only, ProtectionHealth::WarnOnly);
+        assert_eq!(warn_only.exit_code(), 1);
+
+        // "off" splits on hook_configured.
+        let hook_missing = ProtectionHealth::classify("off", false);
+        assert_eq!(hook_missing, ProtectionHealth::HookMissing);
+        assert_eq!(hook_missing.exit_code(), 1);
+        assert_eq!(hook_missing.label(), "hook-missing");
+
+        let off = ProtectionHealth::classify("off", true);
+        assert_eq!(off, ProtectionHealth::Off);
+        assert_eq!(off.exit_code(), 1);
+
+        let degraded = ProtectionHealth::classify("degraded", true);
+        assert_eq!(degraded, ProtectionHealth::Degraded);
+        assert_eq!(degraded.exit_code(), 1);
+
+        // Anything outside the known vocabulary is Unknown (hook flag irrelevant).
+        let unknown = ProtectionHealth::classify("futureValue", true);
+        assert_eq!(unknown, ProtectionHealth::Unknown);
+        assert_eq!(unknown.exit_code(), 1);
+        assert_eq!(unknown.label(), "unknown");
     }
 
     #[test]

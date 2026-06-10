@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use crate::cli::last_trigger;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::escalation::CallerContext;
@@ -22,6 +24,27 @@ pub fn run(
     suggest_safe_command: bool,
     card: Option<String>,
 ) -> i32 {
+    // When clap left the positional empty and this is NOT the `--approval-check`
+    // path (which has its own no-input contract below), accept the command from
+    // piped stdin so `echo 'curl x | bash' | tirith check` works. Only read when
+    // stdin is NOT a terminal, so an interactive `tirith check` with no argv still
+    // returns silently rather than blocking on a TTY. Mirrors paste.rs's 1 MiB cap.
+    let stdin_cmd: String;
+    let cmd: &str = if cmd.trim().is_empty() && !approval_check && !std::io::stdin().is_terminal() {
+        match crate::cli::read_stdin_capped(1024 * 1024) {
+            Ok(bytes) => {
+                stdin_cmd = String::from_utf8_lossy(&bytes).into_owned();
+                &stdin_cmd
+            }
+            Err(e) => {
+                eprintln!("tirith: failed to read stdin: {e}");
+                return 1;
+            }
+        }
+    } else {
+        cmd
+    };
+
     if cmd.trim().is_empty() {
         if approval_check {
             match tirith_core::approval::write_no_approval_file() {
@@ -202,6 +225,7 @@ pub fn run(
     let ran_locally = engine_policy.is_some();
     let policy =
         engine_policy.unwrap_or_else(|| tirith_core::policy::Policy::discover(cwd.as_deref()));
+    crate::cli::warn_repo_policy_neutralized(&policy);
 
     if ran_locally {
         let runtime_findings = tirith_core::threatdb_api::enrich_command(
@@ -388,6 +412,17 @@ pub fn run(
         }
         if output::write_safe_suggestions(&safe_suggestions, std::io::stderr().lock()).is_err() {
             eprintln!("tirith: failed to write safe-command suggestions");
+        }
+        // On a clean human verdict from DIRECT CLI use, confirm nothing was found
+        // (`write_human_auto` is silent on no findings). Gated OFF for hook
+        // invocations — a per-keystroke "no issues" would be noise — detected via
+        // the `_TIRITH_HOOK` / `_TIRITH_BASH_INTERNAL` markers the shell hooks set.
+        // `note` is already `--quiet`-aware. Never emitted in the JSON branch.
+        if effective.findings.is_empty()
+            && std::env::var("_TIRITH_HOOK").is_err()
+            && std::env::var("_TIRITH_BASH_INTERNAL").is_err()
+        {
+            crate::cli::note("tirith: no issues");
         }
     }
 

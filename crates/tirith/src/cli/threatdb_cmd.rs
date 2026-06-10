@@ -522,10 +522,10 @@ pub fn status(json: bool) -> i32 {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct ThreatDbStatus {
-    installed: bool,
-    path: Option<String>,
-    age_hours: Option<f64>,
+pub(crate) struct ThreatDbStatus {
+    pub(crate) installed: bool,
+    pub(crate) path: Option<String>,
+    pub(crate) age_hours: Option<f64>,
     build_timestamp: Option<u64>,
     build_sequence: Option<u64>,
     package_count: Option<u32>,
@@ -535,12 +535,12 @@ struct ThreatDbStatus {
     popular_count: Option<u32>,
     total_entries: Option<u32>,
     skipped_range_only: Option<u32>,
-    signature_valid: Option<bool>,
-    stale: bool,
+    pub(crate) signature_valid: Option<bool>,
+    pub(crate) stale: bool,
     error: Option<String>,
 }
 
-fn gather_status() -> ThreatDbStatus {
+pub(crate) fn gather_status() -> ThreatDbStatus {
     let db_path = ThreatDb::default_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
 

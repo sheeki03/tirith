@@ -6,13 +6,35 @@ use std::path::PathBuf;
 use crate::cli::{HumanJsonFormat, HumanJsonSarifFormat};
 use clap::{Parser, Subcommand};
 
+/// A categorized command overview appended to `tirith --help` (the long help),
+/// since clap-derive cannot group subcommands by category. The
+/// `every_command_is_categorized` test guards this against drift.
+const COMMANDS_BY_CATEGORY: &str = "\
+COMMANDS BY CATEGORY:
+  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run taint intend lab explain why visual-audit
+  Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
+  Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
+  Policy & Trust:   policy trust rule output
+  Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
+  Supply-chain:     package ecosystem threat-db iac canary secret command-card commands
+  Integrations:     mcp mcp-server gateway agent ai lsp license
+  Forensics:        audit incident checkpoint share redact clipboard
+
+Run `tirith <command> --help` for details on any command.";
+
 #[derive(Parser)]
 #[command(
     name = "tirith",
     version,
-    about = "URL security analysis for shell environments"
+    about = "URL security analysis for shell environments",
+    after_long_help = COMMANDS_BY_CATEGORY
 )]
 pub struct Cli {
+    /// Suppress low-value advisory output (clean "no issues" lines, shadow-binary
+    /// warnings, tips). Never hides errors, verdicts, JSON, or security notices.
+    #[arg(long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -634,6 +656,15 @@ Cache:
         format: Option<HumanJsonFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Show whether tirith is actively protecting this shell: protection mode,
+    /// hook health, active policy + scope, and threat-DB freshness. Exits NON-ZERO
+    /// unless protection is actively blocking — use it in CI or a prompt guard.
+    Status {
+        /// Output as JSON.
+        #[arg(long)]
         json: bool,
     },
 
@@ -5179,11 +5210,31 @@ Templates:
     #[command(after_help = "\
 Examples:
   tirith policy validate
+  tirith policy validate ./policy.yaml
   tirith policy validate --format json")]
     Validate {
+        /// Policy file to validate, as a positional arg (default: auto-discover).
+        /// Conflicts with --path.
+        #[arg(value_name = "PATH", conflicts_with = "path")]
+        path_pos: Option<String>,
         /// Path to policy file (default: auto-discover)
         #[arg(long)]
         path: Option<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show the fully-resolved effective policy for the current directory: source
+    /// path, scope, and (for a repo-scoped policy) which weakening fields were
+    /// neutralized. Local discovery only — never a network fetch.
+    #[command(after_help = "\
+Examples:
+  tirith policy effective
+  tirith policy effective --format json")]
+    Effective {
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -5422,6 +5473,17 @@ Examples:
 Examples:
   tirith trust last")]
     Last,
+    /// Print ready-to-run `trust add` commands for the most recent blocked finding
+    /// (from the last-trigger record). Suggest-only by default; --apply runs them.
+    #[command(after_help = "\
+Examples:
+  tirith trust from-last-trigger
+  tirith trust from-last-trigger --apply")]
+    FromLastTrigger {
+        /// Add the trust entries instead of just printing the commands.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Garbage-collect expired entries from trust stores
     #[command(after_help = "\
 Examples:
@@ -5490,11 +5552,17 @@ Examples:
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Start the daemon in the foreground
+    /// Start the daemon (foreground by default; --detach backgrounds it)
     #[command(after_help = "\
 Examples:
-  tirith daemon start")]
-    Start,
+  tirith daemon start            # foreground (blocks; run under a supervisor)
+  tirith daemon start --detach   # background; returns once the socket is up")]
+    Start {
+        /// Run in the background: re-spawn detached, verify the socket comes up,
+        /// then return. Default is foreground.
+        #[arg(long, short = 'd')]
+        detach: bool,
+    },
     /// Stop a running daemon
     #[command(after_help = "\
 Examples:
@@ -6308,10 +6376,11 @@ fn run() {
     }
 
     let cli = Cli::parse();
+    cli::init_quiet(cli.quiet);
 
     let exit_code = match cli.command {
         Commands::Daemon { action } => match action {
-            DaemonAction::Start => cli::daemon::start(),
+            DaemonAction::Start { detach } => cli::daemon::start(detach),
             DaemonAction::Stop => cli::daemon::stop(),
             DaemonAction::Status => cli::daemon::status(),
         },
@@ -6636,9 +6705,18 @@ fn run() {
                 minimal,
                 template,
             } => cli::policy::init(force, minimal, template.as_deref()),
-            PolicyAction::Validate { path, format, json } => {
+            PolicyAction::Validate {
+                path_pos,
+                path,
+                format,
+                json,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::policy::validate(path.as_deref(), json)
+                cli::policy::validate(path_pos.or(path).as_deref(), json)
+            }
+            PolicyAction::Effective { format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::policy::effective(json)
             }
             PolicyAction::Test {
                 command,
@@ -6867,6 +6945,7 @@ fn run() {
                 scope,
             } => cli::trust::remove(&pattern, rule.as_deref(), &scope),
             TrustAction::Last => cli::trust::last(),
+            TrustAction::FromLastTrigger { apply } => cli::trust::from_last_trigger(apply),
             TrustAction::Gc {
                 expired,
                 scope,
@@ -6933,6 +7012,8 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::prompt_status::run(short, json)
         }
+
+        Commands::Status { json } => cli::status::run(json),
 
         Commands::Warnings {
             clear,
@@ -7840,4 +7921,40 @@ fn run() {
     };
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod help_category_tests {
+    use super::{Cli, COMMANDS_BY_CATEGORY};
+    use clap::CommandFactory;
+
+    /// Every non-hidden top-level command must appear in the categorized help
+    /// block, so `tirith --help`'s overview never silently drifts from the real
+    /// command set when a new subcommand is added.
+    #[test]
+    fn every_command_is_categorized() {
+        // `Cli::command()` builds a very large command tree; the default ~2 MiB
+        // test-thread stack overflows in debug, so build it on a roomier stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cmd = Cli::command();
+                for sub in cmd.get_subcommands() {
+                    if sub.is_hide_set() {
+                        continue;
+                    }
+                    let name = sub.get_name();
+                    if name == "help" {
+                        continue; // clap's auto-generated built-in
+                    }
+                    assert!(
+                        COMMANDS_BY_CATEGORY.contains(name),
+                        "command `{name}` is missing from COMMANDS_BY_CATEGORY — add it to a category"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

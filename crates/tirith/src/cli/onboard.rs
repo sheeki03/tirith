@@ -131,6 +131,9 @@ pub fn run(mode: Option<&str>, apply: bool, json: bool) -> i32 {
     if apply {
         return apply_actions(&report);
     }
+    // Discoverability: `--apply` already performs the steps, but the report never
+    // named it, so users didn't know it existed.
+    crate::cli::note("Run `tirith onboard --apply` to perform the recommended safe actions.");
     0
 }
 

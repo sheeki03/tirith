@@ -43,6 +43,63 @@ pub struct DiffPair {
     pub diff_text: Option<String>,
 }
 
+/// Why a single user-agent fetch failed.
+///
+/// `Connect` means the host could not be reached at all (DNS resolution or TCP
+/// connect failure, or a connect-phase timeout) — that failure is identical for
+/// every user-agent, so the caller short-circuits the loop. Every other failure
+/// (`Other`) is treated as agent-specific and the caller keeps trying the
+/// remaining user-agents, because a fetch that *reaches* the server but fails
+/// (or returns a different status) for one UA and not another IS the cloaking
+/// signal we are looking for. An HTTP error response is not a `FetchErr` at all:
+/// it is returned as `Ok((status, body))` so status differences stay visible.
+#[cfg(unix)]
+enum FetchErr {
+    /// Host unreachable for everyone (DNS/connect failure or connect timeout).
+    Connect(String),
+    /// Anything else: redirect/SSRF rejection, oversized/unreadable body, etc.
+    Other(String),
+}
+
+#[cfg(unix)]
+impl FetchErr {
+    /// True only for an unambiguous host-unreachable failure. Be conservative:
+    /// anything uncertain returns false so cloaking is never under-tested.
+    fn is_host_unreachable(&self) -> bool {
+        matches!(self, FetchErr::Connect(_))
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            FetchErr::Connect(m) | FetchErr::Other(m) => m,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for FetchErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Classify a `reqwest::Error` from the request/connect phase.
+///
+/// A connect failure or a connect-phase timeout means the host is unreachable
+/// regardless of user-agent → `Connect` (short-circuit). reqwest folds DNS
+/// resolution failures into the connect phase, so `is_connect()` covers the
+/// "host does not resolve" case too. Anything else (including redirect-policy
+/// errors such as our SSRF re-validation or too-many-redirects) is `Other` so
+/// the caller keeps probing the other user-agents.
+#[cfg(unix)]
+fn classify_reqwest_err(e: &reqwest::Error) -> FetchErr {
+    if e.is_connect() || e.is_timeout() {
+        FetchErr::Connect(format!("request failed: {e}"))
+    } else {
+        FetchErr::Other(format!("request failed: {e}"))
+    }
+}
+
 #[cfg(unix)]
 impl CloakingResult {
     /// Serialize to JSON; diff text is included only when `include_diff_text`.
@@ -109,7 +166,17 @@ pub fn check(url: &str) -> Result<CloakingResult, String> {
             }
             Err(e) => {
                 eprintln!("tirith: cloaking: {name} fetch failed: {e}");
+                // A host-unreachable failure (DNS/connect) is identical for every
+                // user-agent, so retrying the rest just burns ~5 more timeouts on
+                // the same dead host. Stop now; the `successful_count == 0` guard
+                // below still yields the honest "all fetches failed" error. Other
+                // failures are agent-specific (e.g. a 403/redirect block to one UA
+                // but not another IS the cloaking signal) so we keep probing.
+                let unreachable = e.is_host_unreachable();
                 responses.push((name.to_string(), 0, String::new()));
+                if unreachable {
+                    break;
+                }
             }
         }
     }
@@ -222,18 +289,22 @@ fn fetch_with_ua(
     url: &str,
     ua: &str,
     max_body: usize,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String), FetchErr> {
+    // Only the request/connect phase can yield a host-unreachable error; an HTTP
+    // error response still resolves to `Ok` here and is reported with its status.
+    // Redirect-policy errors (our SSRF re-validation, too-many-redirects) also
+    // surface from `.send()` but classify as `Other`, so they never short-circuit.
     let response = client
         .get(url)
         .header("User-Agent", ua)
         .send()
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| classify_reqwest_err(&e))?;
 
     let status = response.status().as_u16();
 
     if let Some(len) = response.content_length() {
         if len > max_body as u64 {
-            return Err(format!("response too large: {len} bytes"));
+            return Err(FetchErr::Other(format!("response too large: {len} bytes")));
         }
     }
 
@@ -243,9 +314,12 @@ fn fetch_with_ua(
     response
         .take((max_body as u64) + 1)
         .read_to_end(&mut body_bytes)
-        .map_err(|e| format!("read body: {e}"))?;
+        .map_err(|e| FetchErr::Other(format!("read body: {e}")))?;
     if body_bytes.len() > max_body {
-        return Err(format!("response too large: {} bytes", body_bytes.len()));
+        return Err(FetchErr::Other(format!(
+            "response too large: {} bytes",
+            body_bytes.len()
+        )));
     }
 
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
@@ -442,5 +516,62 @@ mod tests {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(err.contains("localhost")),
         }
+    }
+
+    /// A real connect refusal (loopback port 1, nothing listening — no external
+    /// network, no DNS) must classify as `Connect` so the caller short-circuits.
+    /// This drives `classify_reqwest_err` with a genuine `reqwest::Error` whose
+    /// `is_connect()` is set, which is exactly the loop's break condition.
+    #[test]
+    fn test_classify_connect_refusal_short_circuits() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client");
+        // Port 1 on loopback is reserved and unbound: the kernel refuses the TCP
+        // connect immediately (ECONNREFUSED) without any network egress.
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .expect_err("connection to an unbound loopback port must fail");
+        assert!(
+            err.is_connect(),
+            "expected a connect-phase error, got: {err:?}"
+        );
+
+        let classified = classify_reqwest_err(&err);
+        assert!(
+            classified.is_host_unreachable(),
+            "a connect/DNS failure must short-circuit the user-agent loop"
+        );
+        assert!(matches!(classified, FetchErr::Connect(_)));
+    }
+
+    /// The non-connect path must NOT short-circuit, so the loop keeps probing the
+    /// remaining user-agents. We assert the mapping directly: `FetchErr::Other`
+    /// (oversized/unreadable body, redirect/SSRF rejection, etc.) reports
+    /// `is_host_unreachable() == false`.
+    #[test]
+    fn test_other_fetch_error_does_not_short_circuit() {
+        let other = FetchErr::Other("response too large: 999 bytes".to_string());
+        assert!(
+            !other.is_host_unreachable(),
+            "a non-connect failure must NOT short-circuit — cloaking stays fully tested"
+        );
+    }
+
+    /// An HTTP error response is never a `FetchErr`: `fetch_with_ua` returns it as
+    /// `Ok((status, body))`, so a 403-to-one-UA vs 200-to-another stays visible to
+    /// the diff logic and is never mistaken for a host-unreachable short-circuit.
+    /// Guard the contract: only `FetchErr::Connect` is host-unreachable.
+    #[test]
+    fn test_http_status_is_not_a_fetch_error() {
+        // Status differences travel through the Ok branch as a u16, not FetchErr.
+        let ok: Result<(u16, String), FetchErr> = Ok((403, "Forbidden".to_string()));
+        assert!(matches!(ok, Ok((403, _))));
+
+        // And of the two error variants, only Connect is treated as unreachable.
+        assert!(FetchErr::Connect(String::new()).is_host_unreachable());
+        assert!(!FetchErr::Other(String::new()).is_host_unreachable());
     }
 }

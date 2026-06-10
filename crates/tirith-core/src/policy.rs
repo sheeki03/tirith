@@ -306,6 +306,15 @@ pub struct Policy {
     /// allows `objects.github.com` but not `evilgithub.com`).
     #[serde(default)]
     pub allowed_install_domains: Vec<String>,
+
+    /// Presentation bookkeeping (NOT a policy knob). When this policy is repo-
+    /// scoped, [`Self::sanitize_repo_scoped`] records here the YAML key name of
+    /// every field whose hostile value it neutralized, so the UX layer can show
+    /// the operator exactly which repo settings were ignored. Never serialized
+    /// (`#[serde(skip)]`): a repo YAML can neither set nor read it. Empty unless
+    /// `sanitize_repo_scoped` ran and found a non-default to reset.
+    #[serde(skip)]
+    pub neutralized_fields: Vec<&'static str>,
 }
 
 /// **M7 ch2** — `tirith share` policy configuration. Empty-default is the
@@ -611,7 +620,7 @@ fn matcher_matches(matcher: &AgentMatcher, origin: &AgentOrigin) -> bool {
 }
 
 /// Threat intelligence configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThreatIntelConfig {
     /// Auto-update interval in hours. 0 = disabled. Default: 24.
@@ -661,7 +670,7 @@ fn default_approval_fallback() -> String {
 }
 
 /// Webhook configuration for event notification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebhookConfig {
     /// Webhook URL.
     pub url: String,
@@ -735,7 +744,7 @@ pub struct ScanPolicyConfig {
 }
 
 /// Per-rule allowlist scoping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllowlistRule {
     /// Rule ID to scope the allowlist entry to.
     pub rule_id: String,
@@ -877,6 +886,7 @@ impl Default for Policy {
             hooks_guard_enabled: false,
             baseline_enabled: false,
             allowed_install_domains: Vec::new(),
+            neutralized_fields: Vec::new(),
         }
     }
 }
@@ -1267,9 +1277,41 @@ impl Policy {
     fn sanitize_repo_scoped(&mut self) {
         let defaults = Policy::default();
 
+        // Presentation bookkeeping (design C): record the YAML key of every field
+        // we neutralize so the UX layer can tell the operator exactly which repo
+        // settings were ignored. `record` pushes a key only when the field is
+        // about to actually change; the reset that follows is byte-for-byte the
+        // historical behavior — recording NEVER alters a final field value.
+        // `neutralized_fields` is reset first so a re-sanitize is idempotent.
+        self.neutralized_fields.clear();
+        let mut neutralized: Vec<&'static str> = Vec::new();
+        macro_rules! record {
+            // Field-equality form: reset target is the default's value for the
+            // field, so "changed" == "differs from default".
+            ($key:expr, $field:ident) => {
+                if self.$field != defaults.$field {
+                    neutralized.push($key);
+                }
+            };
+            // Explicit-predicate form: the reset target is a literal (false /
+            // None) that may NOT be the Default (e.g. `allow_bypass_env` defaults
+            // to true but is forced false). `$changed` is a bool that is true iff
+            // the current value differs from that reset target.
+            ($key:expr, $changed:expr) => {
+                if $changed {
+                    neutralized.push($key);
+                }
+            };
+        }
+
         // Suppression vectors — a repo must not be able to DROP a finding. The
         // engine's allowlist/allowlist_rules path (engine.rs `findings.retain`)
         // and severity downgrades are the documented suppression surfaces.
+        record!("allowlist", allowlist);
+        record!("allowlist_rules", allowlist_rules);
+        record!("network_allow", network_allow);
+        record!("additional_known_domains", additional_known_domains);
+        record!("severity_overrides", severity_overrides);
         self.allowlist = defaults.allowlist;
         self.allowlist_rules = defaults.allowlist_rules;
         self.network_allow = defaults.network_allow;
@@ -1278,6 +1320,22 @@ impl Policy {
 
         // Bypass / remote-fail relaxation — a repo must not be able to re-enable
         // the `TIRITH=0` bypass or steer remote-fetch failure toward open/cached.
+        // NOTE: `allow_bypass_env` defaults to TRUE (permissive), so leaving/omitting
+        // it (the common case for ANY repo policy) is NOT a weakening attempt — it is
+        // forced false for safety regardless. We deliberately do NOT record it, so the
+        // operator-facing "ignored weakening fields" notice never fires for a
+        // tightening-only repo. `allow_bypass_env_noninteractive` defaults FALSE, so a
+        // `true` there IS an explicit weakening and is recorded. The resets below are
+        // unchanged.
+        record!(
+            "allow_bypass_env_noninteractive",
+            self.allow_bypass_env_noninteractive
+        );
+        record!(
+            "policy_fetch_fail_mode",
+            self.policy_fetch_fail_mode.is_some()
+        );
+        record!("enforce_fail_mode", self.enforce_fail_mode.is_some());
         self.allow_bypass_env = false;
         self.allow_bypass_env_noninteractive = false;
         self.policy_fetch_fail_mode = None;
@@ -1285,6 +1343,13 @@ impl Policy {
 
         // Exfil / remote redirection — a repo must not be able to ship findings
         // to its own webhook or point discovery at its own policy server.
+        record!("webhooks", webhooks);
+        record!("policy_server_url", self.policy_server_url.is_some());
+        record!(
+            "policy_server_api_key",
+            self.policy_server_api_key.is_some()
+        );
+        record!("dlp_custom_patterns", dlp_custom_patterns);
         self.webhooks = defaults.webhooks;
         self.policy_server_url = None;
         self.policy_server_api_key = None;
@@ -1293,6 +1358,10 @@ impl Policy {
         // Guard-disable suppression — a repo must not be able to turn OFF a guard
         // that defaults ON, demote/silence supply-chain findings, disable threat
         // lookups, or downgrade a paste-source mismatch by self-listing its host.
+        record!("context_guard_enabled", context_guard_enabled);
+        record!("package_policy", package_policy);
+        record!("threat_intel", threat_intel);
+        record!("allowed_install_domains", allowed_install_domains);
         self.context_guard_enabled = defaults.context_guard_enabled;
         self.package_policy = defaults.package_policy.clone();
         self.threat_intel = defaults.threat_intel.clone();
@@ -1303,10 +1372,26 @@ impl Policy {
         // the `tirith scan` walk or relax its CI gate. Reset the weakening scan
         // sub-fields; `additional_config_files` and `mcp_allowed_tools` are
         // tightening (more coverage / an opt-in tool allow-list) and stay.
+        if self.scan.trusted_mcp_servers != defaults.scan.trusted_mcp_servers {
+            neutralized.push("scan.trusted_mcp_servers");
+        }
+        if self.scan.ignore_patterns != defaults.scan.ignore_patterns {
+            neutralized.push("scan.ignore_patterns");
+        }
+        if self.scan.fail_on != defaults.scan.fail_on {
+            neutralized.push("scan.fail_on");
+        }
+        // `scan.profiles` (HashMap<String, ScanProfile>) has no PartialEq; its
+        // default is empty, so a non-empty map is an author-set (weakening) value.
+        if !self.scan.profiles.is_empty() {
+            neutralized.push("scan.profiles");
+        }
         self.scan.trusted_mcp_servers = defaults.scan.trusted_mcp_servers.clone();
         self.scan.ignore_patterns = defaults.scan.ignore_patterns.clone();
         self.scan.fail_on = defaults.scan.fail_on.clone();
         self.scan.profiles = defaults.scan.profiles.clone();
+
+        self.neutralized_fields = neutralized;
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -3146,6 +3231,10 @@ custom_rules:
             scope: PolicyScope::Repo,
             context_labels: BTreeMap::new(),
             ssh_host_labels: BTreeMap::new(),
+            // Presentation bookkeeping — `sanitize_repo_scoped` OVERWRITES this,
+            // so the initial value is inert; set empty only to keep the
+            // (no-`..`) constructor total.
+            neutralized_fields: Vec::new(),
         };
 
         p.sanitize_repo_scoped();
@@ -3205,6 +3294,12 @@ custom_rules:
             scope,
             context_labels,
             ssh_host_labels,
+            // Presentation bookkeeping (design C) — NOT a sanitize-classified
+            // field (neither RESET nor KEPT). The sanitizer WRITES this with the
+            // keys it neutralized; it is `#[serde(skip)]` and a repo cannot set
+            // it. Bound here only to keep the no-`..` destructure total; its
+            // population is asserted by `sanitize_records_neutralized_fields`.
+            neutralized_fields: _,
         } = p;
 
         // ---- RESET: every weakening/suppression/exfil knob back to default ----
@@ -3354,5 +3449,80 @@ custom_rules:
         assert_eq!(scope, PolicyScope::Repo, "untouched: scope");
         assert!(context_labels.is_empty(), "untouched: context_labels");
         assert!(ssh_host_labels.is_empty(), "untouched: ssh_host_labels");
+    }
+
+    /// Design C — `sanitize_repo_scoped` records the YAML key of every WEAKENING
+    /// field it neutralized into `neutralized_fields`, so the UX layer can surface
+    /// which repo settings were ignored. Verifies: (1) repo `allowlist` +
+    /// `severity_overrides` are recorded; (2) `allow_bypass_env` (default true,
+    /// permissive) is NOT recorded — leaving it at the default is not an author
+    /// weakening attempt — while `allow_bypass_env_noninteractive` (default false)
+    /// IS recorded when set true; (3) a tightening-only / all-default policy records
+    /// nothing, so the operator notice never fires for it.
+    #[test]
+    fn sanitize_records_neutralized_fields() {
+        let mut p = Policy {
+            allowlist: vec!["evil.example".into()],
+            severity_overrides: HashMap::from([("curl_pipe_shell".into(), Severity::Low)]),
+            allow_bypass_env_noninteractive: true,
+            ..Policy::default()
+        };
+        p.sanitize_repo_scoped();
+
+        assert!(
+            p.neutralized_fields.contains(&"allowlist"),
+            "allowlist (non-default) must be recorded; got {:?}",
+            p.neutralized_fields
+        );
+        assert!(
+            p.neutralized_fields.contains(&"severity_overrides"),
+            "severity_overrides (non-default) must be recorded; got {:?}",
+            p.neutralized_fields
+        );
+        // Permissive-default `allow_bypass_env` is forced false but NOT recorded;
+        // restrictive-default `allow_bypass_env_noninteractive` set true IS recorded.
+        assert!(
+            !p.neutralized_fields.contains(&"allow_bypass_env"),
+            "allow_bypass_env (permissive default) must NOT be recorded; got {:?}",
+            p.neutralized_fields
+        );
+        assert!(
+            p.neutralized_fields
+                .contains(&"allow_bypass_env_noninteractive"),
+            "allow_bypass_env_noninteractive (set true) must be recorded; got {:?}",
+            p.neutralized_fields
+        );
+        // No key recorded more than once (the leading `clear()` prevents append).
+        let mut deduped = p.neutralized_fields.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            p.neutralized_fields.len(),
+            "neutralized keys must be unique; got {:?}",
+            p.neutralized_fields
+        );
+        // The reset VALUES are unchanged: suppression knobs back to default, both
+        // bypass flags forced off.
+        assert!(p.allowlist.is_empty(), "allowlist still reset to default");
+        assert!(
+            p.severity_overrides.is_empty(),
+            "severity_overrides still reset to default"
+        );
+        assert!(!p.allow_bypass_env, "allow_bypass_env still forced false");
+        assert!(
+            !p.allow_bypass_env_noninteractive,
+            "allow_bypass_env_noninteractive still forced false"
+        );
+
+        // A tightening-only / all-default policy records NOTHING — so the
+        // operator-facing weakening notice never fires for a benign repo.
+        let mut all_default = Policy::default();
+        all_default.sanitize_repo_scoped();
+        assert!(
+            all_default.neutralized_fields.is_empty(),
+            "an all-default (tightening-only) policy must record nothing; got {:?}",
+            all_default.neutralized_fields
+        );
     }
 }

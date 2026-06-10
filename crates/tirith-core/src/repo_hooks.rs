@@ -223,13 +223,30 @@ pub fn scan_for_repo(repo_root: &Path) -> RepoHookScan {
     }
 }
 
+/// Match an entry for `tirith hooks explain` against either its short display name
+/// (`pre-commit`) OR the path `hooks scan` prints (`.git/hooks/pre-commit`), so a user
+/// can copy-paste either form. Tries, in order: exact name; the source path's file name;
+/// the full displayed path; the displayed path with a trailing `/<query>` (or bare
+/// suffix) so a relative fragment of the printed path also matches.
+fn entry_matches(entry: &RepoHookEntry, query: &str) -> bool {
+    if entry.name == query {
+        return true;
+    }
+    let sp = entry.source_path.as_path();
+    if sp.file_name().and_then(|n| n.to_str()) == Some(query) {
+        return true;
+    }
+    let disp = sp.to_string_lossy();
+    disp == query || disp.ends_with(&format!("/{query}")) || disp.ends_with(query)
+}
+
 /// Look up a surface by name for `tirith hooks explain`. Returns every matching entry
 /// (a name like `pre-commit` can exist under `.git/hooks`, `.husky`, AND `lefthook.yml`).
 pub fn explain_for_cwd(name: &str) -> Vec<RepoHookEntry> {
     let scan = scan_for_cwd();
     scan.entries
         .into_iter()
-        .filter(|e| e.name == name)
+        .filter(|e| entry_matches(e, name))
         .collect()
 }
 
@@ -238,7 +255,7 @@ pub fn explain_for_repo(repo_root: &Path, name: &str) -> Vec<RepoHookEntry> {
     scan_for_repo(repo_root)
         .entries
         .into_iter()
-        .filter(|e| e.name == name)
+        .filter(|e| entry_matches(e, name))
         .collect()
 }
 
@@ -1788,6 +1805,37 @@ mod tests {
         let root = tempdir().unwrap();
         write(root.path(), ".husky/pre-commit", "#!/bin/sh\nnpm test\n");
         assert!(explain_for_repo(root.path(), "nonexistent").is_empty());
+    }
+
+    /// `explain` must accept BOTH the short hook name (`pre-commit`) AND the path that
+    /// `hooks scan` prints (`.git/hooks/pre-commit`), since a user naturally copies the
+    /// displayed path. A bogus query still matches nothing.
+    #[cfg(unix)]
+    #[test]
+    fn explain_matches_short_name_or_displayed_path() {
+        let root = tempdir().unwrap();
+        mkgit(root.path());
+        write(
+            root.path(),
+            ".git/hooks/pre-commit",
+            "#!/bin/sh\ncurl https://evil.example\n",
+        );
+
+        // Short name.
+        let by_name = explain_for_repo(root.path(), "pre-commit");
+        assert_eq!(by_name.len(), 1, "short name should match: {by_name:?}");
+        assert_eq!(by_name[0].name, "pre-commit");
+
+        // The displayed path form (what `hooks scan` prints).
+        let by_path = explain_for_repo(root.path(), ".git/hooks/pre-commit");
+        assert_eq!(by_path.len(), 1, "displayed path should match: {by_path:?}");
+        assert_eq!(by_path[0].name, "pre-commit");
+
+        // A bogus query matches nothing.
+        assert!(
+            explain_for_repo(root.path(), ".git/hooks/bogus").is_empty(),
+            "an unknown path must not match"
+        );
     }
 
     #[test]

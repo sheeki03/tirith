@@ -897,7 +897,11 @@ fn kill_process(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-pub fn start() -> i32 {
+pub fn start(detach: bool) -> i32 {
+    if detach {
+        return start_detached();
+    }
+
     let sock = socket_path();
     let pid = pid_path();
 
@@ -921,8 +925,142 @@ pub fn start() -> i32 {
     run_server(&sock, &pid)
 }
 
+/// Re-spawn `tirith daemon start` (no `--detach`, so the child runs the
+/// foreground path that binds the socket and writes the PID file) detached from
+/// this process, then VERIFY it actually came up before reporting success.
+///
+/// FIX S1: never report "started" blindly. After spawning we poll for up to ~2s
+/// for the socket to appear while confirming the child is still alive
+/// (`try_wait() == Ok(None)`). Three outcomes:
+///   * socket appears, child alive → success (return 0);
+///   * child exits early (`try_wait()` yields a status) → the foreground path
+///     refused/failed (e.g. already-running, runtime-dir gate, bind error);
+///     report it and return 1;
+///   * timeout with no socket → report failure, best-effort kill the orphaned
+///     child, return 1.
+#[cfg(unix)]
+fn start_detached() -> i32 {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("tirith: cannot determine current executable to detach: {e}");
+            return 1;
+        }
+    };
+
+    let sock = socket_path();
+
+    // Mirror the detached-spawn idiom used by the periodic threat-DB updater:
+    // null all stdio so the background daemon holds no terminal fds, and
+    // `setsid()` in the forked child so it leaves the controlling TTY and
+    // becomes a session/group leader (it won't die on terminal close / Ctrl-C).
+    let mut cmd = Command::new(&exe);
+    cmd.args(["daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and is the only call in the forked
+    // child before exec; it detaches the child from the controlling terminal.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tirith: failed to spawn background daemon: {e}");
+            return 1;
+        }
+    };
+
+    // FIX S1: verify the daemon actually bound before reporting success. Poll up
+    // to ~2s (20 × 100ms) for the socket, bailing early if the child exits.
+    let child_id = child.id();
+    match poll_startup(&mut child, &sock, 20, std::time::Duration::from_millis(100)) {
+        StartupOutcome::SocketUp => {
+            eprintln!("tirith: daemon started in background (PID {child_id})");
+            0
+        }
+        StartupOutcome::ChildExited(status) => {
+            // The foreground child exited before binding — surface its status.
+            eprintln!("tirith: daemon failed to start (exited {status})");
+            1
+        }
+        StartupOutcome::PollError(e) => {
+            eprintln!("tirith: failed to poll background daemon: {e}");
+            let _ = child.kill();
+            let _ = child.wait();
+            1
+        }
+        StartupOutcome::TimedOut => {
+            // The child may be wedged — best-effort kill so we don't leave an
+            // orphan, then report failure.
+            eprintln!(
+                "tirith: daemon did not come up within 2s (no socket at {})",
+                sock.display()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            1
+        }
+    }
+}
+
+/// Result of polling a freshly spawned detached daemon for startup (FIX S1).
+#[cfg(unix)]
+#[derive(Debug)]
+enum StartupOutcome {
+    /// The socket appeared while the child was still alive — daemon is up.
+    SocketUp,
+    /// The child exited before the socket appeared, carrying its exit status.
+    ChildExited(std::process::ExitStatus),
+    /// `try_wait()` itself errored.
+    PollError(std::io::Error),
+    /// The attempt budget elapsed with no socket and the child still running.
+    TimedOut,
+}
+
+/// Poll `child` up to `attempts` times (sleeping `delay` between attempts) for
+/// `sock` to exist, treating early child exit as failure.
+///
+/// On each attempt: if `try_wait()` shows the child EXITED, return
+/// [`StartupOutcome::ChildExited`] (the foreground daemon refused/crashed before
+/// binding). If the child is still alive AND the socket now exists, return
+/// [`StartupOutcome::SocketUp`]. If `try_wait()` errors, return
+/// [`StartupOutcome::PollError`]. If the budget is exhausted with neither, return
+/// [`StartupOutcome::TimedOut`]. The socket is checked only while the child is
+/// confirmed alive so a stale socket from a crashed child is never mistaken for a
+/// successful start.
+#[cfg(unix)]
+fn poll_startup(
+    child: &mut std::process::Child,
+    sock: &std::path::Path,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> StartupOutcome {
+    for _ in 0..attempts {
+        match child.try_wait() {
+            Ok(Some(status)) => return StartupOutcome::ChildExited(status),
+            Ok(None) => {
+                if sock.exists() {
+                    return StartupOutcome::SocketUp;
+                }
+            }
+            Err(e) => return StartupOutcome::PollError(e),
+        }
+        std::thread::sleep(delay);
+    }
+    StartupOutcome::TimedOut
+}
+
 #[cfg(not(unix))]
-pub fn start() -> i32 {
+pub fn start(_detach: bool) -> i32 {
     eprintln!("tirith: daemon requires Unix; Windows named pipe support coming soon");
     1
 }
@@ -1421,5 +1559,145 @@ mod tests {
             "with no state_dir, XDG_RUNTIME_DIR/tirith should win"
         );
         std::env::remove_var("XDG_RUNTIME_DIR");
+    }
+
+    // ---- D: `daemon start --detach` startup verification (FIX S1) ----
+
+    /// Spawn a real, long-lived child so `poll_startup` can observe it as alive.
+    /// Killed on drop so a passing/failing test never leaks a process.
+    #[cfg(unix)]
+    struct LiveChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl LiveChild {
+        /// A process that stays alive well past the poll budget.
+        fn sleeping() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn `sleep 30`");
+            Self(child)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LiveChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// When the socket appears while the child is still alive, `poll_startup`
+    /// reports `SocketUp` — the success path of FIX S1.
+    #[cfg(unix)]
+    #[test]
+    fn poll_startup_reports_socket_up_when_socket_appears() {
+        let tmp = TmpDir::new("poll-up");
+        std::fs::create_dir_all(&tmp.0).expect("dir");
+        let sock = tmp.0.join("daemon.sock");
+        // Create the "socket" file up front; the live child never touches it, so
+        // this isolates the socket-appeared decision from any real daemon.
+        std::fs::write(&sock, b"").expect("create sock placeholder");
+
+        let mut live = LiveChild::sleeping();
+        let outcome =
+            super::poll_startup(&mut live.0, &sock, 20, std::time::Duration::from_millis(5));
+        assert!(
+            matches!(outcome, super::StartupOutcome::SocketUp),
+            "socket present + child alive must yield SocketUp, got {outcome:?}"
+        );
+    }
+
+    /// When the child exits before the socket appears, `poll_startup` reports
+    /// `ChildExited` (carrying the status) instead of blindly succeeding — the
+    /// core of FIX S1.
+    #[cfg(unix)]
+    #[test]
+    fn poll_startup_reports_child_exited_when_child_dies() {
+        let tmp = TmpDir::new("poll-exit");
+        std::fs::create_dir_all(&tmp.0).expect("dir");
+        // No socket is ever created.
+        let sock = tmp.0.join("daemon.sock");
+
+        // `true` exits 0 immediately; wait for it so the first `try_wait()` in
+        // `poll_startup` observes the exit deterministically.
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn `true`");
+        let _ = child.wait();
+
+        let outcome =
+            super::poll_startup(&mut child, &sock, 20, std::time::Duration::from_millis(5));
+        match outcome {
+            super::StartupOutcome::ChildExited(status) => {
+                assert!(status.success(), "`true` exits 0");
+            }
+            other => panic!("an early-exiting child must yield ChildExited, got {other:?}"),
+        }
+        assert!(!sock.exists(), "no socket should have been created");
+    }
+
+    /// When the child stays alive but the socket never appears, `poll_startup`
+    /// reports `TimedOut` after exhausting its attempt budget.
+    #[cfg(unix)]
+    #[test]
+    fn poll_startup_times_out_when_no_socket() {
+        let tmp = TmpDir::new("poll-timeout");
+        std::fs::create_dir_all(&tmp.0).expect("dir");
+        let sock = tmp.0.join("daemon.sock"); // never created
+
+        let mut live = LiveChild::sleeping();
+        let outcome = super::poll_startup(
+            &mut live.0,
+            &sock,
+            3, // tiny budget so the test is fast
+            std::time::Duration::from_millis(5),
+        );
+        assert!(
+            matches!(outcome, super::StartupOutcome::TimedOut),
+            "alive child + no socket must time out, got {outcome:?}"
+        );
+    }
+
+    /// End-to-end: `start(true)` spawns a detached daemon, the socket appears,
+    /// the daemon is reachable (`status()` pings it successfully), then `stop()`
+    /// tears it down.
+    ///
+    /// `#[ignore]` because it points process-global `XDG_STATE_HOME` at a temp
+    /// dir (so the detached child resolves an isolated runtime dir) and actually
+    /// binds a socket — mutating that env races the other parallel env-reading
+    /// tests in this binary. Run with `--ignored` in isolation.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    fn start_detach_spawns_verifies_and_stops() {
+        let tmp = TmpDir::new("detach-e2e");
+        std::fs::create_dir_all(&tmp.0).expect("create state dir");
+        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+
+        // Ensure a clean slate (no leftover pid/sock from a prior run).
+        let _ = super::stop();
+
+        let code = super::start(true);
+        assert_eq!(code, 0, "start(true) must verify startup and return 0");
+
+        // The detached child's foreground `run_server` bound the socket and wrote
+        // the PID file; `status()` connects + pings to confirm reachability.
+        assert!(
+            super::socket_path().exists(),
+            "socket must exist after start"
+        );
+        assert_eq!(super::status(), 0, "daemon must be reachable via ping");
+
+        assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
+
+        std::env::remove_var("XDG_STATE_HOME");
     }
 }

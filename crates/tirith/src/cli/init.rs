@@ -34,9 +34,40 @@ fn check_path_shadow() -> Option<String> {
     ))
 }
 
+/// How long to suppress a repeat PATH-shadow warning. `eval "$(tirith init)"`
+/// runs on every new shell, so without this the warning would print every time.
+const SHADOW_WARN_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// True when the shadow warning hasn't fired in the last 24h (or ever). Cheap
+/// marker stat — checked BEFORE the `check_path_shadow` PATH walk.
+fn shadow_warn_due() -> bool {
+    let Some(marker) = tirith_core::policy::state_dir().map(|d| d.join("shadow-warned")) else {
+        return true;
+    };
+    match std::fs::metadata(&marker).and_then(|m| m.modified()) {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|age| age.as_secs() >= SHADOW_WARN_INTERVAL_SECS)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn mark_shadow_warned() {
+    if let Some(dir) = tirith_core::policy::state_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("shadow-warned"), b"");
+    }
+}
+
 pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
-    if let Some(warning) = check_path_shadow() {
-        eprintln!("{warning}");
+    // Throttled (once/24h) + `--quiet`-gated: a sourced `tirith init` runs on every
+    // new shell. The PATH walk is skipped entirely when a warning isn't due.
+    if !crate::cli::is_quiet() && shadow_warn_due() {
+        if let Some(warning) = check_path_shadow() {
+            eprintln!("{warning}");
+            mark_shadow_warned();
+        }
     }
 
     let shell = shell.unwrap_or_else(|| detect_shell());

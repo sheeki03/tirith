@@ -204,6 +204,7 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
     # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
     $errfile = [System.IO.Path]::GetTempFileName()
+    $env:_TIRITH_HOOK = '1'
     $approvalPath = & tirith check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
     $rc = $LASTEXITCODE
     $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
@@ -323,6 +324,7 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 
     # Check with tirith paste, use temp file to prevent output leakage
     $tmpfile = [System.IO.Path]::GetTempFileName()
+    $env:_TIRITH_HOOK = '1'
     $pasted | & tirith paste --shell powershell --interactive > $tmpfile 2>&1
     $rc = $LASTEXITCODE
     $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue

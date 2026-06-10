@@ -683,6 +683,147 @@ fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
     eprintln!("  tirith did not change your policy. Apply any suggestion by editing your .tirith/policy.yaml.");
 }
 
+/// The fully-resolved local policy plus its provenance, as gathered for
+/// `tirith policy effective`. Factored out of [`effective`] so the gathering is
+/// unit-testable without capturing stdout (the rendering is a thin function of
+/// these fields).
+struct EffectivePolicy {
+    /// Source file the policy was loaded from, or `None` for built-in defaults.
+    source_path: Option<String>,
+    /// Discovery scope (which branch matched) — drives the trust framing below.
+    scope: tirith_core::policy::PolicyScope,
+    /// The resolved policy itself (repo-scope sanitization already applied).
+    policy: Policy,
+}
+
+/// Map a [`PolicyScope`] to its lowercase label for output. The single mapping
+/// point shared by both the JSON `scope` field and the human framing.
+///
+/// [`PolicyScope`]: tirith_core::policy::PolicyScope
+fn scope_label(scope: tirith_core::policy::PolicyScope) -> &'static str {
+    use tirith_core::policy::PolicyScope;
+    match scope {
+        PolicyScope::Repo => "repo",
+        PolicyScope::User => "user",
+        PolicyScope::Org => "org",
+        PolicyScope::Remote => "remote",
+        PolicyScope::Default => "default",
+    }
+}
+
+/// Gather the effective local policy for `cwd`: its source path + scope (via
+/// [`discover_local_policy_path_scoped`]) and the fully-resolved policy (via
+/// [`Policy::discover_local_only`], which runs LOCAL resolution + repo-scope
+/// sanitize and NEVER fetches remotely). Discovery-only; no network.
+///
+/// [`discover_local_policy_path_scoped`]: tirith_core::policy::discover_local_policy_path_scoped
+fn gather_effective(cwd: Option<&str>) -> EffectivePolicy {
+    let (source_path, scope) = match tirith_core::policy::discover_local_policy_path_scoped(cwd) {
+        Some((path, scope)) => (Some(path.display().to_string()), scope),
+        None => (None, tirith_core::policy::PolicyScope::Default),
+    };
+    let policy = Policy::discover_local_only(cwd);
+    EffectivePolicy {
+        source_path,
+        scope,
+        policy,
+    }
+}
+
+/// `tirith policy effective` — a transparency surface that prints the FULLY-
+/// RESOLVED effective policy for the current directory, where it came from, and
+/// (for a repo-scoped policy) which weakening fields were neutralized down to
+/// tightening-only. Discovery-only: no path argument, no network fetch (uses
+/// [`Policy::discover_local_only`], not [`Policy::discover`]).
+pub fn effective(json: bool) -> i32 {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+
+    let info = gather_effective(cwd.as_deref());
+
+    if json {
+        print_effective_json(&info)
+    } else {
+        print_effective_human(&info)
+    }
+}
+
+fn print_effective_json(info: &EffectivePolicy) -> i32 {
+    #[derive(serde::Serialize)]
+    struct Output<'a> {
+        source_path: Option<&'a str>,
+        scope: &'a str,
+        neutralized_fields: &'a [&'static str],
+        policy: &'a Policy,
+    }
+
+    let output = Output {
+        source_path: info.source_path.as_deref(),
+        scope: scope_label(info.scope),
+        neutralized_fields: &info.policy.neutralized_fields,
+        policy: &info.policy,
+    };
+
+    if super::write_json_stdout(
+        &output,
+        "tirith policy effective: failed to write JSON output",
+    ) {
+        0
+    } else {
+        1
+    }
+}
+
+fn print_effective_human(info: &EffectivePolicy) -> i32 {
+    use tirith_core::policy::PolicyScope;
+
+    eprintln!(
+        "tirith policy effective: source = {}",
+        info.source_path
+            .as_deref()
+            .unwrap_or("(none — built-in defaults)")
+    );
+    eprintln!("  scope: {}", scope_label(info.scope));
+    eprintln!();
+
+    // Render the resolved policy as readable YAML (the crate already depends on
+    // serde_yaml; the policy is `Serialize`). On the unlikely serialize error,
+    // fall back to a note rather than failing the command — the provenance and
+    // neutralization sections below are the load-bearing transparency output.
+    match serde_yaml::to_string(&info.policy) {
+        Ok(yaml) => {
+            eprintln!("  effective policy:");
+            for line in yaml.lines() {
+                eprintln!("    {line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("  (could not render effective policy as YAML: {e})");
+        }
+    }
+    eprintln!();
+
+    let neutralized = &info.policy.neutralized_fields;
+    match info.scope {
+        PolicyScope::Repo if !neutralized.is_empty() => {
+            eprintln!(
+                "  Neutralized (this repo policy is tightening-only; these weakening fields \
+                 were ignored): {}",
+                neutralized.join(", ")
+            );
+        }
+        PolicyScope::Repo => {
+            eprintln!("  No weakening fields — this repo policy only tightens.");
+        }
+        _ => {
+            eprintln!("  Operator-scoped policy — all fields honored (nothing neutralized).");
+        }
+    }
+
+    0
+}
+
 #[derive(serde::Serialize)]
 struct PolicyTrace {
     policy_path: Option<String>,
@@ -1139,5 +1280,61 @@ mod tests {
         assert!(!p.allow_bypass_env_noninteractive);
         assert!(!p.approval_rules.is_empty());
         assert!(!p.escalation.is_empty());
+    }
+
+    /// `policy effective` transparency contract: for a REPO-scoped policy that
+    /// declares a weakening field (a non-empty `allowlist`), the gathered data
+    /// must name the source path, classify the scope as `repo`, and list
+    /// `allowlist` among the neutralized fields (repo policies are tightening-
+    /// only). Drives [`gather_effective`] directly so no stdout capture is
+    /// needed — the renderer is a thin function of these fields.
+    #[test]
+    fn effective_repo_scope_lists_neutralized_allowlist() {
+        use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // Isolate machine-level policy sources so only our repo policy is
+            // discovered (these are not faked by `with_fake_env`).
+            let _root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+            let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+
+            // A repo checkout: `.git` makes the walk-up stamp PolicyScope::Repo,
+            // which triggers repo-scope sanitization of the weakening `allowlist`.
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+            std::fs::write(
+                cwd.join(".tirith/policy.yaml"),
+                "fail_mode: open\nallowlist:\n  - evil.example\n",
+            )
+            .unwrap();
+
+            let info = gather_effective(cwd.to_str());
+
+            // Source path: the repo-root policy we just wrote.
+            let expected_path = cwd.join(".tirith/policy.yaml").display().to_string();
+            assert_eq!(
+                info.source_path.as_deref(),
+                Some(expected_path.as_str()),
+                "effective must name the repo-root policy as the source",
+            );
+
+            // Scope: repo (and its lowercase label).
+            assert_eq!(info.scope, tirith_core::policy::PolicyScope::Repo);
+            assert_eq!(scope_label(info.scope), "repo");
+
+            // The weakening `allowlist` was neutralized AND recorded — this is the
+            // drop list `policy effective` surfaces.
+            assert!(
+                info.policy.neutralized_fields.contains(&"allowlist"),
+                "allowlist must be listed as neutralized for a repo policy; got {:?}",
+                info.policy.neutralized_fields,
+            );
+            // And the value itself was actually reset to tightening-only default.
+            assert!(
+                info.policy.allowlist.is_empty(),
+                "the repo allowlist must be reset (neutralized), not honored",
+            );
+        });
     }
 }

@@ -102,6 +102,7 @@ pub fn run(
     // close the TOCTOU window where a `.tirith/policy.yaml` change between two
     // `Policy::discover` reads routed detection and enforcement against different policies.
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
+    crate::cli::warn_repo_policy_neutralized(&policy);
 
     // M4 item 8: origin attribution — the CLI is the only layer that knows whether the
     // caller was a human, an agent (TIRITH_INTEGRATION), or CI. The audit below picks it up.

@@ -62,7 +62,7 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
 
             $env._TIRITH_NU_RUNNING = true
             try {
-                let result = (do { ^tirith check --non-interactive --interactive --shell posix -- $cmd } | complete)
+                let result = (with-env {_TIRITH_HOOK: "1"} { do { ^tirith check --non-interactive --interactive --shell posix -- $cmd } | complete })
                 $env._TIRITH_NU_RUNNING = false
 
                 if $result.exit_code != 0 {
