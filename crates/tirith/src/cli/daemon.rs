@@ -1377,6 +1377,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dir_owned_by_euid_rejects_group_or_other_writable() {
         use std::os::unix::fs::PermissionsExt;
