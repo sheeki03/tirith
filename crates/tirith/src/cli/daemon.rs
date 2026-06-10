@@ -23,16 +23,144 @@ use tirith_core::tokenize::ShellType;
 #[cfg(unix)]
 use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Severity};
 
+/// Directory that holds the daemon's runtime files (socket + PID).
+///
+/// Prefers `state_dir()` (`$XDG_STATE_HOME/tirith` or `~/.local/state/tirith`).
+/// When that is unresolvable (no `XDG_STATE_HOME` and no home directory) we fall
+/// back to a *per-uid* `/tmp/tirith-<uid>` directory rather than the shared,
+/// world-writable `/tmp`. The bare `/tmp/daemon.sock` fallback let any same-host
+/// user pre-bind the socket and feed the hook path forged verdicts (F19); a
+/// uid-scoped `0700` dir keeps the path predictable for both client and server
+/// while denying other users write access. The `0700` mode is enforced when the
+/// directory is materialized (see `ensure_private_dir`).
+#[cfg(unix)]
+fn runtime_dir() -> PathBuf {
+    tirith_core::policy::state_dir().unwrap_or_else(|| {
+        let uid = unsafe { libc::geteuid() };
+        std::env::temp_dir().join(format!("tirith-{uid}"))
+    })
+}
+
+#[cfg(not(unix))]
+fn runtime_dir() -> PathBuf {
+    tirith_core::policy::state_dir().unwrap_or_else(|| PathBuf::from("/tmp").join("tirith"))
+}
+
 fn socket_path() -> PathBuf {
-    tirith_core::policy::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("daemon.sock")
+    runtime_dir().join("daemon.sock")
 }
 
 fn pid_path() -> PathBuf {
-    tirith_core::policy::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("daemon.pid")
+    runtime_dir().join("daemon.pid")
+}
+
+/// Create `dir` (and parents) with mode `0700` so only the owner can traverse or
+/// write inside it. If the directory already exists, tighten its mode to `0700`.
+/// Used for the daemon runtime dir so a peer cannot drop a same-named socket
+/// alongside ours or pre-create the path with looser permissions.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(dir)?;
+    // `recursive(true)` leaves a pre-existing dir's mode untouched, so re-assert
+    // 0700 to close a looser-permission pre-create.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Restrict the bound socket to owner read/write only (`0600`), so no other user
+/// can `connect()` to it even if they can reach the directory. Called right after
+/// `UnixListener::bind`.
+#[cfg(unix)]
+fn set_socket_perms(sock: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Return the effective uid of the process on the other end of `fd`, or `None`
+/// if the kernel could not supply peer credentials (e.g. the fd is not a
+/// connected `AF_UNIX` socket). Used to reject cross-user connections so a same-
+/// host attacker cannot drive the daemon (which the hook path trusts).
+///
+/// Platform notes for integrators:
+/// - Linux: `getsockopt(SOL_SOCKET, SO_PEERCRED)` filling `libc::ucred`; read
+///   `ucred.uid` (the peer's *effective* uid at `connect()` time).
+/// - macOS/BSD: `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` filling `libc::xucred`;
+///   read `xucred.cr_uid`. NOTE: `libc` (0.2.x) does NOT export `getpeereuid`,
+///   so we use `LOCAL_PEERCRED`/`xucred` instead of the `getpeereuid(3)` the
+///   task hint mentioned. Verify `cr_version == XUCRED_VERSION` before trusting.
+#[cfg(target_os = "linux")]
+fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    // SAFETY: getsockopt returned 0 and filled the full struct.
+    Some(unsafe { cred.assume_init() }.uid)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+))]
+fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut cred = std::mem::MaybeUninit::<libc::xucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    // The kernel may report a length shorter than the full struct (fewer
+    // groups), so require only that it covered through `cr_uid` rather than an
+    // exact match — an over-strict equality would spuriously reject legitimate
+    // same-uid peers.
+    let min_len = std::mem::offset_of!(libc::xucred, cr_uid) + std::mem::size_of::<libc::uid_t>();
+    if rc != 0 || (len as usize) < min_len {
+        return None;
+    }
+    // SAFETY: getsockopt returned 0 and filled at least through `cr_uid`. The
+    // backing buffer was zero-initialized, so any unfilled trailing groups read
+    // as 0 rather than uninitialized memory.
+    let cred = unsafe { cred.assume_init() };
+    if cred.cr_version != libc::XUCRED_VERSION {
+        return None;
+    }
+    Some(cred.cr_uid)
+}
+
+/// Fallback for Unix platforms we don't have a peer-credential path for: fail
+/// closed by returning `None` so the caller drops the connection.
+#[cfg(all(
+    unix,
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "freebsd"),
+    not(target_os = "dragonfly"),
+))]
+fn peer_euid(_fd: std::os::unix::io::RawFd) -> Option<u32> {
+    None
 }
 
 /// Wire protocol: one DaemonRequest per newline-delimited JSON line.
@@ -382,7 +510,15 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 #[cfg(unix)]
 fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
     if let Some(parent) = sock.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // 0700 so no other user can drop a same-named socket beside ours or read
+        // the directory (F19). Refuse to start if we can't lock it down.
+        if let Err(e) = ensure_private_dir(parent) {
+            eprintln!(
+                "tirith: failed to create runtime dir {} with 0700 perms: {e}",
+                parent.display()
+            );
+            return 1;
+        }
     }
 
     // Clean up a stale socket from a previous unclean shutdown.
@@ -415,6 +551,17 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                 return 1;
             }
         };
+
+        // Restrict the socket to owner-only (0600) immediately after bind so no
+        // other user can connect (F19). Bail if we can't, rather than serve an
+        // over-permissive socket.
+        if let Err(e) = set_socket_perms(sock) {
+            eprintln!(
+                "tirith: failed to set 0600 perms on socket {}: {e}",
+                sock.display()
+            );
+            return 1;
+        }
 
         eprintln!(
             "tirith: daemon listening on {} (PID {})",
@@ -486,6 +633,20 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                     match result {
                         Ok((stream, _addr)) => {
                             tokio::spawn(async move {
+                                // Reject cross-user peers: the hook path trusts
+                                // the daemon's verdict, so only the owning uid may
+                                // connect (F19). Drop silently on mismatch or when
+                                // peer creds are unavailable (fail closed).
+                                {
+                                    use std::os::unix::io::AsRawFd;
+                                    let fd = stream.as_raw_fd();
+                                    let me = unsafe { libc::geteuid() };
+                                    match peer_euid(fd) {
+                                        Some(uid) if uid == me => {}
+                                        _ => return,
+                                    }
+                                }
+
                                 let (reader, mut writer) = stream.into_split();
                                 // Cap request size to 1 MiB (OOM guard).
                                 let mut buf_reader = BufReader::new(reader.take(1024 * 1024));
@@ -838,5 +999,162 @@ mod tests {
             back.manifest_allowed_match.is_none(),
             "a payload without the field must default to None"
         );
+    }
+
+    // ---- F19: Unix socket auth / permission hardening ----
+
+    /// Unique temp dir under the system tempdir for a single test, removed on
+    /// drop. Avoids a hard dep on `tempfile` in the test path.
+    #[cfg(unix)]
+    struct TmpDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let p =
+                std::env::temp_dir().join(format!("tirith-f19-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// `ensure_private_dir` creates the runtime dir (and parents) at mode 0700.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_creates_0700() {
+        let tmp = TmpDir::new("mkdir");
+        let nested = tmp.0.join("a").join("b");
+        super::ensure_private_dir(&nested).expect("create private dir");
+        assert!(nested.is_dir());
+        assert_eq!(mode_of(&nested), 0o700, "leaf dir must be 0700");
+        // The intermediate dir we created is locked down too.
+        assert_eq!(mode_of(&tmp.0.join("a")), 0o700, "parent dir must be 0700");
+    }
+
+    /// A pre-existing, looser-permission dir is tightened back to 0700 (closes a
+    /// peer pre-creating the path world-writable before the daemon starts).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_tightens_existing_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("tighten");
+        std::fs::create_dir_all(&tmp.0).expect("pre-create");
+        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
+        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
+        super::ensure_private_dir(&tmp.0).expect("tighten");
+        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+    }
+
+    /// After binding a real listener, `set_socket_perms` leaves the socket file
+    /// at mode 0600 (mirrors `run_server`'s post-bind step).
+    #[cfg(unix)]
+    #[test]
+    fn set_socket_perms_makes_socket_0600() {
+        let tmp = TmpDir::new("sock");
+        super::ensure_private_dir(&tmp.0).expect("dir");
+        let sock = tmp.0.join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        super::set_socket_perms(&sock).expect("chmod socket");
+        assert_eq!(mode_of(&sock), 0o600, "socket must be owner-only 0600");
+        // And the containing runtime dir is 0700.
+        assert_eq!(mode_of(&tmp.0), 0o700, "runtime dir must be 0700");
+    }
+
+    /// `peer_euid` on a self-connected socket pair reports our own euid, and the
+    /// daemon's accept-time comparison (`uid == geteuid()`) accepts it. A forged
+    /// non-matching uid is rejected by the same comparison.
+    #[cfg(unix)]
+    #[test]
+    fn peer_euid_matches_self_and_rejects_other() {
+        use std::os::unix::io::AsRawFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let me = unsafe { libc::geteuid() };
+
+        let peer = super::peer_euid(a.as_raw_fd());
+        // On Linux/macOS we expect a concrete answer equal to our own euid.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let peer = peer.expect("peer_euid should resolve on linux/macos");
+            assert_eq!(peer, me, "a self-connected pair must report our euid");
+        }
+
+        // The accept-loop decision: accept iff Some(uid) == me. A mismatching
+        // uid (here me+1) must be rejected regardless of platform.
+        let accepts = |p: Option<u32>| matches!(p, Some(uid) if uid == me);
+        if peer.is_some() {
+            assert!(accepts(peer), "matching euid must be accepted");
+        }
+        assert!(
+            !accepts(Some(me.wrapping_add(1))),
+            "a non-matching euid must be rejected"
+        );
+        assert!(
+            !accepts(None),
+            "missing peer creds must be rejected (fail closed)"
+        );
+    }
+
+    /// The runtime dir is the state dir when available, and `socket_path` /
+    /// `pid_path` sit directly inside it (no bare-`/tmp` join).
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_drives_socket_and_pid_paths() {
+        let dir = super::runtime_dir();
+        if let Some(state) = tirith_core::policy::state_dir() {
+            assert_eq!(dir, state, "runtime dir should prefer state_dir when set");
+        }
+        assert_eq!(super::socket_path(), dir.join("daemon.sock"));
+        assert_eq!(super::pid_path(), dir.join("daemon.pid"));
+        // Whatever the runtime dir is, it is never the shared, world-writable
+        // tempdir itself (F19): a fallback must be a uid-scoped *subdir*.
+        assert_ne!(
+            dir,
+            std::env::temp_dir(),
+            "runtime dir must never be the bare tempdir"
+        );
+    }
+
+    /// The `/tmp` fallback (used only when `state_dir()` is `None`) is a
+    /// uid-scoped `tirith-<uid>` subdirectory of the tempdir, not bare `/tmp`.
+    /// Verified by replicating the fallback construction so the test never has to
+    /// mutate process-global `HOME` / `XDG_STATE_HOME` (which would race other
+    /// parallel tests in this binary).
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_dir_is_uid_scoped() {
+        let uid = unsafe { libc::geteuid() };
+        let fallback = std::env::temp_dir().join(format!("tirith-{uid}"));
+        let tmp = std::env::temp_dir();
+        assert!(
+            fallback.starts_with(&tmp) && fallback != tmp,
+            "fallback must be a subdir of the tempdir, got {}",
+            fallback.display()
+        );
+        let name = fallback.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert_eq!(name, format!("tirith-{uid}"), "fallback must be uid-scoped");
+        // `ensure_private_dir` (the helper run_server uses on this path)
+        // materializes any such dir at 0700 — proven by
+        // `ensure_private_dir_creates_0700`, so we don't touch the shared
+        // production fallback path here.
     }
 }
