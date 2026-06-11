@@ -174,7 +174,7 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "if [[ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]]; then",
             "  _TIRITH_PROMPT_STATUS_LOADED=1",
             "  setopt PROMPT_SUBST",
-            "  PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"",
+            "  PROMPT='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PROMPT\"",
             "fi",
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
@@ -183,7 +183,7 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
             "# >>> tirith prompt-status (M8 ch6) >>>",
             "if [ -z \"${_TIRITH_PROMPT_STATUS_LOADED:-}\" ]; then",
             "  _TIRITH_PROMPT_STATUS_LOADED=1",
-            "  PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"",
+            "  PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\"",
             "fi",
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
@@ -230,10 +230,10 @@ pub(crate) fn prompt_status_snippet(shell: &str) -> String {
         // print a manual-install pointer instead.
         "nushell" | "nu" => [
             "# >>> tirith prompt-status (M8 ch6) >>>",
-            "# Nushell does not support eval-style prompt wiring; add this to",
-            "# your config.nu (~/.config/nushell/config.nu):",
-            "#   $env.PROMPT_COMMAND = {|| $\"(tirith prompt-status --short) ($env.PWD)> \"}",
-            "# See docs/prompt-integration.md for details.",
+            "# Nushell exposes no non-exported TIRITH_STATUS variable, so a live",
+            "# status segment would always read `off`. nushell protection is",
+            "# warn-only regardless — there is no live prompt status to wire up",
+            "# here. See docs/prompt-status.md.",
             "# <<< tirith prompt-status (M8 ch6) <<<",
         ]
         .join("\n"),
@@ -568,14 +568,16 @@ mod tests {
         // Single-quoted so PROMPT re-renders each redraw, AND the non-exported
         // TIRITH_STATUS is forwarded inline so the child can actually read it
         // (a bare `tirith prompt-status` child sees a non-exported var as unset).
-        assert!(s.contains("'$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '"));
+        assert!(
+            s.contains("'$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '")
+        );
     }
 
     #[test]
     fn prompt_status_snippet_bash_uses_ps1_with_single_quoted_subst() {
         let s = prompt_status_snippet("bash");
         assert!(s.contains(
-            "PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\""
+            "PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\""
         ));
         assert!(s.contains("_TIRITH_PROMPT_STATUS_LOADED"));
         assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
@@ -613,10 +615,19 @@ mod tests {
     }
 
     #[test]
-    fn prompt_status_snippet_nushell_emits_manual_install_pointer() {
+    fn prompt_status_snippet_nushell_explains_no_live_status() {
         let s = prompt_status_snippet("nushell");
-        // Nushell snippet is a doc pointer (no eval-able closure).
-        assert!(s.contains("docs/prompt-integration.md"));
-        assert!(s.contains("tirith prompt-status --short"));
+        // Nushell exposes no non-exported TIRITH_STATUS, so the snippet must be an
+        // HONEST explanation (warn-only, no live status), NOT a prompt-status
+        // command that would always render `off`.
+        assert!(s.contains("warn-only"));
+        assert!(s.contains("docs/prompt-status.md"));
+        // Must NOT hand the user runnable prompt wiring that would render `off`.
+        // (The `# >>> tirith prompt-status` MARKER legitimately names the command;
+        // we guard against the old `$env.PROMPT_COMMAND` closure instead.)
+        assert!(
+            !s.contains("PROMPT_COMMAND"),
+            "nushell snippet must not suggest a runnable prompt closure (always reads off); got: {s}"
+        );
     }
 }

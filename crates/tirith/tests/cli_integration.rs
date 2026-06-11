@@ -8017,7 +8017,7 @@ fn init_prompt_status_emits_marker_wrapped_snippet_zsh() {
         "zsh snippet must set PROMPT_SUBST; got: {stdout}"
     );
     assert!(
-        stdout.contains("'$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '"),
+        stdout.contains("'$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '"),
         "zsh snippet must single-quote the command substitution and forward the \
          non-exported TIRITH_STATUS; got: {stdout}"
     );
@@ -8063,7 +8063,7 @@ fn init_prompt_status_is_idempotent_when_run_twice() {
 
     // The PS1 / PROMPT wrap-line must also appear exactly once.
     let prompt_line =
-        "PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"";
+        "PROMPT='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PROMPT\"";
     assert_eq!(
         stdout_a.matches(prompt_line).count(),
         1,
@@ -8090,7 +8090,7 @@ fn init_prompt_status_supports_bash_and_fish_and_powershell() {
     for (shell, must_contain) in [
         (
             "bash",
-            "PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"",
+            "PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\"",
         ),
         ("fish", "function fish_right_prompt"),
         ("powershell", "function global:prompt"),

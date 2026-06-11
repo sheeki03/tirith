@@ -640,9 +640,10 @@ Output forms:
 Examples:
   tirith prompt-status --short
   tirith prompt-status --json
-  PS1='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PS1\"        # bash
-  PROMPT='$(TIRITH_STATUS=\"$TIRITH_STATUS\" tirith prompt-status --short) '\"$PROMPT\"  # zsh (after setopt PROMPT_SUBST)
-  # The TIRITH_STATUS= prefix forwards the hook's non-exported status var to the child.
+  PS1='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PS1\"        # bash
+  PROMPT='$(TIRITH_STATUS=\"${TIRITH_STATUS:-}\" tirith prompt-status --short) '\"$PROMPT\"  # zsh (after setopt PROMPT_SUBST)
+  # The TIRITH_STATUS= prefix forwards the hook's non-exported status var to the child
+  # (the ${VAR:-} form stays safe under `set -u`).
 
 Cache:
   $XDG_RUNTIME_DIR/tirith/prompt-<uid>.cache (30s TTL).

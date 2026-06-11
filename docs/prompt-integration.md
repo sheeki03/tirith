@@ -61,7 +61,7 @@ etc.) prevents double-wrapping if your rc file is re-sourced.
 ```zsh
 # ~/.zshrc
 setopt PROMPT_SUBST
-PROMPT='$(TIRITH_STATUS="$TIRITH_STATUS" tirith prompt-status --short) '"$PROMPT"
+PROMPT='$(TIRITH_STATUS="${TIRITH_STATUS:-}" tirith prompt-status --short) '"$PROMPT"
 ```
 
 **Use single quotes** around the substitution. With double quotes, the
@@ -72,19 +72,21 @@ to prompt-render time.
 **Forward `TIRITH_STATUS`.** The shell hooks expose the live status as a
 deliberately NON-exported variable, so a bare `tirith prompt-status` child
 process cannot see it (it would always show `off`). The
-`TIRITH_STATUS="$TIRITH_STATUS"` prefix passes it into the child for that one
-call without exporting it session-wide.
+`TIRITH_STATUS="${TIRITH_STATUS:-}"` prefix passes it into the child for that one
+call without exporting it session-wide. The `${VAR:-}` form (rather than bare
+`$VAR`) keeps the prompt safe under `set -u` / `setopt NO_UNSET` when the hook
+has not set the variable yet.
 
 ### bash
 
 ```bash
 # ~/.bashrc
-PS1='$(TIRITH_STATUS="$TIRITH_STATUS" tirith prompt-status --short) '"$PS1"
+PS1='$(TIRITH_STATUS="${TIRITH_STATUS:-}" tirith prompt-status --short) '"$PS1"
 ```
 
 Same rules as zsh: single quotes around the substitution, and the
-`TIRITH_STATUS="$TIRITH_STATUS"` prefix to forward the hook's non-exported
-status into the child.
+`TIRITH_STATUS="${TIRITH_STATUS:-}"` prefix to forward the hook's non-exported
+status into the child (the `${VAR:-}` form is `set -u`-safe).
 
 ### fish
 
@@ -122,20 +124,29 @@ prefix its output rather than replacing it.
 
 ### nushell
 
-Nushell doesn't have an `eval`-able prompt-wrapper, so the auto-install
-path emits a doc pointer. Wire it manually:
+The nushell hook **deliberately exposes no `TIRITH_STATUS` variable**: every
+nushell `$env` entry is exported (inherited by child processes), and nushell
+has no non-exported session variable a prompt closure could read, so there is
+no safe way to surface a live status. A `tirith prompt-status` call in a
+nushell prompt would therefore always print `off`. nushell protection is
+warn-only regardless — see the nushell note in `docs/prompt-status.md`. If you
+just want a plain prompt, render `$env.PWD` directly without a tirith segment:
 
 ```nu
 # ~/.config/nushell/config.nu
-$env.PROMPT_COMMAND = {|| $"(tirith prompt-status --short) ($env.PWD)> "}
+$env.PROMPT_COMMAND = {|| $"($env.PWD)> "}
 ```
 
 ### Starship
 
-Starship runs as a separate process and doesn't share the parent
-shell's `TIRITH_STATUS` non-exported variable. For starship users,
-invoke `tirith prompt-status --json` from a starship custom module and
-template the fields you care about.
+Starship is an **external** renderer: it shells out to a separate child
+process each prompt, which cannot read the hook's non-exported
+`TIRITH_STATUS`. So a Starship `custom` module that runs `tirith
+prompt-status` would always show `off`. To surface the status in Starship you
+must opt back into **exporting** the variable yourself (accepting that child
+processes then inherit it) and read it directly — `export TIRITH_STATUS` after
+the hook is sourced, then `command = "echo $TIRITH_STATUS"`. The full Starship
+recipe (with the `custom` module TOML) is in `docs/prompt-status.md`.
 
 ## Latency
 
