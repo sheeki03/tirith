@@ -1219,6 +1219,16 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "AiConfigHiddenInstructionAdded",
     ),
     ("ai_config_tool_use_escalation", "AiConfigToolUseEscalation"),
+    // Cross-event correlation rules (W7). Session/post-process, fired by
+    // `correlate_session` over a bounded per-session event ring; no PATTERN_TABLE
+    // entry (the trigger is a sequence, not a single input). Category "correlation".
+    ("secret_write_then_network", "SecretWriteThenNetwork"),
+    (
+        "dependency_change_then_network",
+        "DependencyChangeThenNetwork",
+    ),
+    ("delete_then_force_push", "DeleteThenForcePush"),
+    ("mass_file_deletion", "MassFileDeletion"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1256,6 +1266,8 @@ const VALID_CATEGORIES: &[&str] = &[
     "canary",
     // M13 ch5 — AI-config drift rules, emitted by `tirith ai diff`.
     "aifile",
+    // W7: cross-event correlation rules, emitted by `correlate_session`.
+    "correlation",
 ];
 
 #[derive(Deserialize)]

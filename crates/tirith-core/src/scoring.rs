@@ -319,7 +319,12 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PasteSourceMismatch
         // M13 ch5 — AI-config drift rules (snapshot-vs-current diff).
         | RuleId::AiConfigHiddenInstructionAdded
-        | RuleId::AiConfigToolUseEscalation => false,
+        | RuleId::AiConfigToolUseEscalation
+        // W7: cross-event correlation rules (session/post-process sequence match).
+        | RuleId::SecretWriteThenNetwork
+        | RuleId::DependencyChangeThenNetwork
+        | RuleId::DeleteThenForcePush
+        | RuleId::MassFileDeletion => false,
     }
 }
 

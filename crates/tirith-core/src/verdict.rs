@@ -690,6 +690,30 @@ pub enum RuleId {
     /// snapshot (run/exec/spawn a shell, network call, or file write). High —
     /// silently widening the agent's blast radius. Only ADDED lines fire.
     AiConfigToolUseEscalation,
+
+    // Cross-event correlation rules (W7). Fire from `correlate_session` over a
+    // bounded per-session ring of typed events recorded AFTER each verdict is
+    // finalized (`crate::event_buffer`, `crate::session_warnings`), NOT from the
+    // `analyze` hot path. They reason about "A THEN B within a window" sequences,
+    // so no single input ever triggers them; like the M11/M12/M13 rules above they
+    // have NO PATTERN_TABLE entry and live in `EXTERNALLY_TRIGGERED_RULES`.
+    // Unit-tested in `event_buffer.rs`.
+    /// W7: a secret-bearing file write was followed by a network egress within
+    /// 30s. Critical, the canonical credential-exfiltration shape.
+    SecretWriteThenNetwork,
+    /// W7: a dependency manifest (package.json/Cargo.toml/requirements.txt/...)
+    /// was modified, then a network call ran within 60s. Warn, a poisoned-install
+    /// signal that is individually unremarkable but suspicious in sequence.
+    DependencyChangeThenNetwork,
+    /// W7: a file deletion was followed by a `git push --force` within 60s.
+    /// Critical: deleting then force-pushing can erase history and overwrite a
+    /// remote branch.
+    DeleteThenForcePush,
+    /// W7: three or more (non-build-artifact) file deletions occurred within
+    /// 20s. Critical: a destructive burst (ransomware-like or an accidental
+    /// recursive wipe). Build-artifact paths are excluded via
+    /// `crate::util_build_dirs::is_build_artifact_path`.
+    MassFileDeletion,
 }
 
 impl fmt::Display for RuleId {

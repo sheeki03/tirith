@@ -20,6 +20,8 @@ const MAX_EVENTS: usize = 100;
 const MAX_ESCALATION_EVENTS: usize = 20;
 /// Maximum hidden events retained per session.
 const MAX_HIDDEN_EVENTS: usize = 50;
+/// W7: maximum typed events retained per session for cross-event correlation.
+const MAX_TYPED_EVENTS: usize = 200;
 
 /// Per-session warning accumulator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,12 @@ pub struct SessionWarnings {
     /// earlier invocation started.
     #[serde(default)]
     pub cooldowns: std::collections::BTreeMap<String, String>,
+    /// W7: bounded ring of typed events for cross-event correlation. Recorded
+    /// AFTER each verdict is finalized (only for security-relevant signals), and
+    /// consumed by [`correlate_session`]. Off the hot path; capped to
+    /// [`MAX_TYPED_EVENTS`].
+    #[serde(default)]
+    pub typed_events: VecDeque<crate::event_buffer::TypedEvent>,
 }
 
 /// A single warning event within a session.
@@ -96,6 +104,7 @@ impl SessionWarnings {
             escalation_events: VecDeque::new(),
             hidden_events: VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
+            typed_events: VecDeque::new(),
         }
     }
 
@@ -368,6 +377,30 @@ pub fn record_escalation_event(session_id: &str, hits: &[crate::escalation::Esca
             session.escalation_events.pop_front();
         }
     });
+}
+
+/// W7: append a typed event to the session's correlation ring. Called AFTER a
+/// verdict is finalized, ONLY for security-relevant signals (never for a clean
+/// Allow with no findings). Best-effort and off the hot path; the ring is capped
+/// to [`MAX_TYPED_EVENTS`] (oldest dropped first).
+pub fn record_typed_event(session_id: &str, event: crate::event_buffer::TypedEvent) {
+    with_session_locked(session_id, move |session| {
+        session.typed_events.push_back(event);
+        while session.typed_events.len() > MAX_TYPED_EVENTS {
+            session.typed_events.pop_front();
+        }
+    });
+}
+
+/// W7: run cross-event correlation over the session's typed-event ring as of
+/// now. Loads the session (best-effort; empty on any I/O error) and delegates to
+/// the pure [`crate::event_buffer::correlate`]. Returns the correlation hits, if
+/// any. Never panics and never mutates session state.
+pub fn correlate_session(session_id: &str) -> Vec<crate::event_buffer::CorrelationHit> {
+    let session = load(session_id);
+    let events: Vec<crate::event_buffer::TypedEvent> =
+        session.typed_events.iter().cloned().collect();
+    crate::event_buffer::correlate(&events, &chrono::Utc::now().to_rfc3339())
 }
 
 /// Shared atomic lock-read-modify-write: open the session file, take an

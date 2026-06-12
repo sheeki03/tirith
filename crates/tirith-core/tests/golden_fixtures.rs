@@ -757,6 +757,11 @@ const ALL_RULE_IDS: &[&str] = &[
     // AI-config drift rules (M13 ch5)
     "ai_config_hidden_instruction_added",
     "ai_config_tool_use_escalation",
+    // Cross-event correlation rules (W7)
+    "secret_write_then_network",
+    "dependency_change_then_network",
+    "delete_then_force_push",
+    "mass_file_deletion",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -967,6 +972,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // not PATTERN_TABLE. Covered by unit tests in `rules/aifile.rs` + CLI tests.
     "ai_config_hidden_instruction_added",
     "ai_config_tool_use_escalation",
+    // W7: cross-event correlation rules fire only from `correlate_session` over a
+    // bounded per-session typed-event ring (`crate::event_buffer`), never from the
+    // `analyze` hot path. They match "A THEN B within a window" sequences, so no
+    // single fixture input can trigger them. Covered by unit tests in
+    // `event_buffer.rs`.
+    "secret_write_then_network",
+    "dependency_change_then_network",
+    "delete_then_force_push",
+    "mass_file_deletion",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1224,6 +1238,8 @@ rule_id_variant_registry! {
     PasteSourceMismatch,
     // AI-config drift rules (M13 ch5)
     AiConfigHiddenInstructionAdded, AiConfigToolUseEscalation,
+    // Cross-event correlation rules (W7)
+    SecretWriteThenNetwork, DependencyChangeThenNetwork, DeleteThenForcePush, MassFileDeletion,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

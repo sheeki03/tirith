@@ -23,6 +23,7 @@ pub mod ecosystem_scan;
 pub mod engine;
 pub mod env_guard;
 pub mod escalation;
+pub mod event_buffer;
 pub mod exec_provenance;
 pub mod extract;
 pub mod homoglyph;
