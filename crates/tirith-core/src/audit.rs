@@ -470,6 +470,12 @@ pub fn verify_audit_log(
         let this_hash = line_hash(line).unwrap_or_default();
 
         if let Some(prev) = prev {
+            if !chaining_started && i > 0 && report.legacy_prefix > 0 && hashes[i - 1] == prev {
+                // The immediately preceding unchained line is this chain's
+                // genesis (its root), not a legacy entry, so it does not count
+                // toward the legacy prefix.
+                report.legacy_prefix -= 1;
+            }
             chaining_started = true;
             report.chained_lines += 1;
             if i == 0 {
@@ -1389,7 +1395,9 @@ mod tests {
             "legacy prefix must not fail verification: {:?}",
             report.problems
         );
-        assert_eq!(report.legacy_prefix, 2);
+        // Two pre-chain lines, but the second is the genesis that the first
+        // chained entry points back to, so only the first counts as legacy.
+        assert_eq!(report.legacy_prefix, 1);
         assert_eq!(report.chained_lines, 2);
     }
 
