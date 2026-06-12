@@ -28,8 +28,8 @@ Browsers solved this years ago. Terminals still render Unicode, ANSI escapes, an
 **Tirith stands at the gate.** It intercepts commands, pasted content, and scanned files for homograph URLs, obfuscated payloads, credential exfiltration, malicious AI skills/configs, and known-bad packages/domains/IPs from a signed threat intelligence database before they execute.
 
 ```bash
+# Homebrew 6.0.0+ trusts just this formula via the fully-qualified name.
 brew install sheeki03/tap/tirith
-brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
 ```
 
 Then activate in your shell profile:
@@ -395,15 +395,20 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 **Homebrew:**
 
 ```bash
+# Direct install: the full name trusts just this formula (Homebrew 6.0.0+).
 brew install sheeki03/tap/tirith
-brew trust --formula sheeki03/tap/tirith   # Homebrew 5.1.15+ tap trust
+
+# Already tapped and installing/upgrading by the short name? Trust it first:
+brew trust --formula sheeki03/tap/tirith
+brew upgrade tirith
 ```
 
-Homebrew 5.1.15 and newer treat third-party taps as untrusted until you opt in
-(loading a tap evaluates its Ruby). `brew trust --formula sheeki03/tap/tirith`
-trusts just this formula; `brew trust sheeki03/tap` trusts the whole tap. Without
-it you'll see a "tap is not trusted" warning, and from Homebrew 5.2.0 / 6.0.0
-(whichever lands first) the trust step becomes required.
+Homebrew 6.0.0 (June 2026) requires third-party taps to be trusted before it
+loads their Ruby. A fully-qualified `brew install sheeki03/tap/tirith` trusts
+just this formula as part of the install, so the one-liner needs nothing extra.
+You only need `brew trust` if you install or upgrade by the short `tirith` name,
+or to silence the "tap is not trusted" warning that `brew update` prints for an
+untrusted tap. `brew trust sheeki03/tap` trusts the whole tap.
 
 ### Linux Packages
 

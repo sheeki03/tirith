@@ -1,5 +1,5 @@
 class Tirith < Formula
-  desc "Terminal security - catches homograph attacks, pipe-to-shell, ANSI injection"
+  desc "Terminal and AI security: injection, homograph, malicious packages, and more"
   homepage "https://github.com/sheeki03/tirith"
   license "AGPL-3.0-only"
   version "0.3.2"
