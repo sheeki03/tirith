@@ -80,20 +80,50 @@ refuses to self-modify a package-manager install and instead prints
 `crates/tirith/src/cli/selfupdate.rs`). Mentioning this up front avoids a likely
 reviewer objection.
 
-## Submission
+## Submission runbook (exact commands)
 
-1. Search open PRs at Homebrew/homebrew-core for "tirith" to avoid a duplicate.
-2. Fork Homebrew/homebrew-core.
-3. Add the formula at `Formula/t/tirith.rb` (the contents of
-   `packaging/homebrew-core/tirith.rb`, sha256 filled).
-4. Open a PR titled `tirith 0.3.2 (new formula)` with a one-paragraph description
-   and the self-updater note above.
-5. BrewTestBot builds and bottles the formula on each macOS version and Linux and
-   runs the audit and test. Address maintainer feedback. A clean new formula
-   typically merges in days to a couple of weeks.
+The actual submission is a PR on **github.com/Homebrew/homebrew-core** (a separate
+repo), NOT this one. PR #141 here is just the staging/record. The PR description is
+ready to paste from `packaging/homebrew-core/PR_BODY.md`.
 
-After merge, `brew install tirith` works globally and is trusted by default. The
-tap can stay for nightlies, but the short `tirith` name resolves to core.
+First search open PRs at Homebrew/homebrew-core for "tirith" to avoid a duplicate.
+Then, with v0.3.2 tagged, run (TIRITH is this checkout's path):
+
+```bash
+TIRITH="$(pwd)"   # run from the tirith checkout root
+
+# 1. Compute the sha256 and fill FILL_ON_RELEASE in packaging/homebrew-core/tirith.rb.
+curl -sSL -o /tmp/tirith-0.3.2.tgz \
+  https://github.com/sheeki03/tirith/archive/refs/tags/v0.3.2.tar.gz
+sha256sum /tmp/tirith-0.3.2.tgz   # paste into packaging/homebrew-core/tirith.rb
+
+# 2. Get the homebrew-core working copy and a branch.
+brew tap --force homebrew/core
+cd "$(brew --repo homebrew/core)"
+git fetch origin && git checkout -b tirith origin/HEAD
+mkdir -p Formula/t
+cp "$TIRITH/packaging/homebrew-core/tirith.rb" Formula/t/tirith.rb
+
+# 3. Local gate (all must pass before opening the PR).
+brew install --build-from-source tirith
+brew test tirith
+brew audit --strict --new tirith
+brew style tirith
+
+# 4. Commit and open the PR. gh offers to fork + push if you lack push access;
+#    accept it. The PR is opened ON Homebrew/homebrew-core under your fork.
+git add Formula/t/tirith.rb
+git commit -m "tirith 0.3.2 (new formula)"
+gh pr create --repo Homebrew/homebrew-core \
+  --title "tirith 0.3.2 (new formula)" \
+  --body-file "$TIRITH/packaging/homebrew-core/PR_BODY.md"
+```
+
+After opening, BrewTestBot builds and bottles the formula on each macOS version and
+Linux and runs the audit and test. Address maintainer feedback. A clean new formula
+typically merges in days to a couple of weeks. After merge, `brew install tirith`
+works globally and is trusted by default. The tap can stay for nightlies, but the
+short `tirith` name resolves to core.
 
 ## Links
 
