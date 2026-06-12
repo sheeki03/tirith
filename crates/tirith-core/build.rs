@@ -710,6 +710,7 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             r"(?i)\bDAN\s+mode\b",
             r"(?i)\bdo\s+anything\s+now\b",
             r"(?i)\bnew\s+instructions\s*:",
+            r"(?i)\bfrom\s+now\s+on\b",
         ],
         notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
                 The precise multi-word regex lives in `rules::prompt_injection`.",

@@ -22,9 +22,12 @@ const KNOWN_CONFIG_FILES: &[&str] = &[
     ".roorules",
     ".roomodes",
     ".aider.conf.yml",
+    ".aider.conf.yaml",
     ".aider.model.settings.yml",
     ".goosehints",
     "opencode.json",
+    "agent-memory.json",
+    "memories.json",
 ];
 
 /// Files that are only config when at repository root (component count == 1).
@@ -81,6 +84,8 @@ const KNOWN_CONFIG_DEEP_DIRS: &[(&[&str], &[&str])] = &[
     (&[".kiro", "steering"], &["md"]),
     (&[".kiro", "hooks"], &["py", "sh"]),
     (&[".github", "hooks"], &["json"]),
+    (&[".hermes"], &["md", "json", "yaml", "yml"]),
+    (&[".claude", "memory"], &["md", "json"]),
 ];
 
 /// Result of checking whether a path matches a known config file.
@@ -518,6 +523,16 @@ pub fn check(
         check_non_ascii(content, file_path, &mut findings);
     }
 
+    // Agent-memory / instruction-file CONTENT signals (long base64 blob, external
+    // URL). NARROW subset of the config surface (see `is_agent_memory_file`):
+    // config files that legitimately carry URLs (mcp.json, settings.json, ...)
+    // are excluded so they stay unaffected.
+    if let Some(path) = file_path {
+        if is_agent_memory_file(path) {
+            check_memory_content_signals(content, is_known, &mut findings);
+        }
+    }
+
     check_prompt_injection(content, is_known, &mut findings);
 
     if is_mcp {
@@ -820,6 +835,236 @@ fn is_mcp_config_file(path: &Path) -> bool {
     }
 
     false
+}
+
+/// Agent-memory / instruction-file basenames whose CONTENT carries free-form
+/// agent directives a poisoned write would target. Lowercased, matched against
+/// the path basename. Deliberately EXCLUDES `mcp.json` / `.mcp.json` and the
+/// IDE config files (settings.json, config.toml, devcontainer.json, ...): those
+/// legitimately embed external URLs, so URL/base64 content signals there would
+/// be pure false positives.
+const AGENT_MEMORY_BASENAMES: &[&str] = &[
+    "claude.md",
+    ".cursorrules",
+    ".clinerules",
+    ".windsurfrules",
+    "agents.md",
+    ".aider.conf.yml",
+    ".aider.conf.yaml",
+    "agent-memory.json",
+    "memories.json",
+];
+
+/// Directory-anchored agent-memory locations: every file directly or deeply
+/// under one of these (root-anchored) component paths is in the memory subset.
+/// `.hermes/*` and `.claude/memory/*` are dedicated agent-memory stores.
+const AGENT_MEMORY_DIRS: &[&[&str]] = &[&[".hermes"], &[".claude", "memory"]];
+
+/// `true` when `path` is an agent-memory / instruction file whose free-form
+/// CONTENT is worth scanning for smuggled payloads (long base64 blob, external
+/// URL). This is a NARROW subset of the known-config surface; non-memory config
+/// files (mcp.json, settings.json, ...) are excluded so their legitimate URLs
+/// do not false-positive.
+fn is_agent_memory_file(path: &Path) -> bool {
+    // Normalize to forward components, dropping any prefix/root so the check is
+    // the same for repo-relative and absolute paths. ParentDir/Prefix bail out.
+    let mut components: Vec<String> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir | Component::RootDir => continue,
+            Component::Prefix(_) | Component::ParentDir => return false,
+            Component::Normal(os) => match os.to_str() {
+                Some(s) => components.push(s.to_ascii_lowercase()),
+                None => return false,
+            },
+        }
+    }
+    if components.is_empty() {
+        return false;
+    }
+
+    let basename = &components[components.len() - 1];
+    if AGENT_MEMORY_BASENAMES.contains(&basename.as_str()) {
+        return true;
+    }
+
+    // Directory-anchored match: the path's leading components must equal one of
+    // the memory dirs (root-anchored, like KNOWN_CONFIG_DEEP_DIRS) and there
+    // must be at least one component (the file) beyond the dir prefix.
+    for dir in AGENT_MEMORY_DIRS {
+        if components.len() > dir.len()
+            && components[..dir.len()]
+                .iter()
+                .zip(dir.iter())
+                .all(|(a, b)| a == b)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Minimum length of a base64 run worth treating as an embedded payload (a short
+/// run, like a hash or an id, is not interesting). Mirrors
+/// `aifile::MIN_BASE64_BLOB_LEN`.
+const MIN_BASE64_BLOB_LEN: usize = 96;
+
+/// Whether `content` contains a long base64 run that actually decodes: the
+/// shape of an encoded payload smuggled into a memory file. Returns the matched
+/// run (ASCII-truncated) when found. Decode-checked port of
+/// `aifile::find_base64_blob` (private there; copied to avoid a cross-module
+/// dependency). Kept ASCII-only (no ellipsis char) so the evidence string never
+/// introduces non-ASCII bytes.
+fn find_base64_blob(content: &str) -> Option<String> {
+    let bytes = content.as_bytes();
+    let is_b64 =
+        |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_b64(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_b64(bytes[i]) {
+            i += 1;
+        }
+        // Tolerate trailing `=` padding.
+        let mut end = i;
+        while end < bytes.len() && bytes[end] == b'=' {
+            end += 1;
+        }
+        let run = &content[start..end];
+        if run.len() >= MIN_BASE64_BLOB_LEN {
+            use base64::Engine as _;
+            let decodes = base64::engine::general_purpose::STANDARD
+                .decode(run)
+                .is_ok()
+                || base64::engine::general_purpose::URL_SAFE
+                    .decode(run)
+                    .is_ok()
+                || base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(run)
+                    .is_ok()
+                || base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(run)
+                    .is_ok();
+            if decodes {
+                return Some(truncate_ascii(run, 64));
+            }
+        }
+        i = end.max(i);
+    }
+    None
+}
+
+/// Truncate `s` to at most `max` chars (char-boundary safe), appending `...`
+/// (ASCII) when truncation happened. Kept ASCII so evidence stays ASCII-only.
+fn truncate_ascii(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}...")
+}
+
+/// `true` for hosts that are loopback / unspecified (never an exfil sink), so an
+/// external-URL signal does not fire on a localhost reference.
+fn is_local_host(host: &str) -> bool {
+    let h = host.trim();
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = h.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback() || v4.is_unspecified();
+    }
+    if let Ok(v6) = h.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback() || v6.is_unspecified();
+    }
+    false
+}
+
+/// Find the first EXTERNAL http(s) URL host in `content`, skipping loopback /
+/// unspecified hosts. Returns the matched URL (ASCII-truncated) for evidence.
+/// Reuses `extract_host_from_url` for the host parse.
+fn find_external_http_url(content: &str) -> Option<String> {
+    // Scan for each `http://` / `https://` occurrence; the first with a non-local
+    // host wins. Bounded by a small set of URL-terminating characters so the
+    // captured span is just the URL, not the rest of the line.
+    let mut search_from = 0;
+    while search_from < content.len() {
+        let rest = &content[search_from..];
+        let rel = rest.find("http://").or_else(|| rest.find("https://"))?;
+        let abs = search_from + rel;
+        let tail = &content[abs..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | ')'))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        if let Some(host) = extract_host_from_url(url) {
+            if !host.is_empty() && !is_local_host(host) {
+                return Some(truncate_ascii(url, 80));
+            }
+        }
+        // Advance past this occurrence to avoid an infinite loop on a local URL.
+        search_from = abs + "http".len();
+    }
+    None
+}
+
+/// Scan an agent-memory / instruction file's CONTENT for smuggled-payload
+/// signals and emit `ConfigSuspiciousIndicator` (warn-level weak indicator,
+/// consistent with the other config indicators). Runs ONLY for the agent-memory
+/// subset (see `is_agent_memory_file`), so config files that legitimately carry
+/// URLs (mcp.json, settings.json, ...) are unaffected. At most one finding per
+/// signal kind.
+fn check_memory_content_signals(content: &str, is_known: bool, findings: &mut Vec<Finding>) {
+    let severity = if is_known {
+        Severity::Medium
+    } else {
+        Severity::Low
+    };
+
+    if let Some(blob) = find_base64_blob(content) {
+        findings.push(Finding {
+            rule_id: RuleId::ConfigSuspiciousIndicator,
+            severity,
+            title: "Encoded payload in agent-memory file".to_string(),
+            description: "This agent-memory / instruction file contains a long base64 run that \
+                          decodes to binary. An instruction file is expected to hold readable \
+                          directives; an embedded encoded blob is the shape of a payload \
+                          smuggled past human review. Confirm the blob is intentional."
+                .to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!("base64 blob: {blob}"),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    if let Some(url) = find_external_http_url(content) {
+        findings.push(Finding {
+            rule_id: RuleId::ConfigSuspiciousIndicator,
+            severity,
+            title: "External URL in agent-memory file".to_string(),
+            description: "This agent-memory / instruction file references an external http(s) \
+                          URL. Agent-memory files steer an agent's behavior; an external link \
+                          here can redirect the agent to fetch instructions or exfiltrate data. \
+                          Confirm the destination is trusted."
+                .to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!("external URL: {url}"),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
 }
 
 /// Detect invisible Unicode characters with elevated severity for config files.
@@ -1909,6 +2154,135 @@ mod tests {
         assert_eq!(
             extract_host_from_url("http://user:pass@10.0.0.1:8080/"),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn test_agent_memory_globs_classified_as_config() {
+        // New globs: `.aider.conf.yaml`, `agent-memory.json`, `memories.json`,
+        // `.hermes/*`, `.claude/memory/*`.
+        assert!(is_known_config_file(Path::new(".aider.conf.yaml")));
+        assert!(is_known_config_file(Path::new("agent-memory.json")));
+        assert!(is_known_config_file(Path::new("memories.json")));
+        assert!(is_known_config_file(Path::new(".hermes/notes.md")));
+        assert!(is_known_config_file(Path::new(".hermes/state.json")));
+        assert!(is_known_config_file(Path::new(".hermes/config.yaml")));
+        assert!(is_known_config_file(Path::new(".claude/memory/prefs.md")));
+        assert!(is_known_config_file(Path::new(".claude/memory/store.json")));
+        // Extension gate still applies.
+        assert!(!is_known_config_file(Path::new(".hermes/notes.txt")));
+        assert!(!is_known_config_file(Path::new(".claude/memory/data.txt")));
+    }
+
+    #[test]
+    fn test_is_agent_memory_file_subset() {
+        // In-subset memory/instruction files.
+        assert!(is_agent_memory_file(Path::new("CLAUDE.md")));
+        assert!(is_agent_memory_file(Path::new(".cursorrules")));
+        assert!(is_agent_memory_file(Path::new(".clinerules")));
+        assert!(is_agent_memory_file(Path::new(".windsurfrules")));
+        assert!(is_agent_memory_file(Path::new("AGENTS.md")));
+        assert!(is_agent_memory_file(Path::new(".aider.conf.yml")));
+        assert!(is_agent_memory_file(Path::new(".aider.conf.yaml")));
+        assert!(is_agent_memory_file(Path::new("agent-memory.json")));
+        assert!(is_agent_memory_file(Path::new("memories.json")));
+        assert!(is_agent_memory_file(Path::new(".hermes/notes.md")));
+        assert!(is_agent_memory_file(Path::new(".claude/memory/prefs.md")));
+        // NOT in subset: MCP / IDE config files that legitimately carry URLs.
+        assert!(!is_agent_memory_file(Path::new("mcp.json")));
+        assert!(!is_agent_memory_file(Path::new(".mcp.json")));
+        assert!(!is_agent_memory_file(Path::new(".vscode/mcp.json")));
+        assert!(!is_agent_memory_file(Path::new(".claude/settings.json")));
+        assert!(!is_agent_memory_file(Path::new(".codex/config.toml")));
+        assert!(!is_agent_memory_file(Path::new("README.md")));
+    }
+
+    #[test]
+    fn test_memory_content_base64_blob_warns() {
+        // A long base64 run that decodes -> ConfigSuspiciousIndicator, NOT injection.
+        let blob = "dGhpcyBpcyBhIHNtdWdnbGVkIHBheWxvYWQgaGlkZGVuIGluc2lkZSBhbiBhZ2VudCBtZW1vcnkgZmlsZSBhcyBiYXNlNjQgY29udGVudCEh";
+        let content = format!("{{\"note\": \"{blob}\"}}");
+        let findings = check(
+            &content,
+            Some(Path::new("agent-memory.json")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ConfigSuspiciousIndicator),
+            "long decode-checked base64 blob must warn: {findings:?}",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ConfigInjection),
+            "base64 blob must not be classified as injection: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_memory_content_external_url_warns() {
+        let content = r#"{"source": "https://evil.example.com/payload"}"#;
+        let findings = check(content, Some(Path::new("memories.json")), None, false, &[]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ConfigSuspiciousIndicator),
+            "external http(s) URL in a memory file must warn: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_memory_content_localhost_url_clean() {
+        // Loopback / unspecified hosts are not exfil sinks -> no content signal.
+        for url in [
+            "http://localhost:8080/x",
+            "http://127.0.0.1/x",
+            "https://[::1]/x",
+            "http://0.0.0.0/x",
+        ] {
+            let content = format!("{{\"source\": \"{url}\"}}");
+            let findings = check(&content, Some(Path::new("memories.json")), None, false, &[]);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::ConfigSuspiciousIndicator),
+                "localhost URL {url} must not warn: {findings:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_content_signals_not_run_for_mcp_json() {
+        // The content scan must NOT touch mcp.json: a base64 blob / external URL
+        // value there is legitimate and must not add a ConfigSuspiciousIndicator.
+        let blob = "dGhpcyBpcyBhIHNtdWdnbGVkIHBheWxvYWQgaGlkZGVuIGluc2lkZSBhbiBhZ2VudCBtZW1vcnkgZmlsZSBhcyBiYXNlNjQgY29udGVudCEh";
+        let content = format!(r#"{{"mcpServers":{{"s":{{"command":"node","args":["{blob}"]}}}}}}"#);
+        let findings = check(&content, Some(Path::new("mcp.json")), None, false, &[]);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ConfigSuspiciousIndicator),
+            "mcp.json must not get the memory content signal: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn test_memory_content_clean_no_signal() {
+        let content = "Remember: the user prefers tabs and concise replies.";
+        let findings = check(
+            content,
+            Some(Path::new(".claude/memory/prefs.md")),
+            None,
+            false,
+            &[],
+        );
+        assert!(
+            findings.is_empty(),
+            "clean memory file must produce no findings: {findings:?}",
         );
     }
 
