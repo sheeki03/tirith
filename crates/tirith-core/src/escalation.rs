@@ -577,6 +577,7 @@ mod tests {
             events: std::collections::VecDeque::new(),
             escalation_events: std::collections::VecDeque::new(),
             hidden_events: std::collections::VecDeque::new(),
+            cooldowns: std::collections::BTreeMap::new(),
         }
     }
 

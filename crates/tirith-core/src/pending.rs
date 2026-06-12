@@ -263,6 +263,9 @@ pub fn list_unresolved() -> Vec<PendingDecision> {
 }
 
 #[cfg(test)]
+// The tests wrap their body in an immediately-invoked closure so the env-var
+// restore below always runs; that trips these two lints harmlessly here.
+#[allow(clippy::redundant_closure_call, clippy::let_unit_value)]
 mod tests {
     use super::*;
 

@@ -43,6 +43,11 @@ pub struct SessionWarnings {
     /// Findings hidden by paranoia filtering, for `tirith warnings --hidden`.
     #[serde(default)]
     pub hidden_events: VecDeque<HiddenEvent>,
+    /// W6 — per-rule suppression cooldowns: `rule_key -> expires_at` (RFC3339).
+    /// Session-backed so one-shot CLI / hook processes honor a cooldown that an
+    /// earlier invocation started.
+    #[serde(default)]
+    pub cooldowns: std::collections::BTreeMap<String, String>,
 }
 
 /// A single warning event within a session.
@@ -90,6 +95,7 @@ impl SessionWarnings {
             events: VecDeque::new(),
             escalation_events: VecDeque::new(),
             hidden_events: VecDeque::new(),
+            cooldowns: std::collections::BTreeMap::new(),
         }
     }
 
@@ -201,6 +207,42 @@ pub fn load(session_id: &str) -> SessionWarnings {
         ));
         SessionWarnings::new(session_id)
     })
+}
+
+/// W6 — per-rule suppression cooldown, session-backed so one-shot CLI / hook
+/// processes share the window. Returns `true` if `rule_id` (optionally scoped to
+/// `target`) is CURRENTLY within its cooldown, meaning the caller should collapse
+/// the finding into a rollup rather than surfacing it again; otherwise it starts
+/// a fresh cooldown and returns `false`. A suppressed hit is never dropped
+/// silently: it emits a compact `finding_suppressed` audit rollup.
+pub fn suppress_check(
+    session_id: &str,
+    rule_id: &str,
+    target: Option<&str>,
+    cooldown_secs: u64,
+) -> bool {
+    let key = crate::suppression::cooldown_key(rule_id, target);
+    let now = chrono::Utc::now().to_rfc3339();
+    let expires =
+        (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs as i64)).to_rfc3339();
+    let mut suppressed = false;
+    with_session_locked(session_id, |sw| {
+        if crate::suppression::is_suppressed(&mut sw.cooldowns, &key, &now) {
+            suppressed = true;
+        } else {
+            crate::suppression::record(&mut sw.cooldowns, &key, expires.clone());
+        }
+    });
+    if suppressed {
+        crate::audit::log_hook_event(
+            "suppression",
+            "cooldown",
+            "finding_suppressed",
+            None,
+            Some(&format!("rule_id={rule_id}")),
+        );
+    }
+    suppressed
 }
 
 /// Record warning findings (thin wrapper around `record_outcome`, no hidden
@@ -810,5 +852,32 @@ mod tests {
         assert!(domains.contains(&"evil.example.com".to_string()));
         assert!(domains.contains(&"github.com".to_string()));
         assert_eq!(domains.len(), 2);
+    }
+
+    #[test]
+    fn suppress_check_is_session_backed() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+        let sid = "test-suppress-1";
+        // First sighting starts the cooldown and is NOT suppressed.
+        assert!(!suppress_check(sid, "curl_pipe_shell", None, 3600));
+        // A separate call (a fresh one-shot process behaves the same) reads the
+        // persisted cooldown and reports suppressed.
+        assert!(suppress_check(sid, "curl_pipe_shell", None, 3600));
+        // A different rule is independent.
+        assert!(!suppress_check(sid, "other_rule", None, 3600));
+        // The cooldown is persisted on the session record.
+        let sw = load(sid);
+        assert!(sw.cooldowns.contains_key("curl_pipe_shell"));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
     }
 }

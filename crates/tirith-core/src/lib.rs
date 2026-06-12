@@ -69,6 +69,7 @@ pub mod session_warnings;
 pub mod ssrf_guard;
 pub mod style;
 pub mod sudo_session;
+pub mod suppression;
 pub mod taint;
 pub mod text_confusables;
 pub mod threatdb;
