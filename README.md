@@ -398,9 +398,10 @@ Detects content invisible to humans but readable by AI in HTML, Markdown, and PD
 # Direct install: the full name trusts just this formula (Homebrew 6.0.0+).
 brew install sheeki03/tap/tirith
 
-# Already tapped and installing/upgrading by the short name? Trust it first:
+# Already tapped, using the short name? Trust it first, then install or upgrade:
 brew trust --formula sheeki03/tap/tirith
-brew upgrade tirith
+brew install tirith     # first install
+brew upgrade tirith     # later updates
 ```
 
 Homebrew 6.0.0 (June 2026) requires third-party taps to be trusted before it
