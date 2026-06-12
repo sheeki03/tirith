@@ -1,8 +1,8 @@
 <!--
 This is the PR description for the new-formula PR on Homebrew/homebrew-core
-(github.com/Homebrew/homebrew-core, NOT this repo). It mirrors Homebrew's own PR
-template verbatim; the only addition is the filled AI-disclosure note, which is
-required because this work was AI-assisted. Tick the build/test/audit boxes only
+(github.com/Homebrew/homebrew-core, NOT this repo). It includes Homebrew's PR
+template verbatim, plus a short project/self-updater note above it and the filled
+AI-disclosure note (required because this work was AI-assisted). Tick the build/test/audit boxes only
 after the local gate passes on the finalized v0.3.2 formula. See
 docs/homebrew-core.md for the runbook. Leaving `<formula>` literal matches what
 accepted new-formula PRs do.
