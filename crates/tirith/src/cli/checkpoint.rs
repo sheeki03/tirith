@@ -105,7 +105,18 @@ pub fn restore_checkpoint(id: &str, json: bool) -> i32 {
                     "Restored {restored_n} files. Database, cloud, and API side effects are not covered by checkpoint restore."
                 );
             }
-            0
+            // A partial/failed restore (any blob missing, corrupt, or a copy
+            // error) must NOT report success: scripts gate on the exit code, and
+            // returning 0 here would make a half-restored state look complete. The
+            // full per-bucket report is still printed above; we only flip the exit
+            // status. 1 == restore completed with failures (distinct from 2, an
+            // operational error that aborted the restore entirely).
+            if !report.missing.is_empty() || !report.corrupt.is_empty() || !report.errors.is_empty()
+            {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             eprintln!("tirith checkpoint restore: {e}");
@@ -659,4 +670,90 @@ fn emit_watch_json(
             "{}".to_string()
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use tirith_core::checkpoint::{self, ManifestEntry};
+
+    // Local env lock (tirith_core::TEST_ENV_LOCK is pub(crate), unreachable here).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// F2: a partial/failed restore (any blob missing/corrupt, or a copy error)
+    /// must return a NON-ZERO exit code so scripts don't mistake a half-restored
+    /// state for success. A fully clean restore returns 0.
+    #[cfg(unix)]
+    #[test]
+    fn restore_checkpoint_nonzero_on_partial_failure() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let state_dir = tmpdir.path().join("state");
+
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized via ENV_LOCK. state_dir() honors XDG_STATE_HOME on all
+        // unix (it is resolved manually, not via etcetera), so this is portable.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "a.txt";
+        let run = || -> Result<(i32, i32), String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+            std::fs::write(name, "alpha").map_err(|e| format!("write: {e}"))?;
+            let meta = checkpoint::create(&[name], Some("rm -rf project"))?;
+
+            // Clean restore first: nothing tampered, must exit 0.
+            let clean_code = super::restore_checkpoint(&meta.id, true);
+
+            // Now delete the backup blob so the next restore buckets into
+            // `missing`, which must flip the exit code to non-zero.
+            let cp_dir = checkpoint::checkpoints_dir().join(&meta.id);
+            let manifest_str = std::fs::read_to_string(cp_dir.join("manifest.json"))
+                .map_err(|e| format!("read manifest: {e}"))?;
+            let manifest: Vec<ManifestEntry> =
+                serde_json::from_str(&manifest_str).map_err(|e| format!("parse: {e}"))?;
+            let sha = manifest
+                .iter()
+                .find(|m| m.original_path == name)
+                .map(|m| m.sha256.clone())
+                .ok_or("no manifest entry")?;
+            std::fs::remove_file(cp_dir.join("files").join(&sha))
+                .map_err(|e| format!("rm blob: {e}"))?;
+
+            let partial_code = super::restore_checkpoint(&meta.id, true);
+            Ok((clean_code, partial_code))
+        };
+
+        let result = run();
+
+        // Restore cwd + env before assertions so cleanup runs even on failure.
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let (clean_code, partial_code) = result.expect("restore flow should run");
+        assert_eq!(clean_code, 0, "a fully clean restore must exit 0");
+        assert_eq!(
+            partial_code, 1,
+            "a restore with a missing backup blob must exit non-zero"
+        );
+    }
 }

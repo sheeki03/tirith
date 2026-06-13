@@ -233,6 +233,42 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
     Ok(entries)
 }
 
+/// Validate that a checkpoint id is an INTERNAL, single-component basename (the
+/// UUID `create()` assigns), not an attacker-controlled path. The id comes
+/// straight from the CLI, and `checkpoints_dir().join(id)` would otherwise let an
+/// absolute or traversal-bearing id select state outside the checkpoints store
+/// (e.g. `--id ../../evil` or `--id /tmp/evil`), whose attacker-planted manifest
+/// could then restore a blob to an arbitrary absolute path. We require the id to
+/// be a single `Normal` path component with no separators, no `..`/`.`, not
+/// absolute, and non-empty. Restricting it to one component is what makes the
+/// later containment check exact: a one-component join cannot escape the base.
+fn validate_checkpoint_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("checkpoint id is empty".to_string());
+    }
+    // Reject any separator outright (covers `/`, `\\`, and platform mixes) before
+    // component analysis, so a backslash on unix can't sneak through as a
+    // "normal" char in a single component.
+    if id.contains('/') || id.contains('\\') {
+        return Err(format!(
+            "checkpoint id must not contain a path separator: {id}"
+        ));
+    }
+    let p = Path::new(id);
+    if p.is_absolute() {
+        return Err(format!("checkpoint id must not be absolute: {id}"));
+    }
+    let mut comps = p.components();
+    match (comps.next(), comps.next()) {
+        // Exactly one component, and it must be a plain name (not `.`, `..`,
+        // a root, or a Windows prefix like `C:`).
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(format!(
+            "checkpoint id must be a single path component (no '..', '.', or separators): {id}"
+        )),
+    }
+}
+
 /// Validate that a restore path does not contain `..` traversal components.
 ///
 /// Absolute paths are ALLOWED: `create()` records `original_path` verbatim, and
@@ -289,6 +325,33 @@ fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Copy `src` over `dst` WITHOUT following a symlink at the destination's final
+/// component. On unix the destination is opened with `O_NOFOLLOW` (plus
+/// create/truncate), so a symlink planted at `dst` between the caller's pre-check
+/// and here is refused by the open itself (closing the TOCTOU window that plain
+/// `fs::copy`, which follows links, would leave open). On non-unix we fall back to
+/// `fs::copy` and rely on the caller's pre-write symlink check.
+fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dst)?;
+        let mut input = fs::File::open(src)?;
+        std::io::copy(&mut input, &mut out)?;
+        out.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::copy(src, dst).map(|_| ())
+    }
+}
+
 /// Validate that a SHA-256 filename is exactly 64 lowercase hex characters.
 fn validate_sha256_filename(sha: &str) -> Result<(), String> {
     if sha.len() != 64
@@ -326,7 +389,22 @@ pub struct RestoreReport {
 /// `attempted` counts the file (non-dir) entries processed.
 pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     require_pro()?;
-    let cp_dir = checkpoints_dir().join(checkpoint_id);
+    // The id is an UNCONSTRAINED CLI argument; validate it is an internal
+    // single-component basename before joining it onto the store path. Otherwise
+    // an absolute or `..`-bearing id could select an attacker-controlled
+    // checkpoint directory whose manifest restores a blob to an arbitrary path.
+    validate_checkpoint_id(checkpoint_id)?;
+    let base_dir = checkpoints_dir();
+    let cp_dir = base_dir.join(checkpoint_id);
+    // Defense in depth: even with a validated single-component id, assert the
+    // resolved directory is contained under the checkpoints store before trusting
+    // its manifest. (id-validated -> cp_dir contained -> no-follow destination
+    // write are the three coherent restore protections.)
+    if cp_dir.parent() != Some(base_dir.as_path()) {
+        return Err(format!(
+            "checkpoint id resolves outside the checkpoints store: {checkpoint_id}"
+        ));
+    }
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
@@ -418,7 +496,18 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             }
         }
 
-        match fs::copy(&src, dst) {
+        // F5 (TOCTOU): the symlink pre-check above ran BEFORE `create_dir_all`, so
+        // an attacker could have repointed `dst` (or swapped in a symlink) in the
+        // window between. Re-validate the parent chain immediately before the
+        // write, AND perform the write through a no-follow open on unix so a
+        // symlink planted at the final component is refused atomically by the open
+        // itself (`fs::copy` would instead follow it and write through). The
+        // pre-check still runs for an early, cheap rejection and to cover non-unix.
+        if let Err(e) = reject_symlinked_restore_dest(dst) {
+            report.errors.push((entry.original_path.clone(), e));
+            continue;
+        }
+        match copy_no_follow(&src, dst) {
             Ok(_) => report.restored.push(entry.original_path.clone()),
             Err(e) => report
                 .errors
@@ -1613,6 +1702,128 @@ mod tests {
             state.path_dirs_added,
             vec!["/opt/evil/bin".to_string()],
             "only the newly-added PATH dir is reported"
+        );
+    }
+
+    #[test]
+    fn test_validate_checkpoint_id_rejects_traversal_and_absolute() {
+        // F10: the id is an unconstrained CLI argument joined onto the store path,
+        // so a traversal/absolute id could select attacker-controlled state. Only
+        // a single-component basename (the UUID create() assigns) is accepted.
+        assert!(validate_checkpoint_id("").is_err(), "empty id");
+        assert!(
+            validate_checkpoint_id("../../etc").is_err(),
+            "parent-dir traversal must be rejected"
+        );
+        assert!(
+            validate_checkpoint_id("..").is_err(),
+            "bare .. must be rejected"
+        );
+        assert!(
+            validate_checkpoint_id("a/b").is_err(),
+            "a path separator must be rejected"
+        );
+        assert!(
+            validate_checkpoint_id("a\\b").is_err(),
+            "a backslash separator must be rejected"
+        );
+        assert!(
+            validate_checkpoint_id("/tmp/evil").is_err(),
+            "an absolute id must be rejected"
+        );
+        assert!(
+            validate_checkpoint_id(".").is_err(),
+            "current-dir must be rejected"
+        );
+        // A legitimate UUID-style basename is accepted.
+        let uuid = uuid::Uuid::new_v4().to_string();
+        assert!(
+            validate_checkpoint_id(&uuid).is_ok(),
+            "a UUID basename must be accepted"
+        );
+        assert!(
+            validate_checkpoint_id("1234-5678").is_ok(),
+            "a plain single-component name must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_restore_reported_rejects_traversal_id() {
+        // F10 end-to-end: `restore_reported` must reject a traversal/absolute id
+        // up front (before reading any manifest), so an attacker cannot point the
+        // restore at a checkpoint directory outside the store.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmpdir = tempfile::tempdir().unwrap();
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+
+        let traversal = restore_reported("../../../../etc");
+        let absolute = restore_reported("/tmp/evil");
+
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+
+        assert!(
+            traversal.is_err(),
+            "a traversal id must be rejected by restore_reported"
+        );
+        assert!(
+            absolute.is_err(),
+            "an absolute id must be rejected by restore_reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_no_follow_refuses_symlinked_destination() {
+        // F5: the destination write must NOT follow a symlink at the final
+        // component (closing the TOCTOU window that plain `fs::copy` would leave
+        // open). `copy_no_follow` opens with O_NOFOLLOW, so a symlinked dst is
+        // refused and the link target outside the tree is left untouched.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src.txt");
+        fs::write(&src, "restored bytes").unwrap();
+
+        let outside = tmpdir.path().join("outside_secret.txt");
+        fs::write(&outside, "SENTINEL DO NOT OVERWRITE").unwrap();
+
+        // dst is a symlink pointing at the outside sentinel.
+        let dst = tmpdir.path().join("dst.txt");
+        std::os::unix::fs::symlink(&outside, &dst).unwrap();
+
+        let result = copy_no_follow(&src, &dst);
+        assert!(
+            result.is_err(),
+            "copy_no_follow must refuse to write through a symlinked destination"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).ok().as_deref(),
+            Some("SENTINEL DO NOT OVERWRITE"),
+            "the symlink target outside the tree must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_no_follow_writes_regular_destination() {
+        // The happy path of the no-follow write: a regular (or absent) destination
+        // is created/overwritten with the source bytes.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src.txt");
+        fs::write(&src, "hello no-follow").unwrap();
+        let dst = tmpdir.path().join("dst.txt");
+
+        copy_no_follow(&src, &dst).expect("copy to a regular destination must succeed");
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "hello no-follow",
+            "the destination must contain the source bytes"
         );
     }
 }

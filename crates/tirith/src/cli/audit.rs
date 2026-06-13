@@ -200,6 +200,24 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
         return 2;
     };
     if !path.exists() {
+        // When the caller anchors verification with --expected-head, a missing
+        // log is a FAILURE, not a vacuous pass: the operator asserted a specific
+        // tail hash that an absent log cannot satisfy. Reporting success here
+        // would let log deletion silently defeat the anchor.
+        if expected_head.is_some() {
+            if json {
+                println!(
+                    r#"{{"ok":false,"total_lines":0,"problems":["expected-head supplied but no audit log at {}"]}}"#,
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "tirith audit verify: FAILED — expected-head supplied but no audit log at {}",
+                    path.display()
+                );
+            }
+            return 1;
+        }
         if json {
             println!(r#"{{"ok":true,"total_lines":0,"note":"no audit log yet"}}"#);
         } else {
@@ -334,4 +352,64 @@ pub fn report(format: &str, since: Option<&str>, entry_type: &str) -> i32 {
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    // Local env lock: `tirith_core::TEST_ENV_LOCK` is pub(crate) and unreachable
+    // here, so this module serializes its own env mutation. (tirith bin tests run
+    // as a separate process from tirith-core lib tests, so the two locks need not
+    // coordinate.)
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// F8: `tirith audit verify --expected-head <hash>` must FAIL (non-zero) when
+    /// the log is missing — an asserted tail hash cannot be satisfied by an absent
+    /// log, so reporting success would let log deletion silently defeat the anchor.
+    /// A plain `verify` (no anchor) on a missing log still succeeds (0).
+    #[cfg(unix)]
+    #[test]
+    fn verify_missing_log_with_expected_head_fails() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty_home");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg_data = std::env::var("XDG_DATA_HOME").ok();
+        // Point BOTH the XDG data dir (Linux) and HOME (macOS, via etcetera's
+        // Apple strategy) at a fresh empty dir, so `audit_log_path()` resolves to a
+        // file that does not exist on either platform.
+        // SAFETY: serialized via ENV_LOCK above.
+        unsafe {
+            std::env::set_var("HOME", &empty);
+            std::env::set_var("XDG_DATA_HOME", &empty);
+        }
+
+        let with_anchor = super::verify(Some("deadbeefcafe"), true);
+        let without_anchor = super::verify(None, true);
+
+        // SAFETY: serialized via ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        assert_eq!(
+            with_anchor, 1,
+            "verify --expected-head on a missing log must return non-zero"
+        );
+        assert_eq!(
+            without_anchor, 0,
+            "verify with no anchor on a missing log stays a vacuous success"
+        );
+    }
 }

@@ -424,20 +424,21 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
     let hp = head_path(log_path);
     let s = serde_json::to_string(receipt)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut tmp_os = hp.as_os_str().to_owned();
-    tmp_os.push(".tmp");
-    let tmp = PathBuf::from(tmp_os);
+
+    // The temp file is created fresh each call and renamed into place immediately.
+    // Open it with O_NOFOLLOW|O_EXCL on unix (matching the audit log's symlink
+    // hardening) so a planted symlink or pre-existing file at the temp path is
+    // NOT followed or clobbered: O_EXCL fails if the path already exists, and
+    // O_NOFOLLOW fails if the final component is a symlink. On an O_EXCL
+    // collision (a name already squatted), randomize the suffix and retry a few
+    // times before giving up. On non-unix we fall back to plain create+truncate.
+    let (tmp, mut f) = open_head_tmp(&hp)?;
 
     // Write + fsync the temp file so its bytes are durable before the rename.
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(s.as_bytes())?;
-        f.sync_all()?;
-    }
+    f.write_all(s.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+
     // Atomic rename into place, then fsync the directory so the rename itself is
     // durable (a rename is a directory metadata change).
     fs::rename(&tmp, &hp)?;
@@ -447,6 +448,59 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
         }
     }
     Ok(())
+}
+
+/// Open the head-receipt temp file for [`write_head`], hardened against a planted
+/// symlink/file at the temp path. Returns the chosen temp path and its open
+/// handle. On unix uses `O_NOFOLLOW|O_EXCL` and, on an `AlreadyExists` collision,
+/// retries with a randomized suffix so a squatted temp name cannot wedge the
+/// writer permanently.
+fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
+    #[cfg(unix)]
+    {
+        // First the stable `<head>.tmp` name (the common, uncontended case), then
+        // randomized fallbacks if that exact path is squatted.
+        for attempt in 0..8u32 {
+            let mut tmp_os = hp.as_os_str().to_owned();
+            if attempt == 0 {
+                tmp_os.push(".tmp");
+            } else {
+                // Cheap, non-cryptographic uniqueness: pid + nanos + attempt. The
+                // O_EXCL open is what actually guarantees we created the file; this
+                // only needs to avoid colliding with the squatted name.
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                tmp_os.push(format!(".tmp.{}.{}.{}", std::process::id(), nonce, attempt));
+            }
+            let tmp = PathBuf::from(tmp_os);
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+            match opts.open(&tmp) {
+                Ok(f) => return Ok((tmp, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "head temp path is squatted; refusing to write head receipt",
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut tmp_os = hp.as_os_str().to_owned();
+        tmp_os.push(".tmp");
+        let tmp = PathBuf::from(tmp_os);
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        Ok((tmp, f))
+    }
 }
 
 /// Optional ed25519 signing secret key (32 raw bytes). Signing is OPT-IN: it
@@ -561,7 +615,13 @@ pub fn verify_audit_log(
         let prev = val.get("prev_hash").and_then(|v| v.as_str());
         let this_hash = line_hash(line).unwrap_or_default();
 
+        // `is_chained` tracks whether THIS entry participates in the hash chain
+        // (carries `prev_hash`). The signature handling below runs for EVERY
+        // entry that carries a `sig`, chained or not, so the genesis/first signed
+        // entry (which has no `prev_hash`) is authenticated and counted too.
+        let mut is_chained = false;
         if let Some(prev) = prev {
+            is_chained = true;
             if !chaining_started && i > 0 && report.legacy_prefix > 0 && hashes[i - 1] == prev {
                 // The immediately preceding unchained line is this chain's
                 // genesis (its root), not a legacy entry, so it does not count
@@ -581,43 +641,6 @@ pub fn verify_audit_log(
                     .problems
                     .push(format!("line {}: chain break (prev_hash mismatch)", i + 1));
             }
-            let sig_present = val.get("sig").and_then(|v| v.as_str());
-            if sig_present.is_some() {
-                report.signed_lines += 1;
-            } else if report.signing_expected {
-                // This log is signed (per the head receipt OR a still-signed line
-                // observed in the pre-scan), but this chained entry has no `sig`.
-                // Because `sig` is excluded from the chain hash, stripping it
-                // leaves the chain intact and is otherwise invisible, so flag it
-                // as a signature downgrade.
-                report.ok = false;
-                report.problems.push(format!(
-                    "line {}: missing signature on a signed log (possible signature downgrade)",
-                    i + 1
-                ));
-            }
-            if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
-                let mut unsigned = val.clone();
-                if let Some(o) = unsigned.as_object_mut() {
-                    o.remove("sig");
-                }
-                let canon = canonical_json_string(&unsigned);
-                let verified = base64::engine::general_purpose::STANDARD
-                    .decode(sig_b64)
-                    .ok()
-                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
-                    .map(|sig| {
-                        use ed25519_dalek::Verifier;
-                        vk.verify(canon.as_bytes(), &sig).is_ok()
-                    })
-                    .unwrap_or(false);
-                if !verified {
-                    report.ok = false;
-                    report
-                        .problems
-                        .push(format!("line {}: signature verification failed", i + 1));
-                }
-            }
         } else if !chaining_started {
             report.legacy_prefix += 1;
         } else {
@@ -626,6 +649,50 @@ pub fn verify_audit_log(
                 "line {}: missing prev_hash after the chain started",
                 i + 1
             ));
+        }
+
+        // Signature handling, run for EVERY entry independent of `prev_hash`. The
+        // genesis entry (no `prev_hash`) and every chained entry are each counted
+        // in `signed_lines` and ed25519-verified when a public key is configured.
+        // Verifying only inside the chained branch (the prior bug) left the first
+        // signed entry unauthenticated and undercounted.
+        let sig_present = val.get("sig").and_then(|v| v.as_str());
+        if sig_present.is_some() {
+            report.signed_lines += 1;
+        } else if report.signing_expected && is_chained {
+            // This log is signed (per the head receipt OR a still-signed line
+            // observed in the pre-scan), but this chained entry has no `sig`.
+            // Because `sig` is excluded from the chain hash, stripping it
+            // leaves the chain intact and is otherwise invisible, so flag it
+            // as a signature downgrade. A legitimately unsigned legacy/unchained
+            // line (no `prev_hash`) is NOT a downgrade, so it is exempt.
+            report.ok = false;
+            report.problems.push(format!(
+                "line {}: missing signature on a signed log (possible signature downgrade)",
+                i + 1
+            ));
+        }
+        if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
+            let mut unsigned = val.clone();
+            if let Some(o) = unsigned.as_object_mut() {
+                o.remove("sig");
+            }
+            let canon = canonical_json_string(&unsigned);
+            let verified = base64::engine::general_purpose::STANDARD
+                .decode(sig_b64)
+                .ok()
+                .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                .map(|sig| {
+                    use ed25519_dalek::Verifier;
+                    vk.verify(canon.as_bytes(), &sig).is_ok()
+                })
+                .unwrap_or(false);
+            if !verified {
+                report.ok = false;
+                report
+                    .problems
+                    .push(format!("line {}: signature verification failed", i + 1));
+            }
         }
         hashes.push(this_hash);
     }
@@ -661,7 +728,25 @@ pub fn verify_audit_log(
             }
         }
         None => {
-            report.head_status = "no head receipt (truncation cannot be detected)".to_string();
+            // A missing `.head` sidecar on a CHAINED log must fail closed: an
+            // attacker who deletes the sidecar of an existing chained log would
+            // otherwise pass verification, defeating truncation detection (the
+            // chain alone proves internal consistency but not that the tail is
+            // intact). The operator can still verify by supplying `--expected-head`
+            // (an explicit out-of-band anchor, validated just below); when present
+            // it is the trusted tail, so we stay tolerant here and let that check
+            // decide. A purely legacy/unchained log (no chained entries) has no
+            // truncation anchor by design and remains tolerant.
+            if report.chained_lines > 0 && expected_head.is_none() {
+                report.ok = false;
+                report.head_status =
+                    "no head receipt for a chained log (missing sidecar; truncation cannot be \
+                     ruled out — pass --expected-head to verify out-of-band)"
+                        .to_string();
+                report.problems.push(report.head_status.clone());
+            } else {
+                report.head_status = "no head receipt (truncation cannot be detected)".to_string();
+            }
         }
     }
 
@@ -1848,5 +1933,179 @@ mod tests {
         );
         // Genesis line is unchained; every subsequent line is chained.
         assert_eq!(report.chained_lines, THREADS * PER_THREAD - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_genesis_signature_is_authenticated_and_counted() {
+        // F1: the genesis/first signed entry carries a `sig` but NO `prev_hash`.
+        // Signature verification (and signed_lines counting) must run for it too;
+        // the prior bug only verified inside the `prev_hash` branch, so a tampered
+        // signature on a single-line log went unauthenticated and uncounted.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let vk = sk.verifying_key();
+        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // A SINGLE signed entry: it is the genesis (no prev_hash) but signed.
+            append_chain(&log, &["Allow"]);
+            let content = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 1, "single-line log");
+            assert!(
+                !lines[0].contains("prev_hash"),
+                "the only line is the genesis (no prev_hash)"
+            );
+
+            // Intact single signed line: verifies ok AND counts the genesis sig.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "an intact single signed entry must verify ok: {:?}",
+                clean.problems
+            );
+            assert_eq!(
+                clean.signed_lines, 1,
+                "the genesis signed line must be counted in signed_lines"
+            );
+
+            // Replace the genesis `sig` with a structurally valid but WRONG
+            // signature (64 zero bytes, base64). `sig` is excluded from the chain
+            // hash, so the head receipt still matches; only signature verification
+            // can catch this. The prior bug never verified the genesis, so it
+            // passed — now it must fail.
+            let mut v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert!(
+                v.get("sig").is_some(),
+                "precondition: the genesis was signed"
+            );
+            let bogus = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+            v.as_object_mut()
+                .unwrap()
+                .insert("sig".to_string(), serde_json::Value::String(bogus));
+            std::fs::write(&log, serde_json::to_string(&v).unwrap() + "\n").unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "a tampered genesis signature must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("signature verification failed")),
+                "a signature-verification-failed problem must be reported: {:?}",
+                report.problems
+            );
+            assert_eq!(
+                report.signed_lines, 1,
+                "the genesis line still carries a sig and must be counted"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_chained_log_fails_closed() {
+        // F11: deleting the `.head` sidecar of an existing CHAINED log must NOT
+        // pass verification (truncation could no longer be ruled out). It stays
+        // verifiable only via an explicit out-of-band --expected-head anchor.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Sanity: with the sidecar present the chain verifies ok.
+        assert!(
+            verify_audit_log(&log, None).ok,
+            "intact chained log with head receipt must verify ok"
+        );
+
+        // Delete the head sidecar (an attacker removing the truncation anchor).
+        std::fs::remove_file(head_path(&log)).expect("remove head sidecar");
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "a chained log with a missing head sidecar must fail closed"
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("no head receipt") || p.contains("missing sidecar")),
+            "the missing-sidecar problem must be reported: {:?}",
+            report.problems
+        );
+
+        // The operator can still verify out-of-band with --expected-head.
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let head = line_hash(last).unwrap();
+        assert!(
+            verify_audit_log(&log, Some(&head)).ok,
+            "an explicit --expected-head anchor must restore tolerance for a missing sidecar"
+        );
+        // A WRONG expected-head still fails.
+        assert!(
+            !verify_audit_log(&log, Some("deadbeef")).ok,
+            "a wrong --expected-head must still fail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_legacy_log_stays_tolerant() {
+        // F11 boundary: a purely LEGACY/unchained log (no prev_hash entries) has
+        // no truncation anchor by design, so a missing head sidecar must remain
+        // tolerant (ok stays true). Only chained logs fail closed.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        // Write two legacy lines (no prev_hash, no head sidecar) directly.
+        std::fs::write(
+            &log,
+            "{\"timestamp\":\"t1\",\"action\":\"Allow\"}\n\
+             {\"timestamp\":\"t2\",\"action\":\"Block\"}\n",
+        )
+        .unwrap();
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            report.ok,
+            "a purely legacy log with no head sidecar must stay tolerant: {:?}",
+            report.problems
+        );
+        assert_eq!(report.chained_lines, 0, "no chained lines");
+        assert_eq!(report.legacy_prefix, 2, "both lines are legacy");
     }
 }

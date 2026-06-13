@@ -464,6 +464,7 @@ pub fn record_correlation_findings(
     session_id: &str,
     hits: &[crate::event_buffer::CorrelationHit],
     cmd: &str,
+    policy: &crate::policy::Policy,
     dlp_patterns: &[String],
 ) {
     if hits.is_empty() {
@@ -483,10 +484,17 @@ pub fn record_correlation_findings(
     }
     let hit_data: Vec<HitData> = hits
         .iter()
-        .map(|h| HitData {
-            rule_id: h.rule_id.to_string(),
-            severity: h.severity.to_string(),
-            title: crate::util::truncate_bytes(&h.title, 120),
+        .map(|h| {
+            // Persist the POST-override (effective) severity, the same value the
+            // verdict path applies via `policy.severity_override`. Recording the
+            // raw `h.severity` here would make `tirith warnings` disagree with the
+            // verdict whenever a `severity_overrides` lever remapped this rule.
+            let severity = policy.severity_override(&h.rule_id).unwrap_or(h.severity);
+            HitData {
+                rule_id: h.rule_id.to_string(),
+                severity: severity.to_string(),
+                title: crate::util::truncate_bytes(&h.title, 120),
+            }
         })
         .collect();
 

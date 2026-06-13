@@ -848,7 +848,11 @@ const AGENT_MEMORY_BASENAMES: &[&str] = &[
     ".cursorrules",
     ".clinerules",
     ".windsurfrules",
+    ".roorules",
+    ".goosehints",
     "agents.md",
+    "agents.override.md",
+    "copilot-instructions.md",
     ".aider.conf.yml",
     ".aider.conf.yaml",
     "agent-memory.json",
@@ -2176,6 +2180,15 @@ mod tests {
         assert!(is_agent_memory_file(Path::new(".clinerules"), None));
         assert!(is_agent_memory_file(Path::new(".windsurfrules"), None));
         assert!(is_agent_memory_file(Path::new("AGENTS.md"), None));
+        // F9: AGENTS.override.md is a known config file and carries free-form
+        // directives, so it must be in the content-scanned memory subset too.
+        assert!(is_agent_memory_file(Path::new("AGENTS.override.md"), None));
+        assert!(is_agent_memory_file(
+            Path::new("copilot-instructions.md"),
+            None
+        ));
+        assert!(is_agent_memory_file(Path::new(".roorules"), None));
+        assert!(is_agent_memory_file(Path::new(".goosehints"), None));
         assert!(is_agent_memory_file(Path::new(".aider.conf.yml"), None));
         assert!(is_agent_memory_file(Path::new(".aider.conf.yaml"), None));
         assert!(is_agent_memory_file(Path::new("agent-memory.json"), None));

@@ -600,6 +600,7 @@ pub fn post_process_verdict(
             session_id,
             &correlation_hits,
             cmd,
+            policy,
             &policy.dlp_custom_patterns,
         );
         // Re-derive the action from the augmented finding set, only ever raising
@@ -714,7 +715,16 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
         let leader_base = command_base(&leader);
 
         match leader_base.as_str() {
-            "curl" | "wget" | "http" | "https" | "xh" => leader_is_network = true,
+            // Only a downloader with an ACTUAL remote target (a URL or a host-like
+            // argument) is a Network egress. A pure `curl --help` / `wget
+            // --version` performs no request, so recording Network for it would let
+            // an informational invocation complete a prior secret-write into a
+            // Critical correlation with no real egress.
+            "curl" | "wget" | "http" | "https" | "xh"
+                if network_invocation_has_remote_target(&args) =>
+            {
+                leader_is_network = true;
+            }
             "rm" | "unlink" | "shred" if delete_path.is_none() => {
                 delete_path = first_path_arg(&args);
             }
@@ -860,14 +870,81 @@ fn first_path_arg(args: &[String]) -> Option<String> {
     args.iter().find(|a| !a.starts_with('-')).cloned()
 }
 
+/// True if a network downloader's args (`curl`/`wget`/`http`/`https`/`xh`) name
+/// an ACTUAL remote target — a scheme URL (`https://...`) or a host-like
+/// positional (`example.com/x`). Returns false for a pure informational
+/// invocation (`curl --help`, `wget --version`) that performs no request, so a
+/// Network egress event is not recorded for it.
+///
+/// Conservative and string-only: it does NOT resolve DNS or decide reachability.
+/// To avoid misreading the value of an output flag (`-o .env`) as a host, the
+/// token consumed by a known value-taking download flag is skipped.
+fn network_invocation_has_remote_target(args: &[String]) -> bool {
+    // Value-taking download flags whose following token is a value, NOT a target.
+    const VALUE_FLAGS: &[&str] = &[
+        "-o",
+        "-O",
+        "--output",
+        "--output-document",
+        "-d",
+        "--data",
+        "--data-raw",
+        "--data-binary",
+        "-H",
+        "--header",
+        "-A",
+        "--user-agent",
+        "-e",
+        "--referer",
+        "-b",
+        "--cookie",
+        "-u",
+        "--user",
+        "-x",
+        "--proxy",
+    ];
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            // A bare value-taking flag consumes the next token as its value; the
+            // `--flag=value` form is self-contained and consumes nothing extra.
+            if VALUE_FLAGS.contains(&a.as_str()) {
+                skip_next = true;
+            }
+            continue;
+        }
+        // A scheme URL is unambiguously a remote target.
+        if a.contains("://") {
+            return true;
+        }
+        // A bare host-like positional (`example.com`, `example.com/x`): the part
+        // before any path component must contain a dot and look like a hostname.
+        let host_part = a.split('/').next().unwrap_or(a);
+        if host_part.contains('.')
+            && !host_part.starts_with('.')
+            && !host_part.contains(' ')
+            && host_part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// True if `args` (the args AFTER `git`) describe a force-push: the git
 /// SUBCOMMAND is `push` AND a force flag (`--force`, `-f`, `--force-with-lease`)
 /// is present. The subcommand is the first token that is neither a global option
 /// nor a global option's value, so a `-f` belonging to a different subcommand
 /// (e.g. `git tag -f push`) does NOT count: there the subcommand is `tag`, not
 /// `push`. Global options before the subcommand (`git -c k=v push --force`,
-/// `git -C dir push --force`) are skipped, including the separate value that
-/// `-c` / `-C` consume.
+/// `git --git-dir /repo push --force`) are skipped, including the separate value
+/// a value-taking global consumes (see [`git_subcommand`]).
 fn git_is_force_push(args: &[String]) -> bool {
     let Some(subcommand) = git_subcommand(args) else {
         return false;
@@ -884,17 +961,33 @@ fn git_is_force_push(args: &[String]) -> bool {
 }
 
 /// The git subcommand: the first token that is neither a global option nor the
-/// value a value-taking global option consumes. `-c <name=value>` and `-C <path>`
-/// take a SEPARATE following token, so that token is skipped too (otherwise it
-/// would be mistaken for the subcommand). Other `--opt=value` global options are
-/// self-contained and skipped by the leading-`-` test.
+/// value a value-taking global option consumes. Several git globals take a
+/// SEPARATE following token (`-c <name=value>`, `-C <path>`, `--git-dir <dir>`,
+/// `--work-tree <dir>`, `--namespace <name>`); that following token is skipped
+/// too, otherwise it would be mistaken for the subcommand (e.g. in
+/// `git --git-dir /repo push --force` the `/repo` value must not be read as the
+/// subcommand, which would hide the `push --force`). The `=`-attached forms
+/// (`--git-dir=/repo`) are self-contained and skipped by the leading-`-` test.
 fn git_subcommand(args: &[String]) -> Option<&String> {
+    /// git global options whose value is a SEPARATE following token.
+    const VALUE_TAKING_GLOBALS: &[&str] = &[
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--config-env",
+    ];
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a.starts_with('-') {
-            // `-c` / `-C` in their separate-value form consume the next token.
-            if (a == "-c" || a == "-C") && i + 1 < args.len() {
+            // A value-taking global in its separate-value form consumes the next
+            // token. The `--opt=value` form is self-contained (it contains its own
+            // value), so only the bare `--opt` form skips an extra token.
+            if VALUE_TAKING_GLOBALS.contains(&a.as_str()) && i + 1 < args.len() {
                 i += 2;
             } else {
                 i += 1;
@@ -2056,6 +2149,84 @@ mod tests {
             !kinds(&derive_typed_events("git branch -f push origin/main", &v))
                 .contains(&EventKind::GitForcePush),
             "`git branch -f push` is not a force-push (subcommand is `branch`)"
+        );
+    }
+
+    #[test]
+    fn derive_git_force_push_skips_value_taking_globals() {
+        // F7: value-taking git globals (`--git-dir`, `--work-tree`, `--namespace`)
+        // consume a SEPARATE following token. If that token were misread as the
+        // subcommand, a real `push --force` behind it would be missed.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            kinds(&derive_typed_events("git --git-dir /r push --force", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git --git-dir /r push --force` must be detected as a force-push"
+        );
+        assert!(
+            kinds(&derive_typed_events("git --work-tree /w push -f", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git --work-tree /w push -f` must be detected as a force-push"
+        );
+        assert!(
+            kinds(&derive_typed_events(
+                "git --namespace ns push --force-with-lease",
+                &v
+            ))
+            .contains(&EventKind::GitForcePush),
+            "`git --namespace ns push --force-with-lease` must be detected"
+        );
+        // The `=`-attached form is self-contained (consumes no extra token).
+        assert!(
+            kinds(&derive_typed_events("git --git-dir=/r push --force", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git --git-dir=/r push --force` must be detected as a force-push"
+        );
+        // A non-push subcommand behind a value-taking global is still NOT a force.
+        assert!(
+            !kinds(&derive_typed_events("git --git-dir /r status", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git --git-dir /r status` is not a force-push"
+        );
+    }
+
+    #[test]
+    fn derive_network_excludes_help_and_version() {
+        // F3: a network LEADER alone is not a Network egress; there must be an
+        // actual remote target. A pure informational invocation performs no
+        // request, so it must record NO Network event (otherwise it could complete
+        // a prior secret-write into a Critical correlation with no real egress).
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            !kinds(&derive_typed_events("curl --help", &v)).contains(&EventKind::Network),
+            "`curl --help` must NOT record a Network event"
+        );
+        assert!(
+            !kinds(&derive_typed_events("wget --version", &v)).contains(&EventKind::Network),
+            "`wget --version` must NOT record a Network event"
+        );
+        assert!(
+            !kinds(&derive_typed_events("curl -h", &v)).contains(&EventKind::Network),
+            "`curl -h` must NOT record a Network event"
+        );
+        // A real remote target (URL) still records Network — including the
+        // `curl https://x -o .env` case, which must record BOTH Network and the
+        // follow-on SecretWrite.
+        let with_target = derive_typed_events("curl https://x.example/k -o .env", &v);
+        let ks = kinds(&with_target);
+        assert!(
+            ks.contains(&EventKind::Network),
+            "`curl https://x -o .env` must record a Network event: {ks:?}"
+        );
+        assert!(
+            ks.contains(&EventKind::SecretWrite),
+            "`curl https://x -o .env` must still record a SecretWrite: {ks:?}"
+        );
+        // A bare host-like positional (no scheme) is also a remote target.
+        assert!(
+            kinds(&derive_typed_events("wget example.com/install.sh", &v))
+                .contains(&EventKind::Network),
+            "`wget example.com/install.sh` must record a Network event"
         );
     }
 
