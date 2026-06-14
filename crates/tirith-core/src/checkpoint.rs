@@ -1023,6 +1023,30 @@ pub fn create_and_purge(paths: &[&str], trigger_command: Option<&str>) -> Result
 }
 
 /// Backup a single file to the checkpoint files directory.
+/// Normalize a captured file's `original_path` for the manifest.
+///
+/// An ABSOLUTE path may run through a symlinked system alias (`/tmp` ->
+/// `/private/tmp`, `/var` -> `/private/var` on macOS). Storing that verbatim
+/// makes `reject_symlinked_restore_dest` falsely reject a legitimate restore at
+/// restore time. We canonicalize the PARENT directory (resolving ancestor
+/// symlinks once, at capture) and rejoin the final component verbatim, so a
+/// symlink at the leaf itself is NOT followed (the file's identity is preserved)
+/// while ancestor aliases are resolved. Relative paths are left untouched: they
+/// anchor to the already-canonicalized `capture_root` at restore time.
+fn normalize_capture_path(path: &Path) -> String {
+    if !path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match fs::canonicalize(parent) {
+            Ok(canon) => canon.join(name).to_string_lossy().into_owned(),
+            Err(_) => path.to_string_lossy().into_owned(),
+        },
+        // Root or no file name: nothing to normalize.
+        _ => path.to_string_lossy().into_owned(),
+    }
+}
+
 fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
     let sha = sha256_file(path)?;
     let dst = files_dir.join(&sha);
@@ -1045,7 +1069,7 @@ fn backup_file(path: &Path, files_dir: &Path) -> Result<ManifestEntry, String> {
     };
 
     Ok(ManifestEntry {
-        original_path: path.to_string_lossy().to_string(),
+        original_path: normalize_capture_path(path),
         sha256: sha,
         size,
         is_dir: false,
@@ -1738,6 +1762,38 @@ mod tests {
         assert!(
             anchor_restore_dst("sub/file.txt", None).is_err(),
             "a relative path with no capture root must be rejected"
+        );
+    }
+
+    // F-followup: an absolute capture path running through a symlinked ancestor
+    // (the macOS /tmp -> /private/tmp case) is normalized at capture so a later
+    // restore is not falsely rejected by reject_symlinked_restore_dest.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_capture_path_resolves_absolute_ancestor_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(tmp.path()).unwrap();
+        let target = real.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = real.join("alias");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = target.join("data.txt");
+        fs::write(&file, b"x").unwrap();
+
+        // Absolute path THROUGH the symlinked alias: parent symlink resolved,
+        // final component kept, so it equals the real canonical file path.
+        let through_link = link.join("data.txt");
+        let normalized = normalize_capture_path(&through_link);
+        assert_eq!(normalized, file.to_string_lossy());
+        assert!(
+            !normalized.contains("alias"),
+            "ancestor symlink must be resolved at capture"
+        );
+
+        // Relative paths are left exactly as-is (they anchor to capture_root).
+        assert_eq!(
+            normalize_capture_path(Path::new("sub/file.txt")),
+            "sub/file.txt"
         );
     }
 
