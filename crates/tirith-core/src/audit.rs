@@ -179,14 +179,83 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
         return AuditWrite::Failed(reason);
     }
 
+    // C1: capture the LOCKED fd's identity (device + inode) via fstat so the
+    // path-based reads below (`read_last_line` / `count_lines`, which reopen the
+    // log BY PATHNAME) can confirm they read the SAME inode we hold the lock on and
+    // will append to. If the log is rotated/replaced between `open()` and those
+    // reads, the path would resolve to a DIFFERENT inode and `prev_hash`/`count`
+    // would come from a file we are not appending to, poisoning the chain. On unix
+    // we stat the path before each such read and fail closed on a mismatch; on
+    // non-unix there is no portable dev/ino, so we keep the prior best-effort
+    // behavior (None disables the check).
+    #[cfg(unix)]
+    let locked_ident: Option<(u64, u64)> = {
+        use std::os::unix::fs::MetadataExt;
+        match file.metadata() {
+            Ok(m) => Some((m.dev(), m.ino())),
+            // If we cannot fstat the locked handle we cannot prove identity; fail
+            // closed rather than read a possibly-rotated path.
+            Err(e) => {
+                let reason = format!("cannot stat locked audit log {}: {e}", path.display());
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                let _ = fs2::FileExt::unlock(&file);
+                return AuditWrite::Failed(reason);
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let locked_ident: Option<()> = None;
+
+    // Verify the LOG path still resolves to the locked inode. Returns an error
+    // string when it does not (or cannot be stat'd) so the caller fails closed.
+    // Always Ok on non-unix (no dev/ino) and a vacuous Ok if identity capture was
+    // unavailable. The `.head` sidecar is intentionally NOT covered: it is rewritten
+    // atomically under this same lock and verified by its own signature/count, so a
+    // sidecar swap is caught downstream, not here.
+    let verify_log_identity = |_p: &std::path::Path| -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some((dev, ino)) = locked_ident {
+                match std::fs::metadata(_p) {
+                    Ok(m) if m.dev() == dev && m.ino() == ino => Ok(()),
+                    Ok(_) => Err("audit log changed identity under lock".to_string()),
+                    Err(e) => Err(format!("cannot stat audit log under lock: {e}")),
+                }
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &locked_ident;
+            Ok(())
+        }
+    };
+
     // Under the exclusive lock: derive `prev_hash` from the actual on-disk tail
     // (never trusting the head sidecar blindly, so it is crash-safe), set it on a
     // clone, optionally sign, serialize, append, then refresh the head receipt.
+    if let Err(reason) = verify_log_identity(&path) {
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
     let prev_hash = read_last_line(&path).as_deref().and_then(line_hash);
     let head_before = read_head(&path);
     let prev_count = match (&head_before, &prev_hash) {
         (Some(h), Some(ph)) if &h.head_hash == ph => h.count,
-        _ => count_lines(&path),
+        _ => {
+            // The fallback path reopens the log by pathname to count lines; re-verify
+            // identity immediately before it so a rotation between the tail read and
+            // here cannot feed a count from a different inode.
+            if let Err(reason) = verify_log_identity(&path) {
+                audit_diagnostic(format!("tirith: audit: {reason}"));
+                let _ = fs2::FileExt::unlock(&file);
+                return AuditWrite::Failed(reason);
+            }
+            count_lines(&path)
+        }
     };
 
     let mut entry = entry.clone();
@@ -711,23 +780,60 @@ pub fn verify_audit_log(
         signed_lines: 0,
         signing_expected: false,
     };
-    let content = match fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) => {
+    // C2: read the log AND its `.head` sidecar under a SHARED fs2 lock, the same
+    // lock `append_to_audit_log` takes exclusively. Without it, a concurrent append
+    // can interleave so that `content` (N lines) and the head receipt (N+1) are read
+    // inconsistently, or the last line is observed half-written, producing a false
+    // truncation / invalid-JSON failure. Open once, lock_shared, read the log
+    // through THAT handle, then read the sidecar, then unlock. A missing log is the
+    // genuine "cannot read" case and is reported as before.
+    let (content, head) = {
+        let log_file = match fs::File::open(log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                report.ok = false;
+                report
+                    .problems
+                    .push(format!("cannot read {}: {e}", log_path.display()));
+                return report;
+            }
+        };
+        // A shared lock can fail (e.g. unsupported fs); treat that as unreadable and
+        // fail closed rather than reading without the lock.
+        if let Err(e) = fs2::FileExt::lock_shared(&log_file) {
             report.ok = false;
             report
                 .problems
-                .push(format!("cannot read {}: {e}", log_path.display()));
+                .push(format!("cannot lock {}: {e}", log_path.display()));
             return report;
         }
+        let read_result = {
+            use std::io::Read;
+            let mut buf = String::new();
+            (&log_file).read_to_string(&mut buf).map(|_| buf)
+        };
+        let content = match read_result {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = fs2::FileExt::unlock(&log_file);
+                report.ok = false;
+                report
+                    .problems
+                    .push(format!("cannot read {}: {e}", log_path.display()));
+                return report;
+            }
+        };
+        // Read the head receipt once while STILL holding the shared lock so it is
+        // consistent with the log content just read: its `signing_enabled` flag
+        // tells us whether a chained entry missing `sig` is a downgrade (signature
+        // stripped) rather than a legitimately unsigned line.
+        let head = read_head(log_path);
+        let _ = fs2::FileExt::unlock(&log_file);
+        (content, head)
     };
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     report.total_lines = lines.len();
     let verify_key = audit_verify_key();
-    // Read the head receipt once: its `signing_enabled` flag tells us whether a
-    // chained entry missing `sig` is a downgrade (signature stripped) rather than
-    // a legitimately unsigned line.
-    let head = read_head(log_path);
     // "Signatures required" must NOT rest solely on the mutable `<log>.head`
     // sidecar: an attacker could strip every `sig` AND rewrite the receipt to
     // `signing_enabled: false`. So anchor the signal in the (hash-chained) log
@@ -936,20 +1042,27 @@ pub fn verify_audit_log(
             }
         }
         None => {
-            // A missing `.head` sidecar on a CHAINED log must fail closed: an
-            // attacker who deletes the sidecar of an existing chained log would
-            // otherwise pass verification, defeating truncation detection (the
-            // chain alone proves internal consistency but not that the tail is
-            // intact). The operator can still verify by supplying `--expected-head`
-            // (an explicit out-of-band anchor, validated just below); when present
-            // it is the trusted tail, so we stay tolerant here and let that check
-            // decide. A purely legacy/unchained log (no chained entries) has no
-            // truncation anchor by design and remains tolerant.
-            if report.chained_lines > 0 && expected_head.is_none() {
+            // A missing `.head` sidecar must fail closed when there is a truncation
+            // anchor to defeat: an attacker who deletes the sidecar of an existing
+            // chained log would otherwise pass verification, defeating truncation
+            // detection (the chain alone proves internal consistency but not that
+            // the tail is intact). The operator can still verify by supplying
+            // `--expected-head` (an explicit out-of-band anchor, validated just
+            // below); when present it is the trusted tail, so we stay tolerant here
+            // and let that check decide. A purely legacy/unchained log (no chained
+            // entries) has no truncation anchor by design and remains tolerant.
+            //
+            // C3: a SIGNED log whose ONLY retained entry is the genesis line has
+            // `signing_expected = true` but `chained_lines = 0` (the genesis has no
+            // `prev_hash`). Deleting its `.head` must ALSO fail closed: the receipt
+            // is what binds `signing_enabled`, so dropping it makes a
+            // truncation-to-empty of a signed log unverifiable. Gate on `signing
+            // expected OR chained` so the signed single-entry case is covered too.
+            if (report.chained_lines > 0 || report.signing_expected) && expected_head.is_none() {
                 report.ok = false;
                 report.head_status =
-                    "no head receipt for a chained log (missing sidecar; truncation cannot be \
-                     ruled out — pass --expected-head to verify out-of-band)"
+                    "no head receipt for a signed/chained log (missing sidecar; truncation cannot \
+                     be ruled out; pass --expected-head to verify out-of-band)"
                         .to_string();
                 report.problems.push(report.head_status.clone());
             } else {
@@ -2596,6 +2709,90 @@ mod tests {
             !verify_audit_log(&log, Some("deadbeef")).ok,
             "a wrong --expected-head must still fail"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_missing_head_on_signed_single_entry_log_fails_closed() {
+        // C3: a SIGNED log whose ONLY retained entry is the genesis line has
+        // `signing_expected = true` but `chained_lines = 0`. Deleting its `.head`
+        // sidecar must STILL fail closed (no --expected-head): the receipt is what
+        // binds `signing_enabled`, so dropping it makes a truncation-to-empty of a
+        // signed log unverifiable. The prior gate (`chained_lines > 0`) missed this.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        // Deterministic ed25519 keypair so signing AND verifying are configured.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+        let vk = sk.verifying_key();
+        write_signing_key(
+            &cfg.join("tirith").join("audit-signing.key"),
+            &sk.to_bytes(),
+        );
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // ONE signed entry: the genesis (no prev_hash), signed.
+            append_chain(&log, &["Allow"]);
+
+            // Precondition: exactly one line, signed, and it verifies ok with its
+            // sidecar present.
+            let content = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(content.lines().count(), 1, "exactly one entry");
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed single-entry log with its head must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+            assert_eq!(clean.chained_lines, 0, "the lone genesis is not chained");
+
+            // Remove the head sidecar (an attacker dropping the signed receipt).
+            std::fs::remove_file(head_path(&log)).expect("remove head sidecar");
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "a signed single-entry log with a missing head sidecar must fail closed"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("no head receipt") || p.contains("missing sidecar")),
+                "the missing-sidecar problem must be reported: {:?}",
+                report.problems
+            );
+
+            // An explicit --expected-head anchor still restores tolerance.
+            let last = content.lines().last().unwrap();
+            let head = line_hash(last).unwrap();
+            assert!(
+                verify_audit_log(&log, Some(&head)).ok,
+                "an explicit --expected-head anchor must restore tolerance"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[cfg(unix)]

@@ -732,7 +732,7 @@ fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
             // an informational invocation complete a prior secret-write into a
             // Critical correlation with no real egress.
             "curl" | "wget" | "http" | "https" | "xh"
-                if network_invocation_has_remote_target(&args) =>
+                if network_invocation_has_remote_target(leader_base.as_str(), &args) =>
             {
                 leader_is_network = true;
             }
@@ -905,7 +905,20 @@ fn command_base(name: &str) -> String {
 /// The first non-flag argument, treated as a path. Conservative: returns the
 /// first token that does not start with `-`.
 fn first_path_arg(args: &[String]) -> Option<String> {
-    args.iter().find(|a| !a.starts_with('-')).cloned()
+    // A bare `--` ends option parsing: every token after it is a POSITIONAL path
+    // even when it begins with `-` (`rm -- -a` deletes a file literally named
+    // `-a`). Without this, a dash-led path after `--` is misread as a flag and the
+    // delete is never recorded.
+    let mut end_of_options = false;
+    args.iter()
+        .find(|a| {
+            if !end_of_options && a.as_str() == "--" {
+                end_of_options = true;
+                return false;
+            }
+            end_of_options || !a.starts_with('-')
+        })
+        .cloned()
 }
 
 /// The number of non-flag PATH arguments a delete command targets. The multi-path
@@ -916,7 +929,18 @@ fn first_path_arg(args: &[String]) -> Option<String> {
 /// emitted FileDelete). The leader/wrappers are already peeled by the caller, so
 /// `args` is just the rm/unlink/shred operands.
 fn count_path_args(args: &[String]) -> usize {
-    args.iter().filter(|a| !a.starts_with('-')).count()
+    // A bare `--` ends option parsing: every later token counts as a positional
+    // path even with a leading `-` (so `rm -f -- -a file` is two deletes, not one).
+    let mut end_of_options = false;
+    args.iter()
+        .filter(|a| {
+            if !end_of_options && a.as_str() == "--" {
+                end_of_options = true;
+                return false;
+            }
+            end_of_options || !a.starts_with('-')
+        })
+        .count()
 }
 
 /// The number of non-flag path arguments that are NOT build artifacts, using the
@@ -926,8 +950,17 @@ fn count_path_args(args: &[String]) -> usize {
 /// mass-deletion correlation sums, so a mixed delete contributes exactly its real
 /// non-build paths instead of all-or-nothing on one sampled path.
 fn count_non_build_path_args(args: &[String]) -> usize {
+    // A bare `--` ends option parsing: every later token is a positional path even
+    // with a leading `-`, so the non-build delete count is not undercounted.
+    let mut end_of_options = false;
     args.iter()
-        .filter(|a| !a.starts_with('-'))
+        .filter(|a| {
+            if !end_of_options && a.as_str() == "--" {
+                end_of_options = true;
+                return false;
+            }
+            end_of_options || !a.starts_with('-')
+        })
         .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
         .count()
 }
@@ -969,18 +1002,17 @@ fn is_remote_url_host(host_token: &str) -> bool {
     !crate::rules::shared::is_loopback_host(&host)
 }
 
-/// True if a network downloader's args (`curl`/`wget`/`http`/`https`/`xh`) name
-/// an ACTUAL remote target — a scheme URL (`https://...`) or a host-like
-/// positional (`example.com/x`). Returns false for a pure informational
-/// invocation (`curl --help`, `wget --version`) that performs no request, so a
-/// Network egress event is not recorded for it.
-///
-/// Conservative and string-only: it does NOT resolve DNS or decide reachability.
-/// To avoid misreading the value of an output flag (`-o .env`) as a host, the
-/// token consumed by a known value-taking download flag is skipped.
-fn network_invocation_has_remote_target(args: &[String]) -> bool {
-    // Value-taking download flags whose following token is a value, NOT a target.
-    const VALUE_FLAGS: &[&str] = &[
+/// The value-taking flags for a given downloader, used to skip the token a flag
+/// consumes so that token is not misread as a remote host. `curl`, `wget`, and
+/// httpie (`http`/`https`/`xh`) each have their OWN large set of value flags;
+/// folding them into one shared list would let one tool's value flag swallow a
+/// real URL for another (or, worse, miss a value flag and read a cert/form path as
+/// a host). An unknown tool falls back to a conservative set of the flags common
+/// across downloaders.
+fn value_flags_for(leader_base: &str) -> &'static [&'static str] {
+    // Flags common to essentially every downloader (output, data, headers, auth,
+    // proxy). Also serves as the conservative default for an unrecognised tool.
+    const COMMON: &[&str] = &[
         "-o",
         "-O",
         "--output",
@@ -1002,6 +1034,148 @@ fn network_invocation_has_remote_target(args: &[String]) -> bool {
         "-x",
         "--proxy",
     ];
+    // curl: many more value flags whose argument is a PATH/value, never a target.
+    const CURL: &[&str] = &[
+        "-o",
+        "-O",
+        "--output",
+        "-d",
+        "--data",
+        "--data-raw",
+        "--data-binary",
+        "--data-urlencode",
+        "-F",
+        "--form",
+        "--form-string",
+        "-H",
+        "--header",
+        "-A",
+        "--user-agent",
+        "-e",
+        "--referer",
+        "-b",
+        "--cookie",
+        "-c",
+        "--cookie-jar",
+        "-u",
+        "--user",
+        "-x",
+        "--proxy",
+        "-U",
+        "--proxy-user",
+        "-K",
+        "--config",
+        "-E",
+        "--cert",
+        "--key",
+        "--cacert",
+        "--capath",
+        "--cert-type",
+        "--key-type",
+        "--max-time",
+        "--connect-timeout",
+        "--retry",
+        "--retry-delay",
+        "--retry-max-time",
+        "--limit-rate",
+        "-r",
+        "--range",
+        "-w",
+        "--write-out",
+        "-T",
+        "--upload-file",
+        "--resolve",
+        "--interface",
+        "--dns-servers",
+        "-Y",
+        "--speed-limit",
+        "-y",
+        "--speed-time",
+    ];
+    // wget: download/output/timeout value flags.
+    const WGET: &[&str] = &[
+        "-O",
+        "--output-document",
+        "-o",
+        "--output-file",
+        "-a",
+        "--append-output",
+        "-P",
+        "--directory-prefix",
+        "--header",
+        "--post-data",
+        "--post-file",
+        "--body-data",
+        "--body-file",
+        "-U",
+        "--user-agent",
+        "--referer",
+        "--user",
+        "--password",
+        "-e",
+        "--execute",
+        "-t",
+        "--tries",
+        "-T",
+        "--timeout",
+        "--connect-timeout",
+        "--read-timeout",
+        "-w",
+        "--wait",
+        "--limit-rate",
+        "--certificate",
+        "--private-key",
+        "--ca-certificate",
+        "--ca-directory",
+        "--bind-address",
+    ];
+    // httpie (`http`/`https`/`xh`): value flags that take a path/value argument.
+    const HTTPIE: &[&str] = &[
+        "-o",
+        "--output",
+        "-d",
+        "--download",
+        "--max-redirects",
+        "--timeout",
+        "-a",
+        "--auth",
+        "-A",
+        "--auth-type",
+        "--proxy",
+        "--cert",
+        "--cert-key",
+        "--verify",
+        "--session",
+        "--session-read-only",
+        "--print",
+        "-p",
+        "--style",
+        "--format-options",
+    ];
+    match leader_base {
+        "curl" => CURL,
+        "wget" => WGET,
+        "http" | "https" | "xh" | "xhs" | "httpie" => HTTPIE,
+        _ => COMMON,
+    }
+}
+
+/// True if a network downloader's args (`curl`/`wget`/`http`/`https`/`xh`) name
+/// an ACTUAL remote target: a scheme URL (`https://...`) or a host-like
+/// positional (`example.com/x`). Returns false for a pure informational
+/// invocation (`curl --help`, `wget --version`) that performs no request, so a
+/// Network egress event is not recorded for it.
+///
+/// Conservative and string-only: it does NOT resolve DNS or decide reachability.
+/// To avoid misreading the value of an output flag (`-o .env`) as a host, the
+/// token consumed by a known value-taking download flag is skipped.
+fn network_invocation_has_remote_target(leader_base: &str, args: &[String]) -> bool {
+    // Value-taking flags whose FOLLOWING token is a value, not a target. The set is
+    // TOOL-SPECIFIC: curl/wget/httpie each take many value flags whose argument
+    // (a cert path, a form field, a timeout) would otherwise be misread as a remote
+    // host and fabricate a Network event. An unknown tool gets a conservative
+    // default covering only the flags common across downloaders.
+    let value_flags: &[&str] = value_flags_for(leader_base);
     let mut skip_next = false;
     for a in args {
         if skip_next {
@@ -1011,7 +1185,7 @@ fn network_invocation_has_remote_target(args: &[String]) -> bool {
         if a.starts_with('-') {
             // A bare value-taking flag consumes the next token as its value; the
             // `--flag=value` form is self-contained and consumes nothing extra.
-            if VALUE_FLAGS.contains(&a.as_str()) {
+            if value_flags.contains(&a.as_str()) {
                 skip_next = true;
             }
             continue;
@@ -2418,18 +2592,48 @@ mod tests {
         );
 
         // Focused unit on the deriver itself.
-        assert!(network_invocation_has_remote_target(&[
-            "https://evil.example.com".to_string()
-        ]));
-        assert!(!network_invocation_has_remote_target(&[
-            "http://localhost:8080/x".to_string()
-        ]));
-        assert!(!network_invocation_has_remote_target(&[
-            "file:///etc/passwd".to_string()
-        ]));
-        assert!(!network_invocation_has_remote_target(&[
-            "http://[::1]:9000/x".to_string()
-        ]));
+        assert!(network_invocation_has_remote_target(
+            "curl",
+            &["https://evil.example.com".to_string()]
+        ));
+        assert!(!network_invocation_has_remote_target(
+            "curl",
+            &["http://localhost:8080/x".to_string()]
+        ));
+        assert!(!network_invocation_has_remote_target(
+            "curl",
+            &["file:///etc/passwd".to_string()]
+        ));
+        assert!(!network_invocation_has_remote_target(
+            "curl",
+            &["http://[::1]:9000/x".to_string()]
+        ));
+
+        // C6: a curl with value flags whose ARGUMENTS are local paths (cert/key)
+        // must detect EXACTLY the trailing remote URL, never the path values.
+        assert!(network_invocation_has_remote_target(
+            "curl",
+            &[
+                "--cert".to_string(),
+                "/p/c".to_string(),
+                "--key".to_string(),
+                "/p/k".to_string(),
+                "https://api.example.com".to_string(),
+            ]
+        ));
+        // A curl with only local-value flags and NO URL yields no remote target
+        // (its `--cert`/`--key`/`--cacert` paths must not be read as hosts).
+        assert!(!network_invocation_has_remote_target(
+            "curl",
+            &[
+                "--cert".to_string(),
+                "/p/c".to_string(),
+                "--key".to_string(),
+                "/p/k".to_string(),
+                "--cacert".to_string(),
+                "/p/ca.pem".to_string(),
+            ]
+        ));
     }
 
     #[test]
@@ -2497,6 +2701,42 @@ mod tests {
                 .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
                 .map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[test]
+    fn derive_file_delete_honors_end_of_options_separator() {
+        // C5: a bare `--` ends option parsing, so dash-led tokens after it are
+        // POSITIONAL paths. `rm -- -a -b -c` deletes three files literally named
+        // `-a`/`-b`/`-c` (3 deletes), and `rm -f -- -a file` deletes `-a` and
+        // `file` (2). Without `--` handling these were dropped/undercounted,
+        // suppressing the mass-deletion correlation.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+
+        let del = derive_typed_events("rm -- -a -b -c", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`rm -- -a -b -c` must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("3"),
+            "all three dash-led tokens after `--` count as deletes"
+        );
+        // The representative `path` is the first positional after `--`.
+        assert_eq!(del.metadata.get("path").map(String::as_str), Some("-a"));
+
+        let del = derive_typed_events("rm -f -- -a file", &v)
+            .into_iter()
+            .find(|e| e.kind == EventKind::FileDelete)
+            .expect("`rm -f -- -a file` must record a FileDelete");
+        assert_eq!(
+            del.metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("2"),
+            "`-a` and `file` after `--` both count; the leading `-f` does not"
         );
     }
 

@@ -966,6 +966,17 @@ fn is_local_host(host: &str) -> bool {
     if h.eq_ignore_ascii_case("localhost") {
         return true;
     }
+    // `*.localhost` resolves to loopback by convention (RFC 6761), so
+    // `app.localhost:3000` is a LOCAL dev reference, not an exfil sink. This
+    // matches `rules::shared::is_loopback_host`, which the W7 deriver uses; without
+    // it a `http://app.localhost/...` config value fired a false external-URL
+    // signal. (A bare `localhost` is handled above; this covers the subdomain
+    // form.) Checked case-insensitively for parity with the exact match above.
+    if h.len() > ".localhost".len()
+        && h[h.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost")
+    {
+        return true;
+    }
     if let Ok(v4) = h.parse::<std::net::Ipv4Addr>() {
         return v4.is_loopback() || v4.is_unspecified();
     }
@@ -2383,6 +2394,35 @@ mod tests {
             got.as_deref(),
             Some("https://evil.example.com/p"),
             "an external URL with a fragment is external, fragment trimmed",
+        );
+    }
+
+    #[test]
+    fn test_is_local_host_treats_dot_localhost_as_local() {
+        // C10: a `*.localhost` subdomain resolves to loopback by convention, so it
+        // is LOCAL and must not raise an external-URL signal. A genuinely external
+        // host still is not local. Mirrors `shared::is_loopback_host`.
+        assert!(is_local_host("app.localhost"), "app.localhost is local");
+        assert!(is_local_host("APP.LOCALHOST"), "case-insensitive");
+        assert!(
+            is_local_host("a.b.localhost"),
+            "any depth of .localhost is local"
+        );
+        assert!(is_local_host("localhost"), "bare localhost stays local");
+        assert!(!is_local_host("evil.example"), "evil.example is NOT local");
+        // A host that merely ENDS in the literal text but is not a `.localhost`
+        // label (no leading dot before it) is external.
+        assert!(
+            !is_local_host("notlocalhost"),
+            "`notlocalhost` is not a .localhost subdomain"
+        );
+
+        // End-to-end: a config value pointing at `app.localhost` must not be
+        // reported as an external URL.
+        assert_eq!(
+            find_external_http_url("endpoint = http://app.localhost:3000/x"),
+            None,
+            "an app.localhost URL must NOT be treated as external",
         );
     }
 

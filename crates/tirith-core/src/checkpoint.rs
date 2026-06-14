@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 fn require_pro() -> Result<(), String> {
@@ -324,9 +324,9 @@ fn validate_restore_path(path: &str) -> Result<(), String> {
 ///   missing/corrupt meta.json) cannot be anchored safely and is REJECTED rather
 ///   than silently resolved against the caller's cwd.
 ///
-/// The caller still applies [`reject_symlinked_restore_dest`] + [`copy_no_follow`]
-/// to the returned path, so symlink redirection at the final component is closed
-/// independently of this anchoring.
+/// The caller still applies [`reject_symlinked_restore_dest`] +
+/// [`copy_no_follow_from_reader`] to the returned path, so symlink redirection at
+/// the final component is closed independently of this anchoring.
 fn anchor_restore_dst(original_path: &str, capture_root: Option<&Path>) -> Result<PathBuf, String> {
     let p = Path::new(original_path);
     if p.is_absolute() {
@@ -403,13 +403,16 @@ fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Copy `src` over `dst` WITHOUT following a symlink at the destination's final
-/// component. On unix the destination is opened with `O_NOFOLLOW` (plus
-/// create/truncate), so a symlink planted at `dst` between the caller's pre-check
-/// and here is refused by the open itself (closing the TOCTOU window that plain
-/// `fs::copy`, which follows links, would leave open). On non-unix we fall back to
-/// `fs::copy` and rely on the caller's pre-write symlink check.
-fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// Copy from an ALREADY-OPEN source handle into `dst` WITHOUT following a symlink
+/// at the destination's final component, instead of reopening the blob by path.
+/// The restore path hashes a blob through this same handle (after seeking it back
+/// to 0), so the bytes written to `dst` are exactly the bytes that were verified,
+/// closing the TOCTOU where the on-disk blob is replaced between the hash and a
+/// path-based reopen (CodeRabbit C4). The destination keeps the same no-follow
+/// discipline: on unix it is opened with `O_NOFOLLOW` (plus create/truncate) so a
+/// symlink planted at `dst` is refused by the open itself; on non-unix it is
+/// created with `File::create` and relies on the caller's pre-write symlink check.
+fn copy_no_follow_from_reader<R: Read>(src: &mut R, dst: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -419,14 +422,16 @@ fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
             .truncate(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(dst)?;
-        let mut input = fs::File::open(src)?;
-        std::io::copy(&mut input, &mut out)?;
+        std::io::copy(src, &mut out)?;
         out.sync_all()?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        fs::copy(src, dst).map(|_| ())
+        let mut out = fs::File::create(dst)?;
+        std::io::copy(src, &mut out)?;
+        out.sync_all()?;
+        Ok(())
     }
 }
 
@@ -544,11 +549,29 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             continue;
         }
 
+        // Open the backup blob ONCE and both hash AND copy through this single
+        // handle (CodeRabbit C4 TOCTOU). Reopening `files/<sha>` by path for the
+        // copy after a separate path-based hash would let a concurrent replacement
+        // slip UNVERIFIED bytes into the destination, breaking the "corrupt blobs
+        // are recorded, never written" guarantee. The handle is rewound to 0
+        // between the hash and the copy below.
+        let mut blob = match fs::File::open(&src) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "tirith: checkpoint restore: cannot open backup for {}: {e}, skipping",
+                    entry.original_path
+                );
+                report.corrupt.push(entry.original_path.clone());
+                continue;
+            }
+        };
+
         // Verify the backup blob's content matches the manifest SHA before
         // restoring. A mismatch means the blob was corrupted or tampered with
         // on disk; restoring it would overwrite the live file with bad data, so
         // skip the copy and record it as corrupt.
-        match sha256_file(&src) {
+        match sha256_reader(&mut blob) {
             Ok(actual) if actual == entry.sha256 => {}
             Ok(_) => {
                 eprintln!(
@@ -611,7 +634,19 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             report.errors.push((entry.original_path.clone(), e));
             continue;
         }
-        match copy_no_follow(&src, dst) {
+        // Rewind the blob handle to the start and copy from THIS verified handle
+        // (not a fresh open by path), so the bytes written are exactly the bytes
+        // just hashed (CodeRabbit C4 TOCTOU). A seek failure means we cannot
+        // guarantee that, so bucket it as an error rather than risk an unverified
+        // or partial write.
+        if let Err(e) = blob.seek(SeekFrom::Start(0)) {
+            report.errors.push((
+                entry.original_path.clone(),
+                format!("cannot rewind verified backup: {e}"),
+            ));
+            continue;
+        }
+        match copy_no_follow_from_reader(&mut blob, dst) {
             Ok(_) => report.restored.push(entry.original_path.clone()),
             Err(e) => report
                 .errors
@@ -1168,10 +1203,19 @@ fn backup_dir_recursive(
 /// Compute SHA-256 of a file.
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    sha256_reader(&mut file)
+}
+
+/// SHA-256 of everything readable from `reader`, streaming in fixed chunks. Used
+/// both by [`sha256_file`] and by the restore path, which hashes a blob through
+/// the SAME open handle it then copies from (seeking back to 0 between), so the
+/// bytes verified are exactly the bytes written even if the blob is replaced on
+/// disk concurrently (CodeRabbit C4 TOCTOU).
+fn sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = file.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
@@ -2232,10 +2276,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_copy_no_follow_refuses_symlinked_destination() {
-        // F5: the destination write must NOT follow a symlink at the final
+        // F5/C4: the destination write must NOT follow a symlink at the final
         // component (closing the TOCTOU window that plain `fs::copy` would leave
-        // open). `copy_no_follow` opens with O_NOFOLLOW, so a symlinked dst is
-        // refused and the link target outside the tree is left untouched.
+        // open). `copy_no_follow_from_reader` opens with O_NOFOLLOW, so a symlinked
+        // dst is refused and the link target outside the tree is left untouched.
         let tmpdir = tempfile::tempdir().unwrap();
         let src = tmpdir.path().join("src.txt");
         fs::write(&src, "restored bytes").unwrap();
@@ -2247,10 +2291,11 @@ mod tests {
         let dst = tmpdir.path().join("dst.txt");
         std::os::unix::fs::symlink(&outside, &dst).unwrap();
 
-        let result = copy_no_follow(&src, &dst);
+        let mut blob = fs::File::open(&src).unwrap();
+        let result = copy_no_follow_from_reader(&mut blob, &dst);
         assert!(
             result.is_err(),
-            "copy_no_follow must refuse to write through a symlinked destination"
+            "copy_no_follow_from_reader must refuse to write through a symlinked destination"
         );
         assert_eq!(
             fs::read_to_string(&outside).ok().as_deref(),
@@ -2263,17 +2308,56 @@ mod tests {
     #[test]
     fn test_copy_no_follow_writes_regular_destination() {
         // The happy path of the no-follow write: a regular (or absent) destination
-        // is created/overwritten with the source bytes.
+        // is created/overwritten with the source bytes read from the open handle.
         let tmpdir = tempfile::tempdir().unwrap();
         let src = tmpdir.path().join("src.txt");
         fs::write(&src, "hello no-follow").unwrap();
         let dst = tmpdir.path().join("dst.txt");
 
-        copy_no_follow(&src, &dst).expect("copy to a regular destination must succeed");
+        let mut blob = fs::File::open(&src).unwrap();
+        copy_no_follow_from_reader(&mut blob, &dst)
+            .expect("copy to a regular destination must succeed");
         assert_eq!(
             fs::read_to_string(&dst).unwrap(),
             "hello no-follow",
             "the destination must contain the source bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_no_follow_from_reader_copies_from_seek_position() {
+        // C4: the restore path hashes the blob through the handle, then rewinds to
+        // 0 and copies from the SAME handle. Verify the copy honours the current
+        // seek position: reading the handle to EOF (as the hash does) then rewinding
+        // must still copy the FULL contents, and copying without rewinding (from
+        // EOF) copies nothing. This is exactly the same-handle guarantee the restore
+        // loop relies on.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("blob");
+        fs::write(&src, "verified bytes").unwrap();
+
+        let mut blob = fs::File::open(&src).unwrap();
+        // Drain to EOF like the hash step does.
+        let _ = sha256_reader(&mut blob).unwrap();
+
+        // Without rewinding, the handle is at EOF: a copy yields an empty file.
+        let dst_eof = tmpdir.path().join("dst_eof");
+        copy_no_follow_from_reader(&mut blob, &dst_eof).unwrap();
+        assert_eq!(
+            fs::read_to_string(&dst_eof).unwrap(),
+            "",
+            "copying from an unrewound (EOF) handle writes nothing"
+        );
+
+        // After rewinding to 0, the copy writes the full verified bytes.
+        blob.seek(SeekFrom::Start(0)).unwrap();
+        let dst_full = tmpdir.path().join("dst_full");
+        copy_no_follow_from_reader(&mut blob, &dst_full).unwrap();
+        assert_eq!(
+            fs::read_to_string(&dst_full).unwrap(),
+            "verified bytes",
+            "after rewind, the copy writes the same bytes that were hashed"
         );
     }
 }
