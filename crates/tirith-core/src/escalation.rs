@@ -895,6 +895,43 @@ fn count_path_args(args: &[String]) -> usize {
     args.iter().filter(|a| !a.starts_with('-')).count()
 }
 
+/// Split a `scheme://rest` argument into its lowercased scheme and the raw host
+/// token (everything between `://` and the first `/`, `?`, or `#`). Returns
+/// `None` when the argument has no `://` separator. The host token still carries
+/// any `:port`, `[ipv6]`, userinfo, etc.; [`is_remote_url_host`] normalises it.
+fn scheme_and_host(arg: &str) -> Option<(String, &str)> {
+    let (scheme, rest) = arg.split_once("://")?;
+    let host_token = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    Some((scheme.to_ascii_lowercase(), host_token))
+}
+
+/// True when `host_token` (a raw authority slice that may carry userinfo, a
+/// `:port`, or `[ipv6]` brackets) resolves to a genuine REMOTE host, i.e. it is
+/// NOT a loopback/local target per [`crate::rules::shared::is_loopback_host`].
+/// An empty host (e.g. `http:///path`) is treated as not-remote so it cannot
+/// record a Network egress.
+fn is_remote_url_host(host_token: &str) -> bool {
+    // Drop any `user:pass@` userinfo prefix; the host is after the last `@`.
+    let after_userinfo = host_token.rsplit('@').next().unwrap_or(host_token);
+    // Separate the host from a trailing `:port`. A bracketed IPv6 literal
+    // (`[::1]`, `[::1]:8080`) keeps its brackets; a bare host drops the port at
+    // the first colon. (A bare IPv6 without brackets is not valid URL authority,
+    // so the first-colon split is correct for the host forms we accept.)
+    let host = if after_userinfo.starts_with('[') {
+        match after_userinfo.find(']') {
+            Some(end) => &after_userinfo[..=end],
+            None => after_userinfo,
+        }
+    } else {
+        after_userinfo.split(':').next().unwrap_or(after_userinfo)
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    !crate::rules::shared::is_loopback_host(&host)
+}
+
 /// True if a network downloader's args (`curl`/`wget`/`http`/`https`/`xh`) name
 /// an ACTUAL remote target — a scheme URL (`https://...`) or a host-like
 /// positional (`example.com/x`). Returns false for a pure informational
@@ -942,12 +979,25 @@ fn network_invocation_has_remote_target(args: &[String]) -> bool {
             }
             continue;
         }
-        // A scheme URL is unambiguously a remote target.
-        if a.contains("://") {
-            return true;
+        // A scheme URL is a remote target ONLY when it points at a real remote
+        // host. `file://...` is not a network fetch at all, and a loopback/local
+        // host (`http://localhost`, `http://127.0.0.1`, `http://[::1]`,
+        // `https://localhost:8080`) never leaves the machine, so neither should
+        // record a Network egress (which could otherwise feed a false W7
+        // correlation). A genuine remote host still counts.
+        if let Some((scheme, host)) = scheme_and_host(a) {
+            if scheme == "file" {
+                continue;
+            }
+            if is_remote_url_host(host) {
+                return true;
+            }
+            continue;
         }
         // A bare host-like positional (`example.com`, `example.com/x`): the part
         // before any path component must contain a dot and look like a hostname.
+        // A loopback literal (`127.0.0.1/x`) is excluded for the same reason as the
+        // scheme case above.
         let host_part = a.split('/').next().unwrap_or(a);
         if host_part.contains('.')
             && !host_part.starts_with('.')
@@ -955,6 +1005,7 @@ fn network_invocation_has_remote_target(args: &[String]) -> bool {
             && host_part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+            && is_remote_url_host(host_part)
         {
             return true;
         }
@@ -2286,6 +2337,62 @@ mod tests {
                 .contains(&EventKind::Network),
             "`wget example.com/install.sh` must record a Network event"
         );
+    }
+
+    #[test]
+    fn derive_network_excludes_local_and_file_targets() {
+        // R4: a downloader pointed at a LOCAL/loopback host or a `file://` URL is
+        // not a remote egress, so it must record NO Network event (and so cannot
+        // feed a false W7 secret-write/dependency-change correlation). A genuine
+        // remote host still records Network.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+
+        // file:// is not a network fetch.
+        assert!(
+            !kinds(&derive_typed_events("curl file:///etc/passwd", &v))
+                .contains(&EventKind::Network),
+            "`curl file:///etc/passwd` must NOT record a Network event"
+        );
+        // Loopback hosts (named, IPv4, IPv6 bracketed), with and without a port.
+        for cmd in [
+            "curl http://localhost:8080/x",
+            "curl http://127.0.0.1/x",
+            "wget http://[::1]/x",
+            "curl https://localhost:8080",
+            "curl http://0.0.0.0/x",
+            "curl http://api.localhost/x",
+        ] {
+            assert!(
+                !kinds(&derive_typed_events(cmd, &v)).contains(&EventKind::Network),
+                "`{cmd}` targets a local host and must NOT record a Network event"
+            );
+        }
+        // A loopback IP positional (no scheme) is likewise not remote.
+        assert!(
+            !kinds(&derive_typed_events("curl 127.0.0.1:8080/x", &v)).contains(&EventKind::Network),
+            "`curl 127.0.0.1:8080/x` must NOT record a Network event"
+        );
+
+        // A real remote host still records Network.
+        assert!(
+            kinds(&derive_typed_events("curl https://evil.example.com", &v))
+                .contains(&EventKind::Network),
+            "`curl https://evil.example.com` MUST record a Network event"
+        );
+
+        // Focused unit on the deriver itself.
+        assert!(network_invocation_has_remote_target(&[
+            "https://evil.example.com".to_string()
+        ]));
+        assert!(!network_invocation_has_remote_target(&[
+            "http://localhost:8080/x".to_string()
+        ]));
+        assert!(!network_invocation_has_remote_target(&[
+            "file:///etc/passwd".to_string()
+        ]));
+        assert!(!network_invocation_has_remote_target(&[
+            "http://[::1]:9000/x".to_string()
+        ]));
     }
 
     #[test]

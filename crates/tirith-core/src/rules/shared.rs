@@ -89,6 +89,20 @@ pub fn is_url_shortener(host: &str) -> bool {
     URL_SHORTENER_HOSTS.iter().any(|s| lower == *s)
 }
 
+/// `true` when `host` is a loopback / local target that never leaves the
+/// machine: `localhost`, the `127.0.0.0/8` loopback block (`127.*`), IPv6 `::1`
+/// (bracketed or bare), the unspecified address `0.0.0.0`, or any `*.localhost`
+/// name. Centralised so `transport.rs` (PlainHttpToSink) and `escalation.rs`
+/// (W7 Network-event derivation) share one definition and cannot drift. Matching
+/// is exact and case-sensitive on the already-lowercased host the callers pass.
+pub fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    ) || host.starts_with("127.")
+        || host.ends_with(".localhost")
+}
+
 /// Canonical "critical" criticality labels for the M8 context/SSH/IaC/container
 /// rules; a label outside this set never fires. Centralised to avoid the
 /// four-copy drift hazard (PR-127 review #7). Case-insensitive, whitespace-trimmed.

@@ -94,7 +94,16 @@ fn load_map() -> BTreeMap<String, PendingDecision> {
     };
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return BTreeMap::new(),
+        // A missing file is the normal "no decisions yet" case: empty map, silent.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        // Any OTHER read error (permission denied, transient I/O) must NOT be
+        // collapsed silently: a subsequent save under `with_store_locked` would
+        // then overwrite a real `pending.json` with an empty snapshot. Report it
+        // (matching the parse-error branch below) and stay usable with an empty map.
+        Err(e) => {
+            eprintln!("tirith: pending: cannot read store {}: {e}", path.display());
+            return BTreeMap::new();
+        }
     };
     if contents.trim().is_empty() {
         return BTreeMap::new();
@@ -135,6 +144,13 @@ fn save_map(map: &BTreeMap<String, PendingDecision>) -> Result<(), String> {
     }
     tmp.write_all(json.as_bytes())
         .map_err(|e| format!("write temp file: {e}"))?;
+    // fsync the temp file before the rename so a crash between write and flush
+    // cannot leave `pending.json` empty/truncated (matches `write_file_atomic` in
+    // crates/tirith/src/cli/mod.rs). This is a regular file, so sync_all is safe
+    // on Windows, unlike a directory fsync.
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync temp file: {e}"))?;
     tmp.persist(&path)
         .map_err(|e| format!("persist pending store: {e}"))?;
     Ok(())

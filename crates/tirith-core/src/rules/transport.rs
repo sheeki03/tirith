@@ -1,4 +1,5 @@
 use crate::parse::UrlLike;
+use crate::rules::shared::is_loopback_host;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run transport rules against a parsed URL.
@@ -25,14 +26,6 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
     }
 
     findings
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    ) || host.starts_with("127.")
-        || host.ends_with(".localhost")
 }
 
 fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Finding>) {

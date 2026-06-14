@@ -22,15 +22,12 @@ pub fn list(format_json: bool) -> i32 {
     let _ = pending::expire_older_than(PENDING_RETENTION_SECS);
     let entries = pending::list_unresolved();
     if format_json {
-        match serde_json::to_string_pretty(&entries) {
-            Ok(s) => {
-                println!("{s}");
-                0
-            }
-            Err(e) => {
-                eprintln!("tirith pending list: JSON serialization failed: {e}");
-                2
-            }
+        // Serialize through the shared helper so a broken pipe (EPIPE) returns a
+        // non-zero exit instead of panicking, and the exit code follows the write.
+        if super::write_json_stdout(&entries, "tirith pending list: failed to write JSON output") {
+            0
+        } else {
+            2
         }
     } else {
         if entries.is_empty() {
@@ -128,32 +125,43 @@ pub fn resolve(id: &str, action: &str, reason: Option<String>) -> i32 {
 /// Export all pending decisions as pretty JSON to a file or stdout.
 pub fn export(output: Option<PathBuf>) -> i32 {
     let all = pending::load_all();
-    let json = match serde_json::to_string_pretty(&all) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tirith pending export: JSON serialization failed: {e}");
-            return 2;
-        }
-    };
 
     match output {
-        Some(path) => match std::fs::write(&path, json.as_bytes()) {
-            Ok(()) => {
-                println!(
-                    "Wrote {} pending decision(s) to {}",
-                    all.len(),
-                    path.display()
-                );
-                0
+        Some(path) => {
+            // The file path still pre-serializes (the bytes are written to a file,
+            // not stdout, so the EPIPE concern does not apply here).
+            let json = match serde_json::to_string_pretty(&all) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("tirith pending export: JSON serialization failed: {e}");
+                    return 2;
+                }
+            };
+            match std::fs::write(&path, json.as_bytes()) {
+                Ok(()) => {
+                    println!(
+                        "Wrote {} pending decision(s) to {}",
+                        all.len(),
+                        path.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("tirith pending export: write {}: {e}", path.display());
+                    2
+                }
             }
-            Err(e) => {
-                eprintln!("tirith pending export: write {}: {e}", path.display());
+        }
+        // Stdout export goes through the shared helper: pass the object directly
+        // (the helper serializes) so a broken pipe returns non-zero rather than
+        // panicking, and the exit code follows the write.
+        None => {
+            if super::write_json_stdout(&all, "tirith pending export: failed to write JSON output")
+            {
+                0
+            } else {
                 2
             }
-        },
-        None => {
-            println!("{json}");
-            0
         }
     }
 }
