@@ -27,5 +27,5 @@ DAN mode
 # like "from now on the build is faster" or "act as if nothing happened" in a
 # changelog does not match. "from now on" needs a tier-1 paste fragment in
 # build.rs (the "act as" fragment already covers "act as if").
-from now on,?\s+(you|act|ignore|respond)
-act as if you(?:'re| are)?
+from now on,?\s+(you|act|ignore|respond)\b
+act as if you(?:'re| are)?\b

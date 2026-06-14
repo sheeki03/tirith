@@ -225,6 +225,20 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
             None => {}
         }
     }
+    // Fail-safe: do NOT switch signing ON mid-stream over a non-empty log whose
+    // prior chained entries are unsigned. Verification would then expect every
+    // chained line to be signed (signing_expected = any_line_signed OR
+    // head.signing_enabled) and flag the intact, legitimately-unsigned prior
+    // entries as signature downgrades, corrupting an otherwise valid log. The
+    // operator must rotate the log first so signing starts from a fresh genesis.
+    // (`prev_count` is the prior on-disk line count read under the lock above.)
+    if !was_signed && signed_now && prev_count > 0 {
+        let reason =
+            "cannot enable signing on a non-empty unsigned log; rotate the log first".to_string();
+        audit_diagnostic(format!("tirith: audit: {reason}"));
+        let _ = fs2::FileExt::unlock(&file);
+        return AuditWrite::Failed(reason);
+    }
     // Signing state is monotonic per log: once any entry was signed, the receipt
     // records it so a later signature strip is detectable even if the current
     // entry happens to be unsigned.
@@ -271,6 +285,9 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
                 head_hash: self_hash,
                 count: prev_count + 1,
                 signing_enabled,
+                // `write_head` fills this in by signing the receipt when
+                // `signing_enabled`; the constructor leaves it None.
+                sig: None,
             },
         ) {
             let reason = format!("head receipt write failed: {e}");
@@ -291,6 +308,18 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
 // line breaks the chain. A per-log `<path>.head` receipt records the latest hash
 // + count so tail TRUNCATION is detectable (the chain alone cannot catch it).
 // Legacy lines without `prev_hash` are tolerated as an unchained prefix.
+//
+// Signing-state integrity (F5). For a SIGNED log, the head receipt is itself
+// ed25519-signed (see `write_head` / [`HeadReceipt::sig`]), binding
+// `signing_enabled` under a signature an attacker without the private key cannot
+// forge. That, together with `signing_expected = any_line_signed ||
+// head.signing_enabled`, closes the "strip every `sig` and rewrite the receipt to
+// look unsigned" downgrade for signed logs: any head tamper invalidates the head
+// signature and verify fails. HONEST LIMITATION: for an UNSIGNED log there is no
+// key, so this anchor cannot exist. A fully local attacker can strip a log back
+// to plain unsigned lines and there is no cryptographic way for purely local
+// verification to prove signing was NEVER enabled. Proving that requires an
+// external anchor (an off-box signed copy, or an out-of-band `--expected-head`).
 
 /// Canonical JSON: object keys sorted recursively, compact, no whitespace, so a
 /// re-canonicalization on read reproduces the bytes hashed on write regardless
@@ -401,6 +430,14 @@ struct HeadReceipt {
     /// Defaults to false so pre-signing receipts parse unchanged.
     #[serde(default)]
     signing_enabled: bool,
+    /// F5: ed25519 signature (base64) over this receipt's canonical JSON with its
+    /// OWN `sig` excluded. Present only for SIGNED logs (`signing_enabled`), set in
+    /// [`write_head`] using the audit signing key. Closes the strip-all + head
+    /// rewrite bypass: an attacker without the private key cannot flip
+    /// `signing_enabled` to false (or otherwise rewrite the receipt) without
+    /// invalidating this signature. Defaults to None so pre-F5 receipts parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
 }
 
 fn head_path(log_path: &std::path::Path) -> PathBuf {
@@ -414,15 +451,46 @@ fn read_head(log_path: &std::path::Path) -> Option<HeadReceipt> {
     serde_json::from_str(&s).ok()
 }
 
+/// Compute the canonical JSON of a head receipt with its OWN `sig` excluded, the
+/// exact bytes signed in [`write_head`] and verified in [`verify_audit_log`]. Key
+/// order is normalized (sorted) so re-serialization on read reproduces the bytes.
+fn head_canonical_unsigned(receipt: &HeadReceipt) -> Option<String> {
+    let mut v = serde_json::to_value(receipt).ok()?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("sig");
+    }
+    Some(canonical_json_string(&v))
+}
+
 /// Refresh the per-log head receipt durably. We already hold the log's exclusive
 /// lock, so there is no concurrent writer. The receipt is the truncation anchor;
 /// if the log line is durable but the receipt is lost or rolled back by more than
 /// one entry, `verify_audit_log` reports a false truncation. So the temp file is
 /// fsynced before the atomic rename, and the parent directory is fsynced after,
 /// before this returns. `Err` means the receipt is NOT durably on disk.
+///
+/// F5: for a SIGNED log (`receipt.signing_enabled`), the receipt is itself signed
+/// with the audit signing key (over its canonical JSON, own `sig` excluded) before
+/// it is written. That binds `signing_enabled`, `head_hash`, and `count` under a
+/// signature an attacker without the private key cannot forge, so flipping
+/// `signing_enabled` to false (the strip-all downgrade) invalidates the head.
 fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Result<()> {
     let hp = head_path(log_path);
-    let s = serde_json::to_string(receipt)
+
+    // Sign the receipt itself when the log is signed. Best-effort on the signing
+    // step (if the key is momentarily unavailable the receipt is written unsigned;
+    // verify then fails closed on a signed log with an unverifiable head, which is
+    // the safe direction). The line-write path already refuses to mark a log
+    // signed without a key, so in practice the key is present here.
+    let to_write = if receipt.signing_enabled {
+        let mut signed = receipt.clone();
+        signed.sig =
+            head_canonical_unsigned(&signed).and_then(|canon| sign_canonical(canon.as_bytes()));
+        std::borrow::Cow::Owned(signed)
+    } else {
+        std::borrow::Cow::Borrowed(receipt)
+    };
+    let s = serde_json::to_string(to_write.as_ref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // The temp file is created fresh each call and renamed into place immediately.
@@ -443,8 +511,12 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
     // durable (a rename is a directory metadata change).
     fs::rename(&tmp, &hp)?;
     if let Some(dir) = hp.parent() {
+        // Opening a directory as a File is best-effort: on Windows it fails, so an
+        // open error must NOT fail the write (that would break every Windows head
+        // write). But when the open SUCCEEDS (unix), a failing `sync_all()` means
+        // the rename is not durably recorded, so surface that as the write error.
         if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
+            d.sync_all()?;
         }
     }
     Ok(())
@@ -712,14 +784,74 @@ pub fn verify_audit_log(
         );
     }
 
+    // F5: verify the HEAD RECEIPT's own signature when the log is signed. The chain
+    // hash excludes `sig`, so an attacker could strip every line's `sig` AND set
+    // the receipt's `signing_enabled=false` to masquerade the log as unsigned.
+    // Anchoring `signing_expected` in the chained data (any_line_signed) already
+    // means stripping must ALSO rewrite the receipt; signing the receipt closes the
+    // loop: without the private key the attacker cannot re-sign a tampered receipt,
+    // so any head edit (including flipping `signing_enabled`) invalidates this
+    // signature. For an UNSIGNED log there is no key and this anchor cannot exist;
+    // see the module note: local verification cannot prove signing was NEVER
+    // enabled on an unsigned log without an external anchor.
+    if report.signing_expected {
+        if let (Some(h), Some(vk)) = (head.as_ref(), verify_key.as_ref()) {
+            let head_sig_ok = match (h.sig.as_deref(), head_canonical_unsigned(h)) {
+                (Some(sig_b64), Some(canon)) => base64::engine::general_purpose::STANDARD
+                    .decode(sig_b64)
+                    .ok()
+                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                    .map(|sig| {
+                        use ed25519_dalek::Verifier;
+                        vk.verify(canon.as_bytes(), &sig).is_ok()
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !head_sig_ok {
+                report.ok = false;
+                report
+                    .problems
+                    .push("head signature invalid (possible signing-state downgrade)".to_string());
+            }
+        }
+    }
+
     match head {
         Some(head) => {
             let n = hashes.len();
+            // The head `count` is the TOTAL number of log lines the receipt covers
+            // (set as `prev_count + 1` in `write_head`, where `prev_count` starts
+            // from `count_lines` over the whole file including any legacy-unchained
+            // prefix). So a clean tail must match BOTH the tail hash AND the line
+            // count: a stale/rewritten receipt that reuses an old hash but reports
+            // the wrong count is otherwise accepted, hiding a rollback/replace.
             if n > 0 && head.head_hash == hashes[n - 1] {
-                report.head_status = format!("head receipt OK (count {})", head.count);
+                if head.count == n as u64 {
+                    report.head_status = format!("head receipt OK (count {})", head.count);
+                } else {
+                    report.ok = false;
+                    report.head_status = format!(
+                        "head receipt count mismatch: expected {n}, got {}",
+                        head.count
+                    );
+                    report.problems.push(report.head_status.clone());
+                }
             } else if n > 1 && head.head_hash == hashes[n - 2] {
-                report.head_status =
-                    "head receipt is one entry behind (crash window); acceptable".to_string();
+                // The documented crash window: the last line synced but the receipt
+                // still points one entry back, so its count must be exactly n - 1.
+                if head.count == (n - 1) as u64 {
+                    report.head_status =
+                        "head receipt is one entry behind (crash window); acceptable".to_string();
+                } else {
+                    report.ok = false;
+                    report.head_status = format!(
+                        "head receipt count mismatch: expected {}, got {}",
+                        n - 1,
+                        head.count
+                    );
+                    report.problems.push(report.head_status.clone());
+                }
             } else {
                 report.ok = false;
                 report.head_status =
@@ -1655,6 +1787,7 @@ mod tests {
                 head_hash: second_to_last,
                 count: (lines.len() - 1) as u64,
                 signing_enabled: false,
+                sig: None,
             },
         )
         .expect("rewrite head receipt");
@@ -1693,6 +1826,7 @@ mod tests {
                 head_hash: "f00dfeed".repeat(8),
                 count: 1,
                 signing_enabled: false,
+                sig: None,
             },
         )
         .expect("rewrite head receipt");
@@ -1703,6 +1837,53 @@ mod tests {
             report.head_status.contains("truncation"),
             "head_status should flag possible truncation: {}",
             report.head_status
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_verify_head_count_mismatch_fails() {
+        // F3: a receipt whose head_hash MATCHES the current tail but whose `count`
+        // is wrong (a stale/rewritten receipt reusing an old hash) must be rejected
+        // with a clear count-mismatch status, not silently accepted.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        append_chain(&log, &["Allow", "Block", "Warn"]);
+
+        // Recompute the REAL tail hash, then write a head with that exact hash but
+        // a deliberately wrong count (the tail is intact, only the count lies).
+        let content = std::fs::read_to_string(&log).unwrap();
+        let last = content.lines().last().unwrap();
+        let real_tail = line_hash(last).unwrap();
+        write_head(
+            &log,
+            &HeadReceipt {
+                head_hash: real_tail,
+                count: 99, // wrong: the log has 3 lines
+                signing_enabled: false,
+                sig: None,
+            },
+        )
+        .expect("rewrite head receipt");
+
+        let report = verify_audit_log(&log, None);
+        assert!(
+            !report.ok,
+            "a head with the right tail hash but a wrong count must fail"
+        );
+        assert!(
+            report.head_status.contains("count mismatch"),
+            "head_status should flag a count mismatch: {}",
+            report.head_status
+        );
+        assert!(
+            report.problems.iter().any(|p| p.contains("count mismatch")),
+            "a count-mismatch problem must be reported: {:?}",
+            report.problems
         );
     }
 
@@ -1770,6 +1951,87 @@ mod tests {
                     .iter()
                     .any(|p| p.contains("signature downgrade")),
                 "a signature-downgrade problem must be reported: {:?}",
+                report.problems
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signed_head_signature_detects_signing_enabled_flip() {
+        // F5: for a SIGNED log the head receipt is itself signed. Flipping
+        // `head.signing_enabled` to false (the strip-all + head-rewrite downgrade)
+        // invalidates the head signature, so verify must fail on "head signature
+        // invalid". An intact signed log (with a signed head) verifies ok.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+        let vk = sk.verifying_key();
+        std::fs::write(cfg.join("tirith").join("audit-signing.key"), sk.to_bytes()).unwrap();
+        std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            append_chain(&log, &["Allow", "Block", "Warn"]);
+
+            // Intact signed log with a SIGNED head verifies clean.
+            let clean = verify_audit_log(&log, None);
+            assert!(
+                clean.ok,
+                "a signed, intact log with a signed head must verify ok: {:?}",
+                clean.problems
+            );
+            assert!(clean.signing_expected, "signing must be expected");
+
+            // The head sidecar must itself carry a `sig`.
+            let hp = head_path(&log);
+            let head_json = std::fs::read_to_string(&hp).unwrap();
+            let mut head_val: serde_json::Value = serde_json::from_str(&head_json).unwrap();
+            assert!(
+                head_val.get("sig").and_then(|s| s.as_str()).is_some(),
+                "a signed log's head receipt must carry its own signature: {head_json}"
+            );
+
+            // Flip `signing_enabled` to false WITHOUT re-signing (the attacker has
+            // no private key). The lines stay signed, so `any_line_signed` keeps
+            // signing_expected = true, and the head signature no longer matches the
+            // tampered receipt body.
+            head_val.as_object_mut().unwrap().insert(
+                "signing_enabled".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            std::fs::write(&hp, serde_json::to_string(&head_val).unwrap()).unwrap();
+
+            let report = verify_audit_log(&log, None);
+            assert!(
+                !report.ok,
+                "flipping head.signing_enabled on a signed log must fail verification"
+            );
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("head signature invalid")),
+                "a head-signature-invalid problem must be reported: {:?}",
                 report.problems
             );
         });
@@ -1882,6 +2144,73 @@ mod tests {
             // The poisoned unsigned line must NOT have been written.
             let n = std::fs::read_to_string(&log).unwrap().lines().count();
             assert_eq!(n, 1, "the unsigned entry must not have been appended");
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_append_refuses_to_enable_signing_on_nonempty_unsigned_log() {
+        // F4: switching signing ON mid-stream over a non-empty UNSIGNED log must
+        // FAIL (and not append). Verification would otherwise expect every chained
+        // line to be signed and flag the intact, legitimately-unsigned prior
+        // entries as downgrades. The operator must rotate the log first.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("tirith")).unwrap();
+        let key_path = cfg.join("tirith").join("audit-signing.key");
+
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let log = dir.path().join("audit.jsonl");
+            // Two UNSIGNED appends first (no key on disk yet).
+            append_chain(&log, &["Allow", "Block"]);
+            let before = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(before.lines().count(), 2, "two unsigned lines written");
+            assert!(
+                !before.lines().any(|l| l.contains("\"sig\"")),
+                "the prior entries must be unsigned"
+            );
+
+            // Now plant a signing key and attempt a THIRD append: signing would
+            // turn on over a non-empty unsigned log, which must be refused.
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+            std::fs::write(&key_path, sk.to_bytes()).unwrap();
+            let third = append_to_audit_log(&chain_test_entry("Warn"), Some(log.clone()));
+            assert!(
+                matches!(third, AuditWrite::Failed(_)),
+                "enabling signing on a non-empty unsigned log must fail"
+            );
+            if let AuditWrite::Failed(reason) = &third {
+                assert!(
+                    reason.contains("rotate the log first"),
+                    "the failure reason must explain rotation: {reason}"
+                );
+            }
+
+            // No new line was appended.
+            let after = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                after.lines().count(),
+                2,
+                "the refused append must not add a line"
+            );
         });
 
         // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.

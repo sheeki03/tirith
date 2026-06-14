@@ -964,20 +964,26 @@ fn network_invocation_has_remote_target(args: &[String]) -> bool {
 
 /// True if `args` (the args AFTER `git`) describe a force-push: the git
 /// SUBCOMMAND is `push` AND a force flag (`--force`, `-f`, `--force-with-lease`)
-/// is present. The subcommand is the first token that is neither a global option
-/// nor a global option's value, so a `-f` belonging to a different subcommand
-/// (e.g. `git tag -f push`) does NOT count: there the subcommand is `tag`, not
-/// `push`. Global options before the subcommand (`git -c k=v push --force`,
-/// `git --git-dir /repo push --force`) are skipped, including the separate value
-/// a value-taking global consumes (see [`git_subcommand`]).
+/// is present AFTER the subcommand. The subcommand is the first token that is
+/// neither a global option nor a global option's value, so a `-f` belonging to a
+/// different subcommand (e.g. `git tag -f push`) does NOT count: there the
+/// subcommand is `tag`, not `push`. Global options before the subcommand
+/// (`git -c k=v push --force`, `git --git-dir /repo push --force`) are skipped,
+/// including the separate value a value-taking global consumes (see
+/// [`git_subcommand_index`]). Crucially the force-flag scan starts AFTER the
+/// subcommand index, so a force token that is actually a GLOBAL's value
+/// (`git --git-dir --force push`, where `--force` is the value of `--git-dir`,
+/// not a flag) is NOT mistaken for a real `push --force`.
 fn git_is_force_push(args: &[String]) -> bool {
-    let Some(subcommand) = git_subcommand(args) else {
+    let Some(sub_idx) = git_subcommand_index(args) else {
         return false;
     };
-    if subcommand != "push" {
+    if args[sub_idx] != "push" {
         return false;
     }
-    args.iter().any(|a| {
+    // Only scan tokens AFTER the `push` subcommand. Anything at or before
+    // `sub_idx` is a global option or a global's value, never a `push` force flag.
+    args.iter().skip(sub_idx + 1).any(|a| {
         a == "--force"
             || a == "-f"
             || a == "--force-with-lease"
@@ -985,15 +991,17 @@ fn git_is_force_push(args: &[String]) -> bool {
     })
 }
 
-/// The git subcommand: the first token that is neither a global option nor the
-/// value a value-taking global option consumes. Several git globals take a
-/// SEPARATE following token (`-c <name=value>`, `-C <path>`, `--git-dir <dir>`,
-/// `--work-tree <dir>`, `--namespace <name>`); that following token is skipped
-/// too, otherwise it would be mistaken for the subcommand (e.g. in
-/// `git --git-dir /repo push --force` the `/repo` value must not be read as the
-/// subcommand, which would hide the `push --force`). The `=`-attached forms
+/// The INDEX of the git subcommand within `args`: the first token that is neither
+/// a global option nor the value a value-taking global option consumes. Several
+/// git globals take a SEPARATE following token (`-c <name=value>`, `-C <path>`,
+/// `--git-dir <dir>`, `--work-tree <dir>`, `--namespace <name>`); that following
+/// token is skipped too, otherwise it would be mistaken for the subcommand (e.g.
+/// in `git --git-dir /repo push --force` the `/repo` value must not be read as
+/// the subcommand, which would hide the `push --force`). The `=`-attached forms
 /// (`--git-dir=/repo`) are self-contained and skipped by the leading-`-` test.
-fn git_subcommand(args: &[String]) -> Option<&String> {
+/// Returning the index (not the token) lets callers scope a scan to the tokens
+/// strictly after the subcommand.
+fn git_subcommand_index(args: &[String]) -> Option<usize> {
     /// git global options whose value is a SEPARATE following token.
     const VALUE_TAKING_GLOBALS: &[&str] = &[
         "-c",
@@ -1019,7 +1027,7 @@ fn git_subcommand(args: &[String]) -> Option<&String> {
             }
             continue;
         }
-        return Some(a);
+        return Some(i);
     }
     None
 }
@@ -2212,6 +2220,31 @@ mod tests {
             !kinds(&derive_typed_events("git --git-dir /r status", &v))
                 .contains(&EventKind::GitForcePush),
             "`git --git-dir /r status` is not a force-push"
+        );
+    }
+
+    #[test]
+    fn derive_git_force_push_ignores_force_consumed_as_global_value() {
+        // F8: a force token that is actually the VALUE of a value-taking global
+        // must NOT synthesize a force-push. In `git --git-dir --force push`,
+        // `--force` is the value of `--git-dir` (the subcommand is `push`, with NO
+        // force flag after it). Scanning the whole args slice would wrongly see
+        // `--force` and fabricate a DeleteThenForcePush feeder; scoping the scan to
+        // tokens AFTER the subcommand index avoids it.
+        let v = raw_verdict_with(Action::Allow, vec![], None);
+        assert!(
+            !kinds(&derive_typed_events(
+                "git --git-dir --force push origin main",
+                &v
+            ))
+            .contains(&EventKind::GitForcePush),
+            "`git --git-dir --force push` is NOT a force-push (--force is --git-dir's value)"
+        );
+        // And the real thing is still caught: a genuine `push --force`.
+        assert!(
+            kinds(&derive_typed_events("git push --force origin main", &v))
+                .contains(&EventKind::GitForcePush),
+            "`git push --force origin main` IS a force-push"
         );
     }
 

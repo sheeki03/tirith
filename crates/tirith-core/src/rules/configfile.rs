@@ -982,31 +982,56 @@ fn find_external_http_url(content: &str) -> Option<String> {
     // Scan for each `http://` / `https://` occurrence; the first with a non-local
     // host wins. Bounded by a small set of URL-terminating characters so the
     // captured span is just the URL, not the rest of the line.
+    //
+    // Scheme matching is CASE-INSENSITIVE: schemes are case-insensitive
+    // (RFC 3986), so `HTTPS://evil` is just as external as `https://evil`. We
+    // lowercase only for finding the scheme position/length; the captured URL and
+    // host are sliced from the ORIGINAL-case `content` (the ASCII scheme bytes are
+    // single-byte, so lowercase indices map 1:1 onto the original).
+    let lowered = content.to_ascii_lowercase();
     let mut search_from = 0;
-    while search_from < content.len() {
-        let rest = &content[search_from..];
-        // Take the EARLIEST of the two scheme matches. `find("http://")` alone
-        // would return the `http://` index even when an `https://` occurs first,
-        // truncating the captured URL at the wrong scheme.
-        let rel = match (rest.find("http://"), rest.find("https://")) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
+    while search_from < lowered.len() {
+        let rest = &lowered[search_from..];
+        // Take the EARLIEST of the two scheme matches, paired with the matched
+        // scheme's own length. `find("http://")` alone would return the `http://`
+        // index even when an `https://` occurs first, truncating the captured URL
+        // at the wrong scheme; and a hardcoded advance length would desync on the
+        // longer scheme.
+        let (rel, scheme_len) = match (rest.find("http://"), rest.find("https://")) {
+            (Some(a), Some(b)) if a <= b => (a, "http://".len()),
+            (Some(_), Some(b)) => (b, "https://".len()),
+            (Some(a), None) => (a, "http://".len()),
+            (None, Some(b)) => (b, "https://".len()),
             (None, None) => return None,
         };
         let abs = search_from + rel;
         let tail = &content[abs..];
-        let end = tail
+        // Two end points are needed. `#` ends the URL AUTHORITY (a fragment is not
+        // part of the host), so `http://localhost/p#...` is a localhost URL; the
+        // captured/returned span and the host parse stop at `#`. But the FRAGMENT
+        // still belongs to that one URL token, so when advancing we must skip past
+        // the fragment too, otherwise an embedded `http://evil` inside the fragment
+        // (`http://localhost/p#http://evil`) would be re-detected as a separate
+        // external URL on the next pass. `token_end` therefore does NOT treat `#` as
+        // a terminator.
+        let url_end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | ')' | '#')
+            })
+            .unwrap_or(tail.len());
+        let token_end = tail
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | ')'))
             .unwrap_or(tail.len());
-        let url = &tail[..end];
+        let url = &tail[..url_end];
         if let Some(host) = extract_host_from_url(url) {
             if !host.is_empty() && !is_local_host(host) {
                 return Some(truncate_ascii(url, 80));
             }
         }
-        // Advance past this occurrence to avoid an infinite loop on a local URL.
-        search_from = abs + "http".len();
+        // Advance past the WHOLE URL token (fragment included), never less than the
+        // matched scheme length, so a local URL's fragment cannot re-trigger and the
+        // loop always makes progress.
+        search_from = abs + token_end.max(scheme_len);
     }
     None
 }
@@ -2315,6 +2340,49 @@ mod tests {
             got.as_deref(),
             Some("https://evil.example.com/a"),
             "earliest scheme (the external https URL) must win, not the later http one",
+        );
+    }
+
+    #[test]
+    fn test_find_external_http_url_uppercase_scheme_detected() {
+        // F9: scheme matching is case-insensitive. An UPPERCASE `HTTPS://` host is
+        // just as external as a lowercase one; the old case-sensitive `find`
+        // missed it entirely.
+        let got = find_external_http_url("see HTTPS://evil.example.com/x for details");
+        assert_eq!(
+            got.as_deref(),
+            Some("HTTPS://evil.example.com/x"),
+            "an uppercase HTTPS scheme must be detected as external",
+        );
+        // Mixed case too.
+        let got = find_external_http_url("HtTp://Evil.Example.Com/y");
+        assert_eq!(
+            got.as_deref(),
+            Some("HtTp://Evil.Example.Com/y"),
+            "a mixed-case http scheme must be detected as external",
+        );
+    }
+
+    #[test]
+    fn test_find_external_http_url_fragment_terminates_url() {
+        // F9: `#` terminates the URL (a fragment is not part of the authority), so
+        // a localhost URL with an `http://evil` fragment stays localhost and is NOT
+        // treated as external.
+        let got = find_external_http_url("http://localhost/page#http://evil.example.com");
+        assert_eq!(
+            got, None,
+            "a localhost URL with an external-looking fragment must NOT be external: {got:?}",
+        );
+        // A plain fragment on a localhost URL is likewise not external.
+        let got = find_external_http_url("http://localhost/page#section");
+        assert_eq!(got, None, "localhost#section is not external: {got:?}");
+        // But a genuinely external host with a fragment is still external (and the
+        // fragment is trimmed off the captured URL).
+        let got = find_external_http_url("https://evil.example.com/p#frag");
+        assert_eq!(
+            got.as_deref(),
+            Some("https://evil.example.com/p"),
+            "an external URL with a fragment is external, fragment trimmed",
         );
     }
 

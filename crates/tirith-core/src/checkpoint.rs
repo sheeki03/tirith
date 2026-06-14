@@ -46,6 +46,14 @@ pub struct CheckpointMeta {
     pub paths: Vec<String>,
     pub total_bytes: u64,
     pub file_count: usize,
+    /// F6: the working directory at capture time, persisted so a RELATIVE
+    /// `original_path` in the manifest is restored against the SAME root it was
+    /// captured under, not against whatever cwd the restore happens to run in
+    /// (which could overwrite unrelated files). Absent on pre-F6 checkpoints
+    /// (serde-default None); a relative entry is then rejected at restore time
+    /// because it cannot be anchored safely.
+    #[serde(default)]
+    pub capture_root: Option<String>,
 }
 
 /// File manifest entry: original path → SHA-256 of content.
@@ -166,6 +174,11 @@ pub fn create(paths: &[&str], trigger_command: Option<&str>) -> Result<Checkpoin
         paths: paths.iter().map(|s| s.to_string()).collect(),
         total_bytes,
         file_count: manifest.len(),
+        // Persist the capture-time cwd so a relative `original_path` restores
+        // against this root, independent of the cwd at restore time.
+        capture_root: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
     };
 
     let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize: {e}"))?;
@@ -286,6 +299,44 @@ fn validate_restore_path(path: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// F6: resolve a manifest `original_path` into the absolute destination to write.
+///
+/// * An ABSOLUTE `original_path` is used verbatim (it already names a concrete
+///   location; the auto-checkpoint path records an absolute cwd).
+/// * A RELATIVE `original_path` is anchored to `capture_root` (the cwd at capture
+///   time, persisted in meta.json) so the restore target does not depend on the
+///   caller's cwd at restore time. After joining, the result must stay CONTAINED
+///   within `capture_root` (defense in depth; `..` is already rejected upstream by
+///   [`validate_restore_path`], so the lexical join cannot climb out).
+/// * A RELATIVE path with NO recorded `capture_root` (a pre-F6 checkpoint, or a
+///   missing/corrupt meta.json) cannot be anchored safely and is REJECTED rather
+///   than silently resolved against the caller's cwd.
+///
+/// The caller still applies [`reject_symlinked_restore_dest`] + [`copy_no_follow`]
+/// to the returned path, so symlink redirection at the final component is closed
+/// independently of this anchoring.
+fn anchor_restore_dst(original_path: &str, capture_root: Option<&Path>) -> Result<PathBuf, String> {
+    let p = Path::new(original_path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    let root = capture_root.ok_or_else(|| {
+        format!(
+            "relative restore path with no recorded capture root (cannot anchor safely): {original_path}"
+        )
+    })?;
+    let joined = root.join(p);
+    // Containment check: the joined path's components must begin with the root's.
+    // `..` was already rejected, so this is belt-and-suspenders against any future
+    // relaxation of `validate_restore_path`.
+    if !joined.starts_with(root) {
+        return Err(format!(
+            "relative restore path escapes the capture root: {original_path}"
+        ));
+    }
+    Ok(joined)
 }
 
 /// Refuse a restore destination that is reached through a symlink. `fs::copy`
@@ -414,6 +465,15 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     let manifest: Vec<ManifestEntry> =
         serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
 
+    // F6: the capture-time root used to anchor RELATIVE manifest paths. Read from
+    // meta.json (best-effort; a missing/corrupt meta or a pre-F6 checkpoint yields
+    // None, which makes relative entries non-anchorable and therefore rejected).
+    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
+        .and_then(|m| m.capture_root)
+        .map(PathBuf::from);
+
     let files_dir = cp_dir.join("files");
     let mut report = RestoreReport {
         checkpoint_id: checkpoint_id.to_string(),
@@ -475,7 +535,18 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             }
         }
 
-        let dst = Path::new(&entry.original_path);
+        // F6: anchor a RELATIVE original_path to the capture-time root so the
+        // restore target does not depend on the caller's cwd (which could clobber
+        // unrelated files). An absolute path is used verbatim. A relative path with
+        // no recorded capture_root cannot be anchored safely and is rejected.
+        let dst_buf = match anchor_restore_dst(&entry.original_path, capture_root.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push((entry.original_path.clone(), e));
+                continue;
+            }
+        };
+        let dst = dst_buf.as_path();
 
         // Refuse to write through a symlink. `fs::copy` follows symlinks at the
         // destination, so a repointed symlink at `dst` (or any existing parent
@@ -1528,6 +1599,212 @@ mod tests {
             live.as_deref(),
             Some("original bytes"),
             "the live file must be restored to its checkpointed bytes"
+        );
+    }
+
+    #[test]
+    fn test_anchor_restore_dst_resolution() {
+        // F6 unit: absolute paths pass through; relative paths anchor to the
+        // capture root; a relative path with no root is rejected.
+        let root = Path::new("/capture/root");
+        // Absolute -> verbatim.
+        assert_eq!(
+            anchor_restore_dst("/etc/hosts", Some(root)).unwrap(),
+            PathBuf::from("/etc/hosts")
+        );
+        // Relative -> anchored to the capture root.
+        assert_eq!(
+            anchor_restore_dst("sub/file.txt", Some(root)).unwrap(),
+            PathBuf::from("/capture/root/sub/file.txt")
+        );
+        // Relative with NO root -> rejected (cannot anchor safely).
+        assert!(
+            anchor_restore_dst("sub/file.txt", None).is_err(),
+            "a relative path with no capture root must be rejected"
+        );
+    }
+
+    /// F6: a checkpoint created with RELATIVE paths must restore against the
+    /// capture-time root, NOT the caller's cwd at restore time. Capturing in dir A
+    /// and restoring while cwd is dir B must write into A/<name>, leaving B
+    /// untouched. The old `dst = Path::new(&original_path)` resolved against the
+    /// restore cwd, so it would have written into B and could clobber unrelated
+    /// files there.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_reported_relative_path_anchors_to_capture_root() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Canonicalize so the macOS /var -> /private/var symlink does not trip the
+        // symlinked-ancestor guard (same rationale as the absolute-path test).
+        let base = fs::canonicalize(tmpdir.path()).unwrap();
+        let dir_a = base.join("capture_here");
+        let dir_b = base.join("restore_from_here");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let state_dir = base.join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "note.txt";
+        let run = || -> Result<RestoreReport, String> {
+            // Capture in dir A with a RELATIVE name (capture_root := dir A).
+            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
+            let meta = create(&[name], Some("rm -rf ."))?;
+            // Mutate the live file in A so a successful restore is observable.
+            fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
+            // Restore from a DIFFERENT cwd (dir B).
+            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+        let live_a = fs::read_to_string(dir_a.join(name)).ok();
+        let leaked_b = dir_b.join(name).exists();
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should succeed");
+        assert!(
+            report.restored.contains(&name.to_string()),
+            "the relative entry must restore (anchored to capture root): {report:?}"
+        );
+        assert_eq!(
+            live_a.as_deref(),
+            Some("captured bytes"),
+            "the file in the CAPTURE dir must be restored to its checkpointed bytes"
+        );
+        assert!(
+            !leaked_b,
+            "restore must NOT write into the caller's cwd (dir B); it leaked there"
+        );
+    }
+
+    /// F6: a relative manifest entry on a checkpoint whose meta.json has NO
+    /// recorded capture_root (a pre-F6 checkpoint) cannot be anchored safely, so it
+    /// must be bucketed into `errors` and NOT written into the caller's cwd.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_reported_legacy_relative_without_root_is_rejected() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmpdir.path()).unwrap();
+        let state_dir = base.join("state");
+        let cwd_dir = base.join("caller_cwd");
+        fs::create_dir_all(&cwd_dir).unwrap();
+
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "legacy.txt";
+        let run = || -> Result<RestoreReport, String> {
+            // Hand-build a pre-F6 checkpoint: meta.json WITHOUT capture_root, a
+            // manifest with a RELATIVE original_path, and a matching blob.
+            let cp_base = checkpoints_dir();
+            let id = "legacy-no-root";
+            let cp_dir = cp_base.join(id);
+            let files_dir = cp_dir.join("files");
+            fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir: {e}"))?;
+
+            let content = b"legacy content";
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(content);
+                format!("{:x}", h.finalize())
+            };
+            fs::write(files_dir.join(&sha), content).map_err(|e| format!("blob: {e}"))?;
+
+            // meta.json WITHOUT a capture_root key (legacy shape).
+            let meta = serde_json::json!({
+                "id": id,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "trigger_command": "rm -rf .",
+                "paths": [name],
+                "total_bytes": content.len(),
+                "file_count": 1
+            });
+            fs::write(cp_dir.join("meta.json"), meta.to_string())
+                .map_err(|e| format!("meta: {e}"))?;
+
+            let manifest = serde_json::json!([{
+                "original_path": name,
+                "sha256": sha,
+                "size": content.len(),
+                "is_dir": false
+            }]);
+            fs::write(cp_dir.join("manifest.json"), manifest.to_string())
+                .map_err(|e| format!("manifest: {e}"))?;
+
+            // Restore from a cwd where a leaked write would be observable.
+            std::env::set_current_dir(&cwd_dir).map_err(|e| format!("chdir: {e}"))?;
+            restore_reported(id)
+        };
+
+        let result = run();
+        let leaked = cwd_dir.join(name).exists();
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should succeed");
+        assert!(
+            report.restored.is_empty(),
+            "a non-anchorable relative entry must NOT restore: {report:?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|(p, msg)| p == name && msg.contains("capture root")),
+            "the legacy relative entry must be bucketed into errors: {report:?}"
+        );
+        assert!(
+            !leaked,
+            "restore must NOT write the legacy relative entry into the caller's cwd"
         );
     }
 

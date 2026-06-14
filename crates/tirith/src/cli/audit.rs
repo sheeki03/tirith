@@ -257,6 +257,16 @@ pub fn verify(expected_head: Option<&str>, json: bool) -> i32 {
                 "  signing: enabled ({} signed line(s))",
                 report.signed_lines
             );
+        } else {
+            // Honest limitation: for an UNSIGNED log there is no key, so local
+            // verification cannot prove signing was never enabled. A fully local
+            // attacker could strip signatures and rewrite the head to look
+            // unsigned. Detecting that requires an external anchor (a signed log,
+            // or an out-of-band --expected-head). See the audit.rs module note.
+            println!(
+                "  signing: not enabled (local verification cannot prove signing was \
+                 never enabled on an unsigned log without an external anchor)"
+            );
         }
         for p in &report.problems {
             println!("  problem: {p}");

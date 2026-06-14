@@ -249,8 +249,14 @@ pub fn suppress_check(
 ) -> bool {
     let key = crate::suppression::cooldown_key(rule_id, target);
     let now = chrono::Utc::now().to_rfc3339();
-    let expires =
-        (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs as i64)).to_rfc3339();
+    // Clamp before the i64 cast: a raw `cooldown_secs as i64` above i64::MAX wraps
+    // NEGATIVE, placing the expiry in the PAST and instantly expiring the cooldown.
+    // Clamp to u32::MAX seconds (~136 years), the same idiom `cutoff_time` /
+    // `is_within_minutes` use, which is far beyond any real cooldown and keeps
+    // both `Duration::seconds` (no internal-ms overflow) and the `Utc::now() + dur`
+    // addition (no DateTime-range overflow) well-defined and panic-free.
+    let cooldown_secs = cooldown_secs.min(u32::MAX as u64) as i64;
+    let expires = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs)).to_rfc3339();
     let mut suppressed = false;
     with_session_locked(session_id, |sw| {
         if crate::suppression::is_suppressed(&mut sw.cooldowns, &key, &now) {
@@ -1000,6 +1006,44 @@ mod tests {
         // The cooldown is persisted on the session record.
         let sw = load(sid);
         assert!(sw.cooldowns.contains_key("curl_pipe_shell"));
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("TIRITH_LOG");
+        }
+    }
+
+    #[test]
+    fn suppress_check_clamps_overflowing_cooldown() {
+        // A `cooldown_secs` above i64::MAX must NOT wrap negative (which would
+        // place the expiry in the past and instantly expire the cooldown). After
+        // clamping, the first sighting starts a far-future cooldown and the second
+        // sighting (same key) is suppressed.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+        let sid = "test-suppress-overflow";
+        // u64::MAX would overflow i64; the clamp keeps the expiry in the future.
+        assert!(!suppress_check(sid, "curl_pipe_shell", None, u64::MAX));
+        assert!(
+            suppress_check(sid, "curl_pipe_shell", None, u64::MAX),
+            "an overflowing cooldown must clamp (not wrap negative) and stay active"
+        );
+        // The persisted expiry parses as a real, future RFC3339 instant.
+        let sw = load(sid);
+        let expiry = sw
+            .cooldowns
+            .get("curl_pipe_shell")
+            .expect("cooldown persisted");
+        let parsed = chrono::DateTime::parse_from_rfc3339(expiry).expect("expiry is valid RFC3339");
+        assert!(
+            parsed > chrono::Utc::now(),
+            "clamped expiry must be in the future, got {expiry}"
+        );
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
             std::env::remove_var("TIRITH_LOG");
