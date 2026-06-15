@@ -420,6 +420,62 @@ fn reject_symlinked_checkpoint_dir(cp_dir: &Path) -> Result<(), String> {
     }
 }
 
+/// K3 (TOCTOU): `reject_symlinked_checkpoint_dir` is a PATH-based check, so after
+/// it passes an attacker could swap `cp_dir` for a symlink (or a different
+/// directory) before we read `manifest.json` / `meta.json` / the `files/` blobs.
+/// Mirror the `(dev, ino)` identity pin used in `audit.rs`'s append path: capture
+/// the directory's device + inode ONCE (via `symlink_metadata`, which does not
+/// follow the final component, so a real dir is pinned and a planted symlink is
+/// not silently resolved), then re-verify the same path still resolves to that
+/// identity immediately before each subsequent read. A mismatch fails closed.
+///
+/// Returns `None` on non-unix (no portable dev/ino) so the re-check is a vacuous
+/// pass there, preserving the prior best-effort behavior. Returns `Err` only when
+/// the directory cannot be stat'd at all (we then refuse to read it).
+#[cfg(unix)]
+fn capture_checkpoint_dir_identity(cp_dir: &Path) -> Result<Option<(u64, u64)>, String> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(cp_dir) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) => Err(format!("cannot stat checkpoint directory: {e}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_checkpoint_dir_identity(_cp_dir: &Path) -> Result<Option<(u64, u64)>, String> {
+    Ok(None)
+}
+
+/// Re-verify that `cp_dir` still resolves to the `(dev, ino)` captured by
+/// [`capture_checkpoint_dir_identity`]. Fails closed if the path now names a
+/// different inode (a swap), is a symlink, or cannot be stat'd. A vacuous pass when
+/// `captured` is `None` (non-unix, or identity capture was unavailable).
+fn verify_checkpoint_dir_identity(
+    cp_dir: &Path,
+    captured: Option<(u64, u64)>,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some((dev, ino)) = captured {
+            return match fs::symlink_metadata(cp_dir) {
+                Ok(m) if m.dev() == dev && m.ino() == ino => Ok(()),
+                Ok(_) => Err(format!(
+                    "checkpoint directory changed identity mid-read (possible swap): {}",
+                    cp_dir.display()
+                )),
+                Err(e) => Err(format!("cannot re-stat checkpoint directory: {e}")),
+            };
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cp_dir, captured);
+        Ok(())
+    }
+}
+
 fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
     // The destination file: a symlink here would have `fs::copy` write through it.
     if let Ok(meta) = fs::symlink_metadata(dst) {
@@ -459,18 +515,38 @@ fn reject_symlinked_restore_dest(dst: &Path) -> Result<(), String> {
 /// discipline: on unix it is opened with `O_NOFOLLOW` (plus create/truncate) so a
 /// symlink planted at `dst` is refused by the open itself; on non-unix it is
 /// created with `File::create` and relies on the caller's pre-write symlink check.
-fn copy_no_follow_from_reader<R: Read>(src: &mut R, dst: &Path) -> std::io::Result<()> {
+///
+/// `perms` are the source blob's permissions, preserved onto the restored file
+/// (CodeRabbit K2): without this the restored file would be created with the
+/// process default (`0o666 & umask`), so restoring a deleted `0600` secret would
+/// yield a WORLD-READABLE copy, a real permission leak. On unix the create mode is
+/// set from `perms` AND `set_permissions` is applied AFTER the copy, so both a
+/// freshly-created file and an existing-overwritten one (whose pre-existing mode
+/// the create-mode would not change) end up with the blob's mode. On non-unix the
+/// portable `set_permissions` still carries the readonly bit.
+fn copy_no_follow_from_reader<R: Read>(
+    src: &mut R,
+    dst: &Path,
+    perms: &fs::Permissions,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut out = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .custom_flags(libc::O_NOFOLLOW)
+            // Set the create mode from the blob so a NEWLY-created destination is
+            // never momentarily more permissive than the source.
+            .mode(perms.mode())
             .open(dst)?;
         std::io::copy(src, &mut out)?;
         out.sync_all()?;
+        // Re-apply after the copy: `.mode()` is ignored when `dst` already existed
+        // (its prior mode would otherwise survive), so this is what guarantees an
+        // overwritten file also matches the blob's permissions.
+        out.set_permissions(perms.clone())?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -478,6 +554,8 @@ fn copy_no_follow_from_reader<R: Read>(src: &mut R, dst: &Path) -> std::io::Resu
         let mut out = fs::File::create(dst)?;
         std::io::copy(src, &mut out)?;
         out.sync_all()?;
+        // Portable: carries at least the readonly bit on non-unix platforms.
+        out.set_permissions(perms.clone())?;
         Ok(())
     }
 }
@@ -544,7 +622,13 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     // would then follow that link. Reject a symlinked checkpoint directory before
     // any read. (`symlink_metadata` does not follow the final component.)
     reject_symlinked_checkpoint_dir(&cp_dir)?;
+    // K3 (TOCTOU): the symlink check above is path-based, so `cp_dir` could be
+    // swapped for a symlink/another directory before the reads below. Pin its
+    // `(dev, ino)` now and re-verify before each subsequent read so a mid-call swap
+    // fails closed instead of feeding an attacker-controlled manifest/meta/blob.
+    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
 
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
     let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
         .map_err(|e| format!("read manifest: {e}"))?;
     let manifest: Vec<ManifestEntry> =
@@ -553,6 +637,7 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     // F6: the capture-time root used to anchor RELATIVE manifest paths. Read from
     // meta.json (best-effort; a missing/corrupt meta or a pre-F6 checkpoint yields
     // None, which makes relative entries non-anchorable and therefore rejected).
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
     let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
@@ -586,6 +671,10 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             continue;
         }
 
+        // K3: re-verify the checkpoint dir identity before EACH `files/<sha>` read,
+        // so a swap part-way through a multi-entry restore is caught too. A mismatch
+        // aborts the whole restore (the store is no longer trustworthy).
+        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
         let src = files_dir.join(&entry.sha256);
         if !src.exists() {
             eprintln!(
@@ -704,7 +793,22 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
             report.errors.push((entry.original_path.clone(), e));
             continue;
         }
-        match copy_no_follow_from_reader(&mut blob, dst) {
+        // K2: preserve the backup blob's permissions onto the restored file.
+        // Read them from the OPEN blob handle (`fstat`, no path re-stat) so the
+        // mode applied is the one we just verified the bytes of. If the stat fails
+        // we cannot prove the source mode; bucket it as an error rather than risk
+        // creating the file with the over-permissive process default.
+        let blob_perms = match blob.metadata() {
+            Ok(m) => m.permissions(),
+            Err(e) => {
+                report.errors.push((
+                    entry.original_path.clone(),
+                    format!("cannot read backup permissions: {e}"),
+                ));
+                continue;
+            }
+        };
+        match copy_no_follow_from_reader(&mut blob, dst, &blob_perms) {
             Ok(_) => report.restored.push(entry.original_path.clone()),
             Err(e) => report
                 .errors
@@ -760,7 +864,13 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     // Same symlink guard as the restore path: a symlinked `cp_dir` could redirect
     // the manifest/file reads outside the store. Reject it before any read.
     reject_symlinked_checkpoint_dir(&cp_dir)?;
+    // K3 (TOCTOU): mirror `restore_reported` exactly. Pin the checkpoint dir's
+    // `(dev, ino)` after the path-based symlink check and re-verify before each
+    // read so a mid-call directory swap fails closed instead of reading an
+    // attacker-controlled manifest/meta/blob.
+    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
 
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
     let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
         .map_err(|e| format!("read manifest: {e}"))?;
     let manifest: Vec<ManifestEntry> =
@@ -770,6 +880,7 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     // meta.json) exactly as `restore_reported` does, rather than resolving them
     // against the caller's cwd. A missing/corrupt meta or a pre-F6 checkpoint yields
     // None, which makes a relative entry non-anchorable (skipped below).
+    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
     let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
@@ -786,6 +897,9 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
+        // K3: re-verify identity before EACH `files/<sha>` read; a swap part-way
+        // through aborts the diff (the store is no longer trustworthy).
+        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
         let backup = files_dir.join(&entry.sha256);
         if !backup.exists() {
             diffs.push(DiffEntry {
@@ -1639,6 +1753,85 @@ mod tests {
         );
     }
 
+    /// K2 (security regression): restoring a deleted file must reproduce its
+    /// ORIGINAL permissions, not the process default (`0o666 & umask`). A `0600`
+    /// secret that is checkpointed, deleted, then restored must come back `0600`,
+    /// otherwise the restore silently widens it to world-readable. The blob in
+    /// `files/<sha>` carries the captured mode (`fs::copy` preserves it), and the
+    /// restore now reapplies that mode onto the destination.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_preserves_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workdir = tmpdir.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+
+        let state_dir = tmpdir.path().join("state");
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state_dir);
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let name = "secret.txt";
+        let run = || -> Result<RestoreReport, String> {
+            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+            fs::write(name, "top secret").map_err(|e| format!("write: {e}"))?;
+            // Lock the original file down to owner-read/write only.
+            fs::set_permissions(name, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod: {e}"))?;
+            let meta = create(&[name], Some("rm -rf project"))?;
+            // Delete the secret entirely so the restore CREATES a new file (the
+            // path where a default-perms create would leak).
+            fs::remove_file(name).map_err(|e| format!("rm: {e}"))?;
+            restore_reported(&meta.id)
+        };
+
+        let result = run();
+        // Read the restored mode while cwd is still the workdir.
+        let restored_mode = fs::metadata(workdir.join(name))
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777);
+
+        if let Some(dir) = prev_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+
+        let report = result.expect("restore_reported should succeed");
+        assert!(
+            report.restored.contains(&name.to_string()),
+            "the secret must restore: {report:?}"
+        );
+        assert_eq!(
+            restored_mode,
+            Some(0o600),
+            "the restored file must keep its original 0600 mode, not widen to the \
+             process default (got octal mode {})",
+            restored_mode
+                .map(|m| format!("{m:o}"))
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
+
     /// Security (A6): a checkpoint DIRECTORY that is itself a symlink must be
     /// refused before its manifest is read. The lexical parent-containment check
     /// does not catch a symlink AT `cp_dir`, so without this guard a planted link
@@ -1718,6 +1911,63 @@ mod tests {
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
+    }
+
+    /// K3 (TOCTOU): the `(dev, ino)` identity pin must FAIL CLOSED when the
+    /// checkpoint-dir path is swapped for a different directory between the initial
+    /// symlink check and a later read. Simulating the swap mid-syscall inside
+    /// `restore_reported`/`diff` is racy, so (per the finding) we unit-test the
+    /// identity-compare helpers directly: capture dir A's identity, prove an
+    /// unchanged path still verifies, then atomically swap the path to a DIFFERENT
+    /// directory (rename B over the path) and prove verification now errors. Also
+    /// covers swap-to-symlink, the exact escape `reject_symlinked_checkpoint_dir`
+    /// cannot catch after it has already run.
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_dir_identity_fails_closed_on_swap() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmpdir.path()).unwrap();
+
+        // The "checkpoint dir" path the reads resolve through.
+        let cp_path = base.join("cp");
+        fs::create_dir(&cp_path).unwrap();
+
+        // Capture identity, then prove the unchanged path verifies.
+        let ident = capture_checkpoint_dir_identity(&cp_path).unwrap();
+        assert!(ident.is_some(), "unix must capture a (dev, ino) identity");
+        assert!(
+            verify_checkpoint_dir_identity(&cp_path, ident).is_ok(),
+            "an unchanged checkpoint dir must verify"
+        );
+
+        // Swap: rename the original away and move a DIFFERENT directory into the
+        // same path. The path now resolves to a different inode.
+        let other = base.join("other");
+        fs::create_dir(&other).unwrap();
+        fs::rename(&cp_path, base.join("cp_moved")).unwrap();
+        fs::rename(&other, &cp_path).unwrap();
+        assert!(
+            verify_checkpoint_dir_identity(&cp_path, ident).is_err(),
+            "a directory swap (different inode at the same path) must fail closed"
+        );
+
+        // Swap-to-symlink: replace the path with a symlink to yet another dir. The
+        // captured identity (a real dir's inode) must not match the symlink's.
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::remove_dir_all(&cp_path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &cp_path).unwrap();
+        assert!(
+            verify_checkpoint_dir_identity(&cp_path, ident).is_err(),
+            "a swap to a symlink must fail closed"
+        );
+
+        // A missing path (removed entirely) must also fail closed, not pass.
+        fs::remove_file(&cp_path).unwrap();
+        assert!(
+            verify_checkpoint_dir_identity(&cp_path, ident).is_err(),
+            "a removed checkpoint dir must fail closed"
+        );
     }
 
     /// Security: a restore destination that has become a symlink (e.g. an
@@ -2509,7 +2759,8 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &dst).unwrap();
 
         let mut blob = fs::File::open(&src).unwrap();
-        let result = copy_no_follow_from_reader(&mut blob, &dst);
+        let perms = blob.metadata().unwrap().permissions();
+        let result = copy_no_follow_from_reader(&mut blob, &dst, &perms);
         assert!(
             result.is_err(),
             "copy_no_follow_from_reader must refuse to write through a symlinked destination"
@@ -2532,7 +2783,8 @@ mod tests {
         let dst = tmpdir.path().join("dst.txt");
 
         let mut blob = fs::File::open(&src).unwrap();
-        copy_no_follow_from_reader(&mut blob, &dst)
+        let perms = blob.metadata().unwrap().permissions();
+        copy_no_follow_from_reader(&mut blob, &dst, &perms)
             .expect("copy to a regular destination must succeed");
         assert_eq!(
             fs::read_to_string(&dst).unwrap(),
@@ -2555,12 +2807,13 @@ mod tests {
         fs::write(&src, "verified bytes").unwrap();
 
         let mut blob = fs::File::open(&src).unwrap();
+        let perms = blob.metadata().unwrap().permissions();
         // Drain to EOF like the hash step does.
         let _ = sha256_reader(&mut blob).unwrap();
 
         // Without rewinding, the handle is at EOF: a copy yields an empty file.
         let dst_eof = tmpdir.path().join("dst_eof");
-        copy_no_follow_from_reader(&mut blob, &dst_eof).unwrap();
+        copy_no_follow_from_reader(&mut blob, &dst_eof, &perms).unwrap();
         assert_eq!(
             fs::read_to_string(&dst_eof).unwrap(),
             "",
@@ -2570,7 +2823,7 @@ mod tests {
         // After rewinding to 0, the copy writes the full verified bytes.
         blob.seek(SeekFrom::Start(0)).unwrap();
         let dst_full = tmpdir.path().join("dst_full");
-        copy_no_follow_from_reader(&mut blob, &dst_full).unwrap();
+        copy_no_follow_from_reader(&mut blob, &dst_full, &perms).unwrap();
         assert_eq!(
             fs::read_to_string(&dst_full).unwrap(),
             "verified bytes",

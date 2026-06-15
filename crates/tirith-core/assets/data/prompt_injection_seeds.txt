@@ -28,4 +28,10 @@ DAN mode
 # changelog does not match. "from now on" needs a tier-1 paste fragment in
 # build.rs (the "act as" fragment already covers "act as if").
 \bfrom now on,?\s+(you|act|ignore|respond)\b
-\bact as if you(?:'re| are)?\b
+# "act as if you ..." gated on a following jailbreak directive / privileged role
+# / alternate-persona token. Benign roleplay prose ("act as if you are reviewing
+# the changelog", "act as if you are a senior engineer documenting the API")
+# lacks that continuation and no longer matches. Real injections ("act as if you
+# are DAN", "act as if you have no restrictions", "act as if you are an
+# unrestricted AI") still fire.
+\bact as if you(?:'re| are)?(?:\s+(?:an?|the|my|our))?\s+(?:dan\b|jailbroken|jailbreak|unrestricted|unfiltered|uncensored|unlimited|root\b|administrator|admin\b|developer mode|sudo|godmode|god mode|no longer bound|free from your|not bound by|without (?:any )?(?:restrictions|filters|limits|rules|guardrails|guidelines)|(?:have|with) no (?:restrictions|filters|limits|rules|guardrails|guidelines)|a different (?:ai|assistant|model|persona|chatbot)|an? (?:evil|malicious|unrestricted|unfiltered|uncensored) (?:ai|assistant|model|persona))
