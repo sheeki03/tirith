@@ -287,6 +287,11 @@ pub fn suppress_check(
     let expires = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs)).to_rfc3339();
     let mut suppressed = false;
     with_session_locked(session_id, |sw| {
+        // Prune ALL expired cooldown entries (not only `key`) so `cooldowns` cannot
+        // grow unbounded across many distinct rule/target keys in a long-lived
+        // session, which would inflate the lock-held parse/serialize cost on every
+        // update. RFC3339 UTC timestamps compare correctly as strings.
+        sw.cooldowns.retain(|_, exp| exp.as_str() > now.as_str());
         if crate::suppression::is_suppressed(&mut sw.cooldowns, &key, &now) {
             suppressed = true;
         } else {
@@ -654,18 +659,41 @@ where
         return;
     }
 
-    // Read the existing session by path WHILE holding the lock. A missing file is the
-    // normal "fresh session" case; any other read error (or empty/corrupt content)
-    // resets to a fresh accumulator, preserving the previous read-path behavior.
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    // Read the existing session WHILE holding the lock, refusing to follow a symlink
+    // at `path` ATOMICALLY via O_NOFOLLOW. The earlier `symlink_metadata` pre-check is
+    // a fast reject, but a symlink planted between it and this open would be followed
+    // by a path-based `read_to_string`; the no-follow open closes that TOCTOU (a
+    // planted link is rejected by the open itself with ELOOP). A missing file is the
+    // normal "fresh session" case; a corrupt/empty read resets to a fresh accumulator;
+    // any other open failure refuses (fail closed) so a foreign inode is never read.
+    use std::io::Read as _;
+    let mut sess_opts = OpenOptions::new();
+    sess_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        sess_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let content = match sess_opts.open(&path) {
+        Ok(mut f) => {
+            let mut s = String::new();
+            if let Err(e) = f.read_to_string(&mut s) {
+                crate::audit::audit_diagnostic(format!(
+                    "tirith: session: cannot read {}; resetting: {e}",
+                    path.display()
+                ));
+                String::new()
+            } else {
+                s
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
             crate::audit::audit_diagnostic(format!(
-                "tirith: session: cannot read {}; resetting: {e}",
+                "tirith: session: refusing to open {} (possible symlink): {e}",
                 path.display()
             ));
-            String::new()
+            return;
         }
     };
     let mut session: SessionWarnings = if content.is_empty() {
@@ -1344,6 +1372,135 @@ mod tests {
             assert!(
                 !outside.exists(),
                 "the lock open must not have been followed through the symlink to the sentinel"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// W6: `suppress_check` must prune ALL expired cooldown entries, not only the
+    /// key under test, so `cooldowns` cannot grow unbounded across many distinct
+    /// rule/target keys in a long-lived session.
+    #[cfg(unix)]
+    #[test]
+    fn suppress_check_prunes_expired_cooldowns_globally() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "prune-cooldowns-session";
+            // Seed an EXPIRED cooldown for a DIFFERENT key (far-past expiry).
+            with_session_locked(sid, |sw| {
+                sw.cooldowns.insert(
+                    "old::expired".to_string(),
+                    "2000-01-01T00:00:00+00:00".to_string(),
+                );
+            });
+            assert!(load(sid).cooldowns.contains_key("old::expired"));
+
+            // A suppression check for a NEW key must prune the unrelated expired entry.
+            suppress_check(sid, "new_rule", None, 3600);
+            let after = load(sid).cooldowns;
+            assert!(
+                !after.contains_key("old::expired"),
+                "an expired cooldown for another key must be pruned globally"
+            );
+            assert!(
+                after.keys().any(|k| k.contains("new_rule")),
+                "the new key's cooldown is recorded"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Security: a SYMLINK planted at the session DATA file path must be refused so
+    /// the read/write never follows it to a foreign inode. The mutation is skipped:
+    /// the symlink target is not written through and the path stays the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn with_session_locked_refuses_symlinked_session_file() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "symlinked-session-file";
+            let path = session_state_path(sid).expect("session path");
+            let sessions_dir = path.parent().expect("sessions dir").to_path_buf();
+            std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+            // A sentinel OUTSIDE the sessions dir; the session symlink targets it, so a
+            // followed read/write would touch it instead of the real session inode.
+            let outside = dir.path().join("outside-session-target");
+            std::fs::write(&outside, "{}").expect("write sentinel");
+            std::os::unix::fs::symlink(&outside, &path).expect("plant session symlink");
+
+            record_typed_event(
+                sid,
+                TypedEvent::new(
+                    &chrono::Utc::now().to_rfc3339(),
+                    EventKind::Network,
+                    "network_egress",
+                ),
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("sentinel readable"),
+                "{}",
+                "a refused symlinked session file must not be written through to the target"
+            );
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .expect("path meta")
+                    .file_type()
+                    .is_symlink(),
+                "the session path must remain the (refused) symlink, not be replaced"
             );
         });
 
