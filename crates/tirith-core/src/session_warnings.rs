@@ -676,9 +676,9 @@ where
     // file is the normal "fresh session" case; any other refusal skips the mutation
     // (fail closed; the lock is released when this function returns) rather than read or
     // overwrite a foreign / non-regular file.
-    let content = match crate::util::read_text_no_follow_capped(&path, SESSION_FILE_READ_CAP) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(crate::util::OpenRegularError::NotFound) => String::new(),
+    let bytes = match crate::util::read_text_no_follow_capped(&path, SESSION_FILE_READ_CAP) {
+        Ok(b) => b,
+        Err(crate::util::OpenRegularError::NotFound) => Vec::new(),
         Err(_) => {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: refusing non-regular, oversized, or unreadable {}; recording skipped",
@@ -687,13 +687,16 @@ where
             return;
         }
     };
-    let mut session: SessionWarnings = if content.is_empty() {
+    // Parse the bytes DIRECTLY (serde_json::from_slice), exactly as `load()` does, so
+    // the reader and writer treat invalid UTF-8 inside the JSON identically (corrupt
+    // resets to a fresh accumulator) rather than the writer silently lossy-decoding it
+    // to U+FFFD and persisting the mangled state.
+    let mut session: SessionWarnings = if bytes.is_empty() {
         SessionWarnings::new(session_id)
     } else {
-        serde_json::from_str(&content).unwrap_or_else(|e| {
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             crate::audit::audit_diagnostic(format!(
-                "tirith: session: corrupt state for '{}': {e} — resetting",
-                session_id
+                "tirith: session: corrupt state for '{session_id}': {e}; resetting"
             ));
             SessionWarnings::new(session_id)
         })
@@ -1664,6 +1667,88 @@ mod tests {
                     .file_type()
                     .is_fifo(),
                 "the session path must remain the (refused) FIFO; the mutation was skipped"
+            );
+        });
+
+        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_log {
+                Some(v) => std::env::set_var("TIRITH_LOG", v),
+                None => std::env::remove_var("TIRITH_LOG"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Consistency: a session JSON carrying RAW invalid UTF-8 inside a string must be
+    /// treated as corrupt by BOTH the reader (`load`) and the writer
+    /// (`with_session_locked`). Previously the writer lossy-decoded the bytes to
+    /// U+FFFD via `from_utf8_lossy` and persisted the mangled state, while `load`
+    /// (from_slice) rejected it. Both now use `from_slice` and reset to a fresh
+    /// accumulator.
+    #[cfg(unix)]
+    #[test]
+    fn reader_and_writer_treat_invalid_utf8_session_identically() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var("XDG_STATE_HOME").ok();
+        let prev_log = std::env::var("TIRITH_LOG").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("TIRITH_LOG", "0");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let sid = "invalid-utf8";
+            let path = session_state_path(sid).expect("session path");
+            std::fs::create_dir_all(path.parent().expect("sessions dir")).expect("mkdir");
+
+            // Structurally valid JSON whose session_id string holds a raw 0xFF byte
+            // (invalid UTF-8) plus a recognizable total_warnings = 7.
+            let mut corrupt = br#"{"session_id":"x"#.to_vec();
+            corrupt.push(0xFF);
+            corrupt.extend_from_slice(
+                br#"","session_start":"2020-01-01T00:00:00+00:00","total_warnings":7,"events":[]}"#,
+            );
+            std::fs::write(&path, &corrupt).expect("write corrupt session");
+
+            // READER: load() rejects invalid UTF-8 as corrupt -> fresh.
+            assert_eq!(
+                load(sid).total_warnings,
+                0,
+                "reader must treat an invalid-UTF-8 session as corrupt, not surface total=7"
+            );
+
+            // WRITER: a mutation reads it the SAME way (corrupt -> fresh), records the
+            // new event, and rewrites a CLEAN session. The persisted bytes must no
+            // longer contain 0xFF, and a re-load must not carry the corrupt total=7.
+            record_typed_event(
+                sid,
+                TypedEvent::new(
+                    &chrono::Utc::now().to_rfc3339(),
+                    EventKind::Network,
+                    "network_egress",
+                ),
+            );
+            let after = std::fs::read(&path).expect("read rewritten session");
+            assert!(
+                !after.contains(&0xFF),
+                "writer must not persist lossy-decoded corrupt bytes"
+            );
+            assert_eq!(
+                load(sid).total_warnings,
+                0,
+                "writer must have reset the corrupt session, not preserved total=7"
             );
         });
 
