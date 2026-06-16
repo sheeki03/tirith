@@ -145,7 +145,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         end
 
         set -l tmpfile (mktemp)
-        echo -n "$content" | env _TIRITH_HOOK=1 command tirith paste --shell fish --interactive >$tmpfile 2>&1
+        echo -n "$content" | env _TIRITH_HOOK=1 tirith paste --shell fish --interactive >$tmpfile 2>&1
         set -l rc $status
         set -l output (string collect < $tmpfile)
         command rm -f $tmpfile
@@ -193,7 +193,7 @@ function _tirith_check_command
     # and command substitution (set -l x (cmd)) can hang in that context.
     set -l outfile (mktemp)
     set -l errfile (mktemp)
-    env _TIRITH_HOOK=1 command tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
+    env _TIRITH_HOOK=1 tirith check --approval-check --non-interactive --interactive --shell fish -- "$cmd" >$outfile 2>$errfile
     set -l rc $status
     # Read stdout lines: line 1 = approval path, line 2 = warn-ack path (exit code 3 only)
     set -l approval_path ""
