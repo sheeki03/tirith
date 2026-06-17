@@ -592,12 +592,21 @@ where
     };
 
     if let Some(parent) = path.parent() {
+        // Record whether the sessions/ dir already existed BEFORE creating it, so
+        // we only fsync when we actually add a directory entry.
+        let existed = parent.exists();
         if let Err(e) = fs::create_dir_all(parent) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: cannot create state dir {}: {e}",
                 parent.display()
             ));
             return;
+        }
+        // M3 durability: fsync the GRANDPARENT so a first-time-created sessions/
+        // dir entry survives a crash. This does NOT recursively fsync a fully
+        // fresh state path; the higher ancestors normally pre-exist.
+        if !existed {
+            crate::util::fsync_parent_dir_logged(parent, "session dir create");
         }
     }
 

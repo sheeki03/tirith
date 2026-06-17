@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -49,6 +49,10 @@ static FALLBACK_CACHE: OnceLock<Mutex<HashMap<String, FallbackEntry>>> = OnceLoc
 
 /// Max age for a file-based fallback ID on disk before regenerating (4 hours).
 const FALLBACK_FILE_MAX_AGE_SECS: u64 = 4 * 3600;
+
+/// Read cap for the fallback file: it holds a single UUID line, so 256 bytes is
+/// generous while still bounding a hostile oversized file.
+const FALLBACK_FILE_READ_CAP: u64 = 256;
 
 /// Per-entry in-process cache refresh interval (5 minutes).
 const FALLBACK_CACHE_REFRESH_SECS: u64 = 300;
@@ -143,20 +147,40 @@ fn load_or_create_fallback_file(scope: &str) -> String {
         None => return generate_session_id(),
     };
 
-    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if let Ok(modified) = meta.modified() {
+    // Open with O_NOFOLLOW so a symlink planted at the fallback path cannot
+    // redirect this read onto another file, and take BOTH the freshness mtime and
+    // the content from the SAME open handle: one inode for the stat and the read
+    // closes the freshness-vs-read race a separate `symlink_metadata` +
+    // `read_to_string` left open (a swap between the two could read a different
+    // file than the one whose mtime we checked).
+    if let Ok(file) = crate::util::open_read_no_follow_capped(&path, FALLBACK_FILE_READ_CAP) {
+        if let Ok(modified) = file.metadata().and_then(|m| m.modified()) {
             if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
                 if age.as_secs() < FALLBACK_FILE_MAX_AGE_SECS {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let id = content.trim().to_string();
-                        if !id.is_empty() && id.len() <= 128 {
-                            return id;
+                    // Read from the SAME handle, overflow-safe: take(cap + 1) so a
+                    // TOCTOU grow past the cap is rejected rather than buffered
+                    // (mirrors util::read_text_no_follow_capped).
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    if (&file)
+                        .take(FALLBACK_FILE_READ_CAP.saturating_add(1))
+                        .read_to_end(&mut buf)
+                        .is_ok()
+                        && buf.len() as u64 <= FALLBACK_FILE_READ_CAP
+                    {
+                        if let Ok(content) = String::from_utf8(buf) {
+                            let id = content.trim().to_string();
+                            if !id.is_empty() && id.len() <= 128 {
+                                return id;
+                            }
                         }
                     }
                 }
             }
         }
     }
+    // NotFound and any other error (symlink refusal, oversized, I/O) all fall
+    // through to regenerate: fail-safe, since a stable ID is best-effort.
 
     let new_id = generate_session_id();
     write_fallback_file(&path, &new_id);
@@ -164,8 +188,12 @@ fn load_or_create_fallback_file(scope: &str) -> String {
 }
 
 /// Write a fallback session ID to file with secure permissions.
-fn write_fallback_file(path: &PathBuf, session_id: &str) {
+fn write_fallback_file(path: &Path, session_id: &str) {
     if let Some(parent) = path.parent() {
+        // Record whether the sessions/ dir already existed BEFORE creating it, so
+        // we only pay the grandparent fsync when we actually added a directory
+        // entry (see below).
+        let existed = parent.exists();
         if let Err(e) = std::fs::create_dir_all(parent) {
             crate::audit::audit_diagnostic(format!(
                 "tirith: session: cannot create dir {}: {e}",
@@ -173,61 +201,24 @@ fn write_fallback_file(path: &PathBuf, session_id: &str) {
             ));
             return;
         }
-    }
-
-    // Refuse to follow symlinks (matches audit.rs / session_warnings.rs).
-    #[cfg(unix)]
-    {
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                crate::audit::audit_diagnostic(format!(
-                    "tirith: session: refusing to follow symlink at {}",
-                    path.display()
-                ));
-                return;
-            }
-            _ => {}
+        // M3 durability: fsync the GRANDPARENT so a first-time-created sessions/
+        // dir entry survives a crash. This does NOT recursively fsync a fully
+        // fresh state path; the higher ancestors normally pre-exist.
+        if !existed {
+            crate::util::fsync_parent_dir_logged(parent, "session dir create");
         }
     }
 
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
+    // Crash-atomic, 0600, symlink-safe in one call: a random temp sibling plus a
+    // rename means no predictable temp and no symlink-follow at `path`, and the
+    // reader never sees a torn file. Replaces the prior in-place O_NOFOLLOW write
+    // plus manual partial-file cleanup.
+    if let Err(e) = crate::util::write_file_atomic_0600(path, format!("{session_id}\n").as_bytes())
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-        open_opts.custom_flags(libc::O_NOFOLLOW);
-    }
-
-    let file = match open_opts.open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            crate::audit::audit_diagnostic(format!(
-                "tirith: session: cannot write fallback {}: {e} — session ID may be unstable",
-                path.display()
-            ));
-            return;
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-
-    use std::io::Write;
-    let mut writer = std::io::BufWriter::new(&file);
-    let write_ok = writer
-        .write_all(session_id.as_bytes())
-        .and_then(|_| writer.write_all(b"\n"))
-        .and_then(|_| writer.flush())
-        .is_ok();
-    drop(writer);
-    if !write_ok {
-        // Remove the partial file so the next read regenerates rather than
-        // reading a truncated session ID.
-        let _ = std::fs::remove_file(path);
+        crate::audit::audit_diagnostic(format!(
+            "tirith: session: cannot write fallback {}: {e}; session ID may be unstable",
+            path.display()
+        ));
     }
 }
 
@@ -324,6 +315,91 @@ mod tests {
             let perms = std::fs::metadata(&path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    /// A symlink planted at the fallback path must NOT be followed: the no-follow
+    /// open refuses it, so the loader regenerates a fresh UUID instead of returning
+    /// the link target's contents.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_fallback_refuses_symlink_and_regenerates() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        let scope = "symlink-test-abcd1234";
+        let path = fallback_file_path(scope).expect("a fallback path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Plant a sentinel and a symlink at the fallback path pointing to it.
+        let sentinel = dir.path().join("sentinel.txt");
+        let sentinel_id = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(&sentinel, format!("{sentinel_id}\n")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+
+        let id = load_or_create_fallback_file(scope);
+        // Must be a fresh valid UUID, NOT the sentinel's contents.
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_ne!(
+            id, sentinel_id,
+            "a symlinked fallback path must not leak the link target's id"
+        );
+        // The sentinel must be untouched (the rename replaced the link, not it).
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            format!("{sentinel_id}\n"),
+            "the symlink target must be byte-for-byte unchanged"
+        );
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    /// `write_fallback_file` publishes the id atomically: the file holds exactly
+    /// the id, no temp sibling remains, and a pre-existing file is replaced
+    /// wholesale (not appended).
+    #[cfg(unix)]
+    #[test]
+    fn test_write_fallback_atomic_replaces_and_leaves_no_temp() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        let scope = "atomic-write-test-abcd1234";
+        let path = fallback_file_path(scope).expect("a fallback path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A stale pre-existing file must be replaced wholesale.
+        std::fs::write(&path, "STALE PARTIAL CONTENT to be replaced wholesale").unwrap();
+
+        let new_id = "abcdef01-2345-6789-abcd-ef0123456789";
+        write_fallback_file(&path, new_id);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{new_id}\n"),
+            "the fallback file must hold exactly the new id plus newline"
+        );
+
+        // No temp sibling may remain after the atomic publish.
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != path.file_name().unwrap().to_string_lossy().as_ref())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file must remain after an atomic publish, found: {leftovers:?}"
+        );
 
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
