@@ -3043,6 +3043,7 @@ mod tests {
         if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
             return;
         }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         let input = "whoami";
@@ -3116,6 +3117,7 @@ mod tests {
         if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
             return;
         }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         // Precondition: `whoami` pasted with no semantic rule fast-exits.
@@ -3232,6 +3234,7 @@ mod tests {
         if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
             return;
         }
+        let _state = isolate_state();
         let input = "whoami";
 
         // (a) No custom rules (a policy with only `fail_mode`).
@@ -3748,6 +3751,50 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        }
+    }
+
+    struct IsolatedState {
+        _tmp: tempfile::TempDir,
+        prev_xdg: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for IsolatedState {
+        fn drop(&mut self) {
+            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
+            unsafe {
+                match &self.prev_xdg {
+                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+    /// Point XDG_STATE_HOME (and HOME) at a fresh tempdir under TEST_ENV_LOCK so the
+    /// tier-1 force-past gate's taint/canary store stats see an EMPTY store, not the
+    /// developer's real ~/.local/state. Restores prior env on drop.
+    fn isolate_state() -> IsolatedState {
+        let lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialized by TEST_ENV_LOCK held above.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+        }
+        IsolatedState {
+            _tmp: tmp,
+            prev_xdg,
+            prev_home,
+            _lock: lock,
         }
     }
 
