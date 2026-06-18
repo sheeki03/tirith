@@ -96,14 +96,18 @@ pub const SENSITIVE_KEY_VARS: &[&str] = &[
 
 /// Sensitive filesystem paths (credential directories, runtime sockets, and the
 /// devcontainer `${env:HOME}` / `${localEnv:HOME}` variable forms) that a config
-/// file should not bind-mount and that natural-language output should not direct
-/// an agent to read. Centralised here so `configfile.rs` (bind-mount detection)
-/// and `exfil.rs` (the read-and-send directive) share ONE list and cannot drift.
+/// file should not bind-mount. Consumed by `configfile.rs` (bind-mount detection).
 ///
-/// Note: this is the directory/socket-shaped list (`~/.ssh`, `/etc`,
-/// `docker.sock`). It is DISTINCT from `command.rs`'s private credential-FILE
-/// list (`/etc/passwd`, `~/.ssh/id_rsa`), which drives the curl-exfil command
-/// rule; the two have different shapes on purpose and must not be merged.
+/// NOT shared with `exfil.rs`: the output-side read-and-send directive in
+/// `exfil.rs` maintains its OWN sensitive-path list (a regex path-alternation of a
+/// DIFFERENT shape, `~/.ssh` | `/etc/` | `.env` | `id_rsa` | …) inline in its
+/// rule. The two lists are independent and must be updated together by hand when a
+/// path class changes. They are not merged because their shapes differ (this exact
+/// `&[&str]` of mount targets vs. a regex fragment).
+///
+/// This is ALSO distinct from `command.rs`'s private credential-FILE list
+/// (`/etc/passwd`, `~/.ssh/id_rsa`), which drives the curl-exfil command rule;
+/// those have different shapes on purpose and must not be merged either.
 pub const SENSITIVE_BIND_PATHS: &[&str] = &[
     "/var/run/docker.sock",
     "/run/docker.sock",
