@@ -85,11 +85,7 @@ pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex:
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let substituted = substitute_placeholders(trimmed);
-        match RegexBuilder::new(&substituted)
-            .case_insensitive(true)
-            .build()
-        {
+        match compile_seed_regex(trimmed) {
             Ok(re) => {
                 let rule_id = classify(&trimmed.to_ascii_lowercase());
                 good.push(Seed {
@@ -128,11 +124,30 @@ fn substitute_placeholders(seed: &str) -> String {
     PLACEHOLDER_RE.replace_all(seed, r"\S+").into_owned()
 }
 
+/// The ONE compile path every seed consumer shares: rewrite `<placeholder>`
+/// tokens, then build a case-insensitive [`Regex`]. [`build_regex`] (built-in
+/// corpus), [`compile_seeds`] (custom seeds), and [`validate_seed_pattern`]
+/// (`policy validate`) all route through this, so validation can never green-light
+/// a pattern the runtime compile would reject (the divergence that silently
+/// disabled custom seeds — `policy validate` compiled the RAW pattern).
+fn compile_seed_regex(seed: &str) -> Result<Regex, regex::Error> {
+    let pattern = substitute_placeholders(seed);
+    RegexBuilder::new(&pattern).case_insensitive(true).build()
+}
+
+/// Validate that `pattern` compiles via the EXACT path [`compile_seeds`] uses
+/// (`substitute_placeholders` + `RegexBuilder::case_insensitive(true)`), so
+/// `tirith policy validate` is a faithful proxy for what the engine will actually
+/// compile. Returns `Ok(())` for a good seed, `Err(regex::Error)` for a bad one.
+/// Empty/length checks stay in the caller ([`crate::policy_validate`]).
+pub fn validate_seed_pattern(pattern: &str) -> Result<(), regex::Error> {
+    compile_seed_regex(pattern).map(|_| ())
+}
+
 /// Compile one seed into a case-insensitive regex. Returns `None` + a warning on
 /// an invalid-regex seed so a typo degrades gracefully (other seeds still load).
 fn build_regex(seed: &str) -> Option<Regex> {
-    let pattern = substitute_placeholders(seed);
-    match RegexBuilder::new(&pattern).case_insensitive(true).build() {
+    match compile_seed_regex(seed) {
         Ok(re) => Some(re),
         Err(e) => {
             eprintln!("tirith: warning: invalid prompt-injection seed '{seed}': {e}");
@@ -805,6 +820,55 @@ mod tests {
         );
         // The built-in `check` (no extra seeds) must NOT fire on it.
         assert!(check("the log says my-secret-phrase here").is_empty());
+    }
+
+    #[test]
+    fn validate_seed_pattern_agrees_with_compile_seeds() {
+        // `validate_seed_pattern` must be a FAITHFUL proxy for `compile_seeds`: a
+        // pattern is accepted by the validator iff `compile_seeds` keeps it. The
+        // OLD `policy validate` compiled the RAW pattern with `regex::Regex::new`,
+        // which DIVERGES from the real compile (placeholder substitution +
+        // case-insensitive build) and silently dropped some seeds at runtime.
+        //
+        // The 5th pattern is the load-bearing one: `(?P<name>x)` is a VALID raw
+        // regex (named capture group), so the old raw-`Regex::new` validator passed
+        // it — but `substitute_placeholders` rewrites the `<name>` token to `\S+`,
+        // yielding `(?P\S+x)`, which fails to compile. The validator must now agree
+        // with `compile_seeds` and REJECT it.
+        let battery = [
+            "ignore previous instructions", // plain, ok
+            "act as <role>",                // placeholder rewritten to \S+, ok
+            "my-secret-phrase",             // literal, ok
+            "(unclosed",                    // invalid raw AND substituted, rejected
+            "(?P<name>x)",                  // ok raw, INVALID after substitution
+        ];
+        for pat in battery {
+            let validator_ok = validate_seed_pattern(pat).is_ok();
+            let (good, bad) = compile_seeds(&[pat.to_string()]);
+            // `compile_seeds` keeps a pattern iff its single entry compiled.
+            let compile_ok = bad.is_empty() && !good.0.is_empty();
+            assert_eq!(
+                validator_ok, compile_ok,
+                "validator and compile_seeds must agree on {pat:?} \
+                 (validator_ok={validator_ok}, compile_ok={compile_ok})"
+            );
+        }
+
+        // Spell out the divergence case so a regression is unambiguous.
+        assert!(
+            regex::Regex::new("(?P<name>x)").is_ok(),
+            "the raw pattern is a valid regex (this is why the old raw validator passed it)"
+        );
+        assert!(
+            validate_seed_pattern("(?P<name>x)").is_err(),
+            "but the validator must reject it: substitution yields (?P\\S+x), which fails to compile"
+        );
+        let (_good, bad) = compile_seeds(&["(?P<name>x)".to_string()]);
+        assert_eq!(
+            bad.len(),
+            1,
+            "compile_seeds must also drop it, proving the validator matches runtime behavior"
+        );
     }
 
     #[test]

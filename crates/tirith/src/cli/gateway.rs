@@ -412,8 +412,10 @@ pub fn run_gateway_with_options(
     // (OFFLINE via `discover_local_only`, which neutralizes a repo-scoped
     // `mcp_redact_injection`), compile the operator's `injection_seeds_custom`,
     // and read the redact flag into an `OutputFilterContext` shared with the
-    // upstream-reader thread. Built only under `--filter-output`. A bad custom
-    // seed is reported by `tirith policy validate`, so the bad-list is dropped.
+    // upstream-reader thread. Built only under `--filter-output`. This is init,
+    // not the hot path, so each bad seed is reported ONCE (to stderr, the
+    // gateway's diagnostic channel) rather than silently dropped: a seed that
+    // passes `policy validate` but fails the real compile would otherwise vanish.
     let filter_ctx: Arc<output_filter::OutputFilterContext> = Arc::new(if filter_output {
         let policy = tirith_core::policy::Policy::discover_local_only(
             std::env::current_dir()
@@ -421,12 +423,13 @@ pub fn run_gateway_with_options(
                 .and_then(|p| p.to_str().map(String::from))
                 .as_deref(),
         );
-        let (custom_seeds, _bad) =
-            tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
-        output_filter::OutputFilterContext {
-            custom_seeds,
-            redact_injection: policy.mcp_redact_injection,
+        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&policy);
+        for (pattern, error) in &bad {
+            eprintln!(
+                "tirith gateway: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
+            );
         }
+        ctx
     } else {
         output_filter::OutputFilterContext::default()
     });

@@ -93,21 +93,38 @@ pub struct NormalizedForm {
     pub transforms: TransformSet,
 }
 
-/// Codepoints in `0x20..=0x7E` plus `\n` `\t` `\r` are "printable" for the gate.
-fn is_printable_byte(b: u8) -> bool {
-    (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\t' || b == b'\r'
-}
-
-/// Printability gate: non-empty AND >= 90% of bytes are printable. Decode-derived
-/// forms are only emitted when the decoded bytes are valid UTF-8 AND pass this,
-/// so a random-bytes blob (a key, a hash, compressed data) is not surfaced as text.
-fn is_mostly_printable(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
+/// `true` if `c` survives printable recovery: a control char (C0/C1) other than
+/// `\n` `\t` `\r`, or the lossy-UTF-8 replacement char, is dropped; everything else
+/// (ASCII text AND non-ASCII letters like Cyrillic/Greek/math alphanumerics) is
+/// kept so the recovered text can still be skeleton/NFKC-folded by `apply_whole_text`.
+fn is_recoverable_char(c: char) -> bool {
+    if c == '\u{FFFD}' {
+        // Replacement char from `from_utf8_lossy` over a non-UTF-8 byte: noise.
         return false;
     }
-    let printable = bytes.iter().filter(|&&b| is_printable_byte(b)).count();
-    // printable / total >= 0.9  <=>  printable * 10 >= total * 9
-    printable * 10 >= bytes.len() * 9
+    c == '\n' || c == '\t' || c == '\r' || !c.is_control()
+}
+
+/// Recover the printable/UTF-8 text from a decoded blob, instead of discarding the
+/// whole blob when it falls below a printability ratio. An attacker otherwise pads
+/// a short injection phrase with non-printable bytes to push the ratio under the
+/// threshold and slip the seed past while it still decodes to readable text.
+///
+/// Lossy-decodes `bytes` to UTF-8, then keeps the [`is_recoverable_char`] subset
+/// (dropping control bytes and lossy replacement chars) preserving order. Returns
+/// `Some(text)` when the result still carries at least one non-whitespace char, and
+/// `None` for a blob with essentially no printable content (a key, a hash, or
+/// compressed/binary data) so it is not surfaced as a form.
+fn recover_printable_text(bytes: &[u8]) -> Option<String> {
+    let text: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|&c| is_recoverable_char(c))
+        .collect();
+    if text.chars().any(|c| !c.is_whitespace()) {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 /// `true` for an ASCII word character (`[A-Za-z0-9_]`). Used by the spacing-
@@ -169,8 +186,9 @@ fn collapse_spaced_chars(s: &str) -> (String, bool) {
             && (i == 0 || !is_word_byte(bytes[i - 1]));
 
         if run_starts_here {
-            // Count the letters in the W( W)* run.
-            let mut letters: Vec<u8> = vec![bytes[i]];
+            // Probe the W( W)* run by index, counting letters WITHOUT allocating a
+            // throwaway buffer per candidate (most candidates are below threshold).
+            let mut count = 1; // bytes[i] is the first single word-char.
             let mut j = i + 1;
             while j + 1 < n && bytes[j] == b' ' && is_word_byte(bytes[j + 1]) {
                 // Ensure the word token is a SINGLE char: the byte after bytes[j+1]
@@ -180,12 +198,18 @@ fn collapse_spaced_chars(s: &str) -> (String, bool) {
                 if !single {
                     break;
                 }
-                letters.push(bytes[j + 1]);
+                count += 1;
                 j += 2;
             }
 
-            if letters.len() >= 4 {
-                out.extend_from_slice(&letters);
+            if count >= 4 {
+                // Only now write the run's letters (positions i, i+2, …, j-1)
+                // straight into `out`, dropping the single interior spaces.
+                let mut k = i;
+                while k < j {
+                    out.push(bytes[k]);
+                    k += 2;
+                }
                 changed = true;
                 i = j;
                 continue;
@@ -197,8 +221,10 @@ fn collapse_spaced_chars(s: &str) -> (String, bool) {
     }
 
     // `out` is built only from bytes copied verbatim from `s` (a valid &str), so
-    // it is valid UTF-8: removing ASCII spaces never splits a multi-byte char.
-    let collapsed = String::from_utf8(out).unwrap_or_else(|_| s.to_string());
+    // it is PROVABLY valid UTF-8: only ASCII spaces are removed, which never splits
+    // a multi-byte char. The `expect` documents that invariant (no dead fallback).
+    let collapsed =
+        String::from_utf8(out).expect("collapse preserves UTF-8: only ASCII spaces removed");
     (collapsed, changed)
 }
 
@@ -236,8 +262,12 @@ fn apply_whole_text(input: &str) -> (String, TransformSet) {
         text = stripped;
     }
 
-    let nfkc: String = text.nfkc().collect();
-    if nfkc != text {
+    // Avoid the unconditional `nfkc().collect()` allocation: compare the NFKC char
+    // stream against the input's chars first (no heap), only collecting when they
+    // actually differ. Clean ASCII (the common case) is already in NFKC, so this
+    // skips the allocation entirely.
+    if !text.nfkc().eq(text.chars()) {
+        let nfkc: String = text.nfkc().collect();
         set.insert(Transform::Nfkc);
         text = nfkc;
     }
@@ -328,10 +358,11 @@ const MIN_BASE64_CANDIDATE_LEN: usize = 16;
 const MIN_HEX_CANDIDATE_LEN: usize = 8;
 
 /// Scan `input` for contiguous base64-shaped runs (>= 16 alphabet chars) and emit
-/// a decode-derived [`NormalizedForm`] for each that decodes to mostly-printable
-/// UTF-8. The decoded text is itself passed through the whole-text normalization
-/// (so base64-of-confusable is covered); the form's `source_range` is the raw byte
-/// range of the encoded run in the ORIGINAL input.
+/// a decode-derived [`NormalizedForm`] for each whose decode has recoverable
+/// printable text ([`recover_printable_text`]). The recovered text is itself passed
+/// through the whole-text normalization (so base64-of-confusable is covered); the
+/// form's `source_range` is the raw byte range of the encoded run in the ORIGINAL
+/// input.
 fn base64_forms(input: &str) -> Vec<NormalizedForm> {
     let bytes = input.as_bytes();
     let n = bytes.len();
@@ -355,16 +386,17 @@ fn base64_forms(input: &str) -> Vec<NormalizedForm> {
             continue;
         }
         if let Some(decoded) = try_decode_base64(run) {
-            if is_mostly_printable(&decoded) {
-                if let Ok(text) = String::from_utf8(decoded) {
-                    let (normalized, mut transforms) = apply_whole_text(&text);
-                    transforms.insert(Transform::Base64Decode);
-                    forms.push(NormalizedForm {
-                        text: normalized,
-                        source_range: Some(start..end),
-                        transforms,
-                    });
-                }
+            // Recover the printable text (so a phrase padded with non-printable
+            // bytes is not discarded) and scan THAT; a blob with essentially no
+            // printable content yields `None` and no form.
+            if let Some(text) = recover_printable_text(&decoded) {
+                let (normalized, mut transforms) = apply_whole_text(&text);
+                transforms.insert(Transform::Base64Decode);
+                forms.push(NormalizedForm {
+                    text: normalized,
+                    source_range: Some(start..end),
+                    transforms,
+                });
             }
         }
     }
@@ -373,8 +405,9 @@ fn base64_forms(input: &str) -> Vec<NormalizedForm> {
 }
 
 /// Scan `input` for contiguous hex runs (even length >= 8) and emit a
-/// decode-derived [`NormalizedForm`] for each that decodes to mostly-printable
-/// UTF-8. Space-separated hex is a documented follow-up; v1 is contiguous-only.
+/// decode-derived [`NormalizedForm`] for each whose decode has recoverable
+/// printable text ([`recover_printable_text`]). Space-separated hex is a documented
+/// follow-up; v1 is contiguous-only.
 fn hex_forms(input: &str) -> Vec<NormalizedForm> {
     let bytes = input.as_bytes();
     let n = bytes.len();
@@ -402,21 +435,74 @@ fn hex_forms(input: &str) -> Vec<NormalizedForm> {
         }
         let run = &input[start..end];
         if let Some(decoded) = try_decode_hex(run) {
-            if is_mostly_printable(&decoded) {
-                if let Ok(text) = String::from_utf8(decoded) {
-                    let (normalized, mut transforms) = apply_whole_text(&text);
-                    transforms.insert(Transform::HexDecode);
-                    forms.push(NormalizedForm {
-                        text: normalized,
-                        source_range: Some(start..end),
-                        transforms,
-                    });
-                }
+            // Recover the printable text (padded phrases survive) and scan THAT; a
+            // blob with essentially no printable content yields `None` and no form.
+            if let Some(text) = recover_printable_text(&decoded) {
+                let (normalized, mut transforms) = apply_whole_text(&text);
+                transforms.insert(Transform::HexDecode);
+                forms.push(NormalizedForm {
+                    text: normalized,
+                    source_range: Some(start..end),
+                    transforms,
+                });
             }
         }
     }
 
     forms
+}
+
+/// Cheap pre-check: `true` if `input` contains a contiguous base64-shaped run of
+/// at least [`MIN_BASE64_CANDIDATE_LEN`] chars OR a contiguous hex run whose
+/// even-length prefix is at least [`MIN_HEX_CANDIDATE_LEN`]. Used by the engine's
+/// tier-1 gate to force a pasted ENCODED injection seed past the fast-exit: such a
+/// blob carries no PATTERN_TABLE keyword and no non-ASCII byte, so without this it
+/// would fast-exit before the deobfuscation pass in `check_with` ever runs.
+///
+/// This only detects the SHAPE of an encoded blob (the same run criteria
+/// `base64_forms`/`hex_forms` use to decide a run is worth decoding); it does NOT
+/// decode. Decoding + seed matching still happen in `check_with` at tier 3.
+pub fn has_encoded_blob(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+
+    // Base64-shaped run: a run cannot start on `=` padding (mirrors `base64_forms`).
+    let mut i = 0;
+    while i < n {
+        if !is_base64_byte(bytes[i]) || bytes[i] == b'=' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_base64_byte(bytes[i]) {
+            i += 1;
+        }
+        if i - start >= MIN_BASE64_CANDIDATE_LEN {
+            return true;
+        }
+    }
+
+    // Hex run: count the even-length prefix (mirrors `hex_forms`).
+    let mut i = 0;
+    while i < n {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        let mut len = i - start;
+        if len % 2 != 0 {
+            len -= 1;
+        }
+        if len >= MIN_HEX_CANDIDATE_LEN {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// The whole-text transforms (strip-invisible, NFKC, skeleton, whitespace-
@@ -451,15 +537,25 @@ pub fn normalized_forms(input: &str) -> Vec<NormalizedForm> {
     forms.extend(hex_forms(input));
 
     // Dedup on (text, source_range); keep first occurrence (insertion order).
-    let mut seen: Vec<(String, Option<Range<usize>>)> = Vec::new();
-    forms.retain(|f| {
-        let key = (f.text.clone(), f.source_range.clone());
+    // Compute a keep-mask with BORROWED keys (no `f.text` clone per form) in an
+    // immutable pass over `forms`, then drop the duplicates. The universe is tiny
+    // (one whole-text form + a few decode forms), so the linear `seen` scan is fine.
+    let mut seen: Vec<(&str, Option<&Range<usize>>)> = Vec::with_capacity(forms.len());
+    let mut keep: Vec<bool> = Vec::with_capacity(forms.len());
+    for f in &forms {
+        let key = (f.text.as_str(), f.source_range.as_ref());
         if seen.contains(&key) {
-            false
+            keep.push(false);
         } else {
             seen.push(key);
-            true
+            keep.push(true);
         }
+    }
+    let mut idx = 0;
+    forms.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
     });
 
     forms
@@ -585,29 +681,55 @@ mod tests {
 
     #[test]
     fn printability_gate_rejects_binary() {
-        // base64 of 24 random-looking non-printable bytes: decodes Ok but is NOT
-        // mostly printable, so no decode-derived form is emitted.
-        let raw: Vec<u8> = (0u8..24)
-            .map(|i| i.wrapping_mul(7).wrapping_add(1))
-            .collect();
+        // A blob with essentially no printable content (control bytes + non-UTF-8
+        // high bytes that lossy-decode to the replacement char) recovers nothing,
+        // so no decode-derived form is emitted. This is the post-FIX-2 contract:
+        // we now RECOVER printable text rather than gate on a ratio, but a blob with
+        // no readable text (a key, a hash, compressed data) still yields no form.
+        let raw: Vec<u8> = vec![
+            0x00, 0x01, 0x02, 0x1F, 0x7F, 0xFF, 0xFE, 0x80, 0x00, 0x1B, 0x07, 0xFF, 0x01, 0x02,
+            0x1F, 0x7F, 0xFE, 0xFF, 0x00, 0x1B, 0x07, 0x80, 0xFE, 0xFF,
+        ];
+        // Premise: the recovery genuinely yields nothing for this blob.
+        assert!(
+            recover_printable_text(&raw).is_none(),
+            "a control/binary blob must recover no printable text"
+        );
         let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
         let forms = normalized_forms(&encoded);
         assert!(
             !forms
                 .iter()
                 .any(|f| f.transforms.contains(Transform::Base64Decode)),
-            "binary base64 must be rejected by the printability gate, got {forms:?}"
+            "binary base64 with no recoverable text must yield no form, got {forms:?}"
         );
     }
 
     #[test]
-    fn is_mostly_printable_thresholds() {
-        assert!(!is_mostly_printable(b""));
-        assert!(is_mostly_printable(b"hello world\n"));
-        // 9 printable + 1 non-printable = 90%, passes.
-        assert!(is_mostly_printable(b"abcdefghi\x00"));
-        // 8 printable + 2 non-printable = 80%, fails.
-        assert!(!is_mostly_printable(b"abcdefgh\x00\x01"));
+    fn recover_printable_text_behavior() {
+        // Empty / all-control / all-replacement-char input recovers nothing.
+        assert!(recover_printable_text(b"").is_none());
+        assert!(recover_printable_text(b"\x00\x01\x02\x1F\x7F").is_none());
+        assert!(recover_printable_text(&[0xFF, 0xFE, 0x80]).is_none());
+        // Whitespace-only is "essentially no printable content" -> None.
+        assert!(recover_printable_text(b"   \t\n").is_none());
+        // Readable text is preserved; interleaved control bytes are dropped.
+        assert_eq!(
+            recover_printable_text(b"hello world\n").as_deref(),
+            Some("hello world\n")
+        );
+        assert_eq!(
+            recover_printable_text(b"ig\x00no\x01re").as_deref(),
+            Some("ignore"),
+            "control bytes must be filtered out, the printable run preserved"
+        );
+        // Non-ASCII letters (e.g. Cyrillic) are KEPT so downstream skeleton/NFKC
+        // folding can still run on the recovered text.
+        let cyr = "\u{0456}gnore".as_bytes();
+        assert_eq!(
+            recover_printable_text(cyr).as_deref(),
+            Some("\u{0456}gnore")
+        );
     }
 
     #[test]
@@ -648,5 +770,87 @@ mod tests {
         assert!(!forms
             .iter()
             .any(|f| f.transforms.contains(Transform::Base64Decode)));
+    }
+
+    #[test]
+    fn has_encoded_blob_detects_base64_and_hex_runs() {
+        // Clean ASCII prose with no long alnum run: no blob.
+        assert!(!has_encoded_blob("git status && cargo build"));
+        assert!(!has_encoded_blob("the quick brown fox jumps"));
+        // A base64-encoded phrase (>= 16 base64 chars) is detected.
+        let encoded = b64("ignore previous instructions");
+        assert!(encoded.len() >= MIN_BASE64_CANDIDATE_LEN);
+        assert!(has_encoded_blob(&format!("data: {encoded} end")));
+        // A short base64-ish token under the floor is NOT a blob.
+        assert!(!has_encoded_blob("aGVsbG8=")); // "hello", 8 chars
+                                                // A hex run whose even-length prefix meets the floor is detected.
+        let hex = to_hex("ignore all rules");
+        assert!(has_encoded_blob(&format!("payload {hex}")));
+        // A hex run under the floor (6 chars) is not.
+        assert!(!has_encoded_blob("color #abcdef done"));
+    }
+
+    #[test]
+    fn base64_phrase_with_nonprintable_padding_still_recovered() {
+        // FIX 2: an attacker pads a short injection phrase with non-printable bytes
+        // so the decoded buffer falls under the old >=90%-printable gate and the
+        // whole form was discarded. We now RECOVER the printable text and scan that,
+        // so the seed phrase still surfaces. The padding here (8 control/high bytes
+        // after a 28-char phrase) is ~78% printable — under the old 90% threshold.
+        let phrase = "ignore previous instructions";
+        let mut raw = phrase.as_bytes().to_vec();
+        raw.extend_from_slice(&[0x00, 0x01, 0x1F, 0x7F, 0xFF, 0xFE, 0x80, 0x1B]);
+        // Confirm the OLD ratio gate would have discarded this buffer.
+        let printable = raw
+            .iter()
+            .filter(|&&b| (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\t' || b == b'\r')
+            .count();
+        assert!(
+            printable * 10 < raw.len() * 9,
+            "the padded buffer must be under the old 90% printability threshold \
+             (else the test does not exercise the evasion)"
+        );
+        // Encode the raw bytes directly (the `b64` test helper takes a &str and
+        // cannot carry the non-UTF-8 padding bytes).
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let input = format!("data: {encoded} end");
+        let forms = normalized_forms(&input);
+        let hit = forms
+            .iter()
+            .find(|f| f.transforms.contains(Transform::Base64Decode))
+            .expect("a base64-decoded form must still be produced for the padded phrase");
+        assert!(
+            hit.text.contains(phrase),
+            "the recovered text must contain the seed phrase, got {:?}",
+            hit.text
+        );
+        // The source_range still maps back to the encoded blob in the original.
+        let range = hit
+            .source_range
+            .clone()
+            .expect("decode forms carry a range");
+        assert_eq!(&input[range], encoded);
+    }
+
+    #[test]
+    fn hex_phrase_with_nonprintable_padding_still_recovered() {
+        // The same evasion via hex: padding bytes drop out, the phrase survives.
+        let phrase = "ignore all rules";
+        let mut raw = phrase.as_bytes().to_vec();
+        raw.extend_from_slice(&[0x00, 0x01, 0x1F, 0x7F, 0xFF, 0xFE]);
+        // Hex-encode the raw bytes directly (the `to_hex` test helper takes a &str
+        // and would mangle the non-UTF-8 high bytes).
+        let encoded: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let input = format!("payload {encoded}");
+        let forms = normalized_forms(&input);
+        let hit = forms
+            .iter()
+            .find(|f| f.transforms.contains(Transform::HexDecode))
+            .expect("a hex-decoded form must still be produced for the padded phrase");
+        assert!(
+            hit.text.contains(phrase),
+            "the recovered hex text must contain the seed phrase, got {:?}",
+            hit.text
+        );
     }
 }

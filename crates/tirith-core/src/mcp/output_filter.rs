@@ -58,6 +58,30 @@ pub struct OutputFilterContext {
     pub redact_injection: bool,
 }
 
+impl OutputFilterContext {
+    /// Build a context from a discovered [`crate::policy::Policy`]: compile the
+    /// operator's `injection_seeds_custom` and read `mcp_redact_injection`. Returns
+    /// the context PLUS the bad-seed list `(pattern, error)` so the long-lived
+    /// server/gateway seams can surface each bad pattern ONCE at init instead of
+    /// silently dropping it (a seed that passes `policy validate` but somehow fails
+    /// the real compile would otherwise disappear with no signal). This is init,
+    /// not the per-call hot path, so surfacing the list here is free.
+    ///
+    /// The caller is expected to have discovered the policy OFFLINE
+    /// ([`crate::policy::Policy::discover_local_only`]), which neutralizes a
+    /// repo-scoped `mcp_redact_injection` so a repo cannot weaken a Block.
+    pub fn from_policy(policy: &crate::policy::Policy) -> (Self, Vec<(String, regex::Error)>) {
+        let (custom_seeds, bad) = prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        (
+            Self {
+                custom_seeds,
+                redact_injection: policy.mcp_redact_injection,
+            },
+            bad,
+        )
+    }
+}
+
 /// Per-call scan cap. Beyond it the result is marked truncated and only the first
 /// `MAX_SCAN_BYTES` of concatenated text is scanned. Never drop content silently.
 pub const MAX_SCAN_BYTES: usize = 1_048_576;

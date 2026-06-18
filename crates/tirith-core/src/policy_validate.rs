@@ -269,12 +269,16 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
 }
 
 /// Validate `injection_seeds_custom` entries (C5). Each entry is a prompt-injection
-/// seed regex layered on top of the built-in corpus via `compile_seeds`. Mirrors the
-/// custom-rule regex checks: error on an empty pattern, a pattern over the 1024-CHAR
-/// cap, or one that fails to compile. Bad seeds are SKIPPED at compile time (not a
-/// hard load error, see `policy.rs::try_parse_yaml`), so this lenient `policy
-/// validate` path is where the operator is told about them. A blank/`#`-comment line
-/// is a deliberate skip in `compile_seeds`, so it is not flagged here either.
+/// seed regex layered on top of the built-in corpus via `compile_seeds`. Error on an
+/// empty pattern, a pattern over the 1024-CHAR cap, or one that fails to compile.
+/// The compile check routes through `prompt_injection::validate_seed_pattern`, which
+/// runs the EXACT `substitute_placeholders` + case-insensitive build that
+/// `compile_seeds` uses — so `policy validate` can never green-light a seed the
+/// engine then silently DROPS (the validate/compile divergence). Bad seeds are
+/// SKIPPED at compile time (not a hard load error, see `policy.rs::try_parse_yaml`),
+/// so this lenient `policy validate` path is where the operator is told about them.
+/// A blank/`#`-comment line is a deliberate skip in `compile_seeds`, so it is not
+/// flagged here either.
 fn validate_injection_seeds(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
     for (i, pattern) in policy.injection_seeds_custom.iter().enumerate() {
         let trimmed = pattern.trim();
@@ -304,8 +308,11 @@ fn validate_injection_seeds(policy: &crate::policy::Policy, issues: &mut Vec<Pol
                 ),
                 field: Some(format!("injection_seeds_custom[{i}]")),
             });
-        } else if let Err(e) = regex::Regex::new(trimmed) {
+        } else if let Err(e) = crate::rules::prompt_injection::validate_seed_pattern(trimmed) {
             // Regex must compile (checked last, after the cap, like custom rules).
+            // Use the SAME compile path `compile_seeds` uses (placeholder
+            // substitution + case-insensitive build), NOT a raw `Regex::new`, so a
+            // pattern that passes here can never be silently dropped at runtime.
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
                 message: format!("injection_seeds_custom[{i}]: invalid regex '{trimmed}': {e}"),
@@ -1234,6 +1241,33 @@ custom_rules:
                 .iter()
                 .any(|i| i.message.contains("unknown field 'mcp_redact_injection'")),
             "mcp_redact_injection must be a known top-level field: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_injection_seeds_custom_validate_compile_parity() {
+        // FIX 1: `policy validate` must use the SAME compile path as the engine
+        // (`validate_seed_pattern` -> placeholder-substitution + case-insensitive
+        // build), NOT a raw `Regex::new`. `(?P<name>x)` is a VALID raw regex (a
+        // named capture group), so the OLD raw validator accepted it — but the
+        // engine rewrites the `<name>` token to `\S+` (`(?P\S+x)`), which fails to
+        // compile and is silently dropped at runtime. `policy validate` must now
+        // REPORT it as invalid so the operator is not told OK while detection never
+        // runs.
+        let yaml = "injection_seeds_custom:\n  - \"(?P<name>x)\"\n";
+        let issues = validate(yaml);
+        assert!(
+            issues.iter().any(|i| i.level == IssueLevel::Error
+                && i.message.contains("injection_seeds_custom[0]")
+                && i.message.contains("invalid regex")),
+            "a seed valid raw but invalid after placeholder substitution must be \
+             reported by policy validate (validate/compile parity): {issues:?}"
+        );
+        // Guard the premise: the raw pattern really is a valid regex, so this test
+        // would have FAILED before the fix (the old raw `Regex::new` passed it).
+        assert!(
+            regex::Regex::new("(?P<name>x)").is_ok(),
+            "premise: the raw pattern is a valid regex"
         );
     }
 
