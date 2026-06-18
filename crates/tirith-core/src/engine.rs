@@ -735,6 +735,19 @@ pub(crate) fn analyze_output_chunk_at(
         }
     }
 
+    // C7 — output-side data-exfiltration scan over the same `prior_tail + chunk`
+    // overlap window so a beacon/secret-URL/directive split across the chunk
+    // boundary still fires. Shares the `prompt_injection_seen` dedup (keyed
+    // `rule_id:title`) so the overlap re-scan is harmless; accumulate so finalize
+    // folds these in for streaming callers that discard return values.
+    for f in crate::rules::exfil::check(scan_text) {
+        let key = format!("{}:{}", f.rule_id, f.title);
+        if state.prompt_injection_seen.insert(key) {
+            state.accumulated_chunk_findings.push(f.clone());
+            findings.push(f);
+        }
+    }
+
     // M11 ch3 — output-path canary scan: a tool echoing a registered token must
     // fire CanaryTokenTouched. We scan `prior_tail + chunk` (not the truncated
     // tail) so a canary anywhere in an oversized chunk still fires (CodeRabbit
@@ -823,6 +836,17 @@ pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
     for f in
         crate::rules::prompt_injection::check_with(&state.tail_text, &state.extra_injection_seeds)
     {
+        let key = format!("{}:{}", f.rule_id, f.title);
+        if state.prompt_injection_seen.insert(key) {
+            findings.push(f);
+        }
+    }
+
+    // C7 — output-side data-exfiltration scan on the captured tail (the output
+    // pipeline bypasses PATTERN_TABLE, so this is unconditionally reachable).
+    // Shares the `prompt_injection_seen` dedup; the tail-scan covers a vector
+    // straddling a chunk boundary.
+    for f in crate::rules::exfil::check(&state.tail_text) {
         let key = format!("{}:{}", f.rule_id, f.title);
         if state.prompt_injection_seen.insert(key) {
             findings.push(f);
@@ -2190,6 +2214,11 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 &ctx.input,
                 &custom_seeds,
             ));
+
+            // C7 — output-side data-exfiltration vectors in pasted content (a
+            // beacon URL or read-and-send directive pasted into the terminal is the
+            // same risk as one read back from a tool).
+            findings.extend(crate::rules::exfil::check(&ctx.input));
         }
 
         if ctx.scan_context == ScanContext::Exec {

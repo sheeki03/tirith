@@ -780,24 +780,8 @@ fn mount_spec_source(spec: &str) -> Option<String> {
 }
 
 fn is_sensitive_bind_source(src: &str) -> bool {
-    let sensitive_exact = [
-        "/var/run/docker.sock",
-        "/run/docker.sock",
-        "/var/run/podman/podman.sock",
-        "~/.ssh",
-        "~/.aws",
-        "~/.kube",
-        "~/.docker",
-        "/etc",
-        "/root/.ssh",
-        "/root/.aws",
-        "${env:HOME}/.ssh",
-        "${env:HOME}/.aws",
-        "${env:HOME}/.docker",
-        "${localEnv:HOME}/.ssh",
-        "${localEnv:HOME}/.aws",
-        "${localEnv:HOME}/.docker",
-    ];
+    // Centralised in `rules::shared` so `exfil.rs` shares the same list (no drift).
+    let sensitive_exact = crate::rules::shared::SENSITIVE_BIND_PATHS;
     if sensitive_exact.contains(&src) {
         return true;
     }

@@ -201,6 +201,83 @@ static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
     ]
 });
 
+/// The credential-shape subset of [`BUILTIN_PATTERNS`] used by
+/// [`looks_secret_shaped`]: OpenAI / AWS / GitHub / Anthropic / Slack tokens.
+///
+/// Deliberately EXCLUDES the Email regex (index 6 of `BUILTIN_PATTERNS`): a
+/// secret-shape gate that matched `?email=foo@bar.com` would fire High false
+/// positives on ordinary mailto links in agent output, which is the whole point
+/// of carving this narrow set out instead of reusing `BUILTIN_PATTERNS` wholesale.
+///
+/// Each regex here is anchored with `\A`…`\z` because [`looks_secret_shaped`]
+/// tests a single already-isolated token (a URL query-param value), not a free-
+/// text haystack: an anchored full match avoids treating `prefix-sk-...suffix`
+/// junk as a key while still matching a bare credential value.
+static SECRET_SHAPE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    [
+        r"\Ask-[A-Za-z0-9]{20,}\z",          // OpenAI API key
+        r"\AAKIA[A-Z0-9]{16}\z",             // AWS access key id
+        r"\Aghp_[A-Za-z0-9]{36,}\z",         // GitHub PAT
+        r"\Aghs_[A-Za-z0-9]{36,}\z",         // GitHub server token
+        r"\Ask-ant-[A-Za-z0-9\-]{20,}\z",    // Anthropic API key
+        r"\Axox[bprs]-[A-Za-z0-9\-]{10,}\z", // Slack token
+    ]
+    .iter()
+    .map(|p| Regex::new(p).expect("static secret-shape regex"))
+    .collect()
+});
+
+/// Shannon entropy of `s` in bits per character (0.0 for the empty string).
+/// Used by [`looks_secret_shaped`] to gate the generic long-opaque-token arm so a
+/// low-entropy run (`aaaaaaaa…`, a repeated word) is not mistaken for a secret.
+fn shannon_entropy_bits_per_char(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+    let mut total = 0usize;
+    for c in s.chars() {
+        *counts.entry(c).or_insert(0) += 1;
+        total += 1;
+    }
+    let total = total as f64;
+    counts
+        .values()
+        .map(|&n| {
+            let p = n as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// `true` when `s` has the SHAPE of a leaked credential: a recognised provider
+/// token (OpenAI / AWS / GitHub / Anthropic / Slack — see [`SECRET_SHAPE_PATTERNS`]),
+/// OR a long opaque high-entropy token (`[A-Za-z0-9_-]{32,}` with Shannon entropy
+/// >= 4.0 bits/char). The narrow set EXCLUDES email addresses on purpose.
+///
+/// Intended for an ALREADY-ISOLATED token (e.g. a single URL query-param value),
+/// not a free-text scan: the provider patterns are anchored, and the generic arm
+/// requires the WHOLE string to be one opaque token. This keeps the
+/// `OutputDataExfiltration` "secret-in-query" detection low-false-positive
+/// (`?page=2`, `?email=foo@bar.com`, `?q=hello+world` do not match).
+pub fn looks_secret_shaped(s: &str) -> bool {
+    if SECRET_SHAPE_PATTERNS.iter().any(|re| re.is_match(s)) {
+        return true;
+    }
+    // Generic long opaque token: 32+ url-safe chars, no other byte classes, and
+    // high entropy (a real random secret), so a long lowercase word or a repeated
+    // run does not trip it.
+    let len = s.chars().count();
+    if len >= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && shannon_entropy_bits_per_char(s) >= 4.0
+    {
+        return true;
+    }
+    false
+}
+
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
     let mut result = input.to_string();
@@ -1039,6 +1116,55 @@ mod tests {
         let report = redact_for_audience(&input, ShareAudience::Slack);
         // Sum across all labels.
         assert!(report.total() >= 2);
+    }
+
+    #[test]
+    fn looks_secret_shaped_matches_provider_tokens() {
+        // The narrow provider subset fires on a bare credential value.
+        assert!(looks_secret_shaped("AKIAIOSFODNN7EXAMPLE"));
+        assert!(looks_secret_shaped(concat!(
+            "sk-",
+            "abcdefghijklmnopqrstuvwxyz123456"
+        )));
+        assert!(looks_secret_shaped(concat!(
+            "gh",
+            "p_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+        )));
+        assert!(looks_secret_shaped(concat!(
+            "sk-ant-",
+            "api03-abcdefghijklmnopqrst"
+        )));
+        assert!(looks_secret_shaped("xoxb-1234567890-abcdefghij"));
+    }
+
+    #[test]
+    fn looks_secret_shaped_excludes_email_and_ordinary_values() {
+        // The whole point of the narrow set: an email must NOT look secret-shaped,
+        // so `?email=foo@bar.com` never fires the exfil secret-in-query rule.
+        assert!(!looks_secret_shaped("user@example.com"));
+        assert!(!looks_secret_shaped("foo.bar+tag@sub.example.co.uk"));
+        // Ordinary query values.
+        assert!(!looks_secret_shaped("2"));
+        assert!(!looks_secret_shaped("hello"));
+        assert!(!looks_secret_shaped("page-2"));
+        // The provider patterns are anchored: a SHORT junk-glued token (too short
+        // to be caught by the generic high-entropy arm) is not a clean match.
+        assert!(!looks_secret_shaped("junkAKIA12"));
+        assert!(!looks_secret_shaped("see-sk-here"));
+    }
+
+    #[test]
+    fn looks_secret_shaped_generic_opaque_token_gated_on_entropy() {
+        // A long mixed-case/digit opaque token (entropy well above 4.0 bits/char)
+        // matches the generic arm.
+        let opaque = "aB3xK9mP2qR7tV1wY5zC4dF8gH6jL0nQ_sT-uW2xZ4bN8kM";
+        assert!(looks_secret_shaped(opaque));
+        // A 32+-char LOW-entropy run (repeated char / one repeated word) does NOT:
+        // length alone is not enough, so a long benign slug is safe.
+        assert!(!looks_secret_shaped(&"a".repeat(40)));
+        assert!(!looks_secret_shaped(&"ab".repeat(20)));
+        // Just under the length floor never matches the generic arm.
+        assert!(!looks_secret_shaped("a1b2c3d4e5f60718293a4b5c6d7e8f9")); // 31 chars
     }
 
     #[test]

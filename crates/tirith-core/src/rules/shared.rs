@@ -94,6 +94,35 @@ pub const SENSITIVE_KEY_VARS: &[&str] = &[
     "GITHUB_TOKEN",
 ];
 
+/// Sensitive filesystem paths (credential directories, runtime sockets, and the
+/// devcontainer `${env:HOME}` / `${localEnv:HOME}` variable forms) that a config
+/// file should not bind-mount and that natural-language output should not direct
+/// an agent to read. Centralised here so `configfile.rs` (bind-mount detection)
+/// and `exfil.rs` (the read-and-send directive) share ONE list and cannot drift.
+///
+/// Note: this is the directory/socket-shaped list (`~/.ssh`, `/etc`,
+/// `docker.sock`). It is DISTINCT from `command.rs`'s private credential-FILE
+/// list (`/etc/passwd`, `~/.ssh/id_rsa`), which drives the curl-exfil command
+/// rule; the two have different shapes on purpose and must not be merged.
+pub const SENSITIVE_BIND_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/podman/podman.sock",
+    "~/.ssh",
+    "~/.aws",
+    "~/.kube",
+    "~/.docker",
+    "/etc",
+    "/root/.ssh",
+    "/root/.aws",
+    "${env:HOME}/.ssh",
+    "${env:HOME}/.aws",
+    "${env:HOME}/.docker",
+    "${localEnv:HOME}/.ssh",
+    "${localEnv:HOME}/.aws",
+    "${localEnv:HOME}/.docker",
+];
+
 /// Known URL-shortener hosts. Centralised so `transport.rs` (`ShortenedUrl`) and
 /// `paste_provenance.rs` (host-mismatch escalation) can't drift (M12 ch1).
 /// Matching is exact, case-insensitive at the call site.

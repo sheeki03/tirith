@@ -10,6 +10,7 @@ pub mod credential;
 pub mod custom;
 pub mod ecosystem;
 pub mod environment;
+pub mod exfil;
 pub mod hostname;
 pub mod iac;
 pub mod install;

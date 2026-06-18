@@ -277,6 +277,14 @@ pub enum RuleId {
     /// is a distinct High finding from the raw `PromptInjectionInOutput` /
     /// `IgnorePreviousInstructions` rules. Names the defeated technique in evidence.
     PromptInjectionObfuscated,
+    /// C7 — an output-side DATA-EXFILTRATION vector in scanned tool/file/MCP
+    /// content: a markdown image/link beacon that auto-fetches a remote URL, a URL
+    /// whose query carries a secret-shaped value or a canary, or a natural-language
+    /// "read <sensitive path> … send/post/upload it" / "do not tell the user"
+    /// directive. High severity (MITRE T1041). DISTINCT from the command-shape
+    /// `DataExfiltration` rule, which fires on a command the user runs; this fires
+    /// on adversarial content the agent reads. Emitted by `rules::exfil`.
+    OutputDataExfiltration,
 
     // Operational-context rules (M8 ch1) — fire from `rules::context` when the
     // leader is a cloud/k8s CLI (kubectl, helm, aws, gcloud, az, …) and the active

@@ -660,6 +660,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "prompt_injection_in_output",
     "ignore_previous_instructions",
     "prompt_injection_obfuscated",
+    // Output-side data-exfiltration rule (C7)
+    "output_data_exfiltration",
     // Operational-context rules (M8 ch1)
     "context_prod_destructive_command",
     "context_prod_write_operation",
@@ -848,6 +850,11 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // guaranteed-reachable case is an OUTPUT-context base64 seed (output bypasses
     // tier-1). Covered by `output.toml` + `test_output_rule_ids_have_fixture_coverage`.
     "prompt_injection_obfuscated",
+    // C7 — the output-side data-exfiltration rule fires from `analyze_output`
+    // (and Paste), not from the `ALL_FIXTURE_FILES` engine::analyze path. Covered
+    // by `output.toml` + `test_output_rule_ids_have_fixture_coverage` and the
+    // `rules::exfil` unit tests.
+    "output_data_exfiltration",
     // M8 ch1 — operational-context rules need both an active provider context
     // (`context_detect`) AND a labels file; covered by unit + integration tests below.
     "context_prod_destructive_command",
@@ -1081,6 +1088,8 @@ fn test_output_rule_ids_have_fixture_coverage() {
         "prompt_injection_in_output",
         "ignore_previous_instructions",
         "prompt_injection_obfuscated",
+        // C7
+        "output_data_exfiltration",
     ];
     let missing: Vec<&str> = required
         .iter()
@@ -1195,6 +1204,8 @@ rule_id_variant_registry! {
     OutputTitleManipulation, OutputClearScreen, OutputTruncatedEscapeSequence,
     // Prompt-injection rules (M7 ch5)
     PromptInjectionInOutput, IgnorePreviousInstructions, PromptInjectionObfuscated,
+    // Output-side data-exfiltration rule (C7)
+    OutputDataExfiltration,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)

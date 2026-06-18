@@ -1052,6 +1052,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("prompt_injection_in_output", "PromptInjectionInOutput"),
     ("ignore_previous_instructions", "IgnorePreviousInstructions"),
     ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
+    // C7 — output-side data-exfiltration rule.
+    ("output_data_exfiltration", "OutputDataExfiltration"),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",
