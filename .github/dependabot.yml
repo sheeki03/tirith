@@ -14,3 +14,9 @@ updates:
           - "*"
     commit-message:
       prefix: "ci"
+    # dtolnay/rust-toolchain has no versioned releases (its channels are mutable
+    # branches), so Dependabot cannot resolve a "newer version" for it. It is
+    # pinned to a master-history SHA and bumped manually; ignore it here so the
+    # other actions still get grouped auto-updates without noise on this one.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
