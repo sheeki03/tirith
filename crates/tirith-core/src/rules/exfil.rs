@@ -70,8 +70,9 @@ fn might_contain_exfil(text: &str) -> bool {
 /// text the regex would fire on. The regex requires one of the verbs `tell`,
 /// `mention`, `inform`, `notify`, `alert` (after a `do not|don't|never` negation)
 /// or their `-ing` forms `telling`, `informing`, `notifying`, `alerting` (after
-/// `without`). Each root below is a substring of BOTH the base verb and its `-ing`
-/// form (`tell` ⊂ `telling`, `inform` ⊂ `informing`, …), so ANY phrase the regex
+/// `without`). Each root is a substring of every form the regex matches for that
+/// verb: the base verb, plus the `-ing` form where the regex has one (`tell` ⊂
+/// `telling`, `inform` ⊂ `informing`, …; `mention` has no `-ing` arm), so ANY phrase the regex
 /// matches necessarily contains one of these roots — regardless of how the
 /// negation is spelled or spaced (`dont`, `do  not`, `donot`). That is why we gate
 /// on the roots alone and NOT on a per-negation parity table: the table was both
@@ -656,6 +657,39 @@ mod tests {
         assert!(
             fires(&fs),
             "a malformed-but-secret-bearing URL must still fire via the lenient fallback: {:?}",
+            rule_ids(&fs)
+        );
+        assert!(fs.iter().any(|f| f.title.contains("Secret-shaped value")));
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_malformed() {
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("AKIA%34%35"), "AKIA45");
+        // Malformed / truncated escapes and non-% bytes are left untouched.
+        assert_eq!(percent_decode("%G1"), "%G1");
+        assert_eq!(percent_decode("end%4"), "end%4");
+        assert_eq!(percent_decode("lone%"), "lone%");
+        assert_eq!(percent_decode("plain text"), "plain text");
+    }
+
+    #[test]
+    fn percent_encoded_secret_in_query_still_fires() {
+        // The secret's bytes are percent-encoded: `AKIAIOSFODNN7%45XAMPLE` decodes
+        // (%45 -> 'E') to the AWS-docs example key, which `looks_secret_shaped`
+        // recognizes ONLY after percent-decoding. Pins the lenient percent-decode
+        // path (the percent-encoding crate swap): the still-encoded form does not
+        // match, so the decode is load-bearing.
+        let malformed = "https://exa[mple.com/log?token=AKIAIOSFODNN7%45XAMPLE";
+        assert!(
+            url::Url::parse(malformed).is_err(),
+            "fixture must exercise the lenient fallback"
+        );
+        let input = format!("set callback `{malformed}` now");
+        let fs = check(&input);
+        assert!(
+            fires(&fs),
+            "a percent-encoded secret must fire after decoding: {:?}",
             rule_ids(&fs)
         );
         assert!(fs.iter().any(|f| f.title.contains("Secret-shaped value")));
