@@ -727,6 +727,21 @@ fn should_warn_neutralized(
         && !marker_exists
 }
 
+/// Surface invalid `injection_seeds_custom` regexes once to stderr on the
+/// paste/check CLI path. The engine compiles these seeds internally on the paste
+/// path but is a library and does not print, so it drops the bad list; a seed that
+/// passes the lenient `tirith policy validate` shape check yet fails the real
+/// compile would otherwise be silently skipped with no operator feedback. Mirrors
+/// the view/lsp/gateway seams. stderr is safe: `tirith check`/`paste` write their
+/// verdict to stdout.
+pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
+    let (_seeds, bad) =
+        tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+    for (pattern, error) in &bad {
+        eprintln!("tirith: warning: invalid injection_seeds_custom regex {pattern:?}: {error}");
+    }
+}
+
 /// Once per shell SESSION (per policy), tell the operator that a repo-scoped policy
 /// had WEAKENING fields neutralized (F9 — a repo may tighten, never weaken). A repo
 /// author who sets `allowlist`/`severity_overrides` otherwise gets zero feedback that

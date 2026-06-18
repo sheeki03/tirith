@@ -2225,12 +2225,12 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
             // M7 ch5 — prompt-injection seeds in pasted content. Scans raw +
             // deobfuscated forms via `check_with`, layered with the operator's
             // `injection_seeds_custom` seeds. Compiled from the `policy` local
-            // discovered above (NOT `ctx.policy`, which does not exist). This is the
-            // per-paste hot path, so the bad-seed list is dropped here WITHOUT an
-            // `eprintln!`; bad seeds are surfaced at load time by `tirith policy
-            // validate` (now a faithful proxy via `validate_seed_pattern`) and once
-            // at init by the long-lived MCP server/gateway seams
-            // (`OutputFilterContext::from_policy`).
+            // discovered above (NOT `ctx.policy`, which does not exist). The engine
+            // is a library and does not print, so the bad-seed list is dropped here;
+            // it is surfaced to the operator at load time by `tirith policy validate`
+            // (a faithful proxy via `validate_seed_pattern`), at MCP server/gateway
+            // init by `OutputFilterContext::from_policy`, and on the paste/check CLI
+            // path by `cli::warn_bad_injection_seeds`.
             let (custom_seeds, _bad) =
                 crate::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
             findings.extend(crate::rules::prompt_injection::check_with(

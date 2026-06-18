@@ -6138,6 +6138,50 @@ fn seed_agent_deny_policy(dir: &std::path::Path, tool: &str) {
     fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
 }
 
+/// A custom `injection_seeds_custom` regex that passes the lenient policy shape
+/// check but fails the real regex compile must be surfaced to the operator on the
+/// paste CLI path, not silently dropped. The engine compiles + drops it (it is a
+/// library and does not print); the CLI surfaces it via `warn_bad_injection_seeds`.
+#[cfg(unix)]
+#[test]
+fn paste_surfaces_bad_injection_seed_to_stderr() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    // `(unclosed` is a valid YAML scalar and a valid policy shape, but an invalid
+    // regex (unbalanced group), so it loads then fails `compile_seeds`.
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let mut child = tirith()
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .args(["paste", "--shell", "posix", "--non-interactive"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn tirith paste");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello world")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait on tirith paste");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
+        "paste must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn paste_audit_entry_with_agent_rules_deny_forces_block() {

@@ -327,6 +327,9 @@ pub fn run(
     crate::cli::warn_repo_policy_neutralized(&policy);
 
     if ran_locally {
+        // Surface a bad `injection_seeds_custom` regex the local engine compiled
+        // and dropped here (the daemon path surfaces its own at the server side).
+        crate::cli::warn_bad_injection_seeds(&policy);
         let runtime_findings = tirith_core::threatdb_api::enrich_command(
             cmd,
             shell_type,
