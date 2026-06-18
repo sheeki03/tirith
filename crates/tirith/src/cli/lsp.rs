@@ -240,15 +240,23 @@ pub fn diagnostics_for(path: &Path, text: &str) -> Vec<Diagnostic> {
         // C3a — honor operator/org `injection_seeds_custom` on the LSP output
         // path too. Discover OFFLINE (`discover_local_only`, no network; a
         // repo-scoped weakening flag is neutralized inside) from the file's
-        // parent dir, mirroring `analysis_context`'s cwd. A bad seed is reported
-        // by `tirith policy validate`, so the bad-list is dropped here.
+        // parent dir, mirroring `analysis_context`'s cwd. Each bad seed is
+        // reported ONCE to stderr (safe: the LSP protocol uses stdout, stderr is
+        // the server's log channel) rather than silently dropped — a seed that
+        // passes `policy validate` but fails the real compile would otherwise
+        // vanish.
         let seed_cwd = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.display().to_string());
         let policy = tirith_core::policy::Policy::discover_local_only(seed_cwd.as_deref());
-        let (custom_seeds, _bad) =
+        let (custom_seeds, bad_seeds) =
             tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        for (pattern, error) in &bad_seeds {
+            eprintln!(
+                "tirith lsp: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
+            );
+        }
         let verdict = engine::analyze_output(
             text,
             OutputContext {

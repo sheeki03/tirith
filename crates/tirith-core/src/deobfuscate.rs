@@ -524,9 +524,9 @@ pub fn applied_transforms(input: &str) -> TransformSet {
 /// scan. Produces:
 /// - ONE composed whole-text form (if the composition changed the input), with
 ///   `source_range == None` and the set of transforms that actually fired;
-/// - one decode-derived form per base64/hex blob in the ORIGINAL input that decodes
-///   to printable UTF-8, each with its `source_range` set to the blob's raw byte
-///   range;
+/// - one decode-derived form per base64/hex blob in the ORIGINAL input whose decode
+///   yields recoverable printable text (via [`recover_printable_text`]), each with
+///   its `source_range` set to the blob's raw byte range;
 /// - one decode-derived form per base64/hex blob that only becomes a contiguous run
 ///   after invisible characters are stripped (a blob laced with e.g. a ZWSP), with
 ///   `source_range == None` (offsets into the stripped text do not map back).

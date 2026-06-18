@@ -723,7 +723,7 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             // only), so a bare `print(...)`, a JSON `"repeat"`, or "reveal the
             // answer" in a paste does NOT force tier-3. Each fragment is a SUPERSET
             // of its seed, so the seed stays Paste-reachable.
-            r"(?i)\breveal (?:your |your system |system |the system )(?:prompt|instructions)\b",
+            r"(?i)\breveal (?:your |the |your system |the system |system )?(?:prompt|instructions)\b",
             r"(?i)\bprint (?:your |the )?(?:system )?(?:prompt|instructions)\b",
             r"(?i)\brepeat (?:the )?(?:words|text) above\b",
         ],

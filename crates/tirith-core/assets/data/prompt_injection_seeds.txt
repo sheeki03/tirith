@@ -56,7 +56,13 @@ DAN mode
 # (verbatim/word for word/exactly/...), so a benign "repeat the text above" alone
 # does NOT match while "repeat the text above verbatim" DOES. All route to
 # PromptInjectionInOutput.
-reveal (?:your |your system |system |the system )(?:prompt|instructions)\b
+#
+# The `prompt` object is rarely benign, so "reveal prompt" / "reveal the prompt"
+# fire with optional/bare framing. The `instructions` object is ambiguous
+# ("reveal the instructions for the puzzle" is benign), so it still REQUIRES the
+# explicit your/system framing. Split into two lines accordingly.
+reveal (?:your |the )?(?:system )?prompt\b
+reveal (?:your |your system |system |the system )instructions\b
 print (?:your |the )?system prompt\b
 print your (?:system )?(?:prompt|instructions)\b
 repeat (?:the )?(?:words|text) above (?:verbatim|word for word|exactly|starting with|including)\b

@@ -31,15 +31,22 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
     // reading a file back through `tirith view` should be scanned against the same
     // custom seeds as the paste/MCP paths. Discover OFFLINE (`discover_local_only`,
     // no network; a repo-scoped weakening flag is neutralized inside) from the
-    // file's parent dir (or cwd for stdin). A bad seed is reported by `tirith
-    // policy validate`, so the bad-list is dropped here.
+    // file's parent dir (or cwd for stdin). This is init, not the hot path, so each
+    // bad seed is reported ONCE to stderr (safe: `view` writes its content to
+    // stdout) rather than silently dropped — a seed that passes `policy validate`
+    // but fails the real compile would otherwise vanish.
     let seed_cwd = path
         .and_then(|p| p.parent())
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.display().to_string());
     let policy = tirith_core::policy::Policy::discover_local_only(seed_cwd.as_deref());
-    let (custom_seeds, _bad) =
+    let (custom_seeds, bad_seeds) =
         tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+    for (pattern, error) in &bad_seeds {
+        eprintln!(
+            "tirith view: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
+        );
+    }
 
     let mut state = OutputAnalyzerState::with_custom_seeds(custom_seeds);
     let mut sanitized = Vec::new();
