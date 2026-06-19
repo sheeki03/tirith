@@ -77,7 +77,10 @@ jobs:
             echo "No exfil-endpoint secret set; skipping the feed."
           fi
 
-      # Compile + sign
+      # Compile + sign. Emits BOTH formats from one run: the v1 asset (--output,
+      # unchanged, served to old clients via the legacy manifest) and the v2
+      # asset (--output-v2, the same v1 data plus the artifact-SHA / malicious-URL
+      # sections, served to v2-capable clients via the v2 index).
       - name: Compile threat database
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
@@ -95,7 +98,8 @@ jobs:
             $EXFIL_ARG \
             --sequence "${RUN_ID}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
-            --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
+            --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat" \
+            --output-v2 "tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat"
 
       # Generate + sign manifest for client discovery
       - name: Generate signed manifest
@@ -124,6 +128,82 @@ jobs:
           {"version":${RUN_ID},"sha256":"$SHA","size":$SIZE,"url":"$URL","signature":"$SIG"}
           EEOF
 
+      # Generate + sign the multi-asset v2 index for v2-capable client discovery.
+      # ADDITIVE: the legacy manifest above is untouched and keeps pointing at v1;
+      # old clients only ever read it. New clients read this index, verify its
+      # signature, and select the highest compatible asset (here v2), falling back
+      # to the legacy manifest on any failure.
+      - name: Generate signed v2 index
+        env:
+          TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          V1_ASSET="tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          V2_ASSET="tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          V1_SHA=$(sha256sum "$V1_ASSET" | cut -d' ' -f1)
+          V2_SHA=$(sha256sum "$V2_ASSET" | cut -d' ' -f1)
+          V1_SIZE=$(stat -c%s "$V1_ASSET")
+          V2_SIZE=$(stat -c%s "$V2_ASSET")
+          V1_URL="https://github.com/sheeki03/tirith/releases/download/threatdb-latest/${V1_ASSET}"
+          V2_URL="https://github.com/sheeki03/tirith/releases/download/threatdb-latest/${V2_ASSET}"
+          # The minimum Tirith version that ships the v2-capable reader. A client
+          # older than this skips the v2 asset and stays on v1 via the legacy
+          # manifest. This is the floor introduced with DB-B/DB-C.
+          V2_MIN_VERSION="0.3.4"
+
+          # Build the canonical payload the v2 index is signed over. It MUST be
+          # byte-identical to the client's IndexV2::canonical_payload() in
+          # crates/tirith/src/cli/threatdb_cmd.rs: top-level {assets, sequence}
+          # (alphabetical, compact), each asset object with alphabetical keys
+          # (filename, format, [min_tirith_version], sha256, size, url), the
+          # signature field excluded, numbers emitted as JSON numbers. `jq -cS`
+          # sorts keys and strips whitespace exactly like the legacy manifest's
+          # signing step; --argjson keeps format/size/sequence numeric. The v1
+          # asset omits min_tirith_version (absent), so jq emits no such key for
+          # it, matching how canonical_payload() skips an absent Option.
+          PAYLOAD=$(jq -cS -n \
+            --argjson sequence "${RUN_ID}" \
+            --arg v1_filename "$V1_ASSET" \
+            --arg v1_sha256 "$V1_SHA" \
+            --argjson v1_size "$V1_SIZE" \
+            --arg v1_url "$V1_URL" \
+            --arg v2_filename "$V2_ASSET" \
+            --arg v2_sha256 "$V2_SHA" \
+            --argjson v2_size "$V2_SIZE" \
+            --arg v2_url "$V2_URL" \
+            --arg v2_min "$V2_MIN_VERSION" \
+            '{
+              assets: [
+                {filename: $v1_filename, format: 1, sha256: $v1_sha256, size: $v1_size, url: $v1_url},
+                {filename: $v2_filename, format: 2, min_tirith_version: $v2_min, sha256: $v2_sha256, size: $v2_size, url: $v2_url}
+              ],
+              sequence: $sequence
+            }')
+
+          SIG=$(./target/release/tirith-threatdb-compile sign-payload \
+            --payload "$PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
+
+          # The published index is exactly the signed PAYLOAD plus a top-level
+          # `signature` and the tolerated `manifest_version`. Deriving it FROM the
+          # signed bytes (rather than rebuilding the asset array) means there is
+          # one source of truth for what was signed. The client excludes
+          # `signature` and ignores `manifest_version` when reconstructing the
+          # canonical payload, so neither key changes what is verified.
+          printf '%s' "$PAYLOAD" \
+            | jq -cS --arg signature "$SIG" '. + {manifest_version: 1, signature: $signature}' \
+            > threatdb-index-v2.json
+
+          # Self-check: strip the two added keys back off the PUBLISHED file and
+          # re-canonicalize; it must equal the PAYLOAD we signed. This fails the
+          # release loudly if the published bytes ever diverge from the signed
+          # region (mirrors the legacy manifest's PAYLOAD == $(jq -cS) guard, but
+          # over the real artifact rather than a tautological re-canonicalization).
+          RECONSTRUCTED=$(jq -cS 'del(.manifest_version, .signature)' threatdb-index-v2.json)
+          if [ "$PAYLOAD" != "$RECONSTRUCTED" ]; then
+            echo "::error::v2 index signed region drift. signed=$PAYLOAD published_region=$RECONSTRUCTED"
+            exit 1
+          fi
+
       # Publish to ONE rolling prerelease so the daily DB builds stop burying the
       # v* binary releases past page 1 of the releases feed (issue #140). The .dat
       # is run-scoped (immutable, never overwritten) to avoid an asset-swap race;
@@ -141,49 +221,77 @@ jobs:
           body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
           files: |
             tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            tirith-threatdb-v2-${{ github.run_id }}-${{ github.run_attempt }}.dat
             threatdb-manifest.json
+            threatdb-index-v2.json
 
-      # Push manifest update directly to main. Branch is unprotected and the
-      # bot has contents:write; the PR + auto-merge ceremony was unreliable
-      # (--auto silently no-ops when there are no required checks to gate on)
-      # and produced an unmerged backlog.
+      # Push manifest + v2 index update directly to main. Branch is unprotected
+      # and the bot has contents:write; the PR + auto-merge ceremony was
+      # unreliable (--auto silently no-ops when there are no required checks to
+      # gate on) and produced an unmerged backlog. Both files are committed
+      # because each client's PRIMARY discovery URL is the raw main copy (the
+      # release asset is only the fallback): the legacy manifest at
+      # raw.githubusercontent.com/.../threatdb-manifest.json and the v2 index at
+      # raw.githubusercontent.com/.../threatdb-index-v2.json.
       - name: Update manifest
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add threatdb-manifest.json
+          git add threatdb-manifest.json threatdb-index-v2.json
           if git diff --cached --quiet; then
-            echo "Manifest unchanged; nothing to commit."
+            echo "Manifest and v2 index unchanged; nothing to commit."
             exit 0
           fi
-          git commit -m "chore: update threatdb manifest to v${RUN_ID}"
+          git commit -m "chore: update threatdb manifest and v2 index to v${RUN_ID}"
           # Absorb any commits that landed on main during the build, then push.
           git pull --rebase --autostash origin main
           git push origin HEAD:main
 
       # Keep only the newest N run-scoped DB assets on the rolling release so it
-      # doesn't accumulate one asset per day forever. Never touches the manifest.
-      # N=3 leaves slack for an in-flight client still holding a prior manifest.
+      # doesn't accumulate one asset per day forever. Never touches either
+      # manifest/index. N=3 leaves slack for an in-flight client still holding a
+      # prior manifest. v1 and v2 assets are pruned as SEPARATE groups: their
+      # names put RUN_ID at different `-`-delimited fields
+      # (tirith-threatdb-<id>-<attempt>.dat vs tirith-threatdb-v2-<id>-<attempt>.dat),
+      # so a combined sort would misorder v2. The v1 regex excludes the v2 names
+      # by requiring digits immediately after the prefix.
       - name: Prune old threatdb assets
         env:
           GH_TOKEN: ${{ github.token }}
           KEEP: "3"
         run: |
           set -euo pipefail
-          mapfile -t STALE < <(
+
+          # v1 assets: tirith-threatdb-<run_id>-<attempt>.dat (no -v2- infix).
+          # RUN_ID is field 3, attempt is field 4.
+          mapfile -t STALE_V1 < <(
             gh release view threatdb-latest --repo "${{ github.repository }}" \
               --json assets \
               --jq '.assets[].name | select(test("^tirith-threatdb-[0-9]+-[0-9]+\\.dat$"))' \
             | sort -t- -k3,3nr -k4,4nr \
             | tail -n +"$((KEEP + 1))"
           )
+
+          # v2 assets: tirith-threatdb-v2-<run_id>-<attempt>.dat. The literal `v2`
+          # is field 3, so RUN_ID is field 4 and attempt is field 5.
+          mapfile -t STALE_V2 < <(
+            gh release view threatdb-latest --repo "${{ github.repository }}" \
+              --json assets \
+              --jq '.assets[].name | select(test("^tirith-threatdb-v2-[0-9]+-[0-9]+\\.dat$"))' \
+            | sort -t- -k4,4nr -k5,5nr \
+            | tail -n +"$((KEEP + 1))"
+          )
+
+          STALE=("${STALE_V1[@]}" "${STALE_V2[@]}")
           if [ "${#STALE[@]}" -eq 0 ]; then
             echo "Prune: nothing to delete."
             exit 0
           fi
           for asset in "${STALE[@]}"; do
+            # Belt-and-suspenders: never delete the manifest or the v2 index even
+            # if a future selection change ever matched them.
             case "$asset" in
-              threatdb-manifest.json) continue ;;
+              threatdb-manifest.json | threatdb-index-v2.json) continue ;;
             esac
             echo "Pruning stale asset: $asset"
             gh release delete-asset threatdb-latest "$asset" \

@@ -3007,6 +3007,115 @@ mod tests {
         assert_eq!(u32::from_le_bytes(v2[8..12].try_into().unwrap()), 2);
     }
 
+    // ---- v2 index publish contract (DB-D) --------------------------------
+    //
+    // These pin the byte-for-byte agreement between the canonical payload the
+    // release workflow signs (.github/workflows/threatdb.yml, "Generate signed
+    // v2 index") and the payload this client reconstructs in
+    // `IndexV2::canonical_payload()`. The two constants below are the LITERAL
+    // `jq -cS` output of that workflow step (captured by running its exact jq
+    // filter). If `canonical_payload()` ever diverges from this shape, the
+    // workflow's signature would no longer verify on the client and v2 would
+    // silently never take effect (clients fall back to v1); these tests turn
+    // that into a local failure. The PRESENT/ABSENT pair proves the canonical
+    // form is stable whether the optional `min_tirith_version` is emitted or
+    // not, matching how the workflow's jq omits an absent key and how
+    // `canonical_payload()` skips an absent `Option`.
+
+    /// Exact workflow `jq -cS` canonical payload for a two-asset index whose v2
+    /// asset carries `min_tirith_version` and whose v1 asset omits it.
+    const WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"},",
+        "{\"filename\":\"tirith-threatdb-v2-7-1.dat\",\"format\":2,",
+        "\"min_tirith_version\":\"0.3.4\",",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+        "\"size\":8192,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
+        "],\"sequence\":7}"
+    );
+
+    /// Exact workflow `jq -cS` canonical payload for a single-asset index with
+    /// NO `min_tirith_version` (the absent-Option case).
+    const WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"}",
+        "],\"sequence\":7}"
+    );
+
+    /// The published `threatdb-index-v2.json` is exactly the signed canonical
+    /// payload with a top-level `manifest_version` and `signature` injected (the
+    /// workflow derives it via `. + {manifest_version, signature}`). This mirrors
+    /// that derivation so a parsed-then-reconstructed payload can be checked.
+    fn published_index_json(canonical_payload: &str, signature: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(canonical_payload).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("manifest_version".to_string(), serde_json::json!(1));
+        obj.insert(
+            "signature".to_string(),
+            serde_json::Value::String(signature.to_string()),
+        );
+        value.to_string()
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_with_min() {
+        // Parse the PUBLISHED index (workflow payload + injected manifest_version
+        // + signature), exactly as the client receives it over the wire.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        // The client's reconstruction MUST equal the bytes the workflow signed.
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN,
+            "client canonical_payload() must be byte-identical to the workflow's jq -cS output"
+        );
+
+        // And a signature made over canonical_payload() verifies. The pinned
+        // production key can't be self-signed in a test, so sign + verify against
+        // a test key directly (same pattern as the DB-B index_v2 sig roundtrip),
+        // which exercises the same bytes verify_signature() would.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_no_min() {
+        // Same proof for the absent-`min_tirith_version` case: the canonical form
+        // is stable, and the workflow omitting the key matches `canonical_payload()`
+        // skipping the absent Option.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        // The single asset must have NO min floor after parsing.
+        assert!(index.assets[0].min_tirith_version.is_none());
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN,
+            "absent min_tirith_version must yield the same byte shape on both sides"
+        );
+
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+    }
+
     /// Check whether the next-check-at file indicates the update is not yet due.
     fn is_next_check_in_future(state_dir: &Path, now: u64) -> bool {
         let next_check_path = state_dir.join(NEXT_CHECK_FILE);
