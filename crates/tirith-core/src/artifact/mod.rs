@@ -75,6 +75,13 @@ pub mod record;
 /// signals, and correlates them into the two startup-hook findings.
 pub mod pth;
 
+/// Native binary triage (PR B7): parses the bounded buffer A4 hands off (ELF /
+/// fat Mach-O / PE) with a vetted read-only object library, extracts execution
+/// entries / danger capabilities / corroboration under strict caps without ever
+/// panicking, and correlates the full conjunction into the Critical
+/// [`crate::verdict::RuleId::NativeImportExecutionChain`].
+pub mod native;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.

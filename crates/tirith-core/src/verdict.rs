@@ -781,6 +781,23 @@ pub enum RuleId {
     /// (`EXTERNALLY_TRIGGERED_RULES`). Critical severity (whence the action is
     /// Block).
     PythonStartupHookCrossRuntime,
+    /// B7: a bundled native module (`.so`/`.dylib`/`.pyd`/`.node`) exposes a direct
+    /// EXECUTION ENTRY (a `PyInit_*` export, an ELF constructor, a Mach-O
+    /// `__mod_init_func`, or a PE TLS callback / `DllMain`) AND a DANGER CAPABILITY
+    /// (a process spawn, an external-runtime loader, a downloader/network call, or
+    /// dynamic code loading) AND CORROBORATION (an external runtime name, a sibling
+    /// script/payload reference, a sensitive credential path, or a known-malicious
+    /// indicator). The native-import trigger the live supply-chain campaign uses to
+    /// hand execution from a compiled extension to a bundled payload at import time.
+    /// The rule keys on GENERIC relationships (any sibling script, any unrelated
+    /// runtime), so renaming the payload does not evade. Correlated from the
+    /// granular `crate::artifact::ArtifactSignalKind`s by native triage over an
+    /// archive member or an installed `.so`/`.pyd`/`.dylib`, never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`. Critical severity (whence the action is Block).
+    /// Mere native-module presence yields at most an informational signal, never
+    /// this finding.
+    NativeImportExecutionChain,
 }
 
 impl fmt::Display for RuleId {
