@@ -195,6 +195,15 @@ fn normalize_name(eco: Ecosystem, name: &str) -> String {
 }
 
 /// OSV JSON schema (subset used for malicious-packages).
+///
+/// OSV records are extensible, so every struct here uses `#[serde(default)]`
+/// and tolerates unknown fields. The shapes below were derived from real
+/// `MAL-*` records fetched from the OSV API (see the vendored fixtures in
+/// `tests/fixtures` exercised by `test_parse_real_ossf_record_indicators`):
+/// indicators live in the entry-level `database_specific.iocs` and
+/// `database_specific.malicious-packages-origins`, NOT under
+/// `affected[].database_specific`. The affected-level `database_specific`
+/// carries provenance (`source` URL) and `cwes`.
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)] // id used for diagnostics in future
 struct OsvEntry {
@@ -216,6 +225,11 @@ struct OsvAffected {
     versions: Vec<String>,
     #[serde(default)]
     ranges: Vec<OsvRange>,
+    // Parsed so the field is tolerated and available to DB-B; provenance only,
+    // never an indicator source.
+    #[serde(default)]
+    #[allow(dead_code)] // affected-level provenance retained for DB-B correlation
+    database_specific: Option<OsvAffectedDatabaseSpecific>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -233,16 +247,144 @@ struct OsvRange {
     range_type: String,
 }
 
+/// Entry-level `database_specific`. Legacy OSV exports carried a `type`
+/// (MALWARE/POTENTIALLY_UNWANTED); current OpenSSF malicious-packages records
+/// instead carry `iocs` and `malicious-packages-origins`.
 #[derive(Debug, serde::Deserialize)]
 struct OsvDatabaseSpecific {
     #[serde(default, rename = "type")]
     entry_type: Option<String>,
+    #[serde(default)]
+    iocs: Option<OsvIocs>,
+    #[serde(default, rename = "malicious-packages-origins")]
+    malicious_packages_origins: Vec<OsvOrigin>,
+}
+
+/// Indicators of compromise carried at the entry level by current records.
+#[derive(Debug, Default, serde::Deserialize)]
+struct OsvIocs {
+    #[serde(default)]
+    ips: Vec<String>,
+    #[serde(default)]
+    domains: Vec<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+}
+
+/// One entry in `malicious-packages-origins`: a per-source attestation that
+/// carries the OSSF analysis artifact `sha256` and the versions it covers.
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)] // versions/id retained for DB-B correlation
+struct OsvOrigin {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    versions: Vec<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Affected-level `database_specific`: provenance only (a `source` URL and
+/// `cwes`), never indicators. Captured so the parser tolerates the field.
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)] // provenance retained for DB-B correlation
+struct OsvAffectedDatabaseSpecific {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    cwes: Vec<OsvCwe>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)] // cwe metadata retained for DB-B correlation
+struct OsvCwe {
+    #[serde(default, rename = "cweId")]
+    cwe_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct OsvReference {
     #[serde(default)]
     url: String,
+}
+
+/// In-memory intermediate model of the artifact/file/URL indicators parsed out
+/// of an OpenSSF malicious-packages record.
+///
+/// DB-A has no on-disk format for these (v1 has no indicator sections), so this
+/// is staged in memory and its counts logged to prove the parser against real
+/// records; it is NOT persisted and does not change client behavior. DB-B's v2
+/// writer will consume this same model to populate v2 indicator sections.
+///
+/// Only explicit indicator fields are collected. OSV `references` (ADVISORY /
+/// ARTICLE / REPORT links) are legitimate documentation, never malicious
+/// indicators, and are deliberately excluded.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct OssfIndicators {
+    /// SHA-256 hashes of the analysis artifacts, from
+    /// `database_specific.malicious-packages-origins[].sha256`.
+    artifact_sha256: Vec<String>,
+    /// Malicious IPs, from `database_specific.iocs.ips`.
+    ips: Vec<String>,
+    /// Malicious domains, from `database_specific.iocs.domains`.
+    domains: Vec<String>,
+    /// Malicious URLs, from `database_specific.iocs.urls`.
+    urls: Vec<String>,
+}
+
+impl OssfIndicators {
+    /// Extract indicators from an entry-level `database_specific`. Pure: it
+    /// reads only explicit indicator fields and never touches `references`.
+    fn from_database_specific(ds: Option<&OsvDatabaseSpecific>) -> Self {
+        let mut out = OssfIndicators::default();
+        let Some(ds) = ds else {
+            return out;
+        };
+        for origin in &ds.malicious_packages_origins {
+            if let Some(sha) = &origin.sha256 {
+                if !sha.is_empty() {
+                    out.artifact_sha256.push(sha.clone());
+                }
+            }
+        }
+        if let Some(iocs) = &ds.iocs {
+            out.ips.extend(iocs.ips.iter().cloned());
+            out.domains.extend(iocs.domains.iter().cloned());
+            out.urls.extend(iocs.urls.iter().cloned());
+        }
+        out
+    }
+
+    /// Total number of indicators across all kinds (for diagnostics).
+    fn len(&self) -> usize {
+        self.artifact_sha256.len() + self.ips.len() + self.domains.len() + self.urls.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// OpenSSF malicious-packages confidence.
+///
+/// Current `MAL-*` records do not carry the legacy `database_specific.type`, so
+/// keying confidence on `type` alone left every real record at `Medium`. A
+/// record published by OpenSSF malicious-packages whose id starts with `MAL-`
+/// is a confirmed-malicious entry, so it maps to `Confirmed` even without a
+/// `type`. Legacy `type` values are still honored when present.
+///
+/// This is source-specific on purpose: it is only applied inside `parse_ossf`
+/// (the OpenSSF feed). The Datadog OSV-fallback path does not call it, so an
+/// arbitrary `MAL-` id arriving from another feed is not auto-promoted.
+fn ossf_confidence(id: &str, entry_type: Option<&str>) -> Confidence {
+    match entry_type {
+        Some("MALWARE") => Confidence::Confirmed,
+        Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
+        _ if id.starts_with("MAL-") => Confidence::Confirmed,
+        _ => Confidence::Medium, // Default: Medium (OSSF allows borderline)
+    }
 }
 
 struct OssfStats {
@@ -252,6 +394,11 @@ struct OssfStats {
     skipped_unknown_ecosystem: usize,
     skipped_unreadable: usize,
     skipped_corrupt: usize,
+    /// Records that carried at least one parsed indicator (artifact/IP/domain/URL).
+    records_with_indicators: usize,
+    /// Total parsed indicators across all records. Staged in memory only (DB-A
+    /// has no on-disk section for them); DB-B's v2 writer will persist them.
+    total_indicators: usize,
 }
 
 fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
@@ -263,6 +410,8 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
         skipped_unknown_ecosystem: 0,
         skipped_unreadable: 0,
         skipped_corrupt: 0,
+        records_with_indicators: 0,
+        total_indicators: 0,
     };
 
     for entry in walkdir::WalkDir::new(root)
@@ -293,22 +442,31 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
 
         stats.total_entries += 1;
 
-        let confidence = match osv
+        let entry_type = osv
             .database_specific
             .as_ref()
-            .and_then(|d| d.entry_type.as_deref())
-        {
-            Some("MALWARE") => Confidence::Confirmed,
-            Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
-            _ => Confidence::Medium, // Default: Medium (OSSF allows borderline)
-        };
+            .and_then(|d| d.entry_type.as_deref());
 
-        let is_malware = matches!(
-            osv.database_specific
-                .as_ref()
-                .and_then(|d| d.entry_type.as_deref()),
-            Some("MALWARE")
-        );
+        // Source-specific: an OpenSSF malicious-packages MAL-* record is
+        // Confirmed even without the legacy `type`. parse_ossf is the only
+        // caller, so the OpenSSF-source constraint is satisfied by construction.
+        let confidence = ossf_confidence(&osv.id, entry_type);
+
+        // An all-versions ("whole package is bad") entry is produced for a
+        // Confirmed record with no versions and no ranges. Previously only a
+        // legacy `type == "MALWARE"` qualified; current MAL-* records confirm
+        // via the id, so key this on the resolved confidence instead.
+        let is_confirmed = confidence == Confidence::Confirmed;
+
+        // Stage indicators in memory and log their counts. DB-A does not persist
+        // them (v1 has no indicator section); DB-B's v2 writer consumes this
+        // same model. Only explicit indicator fields are read; `references` are
+        // legitimate documentation links and are excluded.
+        let indicators = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        if !indicators.is_empty() {
+            stats.records_with_indicators += 1;
+            stats.total_indicators += indicators.len();
+        }
 
         let reference = osv.references.first().map(|r| r.url.clone());
 
@@ -345,8 +503,9 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
             } else if has_ranges {
                 // Ranges but no explicit version list — skipped in Phase A.
                 stats.skipped_range_only_count += 1;
-            } else if is_malware {
-                // MALWARE with no versions and no ranges — whole package is bad.
+            } else if is_confirmed {
+                // Confirmed-malicious (legacy MALWARE type or a MAL-* id) with no
+                // versions and no ranges — the whole package is bad.
                 entries.push(PackageEntry {
                     ecosystem,
                     name,
@@ -892,6 +1051,11 @@ fn main() {
             stats.skipped_unreadable,
             stats.skipped_corrupt,
         );
+        // DB-A stages indicators in memory only; DB-B's v2 writer persists them.
+        eprintln!(
+            "    {} indicators parsed across {} records (staged in memory, not persisted in v1)",
+            stats.total_indicators, stats.records_with_indicators,
+        );
         total_files_scanned +=
             stats.total_entries + stats.skipped_unreadable + stats.skipped_corrupt;
         total_files_skipped += stats.skipped_unreadable + stats.skipped_corrupt;
@@ -905,6 +1069,8 @@ fn main() {
             skipped_unknown_ecosystem: 0,
             skipped_unreadable: 0,
             skipped_corrupt: 0,
+            records_with_indicators: 0,
+            total_indicators: 0,
         };
     }
 
@@ -1335,29 +1501,137 @@ mod tests {
 
     #[test]
     fn test_ossv_confidence_mapping() {
-        let malware_type: Option<&str> = Some("MALWARE");
-        let confidence = match malware_type {
-            Some("MALWARE") => Confidence::Confirmed,
-            Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
-            _ => Confidence::Medium,
-        };
-        assert_eq!(confidence, Confidence::Confirmed);
+        // Legacy `database_specific.type` still wins when present, regardless of id.
+        assert_eq!(
+            ossf_confidence("MAL-2025-6812", Some("MALWARE")),
+            Confidence::Confirmed
+        );
+        assert_eq!(
+            ossf_confidence("MAL-2025-6812", Some("POTENTIALLY_UNWANTED")),
+            Confidence::Medium
+        );
 
-        let unwanted_type: Option<&str> = Some("POTENTIALLY_UNWANTED");
-        let confidence2 = match unwanted_type {
-            Some("MALWARE") => Confidence::Confirmed,
-            Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
-            _ => Confidence::Medium,
-        };
-        assert_eq!(confidence2, Confidence::Medium);
+        // Source-specific fix: a real MAL-* record carries no `type`, but is a
+        // confirmed OpenSSF malicious-packages entry, so it maps to Confirmed.
+        assert_eq!(
+            ossf_confidence("MAL-2026-2307", None),
+            Confidence::Confirmed
+        );
 
-        let no_type: Option<&str> = None;
-        let confidence3 = match no_type {
-            Some("MALWARE") => Confidence::Confirmed,
-            Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
-            _ => Confidence::Medium,
-        };
-        assert_eq!(confidence3, Confidence::Medium);
+        // A non-MAL id with no `type` stays Medium (OSSF allows borderline).
+        assert_eq!(ossf_confidence("OSV-2025-0001", None), Confidence::Medium);
+        assert_eq!(ossf_confidence("", None), Confidence::Medium);
+
+        // POTENTIALLY_UNWANTED is never promoted by a MAL- id.
+        assert_eq!(
+            ossf_confidence("MAL-2026-2307", Some("POTENTIALLY_UNWANTED")),
+            Confidence::Medium
+        );
+    }
+
+    // Real OpenSSF malicious-packages records fetched from the OSV API and
+    // vendored as fixtures. The parser structs are derived from these actual
+    // shapes (indicators under entry-level `database_specific.iocs` /
+    // `malicious-packages-origins`, not `affected[].database_specific`).
+    const MAL_2025_6812: &str = include_str!("fixtures/mal-2025-6812.json");
+    const MAL_2026_2307: &str = include_str!("fixtures/mal-2026-2307.json");
+
+    #[test]
+    fn test_parse_real_ossf_record_indicators() {
+        // MAL-2025-6812: malicious-packages-origins with one sha256, no iocs.
+        let osv: OsvEntry = serde_json::from_str(MAL_2025_6812).expect("fixture must deserialize");
+        assert_eq!(osv.id, "MAL-2025-6812");
+        assert_eq!(osv.affected.len(), 1);
+        assert_eq!(osv.affected[0].versions, vec!["71.71.72".to_string()]);
+
+        // Confirmed via the MAL- id, with no legacy `type`.
+        let entry_type = osv
+            .database_specific
+            .as_ref()
+            .and_then(|d| d.entry_type.as_deref());
+        assert_eq!(entry_type, None);
+        assert_eq!(
+            ossf_confidence(&osv.id, entry_type),
+            Confidence::Confirmed,
+            "a MAL-* record with no type must be Confirmed"
+        );
+
+        let ind = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        assert_eq!(
+            ind.artifact_sha256,
+            vec!["091ef657bc115b400dc3d8cd65691df53caef85fa307f52d627aac4d50120a77".to_string()]
+        );
+        assert!(ind.ips.is_empty());
+        assert!(ind.domains.is_empty());
+        assert!(ind.urls.is_empty());
+        assert_eq!(ind.len(), 1);
+
+        // The affected-level database_specific (source URL) is tolerated, not
+        // mistaken for an indicator.
+        assert!(osv.affected[0]
+            .database_specific
+            .as_ref()
+            .and_then(|d| d.source.as_deref())
+            .is_some_and(|s| s.contains("ossf/malicious-packages")));
+    }
+
+    #[test]
+    fn test_parse_real_ossf_record_with_iocs() {
+        // MAL-2026-2307: iocs (ips/domains/urls) plus three origin sha256s.
+        let osv: OsvEntry = serde_json::from_str(MAL_2026_2307).expect("fixture must deserialize");
+        assert_eq!(osv.id, "MAL-2026-2307");
+
+        let ind = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        assert_eq!(ind.ips, vec!["142.11.206.73".to_string()]);
+        assert_eq!(ind.domains, vec!["sfrclak.com".to_string()]);
+        assert_eq!(
+            ind.urls,
+            vec!["http://sfrclak.com:8000/6202033".to_string()]
+        );
+        // Three origins each contribute their artifact sha256.
+        assert_eq!(ind.artifact_sha256.len(), 3);
+        assert!(ind.artifact_sha256.contains(
+            &"503284900929e333b801f9f47419a2b4c21e4022d13a03fc14e4b5390767a51d".to_string()
+        ));
+        assert_eq!(ind.len(), 6);
+
+        // The OSV `references` (ADVISORY/ARTICLE/REPORT) are legitimate links and
+        // must NOT leak into any indicator field.
+        assert!(!osv.references.is_empty(), "fixture has references");
+        for r in &osv.references {
+            assert!(
+                !ind.urls.contains(&r.url),
+                "references must not be indicators"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ossf_indicators_ignore_references_and_tolerate_unknowns() {
+        // Unknown top-level and nested fields are tolerated (records are
+        // extensible), and references never become indicators.
+        let json = r#"{
+            "id": "MAL-2099-0001",
+            "some_future_field": {"nested": [1, 2, 3]},
+            "references": [{"type": "ADVISORY", "url": "https://example.com/advisory"}],
+            "database_specific": {
+                "future_key": true,
+                "iocs": {"domains": ["evil.example"], "future_ioc": ["x"]},
+                "malicious-packages-origins": [
+                    {"source": "ossf-package-analysis", "sha256": "abc", "extra": 1}
+                ]
+            },
+            "affected": [{
+                "package": {"name": "p", "ecosystem": "npm"},
+                "versions": ["1.0.0"],
+                "database_specific": {"source": "https://x", "unknown": 5}
+            }]
+        }"#;
+        let osv: OsvEntry = serde_json::from_str(json).expect("unknown fields must be tolerated");
+        let ind = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        assert_eq!(ind.domains, vec!["evil.example".to_string()]);
+        assert_eq!(ind.artifact_sha256, vec!["abc".to_string()]);
+        assert!(ind.urls.is_empty());
     }
 
     #[test]
