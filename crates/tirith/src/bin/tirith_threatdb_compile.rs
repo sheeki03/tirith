@@ -13,7 +13,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 
-use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
+use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
     parse_domain_blocklist, parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip,
     parse_tor_exit_list, parse_urlhaus_csv,
@@ -92,9 +92,16 @@ struct Cli {
     #[arg(long)]
     sequence: Option<u64>,
 
-    /// Output .dat file path
+    /// Output v1 .dat file path
     #[arg(long, default_value = "tirith-threatdb.dat")]
     output: PathBuf,
+
+    /// Optional v2 .dat output path. When set, the compiler ALSO emits a v2 DB
+    /// to this path: the same v1 data PLUS the artifact-SHA / malicious-URL
+    /// sections derived from the parsed OpenSSF indicators (DB-A's model). The
+    /// v1 `--output` is always written too, so CI can publish both formats.
+    #[arg(long)]
+    output_v2: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -365,6 +372,30 @@ impl OssfIndicators {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Fold another record's indicators into this aggregate (used to gather all
+    /// parsed indicators across the OSSF tree for the v2 writer).
+    fn extend(&mut self, other: OssfIndicators) {
+        self.artifact_sha256.extend(other.artifact_sha256);
+        self.ips.extend(other.ips);
+        self.domains.extend(other.domains);
+        self.urls.extend(other.urls);
+    }
+}
+
+/// Decode a 64-char hex SHA-256 string into 32 bytes; `None` for anything that
+/// is not exactly a 32-byte hex digest (so a malformed indicator is dropped, not
+/// written as a bogus hash). Accepts upper or lower case.
+fn decode_sha256_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// OpenSSF malicious-packages confidence.
@@ -410,8 +441,12 @@ struct OssfStats {
     total_indicators: usize,
 }
 
-fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
+fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats, OssfIndicators) {
     let mut entries = Vec::new();
+    // Aggregate every record's parsed indicators across the tree; DB-B's v2
+    // writer consumes this to populate the artifact-SHA and malicious-URL
+    // sections. DB-A only counted them.
+    let mut all_indicators = OssfIndicators::default();
     let mut stats = OssfStats {
         total_entries: 0,
         parsed_packages: 0,
@@ -475,6 +510,8 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
         if !indicators.is_empty() {
             stats.records_with_indicators += 1;
             stats.total_indicators += indicators.len();
+            // DB-B: keep the parsed indicators so the v2 writer can persist them.
+            all_indicators.extend(indicators);
         }
 
         let reference = osv.references.first().map(|r| r.url.clone());
@@ -531,7 +568,7 @@ fn parse_ossf(root: &Path) -> (Vec<PackageEntry>, OssfStats) {
         }
     }
 
-    (entries, stats)
+    (entries, stats, all_indicators)
 }
 
 /// Datadog dataset entry format.
@@ -1045,12 +1082,14 @@ fn main() {
 
     // 1. OSSF malicious-packages
     let ossf_stats;
+    // Aggregated OpenSSF indicators (DB-A model), consumed by the v2 writer.
+    let mut ossf_indicators = OssfIndicators::default();
     if let Some(ref ossf_dir) = cli.ossf {
         eprintln!(
             "  parsing OSSF malicious-packages from {}",
             ossf_dir.display()
         );
-        let (ossf_packages, stats) = parse_ossf(ossf_dir);
+        let (ossf_packages, stats, indicators) = parse_ossf(ossf_dir);
         eprintln!(
             "    {} entries scanned, {} packages extracted, {} skipped (range-only), {} unknown ecosystem, {} unreadable, {} corrupt",
             stats.total_entries,
@@ -1060,15 +1099,19 @@ fn main() {
             stats.skipped_unreadable,
             stats.skipped_corrupt,
         );
-        // DB-A stages indicators in memory only; DB-B's v2 writer persists them.
+        // v1 never persists indicators; the v2 writer (below) consumes them.
         eprintln!(
-            "    {} indicators parsed across {} records (staged in memory, not persisted in v1)",
-            stats.total_indicators, stats.records_with_indicators,
+            "    {} indicators parsed across {} records ({} artifact sha256, {} urls; v1 omits them, v2 persists them)",
+            stats.total_indicators,
+            stats.records_with_indicators,
+            indicators.artifact_sha256.len(),
+            indicators.urls.len(),
         );
         total_files_scanned +=
             stats.total_entries + stats.skipped_unreadable + stats.skipped_corrupt;
         total_files_skipped += stats.skipped_unreadable + stats.skipped_corrupt;
         ossf_stats = stats;
+        ossf_indicators = indicators;
         all_packages.extend(ossf_packages);
     } else {
         ossf_stats = OssfStats {
@@ -1284,12 +1327,47 @@ fn main() {
         writer.add_popular(pop.ecosystem, &pop.name);
     }
 
-    // ThreatDbWriter handles sorting, dedup, index generation, header layout,
-    // and signing in a format compatible with the reader.
-    let data = writer.build(&signing_key).unwrap_or_else(|e| {
-        eprintln!("error: failed to build threat DB: {e}");
-        std::process::exit(1);
-    });
+    // v2-only: persist the OpenSSF artifact-SHA and malicious-URL indicators
+    // (DB-A's parsed model). These are ignored by a v1 build and only emitted
+    // into the v2 file. Malformed artifact hashes are dropped, not written.
+    let mut v2_artifact_count = 0usize;
+    let mut v2_skipped_bad_sha = 0usize;
+    for sha in &ossf_indicators.artifact_sha256 {
+        match decode_sha256_hex(sha) {
+            Some(bytes) => {
+                writer.add_artifact_sha256(
+                    bytes,
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    // The OSSF origin sha256 attests a specific analysis
+                    // artifact, not "all versions"; mark it as a specific match.
+                    false,
+                    None,
+                );
+                v2_artifact_count += 1;
+            }
+            None => v2_skipped_bad_sha += 1,
+        }
+    }
+    // Malicious URLs come ONLY from explicit indicator fields (never OSSF
+    // `references`, which DB-A already excludes from the indicator model).
+    let mut v2_url_count = 0usize;
+    for url in &ossf_indicators.urls {
+        let normalized = url.trim();
+        if !normalized.is_empty() {
+            writer.add_malicious_url(normalized, ThreatSource::ExfilEndpoint);
+            v2_url_count += 1;
+        }
+    }
+
+    // Always build and write the v1 DB. (A v1 build ignores the v2 inputs above,
+    // so an old binary and the legacy manifest keep getting exactly v1.)
+    let data = writer
+        .build_format(ThreatDbFormat::V1, &signing_key)
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to build threat DB: {e}");
+            std::process::exit(1);
+        });
 
     let mut file = std::fs::File::create(&cli.output).unwrap_or_else(|e| {
         eprintln!(
@@ -1302,6 +1380,31 @@ fn main() {
         eprintln!("error: cannot write output file: {e}");
         std::process::exit(1);
     });
+
+    // Optionally also emit a v2 DB (same v1 data PLUS the indicator sections).
+    if let Some(ref v2_path) = cli.output_v2 {
+        let v2_data = writer
+            .build_format(ThreatDbFormat::V2, &signing_key)
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to build v2 threat DB: {e}");
+                std::process::exit(1);
+            });
+        std::fs::write(v2_path, &v2_data).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot write v2 output file {}: {e}",
+                v2_path.display()
+            );
+            std::process::exit(1);
+        });
+        eprintln!(
+            "  v2 output:             {} ({} bytes; {} artifact sha256, {} urls; {} bad sha skipped)",
+            v2_path.display(),
+            v2_data.len(),
+            v2_artifact_count,
+            v2_url_count,
+            v2_skipped_bad_sha,
+        );
+    }
 
     let ecosystems_seen: BTreeSet<String> = packages
         .iter()
@@ -1624,6 +1727,88 @@ mod tests {
                 "references must not be indicators"
             );
         }
+    }
+
+    #[test]
+    fn test_decode_sha256_hex() {
+        // 64 lowercase hex -> 32 bytes.
+        let s = "503284900929e333b801f9f47419a2b4c21e4022d13a03fc14e4b5390767a51d";
+        let bytes = decode_sha256_hex(s).expect("valid sha256 hex");
+        assert_eq!(bytes[0], 0x50);
+        assert_eq!(bytes[31], 0x1d);
+        // Uppercase tolerated.
+        assert!(decode_sha256_hex(&s.to_uppercase()).is_some());
+        // Wrong length / non-hex rejected.
+        assert!(decode_sha256_hex("abc").is_none());
+        assert!(decode_sha256_hex(&"z".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn test_compiler_emits_v2_sections_from_indicator_model() {
+        use ed25519_dalek::SigningKey;
+        use tirith_core::threatdb::{ThreatDb, ThreatDbFormat};
+
+        // Drive the DB-A parser over the vendored MAL-2026-2307 record, which
+        // carries artifact sha256 + an ioc URL, then feed that model into the v2
+        // writer exactly as main() does and assert the v2 lookups resolve.
+        let osv: OsvEntry = serde_json::from_str(MAL_2026_2307).expect("fixture deserialize");
+        let indicators = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        assert!(!indicators.artifact_sha256.is_empty());
+        assert!(!indicators.urls.is_empty());
+
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        // A v1 package too, so the v2 file still carries v1 data.
+        writer.add_package(
+            Ecosystem::PyPI,
+            "compiler-v2-pkg",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        for sha in &indicators.artifact_sha256 {
+            if let Some(bytes) = decode_sha256_hex(sha) {
+                writer.add_artifact_sha256(
+                    bytes,
+                    ThreatSource::OssfMalicious,
+                    Confidence::Confirmed,
+                    false,
+                    None,
+                );
+            }
+        }
+        for url in &indicators.urls {
+            writer.add_malicious_url(url.trim(), ThreatSource::ExfilEndpoint);
+        }
+
+        let v2 = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(v2, 0).expect("v2 load");
+        assert_eq!(db.stats().format_version, 2);
+
+        // The artifact hash from the fixture resolves.
+        let target =
+            decode_sha256_hex("503284900929e333b801f9f47419a2b4c21e4022d13a03fc14e4b5390767a51d")
+                .unwrap();
+        let am = db.check_artifact_sha256(&target).expect("artifact hit");
+        assert_eq!(am.source, ThreatSource::OssfMalicious);
+
+        // The ioc URL resolves; a non-listed URL does not.
+        assert_eq!(
+            db.check_malicious_url("http://sfrclak.com:8000/6202033"),
+            Some(ThreatSource::ExfilEndpoint)
+        );
+        assert!(db
+            .check_malicious_url("http://not-listed.example/x")
+            .is_none());
+
+        // v1 package still resolves on the v2 file.
+        assert!(db
+            .check_package(Ecosystem::PyPI, "compiler-v2-pkg", Some("1.0.0"))
+            .is_some());
     }
 
     #[test]
