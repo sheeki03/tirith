@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
 use crate::location::SubjectLocation;
@@ -76,7 +78,8 @@ pub enum GuardedScanOutcome {
 /// Why a matched file was NOT fully analyzed. Distinct from an INTENTIONAL
 /// exclusion (an ignore/exclude pattern or ordinary media), which is never a
 /// gap: a gap means "this could have mattered and we did not cover it".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoverageGapKind {
     /// File exceeds the analysis size ceiling ([`MAX_FILE_SIZE`]) but is small
     /// enough to hash within [`MAX_COVERAGE_HASH_BYTES`].
@@ -117,10 +120,11 @@ impl CoverageGapKind {
 /// and a best-effort SHA-256 (lowercase hex) for later hash lookups. `sha256` is
 /// `None` when hashing failed or was skipped (e.g. [`CoverageGapKind::Unreadable`]
 /// or [`CoverageGapKind::HashBudgetExceeded`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageGap {
     pub location: SubjectLocation,
     pub kind: CoverageGapKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
 

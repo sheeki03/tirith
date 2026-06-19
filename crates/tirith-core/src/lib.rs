@@ -1,6 +1,7 @@
 pub mod agent_origin;
 pub mod aliases;
 pub mod approval;
+pub mod artifact;
 pub mod audit;
 pub mod audit_aggregator;
 pub mod audit_tune;
