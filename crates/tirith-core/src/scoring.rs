@@ -80,6 +80,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::ThreatMaliciousIp
         | RuleId::ThreatPackageTyposquat
         | RuleId::ThreatPackageSimilarName
+        | RuleId::ThreatUnresolvedMaliciousPackage
         | RuleId::ThreatMaliciousUrl
         | RuleId::ThreatPhishingUrl
         | RuleId::ThreatTorExitNode

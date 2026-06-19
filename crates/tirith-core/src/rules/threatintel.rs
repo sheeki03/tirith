@@ -1,34 +1,41 @@
 use std::net::Ipv4Addr;
 
 use crate::extract::ExtractedUrl;
-use crate::threatdb::{self, Ecosystem, ThreatDb};
+use crate::threatdb::{self, Ecosystem, PackageThreatAssessment, ThreatDb};
 use crate::tokenize::{Segment, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
+use crate::version_intent::VersionIntent;
 
 /// A reference to a package extracted from a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {
     pub ecosystem: Ecosystem,
     pub name: String,
-    pub version: Option<String>,
+    /// How the version was expressed. An unpinned install is `Unspecified`; an
+    /// unparsed range is a `Constraint` and is treated as unresolved, never
+    /// silently as an exact pin.
+    pub version: VersionIntent,
 }
 
-/// Split a `name<sep>version` string (e.g. `serde@1.0`). `(name, None)` when
-/// `sep` is absent or the version part is empty.
-fn split_name_version(s: &str, sep: char) -> (&str, Option<String>) {
+/// Split a `name<sep>version` string (e.g. `serde@1.0`) into a name and an
+/// explicit [`VersionIntent`]. The version part is interpreted as an explicit
+/// single token (exact pin if plain, unresolved constraint otherwise).
+fn split_name_version(s: &str, sep: char) -> (&str, VersionIntent) {
     if let Some(pos) = s.find(sep) {
         let name = &s[..pos];
         let ver = &s[pos + 1..];
-        (
-            name,
-            if ver.is_empty() {
-                None
-            } else {
-                Some(ver.to_string())
-            },
-        )
+        (name, VersionIntent::from_explicit_version(ver))
     } else {
-        (s, None)
+        (s, VersionIntent::Unspecified)
+    }
+}
+
+/// Build a [`VersionIntent`] from an optional explicit version token; `None`
+/// (and empty) becomes [`Unspecified`](VersionIntent::Unspecified).
+fn intent_from_opt_token(token: Option<&str>) -> VersionIntent {
+    match token {
+        Some(v) => VersionIntent::from_explicit_version(v),
+        None => VersionIntent::Unspecified,
     }
 }
 
@@ -168,7 +175,10 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        let version = extract_pip_version(rest);
+        // `rest` is the full PEP 440 specifier tail (e.g. `==1.2.3`, `>=1.4.4`,
+        // `>=1.2,<2.0`, or empty). Parse it so an exact pin stays exact and a
+        // range is resolved/excluded properly instead of being dropped.
+        let version = VersionIntent::from_pep440_specifier(rest);
         let normalized = normalize_pypi_name(name_part);
 
         packages.push(PackageRef {
@@ -185,17 +195,6 @@ fn normalize_pypi_name(name: &str) -> String {
         .chars()
         .map(|c| if c == '_' || c == '.' { '-' } else { c })
         .collect()
-}
-
-/// Exact pip version — only `==` (exact match) yields a version.
-fn extract_pip_version(spec: &str) -> Option<String> {
-    if let Some(ver) = spec.strip_prefix("==") {
-        let v = ver.trim();
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    None
 }
 
 /// Flags for npm/yarn/pnpm that consume the next argument.
@@ -301,7 +300,7 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
     Some(PackageRef {
         ecosystem: Ecosystem::Npm,
         name: name.to_string(),
-        version: version.map(|v| v.to_string()),
+        version: intent_from_opt_token(version),
     })
 }
 
@@ -342,8 +341,10 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 if lower == "--version" || lower == "--vers" {
                     if let Some(ver) = iter.next() {
                         if let Some(last) = packages.last_mut() {
-                            if last.ecosystem == Ecosystem::Crates && last.version.is_none() {
-                                last.version = Some(ver.to_string());
+                            if last.ecosystem == Ecosystem::Crates
+                                && matches!(last.version, VersionIntent::Unspecified)
+                            {
+                                last.version = VersionIntent::from_explicit_version(ver);
                             }
                         }
                     }
@@ -394,8 +395,10 @@ fn extract_gem_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                 if lower == "--version" || lower == "-v" {
                     if let Some(ver) = iter.next() {
                         if let Some(last) = packages.last_mut() {
-                            if last.ecosystem == Ecosystem::RubyGems && last.version.is_none() {
-                                last.version = Some(ver.to_string());
+                            if last.ecosystem == Ecosystem::RubyGems
+                                && matches!(last.version, VersionIntent::Unspecified)
+                            {
+                                last.version = VersionIntent::from_explicit_version(ver);
                             }
                         }
                     }
@@ -503,8 +506,10 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             if lower == "--version" || lower == "-v" {
                 if let Some(ver) = iter.next() {
                     if let Some(last) = packages.last_mut() {
-                        if last.ecosystem == Ecosystem::NuGet && last.version.is_none() {
-                            last.version = Some(ver.to_string());
+                        if last.ecosystem == Ecosystem::NuGet
+                            && matches!(last.version, VersionIntent::Unspecified)
+                        {
+                            last.version = VersionIntent::from_explicit_version(ver);
                         }
                     }
                 }
@@ -519,7 +524,7 @@ fn extract_dotnet_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         packages.push(PackageRef {
             ecosystem: Ecosystem::NuGet,
             name: arg.to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         });
     }
 }
@@ -535,13 +540,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             let parts: Vec<&str> = coord.splitn(4, ':').collect();
             if parts.len() >= 2 {
                 let name = format!("{}:{}", parts[0], parts[1]);
-                let version = parts.get(2).and_then(|v| {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.to_string())
-                    }
-                });
+                let version = intent_from_opt_token(parts.get(2).copied());
                 packages.push(PackageRef {
                     ecosystem: Ecosystem::Maven,
                     name,
@@ -559,13 +558,7 @@ fn extract_maven_packages(args: &[String], packages: &mut Vec<PackageRef>) {
         let parts: Vec<&str> = arg.splitn(4, ':').collect();
         if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
             let name = format!("{}:{}", parts[0], parts[1]);
-            let version = parts.get(2).and_then(|v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            });
+            let version = intent_from_opt_token(parts.get(2).copied());
             packages.push(PackageRef {
                 ecosystem: Ecosystem::Maven,
                 name,
@@ -604,8 +597,9 @@ pub fn extract_ipv4_from_token(token: &str) -> Option<Ipv4Addr> {
     ip_str.parse::<Ipv4Addr>().ok()
 }
 
-/// Map threat-DB confidence to finding severity.
-fn confidence_to_severity(c: threatdb::Confidence) -> Severity {
+/// Map threat-DB confidence to finding severity. `pub(crate)` so the ecosystem
+/// scan path (A1e) maps an `ExactMatch` to the same severity as this command path.
+pub(crate) fn confidence_to_severity(c: threatdb::Confidence) -> Severity {
     match c {
         threatdb::Confidence::Confirmed => Severity::Critical,
         threatdb::Confidence::Medium => Severity::Medium,
@@ -668,6 +662,71 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
     }
 }
 
+/// Which unresolved shape produced a [`RuleId::ThreatUnresolvedMaliciousPackage`].
+#[derive(Debug, Clone, Copy)]
+enum UnresolvedKind {
+    /// No definite version (unpinned install, or a constraint/affected version
+    /// outside the supported subset).
+    Unresolved,
+    /// A constraint that provably overlaps the affected versions.
+    ConstraintIntersects,
+}
+
+/// Build the Medium/Warn finding for a malicious-package name whose installed
+/// version could not be resolved to a definite hit. Advises pinning to a known
+/// non-affected version (the install-path resolution note).
+fn unresolved_package_finding(
+    pkg: &PackageRef,
+    summary: &threatdb::ThreatMatchSummary,
+    affected_versions: &[String],
+    kind: UnresolvedKind,
+) -> Finding {
+    let affected_list = if affected_versions.is_empty() {
+        "unknown".to_string()
+    } else {
+        affected_versions.join(", ")
+    };
+    let request_desc = match kind {
+        UnresolvedKind::Unresolved => match &pkg.version {
+            VersionIntent::Unspecified => "No version was pinned".to_string(),
+            VersionIntent::Constraint { raw, .. } => {
+                format!("The constraint '{raw}' could not be fully resolved")
+            }
+            // Exact/Resolved never reach the unresolved path.
+            other => format!("The request '{other:?}' could not be resolved"),
+        },
+        UnresolvedKind::ConstraintIntersects => match pkg.version.constraint_raw() {
+            Some(raw) => format!("The constraint '{raw}' overlaps the affected versions"),
+            None => "The request overlaps the affected versions".to_string(),
+        },
+    };
+    Finding {
+        rule_id: RuleId::ThreatUnresolvedMaliciousPackage,
+        severity: Severity::Medium,
+        title: format!(
+            "Unresolved malicious {} package: {}",
+            pkg.ecosystem, pkg.name
+        ),
+        description: format!(
+            "Package '{}' in {} is flagged as malicious by {} for specific versions \
+             ({affected_list}). {request_desc}, so the resolver might install an affected \
+             version. Pin an exact non-affected version (or choose a different package) to \
+             clear this warning.",
+            pkg.name, pkg.ecosystem, summary.source_label,
+        ),
+        evidence: vec![Evidence::ThreatIntel {
+            source: summary.source_label.clone(),
+            threat_type: "unresolved_malicious_package".to_string(),
+            confidence: summary.confidence,
+            reference: summary.reference_url.clone(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
 /// Check input against the local threat intelligence database. Fail-open: a
 /// `None` db returns no findings. All lookups are in-memory, no network I/O.
 pub fn check(
@@ -689,35 +748,68 @@ pub fn check(
     for pkg in &packages {
         let db_eco = pkg.ecosystem;
 
-        if let Some(m) = db.check_package(db_eco, &pkg.name, pkg.version.as_deref()) {
-            findings.push(Finding {
-                rule_id: RuleId::ThreatMaliciousPackage,
-                severity: confidence_to_severity(m.confidence),
-                title: format!("Known malicious {} package: {}", pkg.ecosystem, pkg.name),
-                description: format!(
-                    "Package '{}' in {} is flagged as malicious by {}. {}",
-                    pkg.name,
-                    pkg.ecosystem,
-                    m.source.label(),
-                    if m.all_versions_malicious {
-                        "All versions are affected."
-                    } else {
-                        "Specific version(s) affected."
-                    }
-                ),
-                evidence: vec![Evidence::ThreatIntel {
-                    source: m.source.label().to_string(),
-                    threat_type: "malicious_package".to_string(),
-                    confidence: m.confidence,
-                    reference: m.reference_url,
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
-            // A confirmed-malicious finding suffices — skip the typosquat checks.
-            continue;
+        match db.assess_package(db_eco, &pkg.name, &pkg.version) {
+            PackageThreatAssessment::ExactMatch(summary) => {
+                findings.push(Finding {
+                    rule_id: RuleId::ThreatMaliciousPackage,
+                    severity: confidence_to_severity(summary.confidence),
+                    title: format!("Known malicious {} package: {}", pkg.ecosystem, pkg.name),
+                    description: format!(
+                        "Package '{}' in {} is flagged as malicious by {}. {}",
+                        pkg.name,
+                        pkg.ecosystem,
+                        summary.source_label,
+                        if summary.all_versions_malicious {
+                            "All versions are affected."
+                        } else {
+                            "Specific version(s) affected."
+                        }
+                    ),
+                    evidence: vec![Evidence::ThreatIntel {
+                        source: summary.source_label.clone(),
+                        threat_type: "malicious_package".to_string(),
+                        confidence: summary.confidence,
+                        reference: summary.reference_url.clone(),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                // A confirmed exact hit suffices — skip the weaker name-similarity
+                // checks for this package.
+                continue;
+            }
+            PackageThreatAssessment::ConstraintIntersectsAffected {
+                summary,
+                affected_versions,
+            } => {
+                findings.push(unresolved_package_finding(
+                    pkg,
+                    &summary,
+                    &affected_versions,
+                    UnresolvedKind::ConstraintIntersects,
+                ));
+                // Do NOT short-circuit: the name may ALSO be a typosquat or near
+                // a popular package, so fall through to those checks.
+            }
+            PackageThreatAssessment::Unresolved {
+                summary,
+                affected_versions,
+                ..
+            } => {
+                findings.push(unresolved_package_finding(
+                    pkg,
+                    &summary,
+                    &affected_versions,
+                    UnresolvedKind::Unresolved,
+                ));
+                // Fall through (see above).
+            }
+            // A proven exclusion or no record: nothing to add; the name-shape
+            // checks below still run.
+            PackageThreatAssessment::ConstraintExcludesAffected
+            | PackageThreatAssessment::NoRecord => {}
         }
 
         if let Some(t) = db.check_typosquat(db_eco, &pkg.name) {
@@ -880,7 +972,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::PyPI);
         assert_eq!(pkgs[0].name, "requests");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -888,16 +980,22 @@ mod tests {
         let pkgs = tokenize_and_extract("pip install requests==2.31.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        assert_eq!(pkgs[0].version, Some("2.31.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31.0".to_string()));
     }
 
     #[test]
-    fn pip_install_version_range_not_exact() {
+    fn pip_install_version_range_is_constraint() {
         let pkgs = tokenize_and_extract("pip install requests>=2.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        // Only `==` pins an exact version; ranges leave version as None.
-        assert_eq!(pkgs[0].version, None);
+        // A range is now preserved as a parsed Constraint (no longer dropped).
+        match &pkgs[0].version {
+            VersionIntent::Constraint { raw, parsed } => {
+                assert_eq!(raw, ">=2.0");
+                assert!(parsed.is_some());
+            }
+            other => panic!("expected Constraint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -930,7 +1028,7 @@ mod tests {
         let pkgs = tokenize_and_extract("pip install requests[security]==2.31.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        assert_eq!(pkgs[0].version, Some("2.31.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("2.31.0".to_string()));
     }
 
     #[test]
@@ -975,7 +1073,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Npm);
         assert_eq!(pkgs[0].name, "lodash");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -983,7 +1081,7 @@ mod tests {
         let pkgs = tokenize_and_extract("npm install lodash@4.17.21");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "lodash");
-        assert_eq!(pkgs[0].version, Some("4.17.21".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("4.17.21".to_string()));
     }
 
     #[test]
@@ -991,7 +1089,7 @@ mod tests {
         let pkgs = tokenize_and_extract("npm install @angular/core@16.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "@angular/core");
-        assert_eq!(pkgs[0].version, Some("16.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("16.0.0".to_string()));
     }
 
     #[test]
@@ -999,7 +1097,7 @@ mod tests {
         let pkgs = tokenize_and_extract("npm install @types/node");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "@types/node");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -1015,7 +1113,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Npm);
         assert_eq!(pkgs[0].name, "react");
-        assert_eq!(pkgs[0].version, Some("18.2.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("18.2.0".to_string()));
     }
 
     #[test]
@@ -1077,7 +1175,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Crates);
         assert_eq!(pkgs[0].name, "ripgrep");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -1092,7 +1190,7 @@ mod tests {
         let pkgs = tokenize_and_extract("cargo add serde@1.0.193");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "serde");
-        assert_eq!(pkgs[0].version, Some("1.0.193".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("1.0.193".to_string()));
     }
 
     #[test]
@@ -1100,7 +1198,7 @@ mod tests {
         let pkgs = tokenize_and_extract("cargo install ripgrep --version 14.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "ripgrep");
-        assert_eq!(pkgs[0].version, Some("14.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("14.0.0".to_string()));
     }
 
     #[test]
@@ -1128,7 +1226,7 @@ mod tests {
         let pkgs = tokenize_and_extract("gem install rails --version 7.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "rails");
-        assert_eq!(pkgs[0].version, Some("7.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
     }
 
     #[test]
@@ -1136,7 +1234,7 @@ mod tests {
         let pkgs = tokenize_and_extract("gem install rails:7.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "rails");
-        assert_eq!(pkgs[0].version, Some("7.0.0".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("7.0.0".to_string()));
     }
 
     #[test]
@@ -1145,7 +1243,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Go);
         assert_eq!(pkgs[0].name, "github.com/gin-gonic/gin");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -1153,7 +1251,8 @@ mod tests {
         let pkgs = tokenize_and_extract("go get github.com/gin-gonic/gin@v1.9.1");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "github.com/gin-gonic/gin");
-        assert_eq!(pkgs[0].version, Some("v1.9.1".to_string()));
+        // Go's `v`-prefixed module version is kept as an exact pin.
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("v1.9.1".to_string()));
     }
 
     #[test]
@@ -1161,7 +1260,14 @@ mod tests {
         let pkgs = tokenize_and_extract("go install golang.org/x/tools/gopls@latest");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "golang.org/x/tools/gopls");
-        assert_eq!(pkgs[0].version, Some("latest".to_string()));
+        // `latest` is a dist-tag, not an exact version: an unparsed constraint.
+        match &pkgs[0].version {
+            VersionIntent::Constraint { raw, parsed } => {
+                assert_eq!(raw, "latest");
+                assert!(parsed.is_none());
+            }
+            other => panic!("expected Constraint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1170,7 +1276,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Packagist);
         assert_eq!(pkgs[0].name, "monolog/monolog");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -1178,7 +1284,14 @@ mod tests {
         let pkgs = tokenize_and_extract("composer require monolog/monolog:^3.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "monolog/monolog");
-        assert_eq!(pkgs[0].version, Some("^3.0".to_string()));
+        // Composer's caret range is not in the parsed subset: unresolved constraint.
+        match &pkgs[0].version {
+            VersionIntent::Constraint { raw, parsed } => {
+                assert_eq!(raw, "^3.0");
+                assert!(parsed.is_none());
+            }
+            other => panic!("expected Constraint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1187,7 +1300,7 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::NuGet);
         assert_eq!(pkgs[0].name, "Newtonsoft.Json");
-        assert_eq!(pkgs[0].version, None);
+        assert_eq!(pkgs[0].version, VersionIntent::Unspecified);
     }
 
     #[test]
@@ -1195,7 +1308,7 @@ mod tests {
         let pkgs = tokenize_and_extract("dotnet add package Newtonsoft.Json --version 13.0.3");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "Newtonsoft.Json");
-        assert_eq!(pkgs[0].version, Some("13.0.3".to_string()));
+        assert_eq!(pkgs[0].version, VersionIntent::Exact("13.0.3".to_string()));
     }
 
     #[test]

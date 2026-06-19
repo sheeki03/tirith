@@ -24,6 +24,7 @@ use crate::rules::threatintel::{self, PackageRef};
 use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
+use crate::version_intent::VersionIntent;
 
 /// Which package manager an install transaction drives. (The `url` form of
 /// `tirith install` is handled by the CLI via [`crate::runner`], not here.)
@@ -641,15 +642,15 @@ fn parse_docker_specs(user_args: &[String]) -> Vec<PackageRef> {
                 Some(reg) => format!("{reg}/{image}"),
                 None => image,
             };
-            let version = match (tag, digest) {
-                (_, Some(d)) => Some(d),
-                (Some(t), None) => Some(t),
-                (None, None) => Some("latest".to_string()),
+            let version_token = match (tag, digest) {
+                (_, Some(d)) => d,
+                (Some(t), None) => t,
+                (None, None) => "latest".to_string(),
             };
             out.push(PackageRef {
                 ecosystem: Ecosystem::Docker,
                 name,
-                version,
+                version: VersionIntent::from_explicit_version(&version_token),
             });
         }
         i += 1;
@@ -704,9 +705,9 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
         if arg.starts_with('-') {
             continue;
         }
-        let (name, version) = match arg.rsplit_once('@') {
-            Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, Some(v.to_string())),
-            _ => (arg.as_str(), Some("latest".to_string())),
+        let (name, version_token) = match arg.rsplit_once('@') {
+            Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, v.to_string()),
+            _ => (arg.as_str(), "latest".to_string()),
         };
         // Reject local-path targets (`./cmd/foo`, `/abs/...`, `~/repo/...`):
         // they're filesystem paths, not registry modules.
@@ -726,7 +727,7 @@ fn parse_go_specs(user_args: &[String]) -> Vec<PackageRef> {
         out.push(PackageRef {
             ecosystem: Ecosystem::Go,
             name: name.to_string(),
-            version,
+            version: VersionIntent::from_explicit_version(&version_token),
         });
     }
     out
@@ -765,7 +766,7 @@ fn gather_package_signals(
         ecosystem: eco,
         name: pkg.name.clone(),
         // M6 ch6 — carry version through so OSV can pin to (eco, name, version).
-        version: pkg.version.clone(),
+        version: pkg.version.as_version_str().map(str::to_string),
         threat_db_missing: db.is_none(),
         name_vs_popular,
         malicious_typosquat_of,
@@ -1505,7 +1506,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let existing = vec![Finding {
             rule_id: RuleId::ThreatPackageSimilarName,
@@ -1549,7 +1550,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         use crate::package_risk::NameVsPopular;
         let signals = PackageSignals {
@@ -1691,21 +1692,24 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Docker);
         assert_eq!(pkgs[0].name, "library/alpine");
-        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("latest"));
 
         // Explicit tag.
         let pkgs = parse_docker_specs(&["alpine:3.18".to_string()]);
-        assert_eq!(pkgs[0].version.as_deref(), Some("3.18"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("3.18"));
 
         // Digest form — version carries `sha256:...`.
         let pkgs = parse_docker_specs(&["alpine@sha256:abcdef0123456789".to_string()]);
         assert_eq!(pkgs.len(), 1);
-        assert_eq!(pkgs[0].version.as_deref(), Some("sha256:abcdef0123456789"));
+        assert_eq!(
+            pkgs[0].version.as_version_str(),
+            Some("sha256:abcdef0123456789")
+        );
 
         // Registry prefix preserved.
         let pkgs = parse_docker_specs(&["ghcr.io/owner/img:v1".to_string()]);
         assert_eq!(pkgs[0].name, "ghcr.io/owner/img");
-        assert_eq!(pkgs[0].version.as_deref(), Some("v1"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("v1"));
 
         // Flags are skipped.
         let pkgs =
@@ -1748,15 +1752,15 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].ecosystem, Ecosystem::Go);
         assert_eq!(pkgs[0].name, "github.com/spf13/cobra");
-        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("latest"));
 
         // Explicit @latest.
         let pkgs = parse_go_specs(&["github.com/spf13/cobra@latest".to_string()]);
-        assert_eq!(pkgs[0].version.as_deref(), Some("latest"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("latest"));
 
         // Explicit @v1.8.0.
         let pkgs = parse_go_specs(&["github.com/spf13/cobra@v1.8.0".to_string()]);
-        assert_eq!(pkgs[0].version.as_deref(), Some("v1.8.0"));
+        assert_eq!(pkgs[0].version.as_version_str(), Some("v1.8.0"));
 
         // A non-module-shaped bareword (`nginx`) is skipped.
         let pkgs = parse_go_specs(&["nginx".to_string()]);
@@ -1852,7 +1856,7 @@ mod tests {
         assert_eq!(plan.packages[0].reference.ecosystem, Ecosystem::Docker);
         assert_eq!(plan.packages[0].reference.name, "library/alpine");
         assert_eq!(
-            plan.packages[0].reference.version.as_deref(),
+            plan.packages[0].reference.version.as_version_str(),
             Some("latest")
         );
     }
@@ -1879,7 +1883,7 @@ mod tests {
         assert_eq!(plan.packages.len(), 1);
         assert_eq!(plan.packages[0].reference.name, "github.com/spf13/cobra");
         assert_eq!(
-            plan.packages[0].reference.version.as_deref(),
+            plan.packages[0].reference.version.as_version_str(),
             Some("latest")
         );
     }
@@ -1943,7 +1947,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "missing-pkg".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "npm".to_string(),
@@ -1975,7 +1979,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "some-pkg".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "npm".to_string(),
@@ -2004,7 +2008,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "fresh-pkg".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "npm".to_string(),
@@ -2037,7 +2041,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "reqeusts".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "pypi".to_string(),
@@ -2070,7 +2074,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "unknown-pkg".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "npm".to_string(),
@@ -2106,7 +2110,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::PyPI,
             name: "unfamiliar".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let provenance = ApiProvenance {
             source: "pypi".to_string(),
@@ -2151,7 +2155,7 @@ mod tests {
         let pkg = PackageRef {
             ecosystem: Ecosystem::Npm,
             name: "test-pkg".to_string(),
-            version: None,
+            version: VersionIntent::Unspecified,
         };
         let breakdown = breakdown_with_provenance(
             "test-pkg",

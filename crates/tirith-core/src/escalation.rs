@@ -283,6 +283,57 @@ pub fn apply_action_overrides(
     (action, causal)
 }
 
+/// Assemble a verdict from a set of findings for a STATIC (non-session)
+/// analysis surface (ecosystem scan, artifact evaluation, generic file scan,
+/// `package inspect`), honoring policy levers that the bare
+/// [`Verdict::from_findings`] constructor does not.
+///
+/// Unlike [`post_process_verdict`], this takes no session/approval/escalation
+/// path (those need a session id and a command string); it applies, in order:
+/// per-rule severity overrides, action derivation, per-rule action overrides
+/// (`block`), then paranoia filtering. Paranoia must never downgrade an action
+/// an override forced to Block, mirroring `post_process_verdict`'s
+/// "never downgrade a causal action" rule. This closes the gap where
+/// `ecosystem_scan` built its verdict via `Verdict::from_findings` directly and
+/// so ignored `action_overrides`.
+pub fn finalize_static_verdict(
+    mut findings: Vec<Finding>,
+    policy: &crate::policy::Policy,
+    tier: u8,
+    timings: crate::verdict::Timings,
+) -> Verdict {
+    // 1. Per-rule severity overrides, applied before the action is derived.
+    for finding in &mut findings {
+        if let Some(override_sev) = policy.severity_override(&finding.rule_id) {
+            finding.severity = override_sev;
+        }
+    }
+
+    // 2. Derive the action from (overridden) severities.
+    let mut verdict = Verdict::from_findings(findings, tier, timings);
+
+    // 3. Per-rule action overrides operate on the full finding set, before any
+    // paranoia filter removes the causal finding.
+    let mut override_forced_block = false;
+    if !policy.action_overrides.is_empty() {
+        let (new_action, caused_by) =
+            apply_action_overrides(verdict.action, &verdict.findings, &policy.action_overrides);
+        if !caused_by.is_empty() && action_rank(new_action) > action_rank(verdict.action) {
+            override_forced_block = true;
+        }
+        verdict.action = new_action;
+    }
+
+    // 4. Paranoia filtering, but never downgrade an override-forced Block.
+    let pre_paranoia_action = verdict.action;
+    crate::engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    if override_forced_block && action_rank(pre_paranoia_action) > action_rank(verdict.action) {
+        verdict.action = pre_paranoia_action;
+    }
+
+    verdict
+}
+
 /// True if `a` is at least as strict as `b`.
 fn action_gte(a: Action, b: Action) -> bool {
     action_rank(a) >= action_rank(b)
@@ -1697,6 +1748,60 @@ mod tests {
             mitre_id: None,
             custom_rule_id: None,
         }
+    }
+
+    #[test]
+    fn finalize_static_verdict_derives_action_from_findings() {
+        // Baseline: a Medium finding under the default policy derives Warn.
+        let findings = vec![make_finding(
+            RuleId::ThreatUnresolvedMaliciousPackage,
+            Severity::Medium,
+        )];
+        let policy = crate::policy::Policy::default();
+        let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
+        assert_eq!(verdict.action, Action::Warn);
+        assert_eq!(verdict.findings.len(), 1);
+    }
+
+    #[test]
+    fn finalize_static_verdict_honors_action_override() {
+        // The bug this closes: a static verdict must honor `action_overrides`,
+        // which `Verdict::from_findings` ignored. A Medium finding (Warn) with a
+        // `block` override must Block.
+        let findings = vec![make_finding(
+            RuleId::ThreatUnresolvedMaliciousPackage,
+            Severity::Medium,
+        )];
+        let mut policy = crate::policy::Policy::default();
+        policy.action_overrides.insert(
+            "threat_unresolved_malicious_package".to_string(),
+            "block".to_string(),
+        );
+        let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
+        assert_eq!(
+            verdict.action,
+            Action::Block,
+            "action_overrides must be honored at static-verdict assembly"
+        );
+        // The causal finding must survive (default paranoia keeps Medium, and an
+        // override-forced Block must never be downgraded).
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|f| f.rule_id == RuleId::ThreatUnresolvedMaliciousPackage));
+    }
+
+    #[test]
+    fn finalize_static_verdict_applies_severity_override_before_action() {
+        // Lowering a High finding to Info via severity_override drops it to Allow
+        // (Info derives Allow, and default paranoia removes it).
+        let findings = vec![make_finding(RuleId::ThreatMaliciousPackage, Severity::High)];
+        let mut policy = crate::policy::Policy::default();
+        policy
+            .severity_overrides
+            .insert("threat_malicious_package".to_string(), Severity::Info);
+        let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
+        assert_eq!(verdict.action, Action::Allow);
     }
 
     fn empty_session() -> SessionWarnings {

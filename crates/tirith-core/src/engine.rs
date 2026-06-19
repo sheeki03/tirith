@@ -159,8 +159,12 @@ pub fn build_dsl_backing(
             // `package.*` casing-dependent — matching `requests` but missing
             // `Requests` (CodeRabbit M13 PR #132 R6-2).
             let name = pkg.name.to_lowercase();
-            let reputation =
-                package_reputation(pkg.ecosystem, &name, pkg.version.as_deref(), threat_db);
+            let reputation = package_reputation(
+                pkg.ecosystem,
+                &name,
+                pkg.version.as_version_str(),
+                threat_db,
+            );
             packages.push((pkg.ecosystem.to_string(), name, reputation));
         }
     }
