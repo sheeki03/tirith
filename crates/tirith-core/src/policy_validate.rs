@@ -820,7 +820,14 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "ignore_patterns",
         "fail_on",
         "profiles",
+        // A2 coverage keys.
+        "require_complete",
+        "oversized_file_action",
+        "unreadable_file_action",
+        "unsupported_artifact_action",
     ];
+    // A2 — valid `GapAction` string values for the `scan.*_action` keys.
+    let known_gap_actions = ["ignore", "warn", "fail"];
     let known_checkpoint_fields = ["max_count", "max_age_hours", "max_storage_bytes"];
     // PR #121 fix-list item 10 — the `allow`/`deny` children were never
     // validated, so `agent_rules: { denyy: [...] }` passed silently and the
@@ -886,6 +893,50 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                             }
                                         }
                                     }
+                                }
+
+                                // A2 — validate the coverage gap-action VALUES so a
+                                // typo (`oversized_file_action: warnn`) is caught
+                                // instead of silently parsing to the serde default.
+                                if matches!(
+                                    sk.as_str(),
+                                    "oversized_file_action"
+                                        | "unreadable_file_action"
+                                        | "unsupported_artifact_action"
+                                ) {
+                                    if let serde_yaml::Value::String(av) = sub_val {
+                                        if !known_gap_actions.contains(&av.to_lowercase().as_str())
+                                        {
+                                            issues.push(PolicyIssue {
+                                                level: IssueLevel::Error,
+                                                message: format!(
+                                                    "scan.{sk}: invalid action '{av}' (valid: ignore, warn, fail)"
+                                                ),
+                                                field: Some(format!("scan.{sk}")),
+                                            });
+                                        }
+                                    } else {
+                                        issues.push(PolicyIssue {
+                                            level: IssueLevel::Error,
+                                            message: format!(
+                                                "scan.{sk}: must be a string (ignore, warn, fail)"
+                                            ),
+                                            field: Some(format!("scan.{sk}")),
+                                        });
+                                    }
+                                }
+
+                                // A2 — `require_complete` must be a boolean.
+                                if sk == "require_complete"
+                                    && !matches!(sub_val, serde_yaml::Value::Bool(_))
+                                {
+                                    issues.push(PolicyIssue {
+                                        level: IssueLevel::Error,
+                                        message:
+                                            "scan.require_complete: must be a boolean (true/false)"
+                                                .to_string(),
+                                        field: Some("scan.require_complete".into()),
+                                    });
                                 }
                             }
                         }

@@ -767,6 +767,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "dependency_change_then_network",
     "delete_then_force_push",
     "mass_file_deletion",
+    // A2 — scan-coverage incompleteness (assembled by the scan driver)
+    "analysis_incomplete",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -997,6 +999,12 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "dependency_change_then_network",
     "delete_then_force_push",
     "mass_file_deletion",
+    // A2 — `analysis_incomplete` is assembled by the scan driver from recorded
+    // coverage gaps (an oversized/unreadable/unsupported/hash-budget file or a
+    // rule panic), never from a fixture input, so it has no PATTERN_TABLE entry
+    // and gets no `tests/fixtures` entry. Covered by unit tests in `scan.rs` +
+    // the `scan --ci` / `policy` CLI integration tests.
+    "analysis_incomplete",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1262,6 +1270,8 @@ rule_id_variant_registry! {
     AiConfigHiddenInstructionAdded, AiConfigToolUseEscalation,
     // Cross-event correlation rules (W7)
     SecretWriteThenNetwork, DependencyChangeThenNetwork, DeleteThenForcePush, MassFileDeletion,
+    // Scan-coverage incompleteness (A2)
+    AnalysisIncomplete,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

@@ -1251,6 +1251,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("delete_then_force_push", "DeleteThenForcePush"),
     ("mass_file_deletion", "MassFileDeletion"),
+    // A2 — scan coverage incompleteness (assembled by the scan driver).
+    ("analysis_incomplete", "AnalysisIncomplete"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1290,6 +1292,8 @@ const VALID_CATEGORIES: &[&str] = &[
     "aifile",
     // W7: cross-event correlation rules, emitted by `correlate_session`.
     "correlation",
+    // A2: scan-coverage rules, assembled by the scan driver from coverage gaps.
+    "scan",
 ];
 
 #[derive(Deserialize)]

@@ -216,15 +216,42 @@ pub fn run(
         }
     }
 
+    // A2 — assemble the driver-level `AnalysisIncomplete` findings from the
+    // recorded coverage gaps and attach each to a synthetic file entry (its
+    // gap path) so it flows through the existing JSON/SARIF/human emitters and is
+    // counted by `total_findings` / `has_findings_at_or_above`. Done BEFORE the
+    // exit decision so a Fail-action gap can drive a non-zero code.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = Policy::discover(cwd.as_deref());
+    let coverage_findings =
+        scan::build_analysis_incomplete_findings(&result.coverage_gaps, &policy);
+    for finding in coverage_findings {
+        // Locate the finding at the gap path it describes when we can recover it
+        // from the evidence; otherwise the scan root. The human/JSON output reads
+        // the per-file `path`, so use the gap's own path for a precise location.
+        let path = analysis_incomplete_finding_path(&finding, &result.coverage_gaps)
+            .unwrap_or_else(|| config.path.clone());
+        result.file_results.push(scan::FileScanResult {
+            path,
+            findings: vec![finding],
+            is_config_file: false,
+        });
+    }
+
+    let analysis_incomplete = !result.coverage_gaps.is_empty();
+
     // A JSON/SARIF write failure must surface exit 1 instead of a `0` paired
     // with truncated output; a finding-driven non-zero code is kept.
     let output_ok = if sarif {
         print_sarif_result(&result)
     } else if json {
-        print_json_result(&result)
+        print_json_result(&result, analysis_incomplete)
     } else {
         if !ci {
             print_human_result(&result);
+            print_coverage_gaps_human(&result.coverage_gaps);
         }
         true
     };
@@ -242,9 +269,16 @@ pub fn run(
         }
     }
 
+    // CI fail-closed on incompleteness: the existing panic rule, PLUS a
+    // security-relevant gap under `require_complete`, PLUS any gap whose effective
+    // action is Fail.
+    let ci_coverage_fail = ci
+        && (!result.panic_files.is_empty()
+            || coverage_requires_failure(&result.coverage_gaps, &policy));
+
     if result.has_findings_at_or_above(fail_on_severity) {
         1
-    } else if ci && !result.panic_files.is_empty() {
+    } else if ci_coverage_fail {
         // Fail closed in CI: an incomplete scan must not report success.
         1
     } else if result.total_findings() > 0 {
@@ -254,6 +288,23 @@ pub fn run(
     } else {
         0
     }
+}
+
+/// Recover the on-disk path an `AnalysisIncomplete` finding describes by matching
+/// it back to a coverage gap whose `Display` location is named in the finding's
+/// description. Best-effort: returns `None` if no gap location is found, so the
+/// caller falls back to the scan root.
+fn analysis_incomplete_finding_path(
+    finding: &tirith_core::verdict::Finding,
+    gaps: &[scan::CoverageGap],
+) -> Option<PathBuf> {
+    for gap in gaps {
+        let loc = gap.location.to_string();
+        if finding.description.contains(&loc) {
+            return gap.primary_path().map(|p| p.to_path_buf());
+        }
+    }
+    None
 }
 
 fn run_stdin(
@@ -288,11 +339,12 @@ fn run_stdin(
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
+    // Stdin has no file path, so a coverage gap is impossible: pass empty gaps.
     // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
-        print_sarif_file_result(&result)
+        print_sarif_file_result(&result, &[])
     } else if json {
-        print_json_file_result(&result)
+        print_json_file_result(&result, &[], false)
     } else {
         if !ci {
             print_human_file_result(&result);
@@ -326,30 +378,60 @@ fn run_single_file(
         return 1;
     }
 
-    let mut result = match scan::scan_single_file(&path) {
-        Some(r) => r,
-        None => {
-            eprintln!("tirith scan: could not read file: {file_path}");
-            return 1;
-        }
-    };
+    // Route through the guarded scan so a coverage gap (oversized / unreadable /
+    // unsupported artifact / hash-budget) or a rule panic carries a reason into
+    // the JSON/SARIF/exit path instead of being read as "clean".
+    use scan::{CoverageGap, FileScanResult, GuardedScanOutcome, ScanFileOutcome};
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = Policy::discover(cwd.as_deref());
+
+    let (mut result, coverage_gaps): (FileScanResult, Vec<CoverageGap>) =
+        match scan::scan_single_file_guarded(&path) {
+            GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => (r, Vec::new()),
+            GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap))
+            | GuardedScanOutcome::RulePanic(gap) => {
+                // No analyzed content: synthesize a result carrying only the
+                // driver-assembled `AnalysisIncomplete` findings (if the gap is
+                // security-relevant and not policy-ignored) so the gap surfaces in
+                // every output and the exit code.
+                let findings =
+                    scan::build_analysis_incomplete_findings(std::slice::from_ref(&gap), &policy);
+                (
+                    FileScanResult {
+                        path: path.clone(),
+                        findings,
+                        is_config_file: false,
+                    },
+                    vec![gap],
+                )
+            }
+        };
     if !rule_overlay.is_empty() {
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
 
+    let analysis_incomplete = !coverage_gaps.is_empty();
+
     // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
-        print_sarif_file_result(&result)
+        print_sarif_file_result(&result, &coverage_gaps)
     } else if json {
-        print_json_file_result(&result)
+        print_json_file_result(&result, &coverage_gaps, analysis_incomplete)
     } else {
         if !ci {
             print_human_file_result(&result);
+            print_coverage_gaps_human(&coverage_gaps);
         }
         true
     };
 
-    if result.findings.iter().any(|f| f.severity >= fail_on) {
+    // CI fail-closed on incompleteness: a security-relevant gap under
+    // `require_complete`, or any gap whose effective action is Fail.
+    let ci_coverage_fail = ci && coverage_requires_failure(&coverage_gaps, &policy);
+
+    if result.findings.iter().any(|f| f.severity >= fail_on) || ci_coverage_fail {
         1
     } else if !result.findings.is_empty() {
         2
@@ -357,6 +439,34 @@ fn run_single_file(
         1
     } else {
         0
+    }
+}
+
+/// Whether a set of coverage gaps must FAIL a CI run under `policy`: either
+/// `scan.require_complete` is set and a security-relevant gap exists, or any gap
+/// whose effective per-kind action is [`GapAction::Fail`]. Shared by the
+/// directory and single-file paths so both fail closed identically.
+fn coverage_requires_failure(gaps: &[scan::CoverageGap], policy: &Policy) -> bool {
+    use tirith_core::policy::GapAction;
+    if policy.scan.require_complete && gaps.iter().any(scan::gap_is_security_relevant) {
+        return true;
+    }
+    gaps.iter()
+        .any(|g| policy.scan.action_for_gap_kind(g.kind) == GapAction::Fail)
+}
+
+/// Print coverage gaps to stderr for the human output path (so `--json`/SARIF
+/// stdout stays uncorrupted). A no-op when there are none.
+fn print_coverage_gaps_human(gaps: &[scan::CoverageGap]) {
+    if gaps.is_empty() {
+        return;
+    }
+    eprintln!(
+        "tirith scan: {} coverage gap(s) — file(s) not fully analyzed:",
+        gaps.len()
+    );
+    for gap in gaps {
+        eprintln!("  {} ({})", gap.location, gap.kind.as_str());
     }
 }
 
@@ -376,7 +486,7 @@ fn parse_severity(s: &str) -> Severity {
 
 /// Emit a directory-scan result as JSON. Returns `false` on a write failure so
 /// the caller can exit non-zero (no truncated JSON with a success code).
-fn print_json_result(result: &scan::ScanResult) -> bool {
+fn print_json_result(result: &scan::ScanResult, analysis_incomplete: bool) -> bool {
     #[derive(serde::Serialize)]
     struct JsonScanOutput<'a> {
         schema_version: u32,
@@ -390,6 +500,11 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
         panic_count: usize,
         panic_files: Vec<String>,
         total_findings: usize,
+        // A2 — coverage incompleteness. `analysis_incomplete` is a single boolean
+        // so a consumer can detect an incomplete scan without walking the list;
+        // `coverage_gaps` enumerates each unanalyzed file with its reason.
+        analysis_incomplete: bool,
+        coverage_gaps: Vec<JsonCoverageGap>,
         files: Vec<JsonFileOutput<'a>>,
     }
 
@@ -412,7 +527,7 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
         .collect();
 
     let output = JsonScanOutput {
-        schema_version: 4,
+        schema_version: 5,
         scanned_count: result.scanned_count,
         skipped_count: result.skipped_count,
         truncated: result.truncated,
@@ -424,6 +539,12 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
             .map(|p| p.display().to_string())
             .collect(),
         total_findings: result.total_findings(),
+        analysis_incomplete,
+        coverage_gaps: result
+            .coverage_gaps
+            .iter()
+            .map(JsonCoverageGap::from)
+            .collect(),
         files,
     };
 
@@ -431,24 +552,55 @@ fn print_json_result(result: &scan::ScanResult) -> bool {
 }
 
 /// Emit a single-file scan result as JSON. Returns `false` on a JSON-write
-/// failure.
-fn print_json_file_result(result: &scan::FileScanResult) -> bool {
+/// failure. Carries coverage gaps / `analysis_incomplete` so a skipped single
+/// file is never read as clean by a `--json` consumer.
+fn print_json_file_result(
+    result: &scan::FileScanResult,
+    coverage_gaps: &[scan::CoverageGap],
+    analysis_incomplete: bool,
+) -> bool {
     #[derive(serde::Serialize)]
     struct JsonOutput<'a> {
         schema_version: u32,
         path: String,
         is_config_file: bool,
         findings: &'a [tirith_core::verdict::Finding],
+        analysis_incomplete: bool,
+        coverage_gaps: Vec<JsonCoverageGap>,
     }
 
     let output = JsonOutput {
-        schema_version: 3,
+        schema_version: 4,
         path: result.path.display().to_string(),
         is_config_file: result.is_config_file,
         findings: &result.findings,
+        analysis_incomplete,
+        coverage_gaps: coverage_gaps.iter().map(JsonCoverageGap::from).collect(),
     };
 
     super::write_json_stdout(&output, "tirith scan: failed to write JSON output")
+}
+
+/// JSON shape for one coverage gap, shared by the directory and single-file
+/// outputs: the member-qualified location, the kind, and a best-effort sha256.
+#[derive(serde::Serialize)]
+struct JsonCoverageGap {
+    location: String,
+    kind: &'static str,
+    security_relevant: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+impl From<&scan::CoverageGap> for JsonCoverageGap {
+    fn from(gap: &scan::CoverageGap) -> Self {
+        JsonCoverageGap {
+            location: gap.location.to_string(),
+            kind: gap.kind.as_str(),
+            security_relevant: scan::gap_is_security_relevant(gap),
+            sha256: gap.sha256.clone(),
+        }
+    }
 }
 
 fn print_human_result(result: &scan::ScanResult) {
@@ -524,16 +676,25 @@ fn print_sarif_result(result: &scan::ScanResult) -> bool {
 }
 
 /// Emit a single-file scan result as SARIF. Returns `false` on a write failure.
-fn print_sarif_file_result(result: &scan::FileScanResult) -> bool {
+/// Coverage-gap `AnalysisIncomplete` findings already live in `result.findings`
+/// (the single-file path synthesizes them), but each gap's member-qualified
+/// LOCATION is attached here so a SARIF consumer sees `foo.whl!/member` rather
+/// than just the outer path.
+fn print_sarif_file_result(
+    result: &scan::FileScanResult,
+    coverage_gaps: &[scan::CoverageGap],
+) -> bool {
     use tirith_core::sarif::{self, SarifFinding};
 
     let version = env!("CARGO_PKG_VERSION");
+    // Map each finding to a SARIF entry; an `AnalysisIncomplete` finding is
+    // located at the matching gap's member-qualified location when available.
     let findings: Vec<SarifFinding> = result
         .findings
         .iter()
         .map(|f| SarifFinding {
             finding: f,
-            file_path: Some(result.path.display().to_string()),
+            file_path: Some(sarif_location_for_finding(f, &result.path, coverage_gaps)),
             line_number: None,
             suppressed: false,
         })
@@ -541,6 +702,22 @@ fn print_sarif_file_result(result: &scan::FileScanResult) -> bool {
 
     let sarif_json = sarif::to_sarif(&findings, version);
     super::write_json_stdout(&sarif_json, "tirith scan: failed to write SARIF output")
+}
+
+/// Choose the SARIF artifact location for a finding: an `AnalysisIncomplete`
+/// finding uses the first coverage gap's member-qualified location (so a virtual
+/// member shows as `foo.whl!/member`); any other finding uses `default_path`.
+fn sarif_location_for_finding(
+    finding: &tirith_core::verdict::Finding,
+    default_path: &std::path::Path,
+    coverage_gaps: &[scan::CoverageGap],
+) -> String {
+    if finding.rule_id == RuleId::AnalysisIncomplete {
+        if let Some(gap) = coverage_gaps.first() {
+            return gap.location.to_string();
+        }
+    }
+    default_path.display().to_string()
 }
 
 fn print_human_file_result(result: &scan::FileScanResult) {
