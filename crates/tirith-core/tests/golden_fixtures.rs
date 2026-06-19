@@ -769,6 +769,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "mass_file_deletion",
     // A2 — scan-coverage incompleteness (assembled by the scan driver)
     "analysis_incomplete",
+    // B5 installed-distribution integrity (correlated by the installed-tree scan)
+    "python_installed_integrity_violation",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1005,6 +1007,13 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // and gets no `tests/fixtures` entry. Covered by unit tests in `scan.rs` +
     // the `scan --ci` / `policy` CLI integration tests.
     "analysis_incomplete",
+    // B5: `python_installed_integrity_violation` is correlated by the
+    // installed-tree scan from `crate::artifact::ArtifactSignalKind`s recorded
+    // while walking a `site-packages` tree on the filesystem (a RECORD mismatch,
+    // a missing/unlisted/duplicate-owned file, an unowned sitecustomize), never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/record.rs` + `ecosystem_scan` installed-tree tests.
+    "python_installed_integrity_violation",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1272,6 +1281,8 @@ rule_id_variant_registry! {
     SecretWriteThenNetwork, DependencyChangeThenNetwork, DeleteThenForcePush, MassFileDeletion,
     // Scan-coverage incompleteness (A2)
     AnalysisIncomplete,
+    // Installed-distribution integrity (B5)
+    PythonInstalledIntegrityViolation,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is
