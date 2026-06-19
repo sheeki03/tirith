@@ -1273,6 +1273,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "native_import_execution_chain",
         "NativeImportExecutionChain",
     ),
+    // B8 + DB-D artifact/member known-malicious hash match (feature-gated,
+    // externally triggered; unreachable until the hash-lookup feature + DB land).
+    ("artifact_known_malicious", "ArtifactKnownMalicious"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

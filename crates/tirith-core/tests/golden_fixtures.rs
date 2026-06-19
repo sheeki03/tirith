@@ -776,6 +776,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "python_startup_hook_cross_runtime",
     // B7 native import-execution chain (correlated by native triage)
     "native_import_execution_chain",
+    // B8 + DB-D artifact/member known-malicious hash match (feature-gated)
+    "artifact_known_malicious",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1037,6 +1039,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // control, the malformed/streaming paths) + the `ecosystem_scan` installed
     // native-triage test.
     "native_import_execution_chain",
+    // B8 + DB-D: `artifact_known_malicious` is emitted by
+    // `crate::artifact::evaluate_artifact` ONLY under the `artifact-hash-lookup`
+    // cargo feature (OFF by default) once the DB-B hash-lookup methods land. The
+    // RuleId is registered now so the registry tests see every variant, but it is
+    // UNREACHABLE in the default build (no feature, no DB method), so it has no
+    // PATTERN_TABLE entry and no fixture. Covered by the feature-gated emission
+    // seam in `artifact/correlate.rs` once DB-B ships.
+    "artifact_known_malicious",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1310,6 +1320,8 @@ rule_id_variant_registry! {
     PythonStartupHookSuspicious, PythonStartupHookCrossRuntime,
     // Native import-execution chain (B7)
     NativeImportExecutionChain,
+    // Artifact/member known-malicious hash match (B8 + DB-D, feature-gated)
+    ArtifactKnownMalicious,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

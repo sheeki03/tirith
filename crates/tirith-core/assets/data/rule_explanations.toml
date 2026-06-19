@@ -2782,3 +2782,15 @@ examples_good = ["a NumPy-shaped .so that exports PyInit__core and only does num
 false_positive_guidance = "An ordinary compiled extension has an execution entry (every Python extension has PyInit_*) but does not reach a danger capability or carry corroboration, so it does not fire. The conjunction is deliberately strict to keep NumPy, SciPy, and other legitimate native wheels clean. A partial triage of an above-cap member can still establish the chain from the available evidence; if a legitimate in-house extension genuinely needs a flagged capability, allowlist the owning distribution rather than weakening the detector."
 remediation = "Treat a native import-execution chain as an incident. Identify the distribution that ships the module and the payload it hands off to, isolate the environment, and rotate any credentials reachable from it. Reinstall affected distributions from a trusted source after confirming the upstream artifact is clean, and prefer wheels whose native members carry no embedded runtime launch or credential-path reference."
 mitre_id = "T1129"
+
+[[rule]]
+id = "artifact_known_malicious"
+title = "An inspected artifact or member matches a known-malicious hash"
+category = "ecosystem"
+severity_rationale = "Critical, mapping to block: a wheel, sdist, or one of its members whose SHA-256 is on the threat database's known-malicious list is a confirmed supply-chain artifact, not a heuristic, so it blocks outright."
+description = "Emitted by artifact inspection only when the off-by-default artifact-hash-lookup cargo feature is enabled and the threat database resolves the artifact's or a member's SHA-256 to a known-malicious record. The hash-lookup database methods are a later deliverable, so this rule is unreachable in the shipped default build: it is registered for completeness and its emission lives behind a reserved feature seam that is wired to the real lookup once the database support lands. Until then no input can trigger it, so it has no tier-1 pattern entry and is in EXTERNALLY_TRIGGERED_RULES."
+examples_bad = ["a downloaded wheel whose whole-file SHA-256 matches a published malicious-package record", "a wheel that bundles a member .so whose SHA-256 is a known-malicious indicator"]
+examples_good = ["a wheel whose hash and member hashes match no known-malicious record", "an artifact inspected with the hash-lookup feature off, where the lookup never runs"]
+false_positive_guidance = "A known-malicious hash match is exact, so a false positive means the database itself is wrong; report a mistaken record to the feed maintainer rather than suppressing the rule."
+remediation = "Do not install or run the artifact. Remove it from caches and mirrors, identify how it entered the supply chain, and rotate any credentials that may have been exposed to it. Pull the dependency only from a trusted source after confirming a clean hash."
+mitre_id = "T1195"

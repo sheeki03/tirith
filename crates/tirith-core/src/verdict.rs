@@ -798,6 +798,19 @@ pub enum RuleId {
     /// Mere native-module presence yields at most an informational signal, never
     /// this finding.
     NativeImportExecutionChain,
+    /// B8 + DB-D: an inspected artifact (a wheel/sdist) or one of its members has a
+    /// SHA-256 that matches a KNOWN-MALICIOUS hash in the threat DB (MITRE T1195
+    /// supply-chain compromise). Emitted by `crate::artifact::evaluate_artifact`
+    /// only when the `artifact-hash-lookup` cargo feature is enabled AND the DB-B
+    /// hash-lookup methods (`ThreatDb::check_artifact_sha256` /
+    /// `check_file_sha256`) resolve a match. Those methods are the DB-B deliverable
+    /// and DO NOT EXIST YET, so this milestone ships the feature OFF by default and
+    /// the emission behind a reserved seam (see `crate::artifact::correlate`); the
+    /// RuleId is therefore UNREACHABLE until the feature + DB land. Registered now
+    /// (the registry tests must see every variant), with NO PATTERN_TABLE entry and
+    /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
+    /// (whence the action is Block).
+    ArtifactKnownMalicious,
 }
 
 impl fmt::Display for RuleId {

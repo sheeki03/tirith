@@ -90,6 +90,293 @@ pub fn scan(
     )
 }
 
+/// Run `tirith package inspect` — the VERDICT-oriented artifact / installed
+/// inspector (B8b). Unlike `risk`/`explain` (advisory scorers that always exit 0),
+/// this exits scan-style: 0 clean, 1 a block-grade finding, 2 an advisory (warn)
+/// finding, 2 on a usage error.
+///
+/// Modes (mutually exclusive at the CLI):
+/// * one or more `--artifact <file>` — inspect each wheel; with two or more, also
+///   correlate a cross-distribution loader/payload split across them (B8c);
+/// * `--artifact-set <dir>` — inspect every `.whl` in a directory as a set;
+/// * `--installed <dir>` — inspect an installed environment (routes through the
+///   `ecosystem scan --installed` engine, which already runs B5/B6/B7 and the
+///   multi-wheel cross-distribution correlation, B8e).
+pub fn inspect(
+    artifacts: &[PathBuf],
+    artifact_set: Option<&Path>,
+    installed: Option<&Path>,
+    json: bool,
+) -> i32 {
+    // Exactly one mode must be selected. clap marks `--artifact-set`/`--installed`
+    // mutually exclusive; guard the combinations clap cannot express.
+    let mode_count =
+        (!artifacts.is_empty()) as u8 + artifact_set.is_some() as u8 + installed.is_some() as u8;
+    if mode_count == 0 {
+        eprintln!(
+            "tirith package inspect: nothing to inspect. Pass --artifact <file> \
+             (repeatable), --artifact-set <dir>, or --installed <dir>."
+        );
+        return 2;
+    }
+    if mode_count > 1 {
+        eprintln!(
+            "tirith package inspect: choose ONE of --artifact, --artifact-set, or --installed."
+        );
+        return 2;
+    }
+
+    if let Some(venv) = installed {
+        return inspect_installed(venv, json);
+    }
+
+    // Resolve the artifact paths to inspect (explicit list, or every `.whl` in the
+    // set directory).
+    let paths: Vec<PathBuf> = if let Some(dir) = artifact_set {
+        match collect_set_wheels(dir) {
+            Ok(p) => p,
+            Err(code) => return code,
+        }
+    } else {
+        artifacts.to_vec()
+    };
+
+    inspect_artifacts(&paths, json)
+}
+
+/// Inspect an installed environment by routing through the `ecosystem scan
+/// --installed` engine (B8e: it already runs B5/B6/B7 and the cross-distribution
+/// ownership correlation, surfaces the `InstalledIntegrityReport`, and folds the
+/// findings into the verdict / exit code).
+fn inspect_installed(venv: &Path, json: bool) -> i32 {
+    let Some(path_str) = venv.to_str() else {
+        eprintln!(
+            "tirith package inspect: path {:?} is not valid UTF-8; tirith inspects UTF-8 paths only.",
+            venv.display()
+        );
+        return 2;
+    };
+    super::ecosystem::scan(
+        Some(path_str),
+        /* online = */ false,
+        /* offline = */ true,
+        /* installed = */ true,
+        /* max_installed_entries = */ 5000,
+        /* non_interactive = */ true,
+        json,
+    )
+}
+
+/// Collect every `.whl` in `dir` (non-recursive) for `--artifact-set`. Returns an
+/// exit code on a usage error (a missing/unreadable directory, or no wheels).
+fn collect_set_wheels(dir: &Path) -> Result<Vec<PathBuf>, i32> {
+    if !dir.is_dir() {
+        eprintln!(
+            "tirith package inspect: --artifact-set path is not a directory: {}",
+            dir.display()
+        );
+        return Err(2);
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "tirith package inspect: cannot read --artifact-set directory {}: {e}",
+                dir.display()
+            );
+            return Err(2);
+        }
+    };
+    let mut wheels: Vec<PathBuf> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("whl"))
+        })
+        .collect();
+    wheels.sort();
+    if wheels.is_empty() {
+        eprintln!(
+            "tirith package inspect: no .whl files found in --artifact-set directory {}",
+            dir.display()
+        );
+        return Err(2);
+    }
+    Ok(wheels)
+}
+
+/// Inspect a list of artifact paths (a single wheel, or a set for
+/// cross-distribution correlation), print the verdict, and return a scan-style
+/// exit code.
+fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
+    use tirith_core::artifact::inspect::inspect_artifact_set;
+    use tirith_core::verdict::Action;
+
+    // Validate each path exists up front so a typo is a usage error (exit 2), not a
+    // silent coverage gap.
+    for p in paths {
+        if !p.exists() {
+            eprintln!(
+                "tirith package inspect: artifact not found: {}",
+                p.display()
+            );
+            return 2;
+        }
+    }
+
+    // The set inspector handles BOTH a single artifact and a set: pass 1 inspects
+    // each independently, pass 2 correlates cross-distribution splits (a no-op for a
+    // single artifact). The threat DB is threaded for the (feature-gated)
+    // known-malicious hash check.
+    let db = ThreatDb::cached();
+    let set = inspect_artifact_set(paths);
+
+    // Discover the operator policy from the first artifact's directory so a strict
+    // integrity policy's overrides are honored on this verdict site too.
+    let policy_root = paths
+        .first()
+        .and_then(|p| p.parent())
+        .map(|p| p.display().to_string());
+    let policy = tirith_core::policy::Policy::discover(policy_root.as_deref());
+
+    let findings = set.all_findings(db.as_deref());
+    let verdict = tirith_core::escalation::finalize_static_verdict(
+        findings,
+        &policy,
+        3,
+        tirith_core::verdict::Timings::default(),
+    );
+
+    let output_ok = if json {
+        print_inspect_json(&set, &verdict)
+    } else {
+        print_inspect_human(&set, &verdict);
+        true
+    };
+
+    if !output_ok {
+        return 1;
+    }
+    match verdict.action {
+        Action::Block => 1,
+        Action::Warn | Action::WarnAck => 2,
+        Action::Allow => 0,
+    }
+}
+
+/// JSON output for `package inspect`: the verdict (with member-qualified finding
+/// locations carried in evidence) plus per-artifact coverage and the
+/// cross-distribution findings. Returns `false` on a write failure.
+fn print_inspect_json(
+    set: &tirith_core::artifact::inspect::ArtifactSetInspection,
+    verdict: &tirith_core::verdict::Verdict,
+) -> bool {
+    #[derive(serde::Serialize)]
+    struct JsonOut<'a> {
+        schema_version: u32,
+        action: String,
+        artifacts: Vec<JsonArtifact<'a>>,
+        cross_distribution_findings: &'a [tirith_core::verdict::Finding],
+        coverage_gaps: Vec<JsonGap>,
+        findings: &'a [tirith_core::verdict::Finding],
+    }
+    #[derive(serde::Serialize)]
+    struct JsonArtifact<'a> {
+        path: String,
+        rejected: bool,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        violations: &'a [String],
+        inspection: &'a tirith_core::artifact::ArtifactInspection,
+    }
+    #[derive(serde::Serialize)]
+    struct JsonGap {
+        location: String,
+        kind: &'static str,
+    }
+
+    let artifacts: Vec<JsonArtifact> = set
+        .members
+        .iter()
+        .map(|m| JsonArtifact {
+            path: m.path.display().to_string(),
+            rejected: m.inspected.rejected,
+            violations: &m.inspected.violation_details,
+            inspection: &m.inspected.inspection,
+        })
+        .collect();
+
+    let out = JsonOut {
+        schema_version: 1,
+        action: format!("{:?}", verdict.action).to_lowercase(),
+        artifacts,
+        cross_distribution_findings: &set.cross_findings,
+        coverage_gaps: set
+            .gaps
+            .iter()
+            .map(|g| JsonGap {
+                location: g.location.to_string(),
+                kind: g.kind.as_str(),
+            })
+            .collect(),
+        findings: &verdict.findings,
+    };
+    super::write_json_stdout(&out, "tirith package inspect: failed to write JSON output")
+}
+
+/// Human output for `package inspect`: a per-artifact summary to stderr and the
+/// findings (member-qualified) to stdout, mirroring the `tirith scan` convention.
+fn print_inspect_human(
+    set: &tirith_core::artifact::inspect::ArtifactSetInspection,
+    verdict: &tirith_core::verdict::Verdict,
+) {
+    eprintln!(
+        "tirith package inspect: {} artifact(s) inspected",
+        set.members.len()
+    );
+    for m in &set.members {
+        let status = if m.inspected.rejected {
+            " [REJECTED: structural violation]"
+        } else {
+            ""
+        };
+        eprintln!("  {}{status}", m.path.display());
+        for v in &m.inspected.violation_details {
+            eprintln!("    - {v}");
+        }
+    }
+    for gap in &set.gaps {
+        eprintln!("  not inspected: {} ({})", gap.location, gap.kind.as_str());
+    }
+
+    if verdict.findings.is_empty() {
+        eprintln!();
+        eprintln!("  no artifact risks found.");
+        return;
+    }
+
+    println!();
+    println!("Artifact findings:");
+    for finding in &verdict.findings {
+        let sev = tirith_core::style::severity_label(
+            &finding.severity,
+            tirith_core::style::Stream::Stdout,
+        );
+        println!("  {} {} — {}", sev, finding.rule_id, finding.title);
+        // Surface the member-qualified location lines from the evidence so a
+        // reviewer sees `foo.whl!/member`, not just the outer wheel.
+        for ev in &finding.evidence {
+            if let tirith_core::verdict::Evidence::Text { detail } = ev {
+                if detail.starts_with("location:") || detail.contains("!/") {
+                    println!("    {detail}");
+                }
+            }
+        }
+    }
+}
+
 /// Run `tirith package risk <ecosystem> <name>`. Prints the deterministic risk
 /// score; `path` optionally points at local package content to inspect (else
 /// auto-discovered under `node_modules`/`site-packages`). `online` opts into

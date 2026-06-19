@@ -467,7 +467,10 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::PythonStartupHookCrossRuntime
         // B7 native import-execution chain: a structural artifact finding, not an
         // injection seed, so it is never downgraded to a redacted Warn.
-        | RuleId::NativeImportExecutionChain => false,
+        | RuleId::NativeImportExecutionChain
+        // B8 + DB-D artifact/member known-malicious hash match: a structural
+        // artifact finding (feature-gated), never an injection seed.
+        | RuleId::ArtifactKnownMalicious => false,
     }
 }
 

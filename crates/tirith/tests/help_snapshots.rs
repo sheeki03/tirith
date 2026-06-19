@@ -95,6 +95,7 @@ help_example_tests! {
     help_package          => (["package", "--help"], "tirith package risk npm react");
     help_package_risk     => (["package", "risk", "--help"], "tirith package risk pypi reqeusts");
     help_package_explain  => (["package", "explain", "--help"], "tirith package explain npm express");
+    help_package_inspect  => (["package", "inspect", "--help"], "tirith package inspect --artifact-set ./downloaded-wheels/");
     help_ecosystem        => (["ecosystem", "--help"], "tirith ecosystem scan");
     help_ecosystem_scan   => (["ecosystem", "scan", "--help"], "tirith ecosystem scan --online ./my-project");
     help_daemon     => (["daemon", "--help"], "tirith daemon start");

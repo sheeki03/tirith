@@ -11,6 +11,20 @@ readme = "../../README.md"
 keywords = ["security", "url", "analysis"]
 categories = ["development-tools"]
 
+[features]
+# Off-by-default seam for artifact / member SHA-256 known-malicious lookups
+# against the threat DB. The DB methods it calls (`check_artifact_sha256` /
+# `check_file_sha256`) are the DB-B deliverable and DO NOT EXIST YET, so this
+# milestone keeps the feature OFF and the emission behind a reserved seam that
+# computes its indicator from a stub returning `false` (see
+# `artifact::correlate::artifact_hash_indicator`). When DB-B lands, the stub body
+# is replaced with the real lookup; the `ArtifactKnownMalicious` RuleId is already
+# registered (so the registry tests see it) and the CLI flips this feature on.
+# Building with `--features artifact-hash-lookup` compiles and tests cleanly
+# today; it just never fires until the DB methods exist.
+default = []
+artifact-hash-lookup = []
+
 [dependencies]
 url = { workspace = true }
 regex = { workspace = true }

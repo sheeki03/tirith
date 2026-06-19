@@ -340,7 +340,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::PythonStartupHookCrossRuntime
         // B7: native import-execution chain, correlated from native-triage signals
         // (structural object-format analysis), not a threat-DB indicator.
-        | RuleId::NativeImportExecutionChain => false,
+        | RuleId::NativeImportExecutionChain
+        // B8 + DB-D: artifact/member known-malicious hash match — a structural
+        // artifact verdict (feature-gated), not a reputation/threat-intel score.
+        | RuleId::ArtifactKnownMalicious => false,
     }
 }
 

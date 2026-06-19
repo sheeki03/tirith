@@ -315,6 +315,13 @@ fn print_human(report: &EcosystemScanReport) {
         }
     }
 
+    // B8e: surface the B5 installed-distribution integrity report (present only in
+    // `--installed` mode) so a human sees the per-distribution coverage and the
+    // cross-distribution ownership signals behind any integrity finding.
+    if let Some(integrity) = &report.integrity {
+        print_integrity_summary(integrity);
+    }
+
     // Findings go to stdout so they can be captured / piped.
     if finding_count == 0 {
         eprintln!();
@@ -366,6 +373,56 @@ fn print_human(report: &EcosystemScanReport) {
                  provenance signals)"
             );
         }
+    }
+}
+
+/// Print the B5 installed-distribution integrity summary to stderr (so it never
+/// corrupts `--format json` stdout). Surfaces the per-distribution coverage and the
+/// cross-distribution ownership signals; the correlated integrity FINDINGS already
+/// print with the other findings (they are folded into the verdict). A clean
+/// installed scan prints a one-line "no integrity issues" confirmation.
+fn print_integrity_summary(integrity: &tirith_core::ecosystem_scan::InstalledIntegrityReport) {
+    eprintln!();
+    eprintln!(
+        "  installed integrity: {} distribution(s) checked across {} site-packages root(s)",
+        integrity.distributions_checked,
+        integrity.site_packages_roots.len(),
+    );
+    if integrity.records_missing > 0 {
+        eprintln!(
+            "    - {} distribution(s) had no RECORD (a coverage gap, not a violation)",
+            integrity.records_missing
+        );
+    }
+    if integrity.hash_mismatches > 0 {
+        eprintln!(
+            "    - {} RECORD hash mismatch(es) against on-disk bytes",
+            integrity.hash_mismatches
+        );
+    }
+    for dup in &integrity.duplicate_owned_paths {
+        eprintln!(
+            "    - path '{}' owned by multiple distributions: {}",
+            dup.path,
+            dup.owners.join(", ")
+        );
+    }
+    for hook in &integrity.unowned_startup_hooks {
+        eprintln!("    - unowned startup hook: {hook}");
+    }
+    if integrity.native_modules_triaged > 0 {
+        eprintln!(
+            "    - {} native module(s) triaged",
+            integrity.native_modules_triaged
+        );
+    }
+    let clean = integrity.hash_mismatches == 0
+        && integrity.duplicate_owned_paths.is_empty()
+        && integrity.unowned_startup_hooks.is_empty()
+        && integrity.startup_signals.is_empty()
+        && integrity.native_findings.is_empty();
+    if clean {
+        eprintln!("    - no integrity issues detected");
     }
 }
 

