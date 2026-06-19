@@ -771,6 +771,9 @@ const ALL_RULE_IDS: &[&str] = &[
     "analysis_incomplete",
     // B5 installed-distribution integrity (correlated by the installed-tree scan)
     "python_installed_integrity_violation",
+    // B6 Python startup-hook execution (correlated by the installed-tree scan)
+    "python_startup_hook_suspicious",
+    "python_startup_hook_cross_runtime",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1014,6 +1017,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
     // unit tests in `artifact/record.rs` + `ecosystem_scan` installed-tree tests.
     "python_installed_integrity_violation",
+    // B6: `python_startup_hook_suspicious` / `python_startup_hook_cross_runtime`
+    // are correlated by the installed-tree scan from
+    // `crate::artifact::ArtifactSignalKind`s recorded while READING a startup-hook
+    // body (`.pth`/`.start`/`sitecustomize.py`/`usercustomize.py`) on the
+    // filesystem, never from a command/paste fixture, so they have no PATTERN_TABLE
+    // entry. Covered by unit tests in `artifact/pth.rs` + the `ecosystem_scan`
+    // installed-tree startup-execution tests.
+    "python_startup_hook_suspicious",
+    "python_startup_hook_cross_runtime",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1283,6 +1295,8 @@ rule_id_variant_registry! {
     AnalysisIncomplete,
     // Installed-distribution integrity (B5)
     PythonInstalledIntegrityViolation,
+    // Python startup-hook execution (B6)
+    PythonStartupHookSuspicious, PythonStartupHookCrossRuntime,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

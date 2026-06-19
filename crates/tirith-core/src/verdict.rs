@@ -760,6 +760,27 @@ pub enum RuleId {
     /// unowned native executable, or cross-distribution execution). A strict
     /// integrity policy upgrades the action to Block via `action_overrides`.
     PythonInstalledIntegrityViolation,
+    /// B6: a Python startup hook (`.pth` `import` line, Python 3.15 `.start`
+    /// entry-point file, or `sitecustomize.py`/`usercustomize.py`) executes
+    /// suspicious code at interpreter start. Correlated from the granular
+    /// `crate::artifact::ArtifactSignalKind`s by the installed-tree scan when an
+    /// executing, non-template line is paired with a danger capability (a network
+    /// download, a subprocess spawn, a `sys.path` search, obfuscated content, or an
+    /// untrusted path addition). Canonical editable-install and namespace-package
+    /// bootstraps are exempt because their COMPLETE line matches a known template.
+    /// Fires over the filesystem from `ecosystem scan --installed`, never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`. High severity (whence the action is Block).
+    PythonStartupHookSuspicious,
+    /// B6: a Python startup hook launches a DIFFERENT language runtime
+    /// (Bun/Node/Deno) at interpreter start, the cross-distribution loader/payload
+    /// split the live campaign uses to hand execution from a Python `.pth` to a
+    /// bundled JavaScript payload. The rule keys on the launched RUNTIME name, not
+    /// the payload filename, so renaming the script does not evade. Correlated from
+    /// the artifact signals by the installed-tree scan; no PATTERN_TABLE entry
+    /// (`EXTERNALLY_TRIGGERED_RULES`). Critical severity (whence the action is
+    /// Block).
+    PythonStartupHookCrossRuntime,
 }
 
 impl fmt::Display for RuleId {
