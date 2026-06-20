@@ -59,8 +59,8 @@ use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::verdict::{Finding, Timings, Verdict};
 
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
-/// shape changes incompatibly; a consumer compares it against
-/// [`ArtifactInspection::schema_version`] before trusting a deserialized value.
+/// shape changes incompatibly; a consumer calls
+/// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
 pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
 /// WHAT was inspected. The subject is separated from per-file detail and from
@@ -183,6 +183,24 @@ impl ArtifactInspection {
             execution_edges: Vec::new(),
             coverage: InspectionCoverage::default(),
         }
+    }
+
+    /// Validate the deserialized schema version against what this build can read.
+    /// A consumer MUST call this before trusting a transported or persisted
+    /// inspection: a value stamped newer than [`ARTIFACT_SCHEMA_VERSION`] may carry
+    /// fields this build cannot interpret, so it is rejected rather than trusted.
+    ///
+    /// No load path deserializes an inspection from an untrusted source in this
+    /// milestone (every deserialize site is a test), so this guard has no caller
+    /// yet; it is the contract a future transport or persistence boundary must use.
+    pub fn check_schema(&self) -> Result<(), String> {
+        if self.schema_version > ARTIFACT_SCHEMA_VERSION {
+            return Err(format!(
+                "artifact inspection schema_version {} is newer than supported {}",
+                self.schema_version, ARTIFACT_SCHEMA_VERSION
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -369,7 +387,17 @@ pub struct InspectionCoverage {
 impl InspectionCoverage {
     /// Whether every member was inspected and no gap was recorded.
     pub fn is_complete(&self) -> bool {
-        self.gaps.is_empty() && self.members_inspected >= self.members_total
+        debug_assert!(
+            self.members_inspected <= self.members_total,
+            "InspectionCoverage inconsistent: members_inspected {} > members_total {}",
+            self.members_inspected,
+            self.members_total
+        );
+        // `==` rather than `>=`: members_inspected can never legitimately exceed
+        // members_total, so an inconsistent (forged) count returns not-complete in
+        // release builds instead of silently passing, while the debug_assert above
+        // surfaces it loudly in tests.
+        self.gaps.is_empty() && self.members_inspected == self.members_total
     }
 }
 
@@ -566,6 +594,33 @@ mod tests {
         let json = r#"{"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
         let back: ArtifactInspection = serde_json::from_str(json).unwrap();
         assert_eq!(back.schema_version, ARTIFACT_SCHEMA_VERSION);
+    }
+
+    /// A schema_version newer than this build understands is rejected by
+    /// check_schema (the guard the module doc promises), so a forward-incompatible
+    /// inspection is not silently trusted; the current version validates.
+    #[test]
+    fn inspection_rejects_unknown_schema_version() {
+        let newer = r#"{"schema_version":999,"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
+        let bad: ArtifactInspection = serde_json::from_str(newer).unwrap();
+        assert!(bad.check_schema().is_err());
+
+        let current = r#"{"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
+        let good: ArtifactInspection = serde_json::from_str(current).unwrap();
+        assert!(good.check_schema().is_ok());
+    }
+
+    /// An inspection claiming more inspected members than exist is internally
+    /// inconsistent; is_complete debug-asserts that invariant.
+    #[test]
+    #[should_panic(expected = "inconsistent")]
+    fn inspection_coverage_rejects_inconsistent_counters() {
+        let cov = InspectionCoverage {
+            members_inspected: 5,
+            members_total: 4,
+            gaps: Vec::new(),
+        };
+        let _ = cov.is_complete();
     }
 
     /// A synthetic Medium finding (the kind the analyzers will emit) is a Warn
