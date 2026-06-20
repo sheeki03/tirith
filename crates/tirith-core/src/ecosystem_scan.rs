@@ -2747,7 +2747,9 @@ fn scan_native_modules(
     use crate::artifact::archive::NativeMemberHandoff;
     use crate::artifact::native::triage_native;
     use crate::artifact::record::NormalizedInstalledPath;
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
     use crate::location::SubjectLocation;
+    use crate::util::OpenRegularError;
 
     // Collect native-module paths via a bounded, iterative (non-recursive) walk so
     // depth and entry count are explicitly capped. We never follow symlinked
@@ -2784,12 +2786,39 @@ fn scan_native_modules(
     native_paths.sort();
 
     for path in native_paths {
-        // Read the whole module (no-follow, capped). A body over the cap or an
-        // unreadable file contributes nothing (best-effort); the streaming
-        // above-cap path is exercised via the archive reader, not the installed walk.
-        let Ok(bytes) = crate::util::read_text_no_follow_capped(&path, MAX_NATIVE_MODULE_BYTES)
-        else {
-            continue;
+        // Read the whole module (no-follow, capped). A module OVER the native-parse
+        // cap, a symlinked/non-regular final component, or an I/O error leaves the
+        // module UNINSPECTED. Do not skip silently and do not fabricate an execution
+        // entry: record an HONEST Low-confidence "uninspectable native module" signal
+        // (a partial-coverage marker, not a danger leg) so the gap is visible. The
+        // installed walk does not stream above-cap members (the archive reader owns
+        // that path), so the size-cap case is a real coverage gap here. A vanished
+        // file (a race with the walk) is a benign gap and stays silent. This signal
+        // path does NOT increment `native_modules_triaged`: the module was not
+        // triaged, and counting it would overstate coverage.
+        let bytes = match crate::util::read_text_no_follow_capped(&path, MAX_NATIVE_MODULE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(OpenRegularError::NotFound) => continue,
+            Err(err) => {
+                let reason = match err {
+                    OpenRegularError::TooLarge => "the module exceeds the native-parse size cap",
+                    OpenRegularError::NotRegularFile => {
+                        "a symlinked or non-regular final component (read refused, not followed)"
+                    }
+                    OpenRegularError::Io(_) => "a permission or I/O error",
+                    OpenRegularError::NotFound => unreachable!("NotFound handled above"),
+                };
+                report.native_signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::NativeUninspectable,
+                    location: SubjectLocation::installed(path.clone()),
+                    evidence: format!(
+                        "native module could not be triaged ({reason}); its content is unknown, \
+                         not known-clean"
+                    ),
+                    confidence: EdgeConfidence::Low,
+                });
+                continue;
+            }
         };
         let sha256 = {
             use sha2::{Digest, Sha256};
@@ -2829,16 +2858,34 @@ fn scan_native_modules(
 }
 
 /// Whether a path names a native module by extension (`.so`/`.dylib`/`.pyd`/
-/// `.node`). Mirrors the archive reader's `NativeModule` classification.
+/// `.node`), including a versioned ELF shared object (`libfoo.so.3`,
+/// `libbar.so.1.2.3`). Mirrors the archive reader's `NativeModule` classification.
 fn is_native_module_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".so")
-        || lower.ends_with(".dylib")
+    lower.ends_with(".dylib")
         || lower.ends_with(".pyd")
         || lower.ends_with(".node")
+        || is_versioned_so(&lower)
+}
+
+/// Whether `name` (already lowercased) matches `*.so` with an optional trailing
+/// numeric version chain, i.e. `\.so(\.\d+)*$`: `foo.so`, `libcrypto.so.3`,
+/// `libfoo.so.1.2.3`. Anchored at the END: trailing `.<digits>` segments are
+/// stripped first, then the remainder must end in `.so`, so `foo.sober` and a
+/// non-numeric suffix like `foo.so.dev` do not match.
+fn is_versioned_so(name: &str) -> bool {
+    // Strip trailing `.<digits>` version segments (`.3`, `.1.2.3`).
+    let mut base = name;
+    while let Some((head, last)) = base.rsplit_once('.') {
+        if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        base = head;
+    }
+    base.ends_with(".so")
 }
 
 /// Discover every `<name>-<version>.dist-info` directory in a `site-packages`
@@ -5025,6 +5072,77 @@ version = "1.0.61"
     }
 
     #[test]
+    fn oversized_native_module_emits_partial_coverage_signal() {
+        // A native module larger than the native-parse cap (64 MiB) cannot be
+        // triaged on the installed walk (which does not stream above-cap members).
+        // Before the fix it was skipped silently with no gap/signal. It must now
+        // emit an HONEST Low-confidence `NativeUninspectable` partial-coverage
+        // signal (NOT a NativeExecutionEntry, which would claim execution we never
+        // observed), and it must NOT be counted as triaged.
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "host",
+            "1.0",
+            &[("host/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // One synthetic .so strictly over the cap (ELF magic so it is plausibly a
+        // module, though it is never parsed because the read is refused for size).
+        let oversized = (MAX_NATIVE_MODULE_BYTES + 1) as usize;
+        let mut body = vec![0u8; oversized];
+        body[..4].copy_from_slice(b"\x7fELF");
+        std::fs::write(site.join("host").join("_big.so"), &body).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeUninspectable
+            )),
+            "an oversized native module must emit the uninspectable partial-coverage signal; got {:?}",
+            integrity
+                .native_signals
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        );
+        // The oversized module must NOT count as triaged (it was not).
+        assert_eq!(
+            integrity.native_modules_triaged, 0,
+            "an uninspected oversized module must not be counted as triaged"
+        );
+        // And it must NOT fabricate an execution entry (the dishonest representation
+        // the finding warns against).
+        assert!(
+            !integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeExecutionEntry
+            )),
+            "an uninspected module must not claim a native execution entry"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `N` reads as the version-component placeholder
+    fn versioned_so_N_is_native_module() {
+        // T3.22: a versioned ELF shared object (`libcrypto.so.3`, `libfoo.so.1.2.3`)
+        // is a native module, not just the bare `.so`/`.dylib`/`.pyd`/`.node`.
+        assert!(is_native_module_path(Path::new("/x/libcrypto.so.3")));
+        assert!(is_native_module_path(Path::new("/x/libfoo.so.1.2.3")));
+        assert!(is_native_module_path(Path::new("/x/_core.so")));
+        assert!(is_native_module_path(Path::new("/x/_core.dylib")));
+        assert!(is_native_module_path(Path::new("/x/_core.pyd")));
+        assert!(is_native_module_path(Path::new("/x/addon.node")));
+        // Negatives: a non-numeric suffix or an unrelated extension is not a module.
+        assert!(!is_native_module_path(Path::new("/x/notes.sober")));
+        assert!(!is_native_module_path(Path::new("/x/lib.so.dev")));
+        assert!(!is_native_module_path(Path::new("/x/readme.txt")));
+    }
+
+    #[test]
     fn integrity_benign_editable_install_no_block() {
         // An editable install: a sparse RECORD (listing only the dist-info and a
         // .pth-style pointer) and absent project files must not block.
@@ -5418,6 +5536,43 @@ version = "1.0.61"
             "an executing line + subprocess capability must still fire suspicious; got {:?}",
             findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
         );
+    }
+
+    /// native_findings is #[serde(skip)] (folded into the verdict via
+    /// native_correlated_findings, not the JSON report), so it must not appear in the
+    /// serialized report yet must still be returned for the verdict.
+    #[test]
+    fn native_findings_skipped_in_json_but_folded_into_verdict() {
+        use crate::verdict::{Evidence, Finding, Severity};
+        let finding = Finding {
+            rule_id: RuleId::NativeImportExecutionChain,
+            severity: Severity::Critical,
+            title: "native import-execution chain".to_string(),
+            description: "test".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "test".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let report = InstalledIntegrityReport {
+            native_findings: vec![finding],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("native_findings"),
+            "native_findings is #[serde(skip)] and must not appear in the JSON report: {json}"
+        );
+        let folded = report.native_correlated_findings();
+        assert_eq!(
+            folded.len(),
+            1,
+            "native_findings must still be folded into the verdict"
+        );
+        assert_eq!(folded[0].rule_id, RuleId::NativeImportExecutionChain);
     }
 
     #[cfg(unix)]

@@ -350,6 +350,14 @@ pub enum ArtifactSignalKind {
     SitecustomizeUnowned,
     /// An editable install could not be verified against its target.
     EditableInstallUnverified,
+    /// A native module could not be triaged (read refused: a body over the
+    /// native-parse size cap, a symlinked or non-regular final component, or an I/O
+    /// error), so its content is unknown rather than known-clean. Low confidence:
+    /// like [`Self::StartupHookUninspectable`] this is an HONEST partial-coverage
+    /// marker, not a danger leg, and does not on its own promote to a Block. It is
+    /// deliberately NOT a `NativeExecutionEntry`, which would falsely claim an
+    /// execution we never observed.
+    NativeUninspectable,
     /// A native module exposes a direct execution entry (`PyInit_*`, a
     /// constructor, TLS/DllMain).
     NativeExecutionEntry,

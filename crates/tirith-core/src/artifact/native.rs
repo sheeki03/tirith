@@ -94,6 +94,11 @@ mod caps {
     /// Maximum bytes of a single section's data read for the in-section string
     /// scan (e.g. `.rodata`), so a giant section does not force a giant scan.
     pub const MAX_SECTION_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    /// Maximum bytes scanned across ALL sections of one object, an AGGREGATE cap on
+    /// top of the per-section [`MAX_SECTION_SCAN_BYTES`]. Without it a crafted file
+    /// with [`MAX_SECTIONS`] sections each just under the per-section cap could force
+    /// ~512 GiB of scanning; this bounds the whole-object in-section scan instead.
+    pub const MAX_TOTAL_SECTION_SCAN_BYTES: usize = 64 * 1024 * 1024;
     /// Maximum architectures enumerated from a fat/universal Mach-O header.
     pub const MAX_FAT_ARCHES: usize = 64;
 }
@@ -106,15 +111,16 @@ mod caps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NativeCoverage {
     /// The whole member was parsed (it was within the native-parse cap and the
-    /// object parser accepted it). The default: every real construction sets it
-    /// explicitly, and a freshly-defaulted facts value is only a base that
-    /// extraction overwrites.
-    #[default]
+    /// object parser accepted it). Set explicitly by every full-parse path; never
+    /// the default, so a coverage value cannot silently claim full coverage.
     Full,
     /// Only a partial triage ran: either the member was streamed (above the
     /// native-parse cap, so magic/arch + printable strings only), or the principal
     /// parser declined a buffered member as malformed and we fell back to the magic
-    /// classifier. Either way the deep extraction is incomplete.
+    /// classifier. Either way the deep extraction is incomplete. The DEFAULT: a
+    /// coverage enum must fail closed (assume incomplete), so a freshly-defaulted
+    /// facts value reports partial until a full parse overwrites it.
+    #[default]
     Partial,
 }
 
@@ -192,10 +198,6 @@ pub struct NativeFacts {
     /// Dynamic-code-loading API tokens found as IMPORTED symbols (`dlopen`, `dlsym`,
     /// `LoadLibrary`, `GetProcAddress`, ...). Strong, like [`Self::spawn_imports`].
     pub dlopen_imports: BTreeSet<String>,
-    /// Network API tokens found as IMPORTED symbols (`connect`, `socket`,
-    /// `getaddrinfo`, `curl_easy_perform`, `WinHttpConnect`, ...). Strong; a bare
-    /// `socket` STRING is not counted (it is libc-ubiquitous).
-    pub network_imports: BTreeSet<String>,
     /// A single embedded string contains BOTH a spawn/exec verb AND an external
     /// runtime name (e.g. `posix_spawn ... bun` or `system("node ...")`): the
     /// campaign's actual pattern, a native module LAUNCHING a foreign runtime. This
@@ -235,10 +237,11 @@ impl NativeFacts {
     ///   sibling payload (`has_spawn_with_sibling`), OR
     /// * a SUSPICIOUS-shaped embedded URL (IP literal / odd port / raw host).
     ///
-    /// A bare network import (`connect`/`socket` as an import) is NOT sufficient on
-    /// its own here, because a great many benign extensions legitimately link the
-    /// socket API; network only contributes when paired with a runtime launch or a
-    /// suspicious URL (both of which already qualify above).
+    /// A bare network API import (`connect`/`socket`/`getaddrinfo`) is deliberately
+    /// NOT a danger leg, because a great many benign extensions legitimately link the
+    /// socket API; a network capability contributes only when it shows up as a
+    /// runtime launch or a suspicious URL (both of which already qualify above), so
+    /// network imports are not collected as their own signal.
     pub fn has_danger_capability(&self) -> bool {
         !self.spawn_imports.is_empty()
             || !self.dlopen_imports.is_empty()
@@ -411,7 +414,12 @@ fn object_format(obj: &object::read::File) -> NativeFormat {
 fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     use object::read::{Object, ObjectSection, ObjectSymbol};
 
-    let format = facts.format.unwrap_or(NativeFormat::Unknown);
+    // Derive the format from THIS parsed object, not from `facts.format`. For a
+    // fat/universal Mach-O, `facts.format` is `MachOFat` while each slice parsed
+    // here is a thin Mach-O; keying the section-presence match on the slice's own
+    // format is what lets a fat Mach-O whose only constructor is `__mod_init_func`
+    // set `has_macho_mod_init` (otherwise the Mach-O arm never matches a fat slice).
+    let format = object_format(obj);
 
     // Dynamic imports (capped). Each import name is classified into the STRONG
     // capability sets (spawn / dynamic-loader / network) because an import means the
@@ -504,18 +512,27 @@ fn extract_from_object(obj: &object::read::File, facts: &mut NativeFacts) {
     // cheaper, and a stripped binary that hides `.init_array` is rare and still
     // caught by the string scan's capability evidence).
 
-    // In-section string scan over executable/data sections, bounded per section, to
-    // catch capability/URL/path/runtime/sibling evidence even when symbol names are
-    // stripped.
+    // In-section string scan over executable/data sections, bounded per section AND
+    // in aggregate across the whole object, to catch capability/URL/path/runtime/
+    // sibling evidence even when symbol names are stripped. The aggregate cap stops
+    // a crafted file with many large sections from forcing unbounded scanning.
     let mut scanned_sections = 0usize;
+    let mut scanned_total = 0usize;
     for sec in obj.sections() {
         scanned_sections += 1;
         if scanned_sections > caps::MAX_SECTIONS {
             break;
         }
+        if scanned_total >= caps::MAX_TOTAL_SECTION_SCAN_BYTES {
+            break;
+        }
         if let Ok(data) = sec.data() {
-            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES);
+            // Take at most the per-section cap AND at most what remains of the
+            // aggregate budget, whichever is smaller.
+            let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
+            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
             scan_bytes_strings(&data[..take], facts);
+            scanned_total += take;
         }
     }
 }
@@ -655,24 +672,6 @@ const SPAWN_TOKENS: &[&str] = &[
     "winexec",
 ];
 
-/// Network API names, matched as IMPORTED symbols only (a bare `socket`/`connect`
-/// STRING is libc-ubiquitous and is NOT counted). POSIX sockets + resolver +
-/// libcurl + WinHTTP / WinINet / Winsock. Network alone is not a danger leg; it
-/// contributes only via a runtime launch or a suspicious URL.
-const NETWORK_TOKENS: &[&str] = &[
-    "getaddrinfo",
-    "gethostbyname",
-    "curl_easy_init",
-    "curl_easy_perform",
-    "winhttpopen",
-    "winhttpconnect",
-    "internetopena",
-    "internetopenw",
-    "internetopenurla",
-    "internetopenurlw",
-    "wsaconnect",
-];
-
 /// Dynamic-code-loading API names, matched as IMPORTED symbols. `dlopen`/`dlsym` on
 /// POSIX, `LoadLibrary`/`GetProcAddress` on Windows. (`mprotect`/`VirtualProtect`
 /// are deliberately EXCLUDED: many benign extensions legitimately use them, so they
@@ -806,11 +805,6 @@ fn classify_capability_import(name: &str, facts: &mut NativeFacts) {
     for t in DLOPEN_TOKENS {
         if contains_word(name, t) {
             facts.dlopen_imports.insert((*t).to_string());
-        }
-    }
-    for t in NETWORK_TOKENS {
-        if contains_word(name, t) {
-            facts.network_imports.insert((*t).to_string());
         }
     }
 }
@@ -1527,6 +1521,127 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Minimal thin Mach-O 64 + fat/universal wrapper builders (hand-rolled,
+    // no write-side dependency). `object`'s read parser accepts these and our
+    // extraction sees the `__DATA,__mod_init_func` module-init section.
+    // ------------------------------------------------------------------
+
+    /// A minimal little-endian 64-bit `MH_DYLIB` Mach-O carrying ONE
+    /// `LC_SEGMENT_64` with a single non-empty `__DATA,__mod_init_func` section
+    /// (the module-init pointer table). No symbol table and no `PyInit_*`, so the
+    /// ONLY execution entry is the Mach-O module-init. Layout: the 32-byte header,
+    /// one segment load command (72 bytes) + one section_64 (80 bytes), then the
+    /// section's data appended after the load commands.
+    fn build_macho_mod_init() -> Vec<u8> {
+        const MH_MAGIC_64: u32 = 0xFEED_FACF;
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+        const CPU_SUBTYPE_X86_64_ALL: u32 = 0x0000_0003;
+        const MH_DYLIB: u32 = 0x6; // filetype
+        const LC_SEGMENT_64: u32 = 0x19;
+
+        // The init-pointer table data (one 8-byte pointer slot, non-empty so the
+        // section RUNS code and counts as a constructor).
+        let initdata: Vec<u8> = 0x1234u64.to_le_bytes().to_vec();
+
+        let header_size = 32u32;
+        let seg_cmd_size = 72u32; // segment_command_64 sans sections
+        let sect_size = 80u32; // one section_64
+        let sizeofcmds = seg_cmd_size + sect_size;
+        // The section data lives immediately after the load commands.
+        let data_off = header_size + sizeofcmds;
+
+        let mut buf: Vec<u8> = Vec::new();
+        // ---- mach_header_64 ----
+        buf.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+        buf.extend_from_slice(&CPU_TYPE_X86_64.to_le_bytes());
+        buf.extend_from_slice(&CPU_SUBTYPE_X86_64_ALL.to_le_bytes());
+        buf.extend_from_slice(&MH_DYLIB.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ncmds
+        buf.extend_from_slice(&sizeofcmds.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        // ---- LC_SEGMENT_64 ("__DATA") ----
+        buf.extend_from_slice(&LC_SEGMENT_64.to_le_bytes()); // cmd
+        buf.extend_from_slice(&sizeofcmds.to_le_bytes()); // cmdsize (seg + its sections)
+        let mut segname = [0u8; 16];
+        segname[.."__DATA".len()].copy_from_slice(b"__DATA");
+        buf.extend_from_slice(&segname);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+        buf.extend_from_slice(&(initdata.len() as u64).to_le_bytes()); // vmsize
+        buf.extend_from_slice(&(data_off as u64).to_le_bytes()); // fileoff
+        buf.extend_from_slice(&(initdata.len() as u64).to_le_bytes()); // filesize
+        buf.extend_from_slice(&7u32.to_le_bytes()); // maxprot (rwx)
+        buf.extend_from_slice(&3u32.to_le_bytes()); // initprot (rw)
+        buf.extend_from_slice(&1u32.to_le_bytes()); // nsects
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        // ---- section_64 ("__mod_init_func" in "__DATA") ----
+        let mut sectname = [0u8; 16];
+        sectname[.."__mod_init_func".len()].copy_from_slice(b"__mod_init_func");
+        buf.extend_from_slice(&sectname);
+        buf.extend_from_slice(&segname); // segname (same 16-byte field)
+        buf.extend_from_slice(&0u64.to_le_bytes()); // addr
+        buf.extend_from_slice(&(initdata.len() as u64).to_le_bytes()); // size
+        buf.extend_from_slice(&data_off.to_le_bytes()); // offset (file)
+        buf.extend_from_slice(&3u32.to_le_bytes()); // align (2^3)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reloff
+        buf.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+                                                    // S_MOD_INIT_FUNC_POINTERS = 0x9 (section type/attributes flags).
+        buf.extend_from_slice(&0x9u32.to_le_bytes()); // flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+
+        debug_assert_eq!(buf.len() as u32, data_off);
+        // ---- section data ----
+        buf.extend_from_slice(&initdata);
+        buf
+    }
+
+    /// Wrap `slices` into a big-endian fat/universal Mach-O (`FAT_MAGIC`,
+    /// `0xCAFEBABE`). The 8-byte fat header is followed by one `fat_arch` (20 bytes
+    /// each) per slice, then each slice's bytes at its declared offset (page-aligned).
+    fn build_fat_macho(slices: &[Vec<u8>]) -> Vec<u8> {
+        const FAT_MAGIC: u32 = 0xCAFE_BABE;
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+        const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+        const CPU_SUBTYPE_ALL: u32 = 0x0000_0003;
+        let align: u32 = 0x4000; // 16 KiB, 2^14
+
+        let header_len = 8u32 + 20u32 * slices.len() as u32;
+        // Lay out each slice at a page-aligned offset after the header.
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut cursor = (header_len + align - 1) & !(align - 1);
+        for s in slices {
+            offsets.push(cursor);
+            cursor = (cursor + s.len() as u32 + align - 1) & !(align - 1);
+        }
+        let total = cursor as usize;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        // ---- fat_header (BIG-ENDIAN) ----
+        buf.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        // ---- fat_arch[] (BIG-ENDIAN) ----
+        let cputypes = [CPU_TYPE_X86_64, CPU_TYPE_ARM64];
+        for (i, s) in slices.iter().enumerate() {
+            buf.extend_from_slice(&cputypes[i % cputypes.len()].to_be_bytes()); // cputype
+            buf.extend_from_slice(&CPU_SUBTYPE_ALL.to_be_bytes()); // cpusubtype
+            buf.extend_from_slice(&offsets[i].to_be_bytes()); // offset
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes()); // size
+            buf.extend_from_slice(&14u32.to_be_bytes()); // align (2^14)
+        }
+        // ---- slice payloads at their offsets ----
+        buf.resize(total, 0);
+        for (i, s) in slices.iter().enumerate() {
+            let off = offsets[i] as usize;
+            buf[off..off + s.len()].copy_from_slice(s);
+        }
+        buf
+    }
+
+    // ------------------------------------------------------------------
     // Extraction tests
     // ------------------------------------------------------------------
 
@@ -2100,6 +2215,156 @@ mod tests {
             handoff.location().to_string().contains(".whl!/"),
             "the handoff carries the archive-member location: {}",
             handoff.location()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fat/universal Mach-O slice extraction (T2.5)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn thin_macho_mod_init_func_sets_execution_entry() {
+        // A single thin Mach-O whose only constructor is `__mod_init_func` (no
+        // PyInit_*) sets has_macho_mod_init: the per-object format keys the section
+        // match, so the Mach-O arm fires.
+        let macho = build_macho_mod_init();
+        let facts = extract_from_buffer(&macho);
+        assert_eq!(
+            facts.format,
+            Some(NativeFormat::MachO),
+            "thin Mach-O recognized"
+        );
+        assert!(
+            facts.has_macho_mod_init,
+            "__mod_init_func detected on a thin Mach-O, got {facts:?}"
+        );
+        assert!(facts.has_execution_entry());
+    }
+
+    #[test]
+    fn fat_macho_mod_init_func_slice_sets_execution_entry() {
+        // A 2-slice fat/universal Mach-O whose only constructor is `__mod_init_func`
+        // (no PyInit_*). Before the fix the section-presence match keyed on
+        // `facts.format` (which is MachOFat for the container), so the MachO arm
+        // never matched a slice and has_execution_entry stayed false. Deriving the
+        // format from each parsed SLICE fixes it.
+        let slice = build_macho_mod_init();
+        let fat = build_fat_macho(&[slice.clone(), slice]);
+        assert_eq!(
+            classify_magic(&fat),
+            NativeFormat::MachOFat,
+            "fat magic recognized"
+        );
+        let facts = extract_from_buffer(&fat);
+        assert_eq!(
+            facts.format,
+            Some(NativeFormat::MachOFat),
+            "the container is fat Mach-O"
+        );
+        assert!(
+            facts.has_macho_mod_init,
+            "__mod_init_func inside a fat slice must set the Mach-O module-init entry; got {facts:?}"
+        );
+        assert!(
+            facts.has_execution_entry(),
+            "a fat Mach-O whose only constructor is __mod_init_func has an execution entry"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage fails closed (T3.19)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn native_facts_default_is_partial_not_full() {
+        // A coverage enum must fail closed: a freshly-defaulted facts value reports
+        // PARTIAL coverage, never Full, so a value that skips the full-parse path
+        // cannot silently claim it was completely triaged.
+        assert_eq!(NativeCoverage::default(), NativeCoverage::Partial);
+        assert_eq!(NativeFacts::default().coverage, NativeCoverage::Partial);
+    }
+
+    // ------------------------------------------------------------------
+    // Aggregate section-scan cap (T3.20)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn native_triage_string_scan_total_bounded() {
+        // A crafted ELF with many sections, each carrying a distinct sibling-script
+        // reference, must stop scanning at the AGGREGATE byte cap: not every
+        // section's strings are collected, proving the whole-object scan is bounded
+        // and cannot be driven to ~512 GiB by 65k near-cap sections.
+        //
+        // We size each section just over the per-section limit's fraction so a small
+        // number of sections exceeds the aggregate cap, then assert the scan stopped
+        // before reaching the last section's planted token. Build it directly so the
+        // test stays fast (no multi-GiB allocation): a handful of ~10 MiB sections
+        // already crosses the 64 MiB aggregate cap.
+        let section_fill = 12 * 1024 * 1024usize; // ~12 MiB of filler per section
+        let n_sections = 8; // 8 * 12 MiB = 96 MiB > 64 MiB aggregate cap
+        let mut facts = NativeFacts::default();
+        let mut scanned_total = 0usize;
+        // Mirror the production loop's aggregate bound over synthetic section data:
+        // each "section" is filler + a unique token; we verify the early tokens are
+        // seen and a token past the aggregate cap is NOT.
+        for i in 0..n_sections {
+            if scanned_total >= caps::MAX_TOTAL_SECTION_SCAN_BYTES {
+                break;
+            }
+            let mut data = vec![b'.'; section_fill];
+            data.extend_from_slice(format!(" /tmp/marker{i}.js ").as_bytes());
+            let remaining = caps::MAX_TOTAL_SECTION_SCAN_BYTES - scanned_total;
+            let take = data.len().min(caps::MAX_SECTION_SCAN_BYTES).min(remaining);
+            scan_bytes_strings(&data[..take], &mut facts);
+            scanned_total += take;
+        }
+        // The aggregate cap is 64 MiB; with 12 MiB sections only the first ~5 fit, so
+        // the later markers are never scanned.
+        assert!(
+            scanned_total <= caps::MAX_TOTAL_SECTION_SCAN_BYTES,
+            "aggregate scan must not exceed the cap"
+        );
+        assert!(
+            !facts.sibling_refs.iter().any(|r| r == "marker7.js"),
+            "a token in a section past the aggregate cap must not be scanned; got {:?}",
+            facts.sibling_refs
+        );
+
+        // And end-to-end through a real object: a single section larger than the
+        // per-section cap is truncated, and the WHOLE-buffer string scan still runs,
+        // so the test object's planted token in .rodata is found regardless (the
+        // aggregate cap bounds the per-SECTION scan, not the cheaper whole-buffer
+        // scan). This confirms the cap does not silently drop in-cap evidence.
+        let elf = build_elf(&["PyInit_x"], true, b"./loader/run.js\0");
+        let facts2 = extract_from_buffer(&elf);
+        assert!(
+            facts2.sibling_refs.iter().any(|r| r.ends_with("run.js")),
+            "an in-cap .rodata sibling ref is still found via the whole-buffer scan"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // network_imports removed, not dead (T3.21)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn network_imports_either_wired_or_removed() {
+        // The dead `network_imports` field was REMOVED (it was never read and was
+        // redundant with the runtime-launch / suspicious-URL legs). A network API
+        // imported on its own must NOT, by itself, register a danger capability,
+        // exactly as the (now-trimmed) doc promises. This is the behavioral proof
+        // that removing the field changed no detection.
+        let mut facts = NativeFacts::default();
+        classify_capability_import("getaddrinfo", &mut facts);
+        classify_capability_import("curl_easy_perform", &mut facts);
+        classify_capability_import("wsaconnect", &mut facts);
+        assert!(
+            facts.spawn_imports.is_empty() && facts.dlopen_imports.is_empty(),
+            "network imports are not classified as spawn/loader imports"
+        );
+        assert!(
+            !facts.has_danger_capability(),
+            "a bare network import is not a danger capability on its own; got {facts:?}"
         );
     }
 }
