@@ -44,7 +44,7 @@
 //! # Native member handoff (the contract B7 consumes)
 //!
 //! A native member (`.so`/`.dylib`/`.pyd`/`.node`) is where B7's deep triage runs.
-//! A4 only does the PLUMBING: for a member within [`ArchiveLimits::max_native_parse_bytes`]
+//! A4 only does the PLUMBING: for a member within [`ArchiveLimits::max_member_uncompressed`]
 //! it decompresses into a bounded in-memory buffer (a [`NativeMemberHandoff::Buffered`])
 //! so B7 gets full random access to section/symbol/import tables; for a larger
 //! member it produces a [`NativeMemberHandoff::Streaming`] view (whole-member
@@ -87,10 +87,6 @@ pub struct ArchiveLimits {
     /// is abandoned mid-stream with a [`CoverageGapKind::CompressionRatioExceeded`]
     /// gap.
     pub max_compression_ratio: u64,
-    /// Maximum uncompressed bytes of a NATIVE member to buffer for B7's
-    /// random-access parser. A larger native member is handed over as a streaming
-    /// view (hash + printable-string scan) and marked truncated.
-    pub max_native_parse_bytes: u64,
 }
 
 impl Default for ArchiveLimits {
@@ -100,23 +96,15 @@ impl Default for ArchiveLimits {
             max_total_uncompressed: 512 * 1024 * 1024,
             max_member_uncompressed: 64 * 1024 * 1024,
             max_compression_ratio: 200,
-            max_native_parse_bytes: 64 * 1024 * 1024,
         }
     }
 }
-
-/// Maximum archive-nesting depth the reader will descend. Documented as a
-/// constant because the DECISION (this milestone) is deliberate: we NEVER recurse
-/// into a nested archive (a `.whl` containing a `.zip` containing a `.whl`). A
-/// nested archive member is treated as ordinary content; a hardened recursive
-/// reader is a separate later design. Value `1` = the top-level archive only.
-pub const MAX_RECURSION_DEPTH: u8 = 1;
 
 /// The header window (2 MiB) that B7's FALLBACK magic/architecture classifier may
 /// read when a native member is too large for a full buffer. This is ONLY for the
 /// fallback classifier, never the principal parser; the principal parser always
 /// gets the full bounded buffer ([`NativeMemberHandoff::Buffered`]) when the
-/// member is within [`ArchiveLimits::max_native_parse_bytes`].
+/// member is within [`ArchiveLimits::max_member_uncompressed`].
 pub const NATIVE_HEADER_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A HARD structural violation: the archive is malformed or hostile in a way an
@@ -221,16 +209,6 @@ pub enum ArchiveOutcome {
 }
 
 impl ArchiveOutcome {
-    /// The inspection regardless of class (the `partial` for a rejection), for a
-    /// caller that wants the evidence either way. Prefer matching on the variant
-    /// when the accept/reject distinction matters (it almost always does).
-    pub fn inspection(&self) -> &ArtifactInspection {
-        match self {
-            ArchiveOutcome::Accepted(i) => i,
-            ArchiveOutcome::Rejected { partial, .. } => partial,
-        }
-    }
-
     /// Whether the archive was rejected for a structural violation.
     pub fn is_rejected(&self) -> bool {
         matches!(self, ArchiveOutcome::Rejected { .. })
@@ -241,7 +219,7 @@ impl ArchiveOutcome {
 /// handoff; B7 consumes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeMemberHandoff {
-    /// The member fit within [`ArchiveLimits::max_native_parse_bytes`], so its
+    /// The member fit within [`ArchiveLimits::max_member_uncompressed`], so its
     /// whole decompressed body is buffered in memory for B7's random-access
     /// parser (section/symbol/import tables, TLS/init data).
     Buffered {
@@ -479,19 +457,33 @@ pub fn read_wheel<R: Read + Seek>(
             continue;
         }
 
+        // Whatever of the total-uncompressed budget remains. Recomputed each
+        // member from the running total, which now ONLY ever grows (every arm
+        // below debits the bytes it consumed), so a member can never read more
+        // than this no matter how an earlier member finished.
+        let remaining_total = limits
+            .max_total_uncompressed
+            .saturating_sub(total_uncompressed);
+
         // Per-member size cap: do not buffer a member larger than the cap for
         // full content analysis. We use the DECLARED size only as a fast pre-check
         // here; the REAL byte budget is still enforced byte-by-byte in
         // `stream_member` below, so a member that lies small but streams huge is
         // still aborted. A native member over the cap still gets a STREAMING view
         // (whole-member hash + header window + printable strings) for B7, plus a
-        // `NativeTruncated` gap noting the deep parse was truncated.
+        // `NativeTruncated` gap noting the deep parse was truncated. The streaming
+        // view is bounded by `remaining_total`, and the bytes it reads are debited,
+        // so an oversized native member cannot bypass the total budget either.
         if meta.declared_size > limits.max_member_uncompressed {
             let file_kind = classify_member(&member_label);
             if file_kind == ArtifactFileKind::NativeModule {
-                if let Some(handoff) =
-                    stream_native_view(&mut archive, meta.index, location.clone(), limits)
-                {
+                let (handoff, consumed) =
+                    stream_native_view(&mut archive, meta.index, location.clone(), remaining_total);
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
+                if total_uncompressed >= limits.max_total_uncompressed {
+                    total_budget_hit = true;
+                }
+                if let Some(handoff) = handoff {
                     visitor.on_native_member(handoff);
                 }
                 inspection.coverage.gaps.push(CoverageGap {
@@ -523,9 +515,6 @@ pub fn read_wheel<R: Read + Seek>(
         // the total budget) are passed separately so the gap kind names the BINDING
         // constraint, and the compression-ratio guard runs against the compressed
         // size. CRC is validated by the zip reader as the stream completes.
-        let remaining_total = limits
-            .max_total_uncompressed
-            .saturating_sub(total_uncompressed);
         let stream = stream_member(
             &mut archive,
             meta.index,
@@ -535,9 +524,18 @@ pub fn read_wheel<R: Read + Seek>(
             limits.max_compression_ratio,
         );
 
+        // EVERY arm debits the REAL bytes the member forced (`consumed`) against
+        // the shared total budget and flips `total_budget_hit` once it is reached,
+        // so neither a completed member, a ratio bomb, a CRC failure, an I/O error,
+        // nor a budget abort can leave the total under-counted. The Complete arm's
+        // `consumed` equals `bytes.len()`.
         match stream {
-            MemberStream::Complete { bytes, sha256 } => {
-                total_uncompressed = total_uncompressed.saturating_add(bytes.len() as u64);
+            MemberStream::Complete {
+                bytes,
+                sha256,
+                consumed,
+            } => {
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
                 if total_uncompressed >= limits.max_total_uncompressed {
                     total_budget_hit = true;
                 }
@@ -566,32 +564,49 @@ pub fn read_wheel<R: Read + Seek>(
                     });
                 }
             }
-            MemberStream::CrcFailed => {
+            MemberStream::CrcFailed { consumed } => {
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
+                if total_uncompressed >= limits.max_total_uncompressed {
+                    total_budget_hit = true;
+                }
                 violations.push(ArchiveViolation::CrcMismatch {
                     member: meta.raw_name.clone(),
                 });
                 inspection.coverage.members_inspected += 1;
             }
-            MemberStream::RatioExceeded => {
+            MemberStream::RatioExceeded { consumed } => {
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
+                if total_uncompressed >= limits.max_total_uncompressed {
+                    total_budget_hit = true;
+                }
                 inspection.coverage.gaps.push(CoverageGap {
                     location,
                     kind: CoverageGapKind::CompressionRatioExceeded,
                     sha256: None,
                 });
-                // The total budget is unaffected (we abandoned mid-stream); count
-                // it as inspected-with-a-gap.
+                // Count it as inspected-with-a-gap; the consumed bytes were debited
+                // above so the abort cannot reset the total budget.
             }
-            MemberStream::BudgetExceeded { kind } => {
+            MemberStream::BudgetExceeded { kind, consumed } => {
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
                 // We hit either the per-member cap or the remaining-total budget
                 // mid-stream. For a native member we still want to give B7 a
-                // streaming view rather than nothing.
+                // streaming view rather than nothing, bounded by what budget is
+                // left after debiting the bytes we just consumed.
                 let file_kind = classify_member(&member_label);
                 if file_kind == ArtifactFileKind::NativeModule {
-                    let handoff =
-                        stream_native_view(&mut archive, meta.index, location.clone(), limits);
+                    let left = limits
+                        .max_total_uncompressed
+                        .saturating_sub(total_uncompressed);
+                    let (handoff, view_consumed) =
+                        stream_native_view(&mut archive, meta.index, location.clone(), left);
+                    total_uncompressed = total_uncompressed.saturating_add(view_consumed);
                     if let Some(h) = handoff {
                         visitor.on_native_member(h);
                     }
+                }
+                if total_uncompressed >= limits.max_total_uncompressed {
+                    total_budget_hit = true;
                 }
                 inspection.coverage.gaps.push(CoverageGap {
                     location,
@@ -602,7 +617,11 @@ pub fn read_wheel<R: Read + Seek>(
                     total_budget_hit = true;
                 }
             }
-            MemberStream::IoError => {
+            MemberStream::IoError { consumed } => {
+                total_uncompressed = total_uncompressed.saturating_add(consumed);
+                if total_uncompressed >= limits.max_total_uncompressed {
+                    total_budget_hit = true;
+                }
                 inspection.coverage.gaps.push(CoverageGap {
                     location,
                     kind: CoverageGapKind::Unreadable,
@@ -960,19 +979,35 @@ fn classify_member(member: &str) -> ArtifactFileKind {
     ArtifactFileKind::Other
 }
 
-/// The result of streaming one member's bytes under the budgets.
+/// The result of streaming one member's bytes under the budgets. EVERY variant
+/// reports `consumed`: the REAL uncompressed bytes the decompressor produced for
+/// this member before the stream finished or was aborted. The caller debits
+/// `consumed` against the shared total-uncompressed budget in EVERY arm, so an
+/// aborted member (ratio bomb, budget hit, CRC failure, I/O error) still counts
+/// the work it forced, and the total budget can never be bypassed by aborting.
 enum MemberStream {
-    /// The whole member was read within budget; its bytes and SHA-256.
-    Complete { bytes: Vec<u8>, sha256: String },
-    /// The member's CRC-32 did not validate (corruption / tampering).
-    CrcFailed,
+    /// The whole member was read within budget; its bytes and SHA-256. `consumed`
+    /// equals `bytes.len()`.
+    Complete {
+        bytes: Vec<u8>,
+        sha256: String,
+        consumed: u64,
+    },
+    /// The member's CRC-32 did not validate (corruption / tampering). `consumed`
+    /// is the bytes decompressed before the failing final read.
+    CrcFailed { consumed: u64 },
     /// The member's real streamed bytes blew past the compression-ratio limit.
-    RatioExceeded,
+    /// `consumed` is the bytes read up to and including the chunk that tripped it.
+    RatioExceeded { consumed: u64 },
     /// A byte budget (per-member cap or remaining total) was hit mid-stream; the
-    /// gap kind to record.
-    BudgetExceeded { kind: CoverageGapKind },
-    /// A non-CRC I/O error occurred while reading.
-    IoError,
+    /// gap kind to record. `consumed` is the bytes read up to the abort.
+    BudgetExceeded {
+        kind: CoverageGapKind,
+        consumed: u64,
+    },
+    /// A non-CRC I/O error occurred while reading. `consumed` is the bytes read
+    /// before the error.
+    IoError { consumed: u64 },
 }
 
 /// Stream one member's decompressed bytes, enforcing BOTH the per-member byte cap
@@ -995,9 +1030,9 @@ fn stream_member<R: Read + Seek>(
         Ok(f) => f,
         Err(e) => {
             // An UnsupportedArchive here would mean an undecodable method slipped
-            // past the pre-check; treat any open error as I/O.
+            // past the pre-check; treat any open error as I/O. Nothing was read.
             let _ = e;
-            return MemberStream::IoError;
+            return MemberStream::IoError { consumed: 0 };
         }
     };
 
@@ -1021,23 +1056,26 @@ fn stream_member<R: Read + Seek>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                // The zip reader surfaces a CRC mismatch as an InvalidData error on
-                // the final read; classify that specifically.
-                if e.kind() == std::io::ErrorKind::InvalidData
-                    && e.to_string().to_lowercase().contains("checksum")
-                {
-                    return MemberStream::CrcFailed;
+                // The zip reader surfaces a CRC mismatch as an InvalidData error
+                // while finalizing the member; classify any InvalidData raised
+                // here as a CRC failure (the decompression completed and the
+                // checksum did not validate), independent of the exact message.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    return MemberStream::CrcFailed { consumed: total };
                 }
-                return MemberStream::IoError;
+                return MemberStream::IoError { consumed: total };
             }
         };
         total = total.saturating_add(n as u64);
         // Compression-ratio guard on REAL bytes (the declared size is not trusted).
         if total > ratio_limit {
-            return MemberStream::RatioExceeded;
+            return MemberStream::RatioExceeded { consumed: total };
         }
         if total > byte_bound {
-            return MemberStream::BudgetExceeded { kind: bound_kind };
+            return MemberStream::BudgetExceeded {
+                kind: bound_kind,
+                consumed: total,
+            };
         }
         hasher.update(&buf[..n]);
         bytes.extend_from_slice(&buf[..n]);
@@ -1045,25 +1083,45 @@ fn stream_member<R: Read + Seek>(
 
     let digest = hasher.finalize();
     let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    MemberStream::Complete { bytes, sha256 }
+    MemberStream::Complete {
+        bytes,
+        sha256,
+        consumed: total,
+    }
 }
 
 /// Produce a [`NativeMemberHandoff::Streaming`] view for a native member too large
 /// to buffer: stream the whole member for its SHA-256, keep the leading header
 /// window and a bounded set of printable strings, but never buffer the whole body.
-/// Returns `None` on an open/read failure.
+/// A streaming view exists PRECISELY for a member larger than the per-member
+/// analysis cap, so it is NOT bounded by `max_member_uncompressed`.
+///
+/// Returns the streaming view (or `None` on an open/read failure or a member that
+/// blows the budget) ALONG WITH the REAL bytes this call consumed, so the caller
+/// debits them against the shared total-uncompressed budget. The streamed bytes
+/// are bounded by `remaining_budget`: the caller passes the total budget LEFT (not
+/// the full total budget), so N oversized native members can never each read the
+/// whole budget. `remaining_budget` of 0 reads nothing and returns `(None, 0)`.
 fn stream_native_view<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
     location: SubjectLocation,
-    limits: &ArchiveLimits,
-) -> Option<NativeMemberHandoff> {
-    // Bound the work even for a streaming view: the native-parse cap times the
-    // ratio bound is far above any honest member, and we cap the total streamed
-    // bytes for the hash to the total-uncompressed budget to avoid an unbounded
-    // read on a member that lies small.
-    let hash_budget = limits.max_total_uncompressed;
-    let mut file = archive.by_index(index).ok()?;
+    remaining_budget: u64,
+) -> (Option<NativeMemberHandoff>, u64) {
+    // Bound the streamed work to whatever of the total budget remains. The declared
+    // size is attacker-controlled, so a member that lies small still cannot read
+    // past `remaining_budget` real bytes here, and the bytes read are debited so
+    // the next member sees a smaller budget.
+    let cap = remaining_budget;
+    // No budget left: read nothing (not even one chunk) so the total budget, once
+    // exhausted, halts further native streaming entirely.
+    if cap == 0 {
+        return (None, 0);
+    }
+    let mut file = match archive.by_index(index) {
+        Ok(f) => f,
+        Err(_) => return (None, 0),
+    };
 
     let mut hasher = Sha256::new();
     let mut header_window: Vec<u8> = Vec::new();
@@ -1075,13 +1133,15 @@ fn stream_native_view<R: Read + Seek>(
             Ok(0) => break,
             Ok(n) => n,
             // A CRC failure or I/O error on a streaming-view member: give up the
-            // view (the member is already a coverage gap).
-            Err(_) => return None,
+            // view (the member is already a coverage gap), but still report the
+            // bytes we read so the caller debits them.
+            Err(_) => return (None, total),
         };
         total = total.saturating_add(n as u64);
-        if total > hash_budget {
-            // Refuse to read unbounded even for the hash.
-            return None;
+        if total > cap {
+            // The member blows the remaining budget (or the per-member cap): give
+            // up the view rather than read unbounded, and report what we consumed.
+            return (None, total);
         }
         hasher.update(&buf[..n]);
         if (header_window.len() as u64) < NATIVE_HEADER_WINDOW_BYTES {
@@ -1093,13 +1153,16 @@ fn stream_native_view<R: Read + Seek>(
     }
     let digest = hasher.finalize();
     let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    Some(NativeMemberHandoff::Streaming {
-        location,
-        sha256,
-        size: total,
-        header_window,
-        printable_strings: printable.finish(),
-    })
+    (
+        Some(NativeMemberHandoff::Streaming {
+            location,
+            sha256,
+            size: total,
+            header_window,
+            printable_strings: printable.finish(),
+        }),
+        total,
+    )
 }
 
 /// A bounded scanner extracting printable-ASCII runs (length >= 4) from a stream,
@@ -1129,7 +1192,13 @@ impl PrintableScanner {
     fn feed(&mut self, data: &[u8]) {
         for &b in data {
             if (0x20..0x7f).contains(&b) {
-                if self.captured_bytes < Self::MAX_CAPTURED_BYTES {
+                // Bound the IN-PROGRESS run directly against the global cap: count
+                // both the bytes already retained and the current run's length, so
+                // a single giant printable run with no separator (which never
+                // flushes) cannot grow `self.current` without limit. Once the cap
+                // is reached we stop appending; bytes beyond it are dropped.
+                if self.captured_bytes.saturating_add(self.current.len()) < Self::MAX_CAPTURED_BYTES
+                {
                     self.current.push(b);
                 }
             } else {
@@ -1382,7 +1451,13 @@ mod tests {
 
         // Hashes are STABLE across re-reads.
         let again = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
-        assert_eq!(again.inspection().files, inspection.files);
+        let again_inspection = match &again {
+            ArchiveOutcome::Accepted(i) => i,
+            ArchiveOutcome::Rejected { violations, .. } => {
+                panic!("a clean wheel must be Accepted on re-read, got violations: {violations:?}")
+            }
+        };
+        assert_eq!(again_inspection.files, inspection.files);
 
         // Full coverage, no gaps.
         assert!(inspection.coverage.gaps.is_empty());
@@ -1624,6 +1699,52 @@ mod tests {
             "CRC mismatch",
             |v| matches!(v, ArchiveViolation::CrcMismatch { member } if member.contains("data.bin")),
         );
+    }
+
+    #[test]
+    fn crc_mismatch_classified_via_invalid_data_not_substring() {
+        // REGRESSION (T3.9): a corrupted member must classify as CrcMismatch via the
+        // error KIND (`ErrorKind::InvalidData` raised while finalizing the member's
+        // decompression), NOT via a fragile `message.contains("checksum")` match
+        // coupled to the zip crate's exact wording. Corrupt the COMPRESSED bytes of
+        // a DEFLATE member: the inflater surfaces this as an InvalidData error whose
+        // message is a deflate decode error (no "checksum" substring), yet the
+        // member must still be Rejected as a CrcMismatch. The old substring gate let
+        // this fall through to an Unreadable coverage gap (Accepted).
+        let body = b"deflate member body that compresses and then gets its stream smashed";
+        let mut bytes = ZipBuilder::new().file("demo/blob.bin", body).build();
+        corrupt_first_local_member_data(&mut bytes);
+
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        assert_rejected_with(
+            &outcome,
+            "CRC mismatch (structural InvalidData classification)",
+            |v| matches!(v, ArchiveViolation::CrcMismatch { member } if member.contains("blob.bin")),
+        );
+    }
+
+    /// Smash the leading bytes of the FIRST local file member's COMPRESSED data,
+    /// breaking the deflate stream so the inflater raises an `InvalidData` error
+    /// (with a decode-error message, not a checksum message). Local file header:
+    /// `PK\x03\x04`, then fixed fields, with the file-name length at offset 26 and
+    /// the extra-field length at offset 28 (both u16 little-endian); the compressed
+    /// data starts at `30 + name_len + extra_len`.
+    fn corrupt_first_local_member_data(bytes: &mut [u8]) {
+        const LFH_SIG: [u8; 4] = [b'P', b'K', 0x03, 0x04];
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == LFH_SIG)
+            .expect("a local file header must be present");
+        let name_len = u16::from_le_bytes([bytes[pos + 26], bytes[pos + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+        let data_start = pos + 30 + name_len + extra_len;
+        // Flip the first few bytes of the deflate stream; this reliably breaks the
+        // block structure so decoding fails (or, failing that, the CRC will not
+        // match the altered output). Either way the reader sees an InvalidData kind.
+        let end = (data_start + 8).min(bytes.len());
+        for b in &mut bytes[data_start..end] {
+            *b ^= 0xff;
+        }
     }
 
     #[cfg(unix)]
@@ -2015,7 +2136,6 @@ mod tests {
             // Below the member size so it cannot be buffered, but the per-member
             // analysis cap is also below so it is a coverage gap; the native view
             // is produced from the BudgetExceeded path.
-            max_native_parse_bytes: 1024,
             max_member_uncompressed: 1024,
             max_total_uncompressed: 512 * 1024 * 1024,
             max_compression_ratio: 1_000_000,
@@ -2066,7 +2186,153 @@ mod tests {
         }
     }
 
+    /// A visitor that sums the REAL streamed bytes the reader reported across all
+    /// native handoffs (the `Streaming.size`, or the `Buffered` body length), so a
+    /// test can assert the total decompression the reader performed is bounded.
+    #[derive(Default)]
+    struct ByteCountingVisitor {
+        streaming_count: usize,
+        total_native_bytes: u64,
+    }
+
+    impl MemberVisitor for ByteCountingVisitor {
+        fn on_native_member(&mut self, handoff: NativeMemberHandoff) {
+            match handoff {
+                NativeMemberHandoff::Streaming { size, .. } => {
+                    self.streaming_count += 1;
+                    self.total_native_bytes = self.total_native_bytes.saturating_add(size);
+                }
+                NativeMemberHandoff::Buffered { bytes, .. } => {
+                    self.total_native_bytes =
+                        self.total_native_bytes.saturating_add(bytes.len() as u64);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn archive_total_budget_debits_aborted_and_native_members() {
+        // REGRESSION (T1.1): the shared total-uncompressed budget must be debited
+        // for EVERY member, including the over-declared-cap native branch (which
+        // historically called `stream_native_view` with the FULL total budget per
+        // member, so N oversized native members could each read the whole budget).
+        //
+        // Build 5 highly-compressible `.so` members, each REAL size 100 KiB but
+        // DECLARING 150 KiB (a lie patched into the central directory) so each
+        // enters the over-cap native branch. With the per-member cap at 100 KiB and
+        // the TOTAL budget at 200 KiB, only the first ~2 members fit the total; the
+        // rest must read NOTHING once the budget is exhausted.
+        const MEMBER_REAL: usize = 100 * 1024;
+        const N: usize = 5;
+        let body = vec![0u8; MEMBER_REAL]; // zeros: deflate to almost nothing
+        let mut b = ZipBuilder::new();
+        for i in 0..N {
+            b = b.file(&format!("demo/_ext{i}.abi3.so"), &body);
+        }
+        let mut bytes = b.build();
+        // Patch every member's DECLARED uncompressed size to 150 KiB (> the 100 KiB
+        // per-member cap) so each takes the over-declared-cap native path. The REAL
+        // streamed bytes (100 KiB) still govern what `stream_native_view` reads.
+        set_central_dir_uncompressed_size(&mut bytes, 150 * 1024);
+        let sha = sha256_hex(&bytes);
+
+        let limits = ArchiveLimits {
+            max_member_uncompressed: MEMBER_REAL as u64, // 100 KiB: each member is "oversized" only by its lie
+            max_total_uncompressed: (2 * MEMBER_REAL) as u64, // 200 KiB: ~2 members fit
+            max_compression_ratio: 1_000_000_000,        // never let the ratio be the trigger
+            ..ArchiveLimits::default()
+        };
+
+        let mut visitor = ByteCountingVisitor::default();
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut visitor,
+        );
+        let inspection = match &outcome {
+            ArchiveOutcome::Accepted(i) => i,
+            other => panic!("oversized native members are a coverage limit, got {other:?}"),
+        };
+
+        // The reader STOPPED after the total budget was exhausted: the bytes it
+        // actually decompressed across all native members must be within the total
+        // budget plus at most one member's slack, NOT ~5 members' worth.
+        assert!(
+            visitor.total_native_bytes <= limits.max_total_uncompressed + MEMBER_REAL as u64,
+            "total decompressed native bytes ({}) must stay within the total budget \
+             plus one member's slack ({}), not ~{} members ({}); the budget was bypassed",
+            visitor.total_native_bytes,
+            limits.max_total_uncompressed + MEMBER_REAL as u64,
+            N,
+            (N * MEMBER_REAL) as u64,
+        );
+        // Concretely: only the first two members fit the 200 KiB budget; the rest
+        // read nothing, so exactly two streaming views were produced (NOT five).
+        assert_eq!(
+            visitor.streaming_count, 2,
+            "only the members that fit the total budget should stream a view"
+        );
+        // Every oversized member is still a MemberTooLarge coverage gap (the
+        // structural bookkeeping is unchanged; only the budget accounting is fixed).
+        let member_too_large = inspection
+            .coverage
+            .gaps
+            .iter()
+            .filter(|g| g.kind == CoverageGapKind::MemberTooLarge)
+            .count();
+        assert_eq!(
+            member_too_large, N,
+            "each oversized native member is a MemberTooLarge gap"
+        );
+        // And the deep parse was marked truncated for each native member.
+        let native_truncated = inspection
+            .coverage
+            .gaps
+            .iter()
+            .filter(|g| g.kind == CoverageGapKind::NativeTruncated)
+            .count();
+        assert_eq!(
+            native_truncated, N,
+            "each oversized native member records a NativeTruncated gap"
+        );
+    }
+
     // ---- helper unit checks ---------------------------------------------------
+
+    #[test]
+    fn printable_scanner_bounds_single_giant_run() {
+        // REGRESSION (T3.8): a single long printable run with NO separator never
+        // hits `flush_current`, so `captured_bytes` (only bumped on flush) used to
+        // stay 0 and the in-progress `current` grew without bound. Feed several MiB
+        // of one uninterrupted printable run and assert the retained bytes stay
+        // capped both DURING the stream (the in-progress run) and at finish.
+        let mut scanner = PrintableScanner::new();
+        let chunk = vec![b'A'; 64 * 1024]; // all printable, no separator byte
+        let mut fed: u64 = 0;
+        for _ in 0..64 {
+            scanner.feed(&chunk); // 64 * 64 KiB = 4 MiB total, far past the 1 MiB cap
+            fed += chunk.len() as u64;
+            // The in-progress run must never exceed the global capture cap.
+            assert!(
+                scanner.current.len() <= PrintableScanner::MAX_CAPTURED_BYTES,
+                "the in-progress run ({}) must stay within MAX_CAPTURED_BYTES ({})",
+                scanner.current.len(),
+                PrintableScanner::MAX_CAPTURED_BYTES,
+            );
+        }
+        assert!(fed > PrintableScanner::MAX_CAPTURED_BYTES as u64);
+        // At finish the retained run is flushed; the single string must still be
+        // bounded by the capture cap, NOT the multi-MiB amount fed.
+        let strings = scanner.finish();
+        let retained: usize = strings.iter().map(|s| s.len()).sum();
+        assert!(
+            retained <= PrintableScanner::MAX_CAPTURED_BYTES,
+            "retained printable bytes ({retained}) must stay within MAX_CAPTURED_BYTES ({})",
+            PrintableScanner::MAX_CAPTURED_BYTES,
+        );
+    }
 
     #[test]
     fn pep503_name_normalization() {
@@ -2169,11 +2435,49 @@ mod tests {
     }
 
     #[test]
+    fn archive_outcome_partial_not_readable_as_clean() {
+        // REGRESSION (T3.10): the class-erasing `ArchiveOutcome::inspection()` helper
+        // (which returned the inner inspection for BOTH Accepted and Rejected) is
+        // gone, so a rejected wheel's `partial` evidence can NEVER be read as a clean
+        // inspection. The only way to the evidence is through the `Rejected` arm; the
+        // `Accepted` arm yields nothing for a rejected outcome. This is enforced at
+        // compile time (there is no longer an accessor that elides the variant); the
+        // assertions below pin the runtime behavior.
+        let bytes = ZipBuilder::new()
+            .file("demo/__init__.py", b"ok")
+            .file("../escape", b"evil")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        assert!(
+            outcome.is_rejected(),
+            "a traversal member must make the outcome Rejected"
+        );
+        // The evidence is reachable ONLY via the Rejected arm. A caller cannot get
+        // an `&ArtifactInspection` without first acknowledging the rejection.
+        let partial = match &outcome {
+            ArchiveOutcome::Rejected { partial, .. } => partial,
+            ArchiveOutcome::Accepted(_) => {
+                panic!("a rejected wheel must never present as Accepted")
+            }
+        };
+        assert!(
+            partial
+                .files
+                .iter()
+                .any(|f| f.location.to_string().ends_with("demo/__init__.py")),
+            "the partial still carries readable evidence, but only behind the Rejected variant"
+        );
+    }
+
+    #[test]
     fn inspection_is_serde_round_trippable() {
         // The Accepted inspection is the A3 model, which must still round-trip.
         let bytes = clean_wheel_bytes();
         let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
-        let inspection = outcome.inspection();
+        let inspection = match &outcome {
+            ArchiveOutcome::Accepted(i) => i,
+            other => panic!("a clean wheel must be Accepted, got {other:?}"),
+        };
         let json = serde_json::to_string(inspection).unwrap();
         let back: ArtifactInspection = serde_json::from_str(&json).unwrap();
         assert_eq!(&back, inspection);
