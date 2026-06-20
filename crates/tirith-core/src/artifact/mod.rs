@@ -323,6 +323,12 @@ pub enum ArtifactSignalKind {
     PthUntrustedPathAddition,
     /// A startup hook's executable content is obfuscated.
     StartupHookObfuscated,
+    /// A startup hook could not be inspected (read refused: a symlinked or
+    /// non-regular final component, a permission-denied body, or an I/O error),
+    /// so its content is unknown rather than known-clean. Low confidence: this is
+    /// a coverage gap, not proof of execution, and does not on its own promote to
+    /// a Block.
+    StartupHookUninspectable,
     /// A RECORD entry's recorded hash does not match the file on disk.
     RecordHashMismatch,
     /// A file RECORD lists is missing from the install.

@@ -2494,11 +2494,24 @@ impl InstalledIntegrityReport {
         // execution. A `PthUntrustedPathAddition` alone (a non-executing path-add)
         // is recorded but does not by itself promote to Block.
         let has_executing_line = kinds.contains(&K::PthExecutableLine);
-        let has_danger = kinds.contains(&K::PthSubprocessSpawn)
-            || kinds.contains(&K::PthNetworkDownload)
-            || kinds.contains(&K::PthSysPathSearch)
-            || kinds.contains(&K::StartupHookObfuscated)
-            || kinds.contains(&K::PthUntrustedPathAddition);
+        // Danger is the SINGLE definition in `BodyCapabilities::has_danger()`
+        // (subprocess / network / dynamic-code / cross-runtime). Reconstruct the
+        // capabilities the recorded signal kinds imply and ask that one method, so
+        // this correlation cannot drift from the analyzer's definition (T3.16/T2.11).
+        // `sys.path` manipulation (`PthSysPathSearch`) and an untrusted path
+        // addition (`PthUntrustedPathAddition`) are EVIDENCE only: they stay in the
+        // signal stream but do not, on their own, satisfy the danger precondition,
+        // so a legitimate `sitecustomize` doing `sys.path.insert(...)` is not
+        // promoted to Block. (Cross-runtime is handled by its own Critical path
+        // below; dynamic-code has no standalone signal kind in this correlation.)
+        let body_caps = crate::artifact::pth::BodyCapabilities {
+            subprocess: kinds.contains(&K::PthSubprocessSpawn),
+            network: kinds.contains(&K::PthNetworkDownload),
+            sys_path_search: kinds.contains(&K::PthSysPathSearch),
+            obfuscated: kinds.contains(&K::StartupHookObfuscated),
+            ..Default::default()
+        };
+        let has_danger = body_caps.has_danger();
 
         if has_executing_line && has_danger {
             let kind_list = startup_distinct_kind_strings(&self.startup_signals);
@@ -2819,11 +2832,45 @@ fn analyze_startup_hook_body(
     kind: crate::artifact::pth::StartupHookKind,
     report: &mut InstalledIntegrityReport,
 ) {
-    use crate::artifact::{ExecutionEdge, ExecutionTrigger};
+    use crate::artifact::{
+        ArtifactSignal, ArtifactSignalKind, EdgeConfidence, ExecutionEdge, ExecutionTrigger,
+    };
     use crate::location::SubjectLocation;
+    use crate::util::OpenRegularError;
 
-    let Ok(bytes) = crate::util::read_text_no_follow_capped(path, MAX_STARTUP_HOOK_BYTES) else {
-        return;
+    let bytes = match crate::util::read_text_no_follow_capped(path, MAX_STARTUP_HOOK_BYTES) {
+        Ok(bytes) => bytes,
+        // A vanished file (a race between the directory walk and the read) is a
+        // benign coverage gap with no hook left to inspect: stay silent.
+        Err(OpenRegularError::NotFound) => return,
+        // A read that was REFUSED (a symlinked / non-regular final component that
+        // O_NOFOLLOW would not open, a body over the size cap, or a permission /
+        // I/O error) leaves an inventoried startup hook UNINSPECTED. Do not treat
+        // it as clean: record a Low-confidence "uninspectable startup hook" signal
+        // so the coverage gap is visible. This does not on its own promote to a
+        // Block (it is not a danger leg in `startup_correlated_findings`), but a
+        // planted symlink or a deliberately unreadable hook is no longer silent.
+        Err(err) => {
+            let reason = match err {
+                OpenRegularError::NotRegularFile => {
+                    "a symlinked or non-regular final component (read refused, not followed)"
+                }
+                OpenRegularError::TooLarge => "the body exceeds the inspection size cap",
+                OpenRegularError::Io(_) => "a permission or I/O error",
+                OpenRegularError::NotFound => unreachable!("NotFound handled above"),
+            };
+            report.startup_signals.push(ArtifactSignal {
+                kind: ArtifactSignalKind::StartupHookUninspectable,
+                location: SubjectLocation::installed(path.to_path_buf()),
+                evidence: format!(
+                    "{} startup hook could not be inspected ({reason}); its content is unknown, \
+                     not known-clean",
+                    kind.label()
+                ),
+                confidence: EdgeConfidence::Low,
+            });
+            return;
+        }
     };
     // A startup hook is text; decode lossily so a stray non-UTF-8 byte does not
     // drop the whole body (the analyzer is substring-based and tolerates it).
@@ -4871,5 +4918,135 @@ version = "1.0.61"
             "a clean env must produce no startup finding; got {rules:?}"
         );
         assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn sitecustomize_with_only_sys_path_insert_is_clean() {
+        // A legitimate sitecustomize whose ONLY action is a sys.path insert. It
+        // executes (module body) and records a `PthSysPathSearch` signal, but
+        // sys.path manipulation alone is NOT a danger leg (T3.16/T2.11), so it must
+        // NOT fire the suspicious finding. (The unowned-hook B5 integrity violation
+        // may still fire; that is a separate, expected signal.)
+        let dir = tempfile::tempdir().unwrap();
+        plant_startup_hook(
+            dir.path(),
+            "sitecustomize.py",
+            b"import sys; sys.path.insert(0, \"/opt/app/plugins\")\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        // The sys.path search IS recorded as evidence.
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::PthSysPathSearch
+            )),
+            "the sys.path.insert must still record a PthSysPathSearch signal"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "sys.path manipulation alone must not fire the suspicious finding; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_correlation_uses_single_danger_definition() {
+        use crate::artifact::{ArtifactSignal, ArtifactSignalKind as K, EdgeConfidence};
+        use crate::location::SubjectLocation;
+
+        let loc = SubjectLocation::installed("/venv/lib/site-packages/x.pth");
+        let sig = |kind: K| ArtifactSignal {
+            kind,
+            location: loc.clone(),
+            evidence: "test".to_string(),
+            confidence: EdgeConfidence::High,
+        };
+
+        // An executing line PLUS only sys.path-search / untrusted-path signals: the
+        // correlation must agree with `BodyCapabilities::has_danger()` (which counts
+        // neither as danger), so NO suspicious finding.
+        let report = InstalledIntegrityReport {
+            startup_signals: vec![
+                sig(K::PthExecutableLine),
+                sig(K::PthSysPathSearch),
+                sig(K::PthUntrustedPathAddition),
+            ],
+            ..Default::default()
+        };
+        let no_danger_caps = crate::artifact::pth::BodyCapabilities {
+            sys_path_search: true,
+            ..Default::default()
+        };
+        assert!(
+            !no_danger_caps.has_danger(),
+            "sys.path search alone is not danger in the single definition"
+        );
+        let findings = report.startup_correlated_findings();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PythonStartupHookSuspicious),
+            "the correlation must agree with has_danger(): sys.path/untrusted-path \
+             alone is not danger; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+
+        // An executing line PLUS a real subprocess capability: both the single
+        // definition and the correlation must treat this as danger -> suspicious.
+        let report = InstalledIntegrityReport {
+            startup_signals: vec![sig(K::PthExecutableLine), sig(K::PthSubprocessSpawn)],
+            ..Default::default()
+        };
+        let danger_caps = crate::artifact::pth::BodyCapabilities {
+            subprocess: true,
+            ..Default::default()
+        };
+        assert!(danger_caps.has_danger(), "a subprocess spawn is danger");
+        let findings = report.startup_correlated_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PythonStartupHookSuspicious),
+            "an executing line + subprocess capability must still fire suspicious; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_startup_hook_emits_signal() {
+        use std::os::unix::fs::symlink;
+
+        // A `.pth` planted as a SYMLINK at the final component. The no-follow read
+        // (O_NOFOLLOW) refuses it as a non-regular file, so the body cannot be
+        // inspected. It must NOT be treated as clean: a Low-confidence
+        // `StartupHookUninspectable` signal must be recorded (T3.18). Before the
+        // fix the read error returned silently with no signal.
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "base",
+            "1.0",
+            &[("base/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // Symlink target need not exist: O_NOFOLLOW refuses the link itself.
+        symlink("/nonexistent/payload.txt", site.join("planted.pth")).unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::StartupHookUninspectable
+            )),
+            "a symlinked (unreadable) startup hook must emit the uninspectable signal; got {:?}",
+            integrity
+                .startup_signals
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        );
     }
 }

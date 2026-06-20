@@ -25,10 +25,13 @@
 //!
 //! # Python 3.15 `.start` entry-point files
 //!
-//! `.start` files (PEP 791) name an entry point that runs at interpreter start. A
-//! matching `.start` can SUPPRESS a `.pth` `import` line of the same stem, but the
-//! `.start` callable still executes, so a `.start` is analyzed as a startup hook
-//! in its own right ([`crate::artifact::ExecutionTrigger::PythonStartupEntryPoint`]).
+//! A Python interpreter startup entry-point (`.start`) file names an entry point
+//! that runs at interpreter start. A matching `.start` can SUPPRESS a `.pth`
+//! `import` line of the same stem, but the `.start` callable still executes, so a
+//! `.start` is analyzed as a startup hook in its own right
+//! ([`crate::artifact::ExecutionTrigger::PythonStartupEntryPoint`]). Because that
+//! callable always runs (its body is executable code, not a `.pth`-style path
+//! list), the body capability scan treats a `.start` like a whole-module hook.
 //!
 //! # Benign-template safety
 //!
@@ -80,7 +83,7 @@ impl StartupHookKind {
     }
 
     /// A short human label for evidence strings.
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             StartupHookKind::Pth => ".pth",
             StartupHookKind::Start => ".start",
@@ -678,12 +681,19 @@ pub fn analyze_body(
         }
     }
 
-    // For a sitecustomize whole-module body there may be no `import`-prefixed line
-    // at all (module code runs regardless), yet the body can still carry a danger
-    // capability at module scope. If the body executes (sitecustomize/usercustomize
-    // always do) and carries a capability but produced no per-line executable
-    // signal, record a body-level executable signal so correlation sees it.
-    let module_always_executes = matches!(kind, StartupHookKind::SiteCustomize);
+    // For a body whose code runs in full regardless of any `import`-prefixed line
+    // there may be no per-line executable signal, yet the body can still carry a
+    // danger capability at module scope. A `sitecustomize.py`/`usercustomize.py`
+    // module always runs; a `.start` names an entry-point callable that ALWAYS
+    // executes at interpreter start (its body is not a `.pth`-style path list, so a
+    // bare `os.system(...)` line in it is real executing code, not a path-add). For
+    // both, if the body carries a capability but produced no per-line executable
+    // signal, record a body-level executable signal so correlation sees it. A
+    // plain `.pth` is excluded: only its `import`-prefixed lines execute.
+    let module_always_executes = matches!(
+        kind,
+        StartupHookKind::SiteCustomize | StartupHookKind::Start
+    );
     let has_line_exec_signal = signals
         .iter()
         .any(|s| s.kind == ArtifactSignalKind::PthExecutableLine);
@@ -1060,6 +1070,27 @@ mod tests {
             "a sitecustomize module that executes must fire; got {kinds:?}"
         );
         assert!(kinds.contains(&ArtifactSignalKind::PthSubprocessSpawn));
+    }
+
+    #[test]
+    fn dot_start_body_with_os_system_fires_subprocess_signal() {
+        // A `.start` entry-point body whose callable runs `os.system(...)`. The
+        // line is NOT `import `-prefixed, so the per-line classifier sees a
+        // `PathAdd`; but a `.start` callable ALWAYS executes at interpreter start,
+        // so the body must be analyzed as executing and its subprocess capability
+        // must surface. Before the fix, `module_always_executes` covered only
+        // SiteCustomize, so `body_executes` was false and the capability block was
+        // skipped, leaving a `.start` with `os.system` silently clean.
+        let body = "os.system(\"curl http://x\")\n";
+        let analysis = analyze_body(body, &loc(), StartupHookKind::Start);
+        let kinds = distinct_kinds(&analysis.signals);
+        assert!(
+            kinds.contains(&ArtifactSignalKind::PthSubprocessSpawn),
+            "a .start body that spawns a subprocess must fire PthSubprocessSpawn; got {kinds:?}"
+        );
+        // The embedded http:// URL also makes it a network capability, and the
+        // body-level executable signal records that the hook executes.
+        assert!(kinds.contains(&ArtifactSignalKind::PthExecutableLine));
     }
 
     #[test]
