@@ -40,6 +40,9 @@ const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
 /// Sanity cap on a v2 index asset's declared `size`, mirroring [`MAX_DB_SIZE`].
 /// An asset claiming more than this is rejected before any download.
 const MAX_INDEX_ASSET_SIZE: u64 = MAX_DB_SIZE;
+/// The highest v2-index manifest_version this build understands; a newer one is
+/// rejected (fail-closed) so an old client falls back to v1 rather than misread it.
+const MAX_MANIFEST_VERSION: u64 = 1;
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -116,7 +119,9 @@ impl Manifest {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IndexAsset {
     format: u32,
-    #[allow(dead_code)] // filename is informational; the explicit `url` is authoritative
+    // `filename` is part of the signed canonical payload (see `canonical_payload`),
+    // so it is load-bearing for signature verification. The explicit `url` is
+    // authoritative only for where the asset is downloaded from.
     filename: String,
     url: String,
     sha256: String,
@@ -132,8 +137,9 @@ struct IndexAsset {
 /// and discipline apply. Old clients never fetch this and only ever see v1.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IndexV2 {
+    /// The index schema version. verify_signature rejects a value newer than
+    /// MAX_MANIFEST_VERSION (fail-closed); excluded from the signed canonical_payload.
     #[serde(default)]
-    #[allow(dead_code)] // schema version tolerated for forward-compat
     manifest_version: u64,
     sequence: u64,
     assets: Vec<IndexAsset>,
@@ -171,8 +177,20 @@ impl IndexV2 {
         serde_json::Value::Object(top).to_string()
     }
 
-    /// Verify the index's top-level Ed25519 signature against the pinned key.
+    /// Verify the index's top-level Ed25519 signature against the pinned key, and
+    /// reject a manifest_version newer than this build understands. The
+    /// manifest_version is NOT covered by the signature (it is excluded from
+    /// `canonical_payload`), so an attacker cannot use it to bypass verification,
+    /// but a legitimately newer publisher schema must make an old client fall back
+    /// to v1 rather than misread the index.
     fn verify_signature(&self) -> Result<(), String> {
+        if self.manifest_version > MAX_MANIFEST_VERSION {
+            return Err(format!(
+                "v2 index manifest_version {} is newer than this build supports (max {}); falling back to v1",
+                self.manifest_version, MAX_MANIFEST_VERSION
+            ));
+        }
+
         let sig_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.signature)
                 .map_err(|e| format!("invalid v2 index signature encoding: {e}"))?;
@@ -198,10 +216,13 @@ impl IndexV2 {
     /// whose `min_tirith_version` is absent or `<=` the running Tirith version,
     /// and whose declared `size` is within the sanity cap. The asset SHA-256 is
     /// verified separately, after download. Returns `None` when no asset is
-    /// compatible (the caller then falls back to legacy v1).
+    /// compatible, or when two or more compatible assets share the highest format
+    /// (an ambiguous index): in both cases the caller falls back to legacy v1
+    /// rather than picking an asset arbitrarily.
     fn select_asset(&self, current_version: &str) -> Option<&IndexAsset> {
         let current = SemVer::parse(current_version);
-        self.assets
+        let mut compatible = self
+            .assets
             .iter()
             .filter(|a| a.format <= MAX_FORMAT_VERSION)
             .filter(|a| a.size <= MAX_INDEX_ASSET_SIZE)
@@ -214,8 +235,25 @@ impl IndexV2 {
                     // never install an asset whose floor we cannot evaluate).
                     _ => false,
                 },
-            })
-            .max_by_key(|a| a.format)
+            });
+        let best = compatible.next()?;
+        // Find the highest format among the compatible assets, tracking whether
+        // any two share that top format. A tie at the top is ambiguous: the
+        // top-level signature covers the whole array, so this is not a forgery
+        // vector, but silently keeping one would be arbitrary. Return None so the
+        // caller falls back to the legacy v1 manifest instead.
+        let (top, top_count) = compatible.fold((best, 1usize), |(top, count), a| {
+            use std::cmp::Ordering;
+            match a.format.cmp(&top.format) {
+                Ordering::Greater => (a, 1),
+                Ordering::Equal => (top, count + 1),
+                Ordering::Less => (top, count),
+            }
+        });
+        if top_count > 1 {
+            return None;
+        }
+        Some(top)
     }
 }
 
@@ -2644,6 +2682,132 @@ mod tests {
     }
 
     #[test]
+    fn index_asset_filename_is_in_signed_canonical_payload() {
+        // `filename` is not dead code: it is part of the canonical payload that
+        // gets signed, so tampering with it must change what is verified. Build an
+        // index with a known filename and assert the canonical payload carries it.
+        let key = SigningKey::from_bytes(&[4u8; 32]);
+        let mut a = asset(2, None);
+        a.filename = "tirith-threatdb-known-name.dat".to_string();
+        let idx = signed_index_v2(1, vec![a], &key);
+        let payload = idx.canonical_payload();
+        assert!(
+            payload.contains(r#""filename":"tirith-threatdb-known-name.dat""#),
+            "filename must appear in the signed canonical payload: {payload}"
+        );
+    }
+
+    #[test]
+    fn canonical_payload_keys_sorted_and_signature_excluded() {
+        // Drift guard for the SIGNED contract. `canonical_payload` builds the
+        // canonical JSON by hand; a v2 client recomputes it to verify a published
+        // index, and the DB-D workflow signs the byte-identical `jq -cS` form. If
+        // the hand-built bytes ever drift from a canonically-sorted serialization,
+        // v2 silently disables (clients fall back to v1). Re-derive the canonical
+        // form a DIFFERENT way (serialize the struct minus the signature to a
+        // Value, sort every object's keys, emit compact) and assert byte-equality
+        // with `canonical_payload`, so any future drift fails this test.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let idx = signed_index_v2(42, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+
+        // Independent re-derivation via a different construction path than
+        // `canonical_payload`: build a `Value` from the struct fields with the
+        // `json!` macro (deliberately NOT in alphabetical order, and NOT including
+        // the signature), recursively sort every object's keys, then emit compact.
+        // `IndexV2` derives only `Deserialize`, so we hand-build the Value rather
+        // than `serde_json::to_value`; the point is an alternate path, not reuse.
+        let assets: Vec<serde_json::Value> = idx
+            .assets
+            .iter()
+            .map(|a| {
+                // Intentionally reverse-alphabetical insertion so the sort step,
+                // not the insertion order, is what produces the canonical form.
+                let mut m = serde_json::json!({
+                    "url": a.url,
+                    "size": a.size,
+                    "sha256": a.sha256,
+                    "format": a.format,
+                    "filename": a.filename,
+                });
+                if let Some(ref v) = a.min_tirith_version {
+                    m.as_object_mut()
+                        .unwrap()
+                        .insert("min_tirith_version".to_string(), serde_json::json!(v));
+                }
+                m
+            })
+            .collect();
+        let value = serde_json::json!({
+            "sequence": idx.sequence,
+            "assets": assets,
+        });
+        let sorted = sort_json_keys(&value);
+        let independent = serde_json::to_string(&sorted).unwrap();
+
+        assert_eq!(
+            idx.canonical_payload(),
+            independent,
+            "canonical_payload must equal an independently sorted, signature-free serialization"
+        );
+
+        // Every object in the independent form has its keys sorted at every level.
+        assert_json_object_keys_sorted(&sorted);
+        assert!(!independent.contains("signature"), "signature excluded");
+
+        // The canonical payload is valid JSON and round-trips back to the same
+        // assets and sequence (the signed fields survive a parse).
+        let reparsed: serde_json::Value = serde_json::from_str(&idx.canonical_payload()).unwrap();
+        assert_eq!(reparsed["sequence"], serde_json::json!(idx.sequence));
+        assert_eq!(
+            reparsed["assets"].as_array().unwrap().len(),
+            idx.assets.len()
+        );
+    }
+
+    /// Recursively return a copy of `v` with every JSON object's keys sorted.
+    /// `serde_json::Map` is backed by a `BTreeMap` by default, so reinserting into
+    /// a fresh map yields sorted keys; this re-derivation does not depend on the
+    /// hand-written insertion order in `canonical_payload`.
+    fn sort_json_keys(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for k in keys {
+                    sorted.insert(k.clone(), sort_json_keys(&map[k]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Assert every JSON object in `v` (recursively) has keys in sorted order.
+    fn assert_json_object_keys_sorted(v: &serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let keys: Vec<&String> = map.keys().collect();
+                let mut expected = keys.clone();
+                expected.sort();
+                assert_eq!(keys, expected, "object keys must be sorted: {map:?}");
+                for val in map.values() {
+                    assert_json_object_keys_sorted(val);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for val in arr {
+                    assert_json_object_keys_sorted(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
     fn index_v2_signature_roundtrips_against_signer() {
         // Verify the canonical payload against the signing key directly (the
         // embedded production key is a placeholder in tests).
@@ -2665,6 +2829,37 @@ mod tests {
             .verifying_key()
             .verify(tampered.canonical_payload().as_bytes(), &signature)
             .is_err());
+    }
+
+    #[test]
+    fn verify_signature_rejects_unknown_manifest_version() {
+        // A future manifest_version (3 > MAX_MANIFEST_VERSION) must be rejected
+        // fail-closed, even though the field is excluded from canonical_payload
+        // (and thus not covered by the signature). An old client must fall back
+        // to v1 rather than silently accept a schema it predates. Sign the index
+        // with a valid test key so the ONLY thing that can make verify fail is the
+        // manifest_version gate, then flip it to 3 and confirm the error.
+        let key = SigningKey::from_bytes(&[6u8; 32]);
+        let mut idx = signed_index_v2(7, vec![asset(2, None)], &key);
+        assert!(idx.manifest_version <= MAX_MANIFEST_VERSION);
+        idx.manifest_version = 3;
+        let err = idx
+            .verify_signature()
+            .expect_err("an unknown manifest_version must be rejected");
+        assert!(
+            err.contains("manifest_version"),
+            "error must name manifest_version, got: {err}"
+        );
+
+        // The exact supported version still passes the gate (it then proceeds to
+        // the signature check, which succeeds against the embedded key only in
+        // production; here it suffices that the gate itself does not reject it).
+        idx.manifest_version = MAX_MANIFEST_VERSION;
+        let err = idx.verify_signature().unwrap_err();
+        assert!(
+            !err.contains("manifest_version"),
+            "the supported manifest_version must pass the version gate, got: {err}"
+        );
     }
 
     #[test]
@@ -2742,6 +2937,34 @@ mod tests {
         );
         let chosen = idx.select_asset("0.3.3").expect("v1 compatible");
         assert_eq!(chosen.format, 1);
+    }
+
+    #[test]
+    fn select_asset_rejects_duplicate_format() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // Two compatible assets share the highest format (2). The index is
+        // ambiguous, so selection returns None and the caller falls back to the
+        // legacy v1 manifest rather than picking one of the two arbitrarily.
+        let mut second = asset(2, None);
+        second.url = "https://example.com/db-v2-alt.dat".to_string();
+        let idx = signed_index_v2(1, vec![asset(2, None), second], &key);
+        assert!(
+            idx.select_asset("9.9.9").is_none(),
+            "an ambiguous index with two top-format assets must select nothing"
+        );
+
+        // A lower-format duplicate does not block a single unambiguous top: with
+        // two format-1 assets and one format-2, the format-2 still wins.
+        let idx = signed_index_v2(
+            1,
+            vec![asset(1, None), asset(1, None), asset(2, None)],
+            &key,
+        );
+        assert_eq!(
+            idx.select_asset("9.9.9").map(|a| a.format),
+            Some(2),
+            "a duplicate below the top format must not block the unambiguous top"
+        );
     }
 
     #[test]
