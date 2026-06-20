@@ -40,9 +40,6 @@ const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
 /// Sanity cap on a v2 index asset's declared `size`, mirroring [`MAX_DB_SIZE`].
 /// An asset claiming more than this is rejected before any download.
 const MAX_INDEX_ASSET_SIZE: u64 = MAX_DB_SIZE;
-/// The highest v2-index manifest_version this build understands; a newer one is
-/// rejected (fail-closed) so an old client falls back to v1 rather than misread it.
-const MAX_MANIFEST_VERSION: u64 = 1;
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -137,13 +134,30 @@ struct IndexAsset {
 /// and discipline apply. Old clients never fetch this and only ever see v1.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IndexV2 {
-    /// The index schema version. verify_signature rejects a value newer than
-    /// MAX_MANIFEST_VERSION (fail-closed); excluded from the signed canonical_payload.
-    #[serde(default)]
+    // Read in `verify_signature` to fail-closed on a schema we don't understand:
+    // a future `manifest_version` (e.g. 3) is rejected so an old client never
+    // silently accepts an index shape it cannot reason about, and falls back to
+    // v1 instead. Excluded from `canonical_payload`, so it is NOT covered by the
+    // signature; rejecting it here is a parse/shape gate, not an authenticity one.
+    #[serde(default = "default_manifest_version")]
     manifest_version: u64,
     sequence: u64,
     assets: Vec<IndexAsset>,
     signature: String,
+}
+
+/// Highest `manifest_version` of the v2 index this build understands. A higher
+/// value means the publisher moved to a schema this client predates; the client
+/// rejects it and falls back to the legacy v1 manifest. Bump this in lockstep
+/// with any change to the published index shape.
+const MAX_MANIFEST_VERSION: u64 = 1;
+
+/// Default `manifest_version` when the field is absent. The first published v2
+/// indexes always carry `manifest_version: 1`, but an absent field is treated as
+/// 1 (the original schema) rather than 0 so a hand-rolled or legacy index without
+/// the key is still accepted.
+fn default_manifest_version() -> u64 {
+    1
 }
 
 impl IndexV2 {
@@ -177,12 +191,12 @@ impl IndexV2 {
         serde_json::Value::Object(top).to_string()
     }
 
-    /// Verify the index's top-level Ed25519 signature against the pinned key, and
-    /// reject a manifest_version newer than this build understands. The
-    /// manifest_version is NOT covered by the signature (it is excluded from
-    /// `canonical_payload`), so an attacker cannot use it to bypass verification,
-    /// but a legitimately newer publisher schema must make an old client fall back
-    /// to v1 rather than misread the index.
+    /// Verify the index's top-level Ed25519 signature against the pinned key,
+    /// after rejecting any `manifest_version` newer than this build understands.
+    /// The version check is fail-closed and runs FIRST: it is not covered by the
+    /// signature (it is excluded from `canonical_payload`), so an attacker cannot
+    /// use it to bypass verification, but a legitimately newer publisher schema
+    /// must make an old client fall back to v1 rather than misread the index.
     fn verify_signature(&self) -> Result<(), String> {
         if self.manifest_version > MAX_MANIFEST_VERSION {
             return Err(format!(
@@ -3089,6 +3103,16 @@ mod tests {
             .verifying_key()
             .verify(index.canonical_payload().as_bytes(), &sig)
             .is_ok());
+
+        // Tamper-negative: the same signature must NOT verify over a one-byte-
+        // mutated payload, proving the byte-equality above is load-bearing for
+        // authenticity and not just an incidental string match.
+        let mut tampered = WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN.as_bytes().to_vec();
+        tampered[0] ^= 0x01;
+        assert!(
+            key.verifying_key().verify(&tampered, &sig).is_err(),
+            "signature must not verify over a mutated payload"
+        );
     }
 
     #[test]
@@ -3114,6 +3138,43 @@ mod tests {
             .verifying_key()
             .verify(index.canonical_payload().as_bytes(), &sig)
             .is_ok());
+    }
+
+    #[test]
+    fn canonical_payload_large_sequence_round_trips_losslessly() {
+        // The workflow signs `--argjson sequence ${RUN_ID}` and the client field
+        // is u64, but jq numbers are IEEE-754 f64, so a RUN_ID > 2^53 would lose
+        // precision on the SIGNING side (jq), even though the client side here is
+        // exact. This documents the u64 client boundary: a sequence above 2^53
+        // must round-trip losslessly through canonical_payload() and a re-parse.
+        // GitHub run IDs are nowhere near 2^53 today, so this is a guard against a
+        // future ID-space change, not a live bug; if jq's f64 ever feeds such a
+        // value the signed bytes (not this client) would be wrong, and the v2
+        // index would simply fail to verify and fall back to v1.
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1, not representable in f64
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let idx = signed_index_v2(big, vec![asset(2, None)], &key);
+
+        // The canonical payload carries the exact integer literal (no f64 rounding,
+        // no scientific notation): serde_json emits u64 as an exact integer.
+        let payload = idx.canonical_payload();
+        assert!(
+            payload.contains(&format!("\"sequence\":{big}")),
+            "sequence must serialize as the exact u64 literal, got: {payload}"
+        );
+
+        // Re-parsing the canonical payload yields the same u64 with no loss.
+        let reparsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            reparsed["sequence"].as_u64(),
+            Some(big),
+            "sequence must round-trip losslessly as u64"
+        );
+
+        // And parsing a full IndexV2 (the wire path) preserves it too.
+        let published = published_index_json(&payload, &idx.signature);
+        let parsed: IndexV2 = serde_json::from_str(&published).unwrap();
+        assert_eq!(parsed.sequence, big, "wire round-trip must preserve u64");
     }
 
     /// Check whether the next-check-at file indicates the update is not yet due.
