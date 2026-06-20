@@ -299,32 +299,43 @@ pub fn verify_wheel_record(
                                 member: member.to_string(),
                             });
                     }
-                    Some(hash) => {
+                    Some(hash) if hash.algorithm == "sha256" => {
                         // Compare the recorded digest to the member's actual
                         // SHA-256 (A4 computed it). Only sha256 is directly
-                        // comparable to the inspection's hex; a stronger algorithm
-                        // is accepted as strong but not re-hashed here (A4 only
-                        // produced sha256), so we compare only when sha256.
-                        if hash.algorithm == "sha256" {
-                            let actual_hex = &file.sha256;
-                            let recorded_hex = hex_of(&hash.digest);
-                            if &recorded_hex != actual_hex {
-                                result.violations.push(WheelRecordViolation::HashMismatch {
-                                    member: member.to_string(),
-                                    recorded: recorded_hex.clone(),
-                                    actual: actual_hex.clone(),
-                                });
-                                result.signals.push(signal(
-                                    ArtifactSignalKind::RecordHashMismatch,
-                                    member_location(outer.as_deref(), member),
-                                    format!(
-                                        "wheel member '{member}' RECORD hash {recorded_hex} \
-                                         != actual {actual_hex}"
-                                    ),
-                                    EdgeConfidence::High,
-                                ));
-                            }
+                        // comparable to the inspection's hex.
+                        let actual_hex = &file.sha256;
+                        let recorded_hex = hex_of(&hash.digest);
+                        if &recorded_hex != actual_hex {
+                            result.violations.push(WheelRecordViolation::HashMismatch {
+                                member: member.to_string(),
+                                recorded: recorded_hex.clone(),
+                                actual: actual_hex.clone(),
+                            });
+                            result.signals.push(signal(
+                                ArtifactSignalKind::RecordHashMismatch,
+                                member_location(outer.as_deref(), member),
+                                format!(
+                                    "wheel member '{member}' RECORD hash {recorded_hex} \
+                                     != actual {actual_hex}"
+                                ),
+                                EdgeConfidence::High,
+                            ));
                         }
+                    }
+                    Some(_) => {
+                        // A strong hash in an algorithm OTHER than sha256
+                        // (sha512/sha384/sha3_*). A4 only computed sha256 for the
+                        // member, so this tool cannot recompute the recorded digest
+                        // to confirm or refute it. Accepting it on the strength of
+                        // the label alone would let a fabricated
+                        // `member,sha512=<bogus>,size` row clear STRICT verification
+                        // with no comparison. Under strict wheel verification an
+                        // UNVERIFIABLE member is a violation, not silent acceptance.
+                        result
+                            .violations
+                            .push(WheelRecordViolation::WeakOrMissingHash {
+                                member: member.to_string(),
+                            });
                     }
                 }
             }
@@ -601,12 +612,23 @@ pub fn verify_installed_record(
                 FileVerification::OutOfEnvironment
             }
             ResolvedPath::OutOfEnvironment => {
-                // Scheme escape permitted: verify the absolute path as-is.
-                verify_one_file(&PathBuf::from(entry.path.replace('\\', "/")), entry)
+                // Scheme escape permitted, but ONLY into a legitimate scheme root
+                // (scripts/data/headers/prefix). An absolute RECORD path that does
+                // not canonicalize under any scheme root stays OutOfEnvironment;
+                // the flag does not license reading arbitrary absolute paths.
+                let abs = PathBuf::from(entry.path.replace('\\', "/"));
+                if path_within_scheme_roots(&abs, layout) {
+                    verify_one_file(&abs, entry)
+                } else {
+                    FileVerification::OutOfEnvironment
+                }
             }
             ResolvedPath::InEnvironment(path) => {
-                // Defense in depth: confirm the resolved path is genuinely inside
-                // the (canonical) environment before touching disk.
+                // Confirm the resolved path canonicalizes to a real location inside
+                // the (canonical) environment BEFORE touching disk. This resolves
+                // through every intermediate directory, so an in-tree symlink whose
+                // target escapes the environment (e.g. `site/legitdir -> /etc`) is
+                // rejected here rather than followed out of the tree.
                 if path_is_within(&path, &canonical_site, layout) {
                     verify_one_file(&path, entry)
                 } else {
@@ -743,46 +765,62 @@ fn resolve_installed_path(raw: &str, layout: &EnvironmentLayout) -> ResolvedPath
     }
 }
 
-/// Whether a resolved path is genuinely within the environment, canonicalizing
-/// the PARENT (the file may be missing) so an intermediate symlink escape is
-/// caught. Falls back to a prefix check on the lexical path when canonicalization
-/// is not possible (a missing parent), which is the conservative outcome.
+/// Whether a resolved path is genuinely within the environment, by REAL
+/// filesystem location and never by lexical spelling. The path's parent is
+/// canonicalized through every intermediate directory and the final component
+/// re-attached (so a not-yet-created file is still checked), then containment is
+/// confirmed against the canonical site root or any canonical scheme root.
+///
+/// This deliberately has NO lexical fast path: a RECORD entry like `legitdir/x`
+/// where `site/legitdir` is a symlink to `/etc` would lexically start inside the
+/// site root, yet its real location is outside the environment. Routing through
+/// [`crate::util::canonical_within`] (which is fail-closed on any
+/// canonicalization error) resolves that symlink and rejects the escape, holding
+/// the module's documented guarantee that it never reads a path OUT of the
+/// environment.
 fn path_is_within(path: &Path, canonical_site: &Path, layout: &EnvironmentLayout) -> bool {
-    // Lexical fast path: a path that lexically starts inside a known root AND has
-    // no `..` segment is in-environment without touching disk.
-    let has_dotdot = path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    if !has_dotdot && (path.starts_with(canonical_site) || layout.contains(path)) {
-        return true;
-    }
-    // Otherwise canonicalize the parent and re-check (catches `..` and symlinks).
-    if let Some(parent) = path.parent() {
-        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
-            return canon_parent.starts_with(canonical_site)
-                || layout.scheme_roots.iter().any(|r| {
-                    std::fs::canonicalize(r)
-                        .map(|cr| canon_parent.starts_with(cr))
-                        .unwrap_or(false)
-                });
-        }
-    }
-    false
+    crate::util::canonical_within(path, canonical_site)
+        || layout
+            .scheme_roots
+            .iter()
+            .any(|r| crate::util::canonical_within(path, r))
 }
 
-/// Verify one in-environment file against its RECORD entry. Empty hash/size makes
-/// it [`FileVerification::Unverifiable`]; a present strong hash is compared to the
-/// file's actual SHA-256.
+/// Whether an absolute RECORD path's REAL location lies under one of the layout's
+/// scheme roots (scripts/data/headers/prefix). Used only on the
+/// `allow_scheme_escape` path: the flag permits resolving a path that legitimately
+/// names a scheme directory, NOT reading an arbitrary absolute path. A path under
+/// no scheme root stays out-of-environment. Canonicalizes through intermediate
+/// directories (fail-closed) so an in-tree symlink cannot smuggle an escape past
+/// the scheme-root check either.
+fn path_within_scheme_roots(path: &Path, layout: &EnvironmentLayout) -> bool {
+    layout
+        .scheme_roots
+        .iter()
+        .any(|r| crate::util::canonical_within(path, r))
+}
+
+/// Verify one in-environment file against its RECORD entry. A present, usable
+/// (sha256) hash is ALWAYS compared to the file's actual SHA-256, even when the
+/// size column is empty: a hash is the real integrity check, and an empty size is
+/// tolerated by the spec, so a valid hash must not be skipped just because size is
+/// blank. Only when no usable hash is available does an empty hash or size column
+/// make the entry [`FileVerification::Unverifiable`].
 fn verify_one_file(path: &Path, entry: &RecordEntry) -> FileVerification {
-    // An empty size column is tolerated as unverifiable per the spec.
-    if entry.size.is_none() {
-        return FileVerification::Unverifiable {
-            reason: UnverifiableReason::EmptySize,
-        };
-    }
+    // Prefer the hash. A sha256 hash is comparable; an empty size column does NOT
+    // suppress it (that was a bug: a valid hash with a blank size was never
+    // checked). A non-sha256 algorithm or an absent hash falls through to the
+    // unverifiable classification below.
     let Some(hash) = &entry.hash else {
+        // No hash to compare. With no size either, the row carries no verifiable
+        // data at all; report the empty-size reason when size is also blank, else
+        // the empty-hash reason.
         return FileVerification::Unverifiable {
-            reason: UnverifiableReason::EmptyHash,
+            reason: if entry.size.is_none() {
+                UnverifiableReason::EmptySize
+            } else {
+                UnverifiableReason::EmptyHash
+            },
         };
     };
     if hash.algorithm != "sha256" {
@@ -1059,6 +1097,46 @@ mod tests {
             .any(|v| matches!(v, WheelRecordViolation::WeakOrMissingHash { .. })));
     }
 
+    #[test]
+    fn wheel_record_sha512_fabricated_hash_is_rejected() {
+        // A RECORD row whose hash is a STRONG-but-non-sha256 algorithm (sha512)
+        // cannot be recompared by this tool (A4 only produced sha256), so an
+        // attacker could fabricate the digest. Strict verification must treat it
+        // as a violation, never accept it by silence.
+        let outer = "demo-1.0-py3-none-any.whl";
+        let body = b"honest bytes";
+        let mut inspection = ArtifactInspection::new(wheel_subject(outer));
+        inspection.files.push(member_file(
+            outer,
+            "demo/mod.py",
+            body,
+            ArtifactFileKind::PythonSource,
+        ));
+        // A 64-byte (sha512-length, so `is_strong()`) but entirely fabricated
+        // digest, labeled sha512. The real bytes are never hashed with sha512.
+        let record = vec![RecordEntry {
+            path: "demo/mod.py".to_string(),
+            hash: Some(RecordHash {
+                algorithm: "sha512".to_string(),
+                digest: vec![0xabu8; 64],
+            }),
+            size: Some(body.len() as u64),
+        }];
+        let result = verify_wheel_record(&inspection, Some(&record));
+        assert!(
+            !result.is_clean(),
+            "a fabricated sha512 hash must not clear strict verification"
+        );
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| matches!(v, WheelRecordViolation::WeakOrMissingHash { .. })),
+            "an unverifiable strong-non-sha256 hash is a violation: {:?}",
+            result.violations
+        );
+    }
+
     // ---- installed RECORD: LAX ------------------------------------------------
 
     /// Build a minimal installed distribution under a fresh site-packages dir,
@@ -1293,6 +1371,177 @@ mod tests {
             result.entries[0].verification,
             FileVerification::OutOfEnvironment
         );
+    }
+
+    #[test]
+    fn verify_one_file_checks_valid_hash_when_size_empty() {
+        // A row with a VALID sha256 hash but an EMPTY size column must still be
+        // hash-verified (previously the empty size short-circuited to
+        // Unverifiable before the hash was ever compared).
+        let tmp = tempdir().unwrap();
+        let site = tmp.path();
+        let body = b"hashed but sizeless\n";
+        let dist_info = make_installed_dist(
+            site,
+            "demo",
+            "1.0",
+            &[("demo/mod.py", body)],
+            // Valid hash, empty size.
+            &[("demo/mod.py", Some(sha256_bytes(body)), None)],
+            &[],
+        );
+        let layout = EnvironmentLayout::for_site_packages(site);
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, false);
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == "demo/mod.py")
+            .unwrap();
+        assert_eq!(
+            entry.verification,
+            FileVerification::Verified,
+            "a valid hash must be checked even when the size column is empty"
+        );
+
+        // And the same row over TAMPERED bytes must be a mismatch, not silently
+        // unverifiable.
+        let tmp2 = tempdir().unwrap();
+        let site2 = tmp2.path();
+        let dist_info2 = make_installed_dist(
+            site2,
+            "demo",
+            "1.0",
+            &[("demo/mod.py", b"TAMPERED\n")],
+            &[("demo/mod.py", Some(sha256_bytes(body)), None)],
+            &[],
+        );
+        let d2 = dist("demo", &dist_info2);
+        let layout2 = EnvironmentLayout::for_site_packages(site2);
+        let result2 = verify_installed_record(&dist_info2, &layout2, &d2, false);
+        let entry2 = result2
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == "demo/mod.py")
+            .unwrap();
+        assert!(
+            matches!(entry2.verification, FileVerification::Mismatch { .. }),
+            "empty size must not suppress a hash mismatch: {:?}",
+            entry2.verification
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_path_via_in_tree_symlink_is_out_of_environment() {
+        use std::os::unix::fs::symlink;
+        // Plant an in-tree symlink `site/legitdir -> /etc`. A RECORD row
+        // `legitdir/passwd` lexically starts inside the site root, but its REAL
+        // location is /etc/passwd, OUT of the environment. The verifier must treat
+        // it as OutOfEnvironment and never read /etc/passwd.
+        let tmp = tempdir().unwrap();
+        let site = tmp.path();
+        let dist_info = site.join("demo-1.0.dist-info");
+        fs::create_dir_all(&dist_info).unwrap();
+        symlink("/etc", site.join("legitdir")).unwrap();
+        // A real (in-environment) control file to prove honest rows still verify.
+        let body = b"in env\n";
+        let good = site.join("demo/ok.py");
+        fs::create_dir_all(good.parent().unwrap()).unwrap();
+        fs::write(&good, body).unwrap();
+        let record = format!(
+            "legitdir/passwd,sha256={},10\ndemo/ok.py,sha256={},{}\n",
+            b64(&sha256_bytes(b"whatever")),
+            b64(&sha256_bytes(body)),
+            body.len()
+        );
+        fs::write(dist_info.join("RECORD"), record).unwrap();
+        let layout = EnvironmentLayout::for_site_packages(site);
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, false);
+
+        let escaped = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == "legitdir/passwd")
+            .unwrap();
+        assert_eq!(
+            escaped.verification,
+            FileVerification::OutOfEnvironment,
+            "an in-tree symlink whose target escapes the environment must not be followed"
+        );
+        // The escaped row must NOT have been read: no mismatch/missing signal, and
+        // it is certainly not Verified (it would never match /etc/passwd anyway).
+        assert!(!matches!(escaped.verification, FileVerification::Verified));
+        // The honest in-environment row still verifies (the no-lexical-fast-path
+        // change did not break legitimate resolution).
+        let honest = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == "demo/ok.py")
+            .unwrap();
+        assert_eq!(honest.verification, FileVerification::Verified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheme_escape_only_reads_scheme_roots() {
+        // With allow_scheme_escape, an absolute RECORD path is verified ONLY when
+        // it canonicalizes under a declared scheme root. A path outside every
+        // scheme root stays OutOfEnvironment despite the flag.
+        let tmp = tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let scripts = tmp.path().join("scripts");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&site).unwrap();
+        fs::create_dir_all(&scripts).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // A legitimate scheme file (inside `scripts`) and an out-of-scheme file.
+        let in_scheme_body = b"#!/bin/sh\necho hi\n";
+        let in_scheme = scripts.join("demo-cli");
+        fs::write(&in_scheme, in_scheme_body).unwrap();
+        let evil = outside.join("evil.py");
+        fs::write(&evil, b"evil\n").unwrap();
+
+        let dist_info = site.join("demo-1.0.dist-info");
+        fs::create_dir_all(&dist_info).unwrap();
+        let record = format!(
+            "{},sha256={},{}\n{},sha256={},5\n",
+            in_scheme.display(),
+            b64(&sha256_bytes(in_scheme_body)),
+            in_scheme_body.len(),
+            evil.display(),
+            b64(&sha256_bytes(b"x")),
+        );
+        fs::write(dist_info.join("RECORD"), record).unwrap();
+
+        let layout = EnvironmentLayout {
+            site_packages: site.clone(),
+            scheme_roots: vec![scripts.clone()],
+        };
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, true);
+
+        // The out-of-scheme absolute path stays refused even with the flag set.
+        let evil_entry = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == evil.display().to_string())
+            .unwrap();
+        assert_eq!(
+            evil_entry.verification,
+            FileVerification::OutOfEnvironment,
+            "scheme escape must not license reading a path outside every scheme root"
+        );
+        // The legitimate scheme path IS verified (the flag still works for real
+        // scheme directories).
+        let scheme_entry = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == in_scheme.display().to_string())
+            .unwrap();
+        assert_eq!(scheme_entry.verification, FileVerification::Verified);
     }
 
     // ---- ownership index ------------------------------------------------------

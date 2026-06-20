@@ -281,6 +281,10 @@ pub enum RecordParseError {
     /// A row had the wrong number of columns (RECORD is always 3: path, hash,
     /// size).
     BadRow { row: usize, columns: usize },
+    /// A row had the three expected columns but an EMPTY path field. This is its
+    /// own error rather than a `BadRow { columns: 3 }`, which would falsely claim
+    /// a column-count problem on a row that has the right number of columns.
+    EmptyPath { row: usize },
     /// A hash field was present but not `<algorithm>=<base64url>` shaped, or the
     /// base64 digest did not decode.
     BadHash { row: usize, value: String },
@@ -294,6 +298,9 @@ impl std::fmt::Display for RecordParseError {
             RecordParseError::MalformedCsv(e) => write!(f, "malformed RECORD CSV: {e}"),
             RecordParseError::BadRow { row, columns } => {
                 write!(f, "RECORD row {row} has {columns} columns, expected 3")
+            }
+            RecordParseError::EmptyPath { row } => {
+                write!(f, "RECORD row {row} has an empty path field")
             }
             RecordParseError::BadHash { row, value } => {
                 write!(f, "RECORD row {row} has an unparseable hash '{value}'")
@@ -334,8 +341,9 @@ pub fn parse_record(text: &str) -> Result<Vec<RecordEntry>, RecordParseError> {
         }
         let path = record[0].to_string();
         if path.is_empty() {
-            // A row with no path is meaningless; treat as a bad row.
-            return Err(RecordParseError::BadRow { row, columns: 3 });
+            // A row with the right column count but no path is meaningless; report
+            // it as an empty-path row, not a (false) column-count error.
+            return Err(RecordParseError::EmptyPath { row });
         }
         let hash = parse_record_hash(&record[1]).map_err(|()| RecordParseError::BadHash {
             row,
@@ -506,6 +514,17 @@ mod tests {
         // Two columns instead of three is structural breakage.
         let err = parse_record("demo/x.py,sha256=AAAA\n").unwrap_err();
         assert!(matches!(err, RecordParseError::BadRow { columns: 2, .. }));
+    }
+
+    #[test]
+    fn parse_record_empty_path_is_empty_path_not_bad_row() {
+        // A row with three columns but an empty path must be reported as
+        // EmptyPath, NOT a (false) BadRow column-count error.
+        let err = parse_record(",sha256=AAAA,10\n").unwrap_err();
+        assert!(
+            matches!(err, RecordParseError::EmptyPath { row: 1 }),
+            "expected EmptyPath, got {err:?}"
+        );
     }
 
     #[test]
