@@ -29,7 +29,7 @@ the clients that cannot still have v1.
 These are implemented in DB-B and are what make the staged rollout safe:
 
 - **Range-accepting reader.** `from_bytes` accepts `MIN_SUPPORTED_FORMAT_VERSION (1)` through `FORMAT_VERSION (2)`. A v1 file loads with every v2 lookup returning `None` (behaves exactly like today); a v2 file loads on the new binary; an old (v1-only) binary rejects a v2 file and fails closed for that file.
-- **Per-format local cache filenames.** v1 keeps the canonical `tirith-threatdb.dat`; the new updater writes v2 to a distinct `tirith-threatdb-v2.dat` and never clobbers the v1 path. The loader prefers `tirith-threatdb-v2.dat` when present and parseable, else falls back to `tirith-threatdb.dat`. So a co-located old binary still reads its own v1 file and is never fail-opened by a shared cache. The same split applies to the supplemental DB.
+- **Per-format local cache filenames.** v1 keeps the canonical `tirith-threatdb.dat`; the new updater writes v2 to a distinct `tirith-threatdb-v2.dat` and never clobbers the v1 path. The loader prefers `tirith-threatdb-v2.dat` when present, parseable, and signature-valid (the primary resolver requires a valid signature, see the unsigned-v2 point below), else falls back to `tirith-threatdb.dat`. So a co-located old binary still reads its own v1 file and is never fail-opened by a shared cache. The same split applies to the supplemental DB.
 - **Dual manifests.** Old clients keep verifying the legacy single-asset `threatdb-manifest.json` (`{sha256,size,url,version}` + detached signature), which keeps pointing at v1. New clients read a separate signed multi-asset `threatdb-index-v2.json` and select the highest `format <= MAX_FORMAT_VERSION` whose `min_tirith_version` is satisfied and whose asset hash verifies, falling back to the legacy manifest on any failure. So an old client only ever sees v1.
 - **Signature and rollback preserved.** All v2 bytes (sections + descriptor trailer + the fixed EOF footer) live after `HEADER_SIZE`, so the existing Ed25519 signature and the rollback `build_sequence` cover them with no change to the signed range. A malformed v2 footer or trailer is rejected (`InvalidTrailer`), fail-closed for v2 data.
 - **Unsigned v2 cannot shadow a good v1.** The primary resolver requires a valid signature; the unsigned supplemental overlay does not. So a structurally-valid but unsigned or wrong-key v2 planted beside a good v1 cannot shadow the v1 and fail open.
@@ -56,10 +56,24 @@ payload (the same `jq -cS` discipline as the legacy manifest), and publishes bot
 the v2 asset and `threatdb-index-v2.json` alongside the unchanged v1 asset and
 legacy manifest.
 
-Rollback is cheap and does not require a client release: stop publishing (or
-revert) `threatdb-index-v2.json`. New clients then fail to fetch or verify the v2
-index and fall back to the legacy manifest and v1. The v1 asset and the legacy
-manifest are kept through the entire migration window, so v1 is always available.
+Rollback does not require a client release, but reverting the published files is
+not enough on its own: the release workflow runs on a daily cron and regenerates
+and re-publishes the v2 asset and `threatdb-index-v2.json` (and re-commits the
+index to main) on every run, so a manual revert is silently undone within a day.
+To roll back, FIRST disable v2 publishing, then remove the published artifacts:
+
+1. Set the repository variable `PUBLISH_V2` to `false` (Settings, then Secrets and
+   variables, then Actions, then Variables). DB-D gates the v2 generate, publish,
+   and commit steps on this variable, so the next cron run stops re-publishing.
+2. Delete the rolling-release v2 asset:
+   `gh release delete-asset threatdb-latest tirith-threatdb-v2-*.dat --repo <owner>/<repo>`.
+3. Revert `threatdb-index-v2.json` on main.
+
+New clients then fail to fetch or verify the v2 index and fall back to the legacy
+manifest and v1. The v1 asset and the legacy manifest are kept through the entire
+migration window, so v1 is always available. Until step 1, the next scheduled cron
+re-publishes v2, so the `PUBLISH_V2` gate (not the revert) is what actually holds
+the rollback.
 
 ## After both stacks merge: activate exact-hash blocking
 
