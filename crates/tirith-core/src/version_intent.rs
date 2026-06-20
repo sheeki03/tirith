@@ -87,15 +87,16 @@ impl VersionIntent {
             return VersionIntent::Unspecified;
         }
 
-        // A single `==<ver>` with a plain version (no wildcard, no extra
-        // clauses) is an exact pin.
+        // A single `==<ver>` (no wildcard, no extra clauses) is an exact pin,
+        // regardless of whether the version parses as a plain numeric release.
+        // The exact INTENT does not need a parseable version: the threat-DB
+        // match is a literal/numeric string compare, so a prerelease pin like
+        // `==1.0.0rc1` is still Exact (and would otherwise degrade to a
+        // Constraint and a mere Warn). This mirrors `from_explicit_version`,
+        // which already returns Exact for prerelease tails.
         if let Some(rest) = trimmed.strip_prefix("==") {
             let ver = rest.trim();
-            if !ver.is_empty()
-                && !ver.contains(',')
-                && !ver.contains('*')
-                && ReleaseVersion::parse(ver).is_some()
-            {
+            if !ver.is_empty() && !ver.contains(',') && !ver.contains('*') {
                 return VersionIntent::Exact(ver.to_string());
             }
         }
@@ -283,6 +284,14 @@ impl ReleaseVersion {
         if s.contains('!') || s.contains('+') || s.contains('*') {
             return None;
         }
+        // Bound the allocation on attacker-influenceable version strings. A real
+        // release version has a handful of segments; a string with more than 16
+        // dot-separated parts is not a version we model, so refuse it rather than
+        // grow `segments` in proportion to the input length.
+        const MAX_SEGMENTS: usize = 16;
+        if s.split('.').count() > MAX_SEGMENTS {
+            return None;
+        }
         let mut segments = Vec::new();
         for seg in s.split('.') {
             if seg.is_empty() {
@@ -350,6 +359,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_pin_with_prerelease_is_exact() {
+        // A lone `==<prerelease>` is an exact INTENT even though the version is
+        // not a plain numeric release: the DB match is a literal string compare,
+        // so it must not degrade to an Unresolved Constraint (a mere Warn).
+        match VersionIntent::from_pep440_specifier("==1.0.0rc1") {
+            VersionIntent::Exact(v) => assert_eq!(v, "1.0.0rc1"),
+            other => panic!("expected Exact for `==1.0.0rc1`, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn exact_pin_with_wildcard_is_unresolved_constraint() {
         // `==1.2.*` is prefix matching, not an exact pin; it must not parse.
         let intent = VersionIntent::from_pep440_specifier("==1.2.*");
@@ -408,6 +428,13 @@ mod tests {
         assert!(ReleaseVersion::parse("1.0.post1").is_none());
         assert!(ReleaseVersion::parse("1.0.dev0").is_none());
         assert!(ReleaseVersion::parse("v1.0").is_none());
+    }
+
+    #[test]
+    fn excessive_segments_do_not_parse() {
+        // 17 dot-separated segments is past the cap; the parser refuses it
+        // rather than allocating a segment vector sized to the input.
+        assert!(ReleaseVersion::parse("1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17").is_none());
     }
 
     #[test]

@@ -1065,7 +1065,21 @@ impl ThreatDb {
 
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                if rec.versions.iter().any(|rv| rv == v) {
+                // Match on a literal string equal OR a numeric release equal, so
+                // a pin like `==1.4` still hits a record listing `1.4.0`. The
+                // numeric arm only fires when both sides parse as plain release
+                // versions; anything else (prereleases, locals) relies on the
+                // literal compare and falls through to NoRecord when it differs.
+                // Compare via `cmp` (not `==`): only `Ord` treats trailing-zero
+                // segments as equal, so `1.4` and `1.4.0` match here.
+                let matched = rec.versions.iter().any(|rv| {
+                    rv == v
+                        || matches!(
+                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v)),
+                            (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
+                        )
+                });
+                if matched {
                     PackageThreatAssessment::ExactMatch(summary)
                 } else {
                     // This concrete version is not the malicious one; no record
@@ -3236,6 +3250,36 @@ mod tests {
                 assert!(!s.all_versions_malicious);
             }
             other => panic!("expected ExactMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_exact_pin_matches_trailing_zero_record() {
+        // The record lists `1.4.0`; a pin of `==1.4` must still hit it. The
+        // literal string compare alone would miss (`"1.4" != "1.4.0"`), so the
+        // numeric-equality fallback is what makes this an ExactMatch.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 11);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "foo",
+            &["1.4.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+
+        let intent = VersionIntent::from_pep440_specifier("==1.4");
+        assert_eq!(intent, VersionIntent::Exact("1.4".to_string()));
+        match db.assess_package(Ecosystem::PyPI, "foo", &intent) {
+            PackageThreatAssessment::ExactMatch(s) => {
+                assert_eq!(s.name, "foo");
+                assert!(!s.all_versions_malicious);
+            }
+            other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
         }
     }
 
