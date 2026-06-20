@@ -226,8 +226,14 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     // Distinct artifacts that were actually inspected (NOT the per-finding result
     // count), so `scanned_count` reflects files scanned, not findings produced.
     let mut artifacts_inspected = 0usize;
+    // Load the threat DB ONCE for the whole artifact pass (the cache re-checks mtime
+    // internally, so this is cheap, but we still hold the Arc rather than re-fetching
+    // per artifact) and thread it into the hash-lookup seam. Latent today (the
+    // hash-lookup seam returns None until the DB-B methods land), but this is the
+    // correct wiring so the artifact path consults the same DB the engine does.
+    let artifact_threat_db = crate::threatdb::ThreatDb::cached();
     for p in &collected.artifact_candidates {
-        let (mut results, gap) = inspect_artifact_candidate(p);
+        let (mut results, gap) = inspect_artifact_candidate(p, artifact_threat_db.as_deref());
         if gap.is_none() {
             artifacts_inspected += 1;
         }
@@ -319,7 +325,10 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 /// `evaluate_inspected_artifact` so a strict integrity policy's `action_overrides`
 /// are honored on this path too (the verdict's findings carry the overridden
 /// severities).
-fn inspect_artifact_candidate(path: &Path) -> (Vec<FileScanResult>, Option<CoverageGap>) {
+fn inspect_artifact_candidate(
+    path: &Path,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> (Vec<FileScanResult>, Option<CoverageGap>) {
     use crate::artifact::inspect::{inspect_artifact_file, InspectedArtifact};
 
     let inspected: InspectedArtifact = match inspect_artifact_file(path) {
@@ -350,14 +359,21 @@ fn inspect_artifact_candidate(path: &Path) -> (Vec<FileScanResult>, Option<Cover
         &inspected.inspection,
         &inspected.native_findings,
         &policy,
-        None,
+        threat_db,
     );
+
+    // The set of member-qualified location strings the inspection actually
+    // produced (`<wheel>!/<member>`), gathered from the inspected files, signals,
+    // and execution edges. `artifact_finding_location` resolves a finding's member
+    // by EXACT membership in this set rather than scraping any `!/`-bearing token,
+    // so a stray `!/` substring in evidence prose can never mislocate a finding.
+    let known_members = known_member_locations(&inspected.inspection);
 
     let mut results: Vec<FileScanResult> = Vec::new();
     for finding in verdict.findings {
         // Locate the finding at its member-qualified location when one is present in
         // the evidence (B8f); else at the outer wheel.
-        let loc = artifact_finding_location(&finding, path);
+        let loc = artifact_finding_location(&finding, path, &known_members);
         results.push(FileScanResult {
             path: loc,
             findings: vec![finding],
@@ -378,28 +394,48 @@ fn inspect_artifact_candidate(path: &Path) -> (Vec<FileScanResult>, Option<Cover
     (results, None)
 }
 
+/// The set of member-qualified location strings (`<wheel>!/<member>`) the
+/// inspection actually produced, drawn from its files, signals, and execution
+/// edges. `artifact_finding_location` matches a finding's evidence tokens against
+/// THIS set, so a member location is recovered by exact identity with a real
+/// member rather than by scraping any `!/`-bearing substring out of prose.
+fn known_member_locations(inspection: &crate::artifact::ArtifactInspection) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut add = |loc: &SubjectLocation| {
+        // Only locations that actually render with a `!/` member separator are
+        // candidate member locations.
+        if loc.member_path.is_some() {
+            out.insert(loc.to_string());
+        }
+    };
+    for f in &inspection.files {
+        add(&f.location);
+    }
+    for s in &inspection.signals {
+        add(&s.location);
+    }
+    for e in &inspection.execution_edges {
+        add(&e.from);
+        add(&e.to);
+    }
+    out.into_iter().collect()
+}
+
 /// Recover the member-qualified location (`foo.whl!/member`) for an artifact
-/// finding from the first `outer!/member` token in its evidence; else the outer
-/// artifact path. Used so each artifact finding's JSON/SARIF path names the
-/// offending member (B8f).
-fn artifact_finding_location(finding: &Finding, outer: &Path) -> PathBuf {
+/// finding by matching a token in its evidence against the inspection's KNOWN
+/// member locations; else the outer artifact path. Matching against the real
+/// member set (not any `!/`-bearing substring) is why a stray `!/` in evidence
+/// prose can never mislocate a finding. Used so each artifact finding's
+/// JSON/SARIF path names the offending member (B8f).
+fn artifact_finding_location(finding: &Finding, outer: &Path, known_members: &[String]) -> PathBuf {
     use crate::verdict::Evidence;
-    let outer_display = outer.display().to_string();
-    for ev in &finding.evidence {
-        if let Evidence::Text { detail } = ev {
-            // A member-qualified location renders `<outer>!/<member>`; find the first
-            // such token that names THIS outer artifact.
-            for token in detail.split_whitespace() {
-                let cleaned = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ','));
-                if let Some(idx) = cleaned.find("!/") {
-                    let (outer_part, _) = cleaned.split_at(idx);
-                    // Match on the basename so a relative vs absolute outer path
-                    // still attaches to this artifact.
-                    let outer_base = outer
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&outer_display);
-                    if outer_part.ends_with(outer_base) || outer_part == outer_display {
+    if !known_members.is_empty() {
+        for ev in &finding.evidence {
+            if let Evidence::Text { detail } = ev {
+                for token in detail.split_whitespace() {
+                    let cleaned = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ','));
+                    // EXACT membership in the inspection's real member locations.
+                    if known_members.iter().any(|m| m == cleaned) {
                         return PathBuf::from(cleaned);
                     }
                 }
@@ -1573,6 +1609,62 @@ mod tests {
                 .iter()
                 .any(|r| { !r.findings.is_empty() && r.path.display().to_string().contains("!/") }),
             "an artifact finding must carry a member-qualified `foo.whl!/member` path"
+        );
+    }
+
+    /// T3.26: `artifact_finding_location` recovers a member location by EXACT
+    /// membership in the inspection's real member set, not by scraping any
+    /// `!/`-bearing token. A stray `!/` substring in evidence prose that is NOT a
+    /// real member must fall back to the outer artifact path; a token that IS a
+    /// known member resolves to that member.
+    #[test]
+    fn artifact_finding_location_matches_known_members_exactly() {
+        use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+        let outer = Path::new("/repo/demo-1.0-py3-none-any.whl");
+        let real_member = "demo-1.0-py3-none-any.whl!/demo/boot.pth".to_string();
+        let known = vec![real_member.clone()];
+
+        // (1) A finding naming the REAL member resolves to it.
+        let f_real = Finding {
+            rule_id: RuleId::PythonStartupHookSuspicious,
+            severity: Severity::High,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!("location: {real_member}"),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        assert_eq!(
+            artifact_finding_location(&f_real, outer, &known),
+            PathBuf::from(&real_member),
+            "a known member location must resolve to that member"
+        );
+
+        // (2) A finding whose prose contains a stray `!/` token that is NOT a real
+        // member must fall back to the OUTER path, never mislocating to the bogus
+        // token (the fragility the scrape had).
+        let f_bogus = Finding {
+            rule_id: RuleId::PythonStartupHookSuspicious,
+            severity: Severity::High,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "see https://example.test/path!/not-a-member for details".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        assert_eq!(
+            artifact_finding_location(&f_bogus, outer, &known),
+            outer.to_path_buf(),
+            "a stray `!/` token that is not a real member must fall back to the outer path"
         );
     }
 

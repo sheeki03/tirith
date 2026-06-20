@@ -461,12 +461,13 @@ impl InspectionCoverage {
 /// severity overrides and `action_overrides` are honored at this verdict site,
 /// exactly like `ecosystem_scan` (cross-cutting invariant 5).
 ///
-/// In A3 there are no analyzers and no artifact-specific
-/// [`crate::verdict::RuleId`]s yet, so the signal-to-finding correlation is a
-/// skeleton: it produces no findings. The real correlation (and the
-/// artifact RuleIds it emits) lands with the analyzers in B5 to B8. The
-/// `threat_db` is threaded now so later PRs can resolve hashes/names without a
-/// signature change.
+/// The signal-to-finding correlation is delegated to
+/// [`crate::artifact::correlate::correlate_inspection_findings`] (wired in B8),
+/// which maps the B5/B6 signal sets to their artifact RuleIds and applies the
+/// DB-gated `ArtifactKnownMalicious` hash check; a clean inspection yields no
+/// findings. The `threat_db` is threaded so the hash lookups resolve without a
+/// signature change. The per-member native chains (B7) are folded in by
+/// [`evaluate_inspected_artifact`], not by this bare-inspection entry point.
 pub fn evaluate_artifact(
     inspection: &ArtifactInspection,
     policy: &Policy,
