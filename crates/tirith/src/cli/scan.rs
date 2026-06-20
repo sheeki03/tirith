@@ -225,13 +225,20 @@ pub fn run(
         .ok()
         .map(|p| p.display().to_string());
     let policy = Policy::discover(cwd.as_deref());
+    // Each finding is paired with the EXACT `SubjectLocation` of its gap, so the
+    // file entry resolves to that gap's own path by exact equality. Matching back
+    // by a substring of the finding's description is WRONG: one gap's location can
+    // be a prefix of another's (`/a/b.so` vs `/a/b.so.bak`), so a substring match
+    // mislabels the finding. The human/JSON output reads the per-file `path`.
     let coverage_findings =
-        scan::build_analysis_incomplete_findings(&result.coverage_gaps, &policy);
-    for finding in coverage_findings {
-        // Locate the finding at the gap path it describes when we can recover it
-        // from the evidence; otherwise the scan root. The human/JSON output reads
-        // the per-file `path`, so use the gap's own path for a precise location.
-        let path = analysis_incomplete_finding_path(&finding, &result.coverage_gaps)
+        scan::build_analysis_incomplete_findings_located(&result.coverage_gaps, &policy);
+    for (location, finding) in coverage_findings {
+        // The gap's most relevant on-disk path (outer container, else installed),
+        // mirroring `CoverageGap::primary_path`; the scan root when neither exists.
+        let path = location
+            .outer_path
+            .clone()
+            .or_else(|| location.installed_path.clone())
             .unwrap_or_else(|| config.path.clone());
         result.file_results.push(scan::FileScanResult {
             path,
@@ -288,23 +295,6 @@ pub fn run(
     } else {
         0
     }
-}
-
-/// Recover the on-disk path an `AnalysisIncomplete` finding describes by matching
-/// it back to a coverage gap whose `Display` location is named in the finding's
-/// description. Best-effort: returns `None` if no gap location is found, so the
-/// caller falls back to the scan root.
-fn analysis_incomplete_finding_path(
-    finding: &tirith_core::verdict::Finding,
-    gaps: &[scan::CoverageGap],
-) -> Option<PathBuf> {
-    for gap in gaps {
-        let loc = gap.location.to_string();
-        if finding.description.contains(&loc) {
-            return gap.primary_path().map(|p| p.to_path_buf());
-        }
-    }
-    None
 }
 
 fn run_stdin(

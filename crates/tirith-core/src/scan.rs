@@ -406,7 +406,19 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
             .read_to_end(&mut buf)
         {
             Ok(_) if buf.len() as u64 > MAX_FILE_SIZE => {
-                let sha256 = hash_path_within_budget(file_path);
+                // Hash from the SAME open handle (matching the oversized arm
+                // above), not by re-opening `file_path`: a path reopen here is a
+                // TOCTOU window where a swap between the read and the reopen could
+                // hash a different inode. The prior read left the cursor at EOF, so
+                // rewind to the start before streaming the hash.
+                use std::io::Seek as _;
+                let sha256 = match (&file).seek(std::io::SeekFrom::Start(0)) {
+                    Ok(_) => match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
+                        Ok(crate::util::HashOutcome::Digest(hex)) => Some(hex),
+                        Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
                 eprintln!(
                     "tirith: scan: skipping {} (grew past {}B analysis limit during read)",
                     file_path.display(),
@@ -836,17 +848,26 @@ fn is_known_config_dir(name: &str) -> bool {
 /// being silently dropped. B8 extends this into a magic-based dispatch into the
 /// real artifact scanner. `.whl`/`.node` were previously read as TEXT (or, for a
 /// raw `.so`/`.dylib`/`.wasm`, dropped as binary); both are now coverage gaps.
-const ARTIFACT_EXTENSIONS: &[&str] = &[".so", ".dylib", ".node", ".wasm", ".whl"];
+/// Native / packaging artifact extensions: executable or loadable code with no
+/// text analyzer yet, so each is an `Unsupported` coverage gap rather than a
+/// silent drop. A `.dll`/`.exe`/`.jar`/`.class` is loadable code too (a Windows
+/// native blob, a Java archive, a compiled class), so they belong here next to
+/// `.so`, not in `IGNORED_BINARY_EXTENSIONS`, where they would be dropped and
+/// hidden from `require_complete`.
+const ARTIFACT_EXTENSIONS: &[&str] = &[
+    ".so", ".dylib", ".node", ".wasm", ".whl", ".exe", ".dll", ".jar", ".class",
+];
 
 /// Ordinary media / compiled-bytecode / generic-archive extensions that are NOT
 /// a security artifact and are intentionally ignored (never a coverage gap).
 /// `.svg` is deliberately NOT here: an SVG is XML text and can carry an active
 /// payload (`<script>`, an `on*` event handler) or an external reference — the
-/// `aifile` rules scan it for hidden / smuggled content.
+/// `aifile` rules scan it for hidden / smuggled content. `.exe`/`.dll`/`.jar`/
+/// `.class` are deliberately NOT here either: they are loadable code and live in
+/// `ARTIFACT_EXTENSIONS` so they surface as `Unsupported` coverage gaps.
 const IGNORED_BINARY_EXTENSIONS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".mp3", ".mp4", ".wav", ".avi",
-    ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".exe", ".dll", ".o", ".a",
-    ".pyc", ".class", ".jar",
+    ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".o", ".a", ".pyc",
 ];
 
 /// Classify a filename for collection: an artifact candidate (a native/packaging
@@ -929,8 +950,13 @@ impl ScanResult {
 /// one of these is treated as a SECURITY-relevant gap (it could carry executable
 /// or supply-chain content), so `require_complete` / a Fail action must surface
 /// it. Lockfiles and workflow YAML are matched by basename/path separately.
+/// `.dll`/`.exe`/`.jar`/`.class` are here for the same reason as `.so`: each is
+/// loadable code with no analyzer yet, so an unanalyzed one must not read as clean
+/// (they are also `ARTIFACT_EXTENSIONS`, so the scan records them as `Unsupported`
+/// gaps in the first place).
 const SECURITY_RELEVANT_EXTENSIONS: &[&str] = &[
-    ".so", ".pth", ".start", ".dylib", ".node", ".wasm", ".sh", ".ps1",
+    ".so", ".pth", ".start", ".dylib", ".node", ".wasm", ".sh", ".ps1", ".dll", ".exe", ".jar",
+    ".class",
 ];
 
 /// Lockfile / workflow basenames or path fragments that make a gap security
@@ -980,25 +1006,56 @@ pub fn build_analysis_incomplete_findings(
     gaps: &[CoverageGap],
     policy: &crate::policy::Policy,
 ) -> Vec<Finding> {
-    let raw = assemble_analysis_incomplete_findings(gaps, policy);
-    if raw.is_empty() {
-        return raw;
+    build_analysis_incomplete_findings_located(gaps, policy)
+        .into_iter()
+        .map(|(_loc, finding)| finding)
+        .collect()
+}
+
+/// Like [`build_analysis_incomplete_findings`], but each returned finding is
+/// paired with the EXACT [`SubjectLocation`] of the gap it was assembled from.
+///
+/// The driver needs this pairing to attach each finding to its own file entry:
+/// matching back by a substring of the finding's `description` is wrong because
+/// one gap's location string can be a PREFIX of another's (e.g. `/a/b.so` is a
+/// substring of `/a/b.so.bak`), so a substring match resolves to the wrong
+/// member. Carrying the location alongside the finding lets the caller resolve by
+/// EXACT equality.
+///
+/// Each gap is finalized through `finalize_static_verdict` INDIVIDUALLY, which is
+/// equivalent to finalizing the whole batch for this rule: the finalizer's passes
+/// (per-rule `severity_overrides` / `action_overrides`, then a paranoia filter
+/// keyed on the finding's own severity) all act per finding, none depends on how
+/// many other `AnalysisIncomplete` findings are in the set. Per-gap finalization
+/// is what makes the exact pairing trivially correct: a finding either survives
+/// for its gap or it does not, with no cross-gap reordering to reconcile.
+pub fn build_analysis_incomplete_findings_located(
+    gaps: &[CoverageGap],
+    policy: &crate::policy::Policy,
+) -> Vec<(SubjectLocation, Finding)> {
+    let mut out = Vec::new();
+    for gap in gaps {
+        // Cross-cutting invariant 5: route each gap's assembled finding(s) through
+        // the shared static-verdict finalizer so a policy `severity_overrides` /
+        // `action_overrides` on `analysis_incomplete` is honored here, exactly as
+        // on every other static-verdict site (ecosystem scan, artifact
+        // evaluation). AnalysisIncomplete is Medium/High, kept at the default
+        // paranoia, so the paranoia pass is a no-op unless the operator raised it.
+        let raw = assemble_analysis_incomplete_findings(std::slice::from_ref(gap), policy);
+        if raw.is_empty() {
+            continue;
+        }
+        let verdict = crate::escalation::finalize_static_verdict(
+            raw,
+            policy,
+            3,
+            crate::verdict::Timings::default(),
+        );
+        for finding in verdict.findings {
+            out.push((gap.location.clone(), finding));
+        }
     }
-    // Cross-cutting invariant 5: route the assembled findings through the shared
-    // static-verdict finalizer so a policy `severity_overrides` /
-    // `action_overrides` on `analysis_incomplete` is honored here, exactly as on
-    // every other static-verdict site (ecosystem scan, artifact evaluation). The
-    // scan exit path is finding-based (it reads the findings, not the derived
-    // action), so we hand back the finalized finding set. AnalysisIncomplete is
-    // Medium/High, kept at the default paranoia, so the paranoia pass is a no-op
-    // unless the operator explicitly raised it.
-    let verdict = crate::escalation::finalize_static_verdict(
-        raw,
-        policy,
-        3,
-        crate::verdict::Timings::default(),
-    );
-    verdict.findings
+    out
 }
 
 /// Assemble the raw `AnalysisIncomplete` findings (one per security-relevant,
@@ -1702,6 +1759,183 @@ mod tests {
         assert!(
             collected.artifact_candidates.is_empty(),
             "an explicitly excluded .so is an intentional exclusion, not a gap"
+        );
+    }
+
+    /// T2.7: `.dll`/`.exe`/`.jar`/`.class` are LOADABLE CODE, so a tree
+    /// containing one records an `Unsupported` coverage gap (the same treatment as
+    /// a `.so`) rather than a silent `BinaryIgnored` drop. A silent drop would make
+    /// a planted native blob read as "clean" and slip past `require_complete`.
+    #[test]
+    fn dll_exe_jar_are_unsupported_gaps_not_clean() {
+        // Each loadable-code extension classifies as an artifact candidate.
+        for name in ["evil.dll", "evil.exe", "evil.jar", "evil.class"] {
+            assert_eq!(
+                classify_collected_file(name),
+                CollectedFileKind::ArtifactCandidate,
+                "{name} must be an artifact candidate, not BinaryIgnored"
+            );
+        }
+
+        // A directory tree containing `evil.dll` surfaces an Unsupported gap.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(tmp.path().join("readme.md"), "hi").unwrap();
+        std::fs::write(tmp.path().join("evil.dll"), b"MZ native bytes").unwrap();
+
+        let config = ScanConfig {
+            path: tmp.path().to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        };
+        let result = scan(&config);
+
+        let dll_gap = result
+            .coverage_gaps
+            .iter()
+            .find(|g| {
+                g.primary_path()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some("evil.dll")
+            })
+            .expect("evil.dll must be recorded as a coverage gap");
+        assert_eq!(
+            dll_gap.kind,
+            CoverageGapKind::Unsupported,
+            "a .dll is an Unsupported coverage gap, not silently dropped"
+        );
+
+        // The gap is security-relevant, so `require_complete` (a Fail action) would
+        // surface a finding: it must NOT read as clean.
+        let mut policy = crate::policy::Policy::default();
+        policy.scan.unsupported_artifact_action = Some(crate::policy::GapAction::Fail);
+        let findings = build_analysis_incomplete_findings(&result.coverage_gaps, &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+                    && f.severity == Severity::High),
+            "the .dll gap must yield a High AnalysisIncomplete finding under require_complete"
+        );
+    }
+
+    /// T2.8: the grow-during-read recovery hashes from the ALREADY-OPEN handle
+    /// (rewound to the start), NOT by re-opening the path. Hashing from the same
+    /// fd is the TOCTOU-safety point: a path swap between the read and a reopen
+    /// could otherwise substitute a different inode. This proves the recovery
+    /// digests the bytes the OPEN handle holds, independent of what the path
+    /// resolves to.
+    #[test]
+    fn grow_during_read_hashes_from_same_handle() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read as _, Seek as _};
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("payload.bin");
+        let handle_bytes = b"the exact bytes the open handle holds";
+        std::fs::write(&path, handle_bytes).unwrap();
+
+        // Open the SAME way `scan_single_file` does, then advance the cursor to
+        // mimic the grow-detection read that leaves the fd at EOF.
+        let file = crate::util::open_read_no_follow_capped(&path, u64::MAX).expect("open handle");
+        let mut sink = Vec::new();
+        (&file)
+            .take(8)
+            .read_to_end(&mut sink)
+            .expect("partial read");
+
+        // SWAP the inode at `path` by atomically renaming a different file over it.
+        // The open `file` fd keeps the ORIGINAL inode (its bytes survive the
+        // unlink), while the PATH now resolves to NEW, different content, so a
+        // path-based re-open would hash the wrong bytes. (A plain truncate-rewrite
+        // of the same path would modify the same inode the fd sees, defeating the
+        // test, so the swap must replace the inode.)
+        let swapped_bytes = b"COMPLETELY DIFFERENT CONTENT ON DISK";
+        let decoy = tmp.path().join("decoy.bin");
+        std::fs::write(&decoy, swapped_bytes).unwrap();
+        std::fs::rename(&decoy, &path).expect("atomic swap of the path's inode");
+
+        // The recovery used by the grow arm: rewind the handle, hash from it.
+        (&file).seek(std::io::SeekFrom::Start(0)).expect("rewind");
+        let recovered = match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
+            Ok(crate::util::HashOutcome::Digest(hex)) => hex,
+            other => panic!("expected a digest from the handle, got {other:?}"),
+        };
+
+        let from_handle: String = Sha256::digest(handle_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let from_reopened_path: String = Sha256::digest(swapped_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            recovered, from_handle,
+            "the hash must be of the bytes read from the handle"
+        );
+        assert_ne!(
+            recovered, from_reopened_path,
+            "the hash must NOT be of a re-opened path's (swapped) content"
+        );
+    }
+
+    /// T2.13: when several gaps' location strings are PREFIXES of one another
+    /// (`/a/b.so` is a substring of `/a/b.so.bak`), each finding still resolves to
+    /// its OWN exact member: the located builder pairs every finding with the exact
+    /// `SubjectLocation` of its gap, so resolution is by exact equality, not a
+    /// substring of the description.
+    #[test]
+    fn analysis_incomplete_finding_path_resolves_nested_member() {
+        let policy = crate::policy::Policy::default();
+        // Both are security-relevant (`.so`), and `/a/b.so` is a CONTIGUOUS
+        // substring of `/a/b.so.extra.so`, the exact prefix collision a
+        // description-substring match would mislabel.
+        let gap_a = CoverageGap {
+            location: SubjectLocation::from_path("/a/b.so"),
+            kind: CoverageGapKind::Unsupported,
+            sha256: None,
+        };
+        let gap_b = CoverageGap {
+            location: SubjectLocation::from_path("/a/b.so.extra.so"),
+            kind: CoverageGapKind::Unsupported,
+            sha256: None,
+        };
+        // Guard the premise: the first location really is a substring of the
+        // second, so a `description.contains(loc)` match WOULD collide.
+        assert!(
+            gap_b
+                .location
+                .to_string()
+                .contains(&gap_a.location.to_string()),
+            "test premise: /a/b.so must be a substring of /a/b.so.extra.so"
+        );
+
+        let located =
+            build_analysis_incomplete_findings_located(&[gap_a.clone(), gap_b.clone()], &policy);
+        assert_eq!(located.len(), 2, "one finding per security-relevant gap");
+
+        // Each finding is paired with its OWN exact location, even though
+        // `/a/b.so` is a substring of `/a/b.so.extra.so`.
+        let loc_a = &located[0].0;
+        let loc_b = &located[1].0;
+        assert_eq!(loc_a, &gap_a.location);
+        assert_eq!(loc_b, &gap_b.location);
+        assert_eq!(
+            loc_a.outer_path.as_deref(),
+            Some(std::path::Path::new("/a/b.so"))
+        );
+        assert_eq!(
+            loc_b.outer_path.as_deref(),
+            Some(std::path::Path::new("/a/b.so.extra.so"))
+        );
+        assert_ne!(
+            loc_a, loc_b,
+            "the nested member must NOT collapse onto its prefix sibling"
         );
     }
 }
