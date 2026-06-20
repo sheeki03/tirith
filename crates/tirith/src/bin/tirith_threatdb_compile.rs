@@ -383,7 +383,16 @@ fn ossf_confidence(id: &str, entry_type: Option<&str>) -> Confidence {
         Some("MALWARE") => Confidence::Confirmed,
         Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
         _ if id.starts_with("MAL-") => Confidence::Confirmed,
-        _ => Confidence::Medium, // Default: Medium (OSSF allows borderline)
+        Some(other) => {
+            // An OpenSSF type we do not recognize: surface it (the feed may have
+            // grown a new value worth handling) and fall back to the borderline
+            // default rather than silently swallowing it.
+            eprintln!(
+                "  warning: unrecognized OpenSSF database_specific type {other:?} for {id}, defaulting to Medium"
+            );
+            Confidence::Medium
+        }
+        None => Confidence::Medium, // No type and not a MAL- id: borderline default.
     }
 }
 
@@ -1526,6 +1535,17 @@ mod tests {
         assert_eq!(
             ossf_confidence("MAL-2026-2307", Some("POTENTIALLY_UNWANTED")),
             Confidence::Medium
+        );
+
+        // An unrecognized type on a non-MAL id falls back to Medium (and emits a
+        // warning that surfaces the new type); a MAL- id still wins over it.
+        assert_eq!(
+            ossf_confidence("OSV-2025-0002", Some("BRAND_NEW_TYPE")),
+            Confidence::Medium
+        );
+        assert_eq!(
+            ossf_confidence("MAL-2026-9999", Some("BRAND_NEW_TYPE")),
+            Confidence::Confirmed
         );
     }
 
