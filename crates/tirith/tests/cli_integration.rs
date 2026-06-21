@@ -15913,6 +15913,47 @@ fn package_inspect_malicious_wheel_exits_1_with_member_location() {
 }
 
 #[test]
+fn package_inspect_rejected_wheel_does_not_pass_as_allow() {
+    // A structurally REJECTED wheel (sole payload: a path-traversal member, with NO
+    // B5/B6/B7 signal) must NOT exit 0 / report action "allow". A CI consumer keying off
+    // the exit code or the JSON `action` would otherwise pass a path-traversal attack that
+    // the human path already flags [REJECTED] (Greptile).
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    let bytes = build_wheel_bytes(&[
+        ("../../evil.py", b"import os\n".as_slice()),
+        (
+            "demo-1.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+        ),
+    ]);
+    let wheel = proj.join("demo-1.0-py3-none-any.whl");
+    std::fs::write(&wheel, &bytes).unwrap();
+
+    let out = tirith_in_proj(proj)
+        .args(["package", "inspect", "--format", "json", "--artifact"])
+        .arg(&wheel)
+        .output()
+        .expect("run package inspect");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a structurally rejected wheel must NOT exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("inspect --format json must be valid JSON");
+    assert_ne!(
+        json["action"], "allow",
+        "a rejected wheel must not report action allow; got: {json}"
+    );
+    assert_eq!(
+        json["artifacts"][0]["rejected"], true,
+        "the artifact must be marked rejected: {json}"
+    );
+}
+
+#[test]
 fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path();
