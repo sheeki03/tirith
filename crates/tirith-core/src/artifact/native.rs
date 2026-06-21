@@ -903,23 +903,24 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     // `has_suspicious_url`. The full URL is still recorded for evidence.
     // Scan ALL scheme occurrences, not just the first: a benign leading URL must not
     // mask a suspicious one later in the same string.
-    if facts.embedded_urls.len() < caps::MAX_URLS {
-        'scheme: for scheme in ["http://", "https://", "ftp://"] {
-            for (pos, _) in lower.match_indices(scheme) {
-                let tail = &s[pos.min(s.len())..];
-                let url: String = tail
-                    .chars()
-                    .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != '`')
-                    .take(2048)
-                    .collect();
-                if url.len() >= scheme.len() {
-                    if is_suspicious_url(&url) {
-                        facts.has_suspicious_url = true;
-                    }
-                    facts.embedded_urls.insert(url);
+    // The scan runs UNCONDITIONALLY (mirroring the sibling/runtime caps) so
+    // `has_suspicious_url` is still set after the storage cap is hit; only the STORAGE is
+    // capped. Otherwise a crafted binary could pad 256 benign URLs early to disable the
+    // suspicious-URL danger leg for every later string.
+    for scheme in ["http://", "https://", "ftp://"] {
+        for (pos, _) in lower.match_indices(scheme) {
+            let tail = &s[pos.min(s.len())..];
+            let url: String = tail
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != '`')
+                .take(2048)
+                .collect();
+            if url.len() >= scheme.len() {
+                if is_suspicious_url(&url) {
+                    facts.has_suspicious_url = true;
                 }
-                if facts.embedded_urls.len() >= caps::MAX_URLS {
-                    break 'scheme;
+                if facts.embedded_urls.len() < caps::MAX_URLS {
+                    facts.embedded_urls.insert(url);
                 }
             }
         }
