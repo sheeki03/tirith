@@ -237,7 +237,17 @@ pub fn verify_wheel_record(
     let mut result = WheelRecordResult::default();
 
     let Some(record) = record else {
+        // A wheel with NO RECORD at all is the most glaring integrity anomaly, yet
+        // every other violation path emits a SIGNAL for signal-driven correlation
+        // while this one only pushed a violation. Emit the matching signal so a
+        // RECORD-less wheel is never silently ignored by a `result.signals` consumer.
         result.violations.push(WheelRecordViolation::MissingRecord);
+        result.signals.push(signal(
+            ArtifactSignalKind::RecordHashMismatch,
+            member_location(wheel_outer_name(inspection).as_deref(), "RECORD"),
+            "wheel has no RECORD member (RECORD is missing entirely)".to_string(),
+            EdgeConfidence::High,
+        ));
         return result;
     };
 
@@ -1116,6 +1126,15 @@ mod tests {
         let inspection = ArtifactInspection::new(wheel_subject(outer));
         let result = verify_wheel_record(&inspection, None);
         assert_eq!(result.violations, vec![WheelRecordViolation::MissingRecord]);
+        // The most glaring integrity anomaly must ALSO emit a signal so a
+        // signal-driven correlation consumer never silently ignores it.
+        assert!(
+            result
+                .signals
+                .iter()
+                .any(|s| s.kind == ArtifactSignalKind::RecordHashMismatch),
+            "a missing RECORD must emit a signal, not just a violation"
+        );
     }
 
     #[test]
