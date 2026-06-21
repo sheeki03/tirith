@@ -45,6 +45,17 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+/// macOS runtime-containment backend (Stack E, unit E3): the `SeatbeltCapsule`,
+/// which builds an SBPL profile (`(deny default)` + the spec's grants, `(deny
+/// network*)` except the loopback broker) and probes the system `sandbox-exec`
+/// wrapper, reporting honest [`CapsuleCoverage`] (an absent/removed
+/// `sandbox-exec` yields degraded coverage, never a silent NoOp success). Gated
+/// to macOS; it needs no extra crates (Seatbelt is driven through the OS
+/// `sandbox-exec` binary), so the profile/argv builders are pure and the other
+/// targets compile without it.
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 /// Sensitive environment variables stripped from a contained child whenever
 /// [`EnvironmentPolicy::deny_sensitive`] is set (the default).
 ///
