@@ -335,6 +335,17 @@ pub struct Policy {
     #[serde(default)]
     pub allowed_install_domains: Vec<String>,
 
+    /// **C5a** — opt-in named MCP-gateway posture (aligned with the
+    /// `ai-agent-heavy` template). `Option` so the gateway can tell "field
+    /// omitted" (no opinion -> permissive built-in gateway defaults) from "field
+    /// set" (`Some(Secure)` -> secure baseline fills the unset gateway-config
+    /// knobs). TIGHTENING-only (the enum has no downgrade value), so this is
+    /// KEPT by [`Self::sanitize_repo_scoped`] — a repo may opt in but can never
+    /// weaken through it. Default `None` (backward-compatible). Read offline by
+    /// the gateway via [`Self::discover_local_only`].
+    #[serde(default)]
+    pub gateway_profile: Option<GatewayProfile>,
+
     /// Presentation bookkeeping (NOT a policy knob). When this policy is repo-
     /// scoped, [`Self::sanitize_repo_scoped`] records here the YAML key name of
     /// every field whose hostile value it neutralized, so the UX layer can show
@@ -945,6 +956,33 @@ pub enum FailMode {
     Closed,
 }
 
+/// C5a — a named, hardened posture for the MCP gateway, aligned with the
+/// `ai-agent-heavy` policy template. The field is intentionally an `enum` with
+/// only TIGHTENING variants (today just [`GatewayProfile::Secure`]); there is no
+/// "less secure" / "off" value a policy could downgrade TO. Absence of the
+/// field (`Option::None` on [`Policy::gateway_profile`]) means "no opinion" and
+/// leaves the gateway's own permissive built-in defaults untouched.
+///
+/// The gateway (`crates/tirith/src/cli/gateway.rs`) reads this OFFLINE via
+/// [`Self::discover_local_only`] and, when it is `Some(Secure)`, fills any
+/// gateway-config knob the operator did NOT explicitly set with a secure
+/// baseline (fail-closed, warn-as-deny, tighter message cap). A knob the
+/// operator set in the gateway config always wins, so this is a default
+/// overlay, never an override.
+///
+/// Because every variant is strictly tightening, this is KEPT (never reset) by
+/// [`Self::sanitize_repo_scoped`] — a repo may opt INTO the secure profile but
+/// can never use it to weaken protection. New variants MUST preserve that
+/// property or the sanitize classification has to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayProfile {
+    /// Hardened MCP gateway posture (aligned with `ai-agent-heavy`): unset
+    /// gateway-config knobs default to fail-closed / warn-as-deny / a tighter
+    /// transport cap instead of the permissive built-ins.
+    Secure,
+}
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -994,6 +1032,7 @@ impl Default for Policy {
             hooks_guard_enabled: false,
             baseline_enabled: false,
             allowed_install_domains: Vec::new(),
+            gateway_profile: None,
             neutralized_fields: Vec::new(),
         }
     }
@@ -1372,6 +1411,10 @@ impl Policy {
     /// * `agent_rules` — `deny` tightens; `allow` is NOT a bypass (escalation.rs).
     /// * `checkpoints`, `sudo_session_ttl`, `scan.additional_config_files`/
     ///   `mcp_allowed_tools` — retention/coverage/tightening, never a guard relax.
+    /// * `gateway_profile` — TIGHTENING: the enum has only the hardened `Secure`
+    ///   variant, so a repo can opt the gateway INTO secure defaults but cannot
+    ///   express a downgrade (absence = no opinion). KEPT, like
+    ///   `injection_seeds_custom`.
     /// * `share` (`customer_id_patterns`) — only ADDS redactions (more scrubbing).
     /// * `schema_version`, `fail_mode`, `webhooks` `min_severity` — inert here
     ///   (`fail_mode: open` is already the default; a repo `closed` only tightens).
@@ -2606,6 +2649,38 @@ custom_rules:
         crate::incident::invalidate_cache();
     }
 
+    /// C5a: the gateway reads `gateway_profile` OFFLINE via `discover_local_only`
+    /// to harden its effective defaults. The field is tightening-only (the enum
+    /// has just the `Secure` variant), so a repo-scoped `.tirith/policy.yaml` that
+    /// opts INTO it must survive sanitize unchanged — the gateway seam relies on
+    /// this (a repo can tighten the gateway, never weaken it).
+    #[test]
+    fn discover_local_only_keeps_repo_gateway_profile_secure() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let state = tempfile::tempdir().unwrap();
+        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        crate::incident::invalidate_cache();
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("policy.yaml"), "gateway_profile: secure\n").unwrap();
+
+        let policy = Policy::discover_local_only(Some(dir.path().to_str().unwrap()));
+        assert_eq!(policy.scope, PolicyScope::Repo, "cwd walk-up is repo scope");
+        assert_eq!(
+            policy.gateway_profile,
+            Some(GatewayProfile::Secure),
+            "a repo-scoped gateway_profile: secure is KEPT (tightening); got {:?}",
+            policy.gateway_profile
+        );
+
+        crate::incident::invalidate_cache();
+    }
+
     /// Snapshot an env var on construction and restore it on `Drop` (the
     /// `TEST_ENV_LOCK` serializes env-mutating tests but does not restore).
     struct EnvVarGuard {
@@ -3419,6 +3494,9 @@ custom_rules:
             exec_guard_enabled: true,
             hooks_guard_enabled: true,
             baseline_enabled: true,
+            // KEPT (C5a): the only variant is the hardened `Secure`, so a repo
+            // opting in is tightening; a `Some(Secure)` must survive sanitize.
+            gateway_profile: Some(GatewayProfile::Secure),
             context_destructive_verbs: HashMap::from([("aws".into(), vec!["nuke".into()])]),
             agent_rules: AgentRules {
                 allow: Vec::new(),
@@ -3492,6 +3570,7 @@ custom_rules:
             exec_guard_enabled,
             hooks_guard_enabled,
             baseline_enabled,
+            gateway_profile,
             context_destructive_verbs,
             agent_rules,
             share,
@@ -3666,6 +3745,11 @@ custom_rules:
         assert!(exec_guard_enabled, "KEPT: exec_guard_enabled");
         assert!(hooks_guard_enabled, "KEPT: hooks_guard_enabled");
         assert!(baseline_enabled, "KEPT: baseline_enabled");
+        assert_eq!(
+            gateway_profile,
+            Some(GatewayProfile::Secure),
+            "KEPT: gateway_profile (only the hardened Secure variant exists; opting in tightens, a repo cannot downgrade)"
+        );
         assert!(
             context_destructive_verbs.contains_key("aws"),
             "KEPT: context_destructive_verbs (widens destructive verbs)"

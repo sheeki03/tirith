@@ -16,6 +16,7 @@ use tirith_core::mcp::content;
 use tirith_core::mcp::output_filter::{self, FilterOutcome};
 use tirith_core::mcp::response_inspect::{self, InspectOutcome, ResponseKind};
 use tirith_core::mcp::types::{ContentItem, JsonRpcError, JsonRpcResponse, ToolCallResult};
+use tirith_core::policy::GatewayProfile;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{Action, Finding};
 
@@ -30,8 +31,13 @@ pub struct GatewayOptions {
 #[derive(Debug, Deserialize)]
 pub struct GatewayConfig {
     pub guarded_tools: Vec<GuardedTool>,
+    /// C5a — PRESENCE-AWARE raw policy block. Every knob is an `Option`, so the
+    /// resolver can distinguish "operator omitted this" (fill from the profile
+    /// baseline or the permissive built-in default) from "operator set this"
+    /// (their value wins). Resolved into the concrete [`PolicyConfig`] by
+    /// [`RawPolicyConfig::resolve`].
     #[serde(default)]
-    pub policy: PolicyConfig,
+    pub policy: RawPolicyConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +108,84 @@ impl Default for PolicyConfig {
     }
 }
 
+/// C5a — the `secure` gateway profile baseline (aligned with the
+/// `ai-agent-heavy` policy template). Used to fill a gateway-config knob the
+/// operator left UNSET when the discovered core policy selects
+/// [`GatewayProfile::Secure`]. Each value is strictly at-least-as-strict as the
+/// permissive built-in default, so an operator never loses protection by opting
+/// in, and an explicitly-set knob always overrides this. Only the SECURITY-
+/// posture knobs differ; transport/lifecycle knobs (`timeout_ms`,
+/// `pending_timeout_ms`, `tombstone_retention_ms`) keep their built-in defaults.
+fn secure_warn_action() -> String {
+    // Treat Medium/Low warn findings as denials under the hardened profile.
+    "deny".to_string()
+}
+fn secure_fail_mode() -> String {
+    // An agent-heavy gateway fails CLOSED: an analysis error denies rather than
+    // forwards (the inverse of the permissive built-in `open`).
+    "closed".to_string()
+}
+fn secure_max_message_bytes() -> usize {
+    // Tighter transport cap (256 KiB) than the permissive 1 MiB built-in.
+    262_144
+}
+
+/// C5a — presence-aware wire form of the gateway policy block. Distinct from
+/// the resolved [`PolicyConfig`]: every field is `Option`, so
+/// [`RawPolicyConfig::resolve`] can tell an omitted knob (fill from the profile
+/// baseline / permissive default) from an explicitly-set one (kept verbatim).
+/// `#[serde(default)]` makes a missing `policy:` block deserialize to all-`None`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawPolicyConfig {
+    pub warn_action: Option<String>,
+    pub fail_mode: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_message_bytes: Option<usize>,
+    pub pending_timeout_ms: Option<u64>,
+    pub tombstone_retention_ms: Option<u64>,
+}
+
+impl RawPolicyConfig {
+    /// Resolve to the concrete [`PolicyConfig`]. For each knob: an
+    /// operator-supplied value wins; otherwise, under
+    /// [`GatewayProfile::Secure`], the SECURE baseline applies; otherwise the
+    /// permissive built-in default. With `profile == None` the result is
+    /// byte-for-byte the historical built-in default (the unnamed default config
+    /// is unchanged).
+    pub fn resolve(&self, profile: Option<GatewayProfile>) -> PolicyConfig {
+        let secure = matches!(profile, Some(GatewayProfile::Secure));
+        // Pick the omitted-knob fallback: secure baseline when the profile is on,
+        // else the permissive built-in default.
+        let pick_str =
+            |set: &Option<String>, secure_default: fn() -> String, builtin: fn() -> String| {
+                set.clone()
+                    .unwrap_or_else(|| if secure { secure_default() } else { builtin() })
+            };
+        let pick_usize =
+            |set: Option<usize>, secure_default: fn() -> usize, builtin: fn() -> usize| {
+                set.unwrap_or_else(|| if secure { secure_default() } else { builtin() })
+            };
+        PolicyConfig {
+            warn_action: pick_str(&self.warn_action, secure_warn_action, default_warn_action),
+            fail_mode: pick_str(&self.fail_mode, secure_fail_mode, default_fail_mode),
+            // Transport/lifecycle knobs share one default regardless of profile.
+            timeout_ms: self.timeout_ms.unwrap_or_else(default_timeout_ms),
+            max_message_bytes: pick_usize(
+                self.max_message_bytes,
+                secure_max_message_bytes,
+                default_max_message_bytes,
+            ),
+            pending_timeout_ms: self
+                .pending_timeout_ms
+                .unwrap_or_else(default_pending_timeout_ms),
+            tombstone_retention_ms: self
+                .tombstone_retention_ms
+                .unwrap_or_else(default_tombstone_retention_ms),
+        }
+    }
+}
+
 #[cfg_attr(test, derive(Debug))]
 struct CompiledConfig {
     guarded_tools: Vec<CompiledGuardedTool>,
@@ -116,7 +200,21 @@ struct CompiledGuardedTool {
 }
 
 impl CompiledConfig {
+    /// Compile with NO gateway profile (the unnamed default): every omitted knob
+    /// resolves to the permissive built-in default, byte-for-byte the historical
+    /// behavior. Used by `validate-config` and the tests.
     fn from_config(config: GatewayConfig) -> Result<Self, String> {
+        Self::from_config_with_profile(config, None)
+    }
+
+    /// C5a — compile, resolving the presence-aware [`RawPolicyConfig`] against
+    /// the discovered core-policy `gateway_profile`. Under
+    /// [`GatewayProfile::Secure`] an omitted knob takes the SECURE baseline
+    /// instead of the permissive built-in; an explicitly-set knob always wins.
+    fn from_config_with_profile(
+        config: GatewayConfig,
+        profile: Option<GatewayProfile>,
+    ) -> Result<Self, String> {
         let mut guarded = Vec::new();
         for tool in config.guarded_tools {
             let regex = Regex::new(&tool.pattern)
@@ -131,9 +229,12 @@ impl CompiledConfig {
                 shell,
             });
         }
-        validate_policy_values(&config.policy)?;
+        // Resolve the presence-aware raw policy into the concrete config FIRST,
+        // then validate the effective values (so a secure-baseline-filled knob is
+        // validated just like an operator-supplied one).
+        let mut policy = config.policy.resolve(profile);
+        validate_policy_values(&policy)?;
         // Normalize "allow" → "forward" so downstream only checks == "deny".
-        let mut policy = config.policy;
         if policy.warn_action == "allow" {
             policy.warn_action = "forward".to_string();
         }
@@ -591,7 +692,26 @@ pub fn run_gateway_with_options(
             return 1;
         }
     };
-    let config = match CompiledConfig::from_config(raw_config) {
+
+    // C5a — discover the operator's core policy ONCE, OFFLINE (no network), so a
+    // named `gateway_profile` (e.g. `secure`, aligned with the `ai-agent-heavy`
+    // template) can harden the gateway's effective defaults. `discover_local_only`
+    // neutralizes a repo-scoped policy's weakening fields; `gateway_profile` is
+    // tightening-only (KEPT), so a repo may opt in but never opt out. The same
+    // discovered policy is reused below for the `--filter-output` seam, so we
+    // resolve it exactly once.
+    let core_policy = tirith_core::policy::Policy::discover_local_only(
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .as_deref(),
+    );
+    let gateway_profile = core_policy.gateway_profile;
+    if gateway_profile.is_some() {
+        eprintln!("tirith gateway: secure profile active (hardened defaults; explicit config keys still win)");
+    }
+
+    let config = match CompiledConfig::from_config_with_profile(raw_config, gateway_profile) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("tirith gateway: {e}");
@@ -646,22 +766,17 @@ pub fn run_gateway_with_options(
     let fail_mode_closed = config.policy.fail_mode == "closed";
 
     // C3a — MCP policy seam (gateway). The gateway's own `PolicyConfig` is
-    // unrelated to the core `Policy`; discover a core policy ONCE at init
-    // (OFFLINE via `discover_local_only`, which neutralizes a repo-scoped
-    // `mcp_redact_injection`), compile the operator's `injection_seeds_custom`,
-    // and read the redact flag into an `OutputFilterContext` shared with the
-    // upstream-reader thread. Built only under `--filter-output`. This is init,
-    // not the hot path, so each bad seed is reported ONCE (to stderr, the
-    // gateway's diagnostic channel) rather than silently dropped: a seed that
-    // passes `policy validate` but fails the real compile would otherwise vanish.
+    // unrelated to the core `Policy`; we already discovered the core policy ONCE
+    // above (OFFLINE via `discover_local_only`, which neutralizes a repo-scoped
+    // `mcp_redact_injection`) to read `gateway_profile`. REUSE it here: compile
+    // the operator's `injection_seeds_custom` and read the redact flag into an
+    // `OutputFilterContext` shared with the upstream-reader thread. Built only
+    // under `--filter-output`. This is init, not the hot path, so each bad seed
+    // is reported ONCE (to stderr, the gateway's diagnostic channel) rather than
+    // silently dropped: a seed that passes `policy validate` but fails the real
+    // compile would otherwise vanish.
     let filter_ctx: Arc<output_filter::OutputFilterContext> = Arc::new(if filter_output {
-        let policy = tirith_core::policy::Policy::discover_local_only(
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .as_deref(),
-        );
-        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&policy);
+        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&core_policy);
         for (pattern, error) in &bad {
             eprintln!(
                 "tirith gateway: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
@@ -2457,7 +2572,10 @@ policy:
 "#;
         let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.guarded_tools.len(), 1);
-        assert_eq!(config.policy.timeout_ms, 5000);
+        // Operator set timeout_ms explicitly; the presence-aware raw value is
+        // Some(5000) and resolves verbatim regardless of profile.
+        assert_eq!(config.policy.timeout_ms, Some(5000));
+        assert_eq!(config.policy.resolve(None).timeout_ms, 5000);
         let compiled = CompiledConfig::from_config(config).unwrap();
         assert_eq!(compiled.guarded_tools.len(), 1);
     }
@@ -2514,14 +2632,21 @@ guarded_tools:
     fn test_config_defaults() {
         let yaml = "guarded_tools: []\n";
         let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.policy.warn_action, "forward");
-        assert_eq!(config.policy.fail_mode, "open");
-        assert_eq!(config.policy.timeout_ms, 10000);
-        assert_eq!(config.policy.max_message_bytes, 1_048_576);
+        // C5a — every knob omitted, so the presence-aware raw form is all-None.
+        assert_eq!(config.policy.warn_action, None);
+        assert_eq!(config.policy.fail_mode, None);
+        assert_eq!(config.policy.timeout_ms, None);
+        // With NO profile, resolution yields the historical permissive defaults
+        // (byte-for-byte: the unnamed default config is unchanged).
+        let resolved = config.policy.resolve(None);
+        assert_eq!(resolved.warn_action, "forward");
+        assert_eq!(resolved.fail_mode, "open");
+        assert_eq!(resolved.timeout_ms, 10000);
+        assert_eq!(resolved.max_message_bytes, 1_048_576);
         // C1 — tombstone lifecycle defaults preserve the old 30s deadline and add
         // a 60s tombstone-retention window.
-        assert_eq!(config.policy.pending_timeout_ms, 30_000);
-        assert_eq!(config.policy.tombstone_retention_ms, 60_000);
+        assert_eq!(resolved.pending_timeout_ms, 30_000);
+        assert_eq!(resolved.tombstone_retention_ms, 60_000);
     }
 
     #[test]
@@ -2530,6 +2655,78 @@ guarded_tools:
         let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
         let err = CompiledConfig::from_config(config).unwrap_err();
         assert!(err.contains("pending_timeout_ms must be > 0"));
+    }
+
+    // C5a — the `secure` gateway profile fills every OMITTED knob with the
+    // hardened baseline (fail-closed, warn-as-deny, tighter message cap), while
+    // the transport/lifecycle knobs keep their built-in defaults.
+    #[test]
+    fn secure_profile_hardens_omitted_knobs() {
+        let yaml = "guarded_tools: []\n";
+        let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.policy.resolve(Some(GatewayProfile::Secure));
+        assert_eq!(resolved.warn_action, "deny", "secure: warn -> deny");
+        assert_eq!(resolved.fail_mode, "closed", "secure: fail closed");
+        assert_eq!(
+            resolved.max_message_bytes, 262_144,
+            "secure: tighter transport cap"
+        );
+        // Transport/lifecycle knobs are profile-independent.
+        assert_eq!(resolved.timeout_ms, 10_000);
+        assert_eq!(resolved.pending_timeout_ms, 30_000);
+        assert_eq!(resolved.tombstone_retention_ms, 60_000);
+    }
+
+    // C5a — an explicitly-set knob ALWAYS wins, even under the secure profile.
+    // The profile only fills knobs the operator omitted; it never overrides.
+    #[test]
+    fn secure_profile_does_not_override_explicit_knobs() {
+        let yaml = "\
+guarded_tools: []
+policy:
+  fail_mode: open
+  warn_action: forward
+  max_message_bytes: 2097152
+";
+        let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.policy.resolve(Some(GatewayProfile::Secure));
+        assert_eq!(
+            resolved.fail_mode, "open",
+            "explicit fail_mode wins over the secure baseline"
+        );
+        assert_eq!(
+            resolved.warn_action, "forward",
+            "explicit warn_action wins over the secure baseline"
+        );
+        assert_eq!(
+            resolved.max_message_bytes, 2_097_152,
+            "explicit max_message_bytes wins over the secure baseline"
+        );
+    }
+
+    // C5a — the secure profile compiles end-to-end and applies the hardened
+    // defaults through `from_config_with_profile` (the production seam).
+    #[test]
+    fn secure_profile_compiles_through_from_config() {
+        let yaml = "guarded_tools: []\n";
+        let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let compiled =
+            CompiledConfig::from_config_with_profile(config, Some(GatewayProfile::Secure)).unwrap();
+        assert_eq!(compiled.policy.fail_mode, "closed");
+        assert_eq!(compiled.policy.warn_action, "deny");
+    }
+
+    // C5a — the presence-aware raw config is strict: a typo'd knob is rejected
+    // at parse time (`deny_unknown_fields`) rather than silently ignored, so a
+    // misspelled `fail_mode` can't leave the gateway on permissive defaults.
+    #[test]
+    fn raw_policy_rejects_unknown_field() {
+        let yaml = "guarded_tools: []\npolicy:\n  fail_mod: closed\n";
+        let err = serde_yaml::from_str::<GatewayConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("fail_mod"),
+            "unknown gateway policy key must be rejected; got {err}"
+        );
     }
 
     #[test]
@@ -2543,12 +2740,14 @@ guarded_tools:
     #[test]
     fn test_embedded_gateway_config_parses_with_new_fields() {
         // The embedded default config must still deserialize + compile after the
-        // C1 fields were added (with their documented defaults).
+        // C1 fields were added (with their documented defaults). The shipped
+        // config sets these knobs EXPLICITLY, so the presence-aware raw form
+        // carries `Some(..)` and resolution returns them verbatim.
         let yaml = include_str!("../../assets/configs/tirith-gateway.yaml");
         let config: GatewayConfig =
             serde_yaml::from_str(yaml).expect("embedded gateway yaml parses");
-        assert_eq!(config.policy.pending_timeout_ms, 30_000);
-        assert_eq!(config.policy.tombstone_retention_ms, 60_000);
+        assert_eq!(config.policy.pending_timeout_ms, Some(30_000));
+        assert_eq!(config.policy.tombstone_retention_ms, Some(60_000));
         CompiledConfig::from_config(config).expect("embedded gateway yaml compiles");
     }
 
