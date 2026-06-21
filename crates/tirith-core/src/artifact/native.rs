@@ -302,15 +302,23 @@ pub struct NativeTriage {
 /// every parse path is fallible and malformed input yields
 /// [`NativeCoverage::Partial`] facts, not a panic.
 ///
-/// `known_malicious_indicator` is `true` when the CALLER has independently matched
-/// the member's SHA-256 against a known-malicious set (the fourth corroborator);
-/// pass `false` when no such lookup is wired (the lookups are DB-gated in B8/DB-D).
+/// `known_malicious_indicator` is `true` when the CALLER has independently matched the
+/// member's SHA-256 against a known-malicious set; pass `false` when no such lookup is
+/// wired (the lookups are DB-gated in B8/DB-D). `unowned` is `true` when the module's path
+/// is in NO installed RECORD - a DISTINCT corroborator with its own evidence text (it is
+/// not a hash match, and must not be reported as one).
 pub fn triage_native(
     handoff: &NativeMemberHandoff,
     known_malicious_indicator: bool,
+    unowned: bool,
 ) -> NativeTriage {
     let facts = extract_facts(handoff);
-    correlate_native(facts, handoff.location(), known_malicious_indicator)
+    correlate_native(
+        facts,
+        handoff.location(),
+        known_malicious_indicator,
+        unowned,
+    )
 }
 
 /// Extract the deterministic facts from a handoff. A buffered member is parsed in
@@ -1077,13 +1085,14 @@ fn correlate_native(
     facts: NativeFacts,
     location: &SubjectLocation,
     known_malicious: bool,
+    unowned: bool,
 ) -> NativeTriage {
     let mut signals: Vec<ArtifactSignal> = Vec::new();
     let mut edges: Vec<ExecutionEdge> = Vec::new();
 
     let has_entry = facts.has_execution_entry();
     let has_capability = facts.has_danger_capability();
-    let has_corroboration = facts.has_corroboration() || known_malicious;
+    let has_corroboration = facts.has_corroboration() || known_malicious || unowned;
 
     // Execution-entry signal (PyInit_* / constructor / mod-init / TLS-DllMain).
     // When there IS a real entry we emit the High-confidence entry signal; when
@@ -1137,7 +1146,7 @@ fn correlate_native(
         signals.push(ArtifactSignal {
             kind: ArtifactSignalKind::NativeCorroboration,
             location: location.clone(),
-            evidence: corroboration_evidence(&facts, known_malicious),
+            evidence: corroboration_evidence(&facts, known_malicious, unowned),
             confidence: EdgeConfidence::Medium,
         });
     }
@@ -1158,7 +1167,7 @@ fn correlate_native(
             mechanism: edge_mechanism(&facts),
             confidence: EdgeConfidence::High,
         });
-        Some(build_finding(&facts, location, known_malicious))
+        Some(build_finding(&facts, location, known_malicious, unowned))
     } else {
         None
     };
@@ -1234,10 +1243,15 @@ fn danger_capability_evidence(facts: &NativeFacts) -> String {
 /// Evidence text for the corroboration signal. Lists only the corroborators that
 /// actually fired (a co-located runtime launch, a co-located sibling spawn, a
 /// sensitive path, or a known-malicious indicator), not bare mentions.
-fn corroboration_evidence(facts: &NativeFacts, known_malicious: bool) -> String {
+fn corroboration_evidence(facts: &NativeFacts, known_malicious: bool, unowned: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if known_malicious {
         parts.push("known malicious indicator (hash match)".to_string());
+    }
+    // The unowned-module corroborator is NOT a hash match: its evidence must say so, or a
+    // responder would search for a threat-DB hash lookup that never happened.
+    if unowned {
+        parts.push("native module not listed in any installed RECORD".to_string());
     }
     if facts.has_runtime_launch {
         parts.push(format!(
@@ -1314,6 +1328,7 @@ fn build_finding(
     facts: &NativeFacts,
     location: &SubjectLocation,
     known_malicious: bool,
+    unowned: bool,
 ) -> Finding {
     let mut evidence: Vec<Evidence> = Vec::new();
     evidence.push(Evidence::Text {
@@ -1326,7 +1341,7 @@ fn build_finding(
         detail: danger_capability_evidence(facts),
     });
     evidence.push(Evidence::Text {
-        detail: corroboration_evidence(facts, known_malicious),
+        detail: corroboration_evidence(facts, known_malicious, unowned),
     });
     if facts.coverage == NativeCoverage::Partial {
         evidence.push(Evidence::Text {
@@ -1809,7 +1824,7 @@ mod tests {
             "a bare .py reference is not corroboration"
         );
         // And the full triage produces no Critical finding.
-        let triage = triage_native(&buffered(elf), false);
+        let triage = triage_native(&buffered(elf), false, false);
         assert!(triage.finding.is_none());
     }
 
@@ -1855,12 +1870,17 @@ mod tests {
         );
         // The corroboration evidence must NOT be empty for this 4th-path-only scenario
         // (regression: it produced "native chain corroboration: " with nothing after).
-        let evidence = corroboration_evidence(&facts, false);
+        let evidence = corroboration_evidence(&facts, false, false);
         assert!(
             evidence.len() > "native chain corroboration: ".len(),
             "the spawn-import + separate-string path must produce non-empty evidence, got {evidence:?}"
         );
-        let triage = correlate_native(facts, &SubjectLocation::member("a.whl", "m.so"), false);
+        let triage = correlate_native(
+            facts,
+            &SubjectLocation::member("a.whl", "m.so"),
+            false,
+            false,
+        );
         assert!(
             triage.finding.is_some(),
             "the import-based chain must trip Critical"
@@ -1885,7 +1905,12 @@ mod tests {
             "bare runtime/sibling without a spawn import is not corroboration"
         );
         assert!(!facts.has_danger_capability());
-        let triage = correlate_native(facts, &SubjectLocation::member("a.whl", "m.so"), false);
+        let triage = correlate_native(
+            facts,
+            &SubjectLocation::member("a.whl", "m.so"),
+            false,
+            false,
+        );
         assert!(triage.finding.is_none());
     }
 
@@ -2006,8 +2031,8 @@ mod tests {
             // The whole pipeline (extract + correlate) must not panic. We also flip
             // the known-malicious corroborator to exercise both correlation branches.
             let h = buffered(bytes.clone());
-            let _ = triage_native(&h, false);
-            let _ = triage_native(&h, true);
+            let _ = triage_native(&h, false, false);
+            let _ = triage_native(&h, true, true);
             // Exercise the streaming path too (header window + arbitrary strings).
             let stream = NativeMemberHandoff::Streaming {
                 location: SubjectLocation::member("a.whl", "m.so"),
@@ -2016,7 +2041,7 @@ mod tests {
                 header_window: bytes.clone(),
                 printable_strings: vec!["bun".into(), "execve".into(), format!("blob{i}")],
             };
-            let _ = triage_native(&stream, false);
+            let _ = triage_native(&stream, false, false);
         }
     }
 
@@ -2033,7 +2058,7 @@ mod tests {
         known_malicious: bool,
     ) -> bool {
         let elf = build_elf(exports, init_array, rodata);
-        let triage = triage_native(&buffered(elf), known_malicious);
+        let triage = triage_native(&buffered(elf), known_malicious, false);
         triage
             .finding
             .as_ref()
@@ -2062,7 +2087,7 @@ mod tests {
     fn near_miss_no_execution_entry_stays_informational() {
         // Danger + corroboration (a runtime launch) but NO execution entry.
         let elf = build_elf(&[], false, b"system(\"bun run ./loader/_index.js\")\0");
-        let triage = triage_native(&buffered(elf), false);
+        let triage = triage_native(&buffered(elf), false, false);
         assert!(
             triage.finding.is_none(),
             "no execution entry -> no Critical (stays informational signals)"
@@ -2098,7 +2123,7 @@ mod tests {
         let facts = extract_from_buffer(&elf);
         assert!(facts.has_danger_capability(), "a suspicious URL is danger");
         assert!(!facts.has_corroboration(), "but it is not corroboration");
-        let triage = triage_native(&buffered(elf), false);
+        let triage = triage_native(&buffered(elf), false, false);
         assert!(
             triage.finding.is_none(),
             "execution entry + danger but no corroboration must not trip Critical"
@@ -2124,7 +2149,7 @@ mod tests {
         // imports/strings, but nothing dangerous.
         let rodata = b"PyInit__multiarray_umath\0cblas_dgemm\0numpy.linalg\0_ARRAY_API\0";
         let elf = build_elf(&["PyInit__multiarray_umath"], true, rodata);
-        let triage = triage_native(&buffered(elf), false);
+        let triage = triage_native(&buffered(elf), false, false);
         assert!(
             triage.finding.is_none(),
             "NumPy-shaped .so must produce no Critical finding, signals only"
@@ -2173,7 +2198,7 @@ mod tests {
                 "system(\"bun run ./loader/_index.js\")".into(),
             ],
         };
-        let triage = triage_native(&stream, false);
+        let triage = triage_native(&stream, false, false);
         assert_eq!(triage.facts.coverage, NativeCoverage::Partial);
         assert_eq!(
             triage.facts.format,
@@ -2196,7 +2221,7 @@ mod tests {
         // A bare module with no entry, no capability, no corroboration: only the
         // informational presence signal, never a finding.
         let elf = build_elf(&[], false, b"plain data section\0");
-        let triage = triage_native(&buffered(elf), false);
+        let triage = triage_native(&buffered(elf), false, false);
         assert!(triage.finding.is_none());
         assert!(
             triage
@@ -2296,7 +2321,7 @@ mod tests {
         );
 
         // Triage the handoff: the chain must fire.
-        let triage = triage_native(handoff, false);
+        let triage = triage_native(handoff, false, false);
         assert_eq!(triage.facts.coverage, NativeCoverage::Full);
         assert!(
             triage
