@@ -286,18 +286,20 @@ pub fn verify_wheel_record(
                 // The member is listed; the hash must be strong AND match.
                 match &entry.hash {
                     None => {
-                        result
-                            .violations
-                            .push(WheelRecordViolation::WeakOrMissingHash {
-                                member: member.to_string(),
-                            });
+                        push_weak_or_missing_hash(
+                            &mut result,
+                            outer.as_deref(),
+                            member,
+                            "is missing",
+                        );
                     }
                     Some(hash) if !hash.is_strong() => {
-                        result
-                            .violations
-                            .push(WheelRecordViolation::WeakOrMissingHash {
-                                member: member.to_string(),
-                            });
+                        push_weak_or_missing_hash(
+                            &mut result,
+                            outer.as_deref(),
+                            member,
+                            "is weak (not a strong algorithm)",
+                        );
                     }
                     Some(hash) if hash.algorithm == "sha256" => {
                         // Compare the recorded digest to the member's actual
@@ -331,11 +333,12 @@ pub fn verify_wheel_record(
                         // `member,sha512=<bogus>,size` row clear STRICT verification
                         // with no comparison. Under strict wheel verification an
                         // UNVERIFIABLE member is a violation, not silent acceptance.
-                        result
-                            .violations
-                            .push(WheelRecordViolation::WeakOrMissingHash {
-                                member: member.to_string(),
-                            });
+                        push_weak_or_missing_hash(
+                            &mut result,
+                            outer.as_deref(),
+                            member,
+                            "uses an unverifiable algorithm (only sha256 is checkable)",
+                        );
                     }
                 }
             }
@@ -360,6 +363,14 @@ pub fn verify_wheel_record(
                 .push(WheelRecordViolation::RecordPathNotPresent {
                     path: entry.path.clone(),
                 });
+            // Emit a signal too, so the ghost-path violation reaches upstream
+            // correlation (the contract is "emit signals, not findings").
+            result.signals.push(signal(
+                ArtifactSignalKind::RecordMissingFile,
+                member_location(outer.as_deref(), &entry.path),
+                format!("RECORD lists '{}' which is not a wheel member", entry.path),
+                EdgeConfidence::High,
+            ));
         }
     }
 
@@ -417,6 +428,30 @@ fn signal(
         evidence,
         confidence,
     }
+}
+
+/// Record a weak / missing / unverifiable RECORD hash as BOTH a violation and a
+/// signal. The module contract is that these verifiers emit SIGNALS (not findings),
+/// so a violation with no matching signal is silently dropped by upstream
+/// correlation; an unverifiable hash is, for correlation, a hash that cannot be
+/// trusted -> `RecordHashMismatch`.
+fn push_weak_or_missing_hash(
+    result: &mut WheelRecordResult,
+    outer: Option<&str>,
+    member: &str,
+    reason: &str,
+) {
+    result
+        .violations
+        .push(WheelRecordViolation::WeakOrMissingHash {
+            member: member.to_string(),
+        });
+    result.signals.push(signal(
+        ArtifactSignalKind::RecordHashMismatch,
+        member_location(outer, member),
+        format!("wheel member '{member}' RECORD hash {reason}"),
+        EdgeConfidence::High,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1130,12 @@ mod tests {
             .violations
             .iter()
             .any(|v| matches!(v, WheelRecordViolation::WeakOrMissingHash { .. })));
+        // The weak hash must ALSO emit a signal (the contract is signals, not
+        // findings), so upstream correlation does not silently drop it.
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| s.kind == ArtifactSignalKind::RecordHashMismatch));
     }
 
     #[test]

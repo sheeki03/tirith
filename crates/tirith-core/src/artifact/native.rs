@@ -672,6 +672,33 @@ const SPAWN_TOKENS: &[&str] = &[
     "winexec",
 ];
 
+/// Spawn tokens safe to match as a co-occurring WORD inside a rodata string. This
+/// excludes the plain English words "system" and "fork" from [`SPAWN_TOKENS`]: as
+/// bare words they appear in benign error strings ("system error: cannot find x.py",
+/// "fork the repo"), so matching them that way co-located with a `.py` sibling
+/// produced false-positive Critical findings. The caller still matches `system(` /
+/// `fork(` (the CALL form) separately, so a real `system("bun run x")` fires; and
+/// both remain in [`SPAWN_TOKENS`] for IMPORT classification, where an imported
+/// `system`/`fork` symbol is a real signal.
+const SPAWN_VERB_TOKENS: &[&str] = &[
+    "execve",
+    "execl",
+    "execlp",
+    "execvp",
+    "execvpe",
+    "posix_spawn",
+    "posix_spawnp",
+    "popen",
+    "vfork",
+    "createprocessa",
+    "createprocessw",
+    "createprocess",
+    "shellexecutea",
+    "shellexecutew",
+    "shellexecute",
+    "winexec",
+];
+
 /// Dynamic-code-loading API names, matched as IMPORTED symbols. `dlopen`/`dlsym` on
 /// POSIX, `LoadLibrary`/`GetProcAddress` on Windows. (`mprotect`/`VirtualProtect`
 /// are deliberately EXCLUDED: many benign extensions legitimately use them, so they
@@ -820,7 +847,12 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     let lower = s.to_ascii_lowercase();
 
     // Does THIS string contain a spawn/exec verb? (used for the co-occurrence legs.)
-    let has_spawn_verb = SPAWN_TOKENS.iter().any(|t| contains_word(&lower, t));
+    // Distinctive spawn tokens match as a word; the plain English words "system" and
+    // "fork" match ONLY as a call (`system(`/`fork(`), so a real `system("bun run x")`
+    // fires but benign prose ("system error: cannot find x.py") does not.
+    let has_spawn_verb = SPAWN_VERB_TOKENS.iter().any(|t| contains_word(&lower, t))
+        || lower.contains("system(")
+        || lower.contains("fork(");
 
     // Runtime names present in this string.
     let mut runtimes_here: Vec<&str> = Vec::new();
@@ -864,9 +896,11 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
     // Embedded URL. A benign homepage/license URL does NOT count as danger; only a
     // SUSPICIOUS shape (IP literal host / non-standard port / raw-content host) sets
     // `has_suspicious_url`. The full URL is still recorded for evidence.
+    // Scan ALL scheme occurrences, not just the first: a benign leading URL must not
+    // mask a suspicious one later in the same string.
     if facts.embedded_urls.len() < caps::MAX_URLS {
-        for scheme in ["http://", "https://", "ftp://"] {
-            if let Some(pos) = lower.find(scheme) {
+        'scheme: for scheme in ["http://", "https://", "ftp://"] {
+            for (pos, _) in lower.match_indices(scheme) {
                 let tail = &s[pos.min(s.len())..];
                 let url: String = tail
                     .chars()
@@ -879,7 +913,9 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
                     }
                     facts.embedded_urls.insert(url);
                 }
-                break;
+                if facts.embedded_urls.len() >= caps::MAX_URLS {
+                    break 'scheme;
+                }
             }
         }
     }
@@ -1813,6 +1849,34 @@ mod tests {
         assert!(!facts.has_danger_capability());
         let triage = correlate_native(facts, &SubjectLocation::member("a.whl", "m.so"), false);
         assert!(triage.finding.is_none());
+    }
+
+    /// The English word "system" co-located with a `.py` sibling in one benign error
+    /// string must NOT fire the spawn-with-sibling leg ("system" is only a spawn
+    /// signal as an IMPORTED symbol, not as a string word).
+    #[test]
+    fn benign_extension_system_error_string_with_py_sibling_is_clean() {
+        let mut facts = NativeFacts::default();
+        scan_one_string("system error: cannot find helper.py", &mut facts);
+        assert!(
+            !facts.has_spawn_with_sibling,
+            "the English word 'system' must not count as a string spawn verb"
+        );
+    }
+
+    /// A benign leading URL must not mask a suspicious URL later in the SAME string:
+    /// every scheme occurrence is scanned, not just the first.
+    #[test]
+    fn second_suspicious_url_in_one_string_sets_flag() {
+        let mut facts = NativeFacts::default();
+        scan_one_string(
+            "http://docs.example.org/ https://198.51.100.1:4444/stage2",
+            &mut facts,
+        );
+        assert!(
+            facts.has_suspicious_url,
+            "the suspicious second URL must be detected"
+        );
     }
 
     #[test]

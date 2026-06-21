@@ -100,7 +100,11 @@ pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 /// WHAT was inspected. The subject is separated from per-file detail and from
 /// any policy decision: it identifies the thing, nothing more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "subject", content = "identity")]
+// `tag = "kind"` (not "subject"): this enum is itself the value of the `subject`
+// field on `ArtifactInspection`, so tagging it "subject" produced a confusing
+// `{"subject":{"subject":...}}` wire shape. `kind` matches the house convention used
+// by the other tagged enums in this crate.
+#[serde(rename_all = "snake_case", tag = "kind", content = "identity")]
 pub enum InspectionSubject {
     /// A distributable artifact (a wheel or sdist) with a known content hash.
     Artifact(ArtifactIdentity),
@@ -437,6 +441,11 @@ pub struct InspectionCoverage {
 
 impl InspectionCoverage {
     /// Whether every member was inspected and no gap was recorded.
+    ///
+    /// A default (`0`/`0`) coverage reports complete BY CONSTRUCTION: an unmeasured
+    /// skeleton has no gaps and `0 == 0`, matching `new()`'s "full coverage until an
+    /// analyzer records otherwise" contract. Analyzers set real totals before relying
+    /// on this, so it is not "vacuously true" in any path that actually consults it.
     pub fn is_complete(&self) -> bool {
         debug_assert!(
             self.members_inspected <= self.members_total,
@@ -658,8 +667,37 @@ mod tests {
     /// wrong-ecosystem fallback.
     #[test]
     fn unknown_ecosystem_fails_to_deserialize() {
-        let json = r#"{"subject":"artifact","identity":{"ecosystem":"not-a-real-ecosystem","name":"x","filename":"x.whl","sha256":"00"}}"#;
+        let json = r#"{"kind":"artifact","identity":{"ecosystem":"not-a-real-ecosystem","name":"x","filename":"x.whl","sha256":"00"}}"#;
         assert!(serde_json::from_str::<InspectionSubject>(json).is_err());
+    }
+
+    /// The `InspectionSubject` tag serializes as `kind` (not `subject`), so the wire
+    /// shape is `{"subject":{"kind":...}}`, not the confusing `{"subject":{"subject"`.
+    #[test]
+    fn serialized_subject_uses_kind_tag() {
+        let json = r#"{"kind":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}"#;
+        let subject: InspectionSubject = serde_json::from_str(json).unwrap();
+        let back = serde_json::to_string(&subject).unwrap();
+        assert!(
+            back.contains(r#""kind":"generic_archive""#),
+            "tag must serialize as `kind`: {back}"
+        );
+        assert!(
+            !back.contains(r#""subject""#),
+            "the enum tag must not be `subject`: {back}"
+        );
+    }
+
+    /// A default (0/0) coverage is complete BY CONSTRUCTION (the documented contract,
+    /// so the 0/0 case is not later mistaken for a bug).
+    #[test]
+    fn default_coverage_is_complete_by_construction() {
+        let cov = InspectionCoverage {
+            members_inspected: 0,
+            members_total: 0,
+            gaps: Vec::new(),
+        };
+        assert!(cov.is_complete());
     }
 
     /// A value written before `schema_version` existed (it is absent from the
@@ -668,7 +706,7 @@ mod tests {
     fn missing_schema_version_defaults() {
         // The `subject` field wraps the adjacently-tagged `InspectionSubject`,
         // and `schema_version` is omitted entirely so the serde default fills it.
-        let json = r#"{"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
+        let json = r#"{"subject":{"kind":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
         let back: ArtifactInspection = serde_json::from_str(json).unwrap();
         assert_eq!(back.schema_version, ARTIFACT_SCHEMA_VERSION);
     }
@@ -678,11 +716,11 @@ mod tests {
     /// inspection is not silently trusted; the current version validates.
     #[test]
     fn inspection_rejects_unknown_schema_version() {
-        let newer = r#"{"schema_version":999,"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
+        let newer = r#"{"schema_version":999,"subject":{"kind":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
         let bad: ArtifactInspection = serde_json::from_str(newer).unwrap();
         assert!(bad.check_schema().is_err());
 
-        let current = r#"{"subject":{"subject":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
+        let current = r#"{"subject":{"kind":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
         let good: ArtifactInspection = serde_json::from_str(current).unwrap();
         assert!(good.check_schema().is_ok());
     }

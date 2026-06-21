@@ -1092,8 +1092,16 @@ impl ThreatDb {
                 reason: UnresolvedReason::UnspecifiedVersion,
                 affected_versions: affected,
             },
-            VersionIntent::Constraint { parsed, .. } => {
+            VersionIntent::Constraint { parsed, raw } => {
                 let Some(constraint) = parsed else {
+                    // Raw-token exact fallback: an explicit-but-unparseable token (a Docker
+                    // digest, a dist-tag like `latest`, a non-semver selector) still names a
+                    // concrete identity. If it LITERALLY equals an affected version that is a
+                    // definite malicious hit, not an unresolved guess, so return ExactMatch
+                    // rather than downgrading a known-bad pin to a Medium warning.
+                    if rec.versions.iter().any(|rv| rv == raw) {
+                        return PackageThreatAssessment::ExactMatch(summary);
+                    }
                     return PackageThreatAssessment::Unresolved {
                         summary,
                         reason: UnresolvedReason::ConstraintUnsupported,
@@ -3281,6 +3289,41 @@ mod tests {
             }
             other => panic!("expected ExactMatch for `==1.4` vs `1.4.0`, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn constraint_unparsed_raw_token_exact_match_is_malicious() {
+        // A non-semver token (a dist-tag like `latest`) is preserved as
+        // Constraint{parsed:None,raw}. If it LITERALLY equals an affected version it
+        // is a definite malicious hit (ExactMatch), not a downgraded warn.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "tagged-evil",
+            &["latest"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let hit = crate::version_intent::VersionIntent::Constraint {
+            parsed: None,
+            raw: "latest".to_string(),
+        };
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "tagged-evil", &hit),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        let miss = crate::version_intent::VersionIntent::Constraint {
+            parsed: None,
+            raw: "sha256:beef".to_string(),
+        };
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "tagged-evil", &miss),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
     }
 
     #[test]
