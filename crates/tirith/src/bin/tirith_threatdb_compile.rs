@@ -1542,15 +1542,16 @@ mod tests {
             Confidence::Medium
         );
 
-        // An unrecognized type on a non-MAL id falls back to Medium (and emits a
-        // warning that surfaces the new type); a MAL- id still wins over it.
+        // An unrecognized but PRESENT type falls back to Medium and emits a warning,
+        // for BOTH a non-MAL and a MAL- id: an explicit (if unrecognized) type takes
+        // precedence, so MAL- promotion applies only to TYPELESS records (tested above).
         assert_eq!(
             ossf_confidence("OSV-2025-0002", Some("BRAND_NEW_TYPE")),
             Confidence::Medium
         );
         assert_eq!(
             ossf_confidence("MAL-2026-9999", Some("BRAND_NEW_TYPE")),
-            Confidence::Confirmed
+            Confidence::Medium
         );
     }
 
