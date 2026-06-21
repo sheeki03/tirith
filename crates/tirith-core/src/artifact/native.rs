@@ -871,13 +871,18 @@ fn scan_one_string(s: &str, facts: &mut NativeFacts) {
         }
     }
 
-    // Sibling script/executable references in this string.
+    // Sibling script/executable references in this string. `sibling_here` is computed
+    // UNCONDITIONALLY (mirroring `runtimes_here` above) so the spawn+sibling
+    // co-occurrence check still fires after the storage cap is hit; only the STORAGE is
+    // capped. Otherwise a crafted binary could pad 256 benign sibling names early to
+    // silently disable the spawn+sibling leg for every later string (e.g. a later
+    // `execvp("./payload.js", ...)`).
     let mut sibling_here = false;
-    if facts.sibling_refs.len() < caps::MAX_SIBLING_REFS {
-        for ext in SIBLING_EXTENSIONS {
-            if let Some(reference) = sibling_reference(s, &lower, ext) {
+    for ext in SIBLING_EXTENSIONS {
+        if let Some(reference) = sibling_reference(s, &lower, ext) {
+            sibling_here = true;
+            if facts.sibling_refs.len() < caps::MAX_SIBLING_REFS {
                 facts.sibling_refs.insert(reference);
-                sibling_here = true;
             }
         }
     }
