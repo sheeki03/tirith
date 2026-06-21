@@ -250,6 +250,13 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
         tirith_core::verdict::Timings::default(),
     );
 
+    // The verdict's own exit code, computed up front so a write failure can preserve it.
+    let code = match verdict.action {
+        Action::Block => 1,
+        Action::Warn | Action::WarnAck => 2,
+        Action::Allow => 0,
+    };
+
     let output_ok = if json {
         print_inspect_json(&set, &verdict)
     } else {
@@ -257,14 +264,13 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
         true
     };
 
+    // A write failure must not DOWNGRADE a Warn (2) into a block-grade 1, nor pass a
+    // clean scan off as success: surface the verdict's own non-zero code, or 1 when the
+    // scan was clean (mirrors the ecosystem.rs write-failure path).
     if !output_ok {
-        return 1;
+        return if code == 0 { 1 } else { code };
     }
-    match verdict.action {
-        Action::Block => 1,
-        Action::Warn | Action::WarnAck => 2,
-        Action::Allow => 0,
-    }
+    code
 }
 
 /// JSON output for `package inspect`: the verdict (with member-qualified finding
