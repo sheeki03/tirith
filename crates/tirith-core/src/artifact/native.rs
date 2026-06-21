@@ -1257,6 +1257,31 @@ fn corroboration_evidence(facts: &NativeFacts, known_malicious: bool) -> String 
             joined(&facts.sensitive_paths, 4)
         ));
     }
+    // The fourth has_corroboration path: a spawn/loader-import symbol alongside a runtime
+    // name or sibling-payload reference carried as SEPARATE rodata strings (paths 1-2 cover
+    // the co-located-in-one-string case). Without this branch that path yields an empty
+    // evidence body, leaving a responder (or triage tooling) with "native chain
+    // corroboration: " and nothing after the colon.
+    if facts.has_spawn_or_loader_import()
+        && !facts.has_runtime_launch
+        && !facts.has_spawn_with_sibling
+        && (!facts.runtime_names.is_empty() || !facts.sibling_refs.is_empty())
+    {
+        let mut bits: Vec<String> = Vec::new();
+        if !facts.runtime_names.is_empty() {
+            bits.push(format!("runtime {}", joined(&facts.runtime_names, 4)));
+        }
+        if !facts.sibling_refs.is_empty() {
+            bits.push(format!(
+                "sibling/payload {}",
+                joined(&facts.sibling_refs, 4)
+            ));
+        }
+        parts.push(format!(
+            "spawn/loader import co-occurs with a {} string",
+            bits.join(" and a ")
+        ));
+    }
     format!("native chain corroboration: {}", parts.join("; "))
 }
 
@@ -1827,6 +1852,13 @@ mod tests {
         assert!(
             facts.has_corroboration(),
             "a real spawn import + a bare runtime/sibling is corroboration"
+        );
+        // The corroboration evidence must NOT be empty for this 4th-path-only scenario
+        // (regression: it produced "native chain corroboration: " with nothing after).
+        let evidence = corroboration_evidence(&facts, false);
+        assert!(
+            evidence.len() > "native chain corroboration: ".len(),
+            "the spawn-import + separate-string path must produce non-empty evidence, got {evidence:?}"
         );
         let triage = correlate_native(facts, &SubjectLocation::member("a.whl", "m.so"), false);
         assert!(

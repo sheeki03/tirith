@@ -945,9 +945,16 @@ fn detect_externally_managed(dist_info_dir: &Path, layout: &EnvironmentLayout) -
     // `<dist-info>/INSTALLER` naming a non-pip installer (conda, distro tools).
     let installer = dist_info_dir.join("INSTALLER");
     if let Ok(bytes) = crate::util::read_text_no_follow_capped(&installer, 4096) {
-        let who = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
-        if !who.is_empty() && who != "pip" {
-            return true;
+        // STRICT from_utf8 (not lossy): a non-UTF-8 INSTALLER is damaged/unreadable, NOT a
+        // valid installer name. Lossy substitution would make any non-UTF-8 byte read as a
+        // non-"pip" installer -> falsely "externally managed" -> SKIP the integrity check,
+        // a bypass an attacker could force with a single byte. An unreadable INSTALLER
+        // falls through to `false` (integrity still runs), matching RECORD / METADATA.
+        if let Ok(text) = String::from_utf8(bytes) {
+            let who = text.trim().to_ascii_lowercase();
+            if !who.is_empty() && who != "pip" {
+                return true;
+            }
         }
     }
     // A PEP 668 `EXTERNALLY-MANAGED` marker at the environment prefix (one level
