@@ -325,9 +325,16 @@ fn npm_partial_xrange(v: &str) -> Option<String> {
         .split('.')
         .map(|s| s.parse::<u64>().ok())
         .collect::<Option<_>>()?;
+    // `checked_add` so a pathological segment (`18446744073709551615`) returns None
+    // (treated as an exact pin) instead of overflowing: a panic in debug, or a bogus
+    // `>=MAX,<0` range in release that would never match.
     match nums.as_slice() {
-        [major] => Some(format!(">={major}.0.0,<{}.0.0", major + 1)),
-        [major, minor] => Some(format!(">={major}.{minor}.0,<{major}.{}.0", minor + 1)),
+        [major] => major
+            .checked_add(1)
+            .map(|hi| format!(">={major}.0.0,<{hi}.0.0")),
+        [major, minor] => minor
+            .checked_add(1)
+            .map(|hi| format!(">={major}.{minor}.0,<{major}.{hi}.0")),
         _ => None,
     }
 }
@@ -2777,6 +2784,11 @@ git+https://github.com/x/y.git
         assert_eq!(
             npm_manifest_intent("1.2.3"),
             VersionIntent::Exact("1.2.3".to_string())
+        );
+        // A pathological u64::MAX segment must not overflow: it stays an exact pin.
+        assert_eq!(
+            npm_manifest_intent("18446744073709551615"),
+            VersionIntent::Exact("18446744073709551615".to_string())
         );
     }
 
