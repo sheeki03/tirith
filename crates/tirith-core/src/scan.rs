@@ -1190,9 +1190,13 @@ pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
     if is_priority_file(path) {
         return true;
     }
+    // `to_string_lossy` (not `to_str`): a non-UTF-8 file name (`café.so` carrying raw
+    // Latin-1 bytes) must still match by its ASCII extension. `to_str().unwrap_or_default()`
+    // would yield "" and let a security-relevant `.so`/`.dylib` gap slip past the
+    // extension gate; lossy conversion preserves the ASCII extension exactly.
     let name = path
         .file_name()
-        .and_then(|n| n.to_str())
+        .map(|n| n.to_string_lossy())
         .unwrap_or_default()
         .to_lowercase();
     if SECURITY_RELEVANT_EXTENSIONS
@@ -1835,6 +1839,25 @@ mod tests {
         assert_eq!(
             classify_collected_path(std::path::Path::new(name)),
             CollectedFileKind::ArtifactCandidate
+        );
+    }
+
+    /// A coverage gap whose path is a non-UTF-8 artifact name (`café.so`) is still
+    /// security-relevant: the extension gate must read the name lossily, not drop it to
+    /// "" via `to_str` and let it slip past `require_complete` (CodeRabbit #152).
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_gap_path_is_security_relevant() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.so"); // invalid UTF-8 + .so
+        let gap = CoverageGap {
+            location: SubjectLocation::from_path(std::path::Path::new(name)),
+            kind: CoverageGapKind::Unsupported,
+            sha256: None,
+        };
+        assert!(
+            gap_is_security_relevant(&gap),
+            "a non-UTF-8 .so gap must be security-relevant"
         );
     }
 

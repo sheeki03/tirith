@@ -300,7 +300,13 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
     Some(PackageRef {
         ecosystem: Ecosystem::Npm,
         name: name.to_string(),
-        version: intent_from_opt_token(version),
+        // npm treats a bare PARTIAL version as an X-range (`lodash@4` == `4.x`), so
+        // classify the CLI spec the same way the manifest path does instead of a bogus
+        // `Exact("4")` that would miss a threat record for the resolved `4.17.21`.
+        version: match version {
+            Some(v) => crate::ecosystem_scan::npm_manifest_intent(v),
+            None => VersionIntent::Unspecified,
+        },
     })
 }
 
