@@ -472,6 +472,14 @@ impl QuarantineTransaction {
         &self.dir
     }
 
+    /// The store this transaction belongs to, so the resolver (D2) can ingest a
+    /// freshly downloaded wheel as a content-addressed blob while holding the
+    /// transaction's lease. The store is a cheap handle clone; the lease that
+    /// guards the install is this transaction value's lifetime, not the store's.
+    pub fn store(&self) -> &QuarantineStore {
+        &self.store
+    }
+
     /// Copy the blob `digest` into this transaction under `filename`, returning the
     /// published path. `filename` must be a single safe `*.whl` component. The copy
     /// is an INDEPENDENT immutable file (no shared inode with the blob): the bytes

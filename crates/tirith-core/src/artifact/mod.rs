@@ -98,6 +98,15 @@ pub mod inspect;
 /// GC. The store the D3 inspection and D4 install-from-digest stand on.
 pub mod quarantine;
 
+/// Hash-locked Python wheel resolver for the package firewall (PR D2): turn
+/// requirement specs into a fully hash-pinned lock
+/// (`uv pip compile --generate-hashes --no-build`), download only the pinned,
+/// binary-only wheels (`python -m pip download --only-binary=:all:
+/// --require-hashes`) into the D1 quarantine, and refuse sdist / VCS / editable /
+/// local-path / direct-URL / credentialed-index / repo-config inputs. The
+/// controlled-network step D3 inspection and D4 install-from-digest stand on.
+pub mod resolver;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
