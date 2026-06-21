@@ -1364,7 +1364,7 @@ fn main() {
     for url in &ossf_indicators.urls {
         let normalized = url.trim();
         if !normalized.is_empty() {
-            writer.add_malicious_url(normalized, ThreatSource::ExfilEndpoint);
+            writer.add_malicious_url(normalized, ThreatSource::OssfMalicious);
             v2_url_count += 1;
         }
     }
@@ -1789,7 +1789,7 @@ mod tests {
             }
         }
         for url in &indicators.urls {
-            writer.add_malicious_url(url.trim(), ThreatSource::ExfilEndpoint);
+            writer.add_malicious_url(url.trim(), ThreatSource::OssfMalicious);
         }
 
         let v2 = writer
@@ -1808,7 +1808,7 @@ mod tests {
         // The ioc URL resolves; a non-listed URL does not.
         assert_eq!(
             db.check_malicious_url("http://sfrclak.com:8000/6202033"),
-            Some(ThreatSource::ExfilEndpoint)
+            Some(ThreatSource::OssfMalicious)
         );
         assert!(db
             .check_malicious_url("http://not-listed.example/x")

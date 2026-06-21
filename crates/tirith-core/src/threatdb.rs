@@ -2044,14 +2044,13 @@ fn path_mtime_epoch(path: &Path) -> Option<u64> {
 /// extension with `-v2.dat`, falling back to appending `-v2` for any other name.
 fn v2_sibling(path: &Path) -> PathBuf {
     if path.extension().and_then(|e| e.to_str()) == Some("dat") {
-        let mut s = path.as_os_str().to_os_string();
-        // Strip ".dat" (4 bytes) and append "-v2.dat".
-        let lossy = s.to_string_lossy();
-        if let Some(stem) = lossy.strip_suffix(".dat") {
-            return PathBuf::from(format!("{stem}-v2.dat"));
+        // Strip the ".dat" extension and append "-v2.dat", operating on the OsStr so
+        // a non-UTF-8 filename is not corrupted by a lossy string conversion.
+        if let Some(stem) = path.file_stem() {
+            let mut name = stem.to_os_string();
+            name.push("-v2.dat");
+            return path.with_file_name(name);
         }
-        s.push("-v2");
-        return PathBuf::from(s);
     }
     let mut s = path.as_os_str().to_os_string();
     s.push("-v2");
@@ -4258,6 +4257,16 @@ mod tests {
             v2_sibling(Path::new("/x/custom.bin")),
             PathBuf::from("/x/custom.bin-v2")
         );
+        // A non-UTF-8 `.dat` filename keeps its raw bytes (no lossy corruption).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/x/\xff-threatdb.dat");
+            assert_eq!(
+                v2_sibling(Path::new(raw)),
+                PathBuf::from(std::ffi::OsStr::from_bytes(b"/x/\xff-threatdb-v2.dat"))
+            );
+        }
     }
 
     #[test]
