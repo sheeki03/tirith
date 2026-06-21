@@ -266,8 +266,6 @@ const SUBPROCESS_TOKENS: &[&str] = &[
     "popen(",
     "check_output",
     "check_call",
-    "call(",
-    "run(",
 ];
 
 /// Network-capability tokens.
@@ -562,7 +560,12 @@ fn is_untrusted_path(path: &str) -> bool {
 
     // World/temp-writable absolute roots.
     const TEMP_ROOTS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/private/tmp/"];
-    if TEMP_ROOTS.iter().any(|r| lower.starts_with(r)) || lower == "/tmp" || lower == "/var/tmp" {
+    if TEMP_ROOTS.iter().any(|r| lower.starts_with(r))
+        || lower == "/tmp"
+        || lower == "/var/tmp"
+        || lower == "/dev/shm"
+        || lower == "/private/tmp"
+    {
         return true;
     }
     // Windows temp / public dirs.
@@ -847,6 +850,17 @@ mod tests {
         assert!(caps.has_danger());
     }
 
+    /// A bare `.run(...)`/`.call(...)` method call is NOT a subprocess spawn: a
+    /// benign `import my_runner; my_runner.run()` must not be a false-positive Block
+    /// (the real subprocess APIs are covered by os.system/subprocess./popen/etc.).
+    #[test]
+    fn run_paren_method_call_is_not_subprocess() {
+        assert!(!scan_capabilities("import my_runner; my_runner.run(config)").subprocess);
+        assert!(!scan_capabilities("import m; m.call(a, b)").subprocess);
+        // The genuine API is still detected.
+        assert!(scan_capabilities("import os; os.system('id')").subprocess);
+    }
+
     #[test]
     fn aliased_subprocess_is_detected() {
         // The deobfuscate pass does not resolve aliases, but the substring scan
@@ -958,6 +972,9 @@ mod tests {
         assert!(is_untrusted_path("/tmp/attacker"));
         assert!(is_untrusted_path("/var/tmp/x"));
         assert!(is_untrusted_path("/dev/shm/y"));
+        // Bare temp roots (no trailing slash) are untrusted too.
+        assert!(is_untrusted_path("/dev/shm"));
+        assert!(is_untrusted_path("/private/tmp"));
     }
 
     #[test]

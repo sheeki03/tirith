@@ -2643,7 +2643,8 @@ impl InstalledIntegrityReport {
                 title: "A Python startup hook launches a different language runtime".to_string(),
                 description:
                     "An installed Python startup hook launches a separate language runtime \
-                     (Bun, Node, or Deno) at interpreter start. This is the cross-distribution \
+                     (Bun, Node, Deno, npm, or npx) at interpreter start. This is the \
+                     cross-distribution \
                      loader/payload split used by the live supply-chain campaign, where a Python \
                      .pth hands execution to a bundled JavaScript payload. The detection keys on \
                      the launched runtime name, not the payload filename, so renaming the script \
