@@ -304,7 +304,7 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
 /// bare version (`1.2.3`) as an exact pin but a PARTIAL bare version as an X-range
 /// (`1` == `1.x.x`, `1.2` == `1.2.x`); explicit operators stay unresolved. This
 /// keeps a partial spec from being mistaken for a too-narrow exact match.
-fn npm_manifest_intent(spec: &str) -> VersionIntent {
+pub(crate) fn npm_manifest_intent(spec: &str) -> VersionIntent {
     match VersionIntent::from_explicit_version(spec) {
         VersionIntent::Exact(v) => match npm_partial_xrange(&v) {
             Some(range) => VersionIntent::from_pep440_specifier(&range),

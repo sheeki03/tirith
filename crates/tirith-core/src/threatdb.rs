@@ -1063,21 +1063,41 @@ impl ThreatDb {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
+        // A malicious record with NO affected versions (and not all-versions-malicious)
+        // gives nothing to match against or exclude, so NO intent can be proven a hit
+        // or an exclusion: it is Unresolved, never a silent NoRecord/clean.
+        if rec.versions.is_empty() {
+            return PackageThreatAssessment::Unresolved {
+                summary,
+                reason: UnresolvedReason::AffectedVersionUnparsed,
+                affected_versions: affected,
+            };
+        }
+
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                // Match on a literal string equal OR a numeric release equal, so
-                // a pin like `==1.4` still hits a record listing `1.4.0`. The
-                // numeric arm only fires when both sides parse as plain release
-                // versions; anything else (prereleases, locals) relies on the
-                // literal compare and falls through to NoRecord when it differs.
-                // Compare via `cmp` (not `==`): only `Ord` treats trailing-zero
-                // segments as equal, so `1.4` and `1.4.0` match here.
+                // Match on a literal string equal OR a numeric release equal, so a pin
+                // like `==1.4` still hits a record listing `1.4.0`. A PEP 440 LOCAL
+                // version (`1.0+ubuntu1`) ALSO matches a record for its base (`1.0`): a
+                // local build is a rebuild of the base release, so a malicious upstream
+                // is not missed, while an exact local record (`1.0+ubuntu1`) still
+                // matches via the literal compare. Compare via `cmp` (not `==`): only
+                // `Ord` treats trailing-zero segments as equal, so `1.4` == `1.4.0`.
+                let v_s: &str = v;
+                let base: &str = v_s.split('+').next().unwrap_or(v_s);
                 let matched = rec.versions.iter().any(|rv| {
-                    rv == v
+                    let rv: &str = rv;
+                    rv == v_s
                         || matches!(
-                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v)),
+                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v_s)),
                             (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
                         )
+                        || (base != v_s
+                            && (rv == base
+                                || matches!(
+                                    (ReleaseVersion::parse(rv), ReleaseVersion::parse(base)),
+                                    (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
+                                )))
                 });
                 if matched {
                     PackageThreatAssessment::ExactMatch(summary)
@@ -1123,16 +1143,6 @@ impl ThreatDb {
                             };
                         }
                     }
-                }
-                // A version-specific malicious record with NO affected versions gives
-                // us nothing to test the constraint against, so we cannot claim the
-                // constraint excludes it; stay unresolved rather than silently clean.
-                if parsed_affected.is_empty() {
-                    return PackageThreatAssessment::Unresolved {
-                        summary,
-                        reason: UnresolvedReason::AffectedVersionUnparsed,
-                        affected_versions: affected,
-                    };
                 }
                 let intersecting: Vec<String> = parsed_affected
                     .iter()
@@ -3357,6 +3367,50 @@ mod tests {
         assert!(matches!(
             db.assess_package(Ecosystem::Npm, "no-versions-evil", &constraint),
             PackageThreatAssessment::Unresolved { .. }
+        ));
+        // The guard runs BEFORE the intent match, so an Exact request is Unresolved too
+        // (not a silent NoRecord that would drop the malicious finding entirely).
+        let exact = crate::version_intent::VersionIntent::Exact("1.0".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "no-versions-evil", &exact),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_local_version_matches_base_record() {
+        // A PEP 440 local version (`1.0+ubuntu1`) is a rebuild of its base `1.0`: a
+        // record listing the malicious base must still hard-match the local pin, and an
+        // exact-local record must match literally. Neither may downgrade to Unresolved.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "base-evil",
+            &["1.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        writer.add_package(
+            Ecosystem::Npm,
+            "exact-local-evil",
+            &["1.0+ubuntu1"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let local = crate::version_intent::VersionIntent::Exact("1.0+ubuntu1".to_string());
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "base-evil", &local),
+            PackageThreatAssessment::ExactMatch(_)
+        ));
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "exact-local-evil", &local),
+            PackageThreatAssessment::ExactMatch(_)
         ));
     }
 
