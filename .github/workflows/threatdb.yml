@@ -99,6 +99,15 @@ jobs:
           if [ -f /tmp/exfil-endpoints.txt ]; then
             EXFIL_ARG="--exfil-endpoints /tmp/exfil-endpoints.txt"
           fi
+          # Compile the v2 asset ONLY when PUBLISH_V2 is on. The v1 asset + legacy
+          # manifest must NEVER be gated by a v2-side failure, so a v2 compilation
+          # regression (or an older binary lacking --output-v2 after a rollback) must not
+          # fail this step and stop v1 updates. With the kill-switch off, the v2 publish/
+          # commit steps below are skipped too, so the asset is not needed.
+          V2_ARG=""
+          if [ "${PUBLISH_V2}" = "true" ]; then
+            V2_ARG="--output-v2 tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          fi
           ./target/release/tirith-threatdb-compile \
             --ossf /tmp/ossf-mp \
             --datadog /tmp/dd-mp \
@@ -108,7 +117,7 @@ jobs:
             --sequence "${RUN_ID}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
             --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat" \
-            --output-v2 "tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat"
+            $V2_ARG
 
       # Generate + sign manifest for client discovery
       - name: Generate signed manifest
