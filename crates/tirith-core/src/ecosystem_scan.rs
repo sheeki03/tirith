@@ -281,10 +281,11 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
                     continue;
                 }
                 let version = match ver.as_str().filter(|s| !s.is_empty()) {
-                    // package.json declares a semver range/version (not parsed
-                    // for npm); a plain version is an exact pin, a range stays
-                    // unresolved.
-                    Some(v) => VersionIntent::from_explicit_version(v),
+                    // package.json declares a semver range/version (not fully
+                    // parsed for npm). A full bare version (`1.2.3`) is an exact
+                    // pin; a PARTIAL bare version (`1`, `1.2`) is an X-range, not
+                    // a too-narrow exact; explicit ranges stay unresolved.
+                    Some(v) => npm_manifest_intent(v),
                     None => VersionIntent::Unspecified,
                 };
                 out.push(DeclaredDependency {
@@ -297,6 +298,38 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
         }
     }
     Some(out)
+}
+
+/// Classify an npm `package.json` version requirement. node-semver treats a full
+/// bare version (`1.2.3`) as an exact pin but a PARTIAL bare version as an X-range
+/// (`1` == `1.x.x`, `1.2` == `1.2.x`); explicit operators stay unresolved. This
+/// keeps a partial spec from being mistaken for a too-narrow exact match.
+fn npm_manifest_intent(spec: &str) -> VersionIntent {
+    match VersionIntent::from_explicit_version(spec) {
+        VersionIntent::Exact(v) => match npm_partial_xrange(&v) {
+            Some(range) => VersionIntent::from_pep440_specifier(&range),
+            None => VersionIntent::Exact(v),
+        },
+        other => other,
+    }
+}
+
+/// Map an npm PARTIAL version (`1`, `1.2`) to an explicit `>=lo,<hi` X-range, or
+/// `None` for a full `x.y.z` version (an exact pin) or any prerelease/build tail.
+fn npm_partial_xrange(v: &str) -> Option<String> {
+    if v.contains('-') || v.contains('+') {
+        return None;
+    }
+    let body = v.strip_prefix(['v', 'V']).unwrap_or(v);
+    let nums: Vec<u64> = body
+        .split('.')
+        .map(|s| s.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    match nums.as_slice() {
+        [major] => Some(format!(">={major}.0.0,<{}.0.0", major + 1)),
+        [major, minor] => Some(format!(">={major}.{minor}.0,<{major}.{}.0", minor + 1)),
+        _ => None,
+    }
 }
 
 /// npm `package-lock.json`: the fully-resolved tree. v2/v3 keys `packages` by
@@ -424,8 +457,10 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
             out.push(DeclaredDependency {
                 name,
                 ecosystem: Ecosystem::PyPI,
-                // requirements.txt parsing keeps only the name today.
-                version: VersionIntent::Unspecified,
+                // Capture the PEP 508 version specifier so a real pin (`==1.4.0`)
+                // is assessed (Exact/Constraint) instead of degrading to a
+                // spurious "unresolved" warning; a bare name stays Unspecified.
+                version: VersionIntent::from_pep440_specifier(&python_requirement_spec(line)),
                 dev: false,
             });
         }
@@ -452,6 +487,29 @@ fn python_requirement_name(line: &str) -> Option<String> {
     }
 }
 
+/// Extract the version specifier from a PEP 508 requirement line: the part after
+/// the name and optional `[extras]`, before any `;` environment marker. Returns an
+/// empty string for a bare name (which `from_pep440_specifier` maps to Unspecified).
+fn python_requirement_spec(line: &str) -> String {
+    // Drop the environment marker, then any `[extras]` so neither is mistaken for a
+    // specifier; the specifier starts at the first comparison operator.
+    let before_marker = line.split(';').next().unwrap_or(line);
+    let mut buf = String::with_capacity(before_marker.len());
+    let mut depth = 0u32;
+    for c in before_marker.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => buf.push(c),
+            _ => {}
+        }
+    }
+    match buf.find(['=', '<', '>', '!', '~']) {
+        Some(i) => buf[i..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
 /// Python `pyproject.toml`: PEP 621 `[project].dependencies` /
 /// `[project.optional-dependencies]`, plus Poetry's
 /// `[tool.poetry.dependencies]` / `[tool.poetry.group.*.dependencies]`.
@@ -460,25 +518,25 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    let mut push = |name: &str, dev: bool, out: &mut Vec<DeclaredDependency>| {
-        let name = name.trim();
-        if name.is_empty() || !is_plausible_package_name(name) {
-            return;
-        }
-        // `python` is the interpreter constraint in Poetry tables, not a dep.
-        if name.eq_ignore_ascii_case("python") {
-            return;
-        }
-        if seen.insert(name.to_lowercase()) {
-            out.push(DeclaredDependency {
-                name: name.to_string(),
-                ecosystem: Ecosystem::PyPI,
-                // pyproject parsing keeps only the name today.
-                version: VersionIntent::Unspecified,
-                dev,
-            });
-        }
-    };
+    let mut push =
+        |name: &str, version: VersionIntent, dev: bool, out: &mut Vec<DeclaredDependency>| {
+            let name = name.trim();
+            if name.is_empty() || !is_plausible_package_name(name) {
+                return;
+            }
+            // `python` is the interpreter constraint in Poetry tables, not a dep.
+            if name.eq_ignore_ascii_case("python") {
+                return;
+            }
+            if seen.insert(name.to_lowercase()) {
+                out.push(DeclaredDependency {
+                    name: name.to_string(),
+                    ecosystem: Ecosystem::PyPI,
+                    version,
+                    dev,
+                });
+            }
+        };
 
     // PEP 621 `[project].dependencies` — an array of requirement strings.
     if let Some(deps) = doc
@@ -489,7 +547,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         for item in deps {
             if let Some(req) = item.as_str() {
                 if let Some(name) = python_requirement_name(req) {
-                    push(&name, false, &mut out);
+                    let version =
+                        VersionIntent::from_pep440_specifier(&python_requirement_spec(req));
+                    push(&name, version, false, &mut out);
                 }
             }
         }
@@ -505,7 +565,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                 for item in items {
                     if let Some(req) = item.as_str() {
                         if let Some(name) = python_requirement_name(req) {
-                            push(&name, true, &mut out);
+                            let version =
+                                VersionIntent::from_pep440_specifier(&python_requirement_spec(req));
+                            push(&name, version, true, &mut out);
                         }
                     }
                 }
@@ -520,7 +582,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         .and_then(|d| d.as_table())
     {
         for name in deps.keys() {
-            push(name, false, &mut out);
+            // Poetry value specs (`^2.0`, `{ version = "^2.0" }`) are not modeled;
+            // keep the name with an Unspecified intent.
+            push(name, VersionIntent::Unspecified, false, &mut out);
         }
     }
     // Poetry dev groups + legacy `[tool.poetry.dev-dependencies]`.
@@ -531,7 +595,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         for group in groups.values() {
             if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
                 for name in deps.keys() {
-                    push(name, true, &mut out);
+                    push(name, VersionIntent::Unspecified, true, &mut out);
                 }
             }
         }
@@ -541,7 +605,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         .and_then(|d| d.as_table())
     {
         for name in deps.keys() {
-            push(name, true, &mut out);
+            push(name, VersionIntent::Unspecified, true, &mut out);
         }
     }
 
@@ -3027,6 +3091,49 @@ git+https://github.com/x/y.git
             Some("pkg")
         );
         assert_eq!(python_requirement_name(""), None);
+    }
+
+    #[test]
+    fn requirements_txt_pinned_dep_carries_version_intent() {
+        let deps = parse_requirements_txt("requests==2.28.1\nflask>=2.0,<3.0\nbare-pkg\n");
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        assert_eq!(requests.version, VersionIntent::Exact("2.28.1".to_string()));
+        let flask = deps.iter().find(|d| d.name == "flask").unwrap();
+        assert!(matches!(
+            flask.version,
+            VersionIntent::Constraint {
+                parsed: Some(_),
+                ..
+            }
+        ));
+        let bare = deps.iter().find(|d| d.name == "bare-pkg").unwrap();
+        assert_eq!(bare.version, VersionIntent::Unspecified);
+    }
+
+    #[test]
+    fn pyproject_pep621_pinned_dep_is_exact() {
+        let toml = "[project]\ndependencies = [\"requests==2.28.1\", \"flask\"]\n";
+        let deps = parse_pyproject_toml(toml).unwrap();
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        assert_eq!(requests.version, VersionIntent::Exact("2.28.1".to_string()));
+        let flask = deps.iter().find(|d| d.name == "flask").unwrap();
+        assert_eq!(flask.version, VersionIntent::Unspecified);
+    }
+
+    #[test]
+    fn npm_partial_version_is_range_not_exact() {
+        // node-semver: `1.2` == `1.2.x` (a range); full `1.2.3` is exact.
+        assert!(matches!(
+            npm_manifest_intent("1.2"),
+            VersionIntent::Constraint {
+                parsed: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            npm_manifest_intent("1.2.3"),
+            VersionIntent::Exact("1.2.3".to_string())
+        );
     }
 
     #[test]
